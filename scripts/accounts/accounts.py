@@ -2429,15 +2429,14 @@ def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[st
 
 
 def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
-    """Select admitted local producers without a pause or an exit request."""
+    """Select admitted local producers without a pause request."""
     from scripts.production import staff
 
     try:
         membership = staff.local_snapshot()
     except staff.StaffAbsent:
         return ()
-    members = eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
-    return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
+    return eligible_producers(membership, "claude") + eligible_producers(membership, "codex")
 
 
 @dataclass(frozen=True)

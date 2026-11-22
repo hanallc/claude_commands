@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+import errno
 import fcntl
 import hashlib
 from itertools import product
@@ -42,6 +43,60 @@ MAKE_WORKTREE = CHECKOUT / "scripts/worktree/make_worktree.sh"
 WORKTREES = CHECKOUT / "scripts/worktree/worktrees.py"
 CARGO_FOLDER = CHECKOUT / "scripts/build_hold/cargo_folder.py"
 NO_PROBE_FDS: frozenset[int] = frozenset()
+ALL_WORKTREES = worktrees.MigrationScope.ALL
+
+BIND_MOVES = """
+from contextlib import redirect_stderr
+from io import StringIO
+from pathlib import Path
+import sys
+from unittest import TestCase
+from unittest.mock import patch
+from scripts.lib import git_files
+from scripts.lint import tmp_sweep
+from scripts.worktree import worktrees
+
+repo, mounted, workspace, build, proc = map(Path, sys.argv[1:])
+tmp_sweep.PROC_DIR = str(proc)
+check = TestCase()
+for name in ("fresh", "resume"):
+    old = mounted / name
+    new = workspace / "origin/fixture-unit" / name
+    worktrees.git(repo, "worktree", "add", "-b", name, str(old))
+    entry = git_files.at(old).git_dir
+    target = old / "target"
+    target.mkdir()
+    (target / "artifact").write_text("warm")
+    target_inode = target.stat().st_ino
+    check.assertEqual(old.stat().st_dev, workspace.stat().st_dev)
+    if name == "resume":
+        with (patch.object(worktrees, "_worktree_copy_required", return_value=False),
+              check.assertRaisesRegex(worktrees.Refused, "Invalid cross-device link")):
+            worktrees.move_worktree(old, "origin", "fixture-unit", name)
+        planned = worktrees.read_move(worktrees.move_file(old))
+        check.assertEqual(planned.stage, worktrees.MoveStage.PLANNED)
+        check.assertEqual(planned.copy_tag, "")
+
+    notices = StringIO()
+    with redirect_stderr(notices):
+        check.assertEqual(worktrees.move_worktree(old, worktrees.MoveRepository.FROM_ORIGIN, "fixture-unit", name), new)
+    journal = worktrees.read_move(worktrees.move_file(old))
+    check.assertTrue(journal.copy_tag)
+    check.assertEqual(journal.stage, worktrees.MoveStage.FINISHED)
+    check.assertEqual(old.readlink(), new)
+    check.assertEqual(git_files.at(new).git_dir, entry)
+    check.assertEqual(worktrees.git(new, "branch", "--show-current").stdout.strip(), name)
+    check.assertEqual((new / "code.txt").read_text(), "base\\n")
+    output = build / "origin/fixture-unit" / name
+    check.assertEqual((new / "target").readlink(), output)
+    check.assertEqual(list(output.iterdir()), [])
+    backup_target = journal.backup / "target"
+    check.assertEqual(backup_target.stat().st_ino, target_inode)
+    check.assertEqual((backup_target / "artifact").read_text(), "warm")
+    check.assertIn(f"kept for a manual removal list: {journal.backup} (worktrees,", notices.getvalue())
+    check.assertIn(f"kept for a manual removal list: {backup_target} (worktrees, the checkout's earlier Cargo target)",
+                   notices.getvalue())
+"""
 
 MIGRATE_WORKTREES = """
 import sys
@@ -52,6 +107,32 @@ from scripts.lint import tmp_sweep
 from scripts.worktree import worktrees
 tmp_sweep.PROC_DIR = proc
 raise SystemExit(worktrees.main())
+"""
+
+BIND_WORKTREE_USE = """
+import subprocess
+import sys
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import patch
+from scripts.lint import tmp_sweep
+from scripts.worktree import worktrees
+
+old, proc, cwd, expected = map(Path, sys.argv[1:5])
+child_code, *child_args = sys.argv[5:]
+tmp_sweep.PROC_DIR = str(proc)
+check = TestCase()
+with subprocess.Popen([sys.executable, "-c", child_code, *child_args], cwd=cwd,
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+    link = child.stdout.readline().strip()
+    check.assertTrue(link)
+    process = Path("/proc") / str(child.pid)
+    (proc / str(child.pid)).symlink_to(process, target_is_directory=True)
+    check.assertEqual((process / link).readlink(), expected)
+    with (patch.object(worktrees, "_worktree_copy_required", return_value=True),
+          check.assertRaisesRegex(worktrees.Refused, f"pids {child.pid}")):
+        worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+check.assertTrue(old.is_dir() and not old.is_symlink())
 """
 
 REQUEST_COPY_WITH_UNIT_LOCK = """
@@ -207,9 +288,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout.strip()
 
-    def migration_command(self, list_file: Path | str) -> list[str]:
+    def migration_command(self, *arguments: Path | str) -> list[str]:
         return [sys.executable, "-B", "-c", MIGRATE_WORKTREES, str(CHECKOUT), str(self.proc),
-                "migrate", "--list", str(list_file)]
+                "migrate", *map(str, arguments)]
 
     def register_process(self, pid: int) -> None:
         (self.proc / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
@@ -260,6 +341,405 @@ class WorktreeLifecycleTests(unittest.TestCase):
         made = self.command(self.repository, ["bash", str(MAKE_WORKTREE), "origin", unit, name])
         self.assertEqual(made.returncode, 0, made.stderr)
         return Path(made.stdout.strip())
+
+    def test_move_command_reads_origin_and_resumes_with_the_warm_target(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        target = old / "target"
+        target.mkdir()
+        _ = (target / "artifact").write_text("warm")
+        inode = target.stat().st_ino
+        checkout = git_files.at(old)
+        new = self.trees / "origin/fixture-unit/cli"
+        output = self.root / "build/origin/fixture-unit/cli"
+        output.parent.mkdir(parents=True)
+        command = [sys.executable, str(WORKTREES), "move", str(old), "fixture-unit", "cli"]
+        with output.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = self.command(self.root, command)
+        self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+        self.assertIn("the build folder lock is held", blocked.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual((new / "target").stat().st_ino, inode)
+        with patch.dict(os.environ, self.environment, clear=True):
+            self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.LINKED)
+        for _attempt in range(2):
+            moved = self.command(self.root, command)
+            self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+            self.assertEqual(moved.stdout, f"{new}\n")
+        self.assertEqual(old.readlink(), new)
+        self.assertEqual(git_files.at(new).git_dir, checkout.git_dir)
+        self.assertEqual((new / "target").readlink(), output)
+        self.assertEqual(output.stat().st_ino, inode)
+        self.assertEqual((output / "artifact").read_text(), "warm")
+        self.assertEqual(list(new.parent.glob(".saved-target-*")), [])
+
+    def test_move_across_a_bind_mount_starts_or_resumes_a_copy(self) -> None:
+        unshare, mount, shell = shutil.which("unshare"), shutil.which("mount"), shutil.which("sh")
+        if sys.platform != "linux" or not unshare or not mount or not shell:
+            self.skipTest("Linux bind mounts require unshare and mount")
+        self.layout_fixture()
+        source, mounted = self.root / "source", self.root / "mount"
+        source.mkdir()
+        mounted.mkdir()
+        python = CHECKOUT / "scripts/lib/py"
+        result = self.command(self.root, [
+            unshare, "--map-root-user", "--mount", "--propagation", "private",
+            shell, "-c", '"$1" --bind "$2" "$3" || exit 77; shift 3; exec "$@"', "bind-fixture",
+            mount, str(source), str(mounted), str(python), "-c", BIND_MOVES,
+            str(self.repository), str(mounted), str(self.trees), str(self.root / "build"), str(self.proc),
+        ])
+        if result.returncode == 77 or "unshare failed: Operation not permitted" in result.stderr:
+            self.skipTest("the kernel does not permit a private bind mount")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_move_refuses_a_numbered_build_copy_before_reading_its_journal(self) -> None:
+        self.layout_fixture()
+        old = self.add_linked_tree(self.repository, self.root / "build/hana/startup/1", "numbered-copy")
+        with patch.dict(os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "cannot move numbered build copy"):
+                _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+            self.assertFalse(worktrees.move_folder().exists())
+            journal = worktrees.move_file(old)
+            journal.parent.mkdir(parents=True)
+            _ = journal.write_text("unreadable move record")
+            with self.assertRaisesRegex(ValueError, "cannot move numbered build copy"):
+                _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+        self.assertFalse(old.is_symlink())
+        self.assertEqual(journal.read_text(), "unreadable move record")
+
+    def test_move_writes_the_checkout_record_before_deferring_the_output(self) -> None:
+        self.layout_fixture()
+        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        with config.open("a") as handle:
+            _ = handle.write("repo_word.origin=claude\n")
+        legacy = self.root / "build/claude/scratch"
+        legacy.mkdir(parents=True)
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        new = self.trees / "claude/fixture-unit/demo"
+        with patch.dict(os.environ, self.environment, clear=True), redirect_stdout(StringIO()):
+            prior = worktrees.read_record(worktrees.record_file(old))
+            self.assertEqual(worktrees.move_worktree(old, "claude", "fixture-unit", "demo"), new)
+            old.unlink()
+            self.assertFalse(worktrees.record_file(old).exists())
+            record = worktrees.read_record(worktrees.record_file(new))
+            self.assertEqual(record, replace(prior, path=str(new), layout=worktrees.UnassignedOutput()))
+            self.assertFalse(os.path.lexists(new / "target"))
+            self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.LINKED)
+            legacy.rmdir()
+            self.assertEqual(worktrees.move_worktree(old, "claude", "fixture-unit", "demo"), new)
+            layout = worktrees.output_record("claude", "fixture-unit", "demo")
+            self.assertEqual(worktrees.worktree_output(new), layout)
+            self.assertEqual((new / "target").readlink(), layout.output)
+
+    def test_move_publishes_the_checkout_record_before_the_linked_stage(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        tip = self.commit(old, "code.txt", "landed\n")
+        _ = self.git(self.repository, "push", "origin", "legacy:main")
+        new = self.trees / "origin/fixture-unit/demo"
+        write_move = worktrees.write_move
+
+        def stop_after_linked(journal: worktrees.MoveJournal) -> None:
+            write_move(journal)
+            if journal.stage is worktrees.MoveStage.LINKED:
+                raise InterruptedError("stop after LINKED")
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            prior = worktrees.read_record(worktrees.record_file(old))
+            prior = replace(prior, merge_branch="main")
+            worktrees.write_record(prior)
+            with (patch.object(worktrees, "write_move", stop_after_linked),
+                  self.assertRaisesRegex(InterruptedError, "stop after LINKED")):
+                _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+            self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.LINKED)
+            old.unlink()
+            self.assertFalse(worktrees.record_file(old).exists())
+            self.assertEqual(worktrees.checkout_record(new), replace(prior, path=str(new)))
+            result, = worktrees.end_landed(self.repository, "main")
+            self.assertIsInstance(result, worktrees.Kept)
+            self.assertEqual(result.path, new)
+            self.assertEqual(self.git(new, "rev-parse", "refs/heads/legacy"), tip)
+            self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+
+    def test_cleanup_keeps_a_branch_registered_at_a_different_worktree_path(self) -> None:
+        old, branch = self.trees / "legacy", "legacy"
+        self.make(old, branch)
+        tip = self.commit(old, "code.txt", "landed\n")
+        self.publish(old, branch)
+        _ = self.git(self.repository, "push", "origin", f"{branch}:main")
+        new = self.trees / "new"
+        _ = self.git(self.repository, "worktree", "move", str(old), str(new))
+        self.assertFalse(os.path.lexists(old))
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            record = worktrees.read_record(worktrees.record_file(old))
+            worktrees.write_record(replace(record, merge_branch="main"))
+            result, = worktrees.end_landed(self.repository, "main")
+            assert isinstance(result, worktrees.Kept), result
+            self.assertIn(str(new), result.reason)
+            self.assertTrue(worktrees.record_file(old).is_file())
+        self.assertEqual(self.git(new, "rev-parse", f"refs/heads/{branch}"), tip)
+        self.assertEqual(self.git(self.repository, "ls-remote", "--heads", "origin", branch),
+                         f"{tip}\trefs/heads/{branch}")
+
+    def test_move_retries_an_unverified_copy_stage_without_removing_it(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        new = self.trees / "origin/fixture-unit/demo"
+        notices = StringIO()
+        with (patch.dict(os.environ, self.environment, clear=True), redirect_stderr(notices),
+              patch.object(worktrees, "_worktree_copy_required", return_value=True)):
+            move = worktrees.WorktreeMove(old, new, "origin", "fixture-unit", "demo", worktrees.MoveOutput.LIVE_UNIT)
+            partial = worktrees._open_move(move)  # pyright: ignore[reportPrivateUsage]
+            partial.staging.mkdir(parents=True)
+            _ = (partial.staging / "code.txt").write_text("partial copy\n")
+            self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+            completed = worktrees.read_move(worktrees.move_file(old))
+        self.assertNotEqual(completed.copy_tag, partial.copy_tag)
+        self.assertEqual(completed.stage, worktrees.MoveStage.FINISHED)
+        self.assertTrue(partial.source.matches(completed.backup))
+        self.assertEqual((new / "code.txt").read_text(), "base\n")
+        self.assertEqual((partial.staging / "code.txt").read_text(), "partial copy\n")
+        self.assertIn(f"{partial.staging} (worktrees, a prior move left an unverified stage)", notices.getvalue())
+
+    def test_copy_move_repairs_a_relative_git_pointer(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        _ = self.git(self.repository, "worktree", "add", "--relative-paths", "-b", "legacy", str(old))
+        original = git_files.at(old)
+        pointer = Path((old / ".git").read_text().strip().removeprefix("gitdir: "))
+        self.assertFalse(pointer.is_absolute())
+        new = self.trees / "origin/fixture-unit/demo"
+        self.assertFalse((new / pointer).resolve().exists())
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees, "_worktree_copy_required", return_value=True)):
+            self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+            completed = worktrees.read_move(worktrees.move_file(old))
+        self.assertEqual(git_files.at(new).git_dir, original.git_dir)
+        self.assertEqual(self.git(new, "branch", "--show-current"), "legacy")
+        self.assertIn(f"worktree {new}", self.git(self.repository, "worktree", "list", "--porcelain"))
+        self.assertEqual((completed.backup / ".git").read_text(), f"gitdir: {pointer}\n")
+
+    def test_copy_move_keeps_tracked_target_files_and_leaves_artifacts_in_backup(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        target = old / "target"
+        (target / "nested").mkdir(parents=True)
+        _ = (target / "nested/.gitkeep").write_text("tracked\n")
+        literal = "target/nested/[keep]\\hint"
+        _ = (old / literal).write_text("literal file name\n")
+        _ = self.git(old, "add", "-f", "target/nested/.gitkeep", f":(literal){literal}")
+        _ = self.git(old, "commit", "-m", "Track a placeholder")
+        _ = (target / "nested/.gitkeep").write_text("local edit\n")
+        _ = (target / "nested/artifact").write_text("warm\n")
+        _ = (target / "untracked").symlink_to("nested")
+        new = self.trees / "origin/fixture-unit/demo"
+        notices = StringIO()
+        with (patch.dict(os.environ, self.environment, clear=True), redirect_stderr(notices),
+              patch.object(worktrees, "_worktree_copy_required", return_value=True)):
+            self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+            completed = worktrees.read_move(worktrees.move_file(old))
+        self.assertEqual(completed.stage, worktrees.MoveStage.FINISHED)
+        self.assertFalse((new / "target").is_symlink())
+        self.assertEqual((new / "target/nested/.gitkeep").read_text(), "local edit\n")
+        self.assertEqual((new / literal).read_text(), "literal file name\n")
+        self.assertFalse((new / "target/nested/artifact").exists())
+        self.assertFalse(os.path.lexists(new / "target/untracked"))
+        self.assertEqual((completed.backup / "target/nested/artifact").read_text(), "warm\n")
+        self.assertIn(f"{completed.backup / 'target'} (worktrees, the checkout's earlier Cargo target)",
+                      notices.getvalue())
+        self.assertIn(f"{new / 'target'} (worktrees, Git tracks the checkout's target)", notices.getvalue())
+        with patch.dict(os.environ, self.environment, clear=True):
+            record = worktrees.read_record(worktrees.record_file(new))
+            self.assertIsInstance(record.layout, worktrees.UnassignedOutput)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_direct_copy_move_refuses_a_source_in_use_before_copying(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        nested = old / "nested"
+        nested.mkdir()
+        new = self.trees / "origin/fixture-unit/demo"
+        copy = worktrees._copy_worktree_source  # pyright: ignore[reportPrivateUsage]
+        with patch.dict(os.environ, self.environment, clear=True):
+            with patch.object(worktrees, "_worktree_copy_required", return_value=False):
+                move = worktrees.WorktreeMove(old, new, "origin", "fixture-unit", "demo", worktrees.MoveOutput.LIVE_UNIT)
+                _ = worktrees._open_move(move)  # pyright: ignore[reportPrivateUsage]
+            with (patch.object(worktrees, "_worktree_copy_required", return_value=True),
+                  patch.object(worktrees, "_copy_worktree_source", wraps=copy) as copy_source):
+                for lock in (old.with_name(old.name + ".lock"), scratch.busy_path(old)):
+                    with self.subTest(lock=lock), lock.open("wb") as handle:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with self.assertRaisesRegex(worktrees.Refused, f"{re.escape(str(lock))} held"):
+                            _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+
+                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+                                      cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
+                    self.register_process(child.pid)
+                    with self.assertRaisesRegex(worktrees.Refused, f"pids {child.pid}"):
+                        _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+                copy_source.assert_not_called()
+                self.assertTrue(old.is_dir() and not old.is_symlink())
+                self.assertFalse(os.path.lexists(new))
+                self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+
+    def test_direct_copy_move_finds_a_working_directory_through_a_bind_mount(self) -> None:
+        self._check_process_use_through_bind_mount(holds_file=False)
+
+    def test_direct_copy_move_finds_an_open_file_through_a_bind_mount(self) -> None:
+        self._check_process_use_through_bind_mount(holds_file=True)
+
+    def _check_process_use_through_bind_mount(self, *, holds_file: bool) -> None:
+        unshare, mount, shell = shutil.which("unshare"), shutil.which("mount"), shutil.which("sh")
+        if sys.platform != "linux" or not unshare or not mount or not shell:
+            self.skipTest("Linux bind mounts require unshare and mount")
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        (old / "nested").mkdir()
+        _ = (old / "nested/work").write_text("work")
+        alias = self.root / "bind alias"
+        alias.mkdir()
+        nested = alias / "legacy/nested"
+        if holds_file:
+            expected = nested / "work"
+            child_code = "import os, sys; fd = os.open(sys.argv[1], os.O_RDWR); print(f'fd/{fd}', flush=True); sys.stdin.read()"
+            cwd, child_args = self.root, [str(expected)]
+        else:
+            expected = nested
+            child_code = "import sys; print('cwd', flush=True); sys.stdin.read()"
+            cwd, child_args = nested, []
+        python = CHECKOUT / "scripts/lib/py"
+        result = self.command(self.root, [
+            unshare, "--map-root-user", "--mount", "--propagation", "private",
+            shell, "-c", '"$1" --bind "$2" "$3" || exit 77; shift 3; exec "$@"', "bind-fixture",
+            mount, str(self.trees), str(alias), str(python), "-c", BIND_WORKTREE_USE,
+            str(old), str(self.proc), str(cwd), str(expected), child_code, *child_args,
+        ])
+        if result.returncode == 77 or "unshare failed: Operation not permitted" in result.stderr:
+            self.skipTest("the kernel does not permit a private bind mount")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_copy_move_preserves_a_destination_created_before_publication(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        new = self.trees / "origin/fixture-unit/demo"
+        rename = Path.rename
+        occupants: list[worktrees.FolderIdentity] = []
+
+        def create_competing_directory(path: Path, target: Path) -> Path:
+            result = rename(path, target)
+            if path == old:
+                new.mkdir()
+                occupants.append(worktrees.FolderIdentity.read(new))
+            return result
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(worktrees, "_worktree_copy_required", return_value=True)):
+            with (patch.object(Path, "rename", create_competing_directory),
+                  self.assertRaisesRegex(FileExistsError, f"{re.escape(str(new))}: worktree destination already exists")):
+                _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+            occupant, = occupants
+            self.assertTrue(occupant.matches(new))
+            self.assertEqual(list(new.iterdir()), [])
+            journal = worktrees.read_move(worktrees.move_file(old))
+            self.assertEqual(journal.stage, worktrees.MoveStage.PLANNED)
+            self.assertTrue(journal.source.matches(journal.backup))
+            self.assertTrue(journal.destination.matches(journal.staging))
+            new.rmdir()
+            self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+            self.assertTrue(journal.destination.matches(new))
+            self.assertEqual(old.readlink(), new)
+
+    def test_move_reuses_an_empty_output_and_reports_a_target_at_an_occupied_output(self) -> None:
+        self.layout_fixture()
+        for name, occupied in (("empty", False), ("occupied", True)):
+            with self.subTest(name=name):
+                old = self.trees / name
+                self.make(old, name)
+                target = old / "target"
+                target.mkdir()
+                _ = (target / "artifact").write_text("warm")
+                inode = target.stat().st_ino
+                output = self.root / "build/origin/fixture-unit" / name
+                output.mkdir(parents=True)
+                if occupied:
+                    _ = (output / "other").write_text("keep")
+                notices = StringIO()
+                with patch.dict(os.environ, self.environment, clear=True), redirect_stderr(notices):
+                    moved = worktrees.move_worktree(old, "origin", "fixture-unit", name)
+                self.assertEqual((moved / "target").readlink(), output)
+                if occupied:
+                    saved, = moved.parent.glob(".saved-target-*")
+                    self.assertEqual((saved / "target").stat().st_ino, inode)
+                    self.assertEqual((saved / "target/artifact").read_text(), "warm")
+                    self.assertEqual((output / "other").read_text(), "keep")
+                    self.assertFalse((output / "artifact").exists())
+                    self.assertIn(f"kept for a manual removal list: {saved} (worktrees, the checkout's earlier Cargo target)",
+                                  notices.getvalue())
+                else:
+                    self.assertEqual(output.stat().st_ino, inode)
+                    self.assertEqual((output / "artifact").read_text(), "warm")
+                    self.assertEqual(list(moved.parent.glob(".saved-target-*")), [])
+
+    def test_move_saves_the_target_when_its_output_rename_crosses_devices(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        target = old / "target"
+        target.mkdir()
+        _ = (target / "artifact").write_text("warm")
+        inode = target.stat().st_ino
+        output = self.root / "build/origin/fixture-unit/demo"
+        notices = StringIO()
+        rename = os.rename
+
+        def rename_with_cross_device_target(source: Path, destination: str | Path, *,
+                                           src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+            if dst_dir_fd is not None and source.name == "target":
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with (patch.dict(os.environ, self.environment, clear=True), redirect_stderr(notices),
+              patch.object(os, "rename", side_effect=rename_with_cross_device_target)):
+            new = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+        saved, = new.parent.glob(".saved-target-*")
+        self.assertEqual((saved / "target").stat().st_ino, inode)
+        self.assertEqual((saved / "target/artifact").read_text(), "warm")
+        self.assertEqual((new / "target").readlink(), output)
+        self.assertEqual(list(output.iterdir()), [])
+        self.assertIn(f"kept for a manual removal list: {saved} (worktrees, the checkout's earlier Cargo target)",
+                      notices.getvalue())
+
+    def test_move_preserves_the_old_target_when_the_output_is_a_symlink(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        target = old / "target"
+        target.mkdir()
+        _ = (target / "artifact").write_text("warm")
+        endpoint = self.root / "other-output"
+        endpoint.mkdir()
+        output = self.root / "build/origin/fixture-unit/demo"
+        output.parent.mkdir(parents=True)
+        output.symlink_to(endpoint, target_is_directory=True)
+        new = self.trees / "origin/fixture-unit/demo"
+        with patch.dict(os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "invalid worktree output"):
+                _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
+            with self.assertRaisesRegex(ValueError, "expected a real output folder"):
+                worktrees.ensure_target_link(new, output)
+        self.assertEqual((new / "target/artifact").read_text(), "warm")
+        self.assertEqual(output.readlink(), endpoint)
+        self.assertEqual(list(endpoint.iterdir()), [])
 
     def test_move_reuses_git_entry_and_finishes_after_transcript_conflict(self) -> None:
         self.layout_fixture()
@@ -335,6 +815,74 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertTrue(final.removed)
             self.assertFalse(old.is_symlink())
 
+    def test_claude_moves_defer_output_until_a_retry_or_migration(self) -> None:
+        self.layout_fixture()
+        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        with config.open("a") as handle:
+            _ = handle.write("repo_word.claude_commands=claude\n")
+        origin = self.root / "claude_commands.git"
+        _ = self.git(self.root, "clone", "--bare", str(self.origin), str(origin))
+        main = self.home / ".claude"
+        _ = self.git(main, "init", "--initial-branch=main")
+        _ = self.git(main, "remote", "add", "origin", str(origin))
+        _ = self.git(main, "fetch", "origin")
+        _ = self.git(main, "checkout", "-B", "main", "--track", "origin/main")
+        _ = self.git(main, "remote", "set-head", "origin", "main")
+        legacy = self.root / "build/claude/scratch"
+        legacy.mkdir(parents=True)
+        destinations = self.trees / "claude/fixture-unit"
+        names = ("retry", "migrate")
+        with patch.dict(os.environ, self.environment, clear=True):
+            for name in names:
+                old = self.add_linked_tree(main, self.trees / name, f"fixture-unit-{name}")
+                new = destinations / name
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(worktrees.move_worktree(old, "claude", "fixture-unit", name), new)
+                self.assertEqual(output.getvalue().strip(), f"defer output {new}: archive the old build root first")
+                self.assertEqual(old.readlink(), new)
+                self.assertEqual(self.git(new, "branch", "--show-current"), f"fixture-unit-{name}")
+                self.assertFalse(os.path.lexists(new / "target"))
+                self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.LINKED)
+
+            old = self.trees / "retry"
+            new = destinations / "retry"
+            self.assertIsInstance(worktrees.cleanup(new), worktrees.CleanupReady)
+            removal = StringIO()
+            with redirect_stderr(removal):
+                worktrees.remove_git_checkout(new, main)
+            self.assertIn(f"kept for a manual removal list: {new}", removal.getvalue())
+            make = [sys.executable, str(WORKTREES), "make", "claude", "fixture-unit"]
+            occupied = self.command(new, [*make, "retry"])
+            self.assertEqual(occupied.returncode, 1, occupied.stdout + occupied.stderr)
+            self.assertIn("editable repository destination is occupied", occupied.stderr)
+            made = self.command(new, [*make, "another"])
+            self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+            self.assertTrue((destinations / "another/target").is_symlink())
+
+            legacy.rmdir()
+            self.assertEqual(worktrees.move_worktree(old, "claude", "fixture-unit", "retry"), new)
+            self.assertEqual((new / "target").readlink(), self.root / "build/claude/fixture-unit/retry")
+            self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.FINISHED)
+            self.assertFalse(os.path.lexists(destinations / "migrate/target"))
+        empty = self.command(self.root, self.migration_command("--list", os.devnull))
+        self.assertEqual(empty.returncode, 0, empty.stdout + empty.stderr)
+        self.assertNotIn("resume ", empty.stdout)
+        self.assertFalse(os.path.lexists(destinations / "migrate/target"))
+        list_file = self.root / "moves"
+        _ = list_file.write_text(f"{self.trees / 'migrate'} fixture-unit migrate\n")
+        applied = self.command(self.root, self.migration_command("--list", list_file))
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertIn(f"resume {self.trees / 'migrate'} -> {destinations / 'migrate'}", applied.stdout)
+        with patch.dict(os.environ, self.environment, clear=True):
+            for name in names:
+                new = destinations / name
+                layout = worktrees.output_record("claude", "fixture-unit", name)
+                self.assertEqual((new / "target").readlink(), layout.output)
+                self.assertEqual(worktrees.worktree_output(new), layout)
+                journal = worktrees.read_move(worktrees.move_file(self.trees / name))
+                self.assertEqual(journal.stage, worktrees.MoveStage.FINISHED)
+
     def add_linked_tree(self, repository: Path, path: Path, branch: str) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = self.git(repository, "worktree", "add", "-b", branch, str(path))
@@ -346,14 +894,127 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.git(self.root, "clone", str(self.origin), str(main))
         return main
 
+    def migration_unit(self, name: str, worktree: staff.PresentWorktree | staff.RemovedWorktree
+                       | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED) -> None:
+        path = Path(self.environment["STAFF_FILE"])
+        snapshot = staff.StaffSnapshot.decode(path.read_text())
+        parent = next(row.id for row in snapshot.rows if row.kind == "showrunner")
+        identity = staff.StaffId(str(uuid4()))
+        unit = staff.StaffRow(identity, "unit", name, staff.ReportsTo(parent), current_session=identity,
+                              worktree=worktree, unit_type=staff.UnitDetails("direct"))
+        _ = path.write_text(replace(snapshot, rows=(*snapshot.rows, unit)).encode())
+
+    def test_migration_limits_the_dry_run_and_apply_to_listed_worktrees(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        listed = self.add_linked_tree(main, self.trees / "listed", "listed")
+        unlisted = self.add_linked_tree(main, self.trees / "origin-fixture-unit-unlisted", "unlisted")
+        list_file = self.root / "list"
+        _ = list_file.write_text(f"{listed} fixture-unit chosen\n")
+        new = self.trees / "origin/fixture-unit/chosen"
+        command = self.migration_command("--list", list_file)
+
+        missing_selection = self.command(self.root, self.migration_command("--dry-run"))
+        self.assertEqual(missing_selection.returncode, 2, missing_selection.stdout + missing_selection.stderr)
+        self.assertIn("specify --list FILE or --all", missing_selection.stderr)
+        for flags in (["--dry-run"], []):
+            with self.subTest(flags=flags):
+                result = self.command(self.root, [*command, *flags])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                moves = [line for line in result.stdout.splitlines() if line.startswith("move ")]
+                self.assertEqual(moves, [f"move {listed} -> {new} | fixture-unit | chosen | list | live-unit"])
+                self.assertNotIn(str(unlisted), result.stdout)
+                self.assertFalse(unlisted.is_symlink())
+                self.assertFalse(os.path.lexists(main / "target"))
+                self.assertFalse((self.trees / "origin/fixture-unit/unlisted").exists())
+        self.assertEqual(listed.readlink(), new)
+        self.assertIn(f"worktree {unlisted}", self.git(main, "worktree", "list", "--porcelain"))
+
+    def test_migration_refuses_rows_for_numbered_hana_copies(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        list_file = self.root / "list"
+        copies = tuple(
+            self.add_linked_tree(main, self.root / "build/hana" / unit / "1", unit)
+            for unit in ("hana-merges", "startup")
+        )
+        for path, flags in product(copies, ([], ["--dry-run"], ["--all", "--dry-run"])):
+            with self.subTest(path=path, flags=flags):
+                _ = list_file.write_text(f"{path} fixture-unit selected\n")
+                result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{list_file}:1: cannot migrate numbered build copy {path}", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse((self.state / "moves").exists())
+        full = self.command(self.root, self.migration_command("--all"))
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        for path in copies:
+            self.assertIn(f"keep {path}: a numbered build copy; the build folder model owns it", full.stdout)
+            self.assertNotIn(f"move {path} ->", full.stdout)
+            self.assertFalse(path.is_symlink())
+            self.assertIn(f"worktree {path}", self.git(main, "worktree", "list", "--porcelain"))
+
+    def test_migration_uses_the_staff_unit_name_for_list_rows_and_fallback(self) -> None:
+        self.layout_fixture()
+        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        with config.open("a") as handle:
+            _ = handle.write("repo_word.origin=claude\n")
+        main = self.migration_main()
+        self.migration_unit("unit-board", staff.PresentWorktree(host_name(), main))
+        listed = self.add_linked_tree(main, self.trees / "claude-natedev-unit-board-home", "home")
+        by_folder = self.add_linked_tree(main, self.trees / "claude-natedev-unit-board-cablesfault", "cablesfault")
+        by_subject = self.add_linked_tree(main, self.trees / "claude-legacy-note", "note")
+        _ = self.git(by_subject, "commit", "--allow-empty", "-m", "checkpoint(claude-natedev-unit-board): save work")
+        list_file = self.root / "list"
+        for unit, flags in (("natedev-unit-board", []), ("claude-unit-board", ["--all", "--dry-run"]),
+                            ("fixture-production/unit-board", ["--dry-run"])):
+            with self.subTest(unit=unit):
+                _ = list_file.write_text(f"{listed} {unit} home\n")
+                result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{unit} is not a staff unit; use unit-board", result.stderr)
+                self.assertFalse(listed.is_symlink())
+                self.assertFalse((self.state / "moves").exists())
+
+        _ = list_file.write_text(f"{listed} unit-board home\n")
+        result = self.command(self.root, self.migration_command("--all", "--list", list_file, "--dry-run"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        unit_folder = self.trees / "claude/unit-board"
+        for old, short, source in ((listed, "home", "list"), (by_folder, "cablesfault", "folder name"),
+                                   (by_subject, "legacy-note", "commit subject")):
+            self.assertIn(f"move {old} -> {unit_folder / short} | unit-board | {short} | {source}", result.stdout)
+        self.assertNotIn(f" -> {self.trees}/claude/natedev-unit-board/", result.stdout)
+
+    def test_migration_refuses_a_different_valid_staff_unit_for_an_owned_checkout(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        owned = self.add_linked_tree(main, self.trees / "owned", "owned")
+        recorded = self.add_linked_tree(main, self.trees / "recorded", "recorded")
+        self.migration_unit("owner", staff.PresentWorktree(host_name(), owned))
+        with patch.dict(os.environ, self.environment, clear=True):
+            worktrees.write_record(worktrees.new_record(recorded, "recorded", main, self.base, "owner", ""))
+        list_file = self.root / "list"
+        for old in (owned, recorded):
+            with self.subTest(old=old):
+                _ = list_file.write_text(f"{old} fixture-unit chosen\n")
+                result = self.command(self.root, self.migration_command("--list", list_file, "--dry-run"))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{list_file}:1: {old} belongs to staff unit owner; use owner", result.stderr)
+                _ = list_file.write_text(f"{old} owner chosen\n")
+                result = self.command(self.root, self.migration_command("--list", list_file, "--dry-run"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"move {old} -> {self.trees}/origin/owner/chosen", result.stdout)
+
     def test_migration_dry_run_reads_without_writing_then_applies_the_same_plan(self) -> None:
         self.layout_fixture()
         main = self.migration_main()
         named = self.add_linked_tree(main, self.trees / "named source", "branch-list")
         inferred = self.add_linked_tree(main, self.trees / "origin-fixture-unit-repair", "branch-name")
         retired = self.add_linked_tree(main, self.trees / "legacy-readme", "branch-subject")
+        self.migration_unit("former-unit", staff.RemovedWorktree(host_name(), self.trees / "former-checkout"))
         _ = self.git(retired, "commit", "--allow-empty", "-m", "checkpoint(former-unit): save work")
         unknown = self.add_linked_tree(main, self.trees / "orphan", "branch-unknown")
+        _ = self.git(unknown, "commit", "--allow-empty", "-m", "checkpoint(unlisted-unit): save work")
         by_record = self.add_linked_tree(main, self.trees / "legacy-proof", "saved-branch")
         by_branch = self.add_linked_tree(main, self.trees / "fixture-unit-45", "fixture-unit-phase-45")
         digits = self.add_linked_tree(main, self.trees / "fixture-unit-47", "47")
@@ -376,7 +1037,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         occupied.mkdir(parents=True)
         list_file = self.root / "list"
         _ = list_file.write_text(f"{shlex.quote(str(named))} fixture-unit chosen\n{conflict} fixture-unit taken\n")
-        check = self.migration_command(list_file)
+        check = self.migration_command("--all", "--list", list_file)
         registered = self.git(main, "worktree", "list", "--porcelain")
         staff_file = Path(self.environment["STAFF_FILE"])
         staff_before = staff_file.read_bytes()
@@ -431,10 +1092,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.add_linked_tree(main, output, "main-output")
         scratch = self.add_linked_tree(main, self.root / "build/claude/scratch/12", "legacy-scratch")
         list_file = self.root / "list"
-        _ = list_file.write_text(f"{copy} fixture-unit copy\n{ci} fixture-unit ci\n"
-                                 + f"{output} fixture-unit output\n{scratch} fixture-unit legacy\n")
+        _ = list_file.write_text(f"{ci} fixture-unit ci\n{output} fixture-unit output\n{scratch} fixture-unit legacy\n")
 
-        result = self.command(self.root, [*self.migration_command(list_file), "--dry-run"])
+        result = self.command(self.root, [*self.migration_command("--all", "--list", list_file), "--dry-run"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"keep {copy}: a numbered build copy; the build folder model owns it", result.stdout)
         self.assertIn(f"keep {ci}: a CI runner folder; the build folder model owns it", result.stdout)
@@ -453,7 +1113,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         nested.mkdir()
         list_file = self.root / "list"
         _ = list_file.write_text(f"{busy} fixture-unit busy\n{idle} fixture-unit idle\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
 
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                               cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
@@ -486,7 +1146,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         busy = self.add_linked_tree(main, self.trees / "busy", "busy")
         list_file = self.root / "list"
         _ = list_file.write_text(f"{busy} fixture-unit busy\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         busy_mark = scratch.busy_path(busy)
         with busy_mark.open("wb") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -505,7 +1165,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         old = self.add_linked_tree(main, self.trees / "source", "source")
         list_file = self.root / "list"
         _ = list_file.write_text(f"{old} fixture-unit source\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         sidecar = old.with_name(old.name + ".lock")
         with sidecar.open("wb") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -523,7 +1183,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with patch.dict(os.environ, self.environment, clear=True):
             lock = worktrees.move_folder() / "move.lock"
         lock.parent.mkdir(parents=True)
-        command = self.migration_command(os.devnull)
+        command = self.migration_command("--all")
         with lock.open("wb") as descriptor:
             fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             dry = self.command(self.root, [*command, "--dry-run"])
@@ -538,7 +1198,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         old = self.add_linked_tree(main, self.trees / "source", "source")
         list_file = self.root / "list"
         _ = list_file.write_text(f"{old} fixture-unit source\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         staff_file = Path(self.environment["STAFF_FILE"])
         with patch.dict(os.environ, self.environment, clear=True):
             row = staff.snapshot().unit_by_worktree(host_name(), self.repository)
@@ -588,13 +1248,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 for dry_run in (True, False):
                     with redirect_stdout(output := StringIO()):
-                        self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=dry_run), 0)
+                        self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=dry_run), 0)
                     self.assertIn(f"keep {old}: kept: {lock} held", output.getvalue())
                     self.assertNotIn(f"move {old} ->", output.getvalue())
                 self.assertEqual(commands, ["show", "worktree-write-lock-status"] * 2)
                 self.assertFalse(old.is_symlink())
             with redirect_stdout(StringIO()):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
         self.assertEqual(old.readlink(), new)
         self.assertIn("set-worktree", commands)
 
@@ -608,7 +1268,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             move = worktrees.WorktreeMove(copy, new, "origin", "fixture-unit", "p12", worktrees.MoveOutput.LIVE_UNIT)
             journal = worktrees._open_move(move)  # pyright: ignore[reportPrivateUsage]
             record = worktrees.move_file(copy)
-        command = self.migration_command(os.devnull)
+        command = self.migration_command("--all")
         for flags in (["--dry-run"], []):
             with self.subTest(flags=flags):
                 result = self.command(self.root, [*command, *flags])
@@ -634,7 +1294,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         doc = self.merge_tree / "docs/production.md"
         _ = doc.write_text(f"- **Showrunner checkout:** `{old}`\n")
 
-        command = self.migration_command(os.devnull)
+        command = self.migration_command("--all")
         for flags in (["--dry-run"], []):
             result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -662,7 +1322,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             worktrees.write_move(replace(journal, destination=worktrees.FolderIdentity.read(journal.staging)))
             record = worktrees.move_file(old)
         before = record.read_bytes()
-        command = self.migration_command(list_file)
+        command = self.migration_command("--list", list_file)
         dry = self.command(self.root, [*command, "--dry-run"])
         self.assertEqual(dry.returncode, 0, dry.stderr)
         self.assertEqual(record.read_bytes(), before)
@@ -695,7 +1355,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = worktrees._open_move(unverified)  # pyright: ignore[reportPrivateUsage]
             _ = missing.rename(missing.with_name("displaced"))
             records = {path: path.read_bytes() for path in worktrees.move_folder().glob("*.json")}
-        command = self.migration_command(os.devnull)
+        command = self.migration_command("--all")
         for flags in (["--dry-run"], []):
             result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -728,7 +1388,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 return journal
 
             with patch.object(worktrees, "_open_move", open_then_start_process), redirect_stdout(first := StringIO()):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
             pid, = pids
             keep = f"keep {old}: in use (pids {pid})"
             self.assertIn(keep, first.getvalue())
@@ -736,12 +1396,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.PLANNED)
             for dry_run in (True, False):
                 with redirect_stdout(held := StringIO()):
-                    self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=dry_run), 0)
+                    self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=dry_run), 0)
                 self.assertIn(keep, held.getvalue())
                 self.assertFalse(new.exists())
 
         with patch.dict(os.environ, self.environment, clear=True), redirect_stdout(resumed := StringIO()):
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
             self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.FINISHED)
         self.assertIn(f"move {old} -> {new}", resumed.getvalue())
         self.assertEqual(resumed.getvalue().splitlines()[-1], "moved 1, kept in use 0, kept 1")
@@ -762,7 +1422,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             (process / "maps").mkdir()
         list_file = self.root / "list"
         _ = list_file.write_text(f"{first} fixture-unit first\n{second} fixture-unit second\n")
-        result = self.command(self.root, self.migration_command(list_file))
+        result = self.command(self.root, self.migration_command("--all", "--list", list_file))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "moved 0, kept in use 2, kept 1")
         for path in (first, second):
@@ -782,9 +1442,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with (patch.dict(os.environ, self.environment, clear=True),
               patch.object(worktrees, "_migration_processes", return_value=uses) as scan):
             with redirect_stdout(dry := StringIO()):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=True), 0)
             with redirect_stdout(applied := StringIO()):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
         self.assertEqual(scan.call_count, 4)
         self.assertEqual(dry.getvalue().splitlines().count(line), 1)
         self.assertEqual(applied.getvalue().splitlines().count(line), 1)
@@ -824,7 +1484,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with (patch.dict(os.environ, self.environment, clear=True),
               patch.object(worktrees, "_migration_processes", scan_under_lock),
               patch.object(worktrees, "git", git_under_lock), redirect_stdout(StringIO())):
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
         self.assertEqual(events, ["scan", "rename"])
         for mark in marks:
             with mark.open("rb") as descriptor:
@@ -834,10 +1494,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.layout_fixture()
         main = self.migration_main()
         old = self.add_linked_tree(main, self.root / "build/origin/fixture-unit", "source")
-        new = self.trees / "origin/moved-unit/source"
+        new = self.trees / "origin/fixture-unit/source"
         list_file = self.root / "list"
-        _ = list_file.write_text(f"{old} moved-unit source\n")
-        command = self.migration_command(list_file)
+        _ = list_file.write_text(f"{old} fixture-unit source\n")
+        command = self.migration_command("--list", list_file)
         for flags in (["--dry-run"], []):
             result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -890,14 +1550,14 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
             with (patch.object(worktrees, "_open_move", open_copy),
                   patch.object(worktrees, "_migration_processes", change_after_copy), redirect_stdout(kept := StringIO())):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 1)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 1)
             self.assertIn(f"keep {old}: in use: changed during copy", kept.getvalue())
             self.assertEqual((old / "code.txt").read_text(), "changed\n")
             self.assertFalse(old.is_symlink())
             self.assertFalse(new.exists())
             self.assertFalse(journals[0].staging.exists())
             with redirect_stdout(StringIO()):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
         self.assertEqual((new / "code.txt").read_text(), "changed\n")
 
     @unittest.skipUnless(sys.platform == "linux", "requires /proc")
@@ -914,7 +1574,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = worktrees._open_move(move, clone_members=(member,))  # pyright: ignore[reportPrivateUsage]
         list_file = self.root / "list"
         _ = list_file.write_text(f"{clone} fixture-unit clone\n{member} fixture-unit member\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                               cwd=member, stdin=subprocess.PIPE, env=self.environment) as child:
             self.register_process(child.pid)
@@ -947,7 +1607,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with (patch.dict(os.environ, self.environment, clear=True),
               patch.object(worktrees, "_migration_processes", add_member_at_final_scan),
               redirect_stdout(kept := StringIO())):
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 1)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 1)
         self.assertIn(f"keep {clone}: linked checkouts changed since the plan", kept.getvalue())
         self.assertFalse(clone.is_symlink())
         self.assertFalse(new.exists())
@@ -973,7 +1633,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     journal = worktrees.read_move(worktrees.move_file(old))
                 self.assertEqual(journal.stage, worktrees.MoveStage.FINISHED)
                 _ = list_file.write_text(f"{clone} {unit} {change}\n{member} {unit} {member_name}-moved\n")
-                command = self.migration_command(list_file)
+                command = self.migration_command("--all", "--list", list_file)
                 registration = git_files.at(member).git_dir / "gitdir"
                 registration_before = registration.read_bytes()
 
@@ -1014,7 +1674,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     with (patch.dict(os.environ, self.environment, clear=True),
                           patch.object(worktrees, "_migration_processes", change_store_at_final_scan),
                           redirect_stdout(kept := StringIO())):
-                        self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 1)
+                        self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 1)
                     self.assertIn(f"keep {clone}: linked worktree {member} now uses a different Git store",
                                   kept.getvalue())
                     self.assertTrue(journal.destination.matches(member))
@@ -1042,7 +1702,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         clone_new = member.with_name("clone")
         list_file = self.root / "list"
         _ = list_file.write_text(f"{clone} fixture-unit clone\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
 
         dry = self.command(self.root, [*command, "--dry-run"])
         self.assertEqual(dry.returncode, 0, dry.stderr)
@@ -1128,10 +1788,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
                       patch.object(git_files, "head", side_effect=head),
                       patch.object(worktrees, "git", side_effect=git)):
                     with redirect_stdout(dry := StringIO()):
-                        self.assertEqual(worktrees.migrate_worktrees(listed, dry_run=True), 0)
+                        self.assertEqual(worktrees.migrate_worktrees(listed, scope=ALL_WORKTREES, dry_run=True), 0)
                     self.assertFalse(destination.exists())
                     with redirect_stdout(applied := StringIO()), redirect_stderr(StringIO()):
-                        self.assertEqual(worktrees.migrate_worktrees(listed, dry_run=False), 1)
+                        self.assertEqual(worktrees.migrate_worktrees(listed, scope=ALL_WORKTREES, dry_run=False), 1)
 
                 self.assertEqual(dry.getvalue().splitlines()[:-1], applied.getvalue().splitlines()[:-1])
                 read_reasons = {
@@ -1210,11 +1870,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
                       patch.object(worktrees, "_migration_journals",
                                    return_value=worktrees.MigrationJournalView(journals, {}))):
                     with redirect_stdout(dry := StringIO()):
-                        self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+                        self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=True), 0)
                     self.assertFalse(clone_new.exists())
                     self.assertEqual(registration.read_bytes(), registration_before)
                     with redirect_stdout(applied := StringIO()), redirect_stderr(StringIO()):
-                        self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), int(state == "foreign"))
+                        self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), int(state == "foreign"))
 
                 decisions = [line for line in dry.getvalue().splitlines() if line.startswith(("move ", "keep ", "review "))]
                 self.assertEqual(decisions, [line for line in applied.getvalue().splitlines()
@@ -1249,7 +1909,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         new.parent.mkdir(parents=True)
         list_file = self.root / "list"
         _ = list_file.write_text(f"{clone} fixture-unit clone\n{member} fixture-unit member\n")
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         lock = new.with_name(new.name + ".lock")
         with lock.open("wb") as descriptor:
             fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1290,12 +1950,38 @@ class WorktreeLifecycleTests(unittest.TestCase):
         doc = self.merge_tree / "docs/production.md"
         _ = doc.write_text(f"- **Showrunner checkout:** `{old}`\n")
 
-        result = self.command(self.root, self.migration_command(os.devnull))
+        result = self.command(self.root, self.migration_command("--all"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(old.readlink(), new)
         self.assertTrue(journal.backup.is_dir())
         with patch.dict(os.environ, self.environment, clear=True):
             self.assertEqual(worktrees.read_move(worktrees.move_file(old)).stage, worktrees.MoveStage.FINISHED)
+
+    def test_full_migration_names_the_scratch_backup_for_a_blocked_move(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        old = self.add_linked_tree(main, self.root / "build/claude/scratch/legacy", "legacy")
+        new = self.trees / "origin/fixture-unit/legacy"
+        new.parent.mkdir(parents=True)
+        move = worktrees.WorktreeMove(old, new, "origin", "fixture-unit", "legacy", worktrees.MoveOutput.LIVE_UNIT)
+        with patch.dict(os.environ, self.environment, clear=True):
+            journal = replace(worktrees._open_move(move), copy_tag=uuid4().hex)  # pyright: ignore[reportPrivateUsage]
+            _ = shutil.copytree(old, journal.staging, symlinks=True)
+            worktrees.write_move(replace(journal, destination=worktrees.FolderIdentity.read(journal.staging)))
+            _ = old.rename(journal.backup)
+        new.mkdir()
+
+        command = self.migration_command("--all")
+        blocked = self.command(self.root, command)
+        self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+        self.assertIn(str(journal.backup), blocked.stderr)
+        self.assertTrue(journal.source.matches(journal.backup))
+
+        new.rmdir()
+        applied = self.command(self.root, command)
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual(old.readlink(), new)
+        self.assertTrue(journal.source.matches(journal.backup))
 
     def test_migration_models_a_linked_registration_repair_in_both_modes(self) -> None:
         self.layout_fixture()
@@ -1316,7 +2002,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = worktrees._open_move(move)  # pyright: ignore[reportPrivateUsage]
             _ = old.rename(new)
 
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         dry = self.command(self.root, [*command, "--dry-run"])
         self.assertEqual(dry.returncode, 0, dry.stderr)
         self.assertEqual(gitdir.read_bytes(), back_pointer)
@@ -1363,7 +2049,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 with (patch.object(worktrees, "_migration_journals",
                                    return_value=worktrees.MigrationJournalView(journals, {})),
                       redirect_stdout(output := StringIO())):
-                    self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+                    self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=True), 0)
                 decisions.append(output.getvalue().splitlines()[:-1])
                 self.assertIn(f"resume {old} -> {new} |", output.getvalue())
                 self.assertIn(f"move {clone} -> {new.with_name('clone')} |", output.getvalue())
@@ -1375,12 +2061,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
             with (patch.object(worktrees, "_migration_journals",
                                return_value=worktrees.MigrationJournalView((journal, duplicate), {})),
                   self.assertRaisesRegex(ValueError, "multiple unfinished move journals")):
-                _ = worktrees.migrate_worktrees(list_file, dry_run=True)
+                _ = worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=True)
 
             with (patch.object(worktrees, "_migration_journals",
                                return_value=worktrees.MigrationJournalView((journal, history), {})),
                   redirect_stdout(output := StringIO())):
-                self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+                self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
             self.assertEqual(output.getvalue().splitlines()[:-1], decisions[0])
             self.assertTrue(journal.destination.matches(new))
 
@@ -1388,7 +2074,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
     def test_migration_keeps_a_clone_with_a_process_in_a_staged_linked_checkout(self) -> None:
         clone, list_file, journal = self.stage_linked_migration_member()
         old, new = journal.move.old, journal.move.new
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                               cwd=journal.staging, stdin=subprocess.PIPE, env=self.environment) as child:
             self.register_process(child.pid)
@@ -1413,7 +2099,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         journal_before = journal_path.read_bytes()
         registration = git_files.at(stage).git_dir / "gitdir"
         git_before = registration.read_bytes()
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
 
         def move_and_keep_rows(result: subprocess.CompletedProcess[str]) -> list[str]:
             return [line for line in result.stdout.splitlines() if line.startswith(("move ", "keep "))]
@@ -1455,7 +2141,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
     def test_migration_keeps_a_clone_when_its_staged_member_cannot_be_verified(self) -> None:
         clone, list_file, journal = self.stage_linked_migration_member()
         _ = journal.staging.rename(journal.staging.with_name("unrecorded-location"))
-        command = self.migration_command(list_file)
+        command = self.migration_command("--all", "--list", list_file)
         dry = self.command(self.root, [*command, "--dry-run"])
         applied = self.command(self.root, command)
         self.assertEqual(dry.returncode, 0, dry.stderr)
@@ -1483,7 +2169,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             worktrees.write_record(worktrees.new_record(member, "member", old, self.base, "", ""))
             _ = old.rename(new)
 
-        result = self.command(self.root, self.migration_command(os.devnull))
+        result = self.command(self.root, self.migration_command("--all"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(old.readlink(), new)
         relocated = new / "member"
@@ -1498,6 +2184,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def test_migration_moves_scratch_clone_and_repairs_its_linked_worktrees(self) -> None:
         self.layout_fixture()
+        self.migration_unit("lfo")
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         with config.open("a") as handle:
             _ = handle.write("repo_word.origin=claude\n")
@@ -1525,9 +2212,9 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with (patch.dict(os.environ, self.environment, clear=True),
               patch.object(worktrees, "_open_move", copy_move),
               redirect_stdout(dry_run := StringIO())):
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=True), 0)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=True), 0)
             self.assertIn(f"keep {archived}: no origin; moves with the build root to old-claude", dry_run.getvalue())
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
             self.assertEqual(clone.readlink(), new / "reach")
             self.assertFalse((new / "reach/target").is_symlink())
             self.assertTrue(any(scratch_root.glob(".worktree-move-*")))
@@ -1540,7 +2227,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = scratch_root.parent.rename(archive)
             self.assertEqual((archive / "scratch" / archived.name / "notes").read_text(),
                              "retain with the old build root")
-            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, scope=ALL_WORKTREES, dry_run=False), 0)
             for short in ("reach", "float", "open"):
                 self.assertEqual((new / short / "target").readlink(), self.root / "build/claude/lfo" / short)
 
@@ -1567,7 +2254,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             target = self.trees / repo / "demo/probe"
             self.assertEqual(Path(result.stdout.strip()), target)
             self.assertEqual(git_files.at(target).common_dir, git_files.at(source).common_dir)
-        migration = self.command(self.root, [*self.migration_command(os.devnull), "--dry-run"])
+        migration = self.command(self.root, [*self.migration_command("--all"), "--dry-run"])
         self.assertEqual(migration.returncode, 0, migration.stderr)
         self.assertIn(f"main output {main} -> {self.root}/build/origin/main", migration.stdout)
         self.assertIn(f"keep {sibling}: keeps its current output; {main} is the main checkout for origin",
@@ -1576,6 +2263,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def test_migration_uses_origin_alias_and_strips_legacy_names(self) -> None:
         self.layout_fixture()
+        self.migration_unit("statusline-role")
+        self.migration_unit("former-foreign")
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         with config.open("a") as handle:
             _ = handle.write("repo_word.claude_commands=claude\n")
@@ -1597,7 +2286,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         gate = self.add_linked_tree(main, self.root / "build/claude/scratch/gate-fixture-unit", "gate")
         repo_unit = self.add_linked_tree(main, self.trees / "origin-other", "repo-unit")
         _ = self.git(repo_unit, "commit", "--allow-empty", "-m", "checkpoint(claude): save work")
-        status = self.add_linked_tree(main, self.trees / "claude-statusline-role", "statusline-role")
+        status = self.add_linked_tree(main, self.trees / "claude-legacy-status", "statusline-role")
         _ = self.git(status, "commit", "--allow-empty", "-m", "checkpoint(claude-old-fixture-unit-statusline-role): save")
         foreign = main.with_name("foreign")
         _ = self.git(self.root, "clone", str(self.origin), str(foreign))
@@ -1605,12 +2294,12 @@ class WorktreeLifecycleTests(unittest.TestCase):
         unknown = self.add_linked_tree(foreign, self.trees / "foreign-fixture-unit-probe", "probe")
         _ = self.git(unknown, "commit", "--allow-empty", "-m", "checkpoint(old-fixture-unit-fixture-unit): save")
         fallback = self.add_linked_tree(foreign, self.trees / "foreign-fixture-unit-example", "example")
-        _ = self.git(fallback, "commit", "--allow-empty", "-m", "shrink(old-fixture-unit-other): save")
+        _ = self.git(fallback, "commit", "--allow-empty", "-m", "shrink(old-fixture-unit-former-foreign): save")
         wrapped = self.add_linked_tree(main, self.trees / "wrapped-fixture-unit", "wrapped")
         archived = self.home / "rust/hanadocs/archive/vault/wrapped/wrapped-production.md"
         archived.parent.mkdir(parents=True)
         _ = archived.write_text(f"- **Showrunner checkout:** `{wrapped}`\n")
-        result = self.command(self.root, [*self.migration_command(os.devnull), "--dry-run"])
+        result = self.command(self.root, [*self.migration_command("--all"), "--dry-run"])
         self.assertEqual(result.returncode, 0, result.stderr)
         for old, _, short in names:
             self.assertIn(f"move {self.trees / old} -> {self.trees}/claude/fixture-unit/{short} |", result.stdout)
@@ -1620,10 +2309,10 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertIn(f"keep {wrapped}: showrunner checkout awaits question 4; archived production wrapped",
                       result.stdout)
         self.assertIn(f"keep {repo_unit}: unit unknown", result.stdout)
-        self.assertIn(f"move {status} -> {self.trees}/claude/statusline-role/worktree | statusline-role | worktree "
+        self.assertIn(f"move {status} -> {self.trees}/claude/statusline-role/legacy-status | statusline-role | legacy-status "
                       + "| commit subject | retired-unit", result.stdout)
         self.assertIn(f"keep {unknown}: unit unknown", result.stdout)
-        self.assertIn(f"move {fallback} -> {self.trees}/foreign/other/fixture-unit-example | other "
+        self.assertIn(f"move {fallback} -> {self.trees}/foreign/former-foreign/fixture-unit-example | former-foreign "
                       + "| fixture-unit-example | commit subject | retired-unit", result.stdout)
         self.assertNotIn(f"{self.trees}/claude_commands/", result.stdout)
 
@@ -1641,12 +2330,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
             registered_parent.symlink_to(physical_parent, target_is_directory=True)
             registered = registered_parent / name
             _ = (git_files.at(physical).git_dir / "gitdir").write_text(f"{registered}/.git\n")
-            listed[registered] = worktrees.ListedWorktree("fixture-unit", name)
+            listed[registered] = worktrees.ListedWorktree(worktrees.StaffUnitName("fixture-unit"), name)
             self.assertEqual(registered.resolve(strict=True), physical)
             self.assertIn(f"worktree {registered}", self.git(main, "worktree", "list", "--porcelain"))
         with patch.dict(os.environ, self.environment, clear=True):
             plan = worktrees.plan_worktree_migration(
-                listed, worktrees.staff_record(), worktrees.MigrationFolders.configured(),
+                worktrees.MigrationSelection(ALL_WORKTREES, listed), worktrees.staff_record(),
+                worktrees.MigrationFolders.configured(),
                 worktrees.MigrationJournalView((), {}), worktrees.MigrationLocations({}))
         self.assertEqual(plan.moves, ())
         for registered in listed:

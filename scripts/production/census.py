@@ -38,15 +38,8 @@ class CensusShell(NamedTuple):
     started_at: float | None
 
 
-class CensusProcessIdentity(NamedTuple):
-    """A PID and a start identity from the census."""
-
-    pid: int
-    started: str
-
-
 class CensusProcessUnreported(NamedTuple):
-    """The census supplies no process identity."""
+    """The census session has no value for this process field."""
 
 
 class CensusSession(NamedTuple):
@@ -56,7 +49,8 @@ class CensusSession(NamedTuple):
     status: str | None
     shells: tuple[CensusShell, ...] = ()
     machine: str | CensusMachineUnreported = CensusMachineUnreported()
-    process: CensusProcessIdentity | CensusProcessUnreported = CensusProcessUnreported()
+    pid: int | CensusProcessUnreported = CensusProcessUnreported()
+    process_start: str | CensusProcessUnreported = CensusProcessUnreported()
 
 
 class CensusRun(NamedTuple):
@@ -178,19 +172,17 @@ def _session(value: object, where: str) -> CensusSession:
     name = _text(fields, "session", where)
     status = _optional_text(fields, "status", where)
     commands = tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells))
-    if ("pid" in fields) != ("process_start" in fields):
-        raise _BadField(f"{where}.pid and process_start must occur together")
-    if "pid" not in fields:
-        machine = _text(fields, "machine", where) if "machine" in fields else CensusMachineUnreported()
-        return CensusSession(name, status, commands, machine)
-    pid = fields["pid"]
-    if isinstance(pid, bool) or not isinstance(pid, int):
-        raise _BadField(f"{where}.pid is not an integer")
-    started = _text(fields, "process_start", where)
-    machine_name = _text(fields, "machine", where)
-    if not machine_name.strip():
+    machine = _text(fields, "machine", where) if "machine" in fields else CensusMachineUnreported()
+    pid: int | CensusProcessUnreported = CensusProcessUnreported()
+    if "pid" in fields:
+        value_pid = fields["pid"]
+        if isinstance(value_pid, bool) or not isinstance(value_pid, int):
+            raise _BadField(f"{where}.pid is not an integer")
+        pid = value_pid
+    started = _text(fields, "process_start", where) if "process_start" in fields else CensusProcessUnreported()
+    if ("pid" in fields or "process_start" in fields) and isinstance(machine, str) and not machine.strip():
         raise _BadField(f"{where}.machine is empty")
-    return CensusSession(name, status, commands, machine_name, CensusProcessIdentity(pid, started))
+    return CensusSession(name, status, commands, machine, pid, started)
 
 
 def _worker(value: object, where: str) -> CensusWorker:
