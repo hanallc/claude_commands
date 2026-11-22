@@ -1141,25 +1141,28 @@ class GateWorker:
                 launch_reply_tries = configuration.whole('launch_reply_tries')
                 launch_json = json.dumps(arguments)
                 candidate = ledger.GateRateCandidate(size, self.box_region)
+                check_machine_switch = request.get('task') != 'paired'
                 launch_reply: tuple[dict[str, object], float] | ledger.GateRateAboveReservation | ledger.GateBillRatesUnavailable
                 try:
                     for retry in range(launch_reply_tries):
-                        if request.get('task') != 'paired':
-                            switch = launch_switch()
-                            if isinstance(switch, InvalidCloudGateSwitch) or switch is machine_switch.MachineSwitch.OFF:
+                        switch = launch_switch() if check_machine_switch else machine_switch.MachineSwitch.ON
+                        try:
+                            if switch is machine_switch.MachineSwitch.ON:
+                                if retry == 0:
+                                    cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
+                                        'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
+                                check = self.book.check_gate_launch_rate(reservation, candidate, int(self.clock()))
+                                if not isinstance(check, ledger.GateRateWithinReservation):
+                                    launch_reply = check
+                                    break
+                                if check_machine_switch:
+                                    switch = launch_switch()
+                            if switch is not machine_switch.MachineSwitch.ON:
                                 if not replaying and retry == 0:
                                     self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
                                 # Keep any uncertain launch for cleanup.
                                 reason = switch.reason if isinstance(switch, InvalidCloudGateSwitch) else CLOUD_GATE_OFF
                                 return LocalFallback(reason)
-                        try:
-                            if retry == 0:
-                                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
-                                    'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
-                            check = self.book.check_gate_launch_rate(reservation, candidate, int(self.clock()))
-                            if not isinstance(check, ledger.GateRateWithinReservation):
-                                launch_reply = check
-                                break
                             reply = api.call('run-instances', '--cli-input-json', launch_json)
                             launch_reply = reply, self.clock()
                             break

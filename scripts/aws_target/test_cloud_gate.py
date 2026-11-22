@@ -403,9 +403,9 @@ class GateLaunchRecoveryTests(unittest.TestCase):
                         worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
                             book, folder / 'aws_target.conf', folder / 'reservation', clock=lambda: now)
                         finished = workers.submit(worker.launch, folder, request, {'regions': []})
+                        self.assertTrue(termination_requested.wait(TEST_HANG_GUARD_SECS))
                         with self.assertRaisesRegex(OSError, 'Cannot save the launch identity'):
                             _ = finished.result(timeout=TEST_HANG_GUARD_SECS)
-                        self.assertTrue(termination_requested.is_set())
                     booking, = book.read_snapshot().gate_reservations
                     if hold_ledger:
                         self.assertIsInstance(booking.state, ledger.GateLaunchPending)
@@ -2730,6 +2730,24 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(len(self.fake.launches), 1)
         self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['arguments'], self.fake.launches[0])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+    def test_switch_off_during_bill_scan_blocks_the_launch(self) -> None:
+        worker, bill, small, _ = self.launch_rate_fixture()
+        with mock.patch.object(self.book, 'read_bills', return_value=(bill,)):
+            self.book_small_box(small)
+        cloud_gate.save(self.folder / 'launch.json', {'variant': 0, 'variants': [asdict(small)]})
+
+        def read_bills_with_switch_off() -> tuple[ledger.ChargeRead, ...]:
+            override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
+            return (bill,)
+
+        with (mock.patch.object(self.book, 'read_bills', side_effect=read_bills_with_switch_off),
+              mock.patch.object(self.book, 'check_gate_launch_rate', wraps=self.book.check_gate_launch_rate) as rate_check):
+            outcome = worker.launch(self.folder, self.request, self.deployment)
+        rate_check.assert_called_once()
+        self.assertEqual(outcome, cloud_gate.LocalFallback(cloud_gate.CLOUD_GATE_OFF))
+        self.assertFalse(any('run-instances' in command for command in self.fake.commands))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
 
     def test_bill_update_during_progress_write_blocks_the_launch(self) -> None:
         worker, updated_bill, small, large = self.launch_rate_fixture()
