@@ -22,7 +22,6 @@ import tempfile
 import threading
 import textwrap
 import time
-import traceback
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
@@ -42,6 +41,7 @@ from scripts.direct.release_events import RELEASE_CHANGES, LocalReleaseEvents, e
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lib.fixture_test_support import clean_up_fixture, register_fixture_class_cleanup, set_up_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -240,14 +240,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
-    cleanup_failures: tuple[str, ...] = ()
 
     @classmethod
     @override
     def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
-        cls.addClassCleanup(builder.doCleanups)
+        cls.addClassCleanup(clean_up_fixture, builder)
         builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
         _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
@@ -274,7 +273,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def setUp(self) -> None:
-        self.cleanup_failures = ()
         self.root: Path = self.fixture_root
         self.addCleanup(shutil.rmtree, self.root)
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -294,17 +292,6 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             admission, {**self.environment, **self.placement_policy}, key)
         controls = caller_provider_controls(self, admission)
         self.provider_observations: list[placement.HostEvidenceKey] = controls.observations
-
-    @override
-    def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
-        def recorded_cleanup() -> None:
-            try:
-                _ = function(*args, **kwargs)
-            except BaseException:
-                self.cleanup_failures += (traceback.format_exc(),)
-                raise
-
-        super().addCleanup(recorded_cleanup)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
@@ -330,13 +317,11 @@ class VerifyHoldWaitFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
-        cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
-        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
+        register_fixture_class_cleanup(cls.addClassCleanup, VerifyHoldTools).setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture_cleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         root = self.fixture.root
         pressure = root / "memory-pressure"
         write_pressure_reading(pressure)
@@ -402,9 +387,6 @@ exit "$status"
             "recipients": {}, "entries": [],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle))
-
-    def fixture_cleanups(self) -> None:
-        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)

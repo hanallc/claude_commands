@@ -10,6 +10,7 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.build_queue.admission_test_support import caller_admission
@@ -72,8 +73,7 @@ class SshReservationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         _ = write_config_fixture(self.fixture.root / "linux.conf", "slots=1\nslots.hana=1\n")
 
     def reserve(self, pid: int) -> tuple[int, Path]:
@@ -169,8 +169,7 @@ class SshResultBoundaryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
 
     def test_linux_result_keeps_completion_separate_from_unconfirmed_cleanup(self) -> None:
         offload = eligibility_support.offload
