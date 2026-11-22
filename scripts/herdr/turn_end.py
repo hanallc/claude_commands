@@ -1320,9 +1320,9 @@ def _handle_locked(event: WorkerEvent,
                 run, row, worker_input=worker_input, resume_parked=resume, input_lock=hold)
             if isinstance(replay, detached_runs.ConfirmedPaneResult):
                 if replay.ownership is detached_runs.ResultPassOwnership.CURRENT:
-                    if parked:
-                        _ = progress_history.record_worker_park(run, row.id, instance, delivery.completion_id,
-                                                               launch=progress_history.ClearWorkerPark.MARKER)
+                    if parked and not worker.clear_result_park(row, worker_panes.ParkWaitingPass(
+                            run, instance, delivery.completion_id)):
+                        return TurnOutcome.RETRY_EVIDENCE
                 return TurnOutcome.SUBMITTED
             if replay in (detached_runs.WorkerResultReplay.RETRY, detached_runs.WorkerResultReplay.DUPLICATE):
                 return TurnOutcome.RETRY_EVIDENCE

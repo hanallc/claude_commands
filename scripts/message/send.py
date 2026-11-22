@@ -5231,8 +5231,10 @@ class WorkerResultSubmitted:
     worker: staff.StaffId
     session: staff.StaffId
     pane: str
+    terminal: str
     name: str
     cursor: worker_panes.TranscriptCursor
+    input_digest: str
     outcome: Literal["sent"] = field(init=False, default="sent")
 
     @property
@@ -5240,7 +5242,7 @@ class WorkerResultSubmitted:
         return f"worker {self.name} at {self.pane}"
 
 
-def _confirm_worker_result(worker: staff.StaffRow, pane: str, text: str,
+def _confirm_worker_result(worker: staff.StaffRow, pane: str, terminal: str, text: str,
                            boundary: worker_panes.TranscriptCursor | NoResultTranscript,
                            ) -> WorkerResultSubmitted | WorkerResultUnconfirmed:
     from scripts.herdr import worker_panes
@@ -5259,7 +5261,8 @@ def _confirm_worker_result(worker: staff.StaffRow, pane: str, text: str,
     if isinstance(boundary, worker_panes.TranscriptCursor) and boundary.stream != stream:
         return missing
     beyond_boundary = isinstance(boundary, NoResultTranscript) or boundary.position == 0
-    expected = "user:\n" + script_prompt(text).rstrip()
+    submitted = script_prompt(text)
+    expected = "user:\n" + submitted.rstrip()
     found: list[worker_panes.TranscriptCursor] = []
     for entry, cursor in _result_transcript_cursors(source, stream):
         if beyond_boundary and entry.get("isMeta") is not True:
@@ -5269,11 +5272,12 @@ def _confirm_worker_result(worker: staff.StaffRow, pane: str, text: str,
             beyond_boundary = True
     if len(found) != 1:
         return missing
-    return WorkerResultSubmitted(worker.id, worker.current_session, pane, worker.name, found[0])
+    return WorkerResultSubmitted(worker.id, worker.current_session, pane, terminal, worker.name, found[0],
+                                 worker_panes.worker_input_digest(submitted))
 
 
 def worker_result_input_matches(worker: staff.StaffRow, membership: staff.StaffSnapshot, run_id: str,
-                                expected: worker_panes.TranscriptCursor) -> bool:
+                                expected: worker_panes.TranscriptCursor, input_digest: str) -> bool:
     from scripts.herdr import worker_panes
     from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
     from scripts.production import worker_admission
@@ -5292,7 +5296,10 @@ def worker_result_input_matches(worker: staff.StaffRow, membership: staff.StaffS
         text = worker_admission.transcript_entry(entry, set())
         if not text.startswith("user:\n"):
             return False
-        body = text.removeprefix("user:\n").strip()
+        body = text.removeprefix("user:\n")
+        if worker_panes.worker_input_digest(body) != input_digest:
+            return False
+        body = body.strip()
         if body.startswith(SCRIPT_ENVELOPE_START) and body.endswith(SCRIPT_ENVELOPE_END):
             body = body.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
         first, _, rest = body.partition("\n")
@@ -5362,8 +5369,10 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 on_submission = submission
 
             if can_prompt:
+                fixed_message = isinstance(receipt, OrdinaryWorkerMessage) and isinstance(selection, FixedStaffLookup)
+                fixed_client = herdr.Herdr(herdr.shared_session()) if fixed_message else None
                 try:
-                    prompt_client = herdr.Herdr(herdr.shared_session())
+                    prompt_client = fixed_client if fixed_client is not None else herdr.Herdr(herdr.shared_session())
                     if wait_for_idle:
                         _ = prompt_client.wait_turn_end(state.pane, int(timeout * 1000))
                     if isinstance(selection, FixedStaffLookup):
@@ -5389,7 +5398,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):
-                            return _confirm_worker_result(worker, state.pane, review_text or text, boundary)
+                            return _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
                         if receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                     except (OSError, ValueError, staff.StaffUnreadable) as error:

@@ -2518,9 +2518,19 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
               patch.object(worker_panes, "worker_run", return_value=current),
               patch.object(herdr.Herdr, "tab_sessions", return_value=[director]),
-              patch.object(herdr.Herdr, "prompt") as send, redirect_stdout(io.StringIO()) as output):
+              patch.object(herdr.Herdr, "prompt") as send,
+              patch.object(worker, "_dispatch_transcript", return_value=worker.TranscriptReceipt(
+                  worker.DispatchNotSubmitted(), frozenset())) as transcript,
+              redirect_stdout(io.StringIO()) as output):
             dispatch = progress_history.begin_dispatch(previous, slot=child.name, phase="46", role="impl",
                 worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+            delivery = pass_record.DispatchDelivery(f"End your final reply with DONE {dispatch}.", dispatch, "")
+            progress_history.save_dispatch_delivery(previous, dispatch, delivery)
+
+            def accept_assignment(*_args: object, **_kwargs: object) -> None:
+                transcript.return_value = worker.TranscriptReceipt(worker.DispatchSubmitted(), frozenset())
+
+            send.side_effect = accept_assignment
             self.assertEqual(shutdown.main(["restart"]), 0)
         receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
         send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),

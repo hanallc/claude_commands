@@ -3230,6 +3230,49 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 finally:
                     _ = case.doCleanups()
 
+    def test_done_recovery_rejects_a_receipt_redirected_to_partial_result_input(self) -> None:
+        self.check_result_occurrence("partial result input")
+
+    def test_result_delivery_waits_for_the_worker_stage(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("stage-pending", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch, replace(stage, completion_id=""))
+        agent.append(pane, "user", stage.line)
+        record = self.record(row, "stage-pending")
+        record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch,
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                         detached_runs.DEFERRED_WORKER_RESULT + "the worker stage is unknown")
+        self.assertEqual(self.inputs, [])
+        self.assertNotIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch, stage)
+        self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                         f"sent: worker {row.name} at {pane}")
+
+    def test_fixed_ordinary_worker_message_propagates_herdr_construction_error(self) -> None:
+        row = self.fixture.worker("fixed-message", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        membership = staff.snapshot()
+        observed = worker_panes.observe(self.fixture.parent.id, membership)
+        fixed = send.FixedStaffLookup(row.id, "worker")
+        with (patch.object(worker_panes, "observe", return_value=observed),
+              patch.object(herdr, "Herdr", side_effect=OSError("Herdr construction failed"))):
+            with self.assertRaisesRegex(OSError, "Herdr construction failed"):
+                _ = send.deliver_worker_text(row, membership, "Continue.", sender="fixture", timeout=1, selection=fixed)
+            result = send.deliver_worker_text(row, membership, "Continue.", sender="fixture", timeout=1)
+            self.assertEqual(result, send.Result("sent", "holder received the result"))
+            result = send.deliver_worker_text(row, membership, "Continue.", sender="fixture", timeout=1,
+                                             selection=fixed, receipt=send.WorkerResultSubmission())
+            self.assertIsInstance(result, send.WorkerResultNotSubmitted)
+        self.assertEqual(self.inputs, [])
+
     def check_result_occurrence(self, cause: str) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
         row = self.fixture.worker("receipt", family="codex")
@@ -3301,7 +3344,18 @@ class PaneRunDeliveryTests(unittest.TestCase):
         backend = staff.backend(row)
         assert isinstance(backend, staff.CodexBackend)
         source = worker_admission.transcript_source(row, backend)
-        if cause == "later duplicate":
+        if cause == "partial result input":
+            agent.append(pane, "user", f"Detached run: {record['run_id']}\nPartial message.")
+            _, cursor = list(worker_panes.transcript_record_cursors(
+                worker_admission.transcript_records(source), worker_panes.transcript_stream(row, source)))[-1]
+            saved = worker_lifecycle.read_json_object(path)
+            fields = cast(dict[str, object], saved["worker_result_receipt"])
+            if "cursor" in fields:
+                fields["cursor"] = {"stream": cursor.stream, "position": cursor.position, "prefix": cursor.prefix}
+            write_text_atomic(path, json.dumps(saved))
+            later = "I read the partial input."
+            agent.append(pane, "assistant", later)
+        elif cause == "later duplicate":
             agent.append(pane, "user", message)
             later = "This is a reply to the duplicate."
             agent.append(pane, "assistant", later)

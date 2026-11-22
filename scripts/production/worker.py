@@ -122,6 +122,7 @@ class DispatchSubmitted:
 class TranscriptInputMessage:
     cursor: TranscriptCursor
     text: str
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -273,6 +274,7 @@ class _TranscriptReceiptState:
 
     def user_message(self, text: str, cursor: TranscriptCursor | NoMatchingDone) -> None:
         self.turn_has_reply = False
+        input_text = text
         text = text.strip()
         results = {part.removeprefix("Detached run: ") for part in text.splitlines()
                    if part.startswith("Detached run: ")}
@@ -309,7 +311,7 @@ class _TranscriptReceiptState:
         elif self.submitted:
             if (self.responding and isinstance(self.cursor, TranscriptCursor) and isinstance(cursor, TranscriptCursor)
                     and first.startswith("Detached run: ") and body.strip()):
-                self.result_message = TranscriptInputMessage(cursor, content)
+                self.result_message = TranscriptInputMessage(cursor, content, worker_panes.worker_input_digest(input_text))
             results.difference_update(self.other_pass_results)
             if not self.responding:
                 results.intersection_update(self.late_result_ids)
@@ -487,6 +489,7 @@ def _dispatch_transcript(
     notice_positions: NoticePositions = NO_NOTICE_POSITIONS,
     stopped: bool = False, late_result_ids: frozenset[str] = NO_RESULT_IDS,
     other_pass_results: frozenset[str] = NO_RESULT_IDS,
+    exact_prompt: bool = False,
 ) -> TranscriptReceipt:
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
@@ -511,7 +514,7 @@ def _dispatch_transcript(
                                         stream=stream, previous=checkpoints)
     receipt = exact.finish(failure, extends_saved=previous in matched,
                            notice_positions=notice_positions, matched_cursors=matched)
-    if isinstance(receipt.receipt, DispatchNotSubmitted):
+    if not exact_prompt and isinstance(receipt.receipt, DispatchNotSubmitted):
         return fallback.finish(failure, extends_saved=previous in matched,
                                notice_positions=notice_positions, matched_cursors=matched)
     return receipt
@@ -689,7 +692,7 @@ def _prove_result_delivery(directory: Path, row: staff.StaffRow, passed: dict[st
         if (not isinstance(receipt, detached_runs.WorkerResultReceipt)
                 or not isinstance(receipt.assignment, detached_runs.ResultSubmissionPass)
                 or not receipt.identifies(record, row, directory.parent)
-                or receipt.cursor != candidate.message.cursor
+                or receipt.cursor != candidate.message.cursor or receipt.input_digest != candidate.message.digest
                 or not _done_covers_run(done.done_at, record, detached_runs.run_finish_time(record))):
             continue
         if receipt.assignment == current and candidate.reply.cursor == latest.cursor:
@@ -2340,10 +2343,21 @@ class NoLaunchCleanup:
 NO_LAUNCH_CLEANUP = NoLaunchCleanup()
 
 
+class OrdinaryResume(Enum):
+    CURRENT = "resume without a detached result continuation"
+
+
+@dataclass(frozen=True)
+class ResultContinuation:
+    pane: str
+    reference: str
+
+
 @dataclass(frozen=True)
 class WorkerResume:
     step: BusyPass | UnsubmittedAssignment | NoOwnPass
     detached: str = ""
+    continuation: ResultContinuation | OrdinaryResume = OrdinaryResume.CURRENT
 
 
 def _resume_launcher(row: staff.StaffRow, resume: WorkerResume, *,
@@ -2355,20 +2369,32 @@ def _resume_launcher(row: staff.StaffRow, resume: WorkerResume, *,
     step, detached = resume.step, resume.detached
     recipient = row if isinstance(step, (BusyPass, NoOwnPass)) else parent
     client = _client()
-    pane = next((item for item in client.tab_sessions()
-                 if recipient is not None and item.session_id == recipient.current_session), None)
-    if pane is None or parent is None or recipient is None:
+    if parent is None or recipient is None:
         return DispatchEvidenceUnknown(f"{'worker' if recipient == row else 'director'} session is unavailable")
+    if isinstance(resume.continuation, ResultContinuation):
+        pane_id = resume.continuation.pane
+    else:
+        pane = next((item for item in client.tab_sessions() if item.session_id == recipient.current_session), None)
+        if pane is None:
+            return DispatchEvidenceUnknown(f"{'worker' if recipient == row else 'director'} session is unavailable")
+        pane_id = pane.pane_id
     if isinstance(step, (BusyPass, NoOwnPass)):
-        status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane.pane_id),
-                      herdr.AgentStatus.UNKNOWN)
+        status = (client.readiness(pane_id)["agent_status"] if isinstance(resume.continuation, ResultContinuation)
+                  else next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane_id),
+                            herdr.AgentStatus.UNKNOWN))
         if status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
             return DispatchEvidenceUnknown("The worker must be idle to receive its resume message")
     text = (launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
             if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step, detached=detached))
     submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
               partial(client.prompt, on_submission=on_submission))
-    submit(pane.pane_id, text, target=str(recipient.current_session))
+    if isinstance(resume.continuation, ResultContinuation):
+        body = text.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
+        text = script_prompt(f"{body}\n{resume.continuation.reference}")
+        submit(pane_id, text, target=str(recipient.current_session),
+               proof=herdr.SubmitStarts(int(herdr.PROGRAM_TIMEOUT_SECONDS * 1000)))
+    else:
+        submit(pane_id, text, target=str(recipient.current_session))
     return ExitCode.OK
 
 
@@ -2386,7 +2412,8 @@ def _detached_resume_context(row: staff.StaffRow, directories: Iterable[Path]) -
 
 
 def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker | worker_panes.ClosedWorker,
-                   directories: Iterable[Path], record: staff.StaffSnapshot
+                   directories: Iterable[Path], record: staff.StaffSnapshot, *,
+                   accepted: worker_panes.ParkWaitingPass | OrdinaryResume = OrdinaryResume.CURRENT,
                    ) -> WorkerResume | DispatchEvidenceUnknown | None:
     """Decide from the recorded dispatches, transcript, pane and live runs."""
     directories = tuple(dict.fromkeys(directories))
@@ -2401,7 +2428,12 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
                 _ = active.setdefault(dispatch.instance_id, dispatch)
     if len(active) > 1:
         return DispatchEvidenceUnknown("The worker has multiple active dispatches")
-    step = resume_step(state.row, next(iter(active.values()))) if active else NO_OWN_PASS
+    if isinstance(accepted, worker_panes.ParkWaitingPass):
+        if accepted.instance not in active:
+            return DispatchEvidenceUnknown("The accepted assignment changed before continuation")
+        step = BusyPass(accepted.instance)
+    else:
+        step = resume_step(state.row, next(iter(active.values()))) if active else NO_OWN_PASS
     if isinstance(step, DispatchEvidenceUnknown):
         return step
     if detached or isinstance(step, UnsubmittedAssignment):
@@ -2582,6 +2614,61 @@ def park_waiting_worker(row: staff.StaffRow, hold: worker_panes.WorkerLockHold, 
     return worker_panes.Kept("the detached run wait changed before parking")
 
 
+def _accepted_assignment(row: staff.StaffRow, passed: dict[str, object]) -> bool:
+    delivery = pass_recorder.dispatch_delivery(passed)
+    if not delivery.line or not delivery.completion_id:
+        return False
+    receipt = _dispatch_transcript(row, delivery.line, DoneReply(delivery.completion_id),
+                                   require_transcript=True, exact_prompt=True).receipt
+    return isinstance(receipt, (DispatchSubmitted, DispatchAwaitingReply, DispatchComplete))
+
+
+def _accepted_result_assignment(row: staff.StaffRow, passed: dict[str, object],
+                                evidence: detached_runs.WorkerResultReceipt) -> bool:
+    return (evidence.park_acceptance is detached_runs.ParkedAssignmentAcceptance.VERIFIED
+            or _accepted_assignment(row, passed))
+
+
+def _result_continuation(pane: worker_panes.OpenWorker, park: worker_panes.ParkWaitingPass) -> ResultContinuation:
+    fields = (str(park.run.resolve()), park.instance, park.stage, pane.row.id, pane.row.current_session,
+              pane.pane, pane.terminal, worker_panes.result_restore_generation(pane, park))
+    reference = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
+    return ResultContinuation(pane.pane, f"Restore reference {reference}.")
+
+
+def _continued_result_pass(pane: worker_panes.OpenWorker, park: worker_panes.ParkWaitingPass,
+                           continuation: ResultContinuation) -> bool:
+    backend = staff.backend(pane.row)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("the worker transcript backend is unavailable")
+    source = worker_admission.transcript_source(pane.row, backend)
+    expected = f"Continue pass {park.instance} in this conversation. Keep the same pass id."
+    records = worker_admission.transcript_records(
+        source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
+    for record in records:
+        if isinstance(record, worker_admission.TornTranscriptRecord):
+            raise ValueError("the worker continuation transcript is incomplete")
+        if record.get("isMeta") is True:
+            continue
+        entry = worker_admission.transcript_entry(record, set()).rstrip()
+        if entry.startswith("user:\n" + SCRIPT_ENVELOPE_START) and entry.endswith(SCRIPT_ENVELOPE_END):
+            lines = entry.splitlines()
+            if expected in lines and lines[-2] == continuation.reference:
+                return True
+    return False
+
+
+def clear_result_park(row: staff.StaffRow, park: worker_panes.ParkWaitingPass) -> bool:
+    """Clear the matching marker or check the pass after a failed comparison."""
+    if progress_history.record_worker_park(park.run, row.id, park.instance, park.stage,
+                                          launch=progress_history.ClearWorkerPark.MARKER):
+        return True
+    current = worker_panes.worker_pass(row, park.run)
+    return (current.get("instance_id") == park.instance
+            and pass_recorder.dispatch_delivery(current).completion_id == park.stage
+            and not progress_history.parked_worker_pass(current))
+
+
 @dataclass
 class RestoreReport:
     restored: set[StaffId] = field(default_factory=set)
@@ -2699,6 +2786,11 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if isinstance(evidence, detached_runs.UncertainResultDelivery):
                         failed(state.row, evidence.reason, notice=f"anomaly: {name}: {evidence.reason}")
                         continue
+                    if (isinstance(evidence, detached_runs.WorkerResultReceipt)
+                            and not _accepted_result_assignment(state.row, passed, evidence)):
+                        failed(state.row, "The result receipt does not prove assignment acceptance",
+                               notice=f"anomaly: {name}: the result receipt does not prove assignment acceptance")
+                        continue
                     # A result delivery can reopen the pane before restore checks the transcript.
                     recover_first = (parked or passed.get("status") == "canceled" or state.row.id in reaped_panes
                                      or isinstance(evidence, detached_runs.WorkerResultReceipt))
@@ -2730,15 +2822,34 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                 failed(state.row, evidence.reason, notice=f"anomaly: {name}: {evidence.reason}")
                                 continue
                             parked = progress_history.parked_worker_pass(passed)
-                    if (recovery in (CompletionRecovery.NO_PENDING_NOTICE, CompletionRecovery.WAITING_ON_REPLY)
-                            and isinstance(state, worker_panes.OpenWorker)
-                            and state.status == herdr.AgentStatus.WORKING
-                            and isinstance(evidence, detached_runs.WorkerResultReceipt)):
-                        if isinstance(report, RestoreReport):
-                            report.restored.add(state.row.id)
+                    result_pass: worker_panes.ParkWaitingPass | OrdinaryResume = OrdinaryResume.CURRENT
+                    if isinstance(evidence, detached_runs.WorkerResultReceipt):
+                        if (not isinstance(evidence.assignment, detached_runs.ResultSubmissionPass)
+                                or not _accepted_result_assignment(state.row, passed, evidence)):
+                            failed(state.row, "The result receipt does not prove assignment acceptance",
+                                   notice=f"anomaly: {name}: the result receipt does not prove assignment acceptance")
+                            continue
+                        result_pass = worker_panes.ParkWaitingPass(run, evidence.assignment.instance,
+                                                                   evidence.assignment.completion)
+                    if (recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS)
+                            and isinstance(result_pass, worker_panes.ParkWaitingPass)):
+                        failed(state.row, recovery.value, notice=f"{name}: {recovery.value}")
                         continue
-                    if recovery is not CompletionRecovery.PENDING_CLOSE and parked:
+                    if isinstance(result_pass, worker_panes.ParkWaitingPass) and isinstance(state, worker_panes.OpenWorker):
+                        working = state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING)
+                        continued = working or (state.status.idle and _continued_result_pass(
+                            state, result_pass, _result_continuation(state, result_pass)))
+                        if continued:
+                            if parked and not clear_result_park(state.row, result_pass):
+                                failed(state.row, "The worker pass changed before park clearance")
+                                continue
+                            if isinstance(report, RestoreReport):
+                                report.restored.add(state.row.id)
+                            continue
+                    if recovery is not CompletionRecovery.PENDING_CLOSE and parked and isinstance(result_pass, OrdinaryResume):
                         if isinstance(state, worker_panes.ClosedWorker):
+                            if isinstance(report, RestoreReport):
+                                report.skipped[state.row.id] = "The worker remains parked for its result"
                             continue
                         delivery = pass_recorder.dispatch_delivery(passed)
                         park = worker_panes.ParkWaitingPass(run, str(passed["instance_id"]), delivery.completion_id)
@@ -2751,10 +2862,12 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                 elif isinstance(closed, worker_panes.UncertainWorker):
                                     failed(state.row, closed.reason, notice=f"anomaly: {name}: {closed.reason}")
                                 continue
-                        _ = progress_history.record_worker_park(run, state.row.id, park.instance, park.stage,
-                                                               launch=progress_history.ClearWorkerPark.MARKER)
+                        if not clear_result_park(state.row, park):
+                            failed(state.row, "The worker pass changed before park clearance")
+                        elif isinstance(report, RestoreReport):
+                            report.skipped[state.row.id] = "The park marker cleared for the next worker turn"
                         continue
-                    if recovery is CompletionRecovery.WAITING_ON_REPLY:
+                    if recovery is CompletionRecovery.WAITING_ON_REPLY and isinstance(result_pass, OrdinaryResume):
                         if isinstance(state, worker_panes.ClosedWorker):
                             fresh = read_locked_pane(current, current_holder, current_record, observed_rows)
                             if not isinstance(fresh, (worker_panes.OpenWorker, worker_panes.StoppedWorker,
@@ -2776,23 +2889,26 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                 if isinstance(closed, worker_panes.Closed):
                                     changed = True
                                     continue
-                    if recovery in pending_completion:
+                    if recovery in pending_completion and isinstance(result_pass, OrdinaryResume):
                         failed(state.row, recovery.value, notice=f"{name}: {recovery.value}")
                         continue
-                    if recover_first:
+                    if isinstance(result_pass, worker_panes.ParkWaitingPass):
+                        if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
+                            failed(state.row, "The worker is unavailable for continuation")
+                            continue
+                        plan = _resume_needed(state, (run, *held_runs), current_record, accepted=result_pass)
+                    elif recover_first:
                         plan = _resume_needed(state, (run, *held_runs), current_record)
-                    if (isinstance(evidence, detached_runs.WorkerResultReceipt) and isinstance(plan, WorkerResume)
-                            and isinstance(plan.step, UnsubmittedAssignment)
-                            and isinstance(evidence.assignment, detached_runs.ResultSubmissionPass)
-                            and plan.step.dispatch_id == evidence.assignment.instance):
-                        plan = replace(plan, step=BusyPass(plan.step.dispatch_id))
                     if isinstance(plan, DispatchEvidenceUnknown):
                         failed(state.row, plan.reason, notice=f"anomaly: {name}: {plan.reason}")
                         continue
                     if plan is None:
                         if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
                             if isinstance(report, RestoreReport):
-                                report.restored.add(state.row.id)
+                                if state.status in (herdr.AgentStatus.WORKING, herdr.AgentStatus.RUNNING):
+                                    report.restored.add(state.row.id)
+                                else:
+                                    report.skipped[state.row.id] = f"The worker pane reports {state.status.value}"
                             continue
                         if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
                             allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
@@ -2815,17 +2931,31 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     if (workers_held and not isinstance(state, worker_panes.OpenWorker)
                             and isinstance(staff.backend(state.row), staff.CodexBackend)):
-                        if report is None and not plan.detached:
-                            print(f"{name}: not resumed: no-worker mode")
-                        else:
+                        if plan.detached or isinstance(result_pass, worker_panes.ParkWaitingPass):
                             failed(state.row, "No-worker mode keeps this worker stopped",
                                    notice=f"{name}: not resumed: no-worker mode")
+                        elif report is None:
+                            print(f"{name}: not resumed: no-worker mode")
+                        elif isinstance(report, RestoreReport):
+                            report.skipped[state.row.id] = "No-worker mode keeps this worker stopped"
                         continue
                     resume = _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
+                        policy: worker_panes.LaunchPolicy | worker_panes.UseRolePolicy = worker_panes.UseRolePolicy.CURRENT
+                        restore_launch: worker_panes.AuthorizedResultLaunch | worker_panes.UseNormalWorkerLaunch = (
+                            worker_panes.UseNormalWorkerLaunch.CURRENT)
+                        if isinstance(result_pass, worker_panes.ParkWaitingPass):
+                            if parked:
+                                saved_policy = worker_panes.parked_launch_policy(state.row, passed)
+                                if isinstance(saved_policy, progress_history.ParkedLaunchUnavailable):
+                                    failed(state.row, saved_policy.value)
+                                    continue
+                                policy = saved_policy
+                            restore_launch = worker_panes.authorize_result_launch(state.row, result_pass)
                         before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, worker_name, worker_panes.dispatch_role(state.row),
-                            account=launch_account, lock=hold, runs=runs, codex=codex, selection=selection)
+                            account=launch_account, lock=hold, runs=runs, codex=codex, selection=selection,
+                            policy=policy, restore_launch=restore_launch)
                         arm_launch_cleanup(cleanup, before, result)
                         if not isinstance(result, worker_panes.OpenWorker):
                             code, reason = _startup_failure(result)
@@ -2838,9 +2968,14 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(result.created_pane, worker_panes.CreatedWorkerPane):
                             resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
-                        row = result.row
-                    else:
-                        row = state.row
+                        state = result
+                        if (isinstance(result_pass, worker_panes.ParkWaitingPass)
+                                and not worker_panes.authorized_result_pane(result, result_pass)):
+                            failed(result.row, "The replacement pane is unproved")
+                            continue
+                    row = state.row
+                    if isinstance(result_pass, worker_panes.ParkWaitingPass):
+                        plan = replace(plan, continuation=_result_continuation(state, result_pass))
                     resumed_record = staff.authority_snapshot() if row != current else current_record
                     with staff.supplied_snapshot(resumed_record):
                         resumed = resume(row, plan)
@@ -2848,9 +2983,23 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         failed(row, resumed.reason, notice=f"anomaly: {name}: {resumed.reason}")
                         continue
                     resume_sent = True
+                    _ = cleanup.pop_all()
+                    if isinstance(result_pass, worker_panes.ParkWaitingPass) and parked and not clear_result_park(row, result_pass):
+                        failed(row, "The worker pass changed before park clearance")
+                        continue
+                    if isinstance(plan.step, UnsubmittedAssignment):
+                        dispatch_id = plan.step.dispatch_id
+                        assignments = (worker_panes.worker_pass(row, directory, record=resumed_record)
+                                       for directory in dict.fromkeys((run, *held_runs)))
+                        if not any(item.get("instance_id") == dispatch_id and _accepted_assignment(row, item)
+                                   for item in assignments):
+                            if isinstance(report, RestoreReport):
+                                report.skipped[row.id] = "The director received the launcher instruction"
+                            else:
+                                print(f"{row.name}: the director received the launcher instruction")
+                            continue
                     if isinstance(report, RestoreReport):
                         report.restored.add(row.id)
-                    _ = cleanup.pop_all()
                     recovery = completion_notices.recover_completion(row, current_holder, run, hold,
                         record=staff.authority_snapshot(), pane=KeepCompletedPane.KEEP)
                     if report is None and recovery in (*pending_completion, CompletionRecovery.WAITING_ON_REAP):
