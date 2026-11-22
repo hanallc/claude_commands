@@ -97,7 +97,7 @@ from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
-from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
+from scripts.direct.release_events import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -2556,7 +2556,7 @@ def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
     owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
     minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
     outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
-        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+        f"Nightly gate result {result.id} has no assigned fix after {minutes} minutes: "
         + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
         + f"The user gets the result push only after assignment: gate.py nightly-assigned --result {result.id} --unit UNIT.")
     print(f"Nightly assignment alert: {outcome}", flush=True)
@@ -2772,7 +2772,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
     requires_full = bool(failed) or not type_failures
     try:
         detail = (f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                  + "Every merge gate now requires the full suite until a merge gate passes."
+                  + "Every gate now requires the full suite until a gate passes."
                   if requires_full else "Tests passed. A type failure does not require full test runs.")
         if type_failures:
             lines = [line for job in type_failures for line in job.output.splitlines()]
@@ -2789,7 +2789,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             detail += f"\nAssign the fix, then run gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
         outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
-                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
+                                   f"Nightly gate failed: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
         if outcome == f"told {owner}":
             return NightlyNoticeReceived(datetime.now(UTC).isoformat())
@@ -3165,7 +3165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--body", default="The complete gate verified the checkpoint.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")

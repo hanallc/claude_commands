@@ -10,7 +10,9 @@ import os
 import json
 from zoneinfo import ZoneInfo
 
+from scripts.aws_target import remote
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets import target_config
 
 
@@ -25,7 +27,6 @@ def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tup
 
 def gate_deployment(path: Path, home: str) -> dict[str, object]:
     """Migrate the single-region record once and read the regional form."""
-    from scripts.lib.atomic_file import write_text_atomic
     value = cast(dict[str, object], json.loads(path.read_text()))
     if 'regions' not in value:
         regional = {key: value.pop(key) for key in ('image', 'subnets', 'template', 'version', 'security_group') if key in value}
@@ -195,6 +196,10 @@ def deployment_record(directory: Path | None = None) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+def save_deployment_record(directory: Path, record: dict[str, object]) -> None:
+    write_text_atomic(directory / 'deployment.json', remote.record_text(record))
+
+
 def deployment_outputs(directory: Path | None = None) -> dict[str, str]:
     value = deployment_record(directory).get('outputs', {})
     if not isinstance(value, dict):
@@ -235,8 +240,6 @@ class DeploymentSettings:
     ami_owner_id: str
     nixos_release: str
     availability_zone: str
-    vpc_id: str
-    subnet_id: str
     root_device_name: str
     notice_low: int
     notice_high: int
@@ -267,6 +270,6 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
     if not 0 < low < high < stop:
         raise ValueError('Budget thresholds must increase')
     return DeploymentSettings(region, text('deployment_profile'), text('stack_name'),
-                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'), text('subnet_id'),
+                              text('ami_id'), owner, text('nixos_release'), zone,
                               text('root_device_name'), low, high, stop,
                               whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'))

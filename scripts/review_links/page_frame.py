@@ -12,7 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import CONF as USER_ZONE_SETTINGS, user_zone
 from scripts.production import staff
 from scripts.review_links import setting_controls
 
@@ -21,6 +21,8 @@ QUESTION_WAITING = "The {owner_role} will answer this"
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "rebuilds", "review"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
+STATUS_ICONS = (('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
+                ('Failed', 'triangle-alert'), ('Paused', 'circle-pause'))
 
 
 class OwnerNewItem(StrEnum):
@@ -126,17 +128,20 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
+def title_source_paths() -> tuple[Path, ...]:
+    """List the user zone and icon files used by the title."""
+    return (Path(USER_ZONE_SETTINGS), *(ICONS / f"{icon}.svg" for _, icon in STATUS_ICONS))
+
+
+def title(text: str, page: str, *, settings: conf.ConfigRead | None = None) -> str:
     """Build the title and refresh status."""
-    settings = conf.read_or_repository("console")
+    settings = conf.read_or_repository("console") if settings is None else settings
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
                "readingDelay": settings.number("status.reading_delay_seconds"),
                "ageLimit": settings.number(f"status.{page}.age_limit_seconds"), "zone": str(user_zone())}
     icons = ''.join(f'<span data-status-icon="{state}"' + ('' if state == 'Reading' else ' hidden')
-                    + '>' + icon_svg(icon) + '</span>' for state, icon in (
-                        ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
-                        ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
+                    + '>' + icon_svg(icon) + '</span>' for state, icon in STATUS_ICONS)
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
@@ -153,9 +158,9 @@ def rendered(content: bytes, started: float, read_at: float) -> bytes:
     return content.replace(b'data-page-facts', facts.encode(), 1)
 
 
-def template(source: str, text: str, page: str) -> str:
+def template(source: str, text: str, page: str, *, settings: conf.ConfigRead | None = None) -> str:
     """Fill the shared title, style and script in a static page template."""
-    return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
+    return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page, settings=settings))
             .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
             .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
 

@@ -2,21 +2,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
 import inspect
 import json
-import shlex
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
-from enum import StrEnum
 import math
+import os
+from pathlib import Path
+import shlex
+from typing import TYPE_CHECKING, Literal, cast
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.python_startup import sitecustomize as python_startup
-from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SuiteMode
 
 if TYPE_CHECKING:
+    from scripts.production.gate_routes import GateRun
     from scripts.test_times import gate_record
-
 
 
 class TrialVariant(StrEnum):
@@ -30,7 +31,9 @@ RUN_FIELDS = {'module', 'variant', 'round', 'cpu_s', 'peak_mib', 'wall_s', 'stat
 
 def validate_paired_result(row: dict[str, object], request: dict[str, object], instance: str) -> None:
     """Validate the task identity and each measured sample."""
+    # start time: loaded only to validate an aws-trial result
     from scripts.aws_target import ledger
+
     for key in ('attempt', 'commit', 'tree', 'base', 'changed', 'module', 'rounds'):
         if row.get(key) != request[key]:
             raise ValueError('The paired result differs from ' + key)
@@ -381,8 +384,9 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     }
     exec(GUEST_TRANSFERS, namespace)
     if request.get('task') == 'paired':
+        # Load the process helper only for a paired trial.
         from scripts.lib.descendants import adopt_descendants
-        from scripts.lib.process_group import send_process_group
+
         namespace.update(
             timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
                        'kernel_boot_at', 'instance_running_at') if key in result},
@@ -614,7 +618,9 @@ GATE_IMAGE_OWNER_TAG = 'cloud-claude-gate-image'
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
+    # start time: loaded only to render guest user data
     from scripts.lib import conf
+
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     if links['step'] == 'size':
@@ -710,13 +716,15 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
-    from scripts.test_times import gate_record
     from dataclasses import asdict
-    from typing import cast
-    if not isinstance(run, GateRun):
+
+    from scripts.production import gate_routes
+    from scripts.test_times import gate_record
+
+    if not isinstance(run, gate_routes.GateRun):
         raise TypeError('expected a completed gate')
 
-    def encode_job(job: GateJobResult) -> dict[str, object]:
+    def encode_job(job: gate_routes.GateJobResult) -> dict[str, object]:
         row: dict[str, object] = asdict(job)
         row['kind'] = job.kind.name
         del row['wall_clock']
@@ -741,10 +749,9 @@ def encode_run(run: object) -> dict[str, object]:
 
 def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
+    from scripts.aws_target import ledger
+    from scripts.production import gate_routes
     from scripts.test_times import gate_record
-    from scripts.aws_target.ledger import mapping, rows, text
-    import math
-    from typing import cast
 
     def number(row: dict[str, object], key: str) -> float:
         value = row[key]
@@ -758,11 +765,11 @@ def decode_run(value: object) -> GateRun:
             raise ValueError(f'{key}: expected a finite nonnegative number')
         return result
 
-    def job(row: dict[str, object]) -> GateJobResult:
+    def job(row: dict[str, object]) -> gate_routes.GateJobResult:
         status = row['returncode']
         if type(status) is not int:
             raise ValueError('expected an integer status')
-        times = mapping(row['times'])
+        times = ledger.mapping(row['times'])
         measured = (cast(gate_record.ModuleTimes, cast(object, times)) if 'tests_run' in times
                     else gate_record.NoModuleTimes(str(times.get('reason', 'timing does not apply'))))
         restart = row['restart']
@@ -776,25 +783,30 @@ def decode_run(value: object) -> GateRun:
             wall_clock = gate_record.WallClockNotRecorded('box result has only one module time')
         else:
             wall_clock = gate_record.WallClockNotRecorded('box result has no module times')
-        return GateJobResult(text(row, 'suite'), text(row, 'module'), status, number(row, 'seconds'),
-                             str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
-                             GateJobKind[text(row, 'kind')], number(row, 'cpu_seconds'), measured,
-                             number(row, 'peak_mib'), restart, wall_clock=wall_clock)
+        return gate_routes.GateJobResult(
+            ledger.text(row, 'suite'), ledger.text(row, 'module'), status, number(row, 'seconds'),
+            str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
+            gate_routes.GateJobKind[ledger.text(row, 'kind')], number(row, 'cpu_seconds'), measured,
+            number(row, 'peak_mib'), restart, wall_clock=wall_clock,
+        )
 
-    row = mapping(value)
+    row = ledger.mapping(value)
     # A newer box leaves out the executions list when it equals the jobs list.
     for key in ('tests_reused', 'selection_certified'):
         if type(row[key]) is not bool:
             raise ValueError(f'{key}: expected a boolean')
-    return GateRun(tuple(job(item) for item in rows(row, 'jobs')), number(row, 'seconds'),
-                   number(row, 'peak_memory_mib'), row['tests_reused'] is True,
-                   row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions' if 'executions' in row else 'jobs')),
-                   str(row.get('time_limit_report', '')))
+    return gate_routes.GateRun(
+        tuple(job(item) for item in ledger.rows(row, 'jobs')), number(row, 'seconds'),
+        number(row, 'peak_memory_mib'), row['tests_reused'] is True, row['selection_certified'] is True,
+        tuple(job(item) for item in ledger.rows(row, 'executions' if 'executions' in row else 'jobs')),
+        str(row.get('time_limit_report', '')),
+    )
 
 
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
     from scripts.test_times import gate_record
+
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
                                   job.returncode, job.restart, job.times, job.output,
                                   wall_clock=job.wall_clock)
@@ -803,6 +815,8 @@ def execution_records(value: GateRun) -> list[gate_record.Execution]:
 
 def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected", "subset"]:
     """Classify a record from the assignment."""
+    from scripts.production.gate_routes import SuiteMode
+
     if split:
         return "subset"
     return "affected" if SuiteMode.step(mode) == SuiteMode.TARGETED.value else "full"
@@ -811,11 +825,11 @@ def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
                       started: float, ended: float, mode: str, *, split: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
-    from scripts.test_times import gate_record
-    from datetime import UTC
     from scripts.buildlog import record, store
-    import os
-    if not isinstance(value, GateRun):
+    from scripts.production import gate_routes
+    from scripts.test_times import gate_record
+
+    if not isinstance(value, gate_routes.GateRun):
         raise TypeError('expected a completed gate')
     modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
@@ -828,7 +842,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': SuiteMode.step(mode),
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': gate_routes.SuiteMode.step(mode),
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

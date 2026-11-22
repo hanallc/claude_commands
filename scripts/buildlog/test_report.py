@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zipfile import ZipFile, Path as ZipPath
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_build_steps_fixture
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
@@ -70,7 +71,10 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
+        configuration = temporary / 'config'
+        configuration.mkdir()
+        write_build_steps_fixture(configuration)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(configuration))))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -209,6 +213,7 @@ class ReportTests(unittest.TestCase):
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
+        write_build_steps_fixture(Path(temporary))
         self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
@@ -1875,8 +1880,11 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_mac_copies_section_counts_outcomes_and_estimates_the_saving(self) -> None:
+        settings = self.root.parent / 'installed' / 'aws_target.conf'
+        install_cost_settings(settings)
         self.write_copy_day()
-        text = self.render()
+        with mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(settings)}):
+            text = self.render()
         lines = text.splitlines()
         mac = self.section_lines(text, "### Mac")
         self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")

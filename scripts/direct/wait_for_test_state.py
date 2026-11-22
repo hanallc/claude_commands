@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from scripts.direct.local_release_wait import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
+from scripts.direct.release_events import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 

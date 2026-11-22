@@ -4,9 +4,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
+from typing import cast
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
-from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
+from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, parse_snapshot_value, public_queue_text, select_queue_name
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
@@ -312,9 +313,19 @@ def gate_job_for_command(argv: Sequence[str]) -> StepJob | GateJobNotRecorded:
     return job if isinstance(job, StepJob) else GATE_JOB_NOT_RECORDED
 
 
+def saved_gate_job(record: Mapping[str, object]) -> StepJob | GateJobNotRecorded:
+    """Read a recorded gate job or report that it is unavailable."""
+    try:
+        return cast(StepJob | GateJobNotRecorded,
+                    parse_snapshot_value(record.get('gate_job'), StepJob | GateJobNotRecorded))
+    except (ValueError, OverflowError):
+        return GATE_JOB_NOT_RECORDED
+
+
 # Show each step as the queue records it, for a caller that reads no configuration.
 RECORDED_STEP_NAMES = StepNames(MappingProxyType({}))
 
 
-def read_step_names() -> StepNames:
-    return StepNames(MappingProxyType(conf.read_or_repository("build_steps").values()))
+def read_step_names(configuration: conf.ConfigRead | None = None) -> StepNames:
+    source = configuration if configuration is not None else conf.read_or_repository("build_steps")
+    return StepNames(MappingProxyType(source.values()))

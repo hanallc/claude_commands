@@ -230,7 +230,7 @@ The two flags together cause a usage error.
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
 A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
 An exact staff name takes precedence over the `<name>-unit` form.
-The `<name>-unit` form uses `copies.unit_owner` and matches only rows of kind `unit`.
+The `<name>-unit` form uses `copy_record.unit_owner` and matches only rows of kind `unit`.
 In a `/` path, only the last part uses the form, and the earlier parts must match the parent chain.
 The resolver selects the unit's staff ID before it checks the peer roster.
 For a live local Claude address or a Codex worker with a local holder, the roster limits worker detail reads to the sender and recipient.

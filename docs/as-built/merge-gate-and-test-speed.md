@@ -947,12 +947,14 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 - `communicate_launcher(process, timeout=TEST_HANG_GUARD_SECS) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
 - In `test_progress_history.py`, `run_command`, `run_failing_command` and `run_unowned_command` go through `invoke_recorder`.
 
+**`scripts/direct/release_events.py`**
+- `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` uses inotify to watch the directories and their existing parents. It restores the watch when a directory changes identity. It treats queue overflow as a change. `IntervalReleasePolling` uses the caller's interval on macOS or when inotify returns ENOSYS or ENOTSUP.
+- `build_targets.py` imports the watcher from `scripts.direct.release_events`.
+
 **`scripts/direct/local_release_wait.py`**
-- `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` watches the directories and their existing parents through inotify via ctypes, re-arms replaced directories, and treats queue overflow as a change. `IntervalReleasePolling` sleeps the caller's interval; it is used where libc has no inotify (macOS) or the call returns ENOSYS/ENOTSUP.
 - `wait_for_local_release(seconds, call_id)` arms the watch before reading target state.
   It returns when the hold ends or the deadline is reached.
   `verify.sh` calls its script; `VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path.
-  `build_targets.py` imports `scripts.direct.local_release_wait`.
 
 **`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=TEST_HANG_GUARD_SECS, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
