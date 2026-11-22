@@ -1289,3 +1289,17 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/aws_target/test_ledger.py` (aws owns it; aws gets the diff before the hash).
 - **Workers:** 1 writer.
 - **Acceptance gate:** the module passes in one tests-only gate after the builds go; module CPU from the gate record under 5 s; basedpyright zero on the changed file; one blind review.
+
+### Phase 431 — no test or product code makes a folder in /tmp outside the model  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** nate 00:49 via builds 00:53: "there is NOTHING that should live outside the model". No file under `scripts/` makes a folder or file at a literal `/tmp` path (`dir="/tmp"`, `tempfile` with `/tmp`, `Path("/tmp...")`, `"/tmp/..."`). A grep of origin/main 0e4ea6e563 finds 91 candidate files (sdlc listed 14, for example `production/gate_test_support.py:344`, `lib/test_socket_test_support.py`, `agents/test_worker_lifecycle.py`, `production/test_stall_watch.py`, `message/send.py`).
+- **Spec:**
+  1. List each real case with file:line; drop matches that only read or name `/tmp` (docs, refusals, assertions about other paths). Leave cases that devtools moves on its own branch (ask builds for that list).
+  2. Move each test folder to the test folder model (`testing_folders` / `build_folders.tool_folder`); move product code to the model root it belongs to. One shared helper; copy no code.
+  3. A test asserts that no file under `scripts/` (except an allowlist with a reason per line) holds a literal `/tmp` folder path.
+  4. No config key changes; no check goes away.
+- **Files:** the listed files; `scripts/lib/testing_folders.py` only if a helper is missing.
+- **Workers:** 2 writers by folder group if the list is long.
+- **Acceptance gate:** the changed modules pass in tests-only gates after the builds go; the guard test passes; basedpyright zero on changed files; one blind review.
