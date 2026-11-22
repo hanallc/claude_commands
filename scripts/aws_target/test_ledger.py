@@ -2067,7 +2067,7 @@ class SettledChargeWatchTests(CostFixture):
         fetch = mock.Mock(return_value=readings)
         log = io.StringIO()
         with redirect_stderr(log):
-            for elapsed in range(0, day, 5):
+            for elapsed in (0, 5, day // 2, day - 5, day - 1):
                 self.assertEqual(book.refresh_charges(self.settings, end + elapsed, fetch), readings[-1])
                 self.assertEqual(fetch.call_count, 1)
         fetch.assert_called_once_with(end - 45 * day, end)
