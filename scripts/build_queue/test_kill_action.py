@@ -5,6 +5,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import select
@@ -15,20 +16,25 @@ import tempfile
 import threading
 from typing import cast, override
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.agents import detached_runs
 from scripts.build_queue import admission_client, admission_records as records, admission_wire, kill_action
 from scripts.build_queue.admission_jobs import VerifyCall
-from scripts.build_queue.kill_action import ScopeStopReceipt
 from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
-from scripts.lib import process_start
+from scripts.lib import process_start, process_stop
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_budget
 from scripts.production import staff
+
+
+def confirm_term(_target: kill_action.KillTarget, _reason: str, *, on_term: Callable[[int], None]) -> bool:
+    on_term(1)
+    return True
 
 
 FIXTURE_CARGO = """import os, signal, subprocess, sys
@@ -122,7 +128,7 @@ class KillActionTests(unittest.TestCase):
         assert isinstance(start, process_start.Started)
         return start.start
 
-    def scope_identity(self, folder: Path) -> kill_action.ScopeIdentity:
+    def scope_identity(self, folder: Path) -> process_stop.ScopeIdentity:
         identity = folder.stat()
         return {"unit": folder.name, "path": "/" + str(folder.relative_to(self.root)),
                 "device": identity.st_dev, "inode": identity.st_ino}
@@ -132,7 +138,7 @@ class KillActionTests(unittest.TestCase):
         scope.mkdir(parents=True)
         return kill_action.ProgramScope(self.scope_identity(scope), pid, start)
 
-    def scope_has_ended(self, scope: kill_action.ScopeIdentity) -> bool:
+    def scope_has_ended(self, scope: process_stop.ScopeIdentity) -> bool:
         events = self.root / scope["path"].lstrip("/") / "cgroup.events"
         return "populated 0" in events.read_text().splitlines()
 
@@ -159,23 +165,21 @@ class KillActionTests(unittest.TestCase):
                 self.assertIsInstance(kill_action.candidate(current, reservation, machine, ci=ci),
                                       kill_action.NoKillCandidate)
 
-    def test_cargo_stop_requires_term_or_an_ended_scope(self) -> None:
+    def test_cargo_stop_rechecks_the_saved_scope(self) -> None:
         route = self.program_scope(42)
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
         target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl3", "impl3", "worker")
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
-        for count, ended, accepted in ((1, False, True), (0, True, True), (0, False, False)):
-            with self.subTest(count=count, ended=ended):
-                stop = Mock(return_value=Mock(term_reached=count))
-                api = Mock(stop_scope=stop, scope_has_ended=Mock(return_value=ended))
-                with (patch.object(kill_action, "process_stop_api", return_value=api),
-                      patch.object(memory_admit, "process_table", return_value={}),
-                      patch.object(kill_action, "stop_route", return_value=route)):
-                    moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
-                    self.assertFalse(kill_action.stop_verified_scope(replace(target, route=moved), "Fixture reason"))
-                    stop.assert_not_called()
-                    self.assertEqual(kill_action.stop_verified_scope(target, "Fixture reason"), accepted)
-                    stop.assert_called_once_with(route.scope, 2.0, 5.0)
+        on_term = Mock()
+        with (patch.object(process_stop, "stop_scope") as stop,
+              patch.object(memory_admit, "process_table", return_value={}),
+              patch.object(kill_action, "stop_route", return_value=route)):
+            moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
+            self.assertFalse(kill_action.stop_verified_scope(replace(target, route=moved), "Fixture reason",
+                                                            on_term=on_term))
+            stop.assert_not_called()
+            self.assertTrue(kill_action.stop_verified_scope(target, "Fixture reason", on_term=on_term))
+            stop.assert_called_once_with(route.scope, 2, 5, on_term=on_term)
 
     def test_detached_stop_uses_the_public_api_with_the_saved_route_check(self) -> None:
         folder = self.root / "builds-detached.slice" / "detached-fixture.scope"
@@ -186,20 +190,25 @@ class KillActionTests(unittest.TestCase):
         target = kill_action.KillTarget(run, route, staff.StaffId("worker-id"), "impl3", "impl3", "worker")
         reason = "Stopped from the Builds page."
         moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
-        stop_scope = Mock()
+        counts: list[int] = []
 
-        def stop_detached(_record: Path, _reason: str, *, check: Callable[[], bool]) -> bool:
-            return check()
+        def stop_detached(_record: Path, _reason: str, *, check: Callable[[], bool],
+                          on_term: Callable[[int], None]) -> bool:
+            if not check():
+                return False
+            on_term(2)
+            return True
 
         verified = Mock(side_effect=stop_detached)
-        with (patch.object(kill_action, "process_stop_api", return_value=Mock(stop_scope=stop_scope)),
-              patch.object(kill_action, "detached_stop_api", return_value=verified),
+        with (patch.object(process_stop, "stop_scope") as stop_scope,
+              patch.object(detached_runs, "stop_command", verified),
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route") as read_route):
             read_route.side_effect = [route, route, route, moved]
-            self.assertTrue(kill_action.stop_verified_scope(target, reason))
-            self.assertFalse(kill_action.stop_verified_scope(target, reason))
+            self.assertTrue(kill_action.stop_verified_scope(target, reason, on_term=counts.append))
+            self.assertFalse(kill_action.stop_verified_scope(target, reason, on_term=counts.append))
         self.assertEqual([call.args for call in verified.call_args_list], [(route.record, reason)] * 2)
+        self.assertEqual(counts, [2])
         stop_scope.assert_not_called()
 
     def test_a_cargo_child_outside_the_scope_makes_kill_unavailable(self) -> None:
@@ -217,9 +226,8 @@ class KillActionTests(unittest.TestCase):
         def program(pid: int, _processes: dict[int, memory_admit.ProcessIdentity]) -> str:
             return "cargo" if pid == 18 else "helper"
 
-        api = Mock(pin_process=Mock(return_value=nullcontext(5)),
-                   command_scope=Mock(return_value=self.scope_identity(scope)))
-        with (patch.object(kill_action, "process_stop_api", return_value=api),
+        with (patch.object(process_stop, "pin_process", return_value=nullcontext(5)),
+              patch.object(process_stop, "command_scope", return_value=self.scope_identity(scope)),
               patch.object(kill_action, "CGROUP_ROOT", self.root),
               patch.object(memory_admit, "builds_slice_cgroup", return_value=scope.parent),
               patch.object(kill_action, "program", new=program),
@@ -231,35 +239,14 @@ class KillActionTests(unittest.TestCase):
             self.assertIsInstance(kill_action.stop_route(run, caller, processes), kill_action.NoStopRoute)
         detached.assert_not_called()
 
-    def test_routes_are_unavailable_without_the_shared_helper(self) -> None:
+    def test_routes_are_unavailable_without_pidfd_support(self) -> None:
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
-        with (patch.object(kill_action, "process_stop_api", return_value=kill_action.NoStopRoute()),
+        with (patch.object(process_stop, "supported", return_value=False),
               patch.object(kill_action, "program_scope") as scope,
               patch.object(kill_action, "detached_command") as detached):
             self.assertIsInstance(kill_action.stop_route(run, staff.StaffId("fixture"), {}), kill_action.NoStopRoute)
         scope.assert_not_called()
         detached.assert_not_called()
-
-    def test_legacy_helper_cannot_stop_a_build_without_a_term_receipt(self) -> None:
-        def legacy_stop(_scope: kill_action.ScopeIdentity, _grace: float, _kill_grace: float) -> None:
-            self.fail("the legacy helper must not signal a scope")
-
-        helper = Mock(supported=Mock(return_value=True), stop_scope=legacy_stop)
-        with patch.object(kill_action, "import_module", return_value=helper):
-            self.assertIsInstance(kill_action.process_stop_api(), kill_action.NoStopRoute)
-
-    def test_legacy_detached_helper_leaves_both_routes_unavailable(self) -> None:
-        def stop_command(_record: Path, _reason: str) -> bool:
-            self.fail("the legacy helper must not stop a detached command")
-
-        def stop_scope(_scope: kill_action.ScopeIdentity, _grace: float,
-                       _kill_grace: float) -> ScopeStopReceipt:
-            self.fail("Cargo Kill requires the complete shared API")
-
-        process_api = Mock(supported=Mock(return_value=True), stop_scope=stop_scope, ScopeStopReceipt=ScopeStopReceipt)
-        detached_api = Mock(stop_command=stop_command)
-        with patch.object(kill_action, "import_module", side_effect=[process_api, detached_api]):
-            self.assertIsInstance(kill_action.process_stop_api(), kill_action.NoStopRoute)
 
     def test_detached_route_uses_the_scope_saved_by_the_supervisor(self) -> None:
         supervisor = self.root / "detached_runs.py"
@@ -270,10 +257,10 @@ class KillActionTests(unittest.TestCase):
             pid, _child = map(int, self.line(command).split())
             started = self.started(pid)
             run = kill_action.KillCandidate(pid, started, pid, started, "session", "check", "at", "")
-            scope: kill_action.ScopeIdentity = {"unit": "detached-fixture.scope", "device": 1, "inode": 2,
+            scope: process_stop.ScopeIdentity = {"unit": "detached-fixture.scope", "device": 1, "inode": 2,
                 "path": "/user.slice/builds-detached.slice/detached-fixture.scope"}
-            api = Mock(pin_process=Mock(return_value=nullcontext(5)), command_scope=Mock(return_value=scope))
-            with patch.object(kill_action, "process_stop_api", return_value=api):
+            with (patch.object(process_stop, "pin_process", return_value=nullcontext(5)),
+                  patch.object(process_stop, "command_scope", return_value=scope)):
                 route = kill_action.stop_route(run, staff.StaffId("worker-id"), memory_admit.process_table())
                 self.assertEqual(route, kill_action.DetachedCommand(path, pid, started, command.pid,
                                                                    self.started(command.pid), scope))
@@ -281,8 +268,7 @@ class KillActionTests(unittest.TestCase):
     def test_legacy_verify_rows_do_not_offer_a_step_scope(self) -> None:
         run = kill_action.KillCandidate(17, "123", 16, "122", "session", "check", "at", "")
         table = {17: memory_admit.ProcessIdentity(16, "123"), 16: memory_admit.ProcessIdentity(1, "122")}
-        with (patch.object(kill_action, "process_stop_api", return_value=Mock()),
-              patch.object(kill_action, "program", side_effect=("cargo", "verify.sh")),
+        with (patch.object(kill_action, "program", side_effect=("cargo", "verify.sh")),
               patch.object(kill_action, "live", return_value=True),
               patch.object(kill_action, "program_scope") as scope):
             self.assertIsInstance(kill_action.stop_route(run, staff.StaffId("fixture"), table), kill_action.NoStopRoute)
@@ -333,7 +319,7 @@ class KillActionTests(unittest.TestCase):
             targets.return_value = {reused.reference: replace(target, candidate=reused)}
             self.assertIsInstance(actions.stop(run.reference, handle, ""), kill_action.NoStopRoute)
             targets.return_value = {run.reference: target}
-            with (patch.object(kill_action, "stop_verified_scope", return_value=True),
+            with (patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
                   patch.object(kill_action, "stop_complete") as observe):
                 def confirm(_action: kill_action.SavedKillAction) -> bool:
                     deliver.assert_not_called()
@@ -362,16 +348,16 @@ class KillActionTests(unittest.TestCase):
         events = scope / "cgroup.events"
         _ = events.write_text("populated 1\n")
         first = kill_action.KillActions(self.root)
-        api = Mock(scope_has_ended=self.scope_has_ended)
         with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(kill_action, "process_stop_api", return_value=api),
-              patch.object(kill_action, "stop_verified_scope", return_value=True) as stop,
+              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
+              patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term) as stop,
               patch.object(first, "_start_watch") as watch,
               patch.object(kill_action, "deliver") as send):
             response = first.stop(run.reference, first.handle(target), "Use the next slot.")
         assert not isinstance(response, kill_action.NoStopRoute)
         self.assertEqual(response["stop"], kill_action.StopState.UNCONFIRMED)
-        stop.assert_called_once_with(target)
+        reason = f'nate killed your run "check" (pid 17) from the Builds page at {response["time"]}'
+        stop.assert_called_once_with(target, reason, on_term=ANY)
         watch.assert_called_once()
         send.assert_not_called()
         record = self.root / ".review-link-build-kill" / f"{run.reference}.json"
@@ -388,7 +374,7 @@ class KillActionTests(unittest.TestCase):
             start(thread)
 
         with (patch.object(threading.Thread, "start", new=record_thread),
-              patch.object(kill_action, "process_stop_api", return_value=api),
+              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
               patch.object(kill_action, "stop_verified_scope") as repeated_stop,
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.QUEUED) as send,
               patch.object(kill_action, "live_targets", return_value={})):
@@ -420,7 +406,7 @@ class KillActionTests(unittest.TestCase):
         class FixtureRestart(BaseException):
             pass
 
-        def exit_before_term(*_arguments: object) -> bool:
+        def exit_before_term(*_arguments: object, **_options: object) -> bool:
             saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
             self.assertIsInstance(saved.stage, kill_action.StopRequested)
             self.assertEqual(saved.result["stop"], kill_action.StopState.STOPPING)
@@ -471,8 +457,8 @@ class KillActionTests(unittest.TestCase):
         target = kill_action.KillTarget(run, route, staff.StaffId("retired"), "founder, a producer", "founder", "producer")
         actions = kill_action.KillActions(self.root)
         with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(kill_action, "process_stop_api", return_value=Mock(scope_has_ended=self.scope_has_ended)),
-              patch.object(kill_action, "stop_verified_scope", return_value=True),
+              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
+              patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
               patch.object(actions, "_start_watch"),
               patch.object(kill_action, "deliver") as send):
             response = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
@@ -493,7 +479,7 @@ class KillActionTests(unittest.TestCase):
             workers.append(thread)
             start(thread)
 
-        def read(saved_scope: kill_action.ScopeIdentity) -> bool:
+        def read(saved_scope: process_stop.ScopeIdentity) -> bool:
             self.assertEqual(saved_scope, scope)
             empty = self.scope_has_ended(saved_scope)
             observed.set()
@@ -502,7 +488,7 @@ class KillActionTests(unittest.TestCase):
         response_text = "send.py: staff:retired: founder is a retired producer"
         refusal = subprocess.CompletedProcess(["send.py"], 2, "", response_text)
         resumed = kill_action.KillActions(self.root)
-        with (patch.object(kill_action, "process_stop_api", return_value=Mock(scope_has_ended=read)),
+        with (patch.object(process_stop, "scope_has_ended", side_effect=read),
               patch.object(kill_action, "live_targets", return_value={}),
               patch.object(kill_action, "stop_verified_scope") as repeated_stop,
               patch.object(send_budget, "seconds", return_value=1),
@@ -547,8 +533,8 @@ class KillActionTests(unittest.TestCase):
         with (patch.object(send_budget, "seconds", return_value=1),
               patch.object(subprocess, "run", new=send),
               patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-              patch.object(kill_action, "process_stop_api", return_value=Mock(scope_has_ended=self.scope_has_ended)),
-              patch.object(kill_action, "stop_verified_scope", return_value=True),
+              patch.object(process_stop, "scope_has_ended", side_effect=self.scope_has_ended),
+              patch.object(kill_action, "stop_verified_scope", side_effect=confirm_term),
               patch.object(actions, "_start_watch")):
             _ = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
         path = self.root / ".review-link-build-kill" / f"{run.reference}.json"
@@ -596,6 +582,106 @@ class KillActionTests(unittest.TestCase):
         self.assertEqual((outcome["reference"], outcome["step"], outcome["pid"]), (run.reference, "check", 17))
         self.assertEqual((outcome["stop"], outcome["delivery"]),
                          (kill_action.StopState.NOT_SENT, kill_action.DeliveryState.PENDING))
+
+    def test_only_a_saved_term_count_allows_a_kill_notice(self) -> None:
+        _ = write_config_fixture(self.root / "shutdown.conf")
+        _ = write_config_fixture(self.root / "review_links.conf", "kill_stop_seconds=0.5")
+        _ = write_config_fixture(self.root / "codex_daemon.conf")
+        for detached in (False, True):
+            for scenario in ("natural exit", "restart", "error"):
+                with self.subTest(detached=detached, scenario=scenario):
+                    self.check_term_receipt(detached, scenario)
+
+    def check_term_receipt(self, detached: bool, scenario: str) -> None:
+        root = self.root / f"{detached}-{scenario}"
+        folder = root / "builds-detached.slice" / "detached-fixture.scope"
+        folder.mkdir(parents=True)
+        events = folder / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        scope = self.scope_identity(folder)
+        run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
+        recipient = staff.StaffId("worker-id")
+        record = root / "fixture.json"
+        route = (kill_action.DetachedCommand(record, 17, "123", 16, "122", scope)
+                 if detached else kill_action.ProgramScope(scope, 17, "123"))
+        target = kill_action.KillTarget(run, route, recipient, "impl2", "impl2", "worker")
+        if detached:
+            _ = record.write_text(json.dumps({
+                "run_id": "fixture", "status": "running", "session_dir": str(root),
+                "worker": "impl2", "staff_id": recipient, "label": "fixture", "command": ["cargo", "check"],
+                "log": str(root / "fixture.log"), "started_at": 10, "pid": 16, "director_dir": "",
+                "done_message_file": "", "command_scope": scope, "command_pid": 17,
+                "command_group": 17, "command_started": "123", "supervisor_started": "122",
+            }))
+        actions = kill_action.KillActions(root)
+        journal = root / ".review-link-build-kill" / f"{run.reference}.json"
+        count = 0 if scenario == "natural exit" else 2
+
+        class Restart(BaseException):
+            pass
+
+        def enter_exit_wait(_scope: process_stop.ScopeIdentity, _descriptor: int, _deadline: float) -> bool:
+            saved = admission_wire.parse_record(journal.read_text(), kill_action.SavedKillAction)
+            if not count:
+                self.assertIsInstance(saved.stage, kill_action.StopRequested)
+                _ = events.write_text("populated 0\n")
+                return True
+            self.assertEqual(saved.stage, kill_action.TermSent(count))
+            if detached:
+                detached_record = cast(dict[str, object], json.loads(record.read_text()))
+                self.assertEqual(detached_record.get("stop_reason"), saved.message)
+            if scenario == "restart":
+                raise Restart
+            raise process_stop.ScopeStopFailed("fixture failure after TERM")
+
+        def start(target_actions: kill_action.KillActions) -> kill_action.KillResult | kill_action.NoStopRoute:
+            return target_actions.stop(run.reference, target_actions.handle(target), "")
+
+        with (patch.object(process_stop, "CGROUP_ROOT", self.root),
+              patch.object(process_stop, "_term_scope", return_value=count) as term,
+              patch.object(process_stop, "_scope_ends_on", side_effect=enter_exit_wait) as wait,
+              patch.object(memory_admit, "process_table", return_value={}),
+              patch.object(kill_action, "stop_route", return_value=route),
+              patch.object(kill_action, "live_targets", return_value={run.reference: target}) as targets,
+              patch.object(actions, "_start_watch"),
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
+            if scenario == "restart":
+                with self.assertRaises(Restart):
+                    _ = start(actions)
+            else:
+                outcome = start(actions)
+                assert not isinstance(outcome, kill_action.NoStopRoute)
+                expected = kill_action.StopState.UNCONFIRMED if count else kill_action.StopState.ALREADY_ENDED
+                self.assertEqual(outcome["stop"], expected)
+            wait.assert_called_once()
+            send.assert_not_called()
+            if not count and detached:
+                self.assertNotIn("stop_reason", record.read_text())
+                self.assertNotIn("stop_pass_requested", record.read_text())
+            if count:
+                _ = events.write_text("populated 0\n")
+            targets.return_value = {}
+            recovered = kill_action.KillActions(root)
+            workers: list[threading.Thread] = []
+            start_thread = threading.Thread.start
+
+            def record_thread(thread: threading.Thread) -> None:
+                workers.append(thread)
+                start_thread(thread)
+
+            with patch.object(threading.Thread, "start", new=record_thread):
+                recovered.resume()
+                for worker in workers:
+                    worker.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.is_alive())
+                recovered_again = kill_action.KillActions(root)
+                recovered_again.resume()
+                self.assertEqual(len(workers), int(count > 0))
+            (_, (result,)) = recovered_again.options()
+            self.assertEqual(result["stop"],
+                             kill_action.StopState.STOPPED if count else kill_action.StopState.ALREADY_ENDED)
+            term.assert_called_once()
+            self.assertEqual(send.call_count, int(count > 0))
 
 
 if __name__ == "__main__":
