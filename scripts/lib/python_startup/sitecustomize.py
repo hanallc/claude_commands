@@ -248,7 +248,14 @@ def start_process(arguments: list[str]) -> str:
 
 
 class UnverifiedGateParent:
-    """The process has no verified gate parent."""
+    """The process has no verified or trusted gate parent."""
+
+
+class TrustedGateParent:
+    """The platform trusts the gate parent from the environment."""
+
+    def __init__(self, pid: str) -> None:
+        self.pid: str = pid
 
 
 class VerifiedGateParentWithoutDescriptor:
@@ -267,7 +274,8 @@ class VerifiedGateParentWithDescriptor:
 
 
 if TYPE_CHECKING:
-    GateParent = UnverifiedGateParent | VerifiedGateParentWithoutDescriptor | VerifiedGateParentWithDescriptor
+    GateParent = (UnverifiedGateParent | TrustedGateParent
+                  | VerifiedGateParentWithoutDescriptor | VerifiedGateParentWithDescriptor)
 
 
 def _gate_source_identity(parent: str) -> VerifiedGateParentWithDescriptor | UnverifiedGateParent:
@@ -327,7 +335,7 @@ def _gate_identity() -> GateParent:
     if not parent:
         return UnverifiedGateParent()
     if sys.platform != "linux":
-        return VerifiedGateParentWithoutDescriptor(parent)
+        return TrustedGateParent(parent)
     if parent != str(os.getppid()):
         return UnverifiedGateParent()
     identity = _gate_source_identity(parent)
@@ -347,11 +355,11 @@ def _remember_gate(parent: str) -> bool:
 
 
 def gate_parent(consume: bool = False) -> GateParent:
-    """Verify the gate parent and manage the source descriptor."""
+    """Identify the gate parent and manage the source descriptor."""
     identity = _gate_identity()
-    verified = (not isinstance(identity, UnverifiedGateParent)
-                and (sys.platform != "linux" or _remember_gate(identity.pid)))
-    if consume or not verified:
+    accepted = (isinstance(identity, TrustedGateParent)
+                or (not isinstance(identity, UnverifiedGateParent) and _remember_gate(identity.pid)))
+    if consume or not accepted:
         _ = os.environ.pop("GATE_PARENT_PID", None)
         _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
         _ = os.environ.pop(GATE_PARENT_SOURCE_FD, None)
@@ -360,7 +368,7 @@ def gate_parent(consume: bool = False) -> GateParent:
             identity = VerifiedGateParentWithoutDescriptor(identity.pid)
     elif isinstance(identity, VerifiedGateParentWithDescriptor):
         os.set_inheritable(identity.descriptor, False)
-    return identity if verified else UnverifiedGateParent()
+    return identity if accepted else UnverifiedGateParent()
 
 
 def _unittest_boundary(module: ModuleType) -> None:
@@ -437,7 +445,7 @@ def _install_unittest_boundary() -> None:
 
 
 def verified_gate() -> bool:
-    """Check the parent proof that the module supervisor can pass through a fork."""
+    """Check for a trusted parent or a parent proof that can pass through a fork."""
     import select
 
     running_gate: object = sys.modules["_devtools_checkout"].__dict__.get("test_gate_pidfd")
