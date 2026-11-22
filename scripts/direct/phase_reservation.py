@@ -58,7 +58,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
@@ -397,7 +397,7 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
 
 
 def claimed_launch_directory(directory: Path, requested: Path) -> Path:
-    """Use the claimed checkout and keep a start directory inside it."""
+    """Select a start directory in the claimed checkout for `assign_claude.run`, the only caller."""
     if not ((directory / BASELINE_FILE).is_file() or (directory / WORKTREE_FILE).is_file()):
         return requested
     root = phase_worktree(directory).root.resolve()
@@ -984,21 +984,20 @@ def _claim_command(args: argparse.Namespace) -> int:
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
     requested = Path(cast(str, args.repo))
-    if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
-        recorded = phase_worktree(directory).root
-        if recorded.is_dir():
-            requested = recorded
-    root = repository_root(requested)
-    if root is None:
-        with suppress(StateRefused, OSError):
-            if ((session_dir / unit_runs.STATE_FILE).is_file()
-                    and requested.resolve() == home_worktree(directory).resolve()):
-                print(f"phase_reservation: {requested}: no Git checkout. {MOVE_UNIT_HOME}", file=sys.stderr)
-                return 2
-        print("phase reservation: no repository or no files to claim; still awaiting first touch")
-        return 0
-    root = root.resolve()
     try:
+        if (directory / WORKTREE_FILE).is_file() or (directory / BASELINE_FILE).is_file():
+            recorded = phase_worktree(directory).root
+            if recorded.is_dir():
+                requested = recorded
+        root = repository_root(requested)
+        if root is None:
+            if (session_dir / unit_runs.STATE_FILE).is_file():
+                home = home_worktree(directory).resolve()
+                if requested.resolve().is_relative_to(home):
+                    raise StateRefused(f"{requested}: no Git checkout. {MOVE_UNIT_HOME}")
+            print("phase reservation: no repository or no files to claim; still awaiting first touch")
+            return 0
+        root = root.resolve()
         _record_worktree(directory, root)
         _record_baselines(directory, root)
     except (StateRefused, OSError) as refused:

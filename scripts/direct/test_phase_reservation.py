@@ -189,11 +189,23 @@ class WorktreeAttributionTests(unittest.TestCase):
 
     def test_claim_refuses_a_home_without_a_git_checkout(self) -> None:
         home = self.session.parent / "non-git-home"
-        home.mkdir()
+        subdirectory = home / "src"
+        subdirectory.mkdir(parents=True)
         row = next(row for row in staff.snapshot().rows if row.kind == "unit")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", home), expected=row.worktree)
-        self.assert_model_worktree_refused(
-            "1", home, "no Git checkout. Move the unit home into the worktree model by the showrunner's order.")
+        reason = "no Git checkout. Move the unit home into the worktree model by the showrunner's order."
+        for requested in (home, subdirectory):
+            with self.subTest(requested=requested):
+                self.assert_model_worktree_refused("1", requested, reason)
+
+    def test_claim_refuses_a_non_git_path_when_the_run_owner_is_unavailable(self) -> None:
+        _ = (self.session / plan_history.STATE_FILENAME).write_text("{}")
+        code, errors = self.claim("1", self.session)
+        self.assertEqual(code, 2)
+        self.assertIn(f"phase_reservation: {self.session}: run owner is unavailable", errors)
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
+        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
 
     def test_claim_uses_the_model_home_without_a_phase_worktree_file(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
