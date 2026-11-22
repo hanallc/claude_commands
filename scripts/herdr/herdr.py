@@ -976,6 +976,7 @@ class RowPaneScan:
     found: dict[staff.StaffId, list[dict[str, object]]]
     unknown: list[UnknownPane]
     closed: frozenset[str] = frozenset()
+    replacements: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2293,16 +2294,11 @@ class Herdr:
                 self.save_layout()
             return True
 
-    def _closed_pane_ids(self, missing: set[str]) -> set[str]:
-        if not missing:
-            return set()
+    def _refresh_pane_list(self) -> dict[str, dict[str, object]]:
         observed = _pane_observations.get()
         if observed is not None:
             _ = observed.replies.pop((self.session, ("pane", "list")), None)
-        try:
-            return missing - {json_text(row.get("pane_id"), "pane id") for row in self.listed("pane")}
-        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
-            return set()
+        return {json_text(row.get("pane_id"), "pane id"): row for row in self.listed("pane")}
 
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
@@ -2347,8 +2343,22 @@ class Herdr:
         launches: dict[str, pane_launch.PaneLaunch] | None = None
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         observations = [(pane, self._row_pane_sessions(pane, run)) for pane in panes]
-        closed = self._closed_pane_ids({str(pane.get("pane_id", "")) for pane, sessions in observations
-                                       if isinstance(sessions, _PaneProcessNotFound)})
+        missing = {str(pane.get("pane_id", "")): str(pane.get("tab_id", "")) for pane, sessions in observations
+                   if isinstance(sessions, _PaneProcessNotFound)}
+        closed: set[str] = set()
+        replacements: tuple[dict[str, object], ...] = ()
+        if missing:
+            try:
+                current = self._refresh_pane_list()
+            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                pass
+            else:
+                closed = missing.keys() - current.keys()
+                tabs = {missing[pane] for pane in closed} - {""}
+                seen = {str(pane.get("pane_id", "")) for pane in panes}
+                replacements = tuple(pane for identity, pane in current.items()
+                                     if identity not in seen and str(pane.get("tab_id", "")) in tabs)
+                observations.extend((pane, self._row_pane_sessions(pane, run)) for pane in replacements)
         for pane, sessions in observations:
             if isinstance(sessions, _PaneProcessNotFound):
                 if str(pane.get("pane_id", "")) in closed:
@@ -2384,7 +2394,7 @@ class Herdr:
                 for identity in sessions:
                     if (row := record.by_current_session(identity)) is not None:
                         found.setdefault(row.id, []).append(pane)
-        return RowPaneScan(found, unknown, frozenset(closed))
+        return RowPaneScan(found, unknown, frozenset(closed), replacements)
 
     @pane_evidence_run()
     def retitle_row(self, row_id: str) -> bool:
@@ -2420,6 +2430,7 @@ class Herdr:
             saved = saved_layout(self.session)
             panes = self.listed("pane")
             scan = self.scan_row_panes(record, panes)
+            panes = [pane for pane in panes if pane.get("pane_id") not in scan.closed] + list(scan.replacements)
             spaces = self.listed("workspace") if panes else []
             moving = frozenset(member.id for member in (row, *record.find(parent=row.id)))
             workspace = (self._workspace_named(parent.name, record=record, exclude=moving,

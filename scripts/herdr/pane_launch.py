@@ -194,6 +194,8 @@ class NativePaneScan(Protocol):
     def unknown(self) -> Sequence[UnknownNativePane]: ...
     @property
     def closed(self) -> frozenset[str]: ...
+    @property
+    def replacements(self) -> Sequence[Mapping[str, object]]: ...
 
 
 class NativePaneServer(Protocol):
@@ -237,7 +239,9 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     else:
         panes = evidence.panes
         scan = evidence.scan
-    panes = [pane for pane in panes if str(pane["pane_id"]) not in scan.closed]
+    if scan.closed:
+        panes = list({str(pane["pane_id"]): pane for pane in (*panes, *scan.replacements)
+                      if str(pane["pane_id"]) not in scan.closed}.values())
     found = scan.found
     unknown = {item.pane for item in scan.unknown}
     decoded: dict[str, set[str]] = {}

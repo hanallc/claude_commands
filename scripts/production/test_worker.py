@@ -658,12 +658,15 @@ class WorkerCommandTests(unittest.TestCase):
         self.assert_restore_live_run(active=True)
 
     def test_restore_continues_a_codex_pass_without_a_reported_session(self) -> None:
-        self.assert_restore_without_worker_session_report(stopped_run=False)
+        self.assert_restore_without_worker_session_report(result_state="none")
 
     def test_restore_delivers_the_stopped_run_to_a_codex_worker_without_a_reported_session(self) -> None:
-        self.assert_restore_without_worker_session_report(stopped_run=True)
+        self.assert_restore_without_worker_session_report(result_state="pending")
 
-    def assert_restore_without_worker_session_report(self, *, stopped_run: bool) -> None:
+    def test_restore_requests_done_after_a_stopped_run_result_already_arrived(self) -> None:
+        self.assert_restore_without_worker_session_report(result_state="delivered")
+
+    def assert_restore_without_worker_session_report(self, *, result_state: Literal["none", "pending", "delivered"]) -> None:
         from scripts.agents import shutdown_record
 
         opened = self.opened()
@@ -672,20 +675,25 @@ class WorkerCommandTests(unittest.TestCase):
         dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
             prompt=self.prompt, kind="impl", lens="")
-        line = f"Complete the work. End your reply with DONE {dispatch_id}."
+        line = f"Complete the work. End your final reply with DONE {dispatch_id}."
         progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
             pass_recorder.DispatchDelivery(line, dispatch_id, str(self.reply)))
         self.agent.append(pane, "user", line)
-        self.agent.append(pane, "assistant", "I am waiting for the check." if stopped_run else "I am waiting for the director.")
+        self.agent.append(pane, "assistant", "I am waiting for the director.")
         world = self.fixture.world
-        shutdown_record.save([str(row.id)])
-        _ = world.stop(row, world)
         run_path, run_record = self.detached_record(row, "restart-check")
-        if stopped_run:
+        if result_state != "none":
             _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
             _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
             run_record.update(exit_code=143, stop_reason="The restart stopped the command.", pane_dispatch_id=dispatch_id)
+            if result_state == "delivered":
+                self.agent.append(pane, "assistant", f"The check started.\nDONE {dispatch_id}")
+                self.agent.append(pane, "user", "Detached run: restart-check\nResult: STOPPED (exit 143)")
+                run_record.update(delivery=f"sent: worker {row.name} at {pane}", delivered_at=time.time())
             atomic_file.write_text_atomic(run_path, json.dumps(run_record))
+        shutdown_record.save([str(row.id)])
+        _ = world.stop(row, world)
+        if result_state == "pending":
             delivery = detached_runs.deliver(run_record, detached_runs.command_result(run_record))
             self.assertEqual(delivery, detached_runs.DEFERRED_WORKER_RESULT + "worker is stopped")
             self.assertNotIn("delivered_at", worker_lifecycle.read_json_object(run_path))
@@ -722,15 +730,24 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(current.current_session, row.current_session)
         prompt, = self.fixture.prompts()
         self.assertEqual(prompt[2], pane)
-        if stopped_run:
+        if result_state == "pending":
             self.assertIn("Detached run: restart-check\n", prompt[3])
             self.assertIn("Result: STOPPED (exit 143)", prompt[3])
             receipt = worker_lifecycle.read_json_object(run_path)
             self.assertEqual(receipt["delivery"], f"sent: worker {row.name} at {pane}")
             self.assertIn("delivered_at", receipt)
-            self.assertFalse(detached_runs.has_pending_worker_result(self.run_dir, current))
         else:
             self.assertIn(f"Continue pass {dispatch_id} in this conversation.", prompt[3])
+        if result_state != "none":
+            self.assertFalse(detached_runs.has_pending_worker_result(self.run_dir, current))
+            self.assertIsInstance(self.receipt(), worker.DispatchWaitingForRuns)
+            final = f"The stopped check is recorded.\nDONE {dispatch_id}"
+            self.agent.append(pane, "assistant", final)
+            world.locations[pane]["agent_status"] = "done"
+            self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
+            self.assertEqual(self.reply.read_text().rstrip(), final)
+            self.assertEqual(worker_panes.worker_pass(current, self.run_dir)["status"], "completed")
+            self.assertNotIn(pane, world.locations)
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
@@ -1282,6 +1299,39 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(errors, "")
                 else:
                     self.assertIn("absence is unproved", errors)
+
+    def test_list_checks_a_replacement_pane_in_the_same_tab(self) -> None:
+        world = self.fixture.world
+        result = world.result
+        sibling = self.fixture.worker("absent-sibling")
+        for unreadable, replacement in ((False, "w1:p90"), (True, "w1:p91")):
+            with self.subTest(unreadable=unreadable):
+                closing = self.opened(f"closing-{replacement[-1]}")
+                row = self.fixture.worker(f"replacement-{replacement[-1]}")
+                tab = cast(str, world.locations[closing.pane]["tab_id"])
+
+                def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments == ("pane", "process-info", "--pane", closing.pane):
+                        world.remove_pane(closing.pane)
+                        world.add(row, replacement, tab=tab)
+                        raise herdr_types.HerdrFailure("fixture pane is absent", "pane_not_found")
+                    if unreadable and arguments == ("pane", "process-info", "--pane", replacement):
+                        raise herdr_types.HerdrFailure("fixture replacement is unreadable")
+                    return result(*arguments, deadline=deadline)
+
+                with patch.object(world, "result", side_effect=read) as queries:
+                    code, output, errors = self.command("list", "all", "--json")
+                self.assertEqual(code, worker.ExitCode.OK)
+                queries.assert_any_call("pane", "process-info", "--pane", replacement)
+                listing = {item["name"]: item["state"] for item in cast(list[dict[str, str]], json.loads(output))}
+                if unreadable:
+                    self.assertEqual(listing[sibling.name], "UncertainWorker")
+                    self.assertIn("fixture replacement is unreadable", errors)
+                else:
+                    self.assertEqual(listing[sibling.name], "ClosedWorker")
+                    self.assertEqual(listing[closing.row.name], "ClosedWorker")
+                    self.assertEqual(listing[row.name], "OpenWorker")
+                    self.assertEqual(errors, "")
 
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
         for foreign_tab in (False, True):

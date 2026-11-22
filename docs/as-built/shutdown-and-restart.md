@@ -540,12 +540,13 @@ Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker with an accepted open dispatch receives a continuation prompt in its proved native pane.
 Herdr checks the native input target even if its inventory has no session ID for the pane.
 Restore gives a pending detached result priority over the continuation prompt.
+Restore checks the shared dispatch receipt when a detached result requires a reply.
+When the worker has all results and still owes a DONE, restore sends the continuation prompt.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
-Restore, named resume, and director notes use one receipt rule.
 An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
 Director notes reuse shared dispatch history reads.
-A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
-The decision reads the record and transcript once per worker and uses the restart's shared run index.
+A complete dispatch gets no resume note or step.
+Restore uses the restart's shared run index.
 
 ## Launch names
 

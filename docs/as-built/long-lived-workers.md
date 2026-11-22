@@ -497,17 +497,19 @@ A limited restore reaps once per selected worker in each held run folder.
 It preserves excluded workers and workers with unknown pane evidence.
 It prints each reaped run id.
 Restore reopens workers with active dispatches or detached work that needs their attention.
-It reads each worker's dispatch record and transcript once to select the resume step.
+It reads each worker's dispatch record and transcript to select the resume step.
 An accepted dispatch gets a continuation prompt in the proved worker pane when the worker is idle.
 The pane can prove its native conversation before Herdr reports the session ID.
 Herdr checks the native input target again before it sends the prompt.
 If a finished detached result is pending, restore tries its delivery before it sends a continuation prompt.
 Delivery requires a receipt in the worker transcript.
+Restore uses the shared dispatch receipt when an active pass waits for a reply to a detached result.
+If the worker received all results and still owes a DONE, restore sends the continuation prompt.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
 An unsubmitted dispatch keeps the saved assign command as its step.
-Restore, named resume, and director notes use the same receipt rule.
+Named resume and director notes use the transcript to identify an accepted dispatch.
 Director notes keep the saved prompt path and reuse shared dispatch history reads.
-A dispatch with a DONE line or a finished record gets no resume note or step.
+A complete dispatch gets no resume note or step.
 Later chat does not reopen a completed dispatch.
 The restart shares its run index and snapshots.
 Idle workers stay closed until their next assign.
@@ -945,8 +947,9 @@ That row has no `home` field.
 `worker.py list [open|closed|all]` defaults to open panes.
 `list closed` shows closed panes. `list all` includes uncertain rows too.
 A fresh inventory can confirm that a pane closed during a process read.
-A confirmed closure lets the listing show absent siblings as closed.
-A pane that stays present and unreadable leaves sibling absence uncertain.
+The scan reads any replacement pane in the same tab.
+The listing reports absent workers as closed when the tab has complete pane evidence.
+An unreadable pane leaves sibling absence uncertain.
 The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
 The flag still selects saved dispatches from every parent.
 `list all --json --all-parents` needs no caller staff row or live pane read.
