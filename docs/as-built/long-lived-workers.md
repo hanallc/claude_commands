@@ -738,6 +738,7 @@ The supervisor saves the exit code and cleanup intent before it releases the wat
 The run record saves `finished_at` when it records the confirmed end of the slice.
 Startup recovery resumes a saved stop even if the supervisor still runs.
 It resumes pending cleanup if the supervisor is gone.
+A failed hold stop retracts the request it added. A saved error cannot authorize recovery to stop the slice.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.

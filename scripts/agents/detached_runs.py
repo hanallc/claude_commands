@@ -492,43 +492,51 @@ def _scope_stop_graces() -> tuple[float, float]:
 
 def _stop_slice_command(
     path: Path, reason: str, run_slice: process_stop.RunSliceIdentity, *,
-    check: Callable[[], bool], stop_pass: bool, resume: bool = False,
+    check: Callable[[], bool], stop_pass: bool,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path) as acquired:
         if not acquired:
             return False
+        added_reason = False
         try:
             with record_lock(path):
                 record = _read_record(path)
                 if record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                     return False
-                pending = record.get("stop_reason") or record.get("scope_error") or record.get("slice_cleanup_pending")
-                if resume and not pending:
-                    return False
-                ended = process_stop.slice_has_ended(run_slice)
-                if ended and not pending:
+                pending = record.get("stop_reason") or record.get("slice_cleanup_pending")
+                if not pending and not reason:
                     return False
                 stopping = record.copy()
-                if not ended and reason:
-                    _ = stopping.setdefault("stop_reason", reason)
-                if not ended and not stopping.get("stop_reason"):
-                    stopping["slice_leftovers"] = True
+                added_reason = bool(reason and not record.get("stop_reason"))
+                if added_reason:
+                    stopping["stop_reason"] = reason
                 if stop_pass and stopping.get("stop_reason") and not stopping.get("stop_pass_requested"):
                     stopping["stop_pass_requested"] = True
                     if _stop_caller_is_owner(stopping["staff_id"], os.environ):
                         stopping["self_stop"] = True
                 if stopping != record:
                     write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
+                ended = process_stop.slice_has_ended(run_slice)
+                if stopping != record:
                     if not check():
                         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
                         return False
+                    if ended and added_reason:
+                        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+                if ended and not pending:
+                    return False
+                if not ended and not stopping.get("stop_reason"):
+                    stopping["slice_leftovers"] = True
+                    write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
             if not ended:
                 process_stop.stop_slice(run_slice, grace, kill_grace)
         except process_stop.SliceStopFailed as error:
             with record_lock(path):
                 record = _read_record(path)
                 if record.get("command_slice") == run_slice and record["status"] == "running":
+                    if added_reason and not stop_pass:
+                        _ = record.pop("stop_reason", None)
                     record["scope_error"] = str(error)
                     write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             raise
@@ -789,10 +797,9 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         supervisor_alive = raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path)
         if (run_slice := raw.get("command_slice")) and (
-                raw.get("stop_reason") or raw.get("scope_error")
-                or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
+                raw.get("stop_reason") or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
             try:
-                _ = _stop_slice_command(path, "", run_slice, check=lambda: True, stop_pass=False, resume=True)
+                _ = _stop_slice_command(path, "", run_slice, check=lambda: True, stop_pass=False)
             except process_stop.SliceStopFailed as error:
                 print(f"detached_runs: {path.stem}: stop recovery failed: {error}", file=sys.stderr)
         if supervisor_alive:
@@ -1852,14 +1859,15 @@ def _retry_failed_push(path: Path) -> None:
 def command_deliver(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", ""))).resolve()
     record = _read_record(record_path)
-    if _has_saved_cgroup(record) and not _command_has_ended(record, record["pid"]):
+    has_slice = _has_saved_cgroup(record)
+    if has_slice and not _command_has_ended(record, record["pid"]):
         print(f"detached_runs: {record['run_id']}: the run slice has no confirmed end", file=sys.stderr)
         return 1
     if record.get("stop_pass_requested") and record["status"] != "finished" and not record.get("scope_error"):
         if "exit_code" not in record:
             print(f"detached_runs: {record['run_id']}: the stopped command has no confirmed exit", file=sys.stderr)
             return 1
-        if not _stopped_group_has_ended(record):
+        if not has_slice and not _stopped_group_has_ended(record):
             print(f"detached_runs: {record['run_id']}: the command group has no confirmed end", file=sys.stderr)
             return 1
     if _cancels_pass(record) and not _result_push_failed(record.get("delivery", "")):

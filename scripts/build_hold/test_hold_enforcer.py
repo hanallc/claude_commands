@@ -926,6 +926,61 @@ class HoldEnforcerTests(unittest.TestCase):
                 result = detached_runs.result_text(saved, detached_runs.command_result(saved))
                 self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
 
+    def test_failed_hold_stop_does_not_resume_after_release(self) -> None:
+        runs = self.root / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir()
+        record = runs / "failed-hold-stop.json"
+        self.write_detached_run(record, command_started=True)
+        cgroups = self.root / "cgroups"
+        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-hold.slice"
+        scope.mkdir(parents=True)
+        stat = scope.stat()
+        identity: process_stop.RunSliceIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": stat.st_dev, "inode": stat.st_ino,
+        }
+        saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+        saved["command_slice"] = identity
+        write_text_atomic(record, json.dumps(saved))
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
+        table = self.table()
+        waiting = hold_enforcer.WaitingRun(table[10], OwningSession("gate-owner"))
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        read_end = process_stop.slice_has_ended
+
+        def read_after_request(saved_scope: process_stop.RunSliceIdentity) -> bool:
+            pending = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+            self.assertEqual(pending.get("stop_reason"), "stopped for timed test; run again after the release")
+            return read_end(saved_scope)
+
+        events = scope / "cgroup.events"
+        kill = scope / "cgroup.kill"
+        _ = kill.write_text("0\n")
+        with (mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              mock.patch("scripts.agents.detached_run_process.supervises", return_value=True),
+              mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(0.0, 0.0)),
+              mock.patch.object(process_stop, "_term_slice") as term):
+            with (mock.patch.object(process_stop, "slice_has_ended", side_effect=read_after_request),
+                  self.assertRaisesRegex(process_stop.SliceStopFailed, "cannot read cgroup.events")):
+                _ = hold_enforcer.stop_waiting_run(
+                    waiting, holder, table, self.proc,
+                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                )
+            failed = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+            self.assertIn("cannot read cgroup.events", failed.get("scope_error", ""))
+            self.assertNotIn("stop_reason", failed)
+            self.assertNotIn("slice_cleanup_pending", failed)
+            (self.holders / "holder").unlink()
+            self.assertEqual(build_hold.natedev_holds(self.holders).in_force, ())
+            _ = events.write_text("populated 1\n")
+            self.assertEqual(detached_runs.reap_orphans(str(self.root)), [])
+            term.assert_not_called()
+        self.assertEqual(events.read_text(), "populated 1\n")
+        self.assertEqual(kill.read_text(), "0\n")
+        self.assertNotIn("finished_at", cast(detached_runs.RunRecord, json.loads(record.read_text())))
+
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
         table = self.table()
