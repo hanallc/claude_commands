@@ -546,6 +546,36 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(admission_wire.read_assignment(path), local_grant)
         self.assertIn("placement: retry — fixture-host (mac-linux) did not answer.", output.getvalue())
 
+    def test_a_refused_placement_during_the_retry_stops_the_gate_as_blocked(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        guest_assignment = self.gate_assignment("mac-linux")
+        request = self.gate_request(guest_assignment)
+        path = self.write_gate_assignment(guest_assignment)
+        self.set_placement_status(guest_assignment, placement.CurrentAssignment())
+        admitted = first_step.FirstStepAdmission(SlotQueuePosition("episode", 1.0),
+            first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
+
+        def settle(_refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
+            return admission_wire.DispatchStatus(guest_assignment, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER),
+                placement.PermissionAvailable(), retry=placement.RetryAt(190.0))
+
+        def run() -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()):
+                status = gate.main(["--tests-only", "--repo", str(self.checkout)])
+            return subprocess.CompletedProcess(["gate.py", "--tests-only"], status, "", "")
+
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(
+                  "mac-linux: not started: fixture")) as guest,
+              mock.patch.object(admission_client, "claim_failure", side_effect=settle),
+              mock.patch.object(first_step, "_placement_grant",
+                                side_effect=first_step.FirstStepRefused("the request left the queue", 75)),
+              redirect_stdout(io.StringIO())):
+            result = admitted.run_gate(run)
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
+        self.assertIn("Gate placement blocked. the request left the queue", result.stderr)
+        guest.assert_called_once()
+
     def test_merge_gate_cli_reports_failed_mac_linux_jobs(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
         assignment = self.gate_assignment("mac-linux")

@@ -23,7 +23,8 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
-    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand, VerifyCommand, command_job, command_program, parse_command_program, verify_command,
+    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
+    VerifyCommand, command_job, command_program, parse_command_program, verify_command,
 )
 from scripts.mac_test import claim_state
 
@@ -269,7 +270,7 @@ def run_gate_with_placement(
             if (not assignment_matches_request(replacement, request)
                     or replacement.attempt == refusal.assignment.attempt):
                 raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
-        except (OSError, ValueError, wire.AdmissionUnavailable) as error:
+        except (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused) as error:
             return subprocess.CompletedProcess(request.constraints.command, result.returncode, '',
                                                f'Gate placement blocked. {error}\n')
 
