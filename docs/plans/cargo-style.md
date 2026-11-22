@@ -205,10 +205,10 @@ S3 and S4 run one after the other: a unit holds one Rust build-queue item at a t
 
 S3 has nine phases, re-cut from the declaration scope read (style-unit, 2026-11-19: the declaration outcome calls the rename proofs). Each phase is one cargo-liner checkpoint and adds one answer to the `finding` reply. The first two ran in series. The rest run in three groups (cargo-liner showrunner ruling): each group runs the full suite and Python parity once, on its final tree, and merges as one. Group C runs last, after group A merges.
 
-1. `s3-cache` (done): typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
-2. `s3-ledger` (done): read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
+1. `s3-cache` (done; on main 2026-11-22): typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
+2. `s3-ledger` (done; on main 2026-11-22): read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
 
-Group A (branch `style-s3`, checkpoints done 2026-11-20):
+Group A (branch `style-s3`, checkpoints done 2026-11-20; on main 2026-11-22, merge run 6, main a9dea4906):
 
 3. `s3-site`: `original_site`, whether the original judgment still covers a site at the synced tip (`_site_proof`).
 4. `s3-relocation`: `same_declaration`, the declaration in place, a gained same-name destination, or the exact blocker.
