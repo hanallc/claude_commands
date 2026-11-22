@@ -253,13 +253,6 @@ def repository_identity(repo_root: Path) -> RepositoryIdentity:
     return KnownRepository(name) if key == store.UNKNOWN_IDENTITY else KnownRepository(name, key)
 
 
-def mac_history_key(key: str) -> str:
-    """Use the queue history key for a Mac claim without an origin."""
-    if key.startswith("git-dir:"):
-        return repository.git_root_key(str(Path(key.removeprefix("git-dir:")).parent))
-    return key or store.UNKNOWN_IDENTITY
-
-
 def comma_values(value: str) -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 

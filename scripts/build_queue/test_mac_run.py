@@ -52,7 +52,7 @@ class MacRunTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin",
                             ORIGIN], check=True)
         _ = (self.root / "machines.conf").write_text("mac.hosts=fixture-mac\n")
-        _ = (self.root / "build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\n"
+        _ = (self.root / "build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
                                                         + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         _ = (self.root / "mac_test.conf").write_text("offload=on\nslots.claude_commands=99\n")
         self.configure_limit(1)
@@ -348,6 +348,9 @@ class MacRunTests(unittest.TestCase):
         reservation.recover_only = True
         self.assertEqual(build_targets.reserve_assigned(reservation), 13)
         self.assertEqual(identity_file.read_text(), "old\told-episode\told-attempt\t\n")
+        reservation.recover_only = False
+        with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use saved scope")):
+            self.assertEqual(build_targets.reserve_assigned(reservation), 13)
         runner = self.native_claim(other)
         runner.remote, runner.from_pid = "fixture-mac", waiting.pid
         runner.claim_id, runner.episode, runner.attempt = "old", "old-episode", "old-attempt"
@@ -429,24 +432,121 @@ class MacRunTests(unittest.TestCase):
                       cast(str, cleanup.call_args.args[2]))
         self.assertFalse(pending.exists())
 
-    def test_mac_history_matches_the_queue_for_a_repository_without_an_origin(self) -> None:
+    def test_mac_history_matches_the_queue_after_a_reservation_handoff(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "remove", "origin"], check=True)
-        saved = claim_state.mac_repository_identity(str(self.checkout))
-        assert isinstance(saved, claim_state.MacRepositoryIdentity)
-        queue_key = repository.repository_key(str(self.checkout))
-        self.assertTrue(queue_key.startswith("git-root:"))
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
-                                           1, 1, 1, "1", {"abandoned_session_minutes": "1"})
-        request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
-                                        "verify", "", target="mac", verb="check")
-        command = offload.remote_test_command(config, request, eligibility.KnownRepository(saved.mirror_name, saved.key))
-        remote_key, = (word.removeprefix("BUILDLOG_REPO_IDENTITY=") for word in shlex.split(command)
-                       if word.startswith("BUILDLOG_REPO_IDENTITY="))
-        self.assertEqual(remote_key, queue_key)
-        self.assertTrue(step_estimator.history_matches_repository({"repo_identity": remote_key},
-                                                                   RepositoryIdentity(queue_key, "checkout")))
+            1, 1, 1, "1", {"abandoned_session_minutes": "1", "linux_only..claude": ""})
+        with mock.patch.object(eligibility, "read_config", return_value=config):
+            for local_origin in (True, False):
+                with self.subTest(local_origin=local_origin):
+                    checkout = self.checkout if local_origin else self.repo
+                    git = ["git", "-C", str(checkout), "remote"]
+                    _ = subprocess.run([*git, "set-url", "origin", str(self.repo)] if local_origin
+                                       else [*git, "remove", "origin"], check=True)
+                    queue_repository, _ = step_estimator.git_identity(["cargo", "check"], str(checkout))
+                    assert isinstance(queue_repository, RepositoryIdentity)
+                    if local_origin:
+                        self.assertEqual(queue_repository.key, str(self.repo))
+                    else:
+                        self.assertTrue(queue_repository.key.startswith("git-root:"))
+                    waiting = self.native_claim(checkout)
+                    waiting.repo_root, waiting.verb, waiting.target = str(checkout), "check", "mac"
+                    with mock.patch.object(repository, "repository_key", wraps=repository.repository_key) as read_key:
+                        self.assertEqual(mac_test.command_claim_wait(waiting, self.paths), 0)
+                    read_key.assert_called_once_with(str(checkout))
+                    held, = claim_state.read_claims(self.paths)
+                    saved = claim_state.saved_mac_repository(held.record)
+                    assert isinstance(saved, claim_state.MacRepositoryIdentity)
+                    self.assertEqual(saved.key, REPOSITORY_KEY if local_origin else "git-dir:" + str(checkout / ".git"))
+                    self.assertEqual(saved.history_key, queue_repository.key)
+                    admission = offload.MacClaimFromWait(waiting.pid, claim_state.claim_identity(held.record), NoOwningSession())
+                    request = offload.OffloadRequest(checkout, "hana", "test", offload.NO_RESULT_FILE, (),
+                        "verify", "", target="mac", verb="check", admission=admission)
+                    controller = offload.ProcessController()
+                    from scripts.copies import copies
+
+                    with mock.patch.object(repository, "repository_key", side_effect=AssertionError("Use saved history")), \
+                            mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use saved scope")), \
+                            mock.patch.object(copies, "remote_lease"), \
+                            mock.patch.object(offload, "leased_offload", return_value=offload.PassedOnMac(1)):
+                        self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()),
+                                              offload.PassedOnMac)
+                        key = controller.attempt_evidence.repository_key
+                        assert isinstance(key, str)
+                        command = offload.remote_test_command(config, request,
+                            eligibility.KnownRepository(saved.mirror_name, saved.key), history_key=key)
+                    remote_key, = (word.removeprefix("BUILDLOG_REPO_IDENTITY=") for word in shlex.split(command)
+                                   if word.startswith("BUILDLOG_REPO_IDENTITY="))
+                    self.assertTrue(step_estimator.history_matches_repository({"repo_identity": remote_key}, queue_repository))
+                    self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
+
+    def test_wait_reservation_retry_keeps_the_exact_claim_after_an_origin_change(self) -> None:
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {"linux_only.checkout": ""})
+        for assigned in (True, False):
+            with self.subTest(assigned=assigned):
+                git = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
+                _ = subprocess.run([*git, ORIGIN], check=True)
+                args = build_targets.CliArguments()
+                args.pid, args.repo_root = os.getpid(), str(self.checkout)
+                args.target, args.kind = "mac", "check"
+                args.reservation_file = str(self.root / "reservation")
+                identity_file = self.root / "reservation.identity"
+                args.claim_identity_file = str(identity_file)
+                if assigned:
+                    start = process_identity.process_start(args.pid)
+                    assert isinstance(start, process_identity.Started)
+                    assignment = placement.PlacementAssignment("saved-episode", "saved-attempt",
+                        placement.PlacementDestination("mac", "mac", "fixture-mac",
+                            claim_state.RepositoryScope("checkout", REPOSITORY_KEY)),
+                        execution_identity.SourceKeyUnavailable("The fixture has no source key"),
+                        placement.SubmittingOwner("fixture-host", args.pid, start.start), NoOwningSession(), 0)
+                    assignment_file = self.root / "assignment.json"
+                    _ = assignment_file.write_text(wire.encode_reply(wire.Assignment(assignment)))
+                    args.assignment_file = str(assignment_file)
+                with mock.patch.object(eligibility, "read_config", return_value=config), \
+                        mock.patch.object(offload, "probe_reachability", return_value=offload.ReachableHost()):
+                    self.assertEqual(build_targets.command_reserve(args), 0)
+                    held, = claim_state.read_claims(self.paths)
+                    claim_bytes = held.path.read_bytes()
+                    identity_bytes = identity_file.read_bytes()
+                    other = self.repository(f"other-{assigned}")
+                    _ = subprocess.run(["git", "-C", str(other), "remote", "add", "origin",
+                                        "https://example.invalid/team/other.git"], check=True)
+                    _ = subprocess.run([*git, str(other)], check=True)
+                    with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use saved scope")), \
+                            mock.patch.object(mac_test, "command_claim_wait") as claim_wait:
+                        self.assertEqual(build_targets.command_reserve(args), 0)
+                    claim_wait.assert_not_called()
+                    self.assertEqual(claim_state.read_claims(self.paths), (held,))
+                    self.assertEqual(held.path.read_bytes(), claim_bytes)
+                    self.assertEqual(identity_file.read_bytes(), identity_bytes)
+                    released = mac_test.release_exact_claims(self.paths, args.pid, claim_state.claim_identity(held.record), "")
+                    self.assertEqual(released, mac_test.ClaimsReleased(1, ()))
+                    Path(args.reservation_file).unlink()
+                    identity_file.unlink()
+
+    def test_mac_capacity_uses_the_assigned_scope_after_an_origin_change(self) -> None:
+        assigned_scope = claim_state.target_claim_scope(self.paths, str(self.checkout))
+        other = self.repository("other")
+        _ = subprocess.run(["git", "-C", str(other), "remote", "add", "origin",
+                            "https://example.invalid/team/other.git"], check=True)
+        _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", str(other)], check=True)
+        busy = self.native_claim(self.checkout)
+        self.assertEqual(mac_test.command_claim(busy, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, busy, self.paths)
+        settings = self.root / "mac_test.conf"
+        self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout), "busy")
+        with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("Use the assigned scope")):
+            self.assertEqual(mac_test.free_now(self.paths, settings, self.checkout, mac_scope=assigned_scope), "free")
+
+    def test_guest_refuses_a_mirror_name_with_a_tab_before_writing_state(self) -> None:
+        checkout = self.repository("with\ta-tab")
+        with self.assertRaises(mac_run.MacRunRefused):
+            with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("The guest used an invalid mirror name")
+        self.assertFalse(self.paths.directory.exists())
 
     def test_guest_probe_and_claim_share_the_scope_without_an_origin(self) -> None:
         _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "remove", "origin"], check=True)

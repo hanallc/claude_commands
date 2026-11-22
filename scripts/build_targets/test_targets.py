@@ -16,6 +16,7 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
+from scripts.buildlog import repository
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, target_config, targets
@@ -746,6 +747,7 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
                         mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.MacRepositoryIdentity(
                             "fixture-hana", "hana", "hana.json", "hana")), \
+                        mock.patch.object(repository, "repository_key", return_value="fixture-history"), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):

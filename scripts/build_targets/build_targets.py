@@ -587,6 +587,7 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
                 backoff: eligibility.BackoffState | eligibility.ReadBackoff,
                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
@@ -594,14 +595,16 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
               else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
+    mac_repository = (eligibility.KnownRepository(mac_scope.name, mac_scope.key)
+                      if isinstance(mac_scope, claim_state.RepositoryScope) else mac_scope)
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
-        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff)
+        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff, mac_repository=mac_repository)
     if isinstance(repository, eligibility.IneligibleMacStep):
         return ExcludedTarget(target, repository.reason)
     for step in rest:
         policy = eligibility.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
+            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff, mac_repository=mac_repository)
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     return repository
@@ -733,6 +736,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -745,13 +749,13 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                   else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
         repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF,
-                                 configuration=configuration)
+                                 configuration=configuration, mac_scope=mac_scope)
         if isinstance(repository, ExcludedTarget):
             return repository
         if isinstance(answer, CapacityNotRead):
             settings = config.source if isinstance(config, eligibility.OffloadConfig) else config.configuration.source
             answer = mac_test.free_now(mac_test.state_paths(name), settings, repo_root, session=session,
-                                      configuration=configuration)
+                                      configuration=configuration, mac_scope=mac_scope)
     except (OSError, UnicodeError, ValueError) as error:
         if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
             raise
@@ -795,6 +799,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
 
@@ -842,12 +847,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
         answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
-                                 configuration=configuration)
+                                 configuration=configuration, mac_scope=mac_scope)
         if new_step and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
             return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
-                                          configuration=configuration, session=session)
+                                          configuration=configuration, session=session, mac_scope=mac_scope)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
     config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
@@ -910,8 +915,11 @@ def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
         return 2
 
 
-def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
-                    *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int, *,
+                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                        expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                        mac_scope: claim_state.ClaimScope = claim_state.WHOLE_MAC,
+                        ) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
     """Find the exact reservation for this process and session."""
     from scripts.lib import process_start as process_identity
     from scripts.mac_test import mac_test
@@ -922,17 +930,40 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
         return claim_state.NO_CLAIM_IDENTITY
     try:
         worktree = claim_state.claim_worktree_path(repo_root)
-        scope = mac_test.target_claim_scope(paths, str(worktree))
         block = mac_test.blocking_claim_block(paths, session)
-        return next((claim_state.claim_identity(claim.record) for claim in mac_test.read_claims(paths)
-                     if claim.record["pid"] == pid and claim.record["proc_start"] == start.start
-                     and claim.record["submitting_session"] == claim_state.session_id(session)
-                     and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
-                     and mac_test.wait_claim_matches(paths, claim, scope, worktree)
-                     and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)),
-                    claim_state.NO_CLAIM_IDENTITY)
+        claims = [claim for claim in mac_test.read_claims(paths)
+                  if claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                  and claim.record["submitting_session"] == claim_state.session_id(session)
+                  and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                  and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)]
+        if paths.platform == "macos":
+            claims = [claim for claim in claims
+                      if (isinstance(expected, claim_state.NoClaimIdentity)
+                          or claim_state.claim_identity(claim.record) == expected)
+                      and (isinstance(mac_scope, claim_state.WholeMacScope)
+                           or claim.matches_mac_assignment_scope(mac_scope))
+                      and (claim_state.recorded_worktree_matches(claim.record["worktree"], worktree)
+                           or (claim.record.get("cleanup_pending")
+                               and (isinstance(expected, claim_state.ClaimIdentity)
+                                    or not claim.record.get("repo_key"))))]
+            return claim_state.claim_identity(claims[0].record) if len(claims) == 1 else claim_state.NO_CLAIM_IDENTITY
+        scope = mac_test.target_claim_scope(paths, str(worktree))
+        return next((claim_state.claim_identity(claim.record) for claim in claims
+                     if mac_test.wait_claim_matches(paths, claim, scope, worktree)), claim_state.NO_CLAIM_IDENTITY)
     except (OSError, mac_test.StateReadError):
         return claim_state.NO_CLAIM_IDENTITY
+
+
+def published_wait_identity(path: str, session: SubmittingSession) -> claim_state.ClaimIdentity | claim_state.NoClaimIdentity:
+    if not path:
+        return claim_state.NO_CLAIM_IDENTITY
+    try:
+        claim_id, episode, attempt, saved_session = Path(path).read_text().removesuffix("\n").split("\t")
+    except FileNotFoundError:
+        return claim_state.NO_CLAIM_IDENTITY
+    if not claim_id or not episode or not attempt or saved_session != claim_state.session_id(session):
+        raise ValueError("the saved reservation identity does not match the wait")
+    return claim_state.ClaimIdentity(claim_id, episode, attempt)
 
 
 def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: SubmittingSession) -> None:
@@ -1037,13 +1068,16 @@ def reserve_assigned(args: CliArguments) -> int:
         publish_wait_reservation(args, target, identity, assignment.session)
         return 0
     paths = mac_test.state_paths(target.name)
-    if args.recover_only:
+    expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                        assignment.episode, assignment.attempt)
+    published = (published_wait_identity(args.claim_identity_file, assignment.session)
+                 if paths.platform == "macos" and not args.recover_only and Path(args.reservation_file).is_file()
+                 else claim_state.NO_CLAIM_IDENTITY)
+    if args.recover_only or (isinstance(published, claim_state.ClaimIdentity) and published != expected):
         from scripts.lib import process_start
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-                                                     assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78
@@ -1055,18 +1089,21 @@ def reserve_assigned(args: CliArguments) -> int:
                     and held.record["pid"] == args.pid
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
-                    and (claim_state.claim_identity(held.record) == expected
-                         or "remote_host" in held.record and held.record.get("cleanup_pending"))]
-                if not matches:
+                    and ((args.recover_only and claim_state.claim_identity(held.record) == expected)
+                         or ("remote_host" in held.record and held.record.get("cleanup_pending")
+                             and (args.recover_only or claim_state.claim_identity(held.record) == published)))]
+                if not matches and args.recover_only:
                     return 1
-                if len(matches) != 1:
+                if len(matches) > 1:
                     return 78
-                held = matches[0]
-                publish_wait_reservation(args, target, claim_state.claim_identity(held.record), assignment.session)
-                return 13 if "remote_host" in held.record else 0
+                if matches:
+                    held = matches[0]
+                    publish_wait_reservation(args, target, claim_state.claim_identity(held.record), assignment.session)
+                    return 13 if "remote_host" in held.record else 0
         except (OSError, ValueError, mac_test.StateReadError):
             return 78
-    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=assignment.session)
+    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=assignment.session,
+                                   expected=expected, mac_scope=assignment.destination.scope)
     if (isinstance(identity, claim_state.ClaimIdentity)
             and (identity.episode, identity.attempt) == (assignment.episode, assignment.attempt)):
         publish_wait_reservation(args, target, identity, assignment.session)
@@ -1107,7 +1144,9 @@ def command_reserve(args: CliArguments) -> int:
                     from scripts.mac_test import mac_test
 
                     paths = mac_test.state_paths(name)
-                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+                    expected = (published_wait_identity(args.claim_identity_file, session) if paths.platform == "macos"
+                                else claim_state.NO_CLAIM_IDENTITY)
+                    identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session, expected=expected)
                     if isinstance(identity, claim_state.ClaimIdentity):
                         publish_wait_reservation(args, target, identity, session)
                         return 0
@@ -1130,6 +1169,9 @@ def command_reserve(args: CliArguments) -> int:
             continue
         paths = mac_test.state_paths(target.name)
         identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
+        if paths.platform == "macos" and isinstance(identity, claim_state.ClaimIdentity):
+            publish_wait_reservation(args, target, identity, session)
+            return 0
         if isinstance(identity, claim_state.NoClaimIdentity):
             answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
             if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):

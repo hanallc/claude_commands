@@ -1961,6 +1961,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                mac_kind: MacClaimKind = MacClaimKind.MIRROR,
                mac_repository: claim_state.MacRepositoryIdentity | WholeMacScope = WHOLE_MAC) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
+    if (isinstance(mac_repository, claim_state.MacRepositoryIdentity)
+            and not claim_state.valid_mac_path_component(mac_repository.mirror_name)):
+        return ClaimDenied(12, "invalid Mac repository path")
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
@@ -2178,6 +2181,8 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
         return 1
     args.worktree = str(worktree)
     args.what = f"{args.verb} {args.package or 'workspace'}"
+    if isinstance(mac_repository, claim_state.MacRepositoryIdentity):
+        mac_repository = mac_repository.with_history(worktree)
     return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment,
                          mac_repository=mac_repository)
 
@@ -2373,6 +2378,7 @@ def free_now(
     mac_kind: MacClaimKind = MacClaimKind.MIRROR,
     mac_repository: claim_state.MacRepositoryIdentity | WholeMacScope | claim_state.ResolveMacRepository
     = claim_state.RESOLVE_MAC_REPOSITORY,
+    mac_scope: ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2396,13 +2402,15 @@ def free_now(
         if isinstance(backoff, eligibility.ActiveBackoff):
             return "backoff"
     session = claim_state.submitting_session(session)
-    if paths.platform == "macos" and isinstance(mac_repository, claim_state.ResolveMacRepository):
-        mac_repository = claim_state.mac_repository_identity(str(repo_root))
     if paths.platform == "linux":
         scope = target_claim_scope(paths, str(repo_root))
     else:
-        scope = (RepositoryScope(mac_repository.mirror_name, mac_repository.key)
-                 if isinstance(mac_repository, claim_state.MacRepositoryIdentity) else WHOLE_MAC)
+        if isinstance(mac_scope, claim_state.ResolveMacRepository):
+            if isinstance(mac_repository, claim_state.ResolveMacRepository):
+                mac_repository = claim_state.mac_repository_identity(str(repo_root))
+            mac_scope = (RepositoryScope(mac_repository.mirror_name, mac_repository.key)
+                         if isinstance(mac_repository, claim_state.MacRepositoryIdentity) else WHOLE_MAC)
+        scope = mac_scope
     if guest and not isinstance(scope, RepositoryScope):
         return "state"
     try:
@@ -2412,9 +2420,8 @@ def free_now(
         claims = read_claims(paths)
     except (OSError, StateReadError):
         return "state"
-    repository_name = (None if guest else mac_repository.mirror_name
-                       if isinstance(mac_repository, claim_state.MacRepositoryIdentity) else
-                       repository.repo_name(str(repo_root)) if paths.platform == "linux" else None)
+    repository_name = (None if guest else repository.repo_name(str(repo_root)) if paths.platform == "linux"
+                       else scope.name if isinstance(scope, RepositoryScope) else None)
     if repository_name is not None and isinstance(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"

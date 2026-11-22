@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 import fcntl
@@ -16,6 +16,7 @@ from subprocess import SubprocessError
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.buildlog import store
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
@@ -292,6 +293,7 @@ class MacRepositoryRecord(TypedDict):
     mirror_name: str
     claim_file: str
     fence_directory: str
+    history_key: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -302,19 +304,33 @@ class MacRepositoryIdentity:
     mirror_name: str
     claim_file: str
     fence_directory: str
+    history_key: str = store.UNKNOWN_IDENTITY
+
+    def with_history(self, worktree: Path) -> MacRepositoryIdentity:
+        from scripts.buildlog import repository
+
+        return replace(self, history_key=repository.repository_key(str(worktree)))
 
     def for_slot(self, slot: int) -> MacRepositoryIdentity:
         fence = mac_claim_stem(self.key, slot)
-        return MacRepositoryIdentity(self.key, self.mirror_name, f"{fence}.json", fence)
+        return replace(self, claim_file=f"{fence}.json", fence_directory=fence)
 
     def record(self) -> MacRepositoryRecord:
-        return {"key": self.key, "mirror_name": self.mirror_name,
-                "claim_file": self.claim_file, "fence_directory": self.fence_directory}
+        record: MacRepositoryRecord = {"key": self.key, "mirror_name": self.mirror_name,
+                                       "claim_file": self.claim_file, "fence_directory": self.fence_directory}
+        if self.history_key != store.UNKNOWN_IDENTITY:
+            record["history_key"] = self.history_key
+        return record
 
 
 def mac_claim_stem(key: str, slot: int) -> str:
     digest = sha256(key.encode()).hexdigest()
     return f"{digest}!{slot}" if slot else digest
+
+
+def valid_mac_path_component(value: object) -> bool:
+    return (isinstance(value, str) and bool(value) and value not in (".", "..")
+            and not any(character in value for character in "/\0\r\n\t"))
 
 
 def mac_repository_record(value: object) -> MacRepositoryIdentity:
@@ -325,14 +341,15 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity:
                                ("key", "mirror_name", "claim_file", "fence_directory"))
     if not isinstance(key, str) or not key:
         raise StateReadError("invalid Mac repository key")
-    if not all(isinstance(field, str) and field and field not in (".", "..")
-               and "/" not in field and not any(c in field for c in "\0\r\n\t")
-               for field in (mirror, file, fence)):
+    if not all(valid_mac_path_component(field) for field in (mirror, file, fence)):
         raise StateReadError("invalid Mac repository path")
     assert isinstance(mirror, str) and isinstance(file, str) and isinstance(fence, str)
     if file != f"{fence}.json":
         raise StateReadError("the Mac claim file and fence directory differ")
-    return MacRepositoryIdentity(key, mirror, file, fence)
+    history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
+    if not isinstance(history_key, str) or not history_key:
+        raise StateReadError("invalid Mac history key")
+    return MacRepositoryIdentity(key, mirror, file, fence, history_key)
 
 
 class NoSavedMacRepository:
@@ -348,7 +365,7 @@ def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | NoSavedMa
 
 def legacy_mac_mirror_name(record: RunRecord) -> str:
     name = record.get("repo_name", "")
-    return name if name not in (".", "..") and not any(c in name for c in "/\0\r\n\t") else ""
+    return name if valid_mac_path_component(name) else ""
 
 
 def claim_fence_directory(path: Path, record: RunRecord) -> str:
@@ -549,7 +566,7 @@ def mac_repository_identity(worktree: str) -> MacRepositoryIdentity | WholeMacSc
         key = repository.remote_identity(origin, str(folder)) if origin else "git-dir:" + source
     except (OSError, SubprocessError, ValueError):
         return WHOLE_MAC
-    if not folder.name:
+    if not valid_mac_path_component(folder.name):
         return WHOLE_MAC
     fence = mac_claim_stem(key, 0)
     return MacRepositoryIdentity(key, folder.name, f"{fence}.json", fence)

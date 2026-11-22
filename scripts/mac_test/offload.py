@@ -2183,6 +2183,7 @@ def remote_test_command(
     request: OffloadRequest,
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
+    *, history_key: str = store.UNKNOWN_IDENTITY,
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
@@ -2207,8 +2208,8 @@ def remote_test_command(
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
-    history_key = eligibility.mac_history_key(repository.key)
-    repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(history_key)} " if history_key != store.UNKNOWN_IDENTITY else ""
+    repo_identity = (f"BUILDLOG_REPO_IDENTITY={shlex.quote(history_key)} "
+                     if history_key and history_key != store.UNKNOWN_IDENTITY else "")
     target = shlex.quote(mirror_target(repository, request.target, request.slot))
     custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
     if isinstance(request.fetch, FetchFolder):
@@ -2770,7 +2771,9 @@ def claimed_run(
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
         try:
-            step_command = remote_test_command(config, request, repository, copied.tree_key)
+            history_key = evidence.repository_key
+            step_command = remote_test_command(config, request, repository, copied.tree_key,
+                history_key=history_key if isinstance(history_key, str) else store.UNKNOWN_IDENTITY)
         except ValueError as error:
             evidence.execution = execution_identity.ExecutionNotStarted()
             return DeclinedMacRun("state", elapsed_seconds(started), str(error))
@@ -3360,6 +3363,7 @@ def run_offload(
             saved = claim_state.saved_mac_repository(held.record)
             if isinstance(saved, claim_state.MacRepositoryIdentity):
                 policy_repository = saved
+                controller.attempt_evidence.repository_key = saved.history_key
             elif mirror := claim_state.legacy_mac_mirror_name(held.record):
                 policy_repository = KnownRepository(mirror, held.record.get("repo_key", ""))
             else:
@@ -3368,8 +3372,8 @@ def run_offload(
             resolved = claim_state.mac_repository_identity(str(request.repo_root))
             if isinstance(resolved, claim_state.WholeMacScope):
                 return declined("repo" if config.enabled else "off", started)
-            mac_repository = policy_repository = resolved
-        controller.attempt_evidence.repository_key = eligibility.mac_history_key(policy_repository.key)
+            mac_repository = policy_repository = resolved.with_history(request.repo_root)
+            controller.attempt_evidence.repository_key = mac_repository.history_key
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
                                                request.target, kind=request.kind, mac_repository=policy_repository)
     if isinstance(decision, IneligibleMacStep):

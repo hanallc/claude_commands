@@ -591,7 +591,7 @@ class OffloadSettingsTests(unittest.TestCase):
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
                 words = shlex.split(offload.remote_test_command(
-                    config, request, eligibility.KnownRepository("hana", key),
+                    config, request, eligibility.KnownRepository("hana"), history_key=key,
                 ))
                 assignments = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
                 self.assertEqual(assignments, [f"BUILDLOG_REPO_IDENTITY={key}"] if key else [])
