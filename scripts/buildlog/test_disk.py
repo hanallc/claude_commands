@@ -47,6 +47,8 @@ class DiskTests(unittest.TestCase):
             "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
             copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
+        # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
+        _ = os.environ.pop("SCCACHE_DIR", None)
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
 
