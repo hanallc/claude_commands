@@ -29,7 +29,7 @@ import sys
 import uuid
 from typing import Literal, Protocol, cast, final
 
-from scripts.agents import detached_runs, pane_record, worker_lifecycle
+from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
@@ -1497,6 +1497,7 @@ class RestoreReport:
     failures: dict[StaffId, tuple[str, str]] = field(default_factory=dict)
     run_failures: dict[Path, str] = field(default_factory=dict)
     skipped: dict[StaffId, str] = field(default_factory=dict)
+    record_busy: set[StaffId] = field(default_factory=set)
 
 
 @herdr.pane_evidence_run()
@@ -1640,6 +1641,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:
                 reason = " ".join(str(error).splitlines()) or type(error).__name__
+                if isinstance(error, shutdown_record.RecordBusy) and report is not None:
+                    report.record_busy.add(state.row.id)
                 if not resume_sent:
                     failed(state.row, reason, notice=f"anomaly: {name}: {reason}")
                 elif report is not None:

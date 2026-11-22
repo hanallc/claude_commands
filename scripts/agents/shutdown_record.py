@@ -154,7 +154,9 @@ def update(*, started: list[str], pending: list[str]) -> None:
             try:
                 worker_lifecycle.acquire_flock(lock, deadline=time.monotonic() + wait)
             except worker_lifecycle.OperationDeadlineExpired as error:
-                raise RecordBusy("not confirmed: the restart record is busy") from error
+                action = (f"remove {', '.join(started)} from" if started else
+                          f"save {', '.join(pending)} to" if pending else "update")
+                raise RecordBusy(f"could not {action} the restart record: the record is busy") from error
         save([row for row in read() if row not in started] + pending)
 
 

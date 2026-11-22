@@ -47,7 +47,7 @@ from scripts.accounts import accounts
 from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
-from scripts.agents import member_account, shutdown_record, stop_resume, pane_record
+from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
 from scripts.lib import conf, file_lock, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
@@ -2317,7 +2317,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             step_text = f"Nate opens a plain terminal without a staff session. Nate runs {retry} there."
             status = "not started: the restart was stopped"
             if step == "busy lock":
-                status = "not confirmed: the restart record is busy"
+                status = f"could not save {row.id} to the restart record: the record is busy"
                 step_text = "Nate waits for the command that holds the restart record lock to finish. " + step_text
             self.assertIn(f"{row.name}: {status}. {step_text}", lines)
             self.assertIn(f"Nate runs {retry} there.", lines[-1])
@@ -4470,6 +4470,40 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(errors.getvalue().splitlines(),
             ["missing: restart anomaly: no staff row; removed from the restart record"])
         self.assertEqual(self.stops, [])
+
+    def test_restart_keeps_a_deleted_id_when_its_record_lock_times_out(self) -> None:
+        missing = "missing-row"
+        rows = self.rows[:2]
+        shutdown_record.save([missing, *(str(row.id) for row in rows)])
+        self.running.clear()
+        path = shutdown_record.record_path().with_suffix(".lock")
+        acquire_flock = worker_lifecycle.acquire_flock
+        with path.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            def release_after_timeout(handle: int | worker_lifecycle.LockFileDescriptor, *,
+                                      mode: int = fcntl.LOCK_EX, deadline: float = math.inf) -> None:
+                try:
+                    acquire_flock(handle, mode=mode, deadline=deadline)
+                except worker_lifecycle.OperationDeadlineExpired:
+                    if getattr(handle, "name", None) == str(path):
+                        fcntl.flock(held, fcntl.LOCK_UN)
+                    raise
+
+            with (patch.object(worker_lifecycle, "acquire_flock", side_effect=release_after_timeout),
+                  patch.object(shutdown_record, "record_lock_seconds", return_value=0.05),
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(shutdown.main(["restart"]), 0)
+
+        self.assertCountEqual([name for name, _ in self.launches], [row.name for row in rows])
+        self.assertEqual(shutdown_record.read(), [missing])
+        report = output.getvalue()
+        self.assertEqual(Path(report.splitlines()[0]).read_text(), report)
+        self.assertIn("agents restart: 2 of 2 sessions back.", report)
+        self.assertIn(f"{missing}: could not remove {missing} from the restart record: the record is busy.", report)
+        self.assertIn("Nate waits for the command that holds the restart record lock to finish.", report)
+        self.assertIn("Nate runs agents restart there.", report)
+        self.assertNotIn("Restart removed the entry.", report)
 
     def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
         reference = str(self.rows[0].current_session)
