@@ -501,8 +501,11 @@ def _stop_scoped_command(
             if len(scopes) > 1:
                 record["moved_scope"] = scopes[-1]
             ended = _command_has_ended(record, record["pid"])
-            if ended and not record.get("stop_reason"):
-                return False
+            if ended:
+                if record["status"] == "finished" or not record.get("stop_reason"):
+                    return False
+                if record.get("scope_end_proved") and record.get("stop_pass_requested"):
+                    return True
             _ = record.setdefault("stop_reason", reason)
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             if not check():
@@ -782,7 +785,9 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             if not detached_run_process.supervises(raw["pid"], path):
                 result.queue_completion(path, raw)
             continue
-        if not _orphaned(path, raw, now):
+        if raw["status"] != "running":
+            continue
+        if raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path):
             continue
         claim = path.with_suffix(".reap")
         try:
@@ -790,17 +795,13 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         except FileExistsError:
             continue
         try:
-            with record_lock(path):
+            with record_lock(path), contextlib.ExitStack() as scope_lock:
                 record = _read_record(path)
-                if record["status"] != "running":
+                if "command_scope" in record and not scope_lock.enter_context(_scope_stop_lock(path)):
                     continue
-                if "command_scope" in record:
-                    with _scope_stop_lock(path) as acquired:
-                        if not acquired:
-                            continue
+                if not _orphaned(path, record, now):
+                    continue
                 record = _recover_staged_pane_stop(path, record)
-                if not _command_has_ended(record, record["pid"]):
-                    continue
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
                         and other.get("staff_id") == record["staff_id"]
                         and _number(other.get("started_at"), 0.0) > record["started_at"]

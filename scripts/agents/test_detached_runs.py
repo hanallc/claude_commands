@@ -2926,33 +2926,46 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.fixture.world.add(row, "w1:p1", family="codex")
         dispatch, reply = self.begin_pane_pass(row)
         record = self.record(row)
-        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start")
+        cgroups = self.fixture.root / "cgroups"
+        scope = cgroups / "builds.slice" / "director-stop.scope"
+        scope.mkdir(parents=True)
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        identity: process_stop.ScopeIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
+        }
+        record.update(pid=DEAD_PID, command_scope=identity)
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         reason = "Stop the private command."
+
+        def finish_scope(_directory: int, saved_scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+            self.assertEqual(saved_scope, identity)
+            self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), reason)
+            _ = events.write_text("populated 0\n")
+            return 1
+
         director = self.fixture.parent
         exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
         _ = self.fixture.session_record(director.current_session, director.name).replace(exact)
         self.addCleanup(exact.unlink, missing_ok=True)
+        _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", cgroups))
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": row.current_session}),
-              patch.object(detached_run_process, "supervisor_match", return_value=True),
-              patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
-              patch.object(detached_runs, "_signal_stopped_command") as signal_group,
-              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
-            self.assertTrue(self.record_confirmed_group_stop(
-                path, reason, signal_group=signal_group))
+              patch.object(process_stop, "_term_scope", side_effect=finish_scope) as term):
+            self.assertTrue(detached_runs.stop_command(path, reason))
             first_stop = path.read_bytes()
-            self.assertFalse(self.record_confirmed_group_stop(path, "A repeat."))
-            signal_group.assert_called_once_with(detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
+            self.assertTrue(detached_runs.stop_command(path, "A repeat."))
+            term.assert_called_once()
         self.assertEqual(path.read_bytes(), first_stop)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertIs(saved.get("stop_pass_requested"), True)
+        self.assertIs(saved.get("scope_end_proved"), True)
         self.assertNotIn("self_stop", saved)
         saved["exit_code"] = 143
         write_text_atomic(path, json.dumps(saved))
-        with patch.object(detached_runs, "_group_is_live", return_value=False):
-            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
         passed = worker_panes.worker_pass(row, self.run_dir)
         self.assertEqual(passed.get("status"), "canceled")
@@ -2971,8 +2984,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                          turn_end.TurnOutcome.STOPPED)
         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         final_record = path.read_bytes()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertFalse(self.record_confirmed_group_stop(path, reason))
+        self.assertFalse(detached_runs.stop_command(path, reason))
         self.assertEqual(path.read_bytes(), final_record)
         self.assertFalse(reply.exists())
         self.assertEqual(self.inputs, [])
