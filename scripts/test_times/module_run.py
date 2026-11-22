@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import gate_parent_pid
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, gate_parent
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
@@ -639,11 +639,11 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
-    parent = gate_parent_pid(consume=True)
     if not adopt_descendants():
         cleanup.enter_context(private_run_roots(owner))
         main(owner)
         return
+    parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -656,9 +656,9 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    if parent:
+    if not isinstance(parent, UnverifiedGateParent):
         # No test child exists before the parent-death handoff completes.
-        parent_fds.append(os.pidfd_open(int(parent)))
+        parent_fds.append(os.pidfd_open(int(parent.pid)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
     cleanup.enter_context(private_run_roots(owner))
