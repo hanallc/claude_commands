@@ -45,8 +45,10 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -92,14 +94,16 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        fixture = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        cls.repository_seed = fixture / "repo"
         _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, env=fixture_git_environment(fixture))
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        isolate_fixture_git(self, self.root)
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         unit_runs.RUN_ROOT.mkdir()
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -8216,7 +8220,18 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([phase.phase for phase in owners.by_phase], ["6"])
         self.assertEqual(owners.refused, [])
 
+    def model_phase_source(self) -> Path:
+        root = self.root.resolve()
+        config = model_worktree_environment(root, self.config_file.parent)
+        self.enterContext(patch.dict(os.environ, config))
+        source = root / "rust" / "fixture"
+        source.parent.mkdir()
+        return source
+
     def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
+        self.working_dir = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(self.working_dir)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
         self.start_numbered_phase(session_dir, "57c", 40_010)
         directory = phase_reservation.phase_directory(session_dir, "57c")
@@ -8239,13 +8254,12 @@ with patch.object(fcntl, "flock", admission):
         old_head = git(self.working_dir, "rev-parse", "HEAD")
         self.finish_numbered_phase(session_dir, 40_020)
 
-        scratch = self.root / "scratch"
-        _ = git(self.working_dir, "worktree", "add", "-qb", "scratch", str(scratch))
-        _ = (scratch / "new.txt").write_text("new start\n", encoding="utf-8")
-        _ = git(scratch, "add", "new.txt")
-        _ = git(scratch, "commit", "-qm", "scratch baseline")
-        _ = (scratch / "dirty.txt").write_text("present before dispatch\n", encoding="utf-8")
-        new_head = git(scratch, "rev-parse", "HEAD")
+        checkout = make_fixture_worktree(self.working_dir, "reservation", "p57c")
+        _ = (checkout / "new.txt").write_text("new start\n", encoding="utf-8")
+        _ = git(checkout, "add", "new.txt")
+        _ = git(checkout, "commit", "-qm", "phase baseline")
+        _ = (checkout / "dirty.txt").write_text("present before dispatch\n", encoding="utf-8")
+        new_head = git(checkout, "rev-parse", "HEAD")
         self.assertNotEqual(new_head, old_head)
 
         self.start_numbered_phase(session_dir, "57c", 40_030)
@@ -8258,12 +8272,12 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(current["working_dir"], str(self.working_dir))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
-                "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+                "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(checkout),
             ]), 0)
-        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(scratch) + "\n")
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(checkout) + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), new_head + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? dirty.txt\n")
-        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["new.txt"], scratch)
+        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["new.txt"], checkout)
         self.assertIsInstance(owners, phase_reservation.Attribution)
         if isinstance(owners, phase_reservation.Attribution):
             self.assertEqual([phase.phase for phase in owners.by_phase], ["57c"])
@@ -8274,11 +8288,12 @@ with patch.object(fcntl, "flock", admission):
         self.start_numbered_phase(run, "4a", 40_010)
         row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
         assert isinstance(row, staff.StaffRow)
-        checkout = self.root / "phase-repository"
-        _ = subprocess.run(["git", "init", "-q", str(checkout)], capture_output=True, check=True)
-        _ = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], capture_output=True, check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
                            capture_output=True, check=True)
+        checkout = make_fixture_worktree(source, "reservation", "p4a")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
                 "claim", "--session-dir", str(run), "--phase", "4a", "--repo", str(checkout),
@@ -8325,14 +8340,15 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_an_open_phase_retry_keeps_its_claim_from_any_cwd(self) -> None:
-        scratch = self.root / "scratch"
-        _ = subprocess.run(["git", "init", "-q", str(scratch)], check=True, capture_output=True,
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         _ = subprocess.run(
-            ["git", "-C", str(scratch), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-             "commit", "--allow-empty", "-qm", "scratch baseline"],
+            ["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-qm", "phase baseline"],
             check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+        checkout = make_fixture_worktree(source, "reservation", "p57c")
         for name, extra in (("retry-57c", ()),
                             ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):
             with self.subTest(name=name):
@@ -8343,12 +8359,12 @@ with patch.object(fcntl, "flock", admission):
                 _ = phase_reservation.enroll(directory, "57c", "unconfigured")
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(phase_reservation.main([
-                        "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+                        "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(checkout),
                     ]), 0)
                 state = (session_dir / plan_history.STATE_FILENAME).read_bytes()
                 events = self.read_events(name)
                 records = {path: path.read_bytes() for path in directory.iterdir() if path.is_file()}
-                for cwd in (self.working_dir, scratch, self.root):
+                for cwd in (self.working_dir, checkout, self.root):
                     with self.subTest(cwd=cwd), chdir(cwd):
                         self.start_numbered_phase(session_dir, "57c", 40_020, *extra)
                         self.assertEqual((session_dir / plan_history.STATE_FILENAME).read_bytes(), state)
@@ -9362,6 +9378,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         self.assertEqual(parsed.call_count, 4)
 
     def test_fixed_run_owner_survives_clear_and_uses_the_current_staff_folder_and_git_branch(self) -> None:
+        isolate_fixture_git(self, self.root)
         owner = fixture_member("showrunner", name="progress")
         first, second = self.root / "first", self.root / "second"
         first.mkdir()

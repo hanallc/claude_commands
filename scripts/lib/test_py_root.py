@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -209,6 +210,30 @@ class PythonRootTests(unittest.TestCase):
                     output = self.run_shim(shim, ["-c", "import os; print(os.environ['ROOT_HOOK'])"],
                                            Path("/"), environment)
                     self.assertEqual(output, "loaded")
+
+    def test_chained_hook_and_callback_do_not_import_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            shim = self.checkout(base / "selected", "selected")
+            hook = base / "hook"
+            hook.mkdir()
+            _ = (hook / "sitecustomize.py").write_text(
+                "from sitecustomize import after_startup\n"
+                + "after_startup(lambda: print('callback ran'))\n",
+                encoding="utf-8",
+            )
+            startup = shim.parent / "python_startup"
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; print('typing' in sys.modules)"],
+                cwd=shim.parents[2],
+                env={"PYTHONPATH": os.pathsep.join((str(startup), str(hook))), "PYTHONNOUSERSITE": "1"},
+                capture_output=True,
+                text=True,
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.splitlines(), ["callback ran", "False"])
 
     def test_isolated_script_loads_the_root_without_inherited_paths_or_user_site(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

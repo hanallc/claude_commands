@@ -23,17 +23,9 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+RUNTIME_LIST = ROOT / hana_render.RUNTIME_FILE_LIST
 IMAGE_LIST = ROOT / 'scripts/aws_target/hana_image.files'
-IMAGE_INPUTS = (
-    'config/hana_aws.conf',
-    'config/build_targets.conf',
-    'config/build_folders.conf',
-    'scripts/aws_target/hana_image.files',
-    'scripts/aws_target/hana_render.py',
-    'scripts/lib/conf.py',
-    'scripts/lib/conf_reads.py',
-)
+RENDER_LIST = ROOT / 'scripts/aws_target/hana_render.files'
 
 # The guest does not ship these imports for host operations, tests, and type annotations.
 UNSHIPPED_IMPORTS = {
@@ -52,7 +44,8 @@ UNSHIPPED_IMPORTS = {
     'lib/unit_runs.py': {'direct/worker_state.py'},
     'lint/memory_admit.py': {'message/unit_labels.py'},
     'mac_test/claim_state.py': {'buildlog/transfer_bytes.py'},
-    'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py'},
+    'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py',
+        'accounts/__init__.py', 'accounts/role_map.py'},
 }
 
 
@@ -81,15 +74,16 @@ class HanaRenderTests(unittest.TestCase):
             checkout = Path(temporary) / 'checkout'
             runtime_entries = RUNTIME_LIST.read_text().splitlines()
             image_entries = IMAGE_LIST.read_text().splitlines()
+            render_entries = RENDER_LIST.read_text().splitlines()
             image_inputs = checkout / 'image-inputs'
-            for entries in (runtime_entries, image_entries):
+            for entries in (runtime_entries, image_entries, render_entries):
                 self.assertEqual(len(entries), len(set(entries)))
                 for entry in entries:
                     with self.subTest(entry=entry):
                         relative = Path(entry)
                         self.assertFalse(relative.is_absolute())
                         self.assertNotIn('..', relative.parts)
-            for root, entries in ((image_inputs, (*image_entries, *IMAGE_INPUTS)),
+            for root, entries in ((image_inputs, render_entries),
                                   (checkout, (*runtime_entries, 'config/copies.conf'))):
                 for entry in entries:
                     destination = root / entry
@@ -109,6 +103,7 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..60\nlocks.probe_wait_seconds.fixture-guest=0.4\n'
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
+                + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
                 + 'roots.slots.fixture-guest=/fixture/slots\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
@@ -173,7 +168,8 @@ class HanaRenderTests(unittest.TestCase):
             for path in (*image_entries, 'config/build_folders.conf'):
                 self.assertEqual(stat.S_IMODE((image_runtime / path).stat().st_mode), 0o644)
             self.assertEqual((image_runtime / 'config/build_folders.conf').read_text(),
-                '# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+                'roots.build=/fixture/build\n# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n'
+                + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
             receiver = cast(dict[str, object], json.loads((output / 'receiver.json').read_text()))
             self.assertEqual(receiver['result_transfer_timeout_s'], 83)
             self.assertEqual(receiver['command_timeout_s'], 23)
@@ -221,6 +217,8 @@ class HanaRenderTests(unittest.TestCase):
                 (targets, 'loopback.shell_timeout_s.fixture-guest', False),
                 (folders, 'locks.probe_wait_seconds.fixture-guest', True),
                 (folders, 'locks.probe_wait_seconds', False),
+                (folders, 'roots.build.fixture-guest', True),
+                (folders, 'roots.build', False),
                 (folders, 'patterns.tool', False),
             ):
                 with self.subTest(file=path.name, key=key):

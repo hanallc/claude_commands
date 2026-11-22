@@ -5790,9 +5790,9 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(calls.read_text().splitlines(), [
             "nextest run --no-run --workspace",
             "nextest list --message-format json --workspace",
-            "nextest run --test-threads 3 --workspace",
+            "nextest run --test-threads 4 --workspace",
         ])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 4)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
@@ -6260,6 +6260,17 @@ class QueueExplanationTests(MemoryQueueFixture):
             counted = replace(inputs, reservations=reservations)
             self.assertEqual(gate.admission_pass(counted, inputs.now, policy).rows[0].decision.state, "admit")
 
+    def test_gate_admitted_in_the_pass_counts_toward_the_run_limit(self) -> None:
+        repo = "claude_commands"
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="gate")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name=repo, step="test-affected")
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repo}": 1}))
+        first, second = gate.admission_pass(inputs, inputs.now, policy).rows
+        self.assertEqual(first.decision.state, "admit")
+        self.assertEqual(second.decision.run_limit, admission_records.RunLimitWait(1, 1, repo, "natedev"))
+
     def test_only_waiters_under_the_same_run_limit_wait_behind_a_capped_run(self) -> None:
         repo = "claude_commands"
         _ = self.running(100, 2, age=30, fields={"repo": repo, "step": "gate"})
@@ -6516,12 +6527,19 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
 
     def test_repository_run_limits_follow_live_configuration(self) -> None:
         original = self.config.read_text()
-        for limit in (2, 3):
+        for limit in (0, 2, 3):
             _ = self.config.write_text(original + f"\n# whole: 1..\nmax_runs.natedev.claude_commands={limit}\n"
-                                       + "# whole: 1..\nmax_runs.mac.other.repo=4\nmax_runs_exempt_unit=natemerge\n")
+                                       + "# whole: 1..\nmax_runs.mac.other.repo=4\nmax_runs.exempt_unit=natemerge\n")
             runs = admission_records.read_memory_config().policy.repository_runs
-            self.assertEqual(runs.for_step("natedev", "claude_commands", "gate"), limit)
-            self.assertEqual(runs.for_step("mac", "other.repo", "test-affected"), 4)
+            self.assertEqual(runs.for_step("natedev", "claude_commands", "gate"),
+                             admission_records.RepositoryRunLimit(limit))
+            self.assertEqual(runs.for_step("mac", "other.repo", "test-affected"),
+                             admission_records.RepositoryRunLimit(4))
+            self.assertEqual(runs.for_repository("natedev", "claude_commands"),
+                             admission_records.RepositoryRunLimit(limit))
+            self.assertEqual(runs.for_repository("natedev", "hana"), admission_records.NoRepositoryRunLimit())
+            self.assertEqual(runs.for_step("natedev", "claude_commands", "check"),
+                             admission_records.NoRepositoryRunLimit())
             self.assertEqual(runs.exempt_unit, "natemerge")
 
     def test_missing_or_invalid_test_margin_uses_the_fallback_and_valid_margin_freezes(self) -> None:

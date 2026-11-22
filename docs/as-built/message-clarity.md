@@ -47,6 +47,21 @@ These fields do not change the recipient, reply name, or message key.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
+`send.py` keeps local messages during an open review and returns `KEPT`.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a unique name match, it gives a `session:` address.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
+
 ### Replies to relay sockets
 
 The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
@@ -417,8 +432,6 @@ Literal counters and owner notices keep their existing rules.
 The notifier detaches one supervised notice job with explicit HOME, XDG, configuration and repeat-state paths. The supervisor owns its process group, including delivery children, and kills descendants at its configured deadline or normal completion on Linux and macOS. Delivery subprocesses inherit this group. There is no nested drain worker or alarm. The nonblocking drain lock prevents overlap. Scheduling progress records admitted attempts, never inspection: insufficient budget leaves the sender cursor and notice order unchanged. An admitted attempt persists its claim and rotation to the tail of the sender’s notice list, then advances the sender cursor before discovery or delivery. Discovery and delivery share one bounded child attempt. A new attempt starts only when the supervisor deadline leaves its full configured budget plus subprocess cleanup; otherwise it stays pending for the next job. No synchronous launcher fallback runs.
 
 With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
-
-`scripts/lib/py scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
 
 ### Permission root cause: `scripts/message/rca.py`
 
