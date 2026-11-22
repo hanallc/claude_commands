@@ -161,12 +161,12 @@ def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> No
             _ = process.wait()
 
 
-def capture_command(command: list[str]) -> tuple[int, str]:
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
+def capture_command(command: list[str], *, capture_stderr: bool) -> tuple[int, str, str]:
+    with subprocess.Popen(command, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE if capture_stderr else None, text=True) as process:
         try:
             output, errors = process.communicate()
-            del errors
-            return process.returncode, output
+            return process.returncode, output, errors or ""
         finally:
             stop_command(process)
 
@@ -300,6 +300,10 @@ class Arguments(argparse.Namespace):
     owned_close: bool = False
     argv: list[str] = []
 
+    @property
+    def is_mac_run(self) -> bool:
+        return self.kind == "run" and Path(self.lifecycle_script).name == MAC_RUN_SCRIPT.name
+
 
 def blocking_run(
     args: Arguments, owner: OwningSession | NoOwningSession,
@@ -307,15 +311,20 @@ def blocking_run(
     if args.kind != "run":
         return mac_test.NO_MAC_BLOCK
     paths = claim_state.state_paths()
-    is_mac_run = Path(args.lifecycle_script).name == MAC_RUN_SCRIPT.name
     try:
         block = mac_test.blocking_claim_block(paths, owner)
     except (OSError, claim_state.StateReadError):
-        if is_mac_run:
+        if args.is_mac_run:
             return mac_test.unreadable_claim(paths.block)
         raise
-    if is_mac_run and not isinstance(block, claim_state.NoMacBlock):
+    if not args.is_mac_run:
+        return block
+    if not isinstance(block, claim_state.NoMacBlock):
         return mac_test.blocked_claim(block)
+    try:
+        _ = mac_test.read_claims(paths)
+    except mac_test.ClaimStateUnreadable as error:
+        return mac_test.unreadable_claim(error.path)
     return block
 
 
@@ -385,19 +394,26 @@ def run_attempt(
         argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
         lease_descriptor = -1
+        mac_run = args.is_mac_run
         try:
             while True:
-                code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
+                code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
                     args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
-                    assignment_file, command))
+                    assignment_file, command), capture_stderr=mac_run)
                 if code in (0, MAC_BUSY_STATUS):
                     block = blocking_run(args, owner)
-                if code != MAC_BUSY_STATUS or args.no_wait or not isinstance(block, claim_state.NoMacBlock):
+                if code != MAC_BUSY_STATUS or args.no_wait or mac_run or not isinstance(block, claim_state.NoMacBlock):
                     break
                 print(output, end="", flush=True)
                 wait_to_retry()
+            if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
+                print(errors, end="", file=sys.stderr, flush=True)
             if not isinstance(block, claim_state.NoMacBlock):
                 status = 0
+            elif code == MAC_BUSY_STATUS and mac_run:
+                if not errors:
+                    print("waiting for the Mac", file=sys.stderr, flush=True)
+                status = MAC_RUN_REFUSED_STATUS
             elif code:
                 print(output, end="", flush=True)
                 status = MAC_RUN_REFUSED_STATUS if args.lifecycle_script and code in (10, 11, 12) else code
@@ -480,9 +496,8 @@ def run_attempt(
                 print("mac queue: the Mac run may still be live; placement release is withheld", file=sys.stderr)
             # The queue ends the placement when this process ends, so the receipt has no later use.
             assignment_file.unlink(missing_ok=True)
-            if not isinstance(block, claim_state.NoMacBlock):
-                for receipt in receipts.glob(assignment_file.name + ".*"):
-                    receipt.unlink(missing_ok=True)
+            for receipt in receipts.glob(assignment_file.name + ".*"):
+                receipt.unlink(missing_ok=True)
             if not released:
                 print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1

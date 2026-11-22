@@ -472,6 +472,27 @@ if sys.argv[1] == "prepare":
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
             self.assertFalse((root / "remote").exists())
 
+    def test_run_retries_the_busy_status_when_it_can_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_QUEUE_BUSY": "1"}
+
+            def allow_placement() -> None:
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+                self.assertFalse((root / "remote").exists())
+                del os.environ["FAKE_QUEUE_BUSY"]
+
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=allow_placement) as wait,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(mac_queue_run.main(self.command(root, "run")[3:]), 0)
+
+            wait.assert_called_once()
+            self.assertEqual(output.getvalue().splitlines(), ["waiting for the Mac", "Mac output", "mac_exit=0"])
+            self.assertEqual([event[0] for event in self.events(root)],
+                             ["place-step", "place-step", "cancel-placement"])
+            self.assertTrue((root / "remote").is_file())
+
     def test_caller_watch_must_be_ready_before_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
