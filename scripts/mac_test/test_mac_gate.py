@@ -736,6 +736,31 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             kill.assert_called_once_with(pid, signal.SIGKILL)
         self.assertFalse(folder.exists())
 
+    def test_run_selects_all_modules_or_named_modules_from_the_working_tree(self) -> None:
+        first = module_path(module_job('one'))
+        second = module_job('two')
+        self.add_module(second)
+        _ = (self.repo / mac_gate.MODULE_LIST).write_text(first + '\n')
+        tree, _dirty = cloud_gate.working_tree(self.repo)
+        self.assertNotEqual(tree, self.tree)
+        output = self.root / 'mac.json'
+        row: dict[str, object] = {'tree': tree}
+        result = mac_gate.MacGateResult(row, gate.GateRun((), 0, 0))
+        paths = (module_path(second), first)
+        for modules, selected in (((), gate.ALL_MODULES), (paths, gate.TreeSelection(paths, tree))):
+            argv = ['mac_gate.py', 'run', str(self.repo), str(output)]
+            for path in modules:
+                argv.extend(('--module', path))
+            with (self.subTest(modules=modules), mock.patch.object(sys, 'argv', argv),
+                  mock.patch.object(mac_gate, 'run_remote', return_value=result) as run_remote,
+                  mock.patch.object(cloud_gate, 'save') as save):
+                self.assertEqual(mac_gate.main(), 0)
+                run_remote.assert_called_once_with(
+                    self.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
+                    module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
+                    cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME)
+                save.assert_called_once_with(output, row)
+
     def test_installed_stop_accepts_old_attempts_without_a_journal_or_script(self) -> None:
         checkout = self.root / 'retained checkout'
         checkout.mkdir()
@@ -953,6 +978,29 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             + 'scripts/fixture/test_skips.py\n'
             + 'scripts/fixture/test_tests.py\n',
         )
+
+    def test_list_writer_refuses_a_mac_subset_and_keeps_the_list(self) -> None:
+        first = module_job('one')
+        second = module_job('two')
+        self.add_module(second)
+        module_list = self.repo / mac_gate.MODULE_LIST
+        original = b'# Saved exclusions\n'
+        _ = module_list.write_bytes(original)
+        _ = commit_repository(self.repo, 'modules and exclusions')
+        tree, _dirty = cloud_gate.working_tree(self.repo)
+        baseline = self.root / 'natedev.jsonl'
+        store.append_line(baseline, {
+            'kind': 'gate_run', 'host': 'natedev', 'tree': tree, 'selection': 'full',
+            'dirty': False, 'aborted': False,
+            'modules': gate_record.module_runs(
+                gate_box.execution_records(gate.GateRun((first, second), 1, 0)), 1),
+        })
+        result = self.root / 'mac.json'
+        cloud_gate.save(result, {'tree': tree, 'gate': gate_box.encode_run(gate.GateRun((first,), 1, 0))})
+
+        with self.assertRaisesRegex(GateRefused, 'The Mac result module list differs from the full checkout list'):
+            mac_gate.write_modules(self.repo, result, baseline)
+        self.assertEqual(module_list.read_bytes(), original)
 
     def test_list_writer_refuses_a_record_from_another_tree(self) -> None:
         result = self.root / 'mac.json'

@@ -596,20 +596,24 @@ def write_modules(repo: Path, mac_result: Path, natedev_record: Path) -> None:
     if cloud_gate.working_tree(repo)[0] != tree:
         raise GateRefused('The checkout tree differs from the Mac result')
     baseline = natedev_counts(natedev_record, tree)
-    observed = set(baseline)
+    mac_modules: set[str] = set()
     passed: set[str] = set()
     for job in gate_box.decode_run(row['gate']).jobs:
         if job.kind is not gate.GateJobKind.TEST_MODULE:
             continue
         name = f'scripts/{job.suite}/{job.module}'
-        observed.add(name)
+        mac_modules.add(name)
         if (job.returncode == 0 and not job.killed_for
                 and isinstance(job.times, dict)
                 and baseline.get(name) == ModuleCounts(ledger.instant(ledger.mapping(job.times), 'tests_run'),
                                                        ledger.instant(ledger.mapping(job.times), 'skipped'))):
             passed.add(name)
+    checkout_modules = {path.relative_to(repo).as_posix() for _, path in discover_test_modules(repo)}
+    if mac_modules != checkout_modules:
+        raise GateRefused('The Mac result module list differs from the full checkout list')
+    excluded = (mac_modules | baseline.keys()) - passed
     write_text_atomic(repo / MODULE_LIST, MODULE_LIST_HEADER + ''.join(
-        name + '\n' for name in sorted(observed - passed)))
+        name + '\n' for name in sorted(excluded)))
 
 
 @dataclass
@@ -621,6 +625,7 @@ class Arguments(argparse.Namespace):
     argv_file: Path = Path()
     repo: Path = Path()
     output: Path = Path()
+    module: list[str] | None = None
     mac_result: Path = Path()
     natedev_record: Path = Path()
     owner: str = ''
@@ -631,9 +636,11 @@ class Arguments(argparse.Namespace):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
-    manual = commands.add_parser('run', help='run all modules on the Mac and save the result')
+    manual = commands.add_parser('run', help='run test modules on the Mac and save the result')
     _ = manual.add_argument('repo', type=Path)
     _ = manual.add_argument('output', type=Path)
+    _ = manual.add_argument('--module', action='append', default=None, metavar='PATH',
+                            help='run only the named modules. Repeat for each repository-relative path')
     writer = commands.add_parser('write-list', help='write exclusions from a Mac result and a natedev gate log')
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
@@ -671,8 +678,13 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
+            repo = args.repo.resolve()
+            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES
+            if args.module:
+                tree, _dirty = cloud_gate.working_tree(repo)
+                selected = gate.TreeSelection(tuple(args.module), tree)
+            result = run_remote(repo, mode=gate.SuiteMode.GATE, full=True,
+                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
                 raise GateRefused(result)
