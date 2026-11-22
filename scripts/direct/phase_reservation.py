@@ -395,14 +395,33 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     return KnownPhaseWorktree(root)
 
 
-def _require_model_worktree(root: Path, owner_unit: str) -> None:
-    from scripts.worktree import worktrees
+class _ModelWorktreePath(NamedTuple):
+    repo: str
+    unit: str
+    short_name: str
+    path: Path
 
+
+def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
+    """Return the model path and its names, or the error that explains the mismatch."""
     try:
         repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
         model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
         if root != model_path.resolve():
-            raise ValueError("the checkout is outside the worktree model")
+            return ValueError("the checkout is outside the worktree model")
+    except ValueError as error:
+        return error
+    return _ModelWorktreePath(repo, unit, short_name, model_path)
+
+
+def _require_model_worktree(root: Path, owner_unit: str) -> None:
+    from scripts.worktree import worktrees
+
+    try:
+        model = _model_worktree_path(root)
+        if isinstance(model, ValueError):
+            raise model
+        repo, unit, short_name, model_path = model
         if unit != owner_unit and not worktrees.has_unit_word(owner_unit, unit):
             raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
         record = worktrees.checkout_record(model_path)
@@ -463,7 +482,7 @@ def _record_claim_checkout(directory: Path, requested: Path | None) -> Path | No
         if recorded.is_dir():
             recorded = recorded.resolve()
             if (requested is not None and requested != recorded
-                    and not recorded.is_relative_to(copy_record.worktree_root())):
+                    and isinstance(_model_worktree_path(recorded), ValueError)):
                 try:
                     _require_model_worktree(requested, _phase_run_home(directory).unit)
                 except StateRefused:

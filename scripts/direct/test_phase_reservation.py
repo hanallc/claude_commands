@@ -131,29 +131,30 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual(self.claim("2", self.second), (0, ""))
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
 
-    def record_clone_outside_the_model(self, phase: str) -> Path:
-        clone = self.session.parent / f"phase-{phase}-clone"
+    def record_clone(self, phase: str, clone: Path) -> None:
         _ = subprocess.run(["git", "clone", "-q", str(self.first), str(clone)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         directory = phase_reservation.phase_directory(self.session, phase)
         directory.mkdir(parents=True)
         _ = (directory / phase_reservation.WORKTREE_FILE).write_text(str(clone) + "\n")
-        return clone
 
     def test_claim_moves_a_recorded_clone_to_a_model_worktree(self) -> None:
-        clone = self.record_clone_outside_the_model("2")
-        directory = phase_reservation.phase_directory(self.session, "2")
-        baseline = directory / phase_reservation.BASELINE_FILE
-        status = directory / phase_reservation.BASELINE_STATUS_FILE
-        first_commit = phase_reservation.commit_id(clone, "HEAD") + "\n"
-        first_status = "?? first-launch.txt\n"
-        _ = baseline.write_text(first_commit)
-        _ = status.write_text(first_status)
+        for phase, clone in (("2", self.session.parent / "phase-2-clone"),
+                             ("3", self.session.parent / "worktrees" / "legacy-home")):
+            with self.subTest(clone=clone):
+                self.record_clone(phase, clone)
+                directory = phase_reservation.phase_directory(self.session, phase)
+                baseline = directory / phase_reservation.BASELINE_FILE
+                status = directory / phase_reservation.BASELINE_STATUS_FILE
+                first_commit = phase_reservation.commit_id(clone, "HEAD") + "\n"
+                first_status = "?? first-launch.txt\n"
+                _ = baseline.write_text(first_commit)
+                _ = status.write_text(first_status)
 
-        self.assertEqual(self.claim("2", self.second), (0, ""))
-        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
-        self.assertEqual(baseline.read_text(), first_commit)
-        self.assertEqual(status.read_text(), first_status)
+                self.assertEqual(self.claim(phase, self.second), (0, ""))
+                self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+                self.assertEqual(baseline.read_text(), first_commit)
+                self.assertEqual(status.read_text(), first_status)
 
     def test_claim_keeps_the_recorded_model_worktree(self) -> None:
         self.assertEqual(self.claim("2", self.second), (0, ""))
@@ -164,7 +165,8 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
 
     def test_claim_refuses_a_recorded_clone_without_a_valid_model_worktree(self) -> None:
-        clone = self.record_clone_outside_the_model("2")
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
         directory = phase_reservation.phase_directory(self.session, "2")
         foreign = make_fixture_worktree(self.first, "other-unit", "p3")
         for requested in (self.first, foreign):
