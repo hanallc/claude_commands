@@ -86,9 +86,10 @@ This covers a Mac block or busy Mac claim, an active retry backoff, a failed gue
 The gate then writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
-The queue keeps the guest out of that episode for 180 seconds, so another named machine takes the run first.
+The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
 If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
-A cause that does not clear, such as a failed arm step, repeats every 180 seconds until the run is stopped.
+A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
+If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
 A failure after the guest armed the run is not placed again: the gate fails.
 `copies.py run` with named gate targets does not place the gate again yet.

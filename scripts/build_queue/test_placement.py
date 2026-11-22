@@ -121,6 +121,19 @@ def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
     return evidence
 
 
+def mac_linux_and_natedev_request(fixture: PlacementFixture, *, natedev: bool = True) -> wire.PlacementRequest:
+    """Name the Mac Linux guest first and natedev second, as a named gate does."""
+    _ = (fixture.root / "build_targets.conf").write_text(
+        "targets=mac-linux,natedev\nkind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=guest.conf\n"
+        + "enabled.mac-linux=on\nkind.natedev=local\nplatform.natedev=linux\n")
+    _ = write_config_fixture(fixture.root / "guest.conf", template="mac_test")
+    guest = placement.PlacementCandidate(
+        placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", FIXTURE_MAC_SCOPE, 1))
+    request = placement_request(fixture)
+    candidates = (guest, local_candidate(fixture)) if natedev else (guest,)
+    return replace(request, constraints=replace(request.constraints, candidates=candidates))
+
+
 def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) -> placement.PlacementAssignment:
     reply, = fixture.server.handle_request(request)
     if not isinstance(reply, wire.Assignment):
@@ -1141,6 +1154,40 @@ class PlacementTests(unittest.TestCase):
         local = placement.PlacementDestination("local", "natedev", "natedev", FIXTURE_MAC_SCOPE)
         self.assertEqual(placement.retry_decision(guest, MAC_LINUX_NO_ANSWER, 10.0), placement.RetryAt(190.0))
         self.assertEqual(placement.retry_decision(local, "busy", 10.0), placement.RetryAt(10.0))
+
+    def test_a_guest_that_took_no_run_frees_the_run_for_natedev_at_once(self) -> None:
+        # Two named machines with the real queue choice: the Mac Linux guest declines, natedev takes the run at once.
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            declined = assignment_for(fixture, request)
+            self.assertEqual(declined.destination.target, "mac-linux")
+            status, = fixture.connect(wire.ClaimFailure("guest-took-no-run", declined, MAC_LINUX_NO_ANSWER)).replies()
+            assert isinstance(status, wire.DispatchStatus)
+            self.assertEqual(status.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(status.retry, placement.RetryAt(fixture.clock.now() + 180))
+            replacement, = fixture.server.handle_request(request)
+            assert isinstance(replacement, wire.LocalPlacementGranted), replacement
+            self.assertEqual(replacement.assignment.destination.target, "natedev")
+            self.assertNotEqual(replacement.assignment.attempt, declined.attempt)
+
+    def test_a_second_decline_ends_the_guest_for_the_run(self) -> None:
+        # A cause that does not clear must not repeat on the same guest: the second decline ends the guest for the run.
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            for decline in range(2):
+                _ = publish_candidate(fixture, request)
+                declined = assignment_for(fixture, request)
+                self.assertEqual(declined.destination.target, "mac-linux")
+                status, = fixture.connect(wire.ClaimFailure(f"decline-{decline}", declined, MAC_LINUX_NO_ANSWER)).replies()
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertEqual(status.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+                fixture.clock.advance(181)
+            _ = publish_candidate(fixture, request)
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.retry, placement.DoNotRetry(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(reply.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
 
     def test_settings_refusals_retry_after_the_provider_settings_change(self) -> None:
         for reason in ("off", "repo", "command"):

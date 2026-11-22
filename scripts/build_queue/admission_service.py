@@ -57,7 +57,7 @@ from scripts.production import staff
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import gate_job_from_process
+from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER, gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -3717,6 +3717,9 @@ done
             and isinstance(saved.state, placement.ClosedAssignment)]
         if not previous:
             return placement.RetryAt(0)
+        # A guest that took no run twice in one run has a cause that does not clear; the next named machine takes it.
+        if sum(closed.state == placement.ClosedAssignment(MAC_LINUX_NO_ANSWER) for closed in previous) > 1:
+            return placement.DoNotRetry(MAC_LINUX_NO_ANSWER)
         saved = previous[-1]
         retry = saved.retry
         if (isinstance(retry, placement.DoNotRetry) and retry.reason in placement.SETTINGS_REFUSAL_REASONS
