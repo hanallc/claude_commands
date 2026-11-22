@@ -824,10 +824,24 @@ class BetweenStepsSlot:
 
 
 @dataclass(frozen=True)
+class NoContinuationClaim:
+    """This waiter has not claimed a continuation slot."""
+
+
+NO_CONTINUATION_CLAIM = NoContinuationClaim()
+
+
+@dataclass(frozen=True)
+class ClaimOrderNotRecorded:
+    """The claim predates the record of earlier waiters."""
+
+
+@dataclass(frozen=True)
 class ContinuationSlot:
     """The owner continues within a memory slot retained between steps."""
     slot: BetweenStepsSlot
     owner: str
+    waiters_ahead_at_grant: frozenset[str] | ClaimOrderNotRecorded = field(default=ClaimOrderNotRecorded(), kw_only=True)
 
 RunSlot = BetweenStepsSlot | ContinuationSlot
 
@@ -1740,6 +1754,11 @@ class WaiterIdentity(TypedDict):
 
 def waiter_owner(row: Waiter) -> str:
     return run_owner(row["pid"], row["start_time"])
+
+
+def queue_row_id(row: Waiter) -> str:
+    """Identify the step even if its position changes."""
+    return row.get("move_id") or waiter_owner(row)
 
 
 def run_owner(pid: int, start_time: str) -> str:

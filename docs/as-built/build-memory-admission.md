@@ -2384,7 +2384,9 @@ The page, client replies, and the head-stall snapshot also filter that order.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
 A confirmed move or Undo changes queue order only.
 A slot assigned at release stays with its row. The moved row can claim the next free local slot in queue order.
-After a drag, a row that already holds a slot can start before the dragged row.
+Each claim records the IDs of the rows ahead when the service assigns the claim.
+Those rows can still block the claim under the ordinary admission rules.
+After a drag, a row that already holds a slot can start before a row that the drag put ahead of it.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
 An absent step keeps its run identity to recover the run's saved queue time.
