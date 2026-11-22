@@ -939,7 +939,7 @@ Use `cargo-berth sequence` for merge order.
 
    Start the waiting unit's next independent phase in a model worktree.
    If it has no independent phase, start tests, docs, or research in its current phase.
-   Build a fix in a numbered copy with `build_slots.py run --source <worktree> --commit <hash> ...`.
+   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and an approval only the user can give in a unit director's own
    session (a permission prompt, an action that cannot be undone). A unit's

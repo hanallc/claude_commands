@@ -96,7 +96,7 @@ Codex review prompts also include section 3's command block.
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. Create it inside the test run's allocated model folder. Use Rust `tempfile::TempDir` or Python `tempfile.TemporaryDirectory` to remove it when the test ends."
    Every implementation, fix, test, research and review prompt carries this instruction verbatim:
-   "Use a numbered copy for a test or proof that needs a clone or copy of source. Run `~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> ...`. Ask the director to make a model worktree for a trial project."
+   "Use a numbered copy for a test or proof that needs a clone or copy of source. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`. Ask the director to make a model worktree for a trial project."
    "Use `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]` only for downloads and other files unrelated to builds, tests, gates, or source copies. It prints the path. The folder is removed when your assignment ends."
    "Apply the same rules on the Mac. Avoid fixed paths such as `~/.cache`."
    Include these repair rules:

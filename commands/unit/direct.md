@@ -170,11 +170,11 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 
 <CoreContract>
 - Never modify unrelated files. The unit director creates a separate worktree with `worktrees.py make <repo word> <unit> <short-name>`.
-  The unit's staff row keeps its one home worktree;
-  where a worker works stays in its run record, not in staff. The director
-  removes each worktree it made when that work ends. In the home worktree, the
-  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
-  never switch to an existing branch.
+  The unit's staff row keeps its home worktree. The run record keeps the worker's checkout.
+  When the work ends, run `worktrees.py remove <path>`.
+  Send the reported paths to the showrunner as a removal list.
+  In the home worktree, create only the branch that <PushCheckpoint/> pushes.
+  Never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly asks.
   Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one

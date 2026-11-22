@@ -327,7 +327,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Give each independent phase its own berth reservation and checkpoint
    (`/showrunner:produce` → Rules, parallel by default).
    Use `worktrees.py make <repo word> <unit> p<phase id>` for a phase that runs beside the current phase.
-   Remove that worktree with `worktrees.py remove <path>` after its checkpoint reaches origin.
+   Run `worktrees.py remove <path>` after its checkpoint reaches origin.
+   Send the reported checkout and output paths to the showrunner as a removal list.
+   Use a distinct short name `p<phase id>` for each phase.
    A phase better run as its own unit goes to the showrunner as a proposed split
    (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
@@ -442,7 +444,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     Continue if the tests pass. If the code blocks you, use item 10's line.
     While you wait, take the work the showrunner names.
     You can also start independent phase work, tests, docs, or research.
-    Build a fix in a numbered copy with `build_slots.py run --source <worktree> --commit <hash> ...`.
+    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix

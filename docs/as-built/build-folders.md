@@ -27,14 +27,16 @@ A short name is one nonempty path component. It must contain a character other t
   It creates the branch `<unit>-<short-name>` from the main checkout's HEAD.
 - A phase that runs beside the current phase uses a model worktree.
   The director creates it with `worktrees.py make <repo word> <unit> p<phase id>`.
-  The director removes it with `worktrees.py remove <path>` after the checkpoint reaches origin.
+  The director uses a distinct short name `p<phase id>` for each phase.
+  The director runs `worktrees.py remove <path>` after the checkpoint reaches origin.
+  The director sends the reported checkout and output paths to the showrunner as a removal list.
   `phase_reservation.py claim` accepts the unit's home worktree or a model worktree.
   The command records the path only for a separate model worktree.
 - `move_worktree(old, repo, unit, short_name)` moves a linked checkout and keeps its Git worktree entry and branch.
   It updates the worktree and staff records, adds a link at the old path, and links the Claude transcript folders.
   A retry resumes from the move record.
   A managed unit rename uses `unit_folder_rename` to move the unit's source and build folders together.
-- `worktrees.py remove <path>` removes the checkout and its assigned output under the folder locks.
+- `worktrees.py remove <path>` reports the checkout and its assigned output for manual removal.
   `worktrees.py retire <unit>` removes that unit's named outputs and numbered copies across the build root.
   A held lock prevents removal of its folder.
 - `worktrees.py migrate --list <file> --dry-run` prints the plan without writing files.
@@ -63,7 +65,8 @@ The Cargo seed is absent. The first test build of a new Hana worktree takes abou
 
 ## Numbered copies and removal
 
-Tests and proofs that need a source copy use `scripts/lib/build_slots.py run --source <worktree> --commit <hash> ...`.
+Use a numbered copy for tests and proofs that need a source copy.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 The director creates a model worktree for a trial project.
 Workers use `scratch.py new --worker` only for downloads and other files unrelated to builds, tests, gates, or source copies.
 
