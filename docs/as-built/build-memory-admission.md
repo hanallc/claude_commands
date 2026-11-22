@@ -1830,8 +1830,10 @@ The server identifies the caller from the reservation's session ID and the curre
 7. The server saves **Stopped** before it sends the keyed notice.
 
 The detached helper stages the reason and the pass cancellation before TERM.
+A detached run with a saved slice uses `builds-detached-<id>.slice`.
+The helper checks `cgroup.events` for `populated 0` to confirm that the slice is empty.
 After acceptance, a completion stamp, a status other than running, or a missing record permits the notice.
-At restart, the server requests the stop again if the record is active and the scope has no exit confirmation.
+At restart, the server requests the stop again if the record is active.
 If the server saved **Stopped**, it resumes only pending delivery.
 The server retains a verified handle for the result visibility interval.
 If the live row disappears, the retained handle can report an already ended run.

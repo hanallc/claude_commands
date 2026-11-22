@@ -90,14 +90,14 @@ def candidate(step: admission_records.RunningStep, reservation: admission_record
 
 @dataclass(frozen=True)
 class DetachedCommand:
-    """A supervised command group that contains the recorded run."""
+    """A supervised command that owns the verified run slice."""
 
     record: Path
     group: int
     started: str
     supervisor: int
     supervisor_start: str
-    scope: process_stop.ScopeIdentity
+    run_slice: process_stop.RunSliceIdentity
 
 
 @dataclass(frozen=True)
@@ -124,19 +124,6 @@ def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str
     return command_program(args) if isinstance(args, list) else ""
 
 
-def detached_launch_scope(value: object) -> process_stop.ScopeIdentity | None:
-    """Decode the scope that the detached launcher saved at startup."""
-    if process_stop.is_scope_identity(value):
-        path = Path(value["path"])
-        unit = value["unit"]
-        if (value["device"] >= 0 and value["inode"] > 0
-                and path.is_absolute() and ".." not in path.parts
-                and path.parent.name == "builds-detached.slice" and path.name == unit
-                and unit.endswith(".scope")):
-            return value
-    return None
-
-
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
                      processes: dict[int, memory_admit.ProcessIdentity],
                      descendants: set[int]) -> DetachedCommand | NoStopRoute:
@@ -157,8 +144,8 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                 group = detached_runs.command_group(path)
             except (OSError, ValueError):
                 return NoStopRoute()
-            scope = detached_launch_scope(raw.get("command_scope"))
-            if (scope is not None
+            run_slice = raw.get("command_slice")
+            if (process_stop.is_slice_identity(run_slice)
                     and group is not None and group.group == pid and group.started == processes[pid].start
                     and raw.get("command_pid") == pid and raw.get("staff_id") == recipient
                     and isinstance(supervisor := raw.get("pid"), int) and supervisor == parent
@@ -168,11 +155,13 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                     and detached_build(raw.get("command"), program(pid, processes))
                     and all(in_group(child, pid) for child in descendants)):
                 try:
-                    unit = process_stop.ScopeUnit("builds-detached.slice", scope["unit"])
                     with process_stop.pin_process(process_stop.ProcessLifetime(run.holder_pid, run.holder_start)):
-                        if (process_stop.command_scope(run.holder_pid, unit) == scope
+                        cgroup = (PROC / str(run.holder_pid) / "cgroup").read_text()
+                        unit = next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::/")), "")
+                        member_scope = process_stop.ScopeUnit(run_slice["unit"], unit)
+                        if (process_stop.command_slice(run.holder_pid, member_scope) == run_slice
                                 and live(run.holder_pid, run.holder_start)):
-                            return DetachedCommand(path, pid, group.started, supervisor, start, scope)
+                            return DetachedCommand(path, pid, group.started, supervisor, start, run_slice)
                 except (OSError, ValueError):
                     return NoStopRoute()
         if parent not in processes or int(processes[parent].start) > int(processes[pid].start):
@@ -319,7 +308,7 @@ def notification(run: KillCandidate, at: datetime) -> str:
 
 @dataclass(frozen=True)
 class RunningDetachedRun:
-    scope_end_proved: bool
+    """The record still shows an active run."""
 
 
 @dataclass(frozen=True)
@@ -335,15 +324,16 @@ def detached_run_state(route: DetachedCommand, recipient: staff.StaffId) -> Runn
     if not isinstance(raw, dict):
         raise ValueError("the detached run record is not an object")
     record = cast(dict[str, object], raw)
+    run_slice = record.get("command_slice")
     if (record.get("run_id") != route.record.stem or record.get("staff_id") != recipient
-            or detached_launch_scope(record.get("command_scope")) != route.scope):
+            or not process_stop.is_slice_identity(run_slice) or run_slice != route.run_slice):
         raise ValueError("the detached run record changed identity")
     if "finished_at" in record or record.get("status") != "running":
         return EndedDetachedRun()
-    return RunningDetachedRun(record.get("scope_end_proved") is True)
+    return RunningDetachedRun()
 
 
-def stop_verified_scope(target: KillTarget, reason: str) -> bool:
+def stop_verified_run(target: KillTarget, reason: str) -> bool:
     """Check the live route again before the detached helper stops it."""
     def route_matches() -> bool:
         return stop_route(target.candidate, target.recipient, memory_admit.process_table(PROC)) == target.route
@@ -472,7 +462,7 @@ class KillActions:
         """Use the run record to advance to the notice."""
         if isinstance(action.stage, StopRequested):
             state = detached_run_state(action.route, action.recipient)
-            if isinstance(state, RunningDetachedRun) and not state.scope_end_proved:
+            if isinstance(state, RunningDetachedRun):
                 try:
                     accepted = request_stop(action)
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -570,7 +560,7 @@ class KillActions:
                 return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}, retention).result
             self._save(action)
             try:
-                action = self._advance(action, retention, lambda _action: stop_verified_scope(target, message))
+                action = self._advance(action, retention, lambda _action: stop_verified_run(target, message))
             except (OSError, ValueError) as error:
                 print(f"review-links build kill {reference}: {error}", file=sys.stderr)
                 action = self._read(reference)

@@ -43,9 +43,9 @@ class KillActionTests(unittest.TestCase):
                         step: str = "check") -> kill_action.KillTarget:
         record = self.root / "detached_runs" / "fixture.json"
         record.parent.mkdir()
-        scope: process_stop.ScopeIdentity = {"unit": "detached-fixture.scope", "device": 1, "inode": 2,
-            "path": "/user.slice/builds-detached.slice/detached-fixture.scope"}
-        route = kill_action.DetachedCommand(record, 17, "123", 16, "122", scope)
+        run_slice: process_stop.RunSliceIdentity = {"unit": "builds-detached-fixture.slice", "device": 1, "inode": 2,
+            "path": "/user.slice/builds.slice/builds-detached.slice/builds-detached-fixture.slice"}
+        route = kill_action.DetachedCommand(record, 17, "123", 16, "122", run_slice)
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", step, "at")
         target = kill_action.KillTarget(run, route, staff.StaffId("fixture"), f"{name}, {role}", name, role)
         self.write_run(target)
@@ -55,7 +55,7 @@ class KillActionTests(unittest.TestCase):
         route = target.route
         _ = route.record.write_text(json.dumps({
             "run_id": route.record.stem, "status": "running", "staff_id": target.recipient,
-            "command_scope": route.scope, "session_dir": str(self.root), "worker": target.recipient_name,
+            "command_slice": route.run_slice, "session_dir": str(self.root), "worker": target.recipient_name,
             "label": "fixture", "command": ["cargo", "check"], "log": str(route.record.with_suffix(".log")),
             "started_at": 10, "pid": route.supervisor, "director_dir": "", "done_message_file": "", **fields,
         }))
@@ -114,21 +114,21 @@ class KillActionTests(unittest.TestCase):
         target = self.detached_target()
         route = target.route
         reason = "Stopped from the Builds page."
-        moved = replace(route, scope={**route.scope, "inode": route.scope["inode"] + 1})
+        moved = replace(route, run_slice={**route.run_slice, "inode": route.run_slice["inode"] + 1})
 
         def stop_detached(_record: Path, _reason: str, *, check: Callable[[], bool]) -> bool:
             return check()
 
-        with (patch.object(process_stop, "stop_scope") as stop_scope,
+        with (patch.object(process_stop, "stop_slice") as stop_slice,
               patch.object(detached_runs, "stop_command", side_effect=stop_detached) as stop,
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route") as read_route):
             read_route.side_effect = [route, route, route, moved]
-            self.assertTrue(kill_action.stop_verified_scope(target, reason))
-            self.assertFalse(kill_action.stop_verified_scope(target, reason))
+            self.assertTrue(kill_action.stop_verified_run(target, reason))
+            self.assertFalse(kill_action.stop_verified_run(target, reason))
         self.assertEqual([call.args for call in stop.call_args_list], [(route.record, reason)] * 2)
         self.assertEqual([set(call.kwargs) for call in stop.call_args_list], [{"check"}, {"check"}])
-        stop_scope.assert_not_called()
+        stop_slice.assert_not_called()
 
     def test_standalone_cargo_has_no_stop_route(self) -> None:
         target = self.detached_target()
@@ -150,24 +150,44 @@ class KillActionTests(unittest.TestCase):
             self.assertIsInstance(kill_action.stop_route(target.candidate, target.recipient, {}), kill_action.NoStopRoute)
         detached.assert_not_called()
 
-    def test_detached_route_uses_the_scope_saved_by_the_supervisor(self) -> None:
+    def test_detached_route_matches_the_saved_slice_for_a_step_scope(self) -> None:
         target = self.detached_target()
+        proc = self.root / "proc"
+        cgroups = self.root / "cgroups"
         route = target.route
+        holder = 18
+        run = replace(target.candidate, holder_pid=holder, holder_start="124")
+        launcher = proc / str(route.group)
+        step = proc / str(holder)
+        for process in (launcher, step):
+            process.mkdir(parents=True)
+            _ = (process / "environ").write_text(f"UNIT_DETACHED_RECORD={route.record}\0")
+
+        member_scope = Path(route.run_slice["path"]) / "run-holder.scope"
+        scope_folder = cgroups / member_scope.relative_to("/")
+        scope_folder.mkdir(parents=True)
+        _ = (scope_folder / "cgroup.procs").write_text(f"{holder}\n")
+        _ = (step / "cgroup").write_text(f"0::{member_scope}\n")
+        identity = scope_folder.parent.stat()
+        run_slice: process_stop.RunSliceIdentity = {**route.run_slice, "device": identity.st_dev, "inode": identity.st_ino}
+        route = replace(route, run_slice=run_slice)
+        target = replace(target, route=route)
         self.write_run(target, command_pid=route.group, command_group=route.group, command_started=route.started,
                        pid=route.supervisor, supervisor_started=route.supervisor_start, command=["cargo", "check"])
-        proc = self.root / "proc"
-        owner = proc / str(route.group)
-        owner.mkdir(parents=True)
-        _ = (owner / "environ").write_text(f"UNIT_DETACHED_RECORD={route.record}\0")
-        table = {route.group: memory_admit.ProcessIdentity(route.supervisor, route.started)}
+        table = {route.group: memory_admit.ProcessIdentity(route.supervisor, route.started),
+                 holder: memory_admit.ProcessIdentity(route.group, run.holder_start)}
         with (patch.object(kill_action, "PROC", proc),
               patch.object(kill_action, "live", return_value=True),
               patch.object(kill_action, "program", return_value="cargo"),
               patch.object(kill_action, "in_group", return_value=True),
               patch.object(detached_run_process, "supervisor_match", return_value=True),
               patch.object(process_stop, "pin_process", return_value=nullcontext(5)),
-              patch.object(process_stop, "command_scope", return_value=route.scope)):
-            self.assertEqual(kill_action.stop_route(target.candidate, target.recipient, table), route)
+              patch.object(process_stop, "PROC", proc),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups)):
+            self.assertEqual(kill_action.stop_route(run, target.recipient, table), route)
+            other_slice = member_scope.parent.with_name("builds-detached-other.slice")
+            _ = (step / "cgroup").write_text(f"0::{other_slice / member_scope.name}\n")
+            self.assertIsInstance(kill_action.stop_route(run, target.recipient, table), kill_action.NoStopRoute)
 
     def test_legacy_verify_rows_do_not_offer_a_step_scope(self) -> None:
         run = kill_action.KillCandidate(17, "123", 16, "122", "session", "check", "at")
@@ -233,7 +253,7 @@ class KillActionTests(unittest.TestCase):
                 targets.return_value = {}
                 return False
 
-            with patch.object(kill_action, "stop_verified_scope", side_effect=complete) as stop:
+            with patch.object(kill_action, "stop_verified_run", side_effect=complete) as stop:
                 result = actions.stop(run.reference, handle, "Use the next slot.")
             stop.assert_called_once_with(target, reason)
             deliver.assert_called_once()
@@ -313,7 +333,7 @@ class KillActionTests(unittest.TestCase):
             pass
 
         with (patch.object(kill_action, "live_targets", return_value={reference: target}),
-              patch.object(kill_action, "stop_verified_scope", side_effect=Restart)):
+              patch.object(kill_action, "stop_verified_run", side_effect=Restart)):
             offers, _ = actions.options()
             with self.assertRaises(Restart):
                 _ = actions.stop(reference, offers[reference]["handle"], "Wait for release.")
@@ -336,7 +356,7 @@ class KillActionTests(unittest.TestCase):
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
         with (patch.object(kill_action, "live_targets", return_value={reference: target}),
-              patch.object(kill_action, "stop_verified_scope", return_value=False) as first_stop,
+              patch.object(kill_action, "stop_verified_run", return_value=False) as first_stop,
               patch.object(actions, "_start_watch") as watch,
               patch.object(kill_action, "deliver") as send):
             offers, _ = actions.options()
@@ -365,45 +385,40 @@ class KillActionTests(unittest.TestCase):
         self.assertEqual((result["stop"], result["delivery"]),
                          (kill_action.StopState.STOPPED, kill_action.DeliveryState.QUEUED))
 
-    def test_scope_exit_waits_for_the_finished_record_and_reports_retirement_once(self) -> None:
+    def test_slice_exit_waits_for_the_finished_record_and_reports_retirement_once(self) -> None:
         target = self.detached_target(name="retired", role="producer")
         cgroups = self.root / "cgroups"
-        folder = cgroups / target.route.scope["path"].lstrip("/")
+        folder = cgroups / target.route.run_slice["path"].lstrip("/")
         folder.mkdir(parents=True)
         identity = folder.stat()
-        scope: process_stop.ScopeIdentity = {**target.route.scope, "device": identity.st_dev, "inode": identity.st_ino}
-        target = replace(target, route=replace(target.route, scope=scope))
+        run_slice: process_stop.RunSliceIdentity = {**target.route.run_slice,
+                                                    "device": identity.st_dev, "inode": identity.st_ino}
+        target = replace(target, route=replace(target.route, run_slice=run_slice))
         self.write_run(target)
-        freeze = folder / "cgroup.freeze"
-        _ = freeze.write_text("0\n")
         events = folder / "cgroup.events"
-        _ = events.write_text("populated 1\nfrozen 1\n")
+        _ = events.write_text("populated 1\n")
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
 
-        def term(_directory: int, stopped: process_stop.ScopeIdentity) -> int:
-            self.assertEqual(stopped, scope)
-            self.assertEqual(freeze.read_text(), "1\n")
+        def term(_directory: int, stopped: process_stop.RunSliceIdentity) -> None:
+            self.assertEqual(stopped, run_slice)
             record = cast(dict[str, object], json.loads(target.route.record.read_text()))
             self.assertEqual(record.get("stop_reason"), self.saved_action(target).message)
             self.assertIs(record.get("stop_pass_requested"), True)
-            _ = events.write_text("populated 0\nfrozen 1\n")
-            return 1
+            _ = events.write_text("populated 0\n")
 
         with (patch.object(kill_action, "live_targets", return_value={reference: target}),
               patch.object(process_stop, "CGROUP_ROOT", cgroups),
-              patch.object(process_stop, "_term_scope", side_effect=term) as send_term,
+              patch.object(process_stop, "_term_slice", side_effect=term) as send_term,
               patch.object(detached_runs, "_stop_caller_is_owner", return_value=False),
               patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "stop_route", return_value=target.route),
               patch.object(actions, "_start_watch"), patch.object(kill_action, "deliver") as send):
             offers, _ = actions.options()
             _ = actions.stop(reference, offers[reference]["handle"], "")
-        send_term.assert_called_once_with(ANY, scope)
-        self.assertEqual(freeze.read_text(), "0\n")
-        record = cast(dict[str, object], json.loads(target.route.record.read_text()))
-        self.assertIs(record.get("scope_end_proved"), True)
+            self.assertTrue(process_stop.slice_has_ended(run_slice))
+        send_term.assert_called_once_with(ANY, run_slice)
         send.assert_not_called()
         saved = self.saved_action(target)
         self.assertEqual(saved.result["stop"], kill_action.StopState.STOPPING)
@@ -438,7 +453,7 @@ class KillActionTests(unittest.TestCase):
         with (patch.object(send_budget, "seconds", return_value=1),
               patch.object(subprocess, "run", new=send),
               patch.object(kill_action, "live_targets", return_value={reference: target}),
-              patch.object(kill_action, "stop_verified_scope", side_effect=stop),
+              patch.object(kill_action, "stop_verified_run", side_effect=stop),
               patch.object(actions, "_start_watch")):
             offers, _ = actions.options()
             _ = actions.stop(reference, offers[reference]["handle"], "Use the next slot.")

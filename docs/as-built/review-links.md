@@ -1813,7 +1813,7 @@ The server limits the form to `kill_request_bytes`.
 Both requests require the Tailscale login in `builds_operator_login`.
 The default admits the user ID that owns the untagged local Tailscale node.
 The server checks the socket peer with Tailscale WhoIs.
-The Builds queue verifies the detached command and its saved scope before it offers Kill.
+The Builds queue verifies the detached command and its saved run slice before it offers Kill.
 The first read of the detached run record determines acceptance.
 A completion stamp, a status other than running, or a missing record on that read gives **Run already ended**.
 The server saves accepted requests under `.review-link-build-kill` in its private state.
