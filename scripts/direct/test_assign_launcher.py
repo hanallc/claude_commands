@@ -115,6 +115,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         calls = self.failing_worker()
         result = self.launch()
         self.assert_run_active(result)
+        self.assertIn("The worker command failed at launch.", result.stderr.splitlines())
         self.assertEqual([event for event in self.events() if event.get("event_type") in (
             "pass_started", "pass_finished", "phase_finished")], [])
         command = cast(list[str], json.loads(calls.read_text()))
@@ -384,7 +385,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().rows, before)
         self.assertEqual(self.fixture.agent.submitted, [])
 
-    def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
+    def test_completed_astra_review_rerun_keeps_its_notice_and_reply(self) -> None:
         for changed_session in (False, True):
             with self.subTest(changed_session=changed_session):
                 case = PaneReviewLauncherTests("runTest")
@@ -423,8 +424,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         launches = case.fixture.fixture.world.launches.copy()
                         repeated = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
                     self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-                    self.assertEqual(case.fixture.agent.notices, [notice, notice])
-                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))] * 2)
+                    self.assertEqual(case.fixture.agent.notices, [notice])
+                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))])
                     self.assertEqual(case.fixture.agent.submitted, submitted)
                     self.assertEqual(case.fixture.fixture.world.launches, launches)
                     self.assertEqual((reply.read_bytes(), reply.stat().st_mtime_ns), saved)
@@ -468,8 +469,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         saved = summary.read_bytes(), (self.phase / "review_status_1").read_bytes()
         notices = self.fixture.agent.notices.copy()
         self.fixture.agent.notice_failures = 1
-        failed = self.launch_review()
-        self.assertNotEqual(failed.returncode, 0)
+        settled = self.launch_review()
+        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
+        self.assertEqual(self.fixture.agent.notice_failures, 1)
         self.assertEqual((self.phase / "review_status_1").read_bytes(), saved[1])
         self.assertEqual(summary.read_bytes(), saved[0])
         self.assertEqual(self.fixture.agent.submitted, [first, second])
@@ -477,7 +479,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
-        self.assertEqual(self.fixture.agent.notices, [*notices, notices[-1]])
+        self.assertEqual(self.fixture.agent.notices, notices)
         self.assertEqual((summary.read_bytes(), (self.phase / "review_status_1").read_bytes()), saved)
         self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
 

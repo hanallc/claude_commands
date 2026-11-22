@@ -42,12 +42,33 @@ The agent-notes job runs these parts in separate processes:
 5. Unit recovery.
 6. Login reminders.
 7. Phase note pruning.
-8. Vault commits.
+8. Producer folder size checks.
+9. Vault commits.
 
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
+An invalid schedule block fails its part. The other due parts still run.
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
+
+## Producer folder sizes
+
+`Part.FOLDER_SIZE` checks active producers' recorded folders below `PRODUCER_FOLDER_ROOT`.
+A recorded document file identifies its parent folder.
+`parts.folder_size` sets a 3,600-second interval and a 60-second process limit.
+Each check reads `producer_folder_limit_mb` from `staff.conf`. The limit is a whole number of at least one and defaults to 10 MB.
+One MB is 1,000,000 bytes.
+The check counts the bytes of every regular file, including media. It skips symlinks.
+The size is an estimate. A folder change during the walk can cause one extra notice.
+A missing or unreadable folder or a failed metadata read produces one log line. The check continues with the next producer.
+The check measures every folder before it sends a notice. It writes each warning as soon as it occurs.
+The job sends one notice to the staff ID when a measured size exceeds the limit.
+The job saves each crossing in `agent-notes/job/folder-size.json` under the state directory.
+A send has a 5-second delivery limit and a 10-second process limit. The job saves the crossing state after each attempt.
+A retry uses the same message key. A queued notice counts as accepted.
+The job sends notices with fewer attempts first on the next pass.
+An interruption after Codex accepts a notice can cause a duplicate on retry.
+A measurement at or below the limit clears the crossing and permits a new notice after the next crossing.
 
 ## Claude quota expiry pushes
 
