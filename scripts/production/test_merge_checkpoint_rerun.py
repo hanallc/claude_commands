@@ -7,6 +7,7 @@ import argparse
 import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import shlex
@@ -48,14 +49,23 @@ class CheckpointRerunTests(MergeCheckpointFixture):
     def test_checkpoint_reuses_its_staff_snapshot_after_the_file_changes(self) -> None:
         review, checkpoint = self.review_checkpoint("One change | Open it | Result")
         with patch.dict("os.environ", self.env):
-            unit = next(row for row in staff.snapshot().rows if row.name == "alpha")
+            original = staff.snapshot()
+            unit = unit_lookup.unit_row("alpha", original)
+            alternate = unit_lookup.unit_row("beta", original)
+
+        def change_route(path: Path) -> None:
+            rows = tuple(replace(row, name="beta") if row.id == unit.id
+                         else replace(row, name="alpha") if row.id == alternate.id else row
+                         for row in original.rows)
+            _ = path.write_text(staff.StaffSnapshot(rows).encode())
+            self.assertEqual(unit_lookup.unit_row("alpha", staff.local_snapshot()).id, alternate.id)
+
         readers = ModuleType("checkpoint_staff_fixture")
         vars(readers).update(vars(staff))
         with (patch.object(readers, "snapshot", wraps=staff.snapshot) as snapshot,
               patch.object(merge_checkpoint, "staff", readers),
               patch.object(change_review, "staff", readers),
-              self.after_input(lambda path: path.write_text(
-                  json.dumps(cast(object, json.loads(path.read_text())), indent=2) + "\n"))):
+              self.after_input(change_route)):
             result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(snapshot.call_count, 1)
