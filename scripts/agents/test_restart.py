@@ -2085,6 +2085,12 @@ class RestartTests(RestartTestCase):
             with self.subTest(step=step):
                 self.assert_detached_signal_report(signal.SIGTERM, step=step)
 
+    def test_detached_stop_reports_a_busy_restart_record(self) -> None:
+        self.assert_detached_signal_report(signal.SIGTERM, step="busy lock")
+
+    def test_detached_stop_records_a_signal_during_final_sync(self) -> None:
+        self.assert_detached_signal_report(signal.SIGTERM, step="final sync")
+
     def detached_fault_arguments(self, command: str, *, resuming: bool = False, count: int = 2) -> list[str]:
         rows = self.rows[:count]
         data: restart.DetachedReport = {
@@ -2097,10 +2103,12 @@ class RestartTests(RestartTestCase):
                 "--parent-report", json.dumps(data)]
 
     def assert_detached_signal_report(self, number: signal.Signals, *,
-                                      step: Literal["claim", "readiness", "stop", "record save"]) -> None:
+                                      step: Literal["claim", "readiness", "stop", "record save",
+                                                    "busy lock", "final sync"]) -> None:
         path = self.root / f"{number.name}-{step}.log"
         script = """\
 import errno
+import fcntl
 import json
 import os
 import resource
@@ -2115,11 +2123,13 @@ from threading import Event
 number = int(sys.argv.pop(1))
 step = sys.argv.pop(1)
 ready_fd = int(sys.argv[sys.argv.index('--ready-fd') + 1])
+log_fd = int(sys.argv[sys.argv.index('--log-fd') + 1])
+log_path = Path(sys.argv[sys.argv.index('--log') + 1])
 write = os.write
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 if step == 'claim':
-    claim = Path(sys.argv[sys.argv.index('--log') + 1]).with_suffix('.claim')
+    claim = log_path.with_suffix('.claim')
     link = os.link
     read_bytes = Path.read_bytes
 
@@ -2135,6 +2145,19 @@ if step == 'claim':
 
     os.link = link_claim
     Path.read_bytes = read_claim
+
+if step == 'final sync':
+    sync = os.fsync
+    signalled = False
+
+    def signal_during_sync(fd):
+        global signalled
+        if fd == log_fd and not signalled and 'sessions stopped.' in log_path.read_text():
+            signalled = True
+            signal.raise_signal(number)
+        sync(fd)
+
+    os.fsync = signal_during_sync
 
 def configure_collection():
     from scripts.agents import shutdown_record
@@ -2160,6 +2183,8 @@ def configure_collection():
             raise RuntimeError('The activity lock released before the task ended')
 
     def stop_row(row, *args, **kwargs):
+        if step == 'busy lock':
+            raise RuntimeError('A stop began while the restart record was busy')
         if step == 'stop':
             if row.id == rows[1].id:
                 hold_task()
@@ -2185,7 +2210,8 @@ def configure_collection():
 
         def __init__(self, **kwargs):
             CollectionPool.count += 1
-            self.inject = CollectionPool.count == (1 if step == 'stop' else 2)
+            self.inject = (step == 'stop' and CollectionPool.count == 1 or
+                           step == 'record save' and CollectionPool.count == 2)
             if self.inject:
                 kwargs['max_workers'] = 1
             super().__init__(**kwargs)
@@ -2216,6 +2242,20 @@ def configure_collection():
                     future.result = signal_before_result
             return future
 
+    if step == 'busy lock':
+        flock = fcntl.flock
+        record_lock = shutdown_record.record_path().with_suffix('.lock')
+        signalled = False
+
+        def signal_during_lock(handle, flags):
+            nonlocal signalled
+            if not signalled and getattr(handle, 'name', None) == str(record_lock):
+                signalled = True
+                os.kill(os.getpid(), number)
+            flock(handle, flags)
+
+        fcntl.flock = signal_during_lock
+
     staff.initial_snapshot = lambda: record
     staff.row_operation = lambda *args: nullcontext()
     herdr.restore_server = lambda *args, **kwargs: None
@@ -2232,7 +2272,7 @@ def on_ready(fd, data):
         os.write = write
         if step == 'readiness':
             signal.raise_signal(number)
-        elif step in ('stop', 'record save'):
+        elif step in ('stop', 'record save', 'busy lock', 'final sync'):
             configure_collection()
     return write(fd, data)
 
@@ -2242,12 +2282,19 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         resuming = step == "record save"
         command = "agents restart" if resuming else "agents stop --all"
         state = "back" if resuming else "stopped"
-        count = 3 if step == "stop" else 2
+        count = 3 if step == "stop" else 1 if step == "busy lock" else 2
         rows = self.rows[:count]
-        completed = 1 if resuming else 2 if step == "stop" else 0
+        completed = 1 if resuming else count if step == "final sync" else 2 if step == "stop" else 0
         shutdown_record.save([])
+        record_lock = shutdown_record.record_path().with_suffix(".lock")
+        if step == "busy lock":
+            config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
+            _ = write_config_fixture(config, "RESTART_RECORD_LOCK_SECONDS=0.05\n")
         read_fd, ready_fd = os.pipe()
-        with os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
+        lock_context = record_lock.open("a") if step == "busy lock" else nullcontext()
+        with lock_context as lock, os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
+            if lock is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
             _ = log.write(f"{path}\n".encode())
             log.flush()
             result = subprocess.run([sys.executable, "-c", script, str(number), step,
@@ -2261,13 +2308,18 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         lines = path.read_text().splitlines()
         self.assertEqual(lines[0], str(path))
         self.assertEqual(lines.count(f"{command}: {completed} of {count} sessions {state}."), 1)
-        self.assertIn(f"{command}: The detached command received {number.name}.", lines)
+        self.assertEqual(lines.count(f"{command}: {number.name} stopped the run."), 1)
+        self.assertNotEqual(lines[-1], "Nothing for you to do.")
         for row in rows[:completed]:
             self.assertIn(f"{row.name}: The session is {state}.", lines)
         for row in rows[completed:]:
             retry = f"agents restart --only {row.id}" if resuming else command
             step_text = f"Nate opens a plain terminal without a staff session. Nate runs {retry} there."
-            self.assertIn(f"{row.name}: not started: the restart was stopped. {step_text}", lines)
+            status = "not started: the restart was stopped"
+            if step == "busy lock":
+                status = "not confirmed: the restart record is busy"
+                step_text = "Nate waits for the command that holds the restart record lock to finish. " + step_text
+            self.assertIn(f"{row.name}: {status}. {step_text}", lines)
             self.assertIn(f"Nate runs {retry} there.", lines[-1])
         self.assertFalse(shutdown_record.active())
         pending = rows[completed:] if resuming else rows[:completed]

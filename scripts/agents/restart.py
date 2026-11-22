@@ -398,8 +398,6 @@ class BulkReport:
             issues[key] = FollowUp(self.targets[key], reason, self.not_started[key], operator=True)
         missing = targets - completed - issues.keys()
         received = self.stop_signal
-        if received is not None:
-            issues["signal"] = FollowUp(self.command, f"The detached command received {received.name}", "")
         if failure is not None and not missing and failure not in issues.values():
             issues["detached"] = failure
         if failure is not None or received is not None:
@@ -439,7 +437,10 @@ class BulkReport:
             actions.append("Nate has no step.")
         actions.extend(f"{item.name}: {item.step}" for item in sorted(
             (item for key, item in issues.items() if key in inherited), key=lambda issue: issue.name))
-        lines.append(" ".join(actions) or "Nothing for you to do.")
+        if received is not None:
+            lines.append(f"{self.command}: {received.name} stopped the run.")
+        if actions or received is None:
+            lines.append(" ".join(actions) or "Nothing for you to do.")
         return lines
 
 
@@ -1582,7 +1583,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
             after_stop: AfterStop = AfterStop.RESTART,
             why: str = DEFAULT_RESTART_CAUSE) -> int:
-    activity = nullcontext() if dry_run else shutdown_record.active_operation()
+    activity = (nullcontext() if dry_run else shutdown_record.active_operation(
+        record_lock_seconds=shutdown_record.record_lock_seconds()))
     with activity, ExitStack() as pane_evidence:
         _ = pane_evidence.enter_context(herdr.pane_evidence_run())
         return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
@@ -1733,13 +1735,27 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
 
+    def resume_retry(members: list[str]) -> str:
+        retry = ["agents", "restart", "--only", ",".join(members)]
+        if not isinstance(account, AllRestartAccounts):
+            retry.append(account.label)
+        return shlex.join(retry)
+
     def defer_resume(identity: staff.StaffId) -> None:
         if report is not None:
             members = members_by_holder[identity]
-            retry = ["agents", "restart", "--only", ",".join(members)]
-            if not isinstance(account, AllRestartAccounts):
-                retry.append(account.label)
-            report.mark_not_started(members, shlex.join(retry))
+            report.mark_not_started(members, resume_retry(members))
+
+    def retry_record(retry: str) -> str:
+        return "Nate waits for the command that holds the restart record lock to finish. " + _plain_terminal_step(retry)
+
+    def record_busy(holder: staff.StaffRow, error: shutdown_record.RecordBusy, *, resuming: bool = False) -> None:
+        if report is None:
+            _anomaly(holder, error)
+            return
+        for member in members_by_holder[holder.id]:
+            retry = resume_retry([member]) if resuming else report.retry
+            report.issues[member] = FollowUp(report.targets[member], str(error), retry_record(retry), operator=True)
 
     # The record saves only members that a restart starts; the stop still reaches every member.
     leaving = {str(row.id) for row in selected if stop_all and leaves_record(row, record, runs=observed.runs) is not None}
@@ -1878,6 +1894,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     for member in members_by_holder[identity]:
                         if staff.StaffId(member) not in unresolved:
                             report.finish(member)
+            except shutdown_record.RecordBusy as error:
+                _ = holders.pop(identity, None)
+                record_busy(holder, error)
             except staff.StaffRefused as error:
                 _ = holders.pop(identity, None)
                 _anomaly(holder, error)
@@ -1942,13 +1961,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     resume_checks = DirectorResumeChecks()
     resume_policies = {record.rows_by_id[identity].current_session: policy
                        for identity, policy in worker_policies.items() if identity not in blocked_workers}
-    record_save_failures: dict[str, str] = {}
+    record_save_failures: dict[str, OSError | ValueError] = {}
 
     def report_record_save_failures() -> None:
         if report is None:
             return
-        step = "Nate sends this error to the efficiency unit."
-        for member, reason in record_save_failures.items():
+        for member, error in record_save_failures.items():
+            if isinstance(error, shutdown_record.RecordBusy):
+                reason = str(error)
+                step = retry_record(resume_retry([member]))
+            else:
+                reason = f"Could not save the restart record. {_error_reason(error)}"
+                step = "Nate sends this error to the efficiency unit."
             issue = report.issues.get(member)
             report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
                 replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
@@ -1964,8 +1988,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             except (OSError, ValueError) as error:
                 if report is None:
                     raise
-                reason = f"Could not save the restart record. {_error_reason(error)}"
-                record_save_failures.update(dict.fromkeys(done, reason))
+                record_save_failures.update(dict.fromkeys(done, error))
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition | None:
@@ -2069,6 +2092,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 exit_code = 1
                 if report is not None:
                     report.failure(identity, holder.name, "Could not write the account trust record")
+            except shutdown_record.RecordBusy as error:
+                record_busy(holder, error, resuming=True)
             except staff.StaffRefused as error:
                 _anomaly(holder, error)
             except errors as error:
@@ -2115,6 +2140,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 report.failure(holder.id, holder.name, "Could not write the account trust record")
         except WorkerRestoreIncomplete:
             continue
+        except shutdown_record.RecordBusy as error:
+            record_busy(holder, error, resuming=True)
         except staff.StaffRefused as error:
             _anomaly(holder, error)
         except errors as error:
@@ -2170,10 +2197,26 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
     stage = "Could not claim the log"
     step = _plain_terminal_step(report.retry)
     handlers = ExitStack()
+    report_committed = False
 
     def request_stop(number: int, _frame: object) -> None:
-        if report.stop_signal is None:
+        if not report_committed and report.stop_signal is None:
             report.stop_signal = signal.Signals(number)
+
+    def report_text(failure: FollowUp | None, prefix: str) -> str:
+        return prefix + "\n".join(report.lines(dry_run=dry_run, failure=failure)) + "\n"
+
+    def save_report(log: io.FileIO, failure: FollowUp | None, *, prefix: str = "") -> None:
+        nonlocal report_committed
+        received = report.stop_signal
+        offset = log.tell()
+        _save_detached_report(log, report_text(failure, prefix))
+        report_committed = True
+        # Include a signal that arrived during the first sync.
+        if report.stop_signal != received:
+            _ = log.truncate(offset)
+            _ = log.seek(offset)
+            _save_detached_report(log, report_text(failure, prefix))
 
     # Update test_detached_child_reports_each_fault_after_the_claim when you change these steps.
     try:
@@ -2203,9 +2246,8 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
                 failure = report.issues.get("") or FollowUp(report.command, detail,
                     "Nate sends this error to the efficiency unit.", operator=True)
             stage = "Could not write the report"
-            result = "\n".join(report.lines(dry_run=dry_run, failure=failure)) + "\n"
             result_offset = log.tell()
-            _save_detached_report(log, result)
+            save_report(log, failure)
         return code
     except BaseException as error:
         detail = _error_reason(error)
@@ -2222,17 +2264,17 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
         if report.stop_plan_recorded or result_offset is not None:
             step = "Nate sends this error to the efficiency unit."
         failure = FollowUp(report.command, f"{stage}. {detail}", step, operator=True)
-        result = prefix + "\n".join(report.lines(dry_run=dry_run, failure=failure)) + "\n"
         try:
             with io.FileIO(log_fd, "wb", closefd=False) as log:
                 if result_offset is not None:
                     _ = log.truncate(result_offset)
                 _ = log.seek(0, os.SEEK_END)
-                _save_detached_report(log, result)
+                save_report(log, failure, prefix=prefix)
         except BaseException as log_error:
+            report_committed = True
             print(f"Could not finish writing the log at {report.log}. {_error_reason(log_error)}",
                   file=sys.stderr, flush=True)
-            print(result, end="", file=sys.stderr, flush=True)
+            print(report_text(failure, prefix), end="", file=sys.stderr, flush=True)
         return 2
     finally:
         handlers.close()

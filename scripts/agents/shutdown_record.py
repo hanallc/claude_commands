@@ -9,14 +9,18 @@ import argparse
 import fcntl
 import json
 import sys
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import cast
 
 
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
+from scripts.agents import worker_lifecycle
 from scripts.agents.stop_results import shutdown_state_root
 
 
@@ -49,13 +53,32 @@ def _activity_path() -> Path:
     return record_path().with_suffix(".active")
 
 
+_RECORD_LOCK_SECONDS: ContextVar[float | None] = ContextVar("_RECORD_LOCK_SECONDS", default=None)
+
+
+class RecordBusy(TimeoutError):
+    """The restart record lock did not become available before the deadline."""
+
+
+def record_lock_seconds() -> float:
+    key = "RESTART_RECORD_LOCK_SECONDS"
+    config = conf.read_or_repository("shutdown")
+    if isinstance(config.settings, dict) and config.effective_key(key) not in config.settings:
+        config = conf.read(Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")
+    return config.number(key)
+
+
 @contextmanager
-def active_operation() -> Generator[None]:
+def active_operation(*, record_lock_seconds: float | None = None) -> Generator[None]:
     path = _activity_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
-        yield
+        token = _RECORD_LOCK_SECONDS.set(record_lock_seconds)
+        try:
+            yield
+        finally:
+            _RECORD_LOCK_SECONDS.reset(token)
 
 
 def active() -> bool:
@@ -124,7 +147,14 @@ def update(*, started: list[str], pending: list[str]) -> None:
     path = record_path().with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        wait = _RECORD_LOCK_SECONDS.get()
+        if wait is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            try:
+                worker_lifecycle.acquire_flock(lock, deadline=time.monotonic() + wait)
+            except worker_lifecycle.OperationDeadlineExpired as error:
+                raise RecordBusy("not confirmed: the restart record is busy") from error
         save([row for row in read() if row not in started] + pending)
 
 
