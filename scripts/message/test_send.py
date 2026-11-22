@@ -8871,6 +8871,17 @@ class PaneWorkerMessageTests(unittest.TestCase):
                                  recipient.current_session)
         self.assertNotEqual(self.row.id, self.row.current_session)
 
+    def test_blocked_worker_keeps_a_run_result_pending_without_sending_to_the_holder(self) -> None:
+        marker = "Detached run: fixture"
+        self.fixture.world.locations["w1:p1"]["agent_status"] = "blocked"
+        with mock.patch.object(send, "_send") as fallback:
+            result = send.deliver_worker_text(self.row, staff.snapshot(), marker,
+                sender="detached-runs", timeout=send.delivery_timeout(),
+                receipt=send.WorkerResultReceipt(marker, wait_for_idle=True))
+        self.assertEqual(result, send.Result("retry", "worker is blocked"))
+        fallback.assert_not_called()
+        self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.fixture.world.commands))
+
     def test_fixed_worker_result_checks_the_current_session_after_waiting_for_idle(self) -> None:
         from scripts.herdr import herdr
 

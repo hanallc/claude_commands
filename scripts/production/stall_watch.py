@@ -35,14 +35,15 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
-from scripts.lib import conf_reads
+from scripts.direct import recorder_state
+from scripts.lib import conf_reads, operation_deadline
 from scripts.lib import conf as tunables
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
-from scripts.production import showrunners, staff, session_staff
+from scripts.production import showrunners, staff, session_staff, worker_pass_alerts
 from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 from scripts.whoami import account, usage_store
@@ -141,16 +142,6 @@ class PaneInspection(NamedTuple):
     row: staff.StaffRow
 
 
-class PaneWorkersUnread(NamedTuple):
-    """The cycle has not needed worker activity yet."""
-
-
-class BusyPaneWorkerParents(NamedTuple):
-    """The directors with busy pane workers in this cycle."""
-
-    ids: frozenset[staff.StaffId]
-
-
 class PromptWait(TypedDict):
     session_id: str
     created: float
@@ -173,6 +164,7 @@ class Delivery(NamedTuple):
     command: list[str]
     # The prompt alert's facts: once the alert is sent, rca.py opens a case to fix why the prompt came up.
     report: rca.Report | None = None
+    pass_alert: worker_pass_alerts.PassAlert | None = None
 
 
 class PromptCancellation(NamedTuple):
@@ -363,18 +355,97 @@ def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
     return False
 
 
-def read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot) -> BusyPaneWorkerParents:
-    """Read worker activity for all directors once per cycle."""
-    if not any(record.find(kind="worker", parent=parent.id) for parent in parents):
-        return BusyPaneWorkerParents(frozenset())
+def read_pane_workers(record: staff.StaffSnapshot, deadline: float) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
+    """Read pane activity once for the directors and their workers."""
+    parents = {parent.id: parent for row in record.find(kind="worker")
+               if (parent := record.parent_of(row)) is not None}
+    if not parents or time.monotonic() >= deadline:
+        return {}
     try:
-        observations = worker_panes.observe_parents(parents, record)
+        with operation_deadline.within(deadline):
+            return worker_panes.observe_parents(tuple(parents.values()), record)
     except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError) as error:
         print(f"stall-watch: pane workers: {' '.join(str(error).splitlines())}", file=sys.stderr)
-        return BusyPaneWorkerParents(frozenset())
-    return BusyPaneWorkerParents(frozenset(
-        parent for parent, workers in observations.items()
-        if any(worker_panes.worker_state(observed) == "busy" for observed in workers)))
+        return {}
+
+
+def blocked_worker_since(path: Path, identity: str, now: float) -> float:
+    """Keep the first observation of this pane and pass."""
+    try:
+        match cast(object, json.loads(path.read_text(encoding="utf-8"))):
+            case {"identity": str(saved), "since": int(since) | float(since)} if saved == identity:
+                if not isinstance(since, bool) and 0 <= since <= now:
+                    return since
+            case _:
+                pass
+    except (FileNotFoundError, ValueError):
+        pass
+    write_text_atomic(path, json.dumps({"identity": identity, "since": now}) + "\n")
+    return now
+
+
+def blocked_worker_deliveries(observations: dict[staff.StaffId, list[worker_panes.WorkerPane]],
+                              record: staff.StaffSnapshot, now: float, deadline: float) -> list[Delivery]:
+    """Prepare alerts for worker panes that remain blocked on an active pass."""
+    pending: list[Delivery] = []
+    if not observations:
+        return pending
+    try:
+        threshold = float(watch_config(status_defaults=True)["worker_blocked_seconds"])
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("expected a finite positive number")
+    except (OSError, KeyError, ValueError) as error:
+        print(f"stall-watch: invalid worker_blocked_seconds: {error}", file=sys.stderr)
+        return pending
+
+    scanned: dict[str, list[str]] | None = None
+    for director, workers in observations.items():
+        for observed in workers:
+            row = observed.row
+            if time.monotonic() >= deadline:
+                return pending
+            path = STATE_DIR / f"{row.id}.worker-blocked"
+            try:
+                if worker_panes.worker_state(observed) == "unknown":
+                    continue
+                if not isinstance(observed, worker_panes.OpenWorker) or observed.status is not BLOCKED:
+                    path.unlink(missing_ok=True)
+                    continue
+                if scanned is None:
+                    scanned = worker_panes.parent_run_index(record)
+                run = worker_panes.worker_run(row, record=record, scanned=scanned)
+                passed = worker_panes.worker_pass(row, run, record=record)
+                instance = passed.get("instance_id")
+                if not passed:
+                    continue
+                if passed.get("status") != "active" or not isinstance(instance, str) or not instance:
+                    path.unlink(missing_ok=True)
+                    continue
+                reason = worker_pass_alerts.AlertReason.BLOCKED
+                key = worker_pass_alerts.alert_key(instance, reason)
+                accepted = STATE_DIR / "worker-pass-accepted" / hashlib.sha256(key.encode()).hexdigest()
+                if accepted.exists():
+                    continue
+                identity = json.dumps([instance, row.current_session, observed.pane, observed.terminal])
+                if now - blocked_worker_since(path, identity, now) < threshold:
+                    continue
+                alert = worker_pass_alerts.PassAlert(director, row.id, run, instance, reason)
+                pending.append(Delivery(accepted, "worker-pass", [], pass_alert=alert))
+            except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+                print(f"stall-watch: {row.name}: worker pass: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    return pending
+
+
+def detached_result_alerts() -> list[Delivery]:
+    """Build one alert attempt for each saved record path."""
+    try:
+        paths = detached_runs.due_director_alert_paths()
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: detached result alerts: {error}", file=sys.stderr)
+        return []
+    script = str(Path(detached_runs.__file__).resolve())
+    return [Delivery(path, "detached-result-alert", [sys.executable, script, "alert-director", str(path)])
+            for path in paths]
 
 
 def has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun,
@@ -1228,7 +1299,18 @@ def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,
     started: list[tuple[Delivery, subprocess.Popen[str]]] = []
     for item in pending:
         try:
-            started.append((item, subprocess.Popen(item.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command = item.command
+            if item.pass_alert is not None or item.kind == "pending-worker-pass":
+                if time.monotonic() >= batch_deadline:
+                    continue
+                with operation_deadline.within(batch_deadline):
+                    arguments = (worker_pass_alerts.alert_arguments(item.pass_alert) if item.pass_alert is not None
+                                 else worker_pass_alerts.pending_arguments(item.state_path))
+                    operation_deadline.check()
+                if arguments is None:
+                    continue
+                command = session_send.send_argv(*arguments, send_script=SEND)
+            started.append((item, subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                    text=True, start_new_session=True)))
         except OSError as error:
             print(f"stall-watch: {item.kind}: {error}", file=sys.stderr)
@@ -1237,8 +1319,26 @@ def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,
         if isinstance(result, CommandFailure):
             print(f"stall-watch: {item.kind}: send {result.reason}", file=sys.stderr)
             continue
+        if item.kind in ("worker-pass", "pending-worker-pass"):
+            outcome = send_result.send_outcome(result.returncode, result.stdout)
+            if (isinstance(outcome, send_result.ConfirmedSendOutcome)
+                    and outcome.header.outcome in worker_pass_alerts.ACCEPTED_OUTCOMES):
+                if item.kind == "pending-worker-pass":
+                    item.state_path.unlink(missing_ok=True)
+                else:
+                    try:
+                        write_text_atomic(item.state_path, outcome.header.outcome + "\n")
+                    except OSError as error:
+                        print(f"stall-watch: worker pass alert acceptance: {error}", file=sys.stderr)
+                continue
+            print(f"stall-watch: {item.kind}: {failure_detail(result)}", file=sys.stderr)
+            continue
         if result.returncode != 0:
             print(f"stall-watch: {item.kind}: {failure_detail(result)}", file=sys.stderr)
+            continue
+        if item.kind == "detached-result-alert":
+            if result.stderr:
+                print(result.stderr.rstrip(), file=sys.stderr)
             continue
         if item.kind == "retire":
             prompt = saved_prompt(item.state_path)
@@ -1394,8 +1494,12 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
     runs = unit_lookup.HeldRunLookup(record=record)
-    pane_worker_parents = tuple(item.row for item in work)
-    busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
+    pane_workers = read_pane_workers(record, inspection_deadline)
+    busy_pane_workers = {parent for parent, workers in pane_workers.items()
+                         if any(worker_panes.worker_state(observed) == "busy" for observed in workers)}
+    pending.extend(Delivery(path, "pending-worker-pass", []) for path in worker_pass_alerts.pending_paths())
+    pending.extend(blocked_worker_deliveries(pane_workers, record, now, inspection_deadline))
+    pending.extend(detached_result_alerts())
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
     for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
@@ -1539,9 +1643,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             running_work = work_running(pid, rows, session_id)
             if not running_work:
-                if isinstance(busy_pane_workers, PaneWorkersUnread):
-                    busy_pane_workers = read_busy_pane_worker_parents(pane_worker_parents, record)
-                running_work = row.id in busy_pane_workers.ids
+                running_work = row.id in busy_pane_workers
             if not running_work:
                 running_work = has_live_detached_worker_run(row, run, record)
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import io
@@ -38,9 +38,9 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-from scripts.production import showrunners, staff
+from scripts.production import showrunners, staff, worker_pass_alerts
 from scripts.agents.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id, fixture_worker
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.herdr import fake_herdr
@@ -113,6 +113,7 @@ WATCH_DEFAULTS = r"""sender_batch_seconds=90
 sender_cleanup_seconds=2
 delivery_reserve_seconds=10
 prompt_grace_seconds=120
+worker_blocked_seconds=300
 login_limit_pattern=Login reached its time limit
 paused_status_pattern=\bpaus(?:e[ds]?|ing)\b
 external_wait_pattern=\b(?:wait(?:ing)?|held|holding|blocked)\b.*?\b(?:on|for)\s+(?:the\s+)?(?P<owner>.+)
@@ -358,6 +359,101 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         path = self.root / "stall_watch.conf"
         _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
         return path
+
+    def test_blocked_worker_alert_uses_the_active_pass_and_restarts_the_clock_after_unblock(self) -> None:
+        director = next(row for row in staff.snapshot().find(kind="unit") if row.name == "unit-one")
+        member = fixture_worker("impl", director.id)
+        record = staff.snapshot()
+        blocked = worker_panes.OpenWorker(member, "w1:p2", "terminal", herdr.AgentStatus.BLOCKED)
+        observed: list[worker_panes.WorkerPane] = [blocked]
+        observations = {director.id: observed}
+        _ = self.watch_settings(worker_blocked_seconds="60")
+        passed = {"status": "active", "instance_id": "pass-one"}
+        with (mock.patch.object(stall_watch, "STATE_DIR", self.state),
+              mock.patch.object(worker_panes, "parent_run_index", return_value={}),
+              mock.patch.object(worker_panes, "worker_run", return_value=self.root),
+              mock.patch.object(worker_panes, "worker_pass", return_value=passed)):
+            def alerts(at: float) -> list[stall_watch.Delivery]:
+                return stall_watch.blocked_worker_deliveries(observations, record, at, float("inf"))
+
+            self.assertEqual(alerts(START), [])
+            self.assertEqual(alerts(START + 58), [])
+            observed[:] = [replace(blocked, status=herdr.AgentStatus.UNKNOWN)]
+            self.assertEqual(alerts(START + 59), [])
+            observed[:] = [worker_panes.UncertainWorker(member, "the pane is unavailable")]
+            self.assertEqual(alerts(START + 60), [])
+            observed[:] = [blocked]
+            alert, = alerts(START + 61)
+            self.assertEqual(alert.command, [])
+            self.assertEqual(alert.pass_alert, worker_pass_alerts.PassAlert(
+                director.id, member.id, self.root, "pass-one", worker_pass_alerts.AlertReason.BLOCKED))
+            observed[:] = [replace(blocked, status=herdr.AgentStatus.IDLE)]
+            self.assertEqual(alerts(START + 62), [])
+            observed[:] = [blocked]
+            self.assertEqual(alerts(START + 63), [])
+            self.assertEqual(alerts(START + 122), [])
+            self.assertEqual(alerts(START + 123), [alert])
+            failure = subprocess.CompletedProcess(alert.command, 3, "FAILED: transport failed\n", "")
+            accepted = subprocess.CompletedProcess(alert.command, 1, "QUEUED: stored for the director\n", "")
+            with (mock.patch.object(worker_panes, "observe_worker", return_value=blocked) as observe,
+                  mock.patch.object(subprocess, "Popen") as start,
+                  mock.patch.object(stall_watch, "finish_process", side_effect=[failure, accepted]),
+                  redirect_stderr(io.StringIO())):
+                limits = stall_watch.SenderLimits(1, 1)
+                stall_watch.send_all([alert], START + 123, limits=limits)
+                self.assertFalse(alert.state_path.exists())
+                retry = alerts(START + 124)
+                observe.return_value = replace(blocked, status=herdr.AgentStatus.IDLE)
+                stall_watch.send_all(retry, START + 124, limits=limits)
+                self.assertEqual(alert.state_path.read_text(), "queued\n")
+                stall_watch.send_all(alerts(START + 125), START + 125, limits=limits)
+                self.assertEqual(start.call_count, 2)
+                first, second = [cast(list[str], call.args[0]) for call in start.call_args_list]
+                key = "worker-pass-alert:pass-one:blocked"
+                self.assertIn(key, first)
+                self.assertIn(key, second)
+                self.assertIn("answer impl --question --text", first[first.index("--text") + 1])
+                self.assertIn("answer impl --text", second[second.index("--text") + 1])
+                self.assertNotIn("--question", second[second.index("--text") + 1])
+
+            observed[:] = [replace(blocked, status=herdr.AgentStatus.IDLE)]
+            self.assertEqual(alerts(START + 126), [])
+            observed[:] = [blocked]
+            self.assertEqual(alerts(START + 187), [])
+            passed["instance_id"] = "pass-two"
+            self.assertEqual(alerts(START + 188), [])
+            next_alert, = alerts(START + 248)
+            self.assertEqual(next_alert.pass_alert, worker_pass_alerts.PassAlert(
+                director.id, member.id, self.root, "pass-two", worker_pass_alerts.AlertReason.BLOCKED))
+            self.assertNotEqual(next_alert.state_path, alert.state_path)
+            passed["status"] = "completed"
+            self.assertEqual(alerts(START + 249), [])
+
+    def test_saved_worker_alert_reads_the_pane_when_the_sender_starts(self) -> None:
+        director = next(row for row in staff.snapshot().find(kind="unit") if row.name == "unit-one")
+        row = fixture_worker("impl", director.id)
+        worker_pass_alerts.save_pending(row, director.id, self.root, "pass-one",
+                                        worker_pass_alerts.AlertReason.NO_DONE, "")
+        path, = worker_pass_alerts.pending_paths(worker=row.id)
+        item = stall_watch.Delivery(path, "pending-worker-pass", [])
+        blocked = worker_panes.OpenWorker(row, "w1:p2", "terminal", herdr.AgentStatus.BLOCKED)
+        passed = {"status": "active", "instance_id": "pass-one"}
+        accepted = subprocess.CompletedProcess([], 0, "SENT: director received the alert\n", "")
+
+        with (mock.patch.object(worker_panes, "worker_pass", return_value=passed),
+              mock.patch.object(worker_panes, "observe_worker", return_value=blocked) as observe,
+              mock.patch.object(subprocess, "Popen") as start,
+              mock.patch.object(stall_watch, "finish_process", return_value=accepted)):
+            arguments = worker_pass_alerts.pending_arguments(path)
+            assert arguments is not None
+            self.assertIn("--question", arguments[arguments.index("--text") + 1])
+            observe.return_value = replace(blocked, status=herdr.AgentStatus.IDLE)
+            stall_watch.send_all([item], START, limits=stall_watch.SenderLimits(1, 1))
+
+        start.assert_called_once()
+        command = cast(list[str], start.call_args.args[0])
+        self.assertIn("answer impl --text", command[command.index("--text") + 1])
+        self.assertFalse(path.exists())
 
     def test_prompt_alert_seconds_reads_changed_config(self) -> None:
         path = self.root / "production.conf"

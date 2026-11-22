@@ -22,7 +22,7 @@ import sys
 import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
@@ -564,6 +564,41 @@ class SharedServer(Enum):
 @dataclass(frozen=True)
 class ObservedServer:
     client: herdr.Herdr
+
+
+@dataclass(frozen=True)
+class WorkerAnswerRefused:
+    reason: str
+    code: ExitCode = ExitCode.REFUSED
+
+    def detail(self, name: str) -> str:
+        return f"{name}: {self.reason}. Use assign.sh for new work."
+
+
+@dataclass(frozen=True)
+class WorkerAnswer:
+    worker: OpenWorker
+    backend: staff.ClaudeBackend | staff.CodexBackend
+    text: str
+
+
+@dataclass(frozen=True)
+class ExpectedWorker:
+    row: staff.StaffRow
+
+
+class WorkerAnswerService(Protocol):
+    def worker_answer(self, parent: StaffId, name: WorkerName, text: str, *,
+                      identity: ExpectedWorker, server: SharedServer | ObservedServer
+                      ) -> AbstractContextManager[WorkerAnswer | WorkerAnswerRefused]: ...
+
+
+def answer_for_message(parent: StaffId, row: staff.StaffRow, text: str, *,
+                       server: SharedServer | ObservedServer
+                       ) -> AbstractContextManager[WorkerAnswer | WorkerAnswerRefused]:
+    """Check the worker's active pass before sending a message."""
+    service = cast(WorkerAnswerService, cast(object, import_module("scripts.production.worker")))
+    return service.worker_answer(parent, WorkerName.parse(row.name), text, identity=ExpectedWorker(row), server=server)
 
 
 def observe_selected(parent: StaffId, record: staff.StaffSnapshot, names: Sequence[WorkerName], *,

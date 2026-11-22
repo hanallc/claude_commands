@@ -777,6 +777,10 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
+class WorkerResultHolderDelivery(Result):
+    """The outcome of a worker result notice to its holder."""
+
+
 class RecordedDeliveryAcceptance(Result):
     """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
 
@@ -5142,12 +5146,22 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
         place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
 
 
+DIRECTOR_RESULT_ACCEPTED = frozenset(("sent", "queued", "kept", "replaced", "skipped"))
+
+
+def detached_result_notice_arguments(marker: str) -> list[str]:
+    """Use the same delivery identity for each route to the director."""
+    key = f"detached-run-alert:{marker.removeprefix('Detached run: ')}"
+    return ["--key", key, "--recipient-key", "detached-run-director", "--repeat-minutes", "52596000"]
+
+
 @dataclass(frozen=True)
 class WorkerResultReceipt:
     marker: str
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
+    before_holder: Callable[[], object] = lambda: None
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
         from scripts.production import worker_admission
@@ -5156,7 +5170,7 @@ class WorkerResultReceipt:
         if isinstance(backend, staff.BackendUnavailable):
             raise ValueError("worker transcript backend is unavailable")
         source = worker_admission.transcript_source(worker, backend)
-        return any(isinstance(entry, str) and entry.startswith("user:\n") and self.marker in entry.splitlines()[1:]
+        return any(isinstance(entry, str) and self.marker in worker_admission.transcript_user_lines(entry)
                    for entry in worker_admission.transcript_entries(source, set()))
 
 
@@ -5179,14 +5193,12 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
                            server: worker_panes.SharedServer | worker_panes.ObservedServer) -> Result:
     from scripts.direct import recorder_state
     from scripts.herdr import herdr, worker_panes
-    from scripts.production import worker
 
     ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
     submission: herdr.TrackedPromptSubmission | None = None
     try:
-        with worker.worker_answer(parent, staff.WorkerName.parse(row.name), text,
-                                  identity=worker.ExpectedWorker(row), server=server) as checked:
-            if isinstance(checked, worker.WorkerAnswerRefused):
+        with worker_panes.answer_for_message(parent, row, text, server=server) as checked:
+            if isinstance(checked, worker_panes.WorkerAnswerRefused):
                 return Result("refused", checked.detail(row.name))
             state = checked.worker
             if isinstance(observed_place, HerdrPlace) and state.pane != observed_place.pane:
@@ -5194,7 +5206,7 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
             if state.status is herdr.AgentStatus.BLOCKED:
                 return Result("refused", f"{row.name}: {_blocked_worker_refusal(observed_place)}")
             if state.status not in ordinary_states:
-                return Result("refused", worker.WorkerAnswerRefused(f"worker is {state.status.value}").detail(row.name))
+                return Result("refused", worker_panes.WorkerAnswerRefused(f"worker is {state.status.value}").detail(row.name))
             if isinstance(selection, FixedStaffLookup):
                 current = _current_staff_session(selection, ExpectedStaffSession(row.current_session))
                 if isinstance(current, RecipientLookupFailed):
@@ -5215,7 +5227,7 @@ def _deliver_worker_answer(parent: staff.StaffId, row: staff.StaffRow, text: str
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError,
             staff.StaffRefused, recorder_state.OldRecorderState) as error:
         if submission is None:
-            return Result("refused", worker.WorkerAnswerRefused(one_line(str(error))).detail(row.name))
+            return Result("refused", worker_panes.WorkerAnswerRefused(one_line(str(error))).detail(row.name))
         if submission.may_have_submitted:
             return WorkerMessageUnconfirmed("failed", f"worker message delivery unconfirmed: {error}. "
                                             + "The message may already have arrived. Do not resend it.")
@@ -5293,9 +5305,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     reason = f"worker transcript is unavailable: {error}"
                 return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
-                reason = f"worker is {state.status.value}"
-                if state.status != herdr.AgentStatus.BLOCKED:
-                    return Result("retry", reason)
+                return Result("retry", f"worker is {state.status.value}")
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -5309,9 +5319,14 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
     address = f"session:{holder.current_session}"
-    options = parse(["--here", "--to", address, "--from", sender,
-                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
-    return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+    arguments = ["--here", "--to", address, "--from", sender,
+                 "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"]
+    if isinstance(receipt, WorkerResultReceipt):
+        _ = receipt.before_holder()
+        arguments.extend(detached_result_notice_arguments(receipt.marker))
+    options = parse(arguments)._replace(selection=WorkerHolderRecipient(address, holder.id))
+    result = _send(options, membership=membership)
+    return WorkerResultHolderDelivery(*result) if isinstance(receipt, WorkerResultReceipt) else result
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:

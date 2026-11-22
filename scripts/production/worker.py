@@ -33,13 +33,16 @@ from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
+from scripts.herdr.worker_panes import ExpectedWorker as ExpectedWorker
+from scripts.herdr.worker_panes import WorkerAnswer as WorkerAnswer
+from scripts.herdr.worker_panes import WorkerAnswerRefused as WorkerAnswerRefused
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import display_cells, session_staff, staff, worker_admission
+from scripts.production import display_cells, session_staff, staff, worker_admission, worker_pass_alerts
 from scripts.whoami import quota_state
 
 from scripts.herdr import herdr
@@ -80,6 +83,11 @@ class DispatchWaitingForRuns:
     runs: tuple[str, ...]
     has_live_run: bool
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply
+    undelivered_runs: tuple[str, ...] = ()
+
+    @property
+    def results_pending(self) -> bool:
+        return self.has_live_run or bool(self.undelivered_runs)
 
 
 class NoMatchingDone(Enum):
@@ -152,7 +160,7 @@ NO_RESULT_IDS: frozenset[str] = frozenset()
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
-                       stop_at_done: bool = False, accept_late_done: bool = False,
+                       accept_late_done: bool = False,
                        late_result_ids: frozenset[str] = NO_RESULT_IDS,
                        other_pass_results: frozenset[str] = NO_RESULT_IDS) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
@@ -179,7 +187,7 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                 entry = worker_admission.transcript_entry(entry, set())
             if entry.startswith("user:\n"):
                 text = entry.removeprefix("user:\n").strip()
-                results = {part.removeprefix("Detached run: ") for part in text.splitlines()
+                results = {part.removeprefix("Detached run: ") for part in worker_admission.transcript_user_lines(entry)
                            if part.startswith("Detached run: ")}
                 received.update(results)
                 if second_stage and completion_id != second_stage and _prompt_names_completion(text, second_stage):
@@ -219,8 +227,6 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                     complete = worker_admission.reply_ends_dispatch(text, completion_id)
                 if accept_late_done and not responding and not complete:
                     continue
-                if complete and stop_at_done and isinstance(completion, DoneReply):
-                    return TranscriptReceipt(DispatchComplete(text), frozenset(received))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
                     responding = True
@@ -295,7 +301,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     stopped = isinstance(pane_pass, progress_history.StoppedPassReceipt)
     late_result_ids = other_pass_results = NO_RESULT_IDS
     if stopped:
-        deliveries, other_passes = detached_runs.worker_results(directory, row, since=0,
+        deliveries, other_passes = detached_runs.worker_results(directory, row, since=None,
                                                                pane_dispatch_id=pane_pass.instance_id)
         late_result_ids = frozenset(deliveries)
         other_pass_results = frozenset(other_passes)
@@ -315,18 +321,17 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     live = ([] if isinstance(pane_pass, worker_panes.PassDetachedResults) and pane_pass.live_runs_checked else
             detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
-        live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
+        live = [record for record in live if detached_runs.result_in_pass(record, pane_pass.instance_id, since=None)]
     else:
         if isinstance(pane_pass, worker_panes.PassDetachedResults):
             since, instance = pane_pass.started_at, pane_pass.instance_id
         else:
             passed = worker_panes.worker_pass(row, run)
-            started = passed.get("started_at", 0)
-            since = float(started) if isinstance(started, (int, float)) else 0
+            since = passed.get("started_at") or 0
             instance = passed.get("instance_id")
-        live = [record for record in live if not detached_runs.result_is_from_another_pass(record, instance)]
+        live = [record for record in live if detached_runs.result_in_pass(record, instance, since=since)]
         deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
-            pane_dispatch_id=instance if isinstance(instance, str) else "", include_legacy_pass=True)
+            pane_dispatch_id=instance, received_runs=transcript.received_runs)
         if isinstance(reply, DispatchAwaitingReply) and other_passes.intersection(reply.runs):
             transcript = transcript_receipt(records(), prompt, done, other_pass_results=frozenset(other_passes))
             recovered = transcript.receipt
@@ -348,7 +353,9 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         elif not live:
             return replace(reply, anomalies=tuple(
                 f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
-    return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
+    if pending:
+        return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply, tuple(sorted(unseen)))
+    return reply
 
 
 def completion_close_evidence(row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
@@ -605,8 +612,9 @@ def launched_agent(row: staff.StaffRow) -> progress_history.CalledAgent:
     return progress_history.CalledAgent(kind, settings.model, settings.effort or "unset")
 
 
-def _prompt_conflict(conflict: pass_recorder.ActiveDispatchPromptConflict) -> ExitCode:
-    print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
+def _prompt_conflict(parent: StaffId, run: Path, conflict: pass_recorder.ActiveDispatchPromptConflict) -> ExitCode:
+    instruction = worker_pass_alerts.recovery_instruction(parent, conflict.worker_name, run, conflict.instance_id)
+    print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content. {instruction}",
           file=sys.stderr)
     return ExitCode.BUSY
 
@@ -677,7 +685,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             prompt=prompt, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
             target=name)
         if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
-            return _prompt_conflict(selection)
+            return _prompt_conflict(parent, session_dir, selection)
         matched = selection.action
         completion_notices = _completion_notices()
         record = staff.snapshot()
@@ -760,7 +768,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
                 new_pass_instance_id=new_pass_instance_id, selection=selection)
         except pass_recorder.DispatchPromptRefused as refused:
-            return _prompt_conflict(refused.conflict)
+            return _prompt_conflict(parent, session_dir, refused.conflict)
         except pass_recorder.DispatchSelectionChanged as error:
             return _selection_changed(error)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
@@ -1134,7 +1142,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 prompt=prompt.resolve(), launcher_command=launcher_command,
                 work=progress_history.DispatchWork(kind, lens, fix_pass))
             if isinstance(matched, pass_recorder.ActiveDispatchPromptConflict):
-                return _prompt_conflict(matched)
+                return _prompt_conflict(parent, session_dir, matched)
             if isinstance(matched, pass_recorder.MatchedDispatch):
                 name = matched.worker_name
         record = staff.snapshot()
@@ -1218,36 +1226,15 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         return result
 
 
-@dataclass(frozen=True)
-class WorkerAnswerRefused:
-    reason: str
-    code: ExitCode = ExitCode.REFUSED
-
-    def detail(self, name: str) -> str:
-        return f"{name}: {self.reason}. Use assign.sh for new work."
-
-
-@dataclass(frozen=True)
-class WorkerAnswer:
-    worker: worker_panes.OpenWorker
-    backend: staff.ClaudeBackend | staff.CodexBackend
-    text: str
-
-
 class CurrentWorker(Enum):
     BY_NAME = "select the current worker by name"
-
-
-@dataclass(frozen=True)
-class ExpectedWorker:
-    row: staff.StaffRow
 
 
 @contextmanager
 def worker_answer(parent: StaffId, name: WorkerName, text: str, *,
                   identity: CurrentWorker | ExpectedWorker,
-                  server: worker_panes.SharedServer | worker_panes.ObservedServer
-                  ) -> Generator[WorkerAnswer | WorkerAnswerRefused]:
+                  server: worker_panes.SharedServer | worker_panes.ObservedServer,
+                  question: bool = False) -> Generator[WorkerAnswer | WorkerAnswerRefused]:
     """Hold the worker lock through the pass check and input."""
     with worker_panes.worker_lock(parent, name) as hold:
         if isinstance(hold, worker_panes.Kept):
@@ -1280,8 +1267,17 @@ def worker_answer(parent: StaffId, name: WorkerName, text: str, *,
         if isinstance(backend, staff.BackendUnavailable):
             yield WorkerAnswerRefused("the worker transcript is unavailable", ExitCode.UNCERTAIN)
             return
-        receipt = transcript_receipt(_receipt_records(row, backend), delivery.line, DoneReply(delivery.completion_id),
-                                     stop_at_done=True).receipt
+        try:
+            receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run)
+        except (OSError, ValueError) as error:
+            yield WorkerAnswerRefused(f"the dispatch receipt is unavailable: {error}", ExitCode.UNCERTAIN)
+            return
+        reply = receipt.reply if isinstance(receipt, DispatchWaitingForRuns) else receipt
+        needs_fresh_done = isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete)
+        if (not question and (needs_fresh_done or isinstance(reply, DispatchComplete))
+                and isinstance(receipt, DispatchWaitingForRuns) and receipt.results_pending):
+            yield WorkerAnswerRefused("the active pass is waiting for detached results")
+            return
         if isinstance(receipt, DispatchComplete):
             yield WorkerAnswerRefused("the active pass already has a DONE reply")
             return
@@ -1296,12 +1292,19 @@ def worker_answer(parent: StaffId, name: WorkerName, text: str, *,
         if not isinstance(state, worker_panes.OpenWorker):
             yield WorkerAnswerRefused("the worker pane is unavailable", ExitCode.UNCERTAIN)
             return
-        yield WorkerAnswer(state, backend, text + "\n" + _done_instruction(delivery.completion_id))
+        if question and state.status is not herdr.AgentStatus.BLOCKED:
+            yield WorkerAnswerRefused("the worker is no longer blocked")
+            return
+        if needs_fresh_done and not question and state.status is herdr.AgentStatus.BLOCKED:
+            yield WorkerAnswerRefused("the worker is blocked. Use answer --question to answer its question")
+            return
+        message = text if question else text + "\n" + _done_instruction(delivery.completion_id)
+        yield WorkerAnswer(state, backend, message)
 
 
-def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
+def answer(parent: StaffId, name: WorkerName, text: str, *, question: bool = False) -> ExitCode:
     with worker_answer(parent, name, text, identity=CurrentWorker.BY_NAME,
-                       server=worker_panes.SharedServer.CONFIGURED) as checked:
+                       server=worker_panes.SharedServer.CONFIGURED, question=question) as checked:
         if isinstance(checked, WorkerAnswerRefused):
             print(checked.detail(name.value), file=sys.stderr)
             return checked.code
@@ -2050,6 +2053,7 @@ def main(arguments: list[str] | None = None) -> int:
     answering = commands.add_parser("answer")
     _ = answering.add_argument("name")
     _ = answering.add_argument("--text", required=True)
+    _ = answering.add_argument("--question", action="store_true", help="answer a question on a blocked worker pane")
     ending = commands.add_parser("end")
     _ = ending.add_argument("name")
     _ = ending.add_argument("--session-dir", default="")
@@ -2105,7 +2109,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "restore":
             return restore(owner.id)
         if args.command == "answer":
-            code = answer(owner.id, WorkerName.parse(args.name), args.text)
+            code = answer(owner.id, WorkerName.parse(args.name), args.text, question=cast(bool, args.question))
         elif args.command == "end":
             code = end(owner.id, WorkerName.parse(args.name))
         elif args.command == "add":
