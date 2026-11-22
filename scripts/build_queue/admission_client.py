@@ -42,7 +42,7 @@ else:
     from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.system_clock import SystemClock
 
-from scripts.lib import conf
+from scripts.lib import conf, process_stat
 from scripts.lib.atomic_file import write_text_atomic
 
 BUILDS_SESSION = "builds"
@@ -762,12 +762,33 @@ def cpu_pool_path() -> Path:
     return Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
 
 
+def _has_live_ancestor(owner_pid: int, owner_start: str) -> bool:
+    from scripts.build_queue import admission_records as records
+
+    pid = os.getppid()
+    seen: set[int] = set()
+    child_start = math.inf
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = process_stat.process_fields(pid)
+            start = fields[19]
+            start_tick = int(start)
+            if start_tick > child_start or records.process_start_time(pid) != start:
+                return False
+            if pid == owner_pid:
+                return start == owner_start
+            pid, child_start = int(fields[1]), start_tick
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
 def outer_reservation(*, match_cpu_pool: bool = False) -> OuterReservation | NoOuterReservation:
     """Find the live parent reservation for this queue or the shared CPU pool."""
     marker = os.environ.get(RESERVED_STEP_ENV, "")
     if not marker:
         return NoOuterReservation()
-    from scripts.build_hold import build_hold
     from scripts.build_queue import admission_records as records
     from scripts.buildlog import store
 
@@ -787,8 +808,7 @@ def outer_reservation(*, match_cpu_pool: bool = False) -> OuterReservation | NoO
         if not (same_queue or same_cpu_pool):
             return NoOuterReservation()
         start = records.process_start_time(pid)
-        ancestors = build_hold.caller_processes(Path("/proc"), os.getppid())
-        if start is None or build_hold.ProcessIdentity(pid, start) not in ancestors:
+        if start is None or not _has_live_ancestor(pid, start):
             return NoOuterReservation()
         state = cast(object, json.loads((Path(directory) / "state.json").read_text()))
     except (OSError, ValueError):
