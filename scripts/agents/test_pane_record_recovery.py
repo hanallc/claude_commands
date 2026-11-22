@@ -18,8 +18,11 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.agents.test_support import write_machine_config
+from scripts.agents.test_support import SHUTDOWN_SETTINGS, write_machine_config
+from scripts.lib.build_folders_test_support import workspace_folder_settings
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message.codex_test_support import CODEX_DAEMON_SETTINGS
+from scripts.production.config_test_support import RENAME_SETTINGS
 from scripts.production.rename_test_support import FolderMoveFixture
 from scripts.herdr import herdr_types
 from scripts.production.cli_fixture import invoke_cli
@@ -32,13 +35,23 @@ from scripts.production import staff, session_staff
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
 from scripts.agents import pane_record as restart_records
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production.staff_test_support import fixture_runtime_id, write_staff_settings
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_move
 from scripts.herdr import herdr
 from scripts.agents import pane_record
 from scripts.herdr import pane_launch
 from scripts.message import sessions
+
+
+def write_recovery_settings(root: Path) -> Path:
+    configuration = root / "configuration"
+    _ = write_config_fixture(configuration / "build_folders.conf", defaults=workspace_folder_settings(configuration))
+    _ = write_config_fixture(configuration / "production.conf", defaults=RENAME_SETTINGS)
+    _ = write_staff_settings(configuration / "staff.conf", producers=root / "producers")
+    _ = write_config_fixture(configuration / "shutdown.conf", defaults=SHUTDOWN_SETTINGS)
+    _ = write_config_fixture(configuration / "codex_daemon.conf", defaults=CODEX_DAEMON_SETTINGS)
+    return configuration
 
 
 def fixture_launch_transcript(root: Path, entry: pane_launch.PaneLaunch, record: staff.StaffSnapshot) -> None:
@@ -229,12 +242,8 @@ class PaneRecordRecoveryTests(unittest.TestCase):
             return (accounts.CodexWorkersAccount("codex1", self.root / ".codex1")
                     if role == "workers" else select_role(role))
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
-        configuration = self.root / "configuration"
-        configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        configuration = write_recovery_settings(self.root)
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):
@@ -386,10 +395,7 @@ class PaneMoveRecoveryTests(FolderMoveFixture):
             return (accounts.CodexWorkersAccount("codex2", self.root / "home/.codex2")
                     if role == "workers" else select_role(role))
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
-        configuration = self.root / "configuration"
-        configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            _ = write_config_fixture(configuration / source.name)
+        configuration = write_recovery_settings(self.root)
         registry = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
