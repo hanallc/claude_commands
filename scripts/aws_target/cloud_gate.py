@@ -43,8 +43,9 @@ from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
-from scripts.production.gate_modules import GateRefused, discover_test_modules
+from scripts.production.gate_modules import GateRefused, is_test_module
 from scripts.production import gate
+from scripts.style.git_process import parse_tree_listing
 from scripts.test_times import gate_record
 
 
@@ -1195,6 +1196,24 @@ def require_selected_tree(repo: Path, tree: str, selected: gate.AllModules | gat
         raise GateRefused('The checkout changed after the test selection')
 
 
+def request_test_modules(repo: Path, tree: str, selected: gate.AllModules | gate.TreeSelection) -> list[str]:
+    listing = gate.checked_git(repo, 'ls-tree', '-rz', '--full-tree', tree, '--', 'scripts/')
+    modules: list[str] = []
+    for name, entry in parse_tree_listing(listing).items():
+        path = Path(name)
+        if entry.kind != 'blob' or not is_test_module(name) or '__pycache__' in path.parts[:-1]:
+            continue
+        if len(path.parts) < 3:
+            raise GateRefused(f'test module must be in a suite folder under scripts/: {path.name}')
+        modules.append(name)
+    if isinstance(selected, gate.TreeSelection):
+        paths = set(selected.paths)
+        if not paths <= set(modules):
+            raise GateRefused('selected modules are absent from the tested tree')
+        modules = [name for name in modules if name in paths]
+    return sorted(modules, key=lambda name: Path(name).parts)
+
+
 def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
                     selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
@@ -1203,12 +1222,7 @@ def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float
     if not dirty and gate.checked_git(repo, 'rev-parse', f'{head}^{{tree}}') != tree:
         raise GateRefused('The checkout changed during cloud request preparation')
     commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
-    modules = discover_test_modules(repo)
-    if isinstance(selected, gate.TreeSelection):
-        paths = set(selected.paths)
-        if not paths <= {str(path.relative_to(repo)) for _, path in modules}:
-            raise GateRefused('selected modules are absent from the tested tree')
-        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
+    modules = request_test_modules(repo, tree, selected)
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
     from urllib.parse import urlsplit
@@ -1217,9 +1231,17 @@ def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float
     folder.mkdir(parents=True, exist_ok=True)
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.wire, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': '',
+        'mode': mode.wire, 'modules': modules, 'source_key': '',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
+    return request
+
+
+def read_saved_request(repo: Path, path: Path, tree: str,
+                       selected: gate.AllModules | gate.TreeSelection) -> dict[str, object]:
+    request = read(path)
+    if request.get('modules') != request_test_modules(repo, tree, selected):
+        raise ValueError('The saved request has a different module list')
     return request
 
 
@@ -1320,7 +1342,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         saved_result = read(result_path) if result_path.exists() else {}
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
-                request = read(folder / 'request.json')
+                request = read_saved_request(repo, folder / 'request.json', tree, selected)
                 saved_attempt = request.setdefault('attempt', folder.name)
                 if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
                         or saved_attempt != folder.name):
@@ -1393,9 +1415,12 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     command = service_command('scripts.aws_target.cloud_gate',
                         ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
-                    request = (read(folder / 'request.json') if (folder / 'request.json').exists()
-                               else prepare(repo, folder, mode, module_time_limit_s,
-                                            selected=selected, gate_job=attempt.gate_job))
+                    request_path = folder / 'request.json'
+                    if request_path.exists():
+                        request = read_saved_request(repo, request_path, tree, selected)
+                    else:
+                        request = prepare(repo, folder, mode, module_time_limit_s,
+                                          selected=selected, gate_job=attempt.gate_job)
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):

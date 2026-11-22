@@ -1196,9 +1196,15 @@ class UnrecordableTestTree:
 
 
 @dataclass(frozen=True)
+class NoPendingTestPass:
+    """The routed gate has no local pass to publish."""
+
+
+@dataclass
 class RoutedGateTree:
     repo: Path
     tree: str
+    pending_pass: PendingTestPass | NoPendingTestPass = NoPendingTestPass()
 
 
 @dataclass(frozen=True)
@@ -1224,6 +1230,14 @@ def clean_test_tree(repo: Path) -> CleanTestTree | UnrecordableTestTree:
         return UnrecordableTestTree("checkout is dirty", tuple(paths))
     commit = checked_git(repo, "rev-parse", "HEAD")
     return CleanTestTree(checked_git(repo, "rev-parse", f"{commit}^{{tree}}"), commit)
+
+
+@dataclass(frozen=True)
+class NoFullRunRequired:
+    pass
+
+
+NO_FULL_RUN_REQUIRED = NoFullRunRequired()
 
 
 @dataclass
@@ -1304,7 +1318,8 @@ class PassedTreeLedger:
         return NoCertifiedBase()
 
     def record_pass(self, selection: AffectedSelection | FullSuite, *,
-                    discovered: Sequence[tuple[str, Path]] = ()) -> None:
+                    discovered: Sequence[tuple[str, Path]] = (),
+                    required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED) -> None:
         if (self.unavailable or isinstance(self.tree, UnrecordableTestTree)
                 or not matches_routed_gate_tree(self.repo, self.tree.tree)):
             return
@@ -1327,11 +1342,20 @@ class PassedTreeLedger:
                     raise OSError("incomplete test pass write")
         except (GateRefused, OSError, ValueError) as error:
             self.report_error(error)
+            return
+        if isinstance(required, FullSuite):
+            (gate_state_dir() / "full-required").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
-class NoFullRunRequired:
-    pass
+class PendingTestPass:
+    ledger: PassedTreeLedger
+    selection: AffectedSelection | FullSuite
+    discovered: Sequence[tuple[str, Path]]
+    required: FullSuite | NoFullRunRequired
+
+    def publish(self) -> None:
+        self.ledger.record_pass(self.selection, discovered=self.discovered, required=self.required)
 
 
 def full_required() -> FullSuite | NoFullRunRequired:
@@ -1340,7 +1364,7 @@ def full_required() -> FullSuite | NoFullRunRequired:
         value = cast(dict[str, object], json.loads(marker.read_text()))
         return FullSuite(f"last nightly run was red ({value['tree']}, {value['at']})")
     except FileNotFoundError:
-        return NoFullRunRequired()
+        return NO_FULL_RUN_REQUIRED
     except (OSError, ValueError, KeyError, TypeError) as error:
         return FullSuite(f"last nightly run was red (unreadable marker: {error})")
 
@@ -1499,14 +1523,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
-    required: FullSuite | NoFullRunRequired = NoFullRunRequired()
+    required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED
     reused = False
     selection: AffectedSelection | FullSuite | SelectedModules = (
         selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
     if shared:
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
         if isinstance(selected, AllModules):
-            required = full_required() if mode is SuiteMode.GATE else NoFullRunRequired()
+            required = full_required() if mode is SuiteMode.GATE else NO_FULL_RUN_REQUIRED
             reused = not full and isinstance(required, NoFullRunRequired) and ledger.reuse()
             selection = FullSuite("passed tree reused")
             if not reused:
@@ -1863,9 +1887,12 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
-        ledger.record_pass(selection, discovered=discovered)
-        if isinstance(required, FullSuite):
-            (gate_state_dir() / "full-required").unlink(missing_ok=True)
+        pending_pass = PendingTestPass(ledger, selection, discovered, required)
+        routed = ACTIVE_ROUTED_GATE_TREE.get()
+        if isinstance(routed, RoutedGateTree) and routed.repo == repo:
+            routed.pending_pass = pending_pass
+        else:
+            pending_pass.publish()
     return run
 
 
@@ -2910,7 +2937,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
         try:
             tree = cloud.working_tree(repo)[0] if isinstance(selection, AllModules) else selection.tree
-            token = ACTIVE_ROUTED_GATE_TREE.set(RoutedGateTree(repo, tree))
+            routed = RoutedGateTree(repo, tree)
+            token = ACTIVE_ROUTED_GATE_TREE.set(routed)
             try:
                 outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                                       selected=selection, gate_job=gate_job)
@@ -2924,6 +2952,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     run = outcome
                 if cloud.working_tree(repo)[0] != tree:
                     raise GateRefused("The checkout changed during the gate")
+                if isinstance(routed.pending_pass, PendingTestPass):
+                    routed.pending_pass.publish()
             finally:
                 ACTIVE_ROUTED_GATE_TREE.reset(token)
         except affected_modules.GraphError as error:

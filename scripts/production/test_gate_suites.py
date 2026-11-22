@@ -354,6 +354,43 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertTrue(run.passed)
         self.assertEqual(self.pass_records(), [])
 
+    @gate_suites("hooks")
+    def test_cloud_fallback_publishes_the_pass_only_after_final_validation(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        subject = self.checkout / "subject.txt"
+        working_tree = cloud_gate.working_tree
+        calls = 0
+
+        def change_before_final_check(repo: Path) -> tuple[str, set[str]]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.write(subject, "changed before the final tree check\n")
+            return working_tree(repo)
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              contextlib.redirect_stdout(io.StringIO())):
+            with (mock.patch.object(cloud_gate, "working_tree", side_effect=change_before_final_check),
+                  self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$")):
+                _ = gate.run_gate_suites(self.checkout)
+            self.assertEqual(self.pass_records(), [])
+            self.assertEqual(marker.read_text(), notice)
+            _ = self.git(self.checkout, "restore", "subject.txt")
+
+            unavailable = self.state / "unavailable-pass-ledger"
+            self.write(unavailable, "The ledger directory is a file.\n")
+            with mock.patch.dict(os.environ, {"GATE_PASSED_DIR": str(unavailable)}):
+                self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertEqual(self.pass_records(), [])
+            self.assertEqual(marker.read_text(), notice)
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+        record, = self.pass_records()
+        self.assertEqual(record["tree"], working_tree(self.checkout)[0])
+        self.assertFalse(marker.exists())
+
     @gate_suites("hooks", "direct")
     def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
         path = self.state / "module_seconds.json"

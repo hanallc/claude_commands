@@ -2837,7 +2837,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                      ('remote', 'add', 'origin', '/private/origin'), ('update-ref', 'refs/remotes/origin/main', 'HEAD')):
             _ = gate.checked_git(self.repo, *args)
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
-        _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
@@ -3179,6 +3178,44 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(request['source_key'], '')
         self.assertFalse((folder / 'source.bundle').exists())
         self.assertEqual(request['modules'], ['scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
+
+    def test_all_module_request_uses_its_tree_after_a_checkout_change(self) -> None:
+        before = cloud_gate.working_tree(self.repo)
+        first = self.modules[0][1]
+        working_tree = cloud_gate.working_tree
+
+        def change_after_tree_read(repo: Path) -> tuple[str, set[str]]:
+            snapshot = working_tree(repo)
+            first.unlink()
+            return snapshot
+
+        with (self.subTest('new request'),
+              mock.patch.object(cloud_gate, 'working_tree', side_effect=change_after_tree_read)):
+            request = cloud_gate.prepare_request(self.repo, self.root / 'attempt', gate.SuiteMode.GATE, 1800)
+            self.assertFalse(first.exists())
+            self.assertEqual(request['tree'], before[0])
+            self.assertEqual(request['modules'], [str(path.relative_to(self.repo)) for _, path in self.modules])
+
+        with self.subTest('saved result'):
+            _ = gate.checked_git(self.repo, 'restore', str(first.relative_to(self.repo)))
+            folder = self._unimported_gate()
+            (self.state / 'gate-deployment.json').unlink()
+            request = cloud_gate.read(folder / 'request.json')
+            request['modules'] = [str(self.modules[1][1].relative_to(self.repo))]
+            result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+            run = gate_box.decode_run(result['gate'])
+            partial = replace(run, jobs=run.jobs[1:], executions=run.jobs[1:])
+            result['gate'] = gate_box.encode_run(partial)
+            result['record'] = gate_box.completion_record(
+                partial, folder.name, ledger.text(request, 'commit'), before[0], 'fixture-guest', 0, 1, 'gate')
+            cloud_gate.save(folder / 'request.json', request)
+            cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+            service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
+            with redirect_stdout(StringIO()):
+                outcome = self._run_gate_for_resume(service)
+            self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+            self.assertFalse((folder / 'imported.json').exists())
+            service.assert_not_called()
 
     def test_bundle_contains_only_the_commit_ahead_of_main(self) -> None:
         base = gate.checked_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
