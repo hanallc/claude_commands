@@ -57,6 +57,7 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
+If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
 An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
 The AWS route refuses assigned gates that request type checks.
@@ -79,7 +80,7 @@ The route sends no more cleanup requests. The guest run keeps its lock until it 
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
-A gate without a verified assignment still tries AWS first when it needs to run the test selection.
+When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
 If AWS refuses that unassigned run, natedev runs the selection.
 A current assignment to an unsupported target fails and reports the target.
 

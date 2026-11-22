@@ -2934,36 +2934,48 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
 
 
 @dataclass(frozen=True)
-class NoCurrentGateAssignment:
-    """The gate has no verified current queue assignment."""
+class NoGateAssignment:
+    """The caller supplied no placement file."""
 
 
-def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> str | NoCurrentGateAssignment:
+class GateAssignmentRefused(GateRefused):
+    """The gate could not verify the placement supplied by the caller."""
+
+
+def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> str | NoGateAssignment:
     """Return the target from the queue assignment for this gate."""
     path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if path is None:
+        return NoGateAssignment()
     if not path:
-        return NoCurrentGateAssignment()
+        raise GateAssignmentRefused("BUILDLOG_PLACEMENT_FILE is empty")
     try:
         saved = admission_wire.read_assignment(Path(path)).assignment
-        if not isinstance(gate_job, StepJob) or saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
-            return NoCurrentGateAssignment()
-        owner = saved.owner
-        identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
-        pid = os.getpid()
-        if (owner.host != host_name()
-                or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid)):
-            return NoCurrentGateAssignment()
-        if (owner.pid != pid and gate_job != gate_job_from_process(
-                mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
-            return NoCurrentGateAssignment()
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot read the gate placement file {path!r}: {error}") from error
+    if saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+        raise GateAssignmentRefused("The placement episode does not match BUILDLOG_PLACEMENT_EPISODE")
+    if not isinstance(gate_job, StepJob):
+        raise GateAssignmentRefused("The placement has no recorded gate job to verify")
+    owner = saved.owner
+    identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+    pid = os.getpid()
+    if owner.host != host_name() or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid):
+        raise GateAssignmentRefused("The placement owner is not this process or a live ancestor")
+    if (owner.pid != pid and gate_job != gate_job_from_process(
+            mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+        raise GateAssignmentRefused("The placement owner's command does not match this gate job")
+    try:
         status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
-        if (isinstance(status, admission_wire.KnownPlacementStatus)
-                and isinstance(status.state, placement.CurrentAssignment)
-                and status.assignment == saved):
-            return saved.destination.target
-    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable):
-        return NoCurrentGateAssignment()
-    return NoCurrentGateAssignment()
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot query the gate placement status: {error}") from error
+    if isinstance(status, admission_wire.UnknownPlacementStatus):
+        raise GateAssignmentRefused("The queue does not know the gate placement attempt")
+    if status.assignment != saved:
+        raise GateAssignmentRefused("The queue assignment does not match the gate placement file")
+    if isinstance(status.state, placement.ClosedAssignment):
+        raise GateAssignmentRefused(f"The gate placement attempt is stale: {status.state.reason}")
+    return saved.destination.target
 
 
 class MacLinuxGateRefused(GateRefused):
@@ -3001,11 +3013,11 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                               selected=selection, gate_job=gate_job)
         if isinstance(outcome, str):
-            if not isinstance(target, NoCurrentGateAssignment):
+            if not isinstance(target, NoGateAssignment):
                 raise GateRefused(f"AWS gate failed: {outcome}")
             print('Cloud gate uses natedev: ' + outcome, flush=True)
             return run_local(type_dirs)
-        return finish_remote(outcome) if isinstance(target, NoCurrentGateAssignment) else outcome
+        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
 
     def run_guest(selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
@@ -3040,7 +3052,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             if type_dirs:
                 raise GateRefused("The AWS gate route does not support type checks")
             run_selected = run_cloud
-        case NoCurrentGateAssignment():
+        case NoGateAssignment():
             run_selected = run_cloud
         case _:
             raise GateRefused(f"The gate does not support the assigned target {target}")
@@ -3063,7 +3075,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                        else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
         modules = discover_test_modules(repo)
         selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        unassigned = isinstance(target, NoCurrentGateAssignment)
+        unassigned = isinstance(target, NoGateAssignment)
         if ledger.reuse(report=not unassigned and not type_dirs):
             if unassigned:
                 return run_local(type_dirs)
