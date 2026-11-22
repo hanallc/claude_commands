@@ -591,6 +591,31 @@ def _prepare_prompt(pane: str, text: str) -> str:
     return text
 
 
+_PRINTABLE_KEY_NAMES = {
+    "space": " ", "minus": "-", "comma": ",", "period": ".", "slash": "/",
+    "backslash": "\\", "quote": "'", "double_quote": '"', "double-quote": '"',
+    "semicolon": ";", "colon": ":", "percent": "%", "ampersand": "&",
+    "backtick": "`", "plus": "+",
+}
+
+
+def _printable_key(key: str) -> str:
+    key = key.strip()
+    if key == "+":
+        return key
+    if key.endswith("++"):
+        key = key[:-1] + "plus"
+    parts = [part.strip() for part in key.split("+")]
+    characters = [part for part in parts if part.lower() != "shift"]
+    if len(characters) != 1:
+        return ""
+    name = characters[0]
+    char = _PRINTABLE_KEY_NAMES.get(name.lower(), name)
+    if len(char) != 1 or not char.isprintable():
+        return ""
+    return char.upper() if len(parts) > 1 and char.isascii() else char
+
+
 @dataclass(frozen=True)
 class ComposerInput:
     text: str
@@ -3074,8 +3099,10 @@ class Herdr:
 
     def idle_command(self, pane: str, terminal: str, text: str, *, target: str, codex: bool) -> tuple[str, ...]:
         """Submit to an empty composer and return the history before submission."""
-        record = script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
-        record.publish()
+        record = (script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
+                  if script_prompts.needs_record(text) else None)
+        if record is not None:
+            record.publish()
         sent = False
         try:
             ready = self.readiness(pane)
@@ -3094,10 +3121,11 @@ class Herdr:
             sent = False
             raise
         finally:
-            if sent:
-                record.trim()
-            else:
-                record.path.unlink(missing_ok=True)
+            if record is not None:
+                if sent:
+                    record.trim()
+                else:
+                    record.path.unlink(missing_ok=True)
         return history
 
     def _wait_for_submit(self, receipt: Callable[[], PromptSubmitted | TranscriptReadable | TranscriptUnreadable],
@@ -3151,7 +3179,7 @@ class Herdr:
             nonlocal terminal, recipient, typed, draft_pending
             with operation_deadline.within(deadline):
                 record = (script_prompts.prepare_record(pane, text, deadline=deadline)
-                           if action is _OpeningComposer.EMPTY and text.lstrip().startswith("/") else None)
+                          if action is _OpeningComposer.EMPTY and script_prompts.needs_record(text) else None)
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
@@ -3369,6 +3397,18 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
                             pane_info=row, client=self, text=expected_text):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        characters = tuple(_printable_key(key) for key in keys)
+        text = ""
+        for char in characters:
+            if char:
+                text += char
+            elif text:
+                script_prompts.record(pane, text)
+                text = ""
+        if text:
+            script_prompts.record(pane, text)
+        if any(characters):
+            script_prompts.mark_keys(pane)
         self._send_keys(pane, *keys)
 
     def answer_question(self, pane: str, text: str, *, target: str) -> None:
@@ -3382,6 +3422,7 @@ class Herdr:
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
             self._send_keys(pane, key)
             if index == 0:
+                script_prompts.record(pane, text)
                 _ = self.run("pane", "send-text", pane, text)
 
     def _send_keys(self, pane: str, *keys: str) -> None:
