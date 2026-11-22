@@ -54,17 +54,35 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 
 ## Whole gate route
 
-The Mac Linux guest runs the whole test selection when `enabled.mac-linux=on` and the queue assigns the gate to `mac-linux`.
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
-It reads the guest switch only for a `mac-linux` target.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
-The gate uses the cloud route when the guest is off or the queue has no `mac-linux` assignment for this gate.
+If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
+An assignment to `natedev` runs the gate on natedev.
+An assignment to `aws` runs the gate in AWS and reports a cloud refusal as a failure.
+The AWS route refuses assigned gates that request type checks.
+An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
+The gate reads the guest switch after it confirms the `mac-linux` assignment.
+If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
 The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
 When the test timer expires, the gate returns the guest's time-limit report.
-If the guest cannot return a result, the gate prints `Mac Linux gate falls back: <reason>` and tries the cloud route.
-If the cloud route returns a fallback reason, natedev runs the selection.
+If the first guest probe fails, the route records a retry backoff for `mac-linux`.
+The route reads and writes this record independently of the placement registry.
+If the write fails, the route adds the write error to the probe failure.
+`mac_test.free_now` reads this backoff now.
+Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
+After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
+The setting accepts whole numbers from 1 to 86400 seconds.
+The Mac claim is a placeholder until item 191 B3. The guest run holds a separate lock.
+If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
+The route sends no more cleanup requests. The guest run keeps its lock until it ends.
+If the guest cannot return a result, the gate fails and reports the guest and the reason.
+If the guest returns a failure, the gate reports the guest and the failed jobs.
+A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
+When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
+If AWS refuses that unassigned run, natedev runs the selection.
+A current assignment to an unsupported target fails and reports the target.
 
 ## Cloud gate route
 
