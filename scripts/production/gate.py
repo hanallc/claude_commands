@@ -160,7 +160,7 @@ os.execvp(sys.argv[1], sys.argv[1:])
 @dataclass
 class GateArguments(argparse.Namespace):
     """Typed command-line boundary; merge fields are validated before use."""
-    repo: str = ""
+    repo: str = field(default_factory=lambda: str(Path.cwd()))
     merge_branch: str = ""
     unit_branch: str = ""
     checkpoint: str = ""
@@ -169,12 +169,12 @@ class GateArguments(argparse.Namespace):
     production: str = ""
     unit: str = ""
     phase: str = ""
-    body: str = ""
+    body: str = "Checkpoint verified by the complete merge gate."
     promote: bool = False
-    main_repo: str = ""
-    ssh: str = ""
-    mac_host: str = ""
-    mac_repo: str = ""
+    main_repo: str = "~/.claude"
+    ssh: str = "ssh"
+    mac_host: str = "mac"
+    mac_repo: str = "~/.claude"
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     affected: bool = False
     tests_only: bool = False
@@ -3275,21 +3275,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--body", default=GateArguments.body)
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--promote", action="store_true")
-    _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
-    _ = parser.add_argument("--ssh", default="ssh")
-    _ = parser.add_argument("--mac-host", default="mac")
-    _ = parser.add_argument("--mac-repo", default="~/.claude")
+    _ = parser.add_argument("--main-repo", "--main-checkout", default=GateArguments.main_repo)
+    _ = parser.add_argument("--ssh", default=GateArguments.ssh)
+    _ = parser.add_argument("--mac-host", default=GateArguments.mac_host)
+    _ = parser.add_argument("--mac-repo", default=GateArguments.mac_repo)
     _ = parser.add_argument("--tests-only", action="store_true")
     _ = parser.add_argument("--affected", action="store_true", help="run affected tests in a temporary test folder")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
-    args = cast(GateArguments, parser.parse_args(arguments))
+    args = parser.parse_args(arguments, namespace=GateArguments())
     args.gate_job = gate_job_for_command(["gate.py", *arguments])
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
