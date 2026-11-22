@@ -2022,7 +2022,7 @@ sys.exit(status)
                     events.append("leave group")
                     left_group = True
 
-                def read_start(_pid: int) -> process_start.ProcessStart:
+                def read_start(_pid: int, **_options: object) -> process_start.ProcessStart:
                     return after if left_group else before
 
                 def send_term(pid: int, number: int) -> None:
@@ -2032,7 +2032,7 @@ sys.exit(status)
                     events.append("send TERM")
                     descendants_live = False
 
-                def group_is_live(group_id: int) -> bool:
+                def group_is_live(group_id: int, **_options: object) -> bool:
                     self.assertEqual(group_id, leader)
                     return descendants_live
 
@@ -2058,6 +2058,53 @@ sys.exit(status)
                     self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
                 else:
                     self.assertNotIn("stop_reason", saved)
+
+    def test_mac_watcher_limits_process_reads_to_the_stop_grace(self) -> None:
+        leader = DEAD_PID
+        started = "Thu Nov 19 00:00:00 2026"
+        for index, (case, grace, expected) in enumerate((
+            ("leader read times out", 2.0, [("-p", 2.0)]),
+            ("group read uses the remaining grace", 2.0, [("-p", 2.0), ("-A", 1.25)]),
+            ("no grace remains", 0.0, []),
+        )):
+            with self.subTest(case=case):
+                path = self.record(["fixture command"], run_id=f"deadline-{index}")
+                self.update_record(path, command_pid=leader, command_group=leader, command_started=started)
+                began = now = 20.0
+                signaled = False
+                reads: list[tuple[str, float]] = []
+
+                def send_term(pid: int, signum: int) -> None:
+                    nonlocal signaled
+                    self.assertEqual((pid, signum), (leader, signal.SIGTERM))
+                    signaled = True
+
+                def ps(argv: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+                    nonlocal now
+                    if not signaled:
+                        return subprocess.CompletedProcess(argv, 0, started + " S\n", "")
+                    reads.append((argv[1], timeout))
+                    if case == "group read uses the remaining grace" and argv[1] == "-p":
+                        now += 0.75
+                        return subprocess.CompletedProcess(argv, 1, "", "")
+                    now += timeout
+                    raise subprocess.TimeoutExpired(argv, timeout)
+
+                with (self.darwin_without_pidfds(),
+                      patch.object(detached_runs, "_scope_stop_graces", return_value=(grace, 2.0)),
+                      patch.object(detached_runs, "reap_orphans", return_value=[]) as reap,
+                      patch.object(os, "getpgrp", side_effect=[leader, os.getpgrp()]),
+                      patch.object(os, "setsid"),
+                      patch.object(os, "killpg", side_effect=send_term),
+                      patch.object(subprocess, "run", side_effect=ps),
+                      patch.object(time, "monotonic", side_effect=lambda: now),
+                      patch.object(time, "sleep") as sleep):
+                    self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+                self.assertTrue(signaled)
+                self.assertEqual(reads, expected)
+                self.assertEqual(now, began + grace)
+                sleep.assert_not_called()
+                reap.assert_called_once_with(str(self.session.resolve()))
 
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])

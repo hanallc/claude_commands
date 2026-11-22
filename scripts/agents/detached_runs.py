@@ -673,11 +673,14 @@ def _number(value: object, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
-def _group_is_live(group: int) -> bool:
+def _group_is_live(group: int, *, deadline: float | None = None) -> bool:
     """Keep the run pending while its group has live processes or cannot be read."""
+    timeout = min(5.0, deadline - time.monotonic()) if deadline is not None else 5.0
+    if timeout <= 0:
+        return True
     try:
         result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True, timeout=5)
+                                capture_output=True, text=True, check=True, timeout=timeout)
     except (OSError, UnicodeError, subprocess.SubprocessError):
         return True
     if result.stderr or not result.stdout.strip():
@@ -696,11 +699,14 @@ class SavedProcessIdReused:
     """A different process now owns the saved PID."""
 
 
-def _saved_process(pid: object, started: object) -> process_start.ProcessStart | SavedProcessIdReused:
+def _saved_process(
+    pid: object, started: object, *, deadline: float | None = None,
+) -> process_start.ProcessStart | SavedProcessIdReused:
     """Read the saved process identity and identify a reused PID."""
     if not isinstance(started, str) or not started or _integer(pid) <= 0:
         return process_start.Gone()
-    observed = process_start.process_start(_integer(pid))
+    observed = (process_start.process_start(_integer(pid)) if deadline is None else
+                process_start.process_start(_integer(pid), deadline=deadline))
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
         return SavedProcessIdReused()
     return observed
@@ -2231,9 +2237,15 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
-def _wait_for_leader(command: CommandGroup, deadline: float) -> None:
-    """Wait for the saved leader to exit or for the stop grace to end."""
-    while isinstance(_saved_process(command.group, command.started), (process_start.Started, process_start.Unreadable)):
+def _wait_for_group(command: CommandGroup, deadline: float) -> None:
+    """Wait for the saved command group within the stop grace."""
+    while time.monotonic() < deadline:
+        leader = _saved_process(command.group, command.started, deadline=deadline)
+        if isinstance(leader, SavedProcessIdReused):
+            return
+        if isinstance(leader, (process_start.Gone, process_start.Zombie)):
+            if not _group_is_live(command.group, deadline=deadline):
+                return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
@@ -2282,12 +2294,13 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
         return 1
     record = _read_record(path)
     group_stop = not use_pidfd and bool(record.get("stop_reason"))
-    if not _has_saved_cgroup(record) and (group_stop or record.get("scope_error")):
+    if group_stop and not _has_saved_cgroup(record) and (command := _recorded_group(record)) is not None:
+        grace, _ = _scope_stop_graces()
+        _wait_for_group(command, time.monotonic() + grace)
+    elif record.get("scope_error") and not _has_saved_cgroup(record):
         grace, _ = _scope_stop_graces()
         deadline = time.monotonic() + grace
-        if group_stop and (command := _recorded_group(record)) is not None:
-            _wait_for_leader(command, deadline)
-        while not _command_has_ended(record, record["pid"]):
+        while time.monotonic() < deadline and not _command_has_ended(record, record["pid"]):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break

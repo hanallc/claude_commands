@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
@@ -70,15 +71,18 @@ def process_start_format() -> str:
     return "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1"
 
 
-def process_start(pid: int) -> ProcessStart:
-    """Read the process start from the host."""
+def process_start(pid: int, *, deadline: float | None = None) -> ProcessStart:
+    """Read the process start and limit the ps read to the deadline."""
     if sys.platform == "darwin":
         if pid <= 0:
             return Unreadable("invalid process id")
+        timeout = min(5.0, deadline - time.monotonic()) if deadline is not None else 5.0
+        if timeout <= 0:
+            return Unreadable("the process read reached its deadline")
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True, text=True, timeout=timeout, check=False,
                 env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
         except (OSError, UnicodeError, subprocess.SubprocessError) as error:
             return Unreadable(str(error))

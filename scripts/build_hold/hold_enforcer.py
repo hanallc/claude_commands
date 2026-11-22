@@ -124,6 +124,12 @@ class RunIdentityChanged:
 
 
 @dataclass(frozen=True)
+class RunStopUnavailable:
+    run: WaitingRun
+    reason: str
+
+
+@dataclass(frozen=True)
 class DetachedRun:
     supervisor: build_hold.AuditProcess
     path: Path
@@ -408,10 +414,10 @@ def stop_waiting_run(
     *, signal_process: Callable[[int, int], None] = os.kill,
     signal_group: Callable[[int, int], None] | None = None,
     supervisor_args: Callable[[int, Path], tuple[str, ...]] = supervisor_args,
-) -> StoppedRun | RunIdentityChanged:
+) -> StoppedRun | RunIdentityChanged | RunStopUnavailable:
     """Check process identities before TERM and record each stopped gate."""
-    if sys.platform != "linux":
-        return RunIdentityChanged(run)
+    if sys.platform != "linux" and proc_root.resolve().is_relative_to(build_hold.PROC_ROOT):
+        return RunStopUnavailable(run, "the natedev hold requires a Linux process table")
     override_guard.require_shared_state_write(
         Path(__file__), "build_hold/hold_enforcer.py", proc_root, build_hold.holder_directory(),
         build_hold.release_directory(), state_directory(), store.root())
@@ -542,7 +548,8 @@ def stop_queued_runs(
         if isinstance(result, StoppedRun) and stopped is not None:
             stopped.add(identity)
         label = "stopped" if isinstance(result, StoppedRun) else "skipped"
-        print(f"{label}: pid {identity.pid}", flush=True)
+        reason = f" ({result.reason})" if isinstance(result, RunStopUnavailable) else ""
+        print(f"{label}: pid {identity.pid}{reason}", flush=True)
 
 
 @dataclass(frozen=True)
