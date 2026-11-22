@@ -149,6 +149,11 @@ def config_environment(root: Path) -> dict[str, str]:
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
+
+
 def gate_isolation_environment(root: Path) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     return {

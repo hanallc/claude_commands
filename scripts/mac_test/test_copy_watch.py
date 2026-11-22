@@ -278,6 +278,14 @@ class StepProgressTests(unittest.TestCase):
 
 
 class CopyResultTests(unittest.TestCase):
+    def test_only_the_exact_mac_history_refusal_ends_the_copy(self) -> None:
+        for reason, status in (("busy", 1), ("busy", 11), ("busy", 15), ("history_key_unavailable", 1)):
+            with self.subTest(reason=reason, status=status):
+                words = copy_watch.MacWords("prelaunch_failed", reason, "0")
+                self.assertEqual(copy_watch.copy_result(words, status), copy_watch.CopyEnded("lost", final=False))
+        words = copy_watch.MacWords("prelaunch_failed", "history_key_unavailable", "0")
+        self.assertEqual(copy_watch.copy_result(words, 15), copy_watch.CopyEnded("declined", final=True))
+
     def test_each_runner_ending_maps_to_one_outcome(self) -> None:
         words = copy_watch.MacWords
         failed, passed = words("failed", "", "1.0"), words("passed", "", "1.0")

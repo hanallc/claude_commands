@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
-from scripts.build_queue import admission_protocol as wire, admission_records
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.direct.local_release_wait import LocalReleaseEvents
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
@@ -880,15 +882,108 @@ class MergeGateSuitesTests(GateSuitesFixture):
                                   "admitted"])
         self.assertEqual(grants, [("test-affected", repository, 3), ("gate", repository, 2)])
         self.assert_gate_released()
-        exempt, ordinary = self.gate_run_records()
-        self.assertEqual((exempt["selection"], exempt["hold_wait_s"], exempt["status"]), ("subset", 0.0, 0))
-        self.assertEqual((ordinary["selection"], ordinary["status"]), ("subset", 1))
-        self.assertGreater(ordinary["hold_wait_s"], 0.0)
+        # A named run writes no gate record.
+        self.assertEqual(self.gate_run_records(), [])
         self.assertFalse(Path(self.environment["GATE_PASSED_DIR"], "passed-trees.jsonl").exists())
         starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
         # A red module runs once more alone, as in the gate, so a flake is not a red name.
         self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
         self.assertEqual(checkpoint_gate.red_names(["gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
+
+    def test_named_modules_report_red_without_a_ledger_or_gate_record(self) -> None:
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
+                   + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
+            for name in ("PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+                _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
+            code = gate.main(["--tests-only", "--repo", str(self.checkout),
+                              "--module-time-limit-s", "0.000001",
+                              "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+        self.assertEqual(code, 1, output.getvalue())
+        starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
+        # A red module runs once more alone, as in the gate, so a flake is not a red name.
+        self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
+        self.assertEqual(checkpoint_gate.red_names(["gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
+
+    @gate_suites("lib")
+    def test_named_modules_share_one_reservation_and_one_available_cpu_slot(self) -> None:
+        self.supply_jobserver(b"A")
+        start, finish = gate.start_gate_job, gate.finish_gate_job
+        active: set[int] = set()
+        reservations: list[str] = []
+
+        def start_module(suite: str, path: Path, argv: list[str], repo: Path,
+                         environment: dict[str, str], log: Path) -> gate.RunningGateJob:
+            self.assertEqual(active, set())
+            self.assertEqual(self.jobserver_tokens(), b"")
+            reservation, = self.admission.server.reservations.values()
+            self.assertEqual(reservation.step, "test-affected")
+            self.assertEqual(reservation.queue_waiter.get("unit"), "natemerge")
+            reservations.append(reservation.reservation_id)
+            job = start(suite, path, argv, repo, environment, log)
+            active.add(job.process.pid)
+            return job
+
+        def finish_module(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            active.remove(job.process.pid)
+            return finish(job, status)
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_UNIT": "natemerge", "TMPDIR": str(self.root)}),
+              mock.patch.object(client, "admit", wraps=client.admit) as admit,
+              mock.patch.object(gate, "start_gate_job", side_effect=start_module),
+              mock.patch.object(gate, "finish_gate_job", side_effect=finish_module),
+              contextlib.redirect_stdout(output)):
+            code = targeted_test.main(["--repo", str(self.checkout),
+                                       "--module", "lib/test_first.py", "--module", "lib/test_second.py"])
+        self.assertEqual(code, 0, output.getvalue())
+        admit.assert_called_once()
+        self.assertEqual(len(reservations), 2)
+        self.assertEqual(len(set(reservations)), 1)
+        self.assertEqual(active, set())
+        self.assertEqual(self.jobserver_tokens(), b"A")
+        self.assert_gate_released()
+
+    @gate_suites("lib")
+    def test_named_modules_use_the_parent_reservation_in_a_custom_state_folder(self) -> None:
+        self.supply_jobserver(b"A")
+        preamble = """
+from unittest.mock import patch
+from scripts.build_queue import admission_client
+patch.object(admission_client, "admit", side_effect=AssertionError("child requested admission")).start()
+patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requested a CPU slot")).start()
+"""
+        with AdmissionFixture(state_dir=self.root / "custom-state") as admission, admission.serving():
+            environment = {**self.environment, "ADMISSION_SOCKET": str(admission.socket_path), "TMPDIR": str(self.root)}
+            self.assertNotEqual(admission.state_dir, Path(environment["BUILDLOG_DIR"]) / "admission")
+            with (mock.patch.dict(os.environ, environment),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  gate.gate_reservation(self.checkout, self.root, gate.BuildHoldWait()) as parent,
+                  gate.shared_cpu_pool() as pool):
+                assert isinstance(pool, gate.SharedCPUPool)
+                self.assertIsInstance(pool.try_acquire(), gate.SharedCPUSlot)
+                self.assertEqual(self.jobserver_tokens(), b"")
+                reservations = admission.caller_reservations()
+                self.assertEqual(len(reservations), 1)
+                child = parent.child_environment(os.environ)
+                for key, value in (("BUILDLOG_JOBSERVER_FIFO", str(self.root / "other-pool")),
+                                   ("ADMISSION_SOCKET", str(admission.socket_dir / "other.sock"))):
+                    with self.subTest(shared_resource_override=key):
+                        result = subprocess.run(
+                            [*self.gate_command(preamble=preamble), "--affected", "--repo", str(self.checkout),
+                             "--module", "lib/test_second.py"],
+                            cwd=self.root, env={**child, key: value}, capture_output=True, text=True,
+                            check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(admission.caller_reservations(), reservations)
+                self.assertEqual(self.jobserver_tokens(), b"")
+                parent.status = 0
+            self.assertTrue(admission.callers_released())
+        self.assertEqual(self.jobserver_tokens(), b"A")
+        starts = [(event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start"]
+        self.assertEqual(starts, [("lib", "test_second.py"), ("lib", "test_second.py")])
 
     def test_a_named_module_needs_tests_only(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):

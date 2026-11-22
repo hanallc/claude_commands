@@ -1011,6 +1011,8 @@ class MemoryWaitRow(WaitRow):
     """A step that holds a place in the memory queue."""
 
     place: int
+    move: NotRequired[admission_records.QueueMoveMember]
+    order_note: NotRequired[str]
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -1159,6 +1161,7 @@ class MemoryPage(TypedDict):
     swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
+    move_revision: NotRequired[str]
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
@@ -2959,10 +2962,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                             ci=step.unit in ci_runners),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
-            if notes := gate_placement_notes(step):
-                remote_row["runs_on"] = notes["runs_on"]
-                remote_row["targets"] = notes["targets"]
-                remote_row["because"] = notes.get("because", "")
+            if placed := gate_placement_notes(step):
+                remote_row["runs_on"] = placed["runs_on"]
+                remote_row["targets"] = placed["targets"]
+                remote_row["because"] = placed.get("because", "")
             if guest:
                 remote_row["guest_run"] = guest
                 if step.mac_placement:
@@ -3047,6 +3050,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         checks[explanation.head.waiter.pid] = explanation.head.room
         order_holds[explanation.head.waiter.pid] = explanation.head.decision.order_hold
     waiting = parsed.view.waiting
+    move_line = parsed.view.move_line
+    move_members = ({member.row_id: member for member in move_line.members}
+                    if isinstance(move_line, admission_records.QueueMoveLine) else {})
+    matched_move_ids: set[str] = set()
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
     for place, waiter in enumerate(waiting, 1):
         check = checks.get(waiter.pid)
@@ -3055,7 +3062,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = step_page_owner(waiter, labels, ci_runners, members, machine, ci_label=ci_label)
         identity = owner.labels
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
-        if isinstance(cause, admission_records.BehindHead):
+        targets = waiter.placement_targets
+        target_text = " or ".join(targets)
+        if isinstance(cause, admission_records.NatedevHeld):
+            reason = reason_phrase(waiter.reason, waiting)
+        elif targets:
+            reason = f"waiting for {target_text}"
+        elif isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
                        else admission_records.behind_place(cause, waiting))
@@ -3070,25 +3083,40 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
         named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
+        member = None
+        if place <= len(parsed.ordered):
+            _, ordered_waiter = parsed.ordered[place - 1]
+            if (ordered_waiter["pid"], ordered_waiter["since"]) == (waiter.pid, waiter.since):
+                member = move_members.get(ordered_waiter.get("move_id", ""))
+        if member is not None:
+            matched_move_ids.add(member.row_id)
         if isinstance(named, NoNamedStep):
             continue
+        notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
+            NO_TARGET_NOTES if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
                         "reason": reason,
-                        "fits": need <= captured.signed_room, "place": place,
+                        "fits": not targets and not isinstance(cause, admission_records.NatedevHeld)
+                                and need <= captured.signed_room, "place": place,
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
-                        "why": wait_why(waiter.reason),
+                        "why": "target" if targets and not isinstance(cause, admission_records.NatedevHeld)
+                                else wait_why(waiter.reason),
                         **local_call_notes(waiter),
-                        **(NO_TARGET_NOTES if ci_label else step_target_notes(waiter, routes)),
+                        **notes,
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
                         **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
                                      waiter.folder, host_name()),
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify,
                                     ci=bool(ci_label))}
+        if waiter.speculative_copy:
+            waiters[place]["order_note"] = "Newest eligible copy starts first"
+        if member is not None:
+            waiters[place]["move"] = member
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -3242,7 +3270,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limit": "room and head protection", "ram": ram,
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,
-        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
+        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting
+            if not step.placement_targets), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
@@ -3264,6 +3293,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    shown_move_ids = {row["move"].row_id for row in waiting_rows if "move" in row}
+    if (any(move_members[row_id].movable for row_id in shown_move_ids)
+            and matched_move_ids == move_members.keys()
+            and isinstance(move_line, admission_records.QueueMoveLine)):
+        page["move_revision"] = move_line.revision
     page["render_seconds"] = time.perf_counter() - started
     return page
 

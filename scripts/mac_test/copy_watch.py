@@ -37,7 +37,7 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
-from scripts.direct import step_record
+from scripts.direct import runner_result, step_record
 from scripts.build_queue import placement, admission_protocol as wire
 
 
@@ -278,7 +278,7 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
         return CopyWin(words, status)
     if words.mac == "declined":
         return CopyEnded("declined", final=words.reason in FINAL_DECLINE_REASONS)
-    if words.mac == "prelaunch_failed" and words.reason and status not in (0, 75):
+    if words.mac == "prelaunch_failed" and runner_result.is_mac_history_refusal(status, words.reason):
         return CopyEnded("declined", final=True)
     return CopyEnded("lost", final=False)
 

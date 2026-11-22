@@ -1727,6 +1727,15 @@ class HeldReservationTests(unittest.TestCase):
                     self.assertTrue(failure)
                 release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
 
+    def test_release_runs_when_the_wait_message_fails(self) -> None:
+        with (mock.patch.object(client, "admit", return_value=self.grant),
+              mock.patch.object(client.WaitOutput, "finished", side_effect=BrokenPipeError("closed pipe")),
+              mock.patch.object(client, "release", return_value=wire.Ok()) as release,
+              self.assertRaisesRegex(BrokenPipeError, "closed pipe")):
+            with queue.held_reservation(self.step_request()):
+                self.fail("the holder ran after the wait message failed")
+        release.assert_called_once_with("reservation-1", 1, self.grant.cleanup_timing)
+
     def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
         replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
             (wire.Refused("no room"), "no room"),

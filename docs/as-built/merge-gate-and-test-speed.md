@@ -73,7 +73,7 @@ If the write fails, the route adds the write error to the probe failure.
 `mac_test.free_now` reads this backoff now.
 Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
 After the SSH transfer ends, `unreachable_wait_seconds` in `build_targets.conf` limits the wait for the guest to prove the run ended.
-This one setting is for every machine. Today only the `mac-linux` route reads it.
+This one setting is for every machine. The `mac-linux` and AWS routes read it.
 The setting accepts whole numbers from 1 to 86400 seconds.
 The route takes the Mac repository claim before the first SSH request.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
@@ -203,6 +203,7 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
 | `log_push_s` | `5` | Send progress logs. |
 | `result_poll_s` | `2` | Check remote results. |
+| `unreachable_wait_seconds` (`build_targets.conf`) | `600` | End a run whose box sends no new log for this long, counted from launch. The box ends. An assigned run fails with `unreachable`; a run with no assignment runs again on natedev. Paired trials are not checked. |
 | `observe_outage_s` | `180` | Keep polling a running box through a short AWS outage. |
 | `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
 | `api_timeout_s` | `30` | Bound each scaler API command. |
@@ -385,15 +386,19 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--affected`, `--promote-only`, or `--nightly` is given.
-Use `--module <suite>/<module>` once for each module to run with `--tests-only` or `--affected`.
-Use the names the gate prints.
-The run uses shared admission and writes a gate record.
-Only the configured exempt unit can run named modules during a build hold.
-Each module keeps its time limit. The run has no overall time limit.
-A named module run never certifies a tree.
-A red module runs once more alone, as in the gate.
-The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
+The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+Use the module names that the gate prints.
+A standalone named run waits for the build hold to clear and takes one local admission reservation.
+A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
+It reads the reservation from the state folder in the grant and checks that release has not started.
+The child runs one module at a time and takes no additional CPU slot.
+The Builds page shows the run while it holds the reservation.
+The reservation counts as one run under `max_runs.natedev.claude_commands`.
+Modules share the CPU slots and use the memory governor.
+A failed module can run once more alone.
+The named run has no time limit and creates no gate record or passed-tree entry.
+The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -1171,7 +1176,7 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **The governor controls starts.** A job can exceed the governor after admission.
   A memory peak does not kill the job or fail the gate.
-- **Module time limit.** The gate kills a module that reaches `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
+- **Module time limit.** For regular runs, the gate stops a module at `DEFAULT_MODULE_TIME_LIMIT_S` (1800 seconds, `--module-time-limit-s`).
   Its result starts `killed: still running after 1800 s, the module time limit`, and the gate fails.
   This prevents a stalled module from holding every gate behind it.
 

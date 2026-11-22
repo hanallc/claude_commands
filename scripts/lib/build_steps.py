@@ -130,7 +130,6 @@ GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for scrip
 # gate.py exits with this status when the assigned Mac Linux guest took no run.
 # It first writes the claim failure next to the placement file, so its caller can place the gate again.
 MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
-MAC_LINUX_NO_ANSWER = "mac_linux_no_answer"
 CLAIM_FAILURE_SUFFIX = ".claim-failure"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 

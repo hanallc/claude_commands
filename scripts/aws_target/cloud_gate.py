@@ -865,6 +865,8 @@ class GateWorker:
         interruption_confirmed = False
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
+            # Read the wait before any launch, so a bad value costs no box.
+            unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -918,11 +920,17 @@ class GateWorker:
                 downloaded_log_etag = ''
                 instance_check_s = settings().whole('instance_check_s')
                 next_instance_check = time.monotonic()
+                # The box pushes gate.log every log_push_s; no new log for unreachable_wait_s means it is unreachable.
+                # A paired trial pauses the pushes while it measures, so only the EC2 state shows that it lives.
+                watch_silence = request.get('task') != 'paired'
+                seen_log_etag = ''
+                last_answer = time.monotonic()
                 while self.clock() < ledger.instant(request, 'expires'):
                     now = time.monotonic()
                     deadline_reached = now >= deadline
                     stop_reason = ''
                     stop_code = ''
+                    silent_s = 0.0
                     ec2_error: AwsUnavailable | None = None
                     if deadline_reached or now >= next_instance_check:
                         next_instance_check = now + instance_check_s
@@ -946,6 +954,11 @@ class GateWorker:
                         etags = self.artifact_etags(bucket, prefix)
                         log_etag = etags.get(log_key, '')
                         log_changed = bool(log_etag and log_etag != downloaded_log_etag)
+                        if log_etag != seen_log_etag:
+                            seen_log_etag = log_etag
+                            last_answer = now
+                        elif watch_silence:
+                            silent_s = now - last_answer
                         if boot_error_key in etags and self.download(bucket, boot_error_key, folder / 'boot-error.json'):
                             reason = ledger.text(read(folder / 'boot-error.json'), 'error')
                             if log_changed:
@@ -984,8 +997,10 @@ class GateWorker:
                                 deadline = began + limit if limit else float('inf')
                         s3_outage.reset()
                     except subprocess.TimeoutExpired:
-                        pass
+                        # Time when S3 cannot be read is not silence from the box.
+                        last_answer = now
                     except AwsUnavailable as error:
+                        last_answer = now
                         if not s3_outage.retry_after_failure(error, self.clock()):
                             raise
                     if ec2_error is not None:
@@ -994,6 +1009,9 @@ class GateWorker:
                         if stop_code in SPOT_INTERRUPTION_CODES:
                             interruption_code = stop_code
                         raise ValueError(stop_reason)
+                    if silent_s >= unreachable_wait_s:
+                        raise ValueError(f'unreachable: the box sent no log for {silent_s:.0f} seconds '
+                                         + f'({target_config.UNREACHABLE_WAIT_KEY}={unreachable_wait_s})')
                     if deadline_reached:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)

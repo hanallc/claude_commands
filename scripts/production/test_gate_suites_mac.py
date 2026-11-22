@@ -23,12 +23,13 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue import queue_place
 from scripts.build_queue import test_placement as placement_fixture
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_targets import mac_linux
+from scripts.build_targets import mac_linux, target_config
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import conf, process_group
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
@@ -458,7 +459,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.set_placement_status(assignment, placement.CurrentAssignment())
         for reason in ("mac-linux: fixture guest unavailable",
                        "mac-linux: guest unreachable: fixture-guest did not confirm the run ended "
-                       + f"within 2 seconds ({mac_linux.UNREACHABLE_WAIT_KEY})"):
+                       + f"within 2 seconds ({target_config.UNREACHABLE_WAIT_KEY})"):
             with (self.subTest(reason=reason), mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
                   mock.patch.object(mac_linux, "route", return_value=reason) as guest,
                   mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):

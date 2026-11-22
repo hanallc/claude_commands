@@ -14,11 +14,15 @@ import json
 from pathlib import Path
 from subprocess import SubprocessError
 import sys
-from typing import TYPE_CHECKING, Final, Literal, NotRequired, Self, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, override
 from uuid import uuid4
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
+from scripts.direct.runner_result import (
+    MAC_HISTORY_KEY_UNAVAILABLE as MAC_HISTORY_KEY_UNAVAILABLE,
+    MAC_HISTORY_KEY_UNAVAILABLE_STATUS as MAC_HISTORY_KEY_UNAVAILABLE_STATUS,
+)
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -528,8 +532,6 @@ class NoSavedMacRepository:
 
 NO_SAVED_MAC_REPOSITORY = NoSavedMacRepository()
 LEGACY_WAIT_CLAIM_RELEASED = 14
-MAC_HISTORY_KEY_UNAVAILABLE: Final = "history_key_unavailable"
-MAC_HISTORY_KEY_UNAVAILABLE_STATUS = 15
 
 
 SavedMacRepository = MacRepositoryIdentity | CleanupOnlyMacRepository | NoSavedMacRepository
@@ -948,6 +950,19 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
     key = mac_claim_key(source.key)
     fence = mac_claim_stem(key, 0)
     return ResolvedMacMirror(key, mirror, f"{fence}.json", fence, worktree)
+
+
+def has_mac_worktree(worktree: str) -> bool:
+    """Recognize a Git checkout even when its metadata is unreadable."""
+    from scripts.lib import git_files
+
+    try:
+        _ = git_files.locate(Path(worktree))
+    except git_files.NotACheckout:
+        return False
+    except git_files.UnreadableGitFiles:
+        pass
+    return True
 
 
 def scopes_overlap(first: ClaimScope, second: ClaimScope, *, mac: bool = False) -> bool:

@@ -1560,7 +1560,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "restart anomaly: efficiency-unit: worker macdata-bytes not restored: pane identity is unavailable; "
             + "run worker.py restore in efficiency-unit"])
-        self.assertEqual(shutdown_record.read(), [str(owner.id), str(bad.id)])
+        self.assertEqual(shutdown_record.read(), [str(bad.id)])
 
     def test_bulk_command_output_with_twenty_units_and_506_finished_dispatches(self) -> None:
         history_sizes = (1, 2, 3, 3, 4, 5, 5, 5, 6, 8, 12, 18, 20, 29, 46, 54, 63, 65, 68, 89)
@@ -5563,7 +5563,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore_attempt) as restore):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
+            self.assertEqual(shutdown_record.read(), [str(child.id)])
             self.assertEqual(restart.restart(), 0)
         self.assertEqual([item.args[0] for item in restore.call_args_list], [holder.id, holder.id])
         self.assertEqual(len(self.launches), 1)
@@ -5595,7 +5595,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore)):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(len(shutdown_record.read()), 3)
+            self.assertEqual(shutdown_record.read(), [str(child.id) for child in children])
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(restart.restart(only=(str(holder.id),)), 0)
         self.assertEqual(resumed, {child.id for child in children})

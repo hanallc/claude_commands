@@ -59,9 +59,6 @@ class MacRunTests(unittest.TestCase):
             "GIT_CONFIG_NOSYSTEM": "0",
         }))
         self.repo = self.repository(".claude")
-        _ = subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Fixture",
-                            "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
-                            "commit", "-qm", "Fixture", "--allow-empty"], check=True)
         _ = subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", ORIGIN], check=True)
         self.checkout = self.root / "checkout"
         _ = subprocess.run(["git", "clone", "-q", str(self.repo), str(self.checkout)], check=True)
@@ -87,6 +84,9 @@ class MacRunTests(unittest.TestCase):
     def repository(self, name: str, *, origin: str = "") -> Path:
         path = self.root / name
         _ = subprocess.run(["git", "init", "-q", str(path)], check=True)
+        _ = subprocess.run(["git", "-C", str(path), "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
+                            "commit", "-qm", "Fixture", "--allow-empty"], check=True)
         if origin:
             _ = subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
         return path
@@ -532,14 +532,13 @@ sys.exit(71)
         for checkout in (linked, peer):
             self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
                              eligibility.IneligibleMacStep("repo"))
+        # A checkout without a Mac mirror has no repository claim, so the Mac refuses it.
         linked_claim = self.native_claim(linked)
-        with mac_run.held(separate, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-            self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 11)
-        self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 0)
-        self.addCleanup(mac_test.command_release, linked_claim, self.paths)
-        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
-            with mac_run.held(self.repo, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
-                self.fail("The origin repository bypassed the whole-Mac claim")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(mac_test.command_claim(linked_claim, self.paths, watch_claim=False), 15)
+        self.assertEqual(output.getvalue().strip(), "history_key_unavailable")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"
@@ -1077,8 +1076,10 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     waiting.episode, waiting.attempt = "episode", "attempt"
                     waiting.claim_id = execution_identity.assigned_claim_id(waiting.episode, waiting.attempt)
                 reservation = saved if recovery == "unlink-error" else claim_state.WHOLE_MAC
-                self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
-                                                       mac_repository=reservation), 0)
+                # A client from before history keys wrote whole-Mac reservations for a checkout.
+                with mock.patch.object(claim_state, "has_mac_worktree", return_value=False):
+                    self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False,
+                                                           mac_repository=reservation), 0)
                 reserved, = claim_state.read_claims(self.paths)
                 old_path = reserved.path
                 if recovery == "unlink-error":
@@ -1494,9 +1495,28 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         assert isinstance(mirror, claim_state.MacMirrorIdentity)
         identity = claim_state.mac_repository_record(mirror.record())
         self.assertIsInstance(identity, claim_state.CleanupOnlyMacRepository)
-        self.assertEqual(mac_test.command_claim(
-            args, self.paths, watch_claim=False, mac_repository=identity), 12)
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(mac_test.command_claim(
+                args, self.paths, watch_claim=False, mac_repository=identity), 15)
+        self.assertEqual(output.getvalue().strip(), "history_key_unavailable")
         self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_direct_claim_refuses_unreadable_repository_keys(self) -> None:
+        empty = self.root / "empty"
+        _ = subprocess.run(["git", "init", "-q", str(empty)], check=True)
+        damaged = self.root / "damaged"
+        damaged.mkdir()
+        _ = (damaged / ".git").write_text("gitdir: missing\n")
+        for worktree in (empty, damaged):
+            with self.subTest(worktree=worktree):
+                output = StringIO()
+                with redirect_stdout(output):
+                    status = mac_test.command_claim(self.native_claim(worktree), self.paths, watch_claim=False)
+                self.assertEqual(status, 15, output.getvalue())
+                self.assertEqual(output.getvalue().strip(), "history_key_unavailable")
+                self.assertEqual(claim_state.read_claims(self.paths), ())
+                self.assertFalse(self.paths.run.exists())
 
     def test_runner_keeps_the_claim_scope_after_the_checkout_origin_changes(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:

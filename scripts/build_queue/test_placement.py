@@ -21,7 +21,7 @@ from unittest import mock
 from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
-from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.aws_target import hana_placement as hana
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
