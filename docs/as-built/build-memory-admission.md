@@ -2360,3 +2360,48 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+### Move a waiting step
+
+Use the three-line handle on the Builds page to move a natedev wait to any place in the list.
+To use the keyboard, press Space on the handle, press an arrow key, then press Enter.
+Press Escape to cancel.
+The numbers show queue positions.
+The policy still checks eligibility before each start.
+Cloud waits have their own order.
+
+The admission service gives each wait an ID.
+The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
+A refresh keeps the ID.
+The service saves pins in `state.json` when a move completes.
+A pin records the request ID and the number of rows ahead.
+Each confirmed move sets the place of every visible pin to its confirmed position.
+If an absent pin occupies a confirmed place, the service moves it to the next free place.
+The service applies pins after it sorts the waits.
+It inserts present pinned waits in place order and clamps each insertion to the end.
+Placement, memory admission, and continuation claims filter the same queue order.
+The page and the head-stall snapshot also filter that order.
+When two steps in one run have the same queue time, the lower PID comes first.
+A request that starts or ends removes one place from pins behind it in the full order.
+The full order includes absent requests and applies their pins.
+An absent step keeps its run identity to recover the run's saved queue time.
+The service keeps a pin while a request is temporarily absent.
+A request that starts or ends loses its own pin.
+Both hosts use the visible order for normal steps.
+A local start can pass a new remote startup hold if a pin put the hold ahead of that start.
+The local preview must select the start before the remote hold begins.
+The table includes remote-only waits in queue order.
+The table identifies waits that a build hold blocks.
+Speculative Mac copy rows show the newest-first rule.
+A refusal before launch keeps the pin and any active local startup claim.
+
+The service checks the order revision for all rows, including rows without handles.
+Its replay ledger records the reply with the new order.
+Undo moves the step before its former next neighbor.
+If the step was last, Undo moves it after its former previous neighbor.
+If that neighbor left the queue, the service refuses Undo.
+Undo uses the current queue order and saves pins as a new move.
+A conflict supplies the current order.
+The page requires a complete move list before it enables another move.
+The page shows an unnamed wait as “Build step.”
+The confirmation uses the current table numbers, including the places of waits without handles.

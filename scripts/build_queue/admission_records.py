@@ -658,6 +658,7 @@ class Waiter(TypedDict):
     need: int
     since: float
     order_since: NotRequired[float]
+    move_id: NotRequired[str]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
@@ -1031,7 +1032,7 @@ class EstimateExpired:
 
 @dataclass(frozen=True)
 class NatedevHeld:
-    """A CI step waits for the release of a natedev hold."""
+    """A step waits for the release of a natedev hold."""
     holder: str
     purpose: str
 
@@ -1053,7 +1054,9 @@ WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMe
 
 
 def held_text(wait: NatedevHeld) -> str:
-    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    if wait.holder and wait.purpose:
+        return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    return f"{wait.holder} holds natedev" if wait.holder else "natedev is held"
 
 
 def build_space_text(wait: BuildSpaceHold) -> str:
@@ -1101,6 +1104,25 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
+class QueueMoveMember:
+    """Identify a queue row and show if it can move."""
+    row_id: str
+    movable: bool = field(default=True, kw_only=True)
+
+
+@dataclass(frozen=True)
+class QueueMoveLine:
+    """Keep the move revision and the order of the queue rows."""
+    revision: str
+    members: tuple[QueueMoveMember, ...]
+
+
+@dataclass(frozen=True)
+class QueueMoveUnavailable:
+    """The service did not publish an order that supports moves."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1119,6 +1141,8 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    speculative_copy: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1198,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    move_line: QueueMoveLine | QueueMoveUnavailable = field(default=QueueMoveUnavailable(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1330,10 +1355,13 @@ class QueueInputs:
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
+    order_captured: bool = field(default=False, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    # Each new hold lists the local preview starts that can pass it.
+    parallel_remote_starts: dict[str, frozenset[str]] = field(default_factory=dict, kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
     local_machine: str = field(default="natedev", kw_only=True)

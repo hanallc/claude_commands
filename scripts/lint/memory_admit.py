@@ -441,7 +441,11 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
         position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
         order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
-    return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
+    return sort_waiters(ranked), context.priority
+
+
+def sort_waiters(rows: Iterable[tuple[Path, RankedWaiter]]) -> list[tuple[Path, RankedWaiter]]:
+    return sorted(rows, key=lambda item: waiter_order(item[1]))
 
 
 
@@ -462,9 +466,9 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
 
 def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
     """Resolve order metadata without adding it to captured waiter rows."""
-    return sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
-                   for path, row in inputs.ordered),
-                  key=lambda item: waiter_order(item[1]))
+    rows = [(path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
+            for path, row in inputs.ordered]
+    return rows if inputs.order_captured else sort_waiters(rows)
 
 
 
@@ -1402,10 +1406,10 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
-def waiter_order(row: Waiter) -> tuple[int, float, int]:
+def waiter_order(row: Waiter) -> tuple[int, float, float, int]:
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
-    return rank, row.get("order_since", row["since"]), row["pid"]
+    return rank, row.get("order_since", row["since"]), row["since"], row["pid"]
 
 
 @dataclass(frozen=True)
@@ -2093,7 +2097,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     clear = isinstance(inputs.pressure, NoPressureHold)
     disk_allows_start = isinstance(inputs.build_space, records.NoBuildSpaceHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)
+        and records.waiter_owner(row) not in inputs.parallel_remote_starts), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2116,6 +2121,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: RankedWaiter | NoWaiter = NoWaiter()
     first_held_other_than_gpu: RankedWaiter | NoWaiter = NoWaiter()
+    parallel_holds: list[tuple[RankedWaiter, frozenset[str]]] = []
+    positions = ({records.waiter_owner(row): index for index, (_, row) in enumerate(ordered)}
+                 if inputs.parallel_remote_starts or limits.by_machine_and_repository else {})
     for _, row in ordered:
         owner = records.waiter_owner(row)
         claim = claims.get(owner)
@@ -2127,7 +2135,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
-        local_route = can_use_natedev(row)
+        can_pass_hold = inputs.parallel_remote_starts.get(owner)
+        if can_pass_hold is not None:
+            parallel_holds.append((row, can_pass_hold))
+        local_route = can_use_natedev(row) and can_pass_hold is None
         local = local_route and isinstance(state, QueuedWaiter)
         repository = row.get("repository_name", "")
         limit = (limits.for_step(inputs.local_machine, repository, row.get("step", ""))
@@ -2167,8 +2178,16 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
         if follows_run_limit and (limited := first_held_by_run_limit.get(repository)) is not None:
-            if isinstance(ahead, NoWaiter) or waiter_order(limited) < waiter_order(ahead):
+            if (isinstance(ahead, NoWaiter)
+                    or positions[records.waiter_owner(limited)] < positions[records.waiter_owner(ahead)]):
                 ahead = limited
+        for hold, allowed in parallel_holds:
+            if (not isinstance(ahead, NoWaiter)
+                    and positions[records.waiter_owner(ahead)] < positions[records.waiter_owner(hold)]):
+                break
+            if owner not in allowed:
+                ahead = hold
+                break
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(records.stored_waiter(ahead))
@@ -2775,7 +2794,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                        readings: QueueSnapshotReadings,
                        now: float, priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY,
                        unowned: tuple[UnownedSliceMemory, ...] = ()) -> QueueInputs:
-    """Build queue evidence from supplied readings without external reads."""
+    """Build evidence from the ordered rows and supplied readings."""
     if (not isinstance(readings.host, (HostMemory, ReadingUnavailable))
             or isinstance(readings.pressure, ReadingNotTaken)
             or isinstance(readings.spacing, ReadingNotTaken) or isinstance(readings.compilers, ReadingNotTaken)):
@@ -2816,8 +2835,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
             pid=value.pid,
             run=activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
             started_at=activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
-    return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
-                       readings.host, readings.pressure, readings.spacing, now, priority)
+    return QueueInputs(ordered, tuple(running), tuple(rows), readings.host, readings.pressure,
+                       readings.spacing, now, priority, order_captured=True)
 
 
 def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[str]) -> QueueInputs:
