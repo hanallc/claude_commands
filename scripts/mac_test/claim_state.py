@@ -513,7 +513,7 @@ class ReservationRetirementError(OSError):
 
 
 def retired_mac_reservation_path(paths: StatePaths, identity: ClaimIdentity) -> Path:
-    return paths.directory / "retired-reservations" / pending_start_key(identity)
+    return paths.retired_reservations / pending_start_key(identity)
 
 
 @dataclass(frozen=True)
@@ -541,6 +541,19 @@ def claim_owner_ended(record: RunRecord) -> bool:
     """Confirm that the saved process no longer owns the claim."""
     owner = process_identity.process_start(record["pid"])
     return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(record["proc_start"])
+
+
+def _sweep_retired_mac_reservations(paths: StatePaths) -> None:
+    """Remove retry permissions for ended waiters under the provider lock."""
+    for path in paths.retired_reservations.glob("[0-9a-f]" * 64):
+        try:
+            record = read_run(path)
+            if (not isinstance(record, NoRun) and "remote_host" not in record
+                    and path == retired_mac_reservation_path(paths, claim_identity(record))
+                    and claim_owner_ended(record)):
+                path.unlink(missing_ok=True)
+        except (StateReadError, OSError) as error:
+            print(str(error), file=sys.stderr)
 
 
 def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: RunRecord, *,
@@ -572,7 +585,7 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
 
 
 def sweep_mac_replacements(paths: StatePaths, claims: tuple[HeldClaim, ...]) -> tuple[tuple[HeldClaim, ...], set[Path]]:
-    """Remove incomplete replacements under the provider lock."""
+    """Remove incomplete replacements and expired retry permissions under the provider lock."""
     if paths.platform != "macos":
         return claims, set()
     retired: set[Path] = set()
@@ -606,6 +619,7 @@ def sweep_mac_replacements(paths: StatePaths, claims: tuple[HeldClaim, ...]) -> 
         except OSError as error:
             print(str(ReservationRetirementError(claim.path, error)), file=sys.stderr)
             current.append(claim)
+    _sweep_retired_mac_reservations(paths)
     return tuple(claim for claim in current if claim.path not in retired), retained
 
 
@@ -634,6 +648,7 @@ class StatePaths:
         self.claim_watch_lock: Path = directory / "claim_watch.lock"
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
+        self.retired_reservations: Path = directory / "retired-reservations"
         self.block: Path = directory / "block.json"
         self.affinity: Path = directory / "affinity"
 
@@ -811,6 +826,8 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
     try:
         source = repository.mac_source_repository(worktree, common)
     except (OSError, SubprocessError, ValueError):
+        return WHOLE_MAC
+    if isinstance(source, repository.UnrecordedSourceCheckout):
         return WHOLE_MAC
     mirror = Path(source.git_dir).parent.name
     if not valid_mac_path_component(mirror):

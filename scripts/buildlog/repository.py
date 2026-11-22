@@ -115,7 +115,7 @@ class UnrecordedSourceCheckout:
     """Git gives the shared metadata path without the main checkout path."""
 
 
-def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
+def mac_source_repository(worktree: str, common: str) -> MacSourceRepository | UnrecordedSourceCheckout:
     """Follow local clone origins from the checkout to the source repository."""
     checkout_origin = _mac_origin(worktree)
     origin = checkout_origin
@@ -123,9 +123,9 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     seen = {common}
     while origin:
         if _relative_local_origin(origin):
-            source_directory = _relative_origin_directory(Path(common))
+            source_directory = _relative_origin_directory(Path(common), directory)
             if isinstance(source_directory, UnrecordedSourceCheckout):
-                break
+                return source_directory
             directory = source_directory
         source = _local_origin_checkout(origin, directory)
         if source is None or str(source.common_dir) in seen:
@@ -137,8 +137,8 @@ def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
 
 
-def _relative_origin_directory(common: Path) -> str | UnrecordedSourceCheckout:
-    # Every checkout must use only the primary path that the shared Git folder can identify.
+def _relative_origin_directory(common: Path, worktree: str) -> str | UnrecordedSourceCheckout:
+    # Resolve relative origins from the primary checkout.
     configured = subprocess.run(
         ["git", "--git-dir", str(common), "config", "--default", str(common.parent), "--get", "core.worktree"],
         cwd=common, capture_output=True, text=True, check=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
@@ -147,10 +147,13 @@ def _relative_origin_directory(common: Path) -> str | UnrecordedSourceCheckout:
     try:
         source = git_files.at(directory)
     except git_files.NotACheckout:
-        return UnrecordedSourceCheckout()
-    if source.git_dir != common or source.common_dir != common:
-        return UnrecordedSourceCheckout()
-    return str(source.toplevel)
+        source = None
+    if source is not None and source.git_dir == common and source.common_dir == common:
+        return str(source.toplevel)
+    current = git_files.locate(Path(worktree))
+    if current.git_dir == common and current.common_dir == common:
+        return str(current.toplevel)
+    return UnrecordedSourceCheckout()
 
 
 def _mac_origin(directory: str) -> str:
