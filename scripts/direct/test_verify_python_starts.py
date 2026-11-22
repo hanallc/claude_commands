@@ -36,7 +36,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assert_lint_start_count(self)
         self.assert_ssh_helper_calls()
 
-    def test_detached_lint_with_file_stderr_runs_slot_request_in_the_helper(self) -> None:
+    def test_detached_lint_with_file_stderr_uses_placement_without_a_run_slot(self) -> None:
         trace = self.root / "detached-starts.tsv"
         log = self.root / "detached.log"
         with log.open("ab") as output:
@@ -44,8 +44,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                 env={**self.environment, "UNIT_DETACHED_RUN": "1", "VERIFY_PY_TRACE": str(trace)},
                 stdout=output, stderr=subprocess.STDOUT, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, log.read_text())
-        calls = [line.split("\t") for line in trace.with_suffix(".tsv.calls").read_text().splitlines()]
-        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
+        calls = [line.split("\t")[:2] for line in trace.with_suffix(".tsv.calls").read_text().splitlines()]
+        self.assertIn(["build-targets.py", "assigned-info"], calls)
+        self.assertNotIn(["admission_client.py", "verify-run-slot"], calls)
 
     def assert_lint_start_count(self, fixture: VerifyLintCacheFixture) -> None:
         _ = fixture.enable_cache()
@@ -77,7 +78,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         calls = [line.split("\t") for line in Path(str(trace) + ".calls").read_text().splitlines()]
         in_helper = Counter(call[0] for call in calls)
         self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
-        self.assertEqual(sum(call[:2] == ["admission_client.py", "verify-run-slot"] for call in calls), 1)
+        self.assertNotIn(["admission_client.py", "verify-run-slot"], [call[:2] for call in calls])
 
     def assert_ssh_helper_calls(self) -> None:
         for target, mode in (("unknown", "passed"), ("linux", "disk")):

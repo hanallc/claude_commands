@@ -53,14 +53,14 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         _ = client.write_text(source, encoding="utf-8")
         self.environment.update(LINT_CONFIG_READER=str(reader), TEST_ADMISSION_CLIENT=str(client))
 
-    def test_failed_verify_slot_does_not_record_a_lint_failure(self) -> None:
+    def test_lint_runs_when_a_verify_slot_request_would_fail(self) -> None:
         cache = self.enable_cache()
         self.override_admission_client(FAILED_VERIFY_SLOT_CLIENT)
         result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(list(cache.glob("*.fail")), [])
-        self.assertEqual(self.calls("mend"), [])
-        self.assertEqual(self.calls("clippy"), [])
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+        self.assertTrue(self.calls("clippy"))
 
     def test_a_placement_crash_before_mend_starts_is_not_cached(self) -> None:
         cache = self.enable_cache()

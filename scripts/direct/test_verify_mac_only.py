@@ -515,6 +515,37 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "unreachable")
 
+    def test_routed_and_mac_only_runs_place_without_a_run_slot(self) -> None:
+        fixture = caller_admission(self, self.root, self.environment)
+        handle = fixture.server.handle_request
+        requests: list[wire.PlacementRequest | wire.VerifyRunSlotRequest] = []
+
+        def record(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, (wire.PlacementRequest, wire.VerifyRunSlotRequest)):
+                requests.append(request)
+            return handle(request, connection)
+
+        for arguments, selection in (((), placement.ConfiguredOrder()), (("--mac", "needs macOS"), placement.MacOnlyHost())):
+            with self.subTest(arguments=arguments), mock.patch.object(fixture.server, "handle_request", side_effect=record):
+                requests.clear()
+                self.clear_observations()
+                result = self.verify("test", "sample", "--no-cache", *arguments, extra={
+                    "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
+                })
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(requests)
+                first = requests[0]
+                if not isinstance(first, wire.PlacementRequest):
+                    self.fail(f"the first request was {type(first).__name__}")
+                self.assertFalse(any(isinstance(request, wire.VerifyRunSlotRequest) for request in requests))
+                self.assertEqual(first.constraints.selection, selection)
+                if not arguments:
+                    self.assertEqual({candidate.destination.target for candidate in first.constraints.candidates},
+                                     {"natedev", "mac"})
+                self.assertEqual(len(self.runner_events()), 1)
+                self.assertEqual(self.local_runs(), [])
+
     def test_mac_pass_published_during_placement_takes_no_run_slot(self) -> None:
         passed = self.verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})

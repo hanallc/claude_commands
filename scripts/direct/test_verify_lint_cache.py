@@ -26,10 +26,8 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
         with mock.patch.object(fixture.server, "handle_request", side_effect=record):
             _ = self.verify("lint", "sample")
             self.assertEqual(len(list(cache.glob("*.pass"))), 1)
-            self.assertEqual(len(requests), 1)
-            repository = requests.pop().repository
             config = self.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.{repository}=0\n")
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.{self.root.name}=0\n")
 
             result = self.verify("lint", "sample")
             self.assertIn("PASS (recorded)", result.stdout)
