@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import unittest
 from unittest import mock
 
@@ -13,6 +16,7 @@ from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
 class VerifyLintScopeTests(VerifyLintJudgmentFixture):
     def test_cached_lint_uses_no_slot_at_limit_zero(self) -> None:
         cache = self.dirty_cache()
+        self.name_fixture_repository("sample")
         fixture = caller_admission(self, self.root, self.environment)
         requests: list[wire.AdmitRequest | wire.PlacementRequest | wire.VerifyRunSlotRequest] = []
         first_release: list[tuple[wire.ReleaseRequest, tuple[service.VerifyRunSlot, ...]]] = []
@@ -35,7 +39,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
             self.assertTrue(admissions)
             self.assertFalse(any(isinstance(request, wire.VerifyRunSlotRequest) for request in requests))
             repository = service.profile_repository_name(admissions[0].profile)
-            self.assertTrue(repository)
+            self.assertEqual(repository, "sample")
             (release, slots), = first_release
             slot, = slots
             self.assertEqual(slot.repository, repository)
@@ -47,6 +51,16 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
             result = self.verify("lint", "sample")
             self.assertIn("PASS (recorded)", result.stdout)
             self.assertFalse(requests)
+
+    def name_fixture_repository(self, name: str) -> None:
+        # Make the fixture a real repository with its own origin.
+        # An empty .git lets Git read the checkout that holds the temporary folder (rule 18).
+        git = shutil.which("git")
+        assert git is not None
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        for arguments in (["init", "-q", str(self.root)],
+                          ["-C", str(self.root), "remote", "add", "origin", f"https://example.invalid/fixture/{name}.git"]):
+            _ = subprocess.run([git, *arguments], check=True, env=environment, capture_output=True)
 
     def test_fixed_and_formatted_tree_is_cached(self) -> None:
         cache = self.dirty_cache()
