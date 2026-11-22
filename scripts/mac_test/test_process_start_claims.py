@@ -257,13 +257,13 @@ class ClaimProcessStartTests(unittest.TestCase):
     def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
         hana = mac_test.RepositoryScope("hana", "https://fixture.invalid/team/hana")
         other = mac_test.RepositoryScope("other", "https://fixture.invalid/team/other")
-        cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int]], ...] = (
-            ("mac", hana, hana, [0, 11]),
-            ("mac", hana, other, [0, 0]),
-            ("mac", mac_test.WHOLE_MAC, hana, [0, 11]),
-            ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11]),
+        cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int], int], ...] = (
+            ("mac", hana, hana, [0, 11], 1),
+            ("mac", hana, other, [0, 0], 2),
+            ("mac", mac_test.WHOLE_MAC, hana, [0, 11], 0),
+            ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11], 1),
         )
-        for provider, first_scope, second_scope, expected in cases:
+        for provider, first_scope, second_scope, expected, expected_authorizations in cases:
             with self.subTest(provider=provider, first=first_scope, second=second_scope), PlacementFixture() as fixture:
                 target = "mac" if provider == "mac" else "box"
                 _ = (fixture.root / "build_targets.conf").write_text(
@@ -318,9 +318,17 @@ class ClaimProcessStartTests(unittest.TestCase):
                     args.pid, args.from_pid, args.target = assigned.owner.pid, assigned.owner.pid, target
                     args.worktree, args.remote = str(worktrees[assigned.episode]), assigned.destination.host
                     args.claim_id, args.episode, args.attempt = exact.claim_id, exact.episode, exact.attempt
-                    with redirect_stdout(io.StringIO()):
-                        self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False,
-                            session=assigned.session, assignment=assigned), 0)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        adopted_status = mac_test.command_claim(args, paths, watch_claim=False,
+                            session=assigned.session, assignment=assigned)
+                    if provider == "mac" and isinstance(claim.scope, claim_state.WholeMacScope):
+                        self.assertEqual(adopted_status, 12)
+                        self.assertEqual(output.getvalue().strip(),
+                            "the Mac reservation needs retirement under the execution lease")
+                        self.assertEqual(mac_test.read_claims(paths), held)
+                        continue
+                    self.assertEqual(adopted_status, 0, output.getvalue())
                     reference = placement.ProviderClaimReference(provider, target, assigned.destination.scope,
                         exact.claim_id, exact.episode, exact.attempt)
                     holder = coordinator_holder(assigned)
@@ -331,7 +339,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                         assigned, reference, holder)).replies()
                     self.assertIsInstance(reply, wire.FirstAuthorization)
                     authorizations += isinstance(reply, wire.FirstAuthorization)
-                self.assertEqual(authorizations, expected.count(0))
+                self.assertEqual(authorizations, expected_authorizations)
 
     def test_darwin_adoption_requires_both_live_start_matches(self) -> None:
         old_start = "Tue Nov  3 23:00:00 2026"

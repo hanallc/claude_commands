@@ -33,6 +33,7 @@ from scripts.production.gate_routes import SuiteMode
 
 ORIGIN = "https://github.com/hanallc/claude_commands.git"
 REPOSITORY_KEY = ORIGIN.removesuffix(".git")
+HANA_ORIGIN = "https://fixture.invalid/team/hana.git"
 
 
 @final
@@ -71,9 +72,11 @@ class MacRunTests(unittest.TestCase):
         _ = self.enterContext(redirect_stdout(StringIO()))
         self.paths = claim_state.state_paths("mac")
 
-    def repository(self, name: str) -> Path:
+    def repository(self, name: str, *, origin: str = "") -> Path:
         path = self.root / name
         _ = subprocess.run(["git", "init", "-q", str(path)], check=True)
+        if origin:
+            _ = subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
         return path
 
     def configure_limit(self, maximum: int) -> None:
@@ -151,7 +154,7 @@ class MacRunTests(unittest.TestCase):
             "since": "2026-11-21T10:00:00+00:00", "claim_id": old.claim_id,
             "episode": old.episode, "attempt": old.attempt, "submitting_session": "", "repo_name": "checkout",
         }
-        other = self.repository("hana")
+        other = self.repository("hana", origin=HANA_ORIGIN)
         native = self.native_claim(other)
         settings = self.root / "mac_test.conf"
         for worktree in (self.checkout, self.root / "missing"):
@@ -700,9 +703,10 @@ class MacRunTests(unittest.TestCase):
 
             def take_over_then_claim(current: offload.ProcessController, _config: eligibility.OffloadConfig,
                                      _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity,
-                                     _slots: tuple[int, ...], *,
-                                     mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
+                                     _slots: tuple[int, ...], *, retire_wait: bool,
+                                     mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
                                      ) -> offload.TakenOverMacClaim | offload.FreshMacClaim:
+                self.assertFalse(retire_wait)
                 if claim.call_count == 2:
                     return offload.TakenOverMacClaim(config.host, 1)
                 current.mac_repository = mac_repository
@@ -728,8 +732,10 @@ class MacRunTests(unittest.TestCase):
 
         def claim(current: offload.ProcessController, _config: eligibility.OffloadConfig,
                   _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity, _slots: tuple[int, ...], *,
-                  mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
+                  retire_wait: bool,
+                  mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
                   ) -> offload.FreshMacClaim:
+            self.assertFalse(retire_wait)
             current.mac_repository = mac_repository
             return offload.FreshMacClaim(1)
 
@@ -1022,7 +1028,7 @@ class MacRunTests(unittest.TestCase):
         original, = claim_state.read_claims(self.paths)
         original_data = original.path.read_bytes()
 
-        with mac_run.held(self.repository("hana"), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             claims = {claim.scope: claim for claim in claim_state.read_claims(self.paths)}
             numbered, = [claim for scope, claim in claims.items()
                          if isinstance(scope, claim_state.RepositoryScope) and scope.name == "hana" and scope.slot == 2]
@@ -1035,7 +1041,7 @@ class MacRunTests(unittest.TestCase):
         with (self.root / "build_folders.conf").open("a") as settings:
             _ = settings.write("# whole: 1..\nslots.fixture-mac.hana.max=2\n")
         other = self.native_claim(self.repository("hana.slot-2"))
-        with mac_run.held(self.repository("hana"), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+        with mac_run.held(self.repository("hana", origin=HANA_ORIGIN), "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             claim, = claim_state.read_claims(self.paths)
             legacy = claim.path.with_name("hana.slot-2.json")
             record = claim.record.copy()
