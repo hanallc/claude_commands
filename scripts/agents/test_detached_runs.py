@@ -1374,7 +1374,7 @@ sys.exit(status)
         )
         for name, fields in cases:
             # The supervisor check passes, so each refusal comes from the command group record.
-            with (self.subTest(case=name), patch.object(process_group, "send_process_group") as send,
+            with (self.subTest(case=name), patch.object(detached_runs, "_signal_stopped_command") as send,
                   patch.object(detached_run_process, "supervisor_match", return_value=True)):
                 self.update_record(path, pid=os.getpid(), **fields)
                 with contextlib.redirect_stderr(io.StringIO()) as error:
@@ -1387,7 +1387,7 @@ sys.exit(status)
             self.update_record(path, status="running", command_group=os.getpid(), command_started=started.start)
             with (patch.object(detached_run_process, "process_args",
                                return_value=detached_run_process.ProcessArgumentsUnavailable()),
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
             send.assert_not_called()
             self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
@@ -1401,7 +1401,7 @@ sys.exit(status)
 
             with (patch.object(detached_run_process, "process_args", side_effect=time_out) as observe,
                   patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
             observe.assert_called_once_with(os.getpid())
             write.assert_not_called()
@@ -1424,7 +1424,7 @@ sys.exit(status)
                 return False
 
             with (patch.object(detached_run_process, "supervisor_match", side_effect=same_supervisor) as observe,
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertFalse(detached_runs.stop_command(path, "new stop"))
             self.assertEqual(observe.call_count, 2)
             send.assert_not_called()
@@ -1437,14 +1437,14 @@ sys.exit(status)
             saved = cast(dict[str, object], json.loads(path.read_text()))
             with (patch.object(atomic_file, "sync_folder", side_effect=[OSError("fixture sync failure"), None]),
                   patch.object(detached_run_process, "supervisor_match", return_value=True),
-                  patch.object(process_group, "send_process_group") as send,
+                  patch.object(detached_runs, "_signal_stopped_command") as send,
                   self.assertRaisesRegex(atomic_file.AtomicDurabilityUnconfirmed, "fixture sync failure")):
                 _ = detached_runs.stop_command(path, "new stop")
             send.assert_not_called()
             self.assertEqual(cast(object, json.loads(path.read_text())), saved)
             self.assertFalse(pending_stop.exists())
 
-        with self.subTest(case="signal uses the group from the final identity check"):
+        with self.subTest(case="stop uses the command from the final identity check"):
             checks = 0
             read_record = worker_lifecycle.read_json_object
 
@@ -1461,10 +1461,10 @@ sys.exit(status)
             with (patch.object(detached_run_process, "supervisor_match", return_value=True),
                   patch.object(process_start, "process_start", side_effect=check_start),
                   patch.object(worker_lifecycle, "read_json_object", side_effect=read_before_signal),
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertTrue(detached_runs.stop_command(path, "new stop"))
             self.assertEqual(checks, 2)
-            send.assert_called_once_with(os.getpid(), signal.SIGTERM)
+            send.assert_called_once_with(ANY, detached_runs.CommandGroup(os.getpid(), started.start), signal.SIGTERM)
             self.assertTrue(pending_stop.is_file())
 
     def test_failed_stop_sync_leaves_the_original_record_when_rollback_would_fail(self) -> None:
@@ -1552,7 +1552,7 @@ sys.exit(status)
         with self.subTest(update="stop after prune"):
             path = self.finished_run("pruned-before-stop")
             self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
-            with patch.object(process_group, "send_process_group") as send:
+            with patch.object(detached_runs, "_signal_stopped_command") as send:
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
             send.assert_not_called()
             self.assertFalse(path.exists())
@@ -1562,7 +1562,7 @@ sys.exit(status)
             partial = json.dumps({"run_id": path.stem})
             write_text_atomic(path, partial)
             with (patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
             write.assert_not_called()
             send.assert_not_called()
@@ -1576,7 +1576,7 @@ sys.exit(status)
             original = path.read_text()
             with (patch.object(detached_run_process, "supervisor_match", return_value=True),
                   patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
-                  patch.object(process_group, "send_process_group") as send):
+                  patch.object(detached_runs, "_signal_stopped_command") as send):
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
             write.assert_not_called()
             send.assert_not_called()
@@ -1590,7 +1590,7 @@ sys.exit(status)
                 self.update_record(path, pid=0, started_at=0, **{field: value})
                 original = path.read_bytes()
                 with (patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
-                      patch.object(process_group, "send_process_group") as send,
+                      patch.object(detached_runs, "_signal_stopped_command") as send,
                       contextlib.redirect_stderr(io.StringIO()) as errors):
                     self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
                     self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
@@ -2667,10 +2667,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
               patch.object(pane_record, "process_arguments", side_effect=caller_arguments),
               patch.object(detached_run_process, "supervisor_match", return_value=True),
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
-              patch.object(process_group, "send_process_group") as signal_group,
+              patch.object(detached_runs, "_signal_stopped_command") as signal_group,
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(detached_runs.main(["stop", "--reason", reason, str(path)]), 0)
-            signal_group.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+            signal_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         stopped = worker_lifecycle.read_json_object(path)
         self.assertEqual(stopped.get("stop_reason"), reason)
         self.assertIs(stopped.get("self_stop"), True)
@@ -2727,12 +2727,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": row.current_session}),
               patch.object(detached_run_process, "supervisor_match", return_value=True),
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
-              patch.object(process_group, "send_process_group") as signal_group,
+              patch.object(detached_runs, "_signal_stopped_command") as signal_group,
               contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
             self.assertEqual(detached_runs.main(stop), 0)
             first_stop = path.read_bytes()
             self.assertEqual(detached_runs.main(["stop", "--reason", "A repeat.", str(path)]), 1)
-            signal_group.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+            signal_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), first_stop)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
@@ -2788,7 +2788,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 write_text_atomic(path, json.dumps(record))
                 with (patch.object(detached_run_process, "supervisor_match", return_value=True),
                       patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
-                      patch.object(process_group, "send_process_group"),
+                      patch.object(detached_runs, "_signal_stopped_command"),
                       contextlib.redirect_stdout(io.StringIO())):
                     self.assertEqual(detached_runs.main(["stop", "--reason", "Private stop.", str(path)]), 0)
                 saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
@@ -3445,10 +3445,10 @@ class PaneRunDeliveryTests(unittest.TestCase):
         with (patch.object(os, "replace", side_effect=fail_record_rename),
               patch.object(detached_run_process, "supervisor_match", return_value=True),
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
-              patch.object(process_group, "send_process_group") as send_group,
+              patch.object(detached_runs, "_signal_stopped_command") as send_group,
               contextlib.redirect_stderr(io.StringIO())):
             self.assertTrue(detached_runs.stop_command(path, reason))
-        send_group.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+        send_group.assert_called_once_with(ANY, detached_runs.CommandGroup(DEAD_PID, "private-start"), signal.SIGTERM)
         self.assertEqual(path.read_bytes(), saved)
 
         identities = frozenset({row.id})
@@ -3634,7 +3634,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                   patch.object(detached_runs, "stop_with_reason", return_value=True) as stop):
                 self.assertTrue(detached_runs.stop_command(path, "Stop the check."))
             stop.assert_called_once_with(path, "Stop the check.", verify_group=ANY,
-                                         signal_group=process_group.send_process_group, stop_pass=True,
+                                         signal_group=ANY, stop_pass=True,
                                          self_stop=expected)
 
         cases = (

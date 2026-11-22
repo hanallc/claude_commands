@@ -716,9 +716,13 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group.
-Each checks the supervisor and the command leader identity before it signals the group.
-Each stages the stop reason before it sends TERM.
+`detached_runs.py stop` checks the supervisor and command leader identity.
+It stages the stop reason and sends TERM through the leader's Linux pidfd.
+It uses `cgroup.kill` for the run's own scope after it verifies membership in the open cgroup directory.
+It sends TERM through individual pidfds to process group members outside that scope.
+It also uses individual pidfds if the scope cannot be stopped.
+The explicit stop requires Linux pidfd support.
+A build hold stop checks the supervisor and command leader identity and stages the stop reason before it sends TERM to the group.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.

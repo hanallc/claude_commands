@@ -6,7 +6,7 @@ The supervisor runs the command and delivers its result to the current worker.
 A unit director or showrunner names its run folder and receives its result through send.py.
 Reap finishes records whose supervisor disappeared and delivers their results.
 The command runs in its own session; the record names its process group.
-`stop` signals that group, and the supervisor records the exit status and delivers the result.
+`stop` uses pidfds and the run's scope. The supervisor records and delivers the result.
 A watcher in the command group holds the supervisor pipe. If the supervisor ends first, the watcher
 stops the command group and delivers the STOPPED result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
@@ -46,7 +46,7 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -431,21 +431,46 @@ def command_group(path: Path) -> CommandGroup | None:
     return None
 
 
-def stop_command(path: Path, reason: str) -> bool:
-    """Save the reason and TERM the command group while the supervisor and command leader are current."""
+def _signal_stopped_command(record: Mapping[str, object], command: CommandGroup, number: int) -> None:
+    """Use the detached command's launcher scope when it exists."""
+    identity = record.get("run_id")
+    kind = record.get("kind", DetachedRunKind.DETECT)
+    scope: process_stop.ScopeUnit | process_stop.NoScopeUnit = process_stop.NoScopeUnit()
+    if (isinstance(identity, str) and identity and "/" not in identity
+            and isinstance(kind, str) and kind in tuple(DetachedRunKind)):
+        scope = _command_scope_unit(kind, identity)
+    process_stop.stop_command_tree(process_stop.ProcessLifetime(command.group, command.started), scope, number)
+
+
+def stop_verified_command(path: Path, reason: str, expected: CommandGroup) -> bool:
+    """Stop only the published command that the caller previously verified."""
+    return stop_command(path, reason, expected=expected)
+
+
+def stop_command(path: Path, reason: str, *, expected: CommandGroup | None = None) -> bool:
+    """Stop the recorded command and keep the supervisor alive to record the result."""
+    if not process_stop.supported():
+        return False
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
+    starting_command = command_group(path) if expected is None else expected
 
     def verify_group() -> CommandGroup | CommandGroupUnverified:
         command = command_group(path)
-        if (command is None or detached_run_process.supervisor_match(supervisor, path) is not True
+        if (command is None or command != starting_command
+                or detached_run_process.supervisor_match(supervisor, path) is not True
                 or process_start.process_start(command.group) != process_start.Started(command.started)):
             return CommandGroupUnverified()
         return command
 
+    def signal_command(group: int, number: int) -> None:
+        if starting_command is None or group != starting_command.group:
+            raise ProcessLookupError("the command changed")
+        _signal_stopped_command(record, starting_command, number)
+
     try:
         return stop_with_reason(path, reason, verify_group=verify_group,
-                                signal_group=process_group.send_process_group, stop_pass=True,
+                                signal_group=signal_command, stop_pass=True,
                                 self_stop=_stop_caller_is_owner(record.get("staff_id"), os.environ))
     except ProcessLookupError:
         return False
@@ -1711,6 +1736,10 @@ def deliver_in_fresh_process(record_path: Path) -> int:
     return completed.returncode
 
 
+def _command_scope_unit(kind: str, run_id: str) -> process_stop.ScopeUnit:
+    return process_stop.ScopeUnit("builds-detached.slice", f"detached-{kind}-{run_id}.scope")
+
+
 def scope_prefix(marker: Path, environment: dict[str, str], *,
                  kind: DetachedRunKind = DetachedRunKind.DETECT) -> list[str]:
     """Start the command in builds-detached.slice when a scope is available."""
@@ -1719,15 +1748,16 @@ def scope_prefix(marker: Path, environment: dict[str, str], *,
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
     run_id = marker.stem.partition("@")[0]
+    scope = _command_scope_unit(kind, run_id)
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds-detached.slice", f"--unit=detached-{kind}-{run_id}.scope",
+            f"--slice={scope.slice}", f"--unit={scope.unit}",
             "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
     """Publish the command identity and group, then run the command in its own session.
 
-    A stop signals the command group only, so the supervisor stays alive to record and deliver.
+    A stop leaves the supervisor alive to record and deliver the result.
     The gate input stays open until the command ends. Then the supervisor writes "done" to the watcher.
     """
     script = Path(__file__).resolve()
