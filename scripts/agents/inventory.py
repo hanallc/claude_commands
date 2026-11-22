@@ -592,27 +592,35 @@ def _git(cwd: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def _checkout_root(cwd: str) -> str | NotACheckout:
+@dataclass(frozen=True)
+class _CheckoutIdentity:
+    work_tree: str
+    git_dir: str
+
+
+def _checkout_identity(cwd: str) -> _CheckoutIdentity | NotACheckout:
     if cwd:
-        result = _git(cwd, "rev-parse", "--show-toplevel")
-        if result is not None and result.returncode == 0 and (root := result.stdout.removesuffix("\n")):
-            return root
+        result = _git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir")
+        if result is not None and result.returncode == 0:
+            work_tree, separator, git_dir = result.stdout.removesuffix("\n").partition("\n/")
+            if separator and work_tree:
+                return _CheckoutIdentity(work_tree, "/" + git_dir)
     return {"kind": "not a checkout"}
 
 
-def _checkout(root: str) -> CheckoutState:
-    branch = _git(root, "branch", "--show-current")
-    head = _git(root, "rev-parse", "HEAD")
+def _checkout(cwd: str, identity: _CheckoutIdentity) -> CheckoutState:
+    branch = _git(cwd, "branch", "--show-current")
+    head = _git(cwd, "rev-parse", "HEAD")
     if branch is None or branch.returncode or head is None or head.returncode:
         return {"kind": "not a checkout"}
-    ahead_result = _git(root, "rev-list", "--count", "@{u}..HEAD")
+    ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
         try:
             upstream = {"kind": "tracking", "ahead": int(ahead_result.stdout.strip())}
         except ValueError:
             pass
-    status = _git(root, "status", "--porcelain")
+    status = _git(cwd, "status", "--porcelain")
     dirty = [] if status is None or status.returncode else [
         line[3:] if len(line) >= 3 else line
         for line in status.stdout.splitlines()
@@ -620,7 +628,7 @@ def _checkout(root: str) -> CheckoutState:
     ]
     return {
         "kind": "git",
-        "path": root,
+        "path": identity.work_tree,
         "head": (
             {"kind": "branch", "name": branch.stdout.strip()}
             if branch.stdout.strip()
@@ -634,16 +642,25 @@ def _checkout(root: str) -> CheckoutState:
 def _checkouts(folders: Sequence[str]) -> dict[str, CheckoutState]:
     if not folders:
         return {}
+    from_session_folder = any(name in os.environ for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE",
+    ))
     if len(folders) == 1:
         folder = folders[0]
-        root = _checkout_root(folder)
-        return {folder: _checkout(root) if isinstance(root, str) else root}
+        identity = _checkout_identity(folder)
+        return {folder: _checkout(folder if from_session_folder else identity.work_tree, identity)
+                if isinstance(identity, _CheckoutIdentity) else identity}
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        folder_roots = dict(zip(folders, pool.map(_checkout_root, folders), strict=True))
-        roots = dict.fromkeys(root for root in folder_roots.values() if isinstance(root, str))
-        checkouts = dict(zip(roots, pool.map(_checkout, roots), strict=True))
-    return {folder: checkouts[root] if isinstance(root, str) else root for folder, root in folder_roots.items()}
+        identities = dict(zip(folders, pool.map(_checkout_identity, folders), strict=True))
+        read_folders: dict[_CheckoutIdentity, str] = {}
+        for folder, identity in identities.items():
+            if isinstance(identity, _CheckoutIdentity):
+                _ = read_folders.setdefault(identity, folder if from_session_folder else identity.work_tree)
+        checkouts = dict(zip(read_folders, pool.map(_checkout, read_folders.values(), read_folders), strict=True))
+    return {folder: checkouts[identity] if isinstance(identity, _CheckoutIdentity) else identity
+            for folder, identity in identities.items()}
 
 
 _LAST_STEP_BYTES = 262_144

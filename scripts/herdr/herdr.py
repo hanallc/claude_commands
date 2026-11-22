@@ -1611,39 +1611,78 @@ class PaneEvidenceRun:
     shell_processes: dict[tuple[str, str, str], int] = field(default_factory=dict)
     reported: set[tuple[str, str, str]] = field(default_factory=set)
     lock: RLock = field(default_factory=RLock)
+    active: bool = True
 
 
 _pane_evidence_run: ContextVar[PaneEvidenceRun | ScanAtUse] = ContextVar(
     "pane_evidence_run", default=_SCAN_AT_USE)
 
 
+def _active_pane_evidence() -> PaneEvidenceRun | ScanAtUse:
+    run = _pane_evidence_run.get()
+    return run if isinstance(run, PaneEvidenceRun) and run.active else _SCAN_AT_USE
+
+
 @contextmanager
-def pane_evidence_run() -> Generator[None]:
+def pane_evidence_run(*, independent: bool = False) -> Generator[None]:
     """Retain the first pane evidence until the run ends or its target changes."""
-    if isinstance(_pane_evidence_run.get(), PaneEvidenceRun):
+    if not independent and isinstance(_active_pane_evidence(), PaneEvidenceRun):
         yield
         return
-    token = _pane_evidence_run.set(PaneEvidenceRun())
+    run = PaneEvidenceRun()
+    token = _pane_evidence_run.set(run)
     try:
         yield
     finally:
+        run.active = False
         _pane_evidence_run.reset(token)
+
+
+class _PlacementScanPolicy(Enum):
+    FRESH = "read the current process scan"
+    SHARE = "share the next process scan"
+
+
+@dataclass(frozen=True)
+class _PlacementScanFailure:
+    error: Exception
 
 
 @dataclass
 class PaneObservations:
     """Share read-only pane evidence until the report scope closes."""
+    share_replies: bool
+    scan_policy: _PlacementScanPolicy = _PlacementScanPolicy.FRESH
+    active: bool = True
     replies: dict[tuple[str, tuple[str, ...]], dict[str, object]] = field(default_factory=dict)
     process_batches: set[str] = field(default_factory=set)
     linux_process_states: dict[int, ForegroundProcessState | UnreadableLinuxProcessState] = field(default_factory=dict)
+    live_panes: dict[str, _LivePanePlaces] = field(default_factory=dict)
+    placement_scan: _LinuxPlacementScan | _DarwinPlacementScan | _PlacementScanFailure | _PlacementScanPolicy = field(init=False)
+    clients: dict[str, ClientsAttached | NoClientAttached | ClientsUnreadable] = field(default_factory=dict)
 
     bulk_placement: HerdrProcessPlacements | None = None
     pid_placements: dict[int, ProcessPlacement] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.placement_scan = self.scan_policy
 
     def clear(self) -> None:
         """Discard the evidence that an action can change."""
         self.replies.clear()
         self.process_batches.clear()
+        self.live_panes.clear()
+        self._clear_process_evidence()
+
+    def refresh_pane_reply(self, session: str, arguments: tuple[str, ...]) -> None:
+        """Discard the reply and the placement evidence that it can change."""
+        _ = self.replies.pop((session, arguments), None)
+        _ = self.live_panes.pop(session, None)
+        self._clear_process_evidence()
+
+    def _clear_process_evidence(self) -> None:
+        self.placement_scan = self.scan_policy
+        self.clients.clear()
         self.linux_process_states.clear()
         self.bulk_placement = None
         self.pid_placements.clear()
@@ -1655,7 +1694,31 @@ class PaneObservations:
         return self.bulk_placement
 
 
-_pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
+_pane_observations: ContextVar[tuple[PaneObservations, ...]] = ContextVar("pane_observations", default=())
+
+
+def _active_observations() -> PaneObservations | None:
+    scopes = _pane_observations.get()
+    return scopes[-1] if scopes and all(scope.active for scope in scopes) else None
+
+
+def _reply_observations() -> PaneObservations | None:
+    observed = _active_observations()
+    return observed if observed is not None and observed.share_replies else None
+
+
+@contextmanager
+def _pane_observation_scope(*, share_replies: bool,
+                            scan_policy: _PlacementScanPolicy = _PlacementScanPolicy.FRESH) -> Generator[PaneObservations]:
+    observed = PaneObservations(share_replies, scan_policy)
+    parents = _pane_observations.get() if _active_observations() is not None else ()
+    token = _pane_observations.set((*parents, observed))
+    try:
+        yield observed
+    finally:
+        observed.active = False
+        observed.clear()
+        _pane_observations.reset(token)
 
 
 _reported_target_retentions: ContextVar[set[tuple[HerdrPlace | NotInHerdr, str | AgentProcessIdentity, str]]] = (
@@ -1686,33 +1749,27 @@ class _PaneProcessInfo(dict[str, object]):
 @contextmanager
 def observation_snapshot() -> Generator[None]:
     """Read each pane, process, and layout once for a status pass."""
-    if _pane_observations.get() is not None:
+    if _reply_observations() is not None:
         yield
         return
-    token = _pane_observations.set(PaneObservations())
-    try:
-        with pane_evidence_run(), process_snapshot():
-            yield
-    finally:
-        _pane_observations.reset(token)
+    with _pane_observation_scope(share_replies=True), pane_evidence_run(), process_snapshot():
+        yield
 
 
 def forget_pane_evidence(session: str, pane: str) -> None:
     """Require fresh scan evidence after a target read or process change."""
-    run = _pane_evidence_run.get()
+    run = _active_pane_evidence()
     if isinstance(run, PaneEvidenceRun):
         with run.lock:
             for key in tuple(run.sessions):
                 if key[:2] == (session, pane):
                     del run.sessions[key]
                     _ = run.shell_processes.pop(key, None)
-    observed = _pane_observations.get()
+    observed = _active_observations()
     if observed is not None:
         _ = observed.replies.pop((session, ("pane", "list")), None)
-        _ = observed.replies.pop((session, ("pane", "process-info", "--pane", pane)), None)
-        observed.linux_process_states.clear()
-        observed.bulk_placement = None
-        observed.pid_placements.clear()
+        observed.refresh_pane_reply(session, ("pane", "process-info", "--pane", pane))
+        observed.process_batches.discard(session)
 
 
 class CodexArgumentsSource(Enum):
@@ -1768,7 +1825,7 @@ class Herdr:
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
-        observed = _pane_observations.get()
+        observed = _reply_observations()
         key = (self.session, arguments)
         shared = observed is not None and arguments[:2] in (
             ("pane", "list"), ("tab", "list"), ("workspace", "list"),
@@ -1793,10 +1850,9 @@ class Herdr:
     def _pane_process_info(self, info: dict[str, object], pane: str, deadline: float) -> _PaneProcessInfo:
         def read_again() -> dict[str, object]:
             arguments = ("pane", "process-info", "--pane", pane)
-            observed = _pane_observations.get()
+            observed = _reply_observations()
             if observed is not None:
-                _ = observed.replies.pop((self.session, arguments), None)
-                observed.linux_process_states.clear()
+                observed.refresh_pane_reply(self.session, arguments)
             reply = self.result(*arguments, **({"deadline": deadline} if deadline != math.inf else {}))
             return json_object(reply.get("process_info"), "fresh pane process info")
 
@@ -1808,7 +1864,7 @@ class Herdr:
             return
         observed.process_batches.add(self.session)
         panes = self.listed("pane")
-        run = _pane_evidence_run.get()
+        run = _active_pane_evidence()
         if isinstance(run, PaneEvidenceRun):
             with run.lock:
                 panes = [pane for pane in panes if
@@ -1961,7 +2017,7 @@ class Herdr:
             member = membership.rows_by_id[row_id]
             _ = candidates.setdefault(row_workspace(member, membership, member.name),
                                   json_text(matches[0].get("workspace_id"), "herdr workspace id"))
-        run = cast(PaneEvidenceRun, _pane_evidence_run.get())
+        run = cast(PaneEvidenceRun, _active_pane_evidence())
         for pane in panes:
             key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
             with run.lock:
@@ -2294,9 +2350,9 @@ class Herdr:
     def _closed_pane_ids(self, missing: set[str]) -> set[str]:
         if not missing:
             return set()
-        observed = _pane_observations.get()
+        observed = _reply_observations()
         if observed is not None:
-            _ = observed.replies.pop((self.session, ("pane", "list")), None)
+            observed.refresh_pane_reply(self.session, ("pane", "list"))
         try:
             return missing - {json_text(row.get("pane_id"), "pane id") for row in self.listed("pane")}
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
@@ -2317,8 +2373,8 @@ class Herdr:
                     if not _claude_start_in_progress(error.pid, shell, foreground):
                         raise
                     # Read again on the next scan so an expired start reports an unknown.
-                    if (snapshot := _pane_observations.get()) is not None:
-                        _ = snapshot.replies.pop((self.session, arguments), None)
+                    if (snapshot := _reply_observations()) is not None:
+                        snapshot.refresh_pane_reply(self.session, arguments)
                     return PaneSessionsStarting.CLAUDE_ARGUMENTS
                 sessions: PaneSessions = (frozenset() if isinstance(observed, NoForegroundAgent)
                                           else frozenset({observed.session_id}))
@@ -2343,7 +2399,7 @@ class Herdr:
         found: dict[staff.StaffId, list[dict[str, object]]] = {}
         unknown: list[UnknownPane] = []
         launches: dict[str, pane_launch.PaneLaunch] | None = None
-        run = cast(PaneEvidenceRun, _pane_evidence_run.get())
+        run = cast(PaneEvidenceRun, _active_pane_evidence())
         observations = [(pane, self._row_pane_sessions(pane, run)) for pane in panes]
         closed = self._closed_pane_ids({str(pane.get("pane_id", "")) for pane, sessions in observations
                                        if isinstance(sessions, _PaneProcessNotFound)})
@@ -4939,8 +4995,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
 
 
 def _observed_process_placement(pid: int) -> ProcessPlacement:
-    observed = _pane_observations.get()
-    if observed is None:
+    observed = _reply_observations()
+    if observed is None or observed.scan_policy is _PlacementScanPolicy.SHARE:
         return herdr_place_of(pid)
     place = observed.process_places.get(pid)
     if place is not None:
@@ -5278,7 +5334,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
         except ProcessLookupError:
             continue
         except (HerdrFailure, OSError, ValueError) as error:
-            observations = _pane_observations.get()
+            observations = _reply_observations()
             if (isinstance(error, CodexPaneStarting) and observations is not None
                     and isinstance(observations.process_places.get(pid), HerdrPlace)):
                 print(f"herdr pid {pid}: pane is starting", file=sys.stderr)
@@ -5659,20 +5715,22 @@ def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, lis
 
 
 def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
-    snapshot = _active_placement_snapshot()
-    if snapshot is None:
+    observed = _active_observations()
+    if observed is None or observed.scan_policy is _PlacementScanPolicy.FRESH or _process_action.get():
         return _read_attached_clients(name)
-    if name not in snapshot.clients:
-        snapshot.clients[name] = _read_attached_clients(name)
-    return snapshot.clients[name]
+    if name not in observed.clients:
+        observed.clients[name] = _read_attached_clients(name)
+    return observed.clients[name]
 
 
 def _read_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
-        snapshot = _active_placement_snapshot()
-        processes = (snapshot.linux().candidates if snapshot is not None
+        scan = _shared_placement_scan()
+        if isinstance(scan, _PlacementScanFailure):
+            return ClientsUnreadable(str(scan.error))
+        processes = (scan.candidates if isinstance(scan, _LinuxPlacementScan)
                      else [path for path in proc_root().iterdir() if path.name.isdecimal()])
     except OSError as error:
         return ClientsUnreadable(str(error))
@@ -5933,37 +5991,26 @@ class _LivePanePlaces:
         return NotInHerdr()
 
 
-_live_pane_reader: ContextVar[Callable[[str], _LivePanePlaces]] = ContextVar(
-    "herdr_live_pane_reader", default=_LivePanePlaces)
-
-
-@dataclass
-class _PanePlacementSnapshot:
-    """Cache pane placement for one report."""
-
-    parent: Callable[[str], _LivePanePlaces]
-    places: dict[str, _LivePanePlaces] = field(default_factory=dict)
-
-    def __call__(self, session: str) -> _LivePanePlaces:
-        if session not in self.places:
-            self.places[session] = self.parent(session)
-        return self.places[session]
-
-    def clear(self) -> None:
-        self.places.clear()
-        if isinstance(self.parent, _PanePlacementSnapshot):
-            self.parent.clear()
+def _live_panes(session: str) -> _LivePanePlaces:
+    observed = _active_observations()
+    if observed is None:
+        return _LivePanePlaces(session)
+    if session not in observed.live_panes:
+        observed.live_panes[session] = _LivePanePlaces(session)
+    return observed.live_panes[session]
 
 
 @contextmanager
 def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
     """Share live panes and retained shells; yield the pane reader for report display."""
-    reader = _PanePlacementSnapshot(_live_pane_reader.get())
-    token = _live_pane_reader.set(reader)
-    try:
-        yield lambda session: [pane.copy() for pane in reader(session).panes.values()]
-    finally:
-        _live_pane_reader.reset(token)
+    def read(session: str) -> list[PaneIdentity]:
+        return [pane.copy() for pane in _live_panes(session).panes.values()]
+
+    if _active_observations() is not None:
+        yield read
+        return
+    with _pane_observation_scope(share_replies=False):
+        yield read
 
 
 def linux_process_parent(pid: int) -> int:
@@ -5972,7 +6019,7 @@ def linux_process_parent(pid: int) -> int:
 
 
 def _linux_process_state(pid: int, *, fresh: bool = False) -> ForegroundProcessState:
-    observed = None if fresh or _process_action.get() else _pane_observations.get()
+    observed = None if fresh or _process_action.get() else _reply_observations()
     state = observed.linux_process_states.get(pid) if observed is not None else None
     if state is None:
         try:
@@ -6005,18 +6052,33 @@ def process_placement(pid: int, *, environment: Mapping[str, str] | None = None)
             environment = process_environment(pid)
         if (not environment.get("HERDR_PANE_ID")) or environment.get("TMUX_PANE"):
             return _placement_in_session(pid, environment, "", linux_process_parent)
-        snapshot = _active_placement_snapshot()
+        scan = _shared_placement_scan()
+        if isinstance(scan, _PlacementScanFailure):
+            return UnprovedHerdrPlacement(f"cannot read the placement of process {pid}")
+        if isinstance(scan, (_LinuxPlacementScan, _DarwinPlacementScan)):
+            if pid not in scan.sessions:
+                return UnprovedHerdrPlacement(f"cannot establish the herdr session of process {pid}")
+            ancestry = scan.server_ancestry(pid)
+            if ancestry:
+                if all(scan.matches_process(ancestor) for ancestor in ancestry):
+                    return _placement_in_session(pid, environment, scan.sessions[pid], scan.parent)
+                if (observed := _active_observations()) is not None:
+                    observed.clear()
+                return UnprovedHerdrPlacement(f"process {pid} or its herdr ancestry changed")
+            # A handoff process needs a new membership read.
         if _platform() == "darwin":
-            scan = snapshot.darwin() if snapshot is not None else _read_darwin_placement_scan(with_terminal=False)
-            session = scan.sessions.get(pid)
+            darwin = _read_darwin_placement_scan(with_terminal=False)
+            session = darwin.sessions.get(pid)
             if session is not None:
-                return _placement_in_session(pid, environment, session, lambda item: scan.processes[item].parent)
+                return _placement_in_session(pid, environment, session, darwin.parent)
+        elif isinstance(scan, _LinuxPlacementScan):
+            linux = _read_linux_placement_scan()
+            session = linux.sessions.get(pid)
+            if session is not None:
+                return _placement_in_session(pid, environment, session, linux.parent)
         else:
-            if snapshot is None:
-                candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
-                sessions = _process_sessions(candidates, _live_server_processes(candidates))
-            else:
-                sessions = snapshot.linux().sessions
+            candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+            sessions = _process_sessions(candidates, _live_server_processes(candidates))
             session = sessions.get(pid)
             if session is not None:
                 return _placement_in_session(pid, environment, session, linux_process_parent)
@@ -6043,20 +6105,11 @@ def herdr_places() -> HerdrProcessPlacements:
     failures: list[str] = []
     servers: dict[int, str] = {}
     try:
-        snapshot = _active_placement_snapshot()
         if _platform() == "darwin":
-            darwin = (snapshot.darwin() if snapshot is not None
-                      else _read_darwin_placement_scan(with_terminal=False))
+            darwin = _read_darwin_placement_scan(with_terminal=False)
             failures.extend(darwin.failures)
             sessions = darwin.sessions
-
-            def parent(pid: int) -> int:
-                return darwin.processes[pid].parent
-        elif snapshot is not None:
-            linux = snapshot.linux()
-            failures.extend(linux.failures)
-            servers, sessions = linux.servers, linux.sessions
-            parent = linux_process_parent
+            parent = darwin.parent
         else:
             candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
             servers = _live_server_processes(candidates, failures=failures)
@@ -6083,7 +6136,7 @@ def _placement_in_session(pid: int, environment: Mapping[str, str], session: str
         return NotInHerdr()
     pane = environment.get("HERDR_PANE_ID", "")
     if pane:
-        return _live_pane_reader.get()(session).placement(pid, pane, parent)
+        return _live_panes(session).placement(pid, pane, parent)
     if any(environment.get(key) for key in ("HERDR_ENV", "HERDR_SESSION", "HERDR_SOCKET_PATH")):
         return UnprovedHerdrPlacement(f"process {pid} has herdr markers but no pane id")
     return NotInHerdr()
@@ -6153,7 +6206,7 @@ def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
 
 def _pane_shell_pids(session: str) -> list[int]:
     """Read the shell identities retained in the live server's PTY runtimes."""
-    return list(_live_pane_reader.get()(session).shells())
+    return list(_live_panes(session).shells())
 
 
 def pane_scopes(groups: list[tuple[str, Path]], slice_name: str) -> list[tuple[str, Path]]:
@@ -6186,16 +6239,18 @@ class _LinuxProcessScan:
             self.terminals[pid] = int(fields[4])
         return parent
 
-    def check_start(self, pid: int) -> None:
-        # Check again after the metadata reads: a reused PID or a new parent makes the evidence unknown.
+    def matches_start(self, pid: int) -> bool:
         try:
             fields = _linux_process_stat(pid)
-            if pid in self.starts and fields[19] == self.starts[pid] and int(fields[1]) == self.parents.get(pid):
-                return
+            return (pid in self.starts and fields[19] == self.starts[pid]
+                    and int(fields[1]) == self.parents.get(pid))
         except (OSError, ValueError, IndexError):
-            pass
-        _ = self.parents.pop(pid, None)
-        _ = self.terminals.pop(pid, None)
+            return False
+
+    def check_start(self, pid: int) -> None:
+        if not self.matches_start(pid):
+            _ = self.parents.pop(pid, None)
+            _ = self.terminals.pop(pid, None)
 
 
 def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
@@ -6396,8 +6451,10 @@ def _darwin_processes(*, complete: bool = False, with_terminal: bool = False,
 
 def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     try:
-        snapshot = _active_placement_snapshot()
-        processes = snapshot.darwin().processes.values() if snapshot is not None else _darwin_processes()
+        scan = _shared_placement_scan()
+        if isinstance(scan, _PlacementScanFailure):
+            return ClientsUnreadable(str(scan.error))
+        processes = scan.processes.values() if isinstance(scan, _DarwinPlacementScan) else _darwin_processes()
     except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
         return ClientsUnreadable(str(error))
     count = 0
@@ -6453,8 +6510,8 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
     return working_directories
 
 
-def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
-                             failures: list[str] | None = None) -> dict[int, str]:
+def _darwin_server_processes(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket],
+                             failures: list[str]) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
     for listener in listeners:
@@ -6465,11 +6522,12 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
         else:
             continue
         holders.setdefault(session, set()).add(listener.pid)
-    if failures is not None:
-        failures.extend(f"cannot establish a socket owner for herdr session {session}"
-                        for session, pids in holders.items() if len(pids) > 1)
-    servers = {pid: session for session, pids in holders.items() if len(pids) == 1
-               for pid in pids if pid in by_pid}
+    failures.extend(f"cannot establish a socket owner for herdr session {session}"
+                    for session, pids in holders.items() if len(pids) > 1)
+    return {pid: session for session, pids in holders.items() if len(pids) == 1 for pid in pids if pid in by_pid}
+
+
+def _darwin_process_sessions(by_pid: dict[int, _UserProcess], servers: dict[int, str]) -> dict[int, str]:
     children: dict[int, list[int]] = {}
     for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
@@ -6487,24 +6545,59 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
 
 
 @dataclass(frozen=True)
+class _DarwinPlacementIdentity:
+    parent: int
+    started: int
+
+
+def _darwin_placement_identity(pid: int) -> _DarwinPlacementIdentity | ProcessGenerationUnavailable:
+    try:
+        info = _darwin_process_bsd_info(pid)
+    except (HerdrFailure, OSError, AttributeError):
+        return ProcessGenerationUnavailable(f"process {pid}: libproc identity is unavailable")
+    return _DarwinPlacementIdentity(info.pbi_ppid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+
+
+@dataclass(frozen=True)
 class _DarwinPlacementScan:
     processes: dict[int, _UserProcess]
+    servers: dict[int, str]
     sessions: dict[int, str]
     failures: tuple[str, ...]
+    identities: dict[int, _DarwinPlacementIdentity]
+
+    def parent(self, pid: int) -> int:
+        return self.processes[pid].parent
+
+    def server_ancestry(self, pid: int) -> tuple[int, ...]:
+        return _server_ancestry(pid, self.sessions[pid], self.servers, self.parent)
+
+    def matches_process(self, pid: int) -> bool:
+        return pid in self.identities and _darwin_placement_identity(pid) == self.identities[pid]
 
 
-def _read_darwin_placement_scan(*, with_terminal: bool) -> _DarwinPlacementScan:
+def _read_darwin_placement_scan(*, with_terminal: bool, retain_identities: bool = False) -> _DarwinPlacementScan:
     processes = _darwin_processes(with_terminal=True) if with_terminal else _darwin_processes()
     by_pid = {process.pid: process for process in processes}
     failures: list[str] = []
-    sessions = _darwin_process_sessions(by_pid, _darwin_bound_sockets(), failures=failures)
-    return _DarwinPlacementScan(by_pid, sessions, tuple(failures))
+    servers = _darwin_server_processes(by_pid, _darwin_bound_sockets(), failures)
+    sessions = _darwin_process_sessions(by_pid, servers)
+    identities: dict[int, _DarwinPlacementIdentity] = {}
+    if retain_identities:
+        for pid in sessions.keys() | servers.keys():
+            identity = _darwin_placement_identity(pid)
+            if isinstance(identity, _DarwinPlacementIdentity) and identity.parent == by_pid[pid].parent:
+                identities[pid] = identity
+    return _DarwinPlacementScan(by_pid, servers, sessions, tuple(failures), identities)
 
 
 def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
     try:
-        snapshot = _active_placement_snapshot()
-        scan = snapshot.darwin() if snapshot is not None else _read_darwin_placement_scan(with_terminal=True)
+        first_scan = _shared_placement_scan(fresh_bulk_read=True)
+        if isinstance(first_scan, _PlacementScanFailure):
+            raise first_scan.error.with_traceback(None)
+        scan = (first_scan if isinstance(first_scan, _DarwinPlacementScan)
+                else _read_darwin_placement_scan(with_terminal=True))
     except (HerdrFailure, subprocess.TimeoutExpired):
         return []
     by_pid, sessions = scan.processes, scan.sessions
@@ -6519,7 +6612,7 @@ def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[Herdr
             if isinstance(arguments, UnreadableProcessArguments):
                 continue
             environment = darwin_process_environment(pid)
-            place = _live_pane_reader.get()(session).place(
+            place = _live_panes(session).place(
                 pid, environment, lambda ident: by_pid[ident].parent if ident in by_pid else 0)
             if isinstance(place, NotInHerdr):
                 continue
@@ -6589,64 +6682,61 @@ class _LinuxPlacementScan:
     servers: dict[int, str]
     sessions: dict[int, str]
     ancestry: _LinuxProcessScan
-    failures: tuple[str, ...]
+
+    def parent(self, pid: int) -> int:
+        return self.ancestry.parents[pid]
+
+    def server_ancestry(self, pid: int) -> tuple[int, ...]:
+        return _server_ancestry(pid, self.sessions[pid], self.servers, self.parent)
+
+    def matches_process(self, pid: int) -> bool:
+        return self.ancestry.matches_start(pid)
+
+
+def _server_ancestry(pid: int, session: str, servers: Mapping[int, str],
+                     parent: Callable[[int], int]) -> tuple[int, ...]:
+    ancestors: dict[int, None] = {}
+    while pid > 1 and pid not in ancestors:
+        ancestors[pid] = None
+        if pid in servers:
+            return tuple(ancestors) if servers[pid] == session else ()
+        try:
+            pid = parent(pid)
+        except KeyError:
+            break
+    return ()
 
 
 def _read_linux_placement_scan() -> _LinuxPlacementScan:
     candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     scan = _LinuxProcessScan()
-    failures: list[str] = []
-    servers = _live_server_processes(candidates, failures=failures)
-    sessions = _process_sessions(candidates, servers, scan=scan, failures=failures)
-    return _LinuxPlacementScan(candidates, servers, sessions, scan, tuple(failures))
+    servers = _live_server_processes(candidates)
+    sessions = _process_sessions(candidates, servers, scan=scan)
+    return _LinuxPlacementScan(candidates, servers, sessions, scan)
 
 
-def _retain_placement_scan[Scan](read: Callable[[], Scan]) -> Callable[[], Scan]:
-    @cache
-    def observed() -> Scan | Exception:
+def _shared_placement_scan(*, fresh_bulk_read: bool = False
+                           ) -> _LinuxPlacementScan | _DarwinPlacementScan | _PlacementScanFailure | _PlacementScanPolicy:
+    observed = _active_observations()
+    if observed is None or _process_action.get():
+        return _PlacementScanPolicy.FRESH
+    if observed.placement_scan is _PlacementScanPolicy.SHARE:
         try:
-            return read()
+            observed.placement_scan = (_read_darwin_placement_scan(with_terminal=fresh_bulk_read, retain_identities=True)
+                                       if _platform() == "darwin" else _read_linux_placement_scan())
         except (OSError, HerdrFailure, ValueError, subprocess.SubprocessError) as error:
-            return error
-
-    def result() -> Scan:
-        scan = observed()
-        if isinstance(scan, Exception):
-            raise scan.with_traceback(None)
-        return scan
-
-    return result
-
-
-class _PlacementProcessSnapshot:
-    def __init__(self) -> None:
-        self.active: bool = True
-        self.linux: Callable[[], _LinuxPlacementScan] = _retain_placement_scan(_read_linux_placement_scan)
-        self.darwin: Callable[[], _DarwinPlacementScan] = _retain_placement_scan(
-            lambda: _read_darwin_placement_scan(with_terminal=True))
-        self.clients: dict[str, ClientsAttached | NoClientAttached | ClientsUnreadable] = {}
-
-
-_placement_process_snapshot: ContextVar[_PlacementProcessSnapshot | None] = ContextVar(
-    "herdr_placement_process_snapshot", default=None)
-
-
-def _active_placement_snapshot() -> _PlacementProcessSnapshot | None:
-    snapshot = _placement_process_snapshot.get()
-    return snapshot if snapshot is not None and snapshot.active and not _process_action.get() else None
+            observed.placement_scan = _PlacementScanFailure(error.with_traceback(None))
+    elif fresh_bulk_read:
+        return _PlacementScanPolicy.FRESH
+    return observed.placement_scan
 
 
 @contextmanager
 def placement_snapshot() -> Generator[None]:
     """Share report placement and client reads until the inventory ends."""
-    snapshot = _PlacementProcessSnapshot()
-    token = _placement_process_snapshot.set(snapshot)
-    try:
-        with observation_snapshot(), pane_snapshot():
-            yield
-    finally:
-        snapshot.active = False
-        _placement_process_snapshot.reset(token)
+    with (_pane_observation_scope(share_replies=True, scan_policy=_PlacementScanPolicy.SHARE),
+          pane_evidence_run(independent=True), process_snapshot()):
+        yield
 
 
 @observation_snapshot()
@@ -6656,8 +6746,10 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
         return _darwin_herdr_processes(inherited_marks_only=True) if inherited_marks_only else _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
-        snapshot = _active_placement_snapshot()
-        placement = snapshot.linux() if snapshot is not None else _read_linux_placement_scan()
+        first_scan = _shared_placement_scan(fresh_bulk_read=True)
+        if isinstance(first_scan, _PlacementScanFailure):
+            raise first_scan.error.with_traceback(None)
+        placement = first_scan if isinstance(first_scan, _LinuxPlacementScan) else _read_linux_placement_scan()
     except OSError:
         return processes
     scan, sessions = placement.ancestry, placement.sessions
@@ -6668,7 +6760,7 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
             if process.stat().st_uid != os.getuid():
                 continue
             environment = _process_environment(process)
-            place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
+            place = _live_panes(session).place(pid, environment, linux_process_parent)
             if isinstance(place, NotInHerdr):
                 continue
             arguments = _process_arguments(process)
@@ -6753,24 +6845,21 @@ def process_action() -> Generator[None]:
     token = _process_reader.set(_read_current_processes)
     action = _process_action.set(True)
     outer_observations = _pane_observations.get()
-    outer_panes = _live_pane_reader.get()
-    outer_evidence = _pane_evidence_run.get()
-    observations = _pane_observations.set(None)
-    panes = _live_pane_reader.set(_LivePanePlaces)
+    outer_evidence = _active_pane_evidence()
+    observations = _pane_observations.set(())
     evidence = _pane_evidence_run.set(_SCAN_AT_USE)
+    for observed in outer_observations:
+        observed.clear()
     try:
         yield
     finally:
-        if outer_observations is not None:
-            outer_observations.clear()
-        if isinstance(outer_panes, _PanePlacementSnapshot):
-            outer_panes.clear()
+        for observed in outer_observations:
+            observed.clear()
         if isinstance(outer_evidence, PaneEvidenceRun):
             with outer_evidence.lock:
                 outer_evidence.sessions.clear()
                 outer_evidence.shell_processes.clear()
         _pane_evidence_run.reset(evidence)
-        _live_pane_reader.reset(panes)
         _pane_observations.reset(observations)
         _process_action.reset(action)
         _process_reader.reset(token)

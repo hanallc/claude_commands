@@ -594,7 +594,7 @@ class InventoryTests(ShutdownTestCase):
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
         process.mkdir(exist_ok=True)
-        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} {'0 ' * 17}1\n")
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
@@ -1287,14 +1287,16 @@ elif "comm=" in joined:
     def test_checkout_reads_can_finish_out_of_order_and_keep_session_order_and_errors(self) -> None:
         later_read = Event()
         read_git = inventory._git  # pyright: ignore[reportPrivateUsage]
+        checkout_read = inventory._checkout  # pyright: ignore[reportPrivateUsage]
         fast_folder = str(self.checkout)
         slow_folder = str(self.root / "plain")
+        require_checkout_completion = False
 
         class ObserveCheckoutCompletion(ThreadPoolExecutor):
             @override
             def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
                 result = super().submit(fn, *args, **kwargs)
-                if args == (fast_folder,):
+                if args and args[0] == fast_folder and (not require_checkout_completion or fn is checkout_read):
                     def release_first(completed: Future[T]) -> None:
                         _ = completed.result()
                         later_read.set()
@@ -1316,6 +1318,34 @@ elif "comm=" in joined:
         self.assertEqual(second["session_id"], UNIT_ID)
         self.assertEqual(second["checkout"]["kind"], "git")
         self.assertEqual([worker["session_id"] for worker in workers], [WORKER_ID])
+
+        with self.subTest(checkout="two successful roots"):
+            separate = self.root / "separate"
+            _ = self.git("worktree", "add", "-b", "separate", str(separate))
+            record_path = self.records / f"{self.director_pid}.json"
+            record = cast(dict[str, object], json.loads(record_path.read_text()))
+            record["cwd"] = str(separate)
+            _ = record_path.write_text(json.dumps(record))
+            later_read.clear()
+            require_checkout_completion = True
+            status_order: list[str] = []
+
+            def read_status(folder: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+                if arguments != ("status", "--porcelain"):
+                    return read_git(folder, *arguments)
+                if folder == str(separate) and not later_read.wait(timeout=5):
+                    self.fail("the later checkout must finish before the first checkout")
+                result = read_git(folder, *arguments)
+                status_order.append(folder)
+                return result
+
+            with (patch.object(inventory, "_git", read_status),
+                  patch.object(inventory, "ThreadPoolExecutor", ObserveCheckoutCompletion)):
+                report = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID, UNIT_ID}))
+            self.assertEqual(status_order, [fast_folder, str(separate)])
+            self.assertEqual([row["session_id"] for row in report["sessions"]], [DIRECTOR_ID, UNIT_ID, WORKER_ID])
+            self.assertEqual([row["checkout"].get("path") for row in report["sessions"][:2]],
+                             [str(separate), fast_folder])
 
         with self.subTest(checkout="three folders in one repository"):
             for pid in (self.director_pid, UNIT_PID, DESKTOP_PID):
@@ -1350,6 +1380,32 @@ elif "comm=" in joined:
                 })
             self.assertEqual(len(status_folders), 1)
             self.assertEqual(status_folders[0], str(self.checkout))
+
+    def test_checkout_groups_distinct_git_directories_with_one_work_tree(self) -> None:
+        linked = self.root / "linked"
+        _ = self.git("worktree", "add", "-b", "linked", str(linked), "origin/shutdown")
+        shared = self.root / "shared"
+        shared.mkdir()
+        _ = (shared / "dirty.txt").write_text("changed\n")
+        _ = (shared / "ahead-1.txt").write_text("ahead 1\n")
+        _ = (shared / "ahead-2.txt").write_text("ahead 2\n")
+        for pid, folder in ((self.director_pid, self.checkout), (DESKTOP_PID, linked)):
+            path = self.records / f"{pid}.json"
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            record["cwd"] = str(folder)
+            _ = path.write_text(json.dumps(record))
+
+        with patch.dict(os.environ, {"GIT_DIR": ".git", "GIT_WORK_TREE": str(shared)}):
+            report = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID, DESKTOP_ID}))
+        by_id = {row["session_id"]: row for row in report["sessions"]}
+        self.assertEqual(by_id[DIRECTOR_ID]["checkout"], {
+            "kind": "git", "path": str(shared), "head": {"kind": "branch", "name": "shutdown"},
+            "upstream": {"kind": "tracking", "ahead": 2}, "dirty": ["dirty.txt"],
+        })
+        self.assertEqual(by_id[DESKTOP_ID]["checkout"], {
+            "kind": "git", "path": str(shared), "head": {"kind": "branch", "name": "linked"},
+            "upstream": {"kind": "tracking", "ahead": 0}, "dirty": ["dirty.txt", "ahead-1.txt", "ahead-2.txt"],
+        })
 
     def test_config_dir_records_the_process_directory_for_the_same_login(self) -> None:
         default_dir = self.home / ".claude"
