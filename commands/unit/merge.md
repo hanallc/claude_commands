@@ -123,7 +123,7 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 | --- | --- |
 | sdlc `land.sh`, `land_mac_ok.sh`, `queue_runner.sh` | Retained merge worker |
 | `merge_checkpoint.py --production sdlc` | Merge worker |
-| `gate.py --checkout . --tests-only` | Gate worker |
+| `~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --checkout . --tests-only` | Gate worker |
 | Hana gate scripts through `copies.py run --commit <sha>` | Gate worker at the recorded commit |
 | `verify.sh check`, `test`, `lint` | Gate worker |
 | `cargo fmt`, `cargo test`, `cargo nextest` | Gate worker under the production's existing build rules |

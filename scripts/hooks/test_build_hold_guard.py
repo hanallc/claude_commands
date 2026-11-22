@@ -24,19 +24,27 @@ CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "r
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 GATE_COMMANDS = (
     "python3 gate.py --tests-only",
+    "python3 merge_gate.py --tests-only",
     "python3.13 -u '/work tree/gate.py' --affected",
     "scripts/lib/py scripts/production/gate.py --affected",
     "/usr/bin/python3 scripts/production/gate.py --promote-only",
+    "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
     "python3.13 -u '/work tree/gate.py' --repo /repo",
+    "python3.13 -u '/work tree/merge_gate.py' --repo /repo",
     "~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --repo /repo",
+    "~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --repo /repo",
     "scripts/lib/py scripts/production/gate.py",
+    "scripts/lib/py scripts/production/merge_gate.py",
     "./gate.py --help",
+    "./merge_gate.py --help",
     "/any/path/gate.py --tests-only",
+    "/any/path/merge_gate.py --tests-only",
     '"/work tree/gate.py" --promote-only',
+    '"/work tree/merge_gate.py" --promote-only',
     "bash -lc 'python3 gate.py --tests-only'",
+    "bash -lc 'python3 merge_gate.py --tests-only'",
     "env CHECK=1 python3 -W ignore -X dev -- gate.py --help",
-    # Both aliases still use the hold matcher.
-    "python3 merge_gate.py --tests-only",
+    "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
     "python3 targeted_test.py --repo /repo",
 )
 GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
@@ -279,6 +287,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.hold()
         for command, session in (("cargo check", "caller"),
                                  ("python3 gate.py --tests-only", "caller"),
+                                 ("python3 merge_gate.py --tests-only", "caller"),
                                  ("cargo metadata", "caller"), ("verify.sh check", "caller"),
                                  (["cargo", "check"], "caller")):
             with self.subTest(command=command, session=session):

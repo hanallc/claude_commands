@@ -130,7 +130,9 @@ Codex review prompts also include section 3's command block.
     3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
     ```
 
-    Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
+    For a unit, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --affected`.
+    For a merge, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py`.
+    Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <MergeWorkerCommands>
