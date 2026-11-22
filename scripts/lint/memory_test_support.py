@@ -39,7 +39,8 @@ def _template(name: str) -> Path:
 
 
 # Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
-UNREACHABLE_WAIT_FIXTURE = "# whole: 1..86400\nunreachable_wait_seconds=45\n"
+UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
+UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:

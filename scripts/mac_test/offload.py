@@ -1610,7 +1610,7 @@ SERVER_ALIVE_INTERVAL_SECONDS = 15
 
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
     # SSH ends a session after this count of unanswered keepalive checks: a lost run ends after the unreachable wait.
-    alive_count = math.ceil(eligibility.unreachable_wait_seconds() / SERVER_ALIVE_INTERVAL_SECONDS)
+    alive_count = math.ceil(config.unreachable_wait_s / SERVER_ALIVE_INTERVAL_SECONDS)
     return [
         "-o",
         "BatchMode=yes",

@@ -318,7 +318,8 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
-        self.assert_fetch_wire("not_run", "lost")
+        # The launch was authorized and its start never settled, so its cleanup is unconfirmed.
+        self.assert_fetch_wire("not_run", "lost", "cleanup_unconfirmed")
         self.assertFalse((self.stub_directory / "pull-started").exists())
         self.config["offload"] = "off"
         self.sync_config()

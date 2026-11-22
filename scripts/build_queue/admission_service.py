@@ -3653,10 +3653,10 @@ for placement_pid in $placement_pids; do
     printf '%s\t%s\n' "$placement_pid" "$placement_start"
 done
 '''
-        probe = eligibility.SshProbeSettings(config)
         host = record["remote_host"]
         try:
             # A build target registry without a usable unreachable wait raises conf.Unusable, a ValueError.
+            probe = eligibility.probe_settings(config, _provider_configuration().read("build_targets"))
             options = offload.ssh_options(probe)
             result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -4943,9 +4943,12 @@ done
             saved = self._saved_assignment(request.episode, request.attempt)
             if isinstance(saved, status_wire.UnknownPlacementStatus):
                 return [status_wire.PlacementStatusReply(saved)]
-            permission = saved.permission if request.include_permission else status_wire.LAUNCH_PERMISSION_NOT_REPORTED
+            if request.include_permission:
+                permission, report = saved.permission, saved.terminal_report
+            else:
+                permission, report = status_wire.LAUNCH_PERMISSION_NOT_REPORTED, placement.NoTerminalReport()
             status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider,
-                                                      permission)
+                                                      permission, report)
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
             return [wire.Refused("Repository copy capacity no longer requires admission")]

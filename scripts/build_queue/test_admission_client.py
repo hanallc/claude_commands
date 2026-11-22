@@ -170,6 +170,40 @@ class ClientTests(unittest.TestCase):
                     status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("unseen", "unseen")))
             self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
 
+    def test_launch_permission_cli_reads_available_consumed_not_started_and_unknown(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            consumed = placement.PermissionConsumed(1.0)
+            settled, pending = placement.DispatchPathSettled(), placement.DispatchPathPending("cleanup remains")
+            refused = placement.PrelaunchRefused("runner")
+            cases: tuple[tuple[placement.LaunchPermission, placement.TerminalAttemptReport | placement.NoTerminalReport, str, int], ...] = (
+                (placement.PermissionAvailable(), placement.NoTerminalReport(), "available", 0),
+                (consumed, placement.NoTerminalReport(), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(refused, pending, 2.0), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), settled, 2.0), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(refused, settled, 2.0), "not_started", 0))
+            for permission, report, word, code in cases:
+                with self.subTest(permission=permission, report=report), fixture.loop_turn():
+                    fixture.server.assignments[key] = records.SavedPlacementAssignment(assignment,
+                        placement.CurrentAssignment(), permission=permission, provider=claim, terminal_report=report)
+                with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(["placement-status", "--launch-only", "--episode", assignment.episode,
+                        "--attempt", assignment.attempt]), code)
+                self.assertEqual(output.getvalue(), word + "\n")
+            with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(client.main(["placement-status", "--launch-only", "--episode", assignment.episode,
+                    "--attempt", "unseen"]), 1)
+            self.assertEqual(output.getvalue(), "unknown\n")
+
     def test_placement_status_cli_returns_two_when_the_service_is_unreachable(self) -> None:
         with AdmissionFixture() as fixture, mock.patch.dict(os.environ,
                 {"ADMISSION_SOCKET": str(fixture.socket_dir / "missing.sock")}), \

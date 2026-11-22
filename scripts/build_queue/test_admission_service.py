@@ -1328,7 +1328,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
     def mac_backoff_fixture(self) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
-        from scripts.mac_test import eligibility, offload
+        from scripts.mac_test import claim_state, eligibility, offload
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
@@ -1336,9 +1336,10 @@ class LocalHoldPlacementTests(unittest.TestCase):
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
+            mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", request.constraints.repository)
             probe = MacProbe()
             with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
-                  mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")),
+                  mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror),
                   mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
                   mock.patch.object(offload.ProcessController, "capture", probe.capture)):
                 offload.write_backoff(time.time() + 300, target.name)

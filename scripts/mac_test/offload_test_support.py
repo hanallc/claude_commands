@@ -607,8 +607,8 @@ def capture(self, arguments, *args, **kwargs):
         clock[0] = 102.0
     return answer
 
-def stream(self, arguments):
-    answer = real_stream(self, arguments)
+def stream(self, arguments, *args, **kwargs):
+    answer = real_stream(self, arguments, *args, **kwargs)
     clock[0] = 103.0
     return answer
 

@@ -431,12 +431,22 @@ def placement_status(episode: str, attempt: str, *, wait_for_service: bool = Tru
 
 
 def _print_placement_permission(episode: str, attempt: str) -> int:
-    """Read launch permission once within the query time limit."""
+    """Read launch permission once within the query time limit.
+
+    The service accepts a settled refusal after consumption only with proof that nothing started,
+    so `not_started` leaves no Mac cleanup to confirm.
+    """
     reply = _query(status_wire.PlacementStatusRequest(episode, attempt, include_permission=True))
     if isinstance(reply, status_wire.PlacementStatusReply) and isinstance(reply.status, status_wire.KnownPlacementStatus):
-        permission = reply.status.permission
+        permission, report = reply.status.permission, reply.status.report
         if isinstance(permission, placement.PermissionAvailable):
             print("available")
+            return 0
+        if (isinstance(permission, placement.PermissionConsumed)
+                and isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                and isinstance(report.path, placement.DispatchPathSettled)):
+            print("not_started")
             return 0
         if isinstance(permission, placement.PermissionConsumed):
             print("consumed")

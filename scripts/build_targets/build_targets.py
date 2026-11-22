@@ -492,7 +492,7 @@ def fixed_remote_candidates(
                 repository = eligibility.UNKNOWN_REPOSITORY
         else:
             scope = claim_state.target_claim_scope(paths, str(repo_root))
-        host = eligibility.SshProbeSettings(configuration).host
+        host = configuration.text("host")
         if isinstance(rule, NatedevOnly):
             policy = placement.FixedExclusion(rule.reason)
         elif (selection == ROUTED and target_config.uses_legacy_mac_layout(target.platform)
@@ -785,13 +785,14 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = (eligibility.SshProbeSettings(configuration) if isinstance(configuration, conf.ConfigRead)
-                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
         backoff = eligibility.NO_BACKOFF if recover_mac_backoff else eligibility.READ_BACKOFF
         repository = step_policy(target, repo_root, package, kind, backoff=backoff, configuration=configuration)
         if isinstance(repository, ExcludedTarget):
             return repository
+        # An excluded step reads no probe settings.
+        config = (eligibility.probe_settings(configuration) if isinstance(configuration, conf.ConfigRead)
+                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         if isinstance(answer, CapacityNotRead):
             settings = config.source if isinstance(config, eligibility.OffloadConfig) else config.configuration.source
             answer = mac_test.free_now(mac_test.state_paths(name), settings, repo_root, session=session,
@@ -918,7 +919,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     from scripts.mac_test import offload
 
-    probe_settings = eligibility.SshProbeSettings(config) if isinstance(config, conf.ConfigRead) else config
+    probe_settings = eligibility.probe_settings(config) if isinstance(config, conf.ConfigRead) else config
     if isinstance(offload.probe_reachability(offload.ProcessController(), probe_settings), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)

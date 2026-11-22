@@ -14,7 +14,8 @@ from scripts.lib.checkout_test_support import python_tool_source, write_python_t
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
+                                              write_pressure_reading)
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
@@ -1233,7 +1234,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
         config = self.root / "build_targets.conf"
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
-                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
@@ -1387,6 +1388,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         setup = r'''
 set -euo pipefail
 PY=$TEST_REAL_DIRECT/../lib/py
+VERIFY_START_DIR=$TEST_REAL_DIRECT
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
@@ -1416,7 +1418,7 @@ MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB=""
 PINNED_TARGET="" STEP_FORCE_MAC=0
-PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
+PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_ATTEMPT="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
 admit_verify_run() { :; }

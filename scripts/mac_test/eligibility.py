@@ -95,10 +95,11 @@ DEFAULT_MAC_SETTINGS = DefaultMacSettings()
 
 @dataclass(frozen=True)
 class SshConnectionSettings:
-    """The connection settings hold the SSH host and connection and cleanup timeouts."""
+    """The connection settings hold the SSH host, the connection and cleanup timeouts and the unreachable wait."""
     host: str
     connect_timeout_s: float
     leftover_timeout_s: float
+    unreachable_wait_s: int
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,10 @@ class OffloadConfig:
         return self.connection.leftover_timeout_s
 
     @property
+    def unreachable_wait_s(self) -> int:
+        return self.connection.unreachable_wait_s
+
+    @property
     def fetch_limit_mib(self) -> float:
         return float(self.values["fetch_limit_mib"])
 
@@ -149,6 +154,7 @@ class SshProbeSettings:
     """Read only the settings needed by an SSH evidence probe."""
 
     configuration: conf.ConfigRead
+    unreachable_wait_s: int
 
     @property
     def host(self) -> str:
@@ -202,9 +208,17 @@ def config_path() -> Path:
     return conf.path("mac_test")
 
 
-def unreachable_wait_seconds() -> int:
+def unreachable_wait_seconds(registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
     """Read how long a machine can stay silent before its run ends as unreachable."""
-    return conf.read_or_repository("build_targets").whole(UNREACHABLE_WAIT_KEY)
+    if isinstance(registry, conf.UseConfiguredValue):
+        registry = conf.read_or_repository("build_targets")
+    return registry.whole(UNREACHABLE_WAIT_KEY)
+
+
+def probe_settings(configuration: conf.ConfigRead,
+                   registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> SshProbeSettings:
+    """Build SSH probe settings from target settings and the build target registry."""
+    return SshProbeSettings(configuration, unreachable_wait_seconds(registry))
 
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:
@@ -247,7 +261,7 @@ def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTI
 
 def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
     return SshConnectionSettings(config.text("host"), config.number("connect_timeout_s"),
-                                 config.number("leftover_timeout_s"))
+                                 config.number("leftover_timeout_s"), unreachable_wait_seconds())
 
 
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:

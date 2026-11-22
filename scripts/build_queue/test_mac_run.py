@@ -29,6 +29,7 @@ from scripts.build_targets import build_targets, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
 from scripts.lib import conf, process_start as process_identity
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.mac_test import claim_state, eligibility, mac_queue_run, mac_test, offload
 from scripts.production.gate_routes import SuiteMode
 
@@ -68,7 +69,8 @@ class MacRunTests(unittest.TestCase):
                             ORIGIN], check=True)
         _ = (self.root / "machines.conf").write_text("mac.hosts=fixture-mac\n")
         _ = (self.root / "build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-                                                        + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                                                        + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                                                        + UNREACHABLE_WAIT_FIXTURE)
         _ = (self.root / "mac_test.conf").write_text("offload=on\nslots.claude_commands=99\n")
         copies_config = self.root / "copies.conf"
         _ = copies_config.write_text("# range: 5e-324..\ngit_timeout_seconds=5\n")
@@ -275,7 +277,7 @@ class MacRunTests(unittest.TestCase):
             "verify", "", target="mac", placement=offload.AssignedOffloadRequest(assignment))
         saved = claim_state.saved_mac_repository(retained.record)
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
         script = """
 from contextlib import redirect_stdout
@@ -346,7 +348,7 @@ sys.exit(71)
             return offload.LeftoverObservation(offload.parse_leftover_check(result.stdout), result.stdout)
 
         with mock.patch.object(eligibility, "read_connection_settings", return_value=eligibility.SshConnectionSettings(
-                "replacement-mac", 1, 1)), mock.patch.object(offload, "read_leftovers", side_effect=local_ssh) as check:
+                "replacement-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS)), mock.patch.object(offload, "read_leftovers", side_effect=local_ssh) as check:
             args = build_targets.CliArguments()
             args.pid, args.repo_root = owner.pid, str(self.repo)
             target = target_config.SshTarget("mac", "macos", config)
@@ -382,7 +384,7 @@ sys.exit(71)
         args = build_targets.CliArguments()
         args.pid, args.repo_root = os.getpid(), str(self.checkout)
         target = target_config.SshTarget("mac", "macos", settings)
-        config = eligibility.SshConnectionSettings("fixture-mac", 1, 1)
+        config = eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         diagnostic = StringIO()
         with mock.patch.object(eligibility, "read_connection_settings", return_value=config), \
                 mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as check, \
@@ -522,7 +524,7 @@ sys.exit(71)
                 with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                     self.fail("A clone took the origin repository's slot")
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only..claude": "", "linux_only.hana": ""})
         for checkout in (separate, self.checkout):
             self.assertEqual(eligibility.mac_step_eligibility(config, checkout, "hana", "nextest", "mac"),
@@ -620,7 +622,7 @@ sys.exit(71)
         args = build_targets.CliArguments()
         args.pid, args.repo_root = runner.pid, str(other)
         target = target_config.SshTarget("mac", "macos", self.root / "mac_test.conf")
-        connection = eligibility.SshConnectionSettings("fixture-mac", 1, 1)
+        connection = eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         with mock.patch.object(eligibility, "read_connection_settings", return_value=connection), \
                 mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as check:
             before = path.read_bytes()
@@ -666,7 +668,7 @@ sys.exit(71)
                     "verify", "", target="mac", placement=(offload.AssignedOffloadRequest(assignment) if assigned
                                                            else offload.DirectOffloadRequest()),
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
-                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                                    1, 1, 1, "1", {"linux_only.source-b": "", "linux_only..claude": "",
                                                                     "mirror_busy_backoff_s": "0"})
                 if changed:
@@ -1066,7 +1068,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
         for recovery in recoveries:
             with self.subTest(recovery=recovery):
@@ -1395,7 +1397,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_cleanup_handoff_holds_the_mirror_lease_and_retries_direct_claim(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
         waiting = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
@@ -1435,7 +1437,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     with copies.remote_lease(old_mirror):
                         return offload.FreshMacClaim(1)
 
-                def release(command: list[str]) -> offload.CommandOutput:
+                def release(command: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
                     self.assertEqual(command[command.index("--claim-id") + 1], identity.claim_id)
                     self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
                     return offload.CommandOutput(0, "", "")
@@ -1502,7 +1504,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         other = self.repository("source-b")
         set_origin = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
         _ = subprocess.run([*set_origin, str(self.repo)], check=True)
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only..claude": ""})
         request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                                          "verify", "", target="mac")
@@ -1549,7 +1551,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_fresh_takeover_waits_for_the_previous_hosts_cleanup_lease(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
         request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                                          "direct", "", target="mac")
@@ -1589,7 +1591,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_host_lease_contention_leaves_the_next_build_eligible(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": "", "mirror_busy_backoff_s": "120"})
         request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
                                          "direct", "", target="mac")
@@ -1619,7 +1621,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
     def test_mac_history_matches_the_queue_after_a_reservation_handoff(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
             1, 1, 1, "1", {"abandoned_session_minutes": "1", "linux_only..claude": "", "linux_only.metadata": ""})
         separate = self.root / "separate"
         metadata = self.root / "metadata" / "repo.git"
@@ -1720,7 +1722,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
 
     def offload_history_command(self, controller: offload.ProcessController,
                                 request: offload.OffloadRequest) -> list[str]:
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
             1, 1, 1, "1", {"abandoned_session_minutes": "1", "kinds": "check", "linux_only.checkout": ""})
 
         def remote_command(_: copies.RemoteMirror, command: str) -> str:
@@ -1748,7 +1750,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         return shlex.split(arguments[-1])
 
     def test_wait_reservation_retry_keeps_the_exact_claim_after_an_origin_change(self) -> None:
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                            1, 1, 1, "1", {"linux_only.checkout": ""})
         for assigned in (True, False):
             with self.subTest(assigned=assigned):

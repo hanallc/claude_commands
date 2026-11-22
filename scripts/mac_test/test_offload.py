@@ -25,7 +25,8 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
-from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
+                                              write_config_fixture,
                                               write_config_fault, commit_config_fixture)
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
@@ -444,9 +445,11 @@ class CompletedRunSyncTests(unittest.TestCase):
 
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("linux-build", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS), 1, 1, 1, "1", {})
         request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
+        # A claimed run holds the exact claim that it releases.
+        controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
         output = io.StringIO()
 
         def release(_controller: offload.ProcessController, _target: str) -> None:
@@ -515,7 +518,7 @@ class LocalVersionPreflightTests(unittest.TestCase):
             if content is not None:
                 _ = (root / "box-tools.json").write_text(content)
             target = target_config.SshTarget("linux", "linux", root / "linux.conf")
-            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1),
+            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                           1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
             request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
             controller = offload.ProcessController()
@@ -2197,7 +2200,7 @@ class BackoffReadTests(unittest.TestCase):
                 self.assertIs(eligibility.read_backoff(100, strict=True), eligibility.ACTIVE_BACKOFF)
 
     def test_a_passed_backoff_decides_eligibility_without_a_read(self) -> None:
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS), 1, 1, 1, "1",
                                        {"linux_only.hana": ""})
         root = Path("/fixture/hana")
         key = "https://fixture.invalid/hana"
