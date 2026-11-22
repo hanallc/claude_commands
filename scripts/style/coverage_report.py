@@ -23,7 +23,7 @@ from typing import TypedDict, cast
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
 from scripts.lib.user_zone import user_zone
-from scripts.style.add_style import NoStyleProduction, configured_style_production
+from scripts.style.add_style import NoStyleProduction, configured_style_production, is_style_production_branch
 
 
 class RuleSnapshot(TypedDict):
@@ -70,7 +70,8 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
         return StyleProduction(standing.name, config.route.branch_point,
                                tuple(assignment.unit for assignment in config.assignments))
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
-    branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
+    branch_point = next((branch for branch in branches if not is_style_production_branch(branch, standing.name)),
+                        tip[:7])
     return StyleProduction(standing.name, branch_point, ())
 
 

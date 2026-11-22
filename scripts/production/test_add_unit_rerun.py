@@ -12,11 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production import add_unit
 from scripts.herdr import herdr
 from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.agents import shutdown
+from scripts.accounts import moves
 from scripts.production import unit_lookup as script_unit_lookup
 from scripts.lib import atomic_file, build_folders
 from scripts.production.production_doc import Refusal, read_production
@@ -271,7 +273,11 @@ class AddUnitRerunTests(AddUnitTestCase):
         output = io.StringIO()
 
         def run_resume(argv: list[str]) -> subprocess.CompletedProcess[str]:
-            return self.cli(*argv[4:])
+            self.prepare_herdr_launch(*(argument for argument in argv[4:] if argument != "--join-recovery-locks"))
+            arguments = argv[2:]
+            lock_environment = {name: value for name, value in os.environ.items() if name.startswith("STAFF_ROW_FD_")}
+            return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments, self.env | lock_environment,
+                              self.checkout, production_state=True)
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
               patch.object(unit_lookup, "labeled_session", return_value=marked),
@@ -279,6 +285,7 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(marked)),
               patch.object(add_unit, "wait_for_remote_control", return_value=marked),
               patch.object(shutdown, "retirement_run", side_effect=run_resume),
+              staff.session_operation(unit.session_id, native_key=moves.native_row_key(unit.session_id)),
               redirect_stdout(output)):
             shutdown.recovery_launch(unit)
         self.assertIn("alpha started:", output.getvalue())

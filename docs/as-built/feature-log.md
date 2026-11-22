@@ -29,17 +29,19 @@ Every call is `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_lo
 
 ### Projects and crates
 
-`PROJECTS: dict[str, ProjectSpec]` with `ProjectSpec(repo: str, crates: frozenset[str], published: frozenset[str], checkouts: tuple[Path, ...])` is the one table of valid projects, crates, published crates and local checkouts.
+`PROJECTS` stores a `ProjectSpec` for each project with its repository, crates, published crates and local checkouts.
 
 | Project | Repo | Crates | Published | Checkouts |
 | --- | --- | --- | --- | --- |
-| `hana` | `natepiano/hana` | 27 package names from `~/rust/hana` and `~/rust/hana_catalyst` | `hana_clerestory`, `hana_kana`, `hana_lagrange`, `hana_liminal`, `hana_rigging`, `hana_rubric` | `~/rust/hana`, `~/rust/hana_catalyst` |
-| `natedev` | `natepiano/nixos` | none | none | `/etc/nixos` |
+| `hana` | `hanallc/hana` | 27 package names from `~/rust/hana` and `~/rust/hana_catalyst` | `hana_clerestory`, `hana_kana`, `hana_lagrange`, `hana_liminal`, `hana_rigging`, `hana_rubric` | `~/rust/hana`, `~/rust/hana_catalyst` |
+| `natedev` | `hanallc/nixos` | none | none | `/etc/nixos` |
 | `cargo-liner` | `natepiano/cargo-liner` | `cargo-berth`, `cargo-berth-test-support`, `cargo-handler`, `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` | `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` | `~/rust/cargo-liner` |
 | `bevy_brp` | `natepiano/bevy_brp` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`, `bevy_brp_test_apps`, `test-app-a`, `test-app-b` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros` | `~/rust/bevy_brp` |
 | `obsidian_knife` | `natepiano/obsidian_knife` | `obsidian_knife` | none | `~/rust/obsidian_knife` |
 | `nateroids` | `natepiano/nateroids` | `nateroids` | none | `~/rust/nateroids` |
-| `claude` | `natepiano/claude_commands` | none | none | `~/.claude` |
+| `claude` | `hanallc/claude_commands` | none | none | `~/.claude` |
+
+A former `natepiano` repository slug in `ProjectSpec.former_repos` still maps to its project.
 
 The folder is the repository boundary; `crate` narrows ownership. A project with no crates (natedev, claude) takes none. `published` holds crates confirmed on crates.io on 2026-10-10. A crate that may publish but has not (`cargo-berth`, `cargo-handler`, `obsidian_knife`, `nateroids`) is not in it. A first publication or a new workspace member is an edit to `PROJECTS`. `checkouts` lists the project's local clones on natedev, in lookup order; a new note reads its default completed date from them (see Note format). Every write runs on natedev, a forwarded one included, so only natedev's paths count.
 
@@ -67,7 +69,7 @@ crate:
 date_created: "[[2026-10-10]]"
 date_modified: "[[2026-10-10]]"
 kind: feature
-link: https://github.com/natepiano/hana/commit/afb0f5e992069a3e2d948bfff093292eff8f41a4
+link: https://github.com/hanallc/hana/commit/afb0f5e992069a3e2d948bfff093292eff8f41a4
 production: hana
 project: "[[hana]]"
 release: []
@@ -99,7 +101,7 @@ unit:
 | `crate` | sorted package names; `[]` only for natedev and claude, at least one elsewhere | `--crate` |
 | `date_created`, `date_modified` | date links | `today()`; `date_modified` moves on every rewrite |
 | `kind` | `feature`, `fix`, `change`, `perf`, `deprecation`, `removal`, `security` | `--kind` |
-| `link` | `https://github.com/<repo>/commit/<40-hex, lowercase>` | `--link`, a 40-hex sha or that URL |
+| `link` | `https://github.com/<repo>/commit/<40-hex, lowercase>` | Pass a bare SHA or a full URL to `--link`. A bare SHA uses the current repository slug. A full URL keeps its current or former slug. Links with the same SHA under a repository's former and current owners identify the same commit. |
 | `production` | string; optional; the production whose change review accepted the note | `--production` |
 | `project` | `"[[<project>]]"` | `--project` |
 | `release` | sorted `crate@Unreleased` or `crate@version`; the crate is in `crate` and published; no crate has both `@Unreleased` and a version | default, or `--release` |
@@ -311,7 +313,7 @@ Both review functions return the output lines and raise `FeatureLogError` on a r
 - An entry exists for a result when a user or operator can state what is now possible, now works, changed, went away or became noticeably faster. Refactor, test, build, CI and docs-only work gets none; it may be evidence for an entry.
 - Before writing, the agent reads `live` for affected entries. Still true: leave it. Stale wording or scope: `amend`. Replaced: `supersede --old`.
 - Hana: each distinct result gets one `A<n>` or `C<n>` row under `## To review` in `~/rust/hanadocs/change-review/change-review - hana.md` and one `propose --review <row>` with `--project hana`, every owning crate, the merge sha as `--link`, `--evidence "Showrunner merge <merge-sha>, from checkpoint <checkpoint-sha>."`, `--production`, every `--unit`, and one `--old` per replaced entry. Internal-only work logs `feature log: none — <reason>` in the production log. A script failure leaves the row open.
-- claude: the same, with no `--crate`, the merge sha as `--link` (a `natepiano/claude_commands` commit), and each row qualified by its list, `<list>/C<n>`.
+- For `claude`, use the Hana procedure and omit `--crate`. Pass the `hanallc/claude_commands` merge SHA to `--link`. Use `<list>/C<n>` to identify each row.
 - `<FeatureLogCloseOut/>` starts with `project-of .` and prints nothing for `hana`, `natedev`, `claude` or `none`.
 
 ### `inventory.py` and the frozen ledgers
@@ -481,7 +483,7 @@ Ruled out:
 - A recovery journal or operation id for the note-without-event gap: a repeat that appends the missing event is simpler.
 - `file.inFolder("feature-log/<project>")` filters in the project Bases: the link filter follows the issue Bases and matches unresolved project links.
 - A separate verification pass per backfill batch: `next --path` lets two writers claim disjoint prefixes, and the audit against the current surface covers both.
-- Exempting a date-only correction from the duplicate-link refusal: such a correction passes `--separate-result` again.
+- An exemption from the duplicate check for date-only corrections. Use `--separate-result` when another live note in the project identifies the same commit.
 - A separate nateroids note for inspector-first Escape: "trigger game and camera commands through brp" already describes it.
 - Storing the rendered section with the saved titles and refusing drift before the stamp: an amend a minute after stamping drifts the same way, so the check protects nothing lasting.
 - Recording the comparison boundary in the saved contents to date a later supersede: both rules print the same sections, and the note never gets a version under either.
