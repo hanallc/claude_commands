@@ -35,7 +35,7 @@ from scripts.lint.memory_test_support import write_config_fixture, commit_config
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_test
+from scripts.mac_test import claim_state, mac_test
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
 
@@ -3511,6 +3511,57 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     _ = self.watch_once()
                 self.assertEqual(self.read_claim(), record)
                 send.assert_not_called()
+
+    def test_mac_claim_boot_round_trips_and_rejects_damaged_records(self) -> None:
+        from scripts.mac_test import offload
+
+        boot: claim_state.MacClaimBoot = {
+            "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+        }
+        record = self.write_claim()
+        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        controller = offload.ProcessController()
+        offload.record_mac_claim_boot(controller, identity, "mac", "claim-mac", boot)
+        self.assertEqual(mac_test.read_run(self.paths.run), {**record, "mac_boot": boot})
+        self.assertEqual(controller.mac_boot, boot)
+        with self.assertRaisesRegex(mac_test.StateReadError, "rebooted"):
+            offload.record_mac_claim_boot(controller, identity, "mac", "claim-mac",
+                                          {**boot, "boot_at_us": 200_000_000})
+        for damaged in ({**boot, "boot_id": "invalid"}, {**boot, "boot_at_us": True}):
+            with self.subTest(boot=damaged):
+                _ = self.write_claim(mac_boot=damaged)
+                with self.assertRaises(mac_test.StateReadError):
+                    _ = mac_test.read_run(self.paths.run)
+
+    def test_mac_claim_releases_only_for_its_own_confirmed_end(self) -> None:
+        from scripts.mac_test import offload
+
+        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        pending = offload.pending_start_path("mac", identity)
+        pending.parent.mkdir(parents=True)
+        key = str(offload.start_fence_relative(identity, "mac"))
+        for ended, holder_dead in ((True, True), (False, True), (True, False)):
+            with self.subTest(ended=ended, holder_dead=holder_dead):
+                record = self.write_claim(mac_boot={
+                    "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+                }, idle_since=mac_test.timestamp(self.now - timedelta(hours=1)))
+                pending.touch()
+                activity = (mac_test.MacActive(1, 1) if ended else mac_test.MacIdle())
+                with (mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacClaimActivity(
+                          activity, frozenset({key if ended else "another-claim"}))),
+                      mock.patch.object(process_identity, "process_start", return_value=(
+                          process_identity.Gone() if holder_dead else process_identity.Started("owner-start"))),
+                      mock.patch.object(mac_test, "send_message", return_value=True) as send):
+                    output = self.watch_once()
+                if ended and holder_dead:
+                    self.assertFalse(self.paths.run.exists())
+                    self.assertFalse(pending.exists())
+                    self.assertIn("its remote run ended", output)
+                    send.assert_called_once()
+                else:
+                    self.assertTrue(pending.exists())
+                    self.assertEqual(self.read_claim()["mac_boot"], record["mac_boot"])
+                    send.assert_not_called()
 
     def test_pass_does_not_modify_claim_changed_during_activity_check(self) -> None:
         for field, value in (("pid", 1234), ("proc_start", "new-start"), ("since", "2026-10-13T12:01:00+00:00")):

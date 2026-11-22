@@ -202,6 +202,20 @@ class QueueRunTests(unittest.TestCase):
             self.assertTrue(block.is_file())
             self.assertTrue((root / "remote").is_file())
 
+    def test_each_mac_kind_refuses_a_block_after_placement(self) -> None:
+        for kind in ("run", "shot", "install", "probe"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                self.write_block(root / "block-on-placement.json")
+                with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()):
+                    status = mac_queue_run.main(["--no-wait", *self.command(root, kind)[3:]])
+                self.assertEqual(status, mac_queue_run.MAC_BUSY_STATUS)
+                self.assertFalse((root / "remote").exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+
     def test_run_uses_the_block_holding_units_session_for_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

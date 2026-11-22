@@ -3337,13 +3337,21 @@ class AdmissionServer:
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
-        eligibility: placement.HostEligibility
-        if build_targets.mac_run_bypasses_repository_policy(target, kind):
-            eligibility = placement.AllowedHost()
-        elif kind not in placement.STEP_COMMAND_KINDS:
-            # The target can never run this command, so a pinned step refuses at once.
-            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
-        else:
+        paths = claim_state.state_paths(destination.target)
+        eligibility: placement.HostEligibility = placement.AllowedHost()
+        if isinstance(target, target_config.SshTarget) and target.platform == "macos":
+            try:
+                block = mac_test.blocking_claim_block(paths, key.session)
+            except (OSError, claim_state.StateReadError):
+                eligibility = placement.TemporaryExclusion("state")
+            else:
+                # A block affects first placement. A placed run waits on its machine or ends.
+                # maclost releases the natedev place. The watcher releases the Mac claim after proof.
+                if not isinstance(block, claim_state.NoMacBlock):
+                    eligibility = placement.TemporaryExclusion("blocked")
+        if isinstance(eligibility, placement.AllowedHost) and not build_targets.mac_run_bypasses_repository_policy(target, kind):
+            if kind not in placement.STEP_COMMAND_KINDS:
+                return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
             if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
@@ -3354,14 +3362,14 @@ class AdmissionServer:
                     configuration=configuration)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
-        paths = claim_state.state_paths(destination.target)
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
-                and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
-            eligibility = placement.TemporaryExclusion("busy")
+                and target.platform == "macos"):
+            capacity = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                         session=key.session, configuration=configuration)
+            if capacity in ("busy", "blocked", "state"):
+                eligibility = placement.TemporaryExclusion(capacity)
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []

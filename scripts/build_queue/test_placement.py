@@ -2273,6 +2273,57 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     assert isinstance(reply, wire.DispatchStatus)
                     self.assertEqual(reply.retry, placement.DoNotRetry("command"))
 
+    def test_a_mac_block_only_changes_first_placement_for_each_command_kind(self) -> None:
+        for kind in placement.MAC_RUN_KINDS:
+            with self.subTest(kind=kind), PlacementFixture() as fixture:
+                fixture.enter_context(mock.patch.dict(os.environ, {
+                    "MAC_TEST_STATE_DIR": str(fixture.root / "mac-block"),
+                }))
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                paths = claim_state.state_paths("mac")
+                paths.directory.mkdir()
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints, command_kind=kind,
+                    candidates=(*request.constraints.candidates, local_candidate(fixture))))
+                _ = publish_candidate(fixture, request)
+                assigned = assignment_for(fixture, request)
+                reference = adopt_assignment(fixture, request, assigned)
+                authorization, = fixture.server.handle_request(consume_permission("authorize", assigned, reference))
+                self.assertIsInstance(authorization, wire.FirstAuthorization)
+                execution = execution_identity.ProcessExecution(assigned.destination.host, "host-generation-a", 42, "start")
+                _ = fixture.server.handle_request(wire.ExecutionReport("started", assigned, reference,
+                    execution_identity.ObservedExecution(execution), placement.AttemptRunning()))
+
+                now = mac_test.utc_now()
+                mac_test.write_block(paths.block, claim_state.PendingMacBlock(
+                    "holder", "fixture work", now, now, claim_state.RecordedSession("holder", "holder"),
+                    mac_test.NO_SHOWRUNNER, "not_configured", claim_state.WaitingOnLocalRun("existing work")))
+                new = placement_request(fixture)
+                new = replace(new, constraints=request.constraints)
+                key = fixture.server.host_evidence_key(new, assigned.destination)
+                fixture.server.host_requests[key] = new
+                evidence = fixture.read_host_evidence(key)
+                self.assertIsInstance(evidence, placement.FreshHostEvidence)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("blocked"))
+                fixture.server.publish_host_evidence(evidence)
+                status, = fixture.server.handle_request(consume_permission("after-block", assigned, reference))
+                self.assertIsInstance(status, wire.DispatchStatus)
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertEqual(status.assignment, assigned)
+                self.assertIsInstance(status.state, placement.CurrentAssignment)
+                reply, = fixture.server.handle_request(new)
+                self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                self.assertNotIn(request.episode, fixture.caller_reservations())
+
+                holder = replace(new, constraints=replace(new.constraints, session=OwningSession("holder")))
+                key = fixture.server.host_evidence_key(holder, assigned.destination)
+                fixture.server.host_requests[key] = holder
+                evidence = fixture.read_host_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+
     def test_each_command_kind_reads_its_own_host_evidence(self) -> None:
         with PlacementFixture() as fixture:
             request = placement_request(fixture)

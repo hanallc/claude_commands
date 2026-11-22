@@ -97,6 +97,7 @@ from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 if TYPE_CHECKING:
+    from scripts.mac_test.offload import MacClaimEndProbe
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
     from scripts.mac_test import eligibility
@@ -277,7 +278,15 @@ class ActivityCheckFailed:
     reason: str
 
 
-MacActivity = MacActive | MacIdle | ActivityCheckFailed
+@dataclass(frozen=True)
+class MacClaimActivity:
+    """Host activity and the exact start fences that the Mac settled."""
+
+    activity: MacActive | MacIdle
+    ended: frozenset[str]
+
+
+MacActivity = MacActive | MacIdle | ActivityCheckFailed | MacClaimActivity
 
 
 @dataclass(frozen=True)
@@ -1427,9 +1436,14 @@ printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 '''
 
 
-def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
+def check_mac_activity(config: MacTestConfig, host: str, probes: tuple[MacClaimEndProbe, ...] = ()) -> MacActivity:
+    script = mac_activity_script()
+    if probes:
+        from scripts.mac_test.offload import mac_claim_end_command
+
+        script += mac_claim_end_command(probes)
     arguments = ["ssh", "-o", "BatchMode=yes", "-o",
-                 f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()]
+                 f"ConnectTimeout={config.connect_timeout_s:g}", host, script]
     try:
         result = subprocess.run(
             arguments,
@@ -1449,7 +1463,7 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
         return ActivityCheckFailed(reason)
     lines = result.stdout.splitlines()
-    if (len(lines) != 3 or lines[2] != "rc=0" or not lines[0].startswith("active=")
+    if (len(lines) != (4 if probes else 3) or lines[2] != "rc=0" or not lines[0].startswith("active=")
             or not lines[1].startswith("work=")):
         return ActivityCheckFailed("the activity check answer could not be read")
     counts = [lines[0].removeprefix("active="), lines[1].removeprefix("work=")]
@@ -1461,7 +1475,18 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         return ActivityCheckFailed("the activity check answer could not be read")
     if work > count:
         return ActivityCheckFailed("the activity check work count exceeds its active count")
-    return MacActive(count, work) if count else MacIdle()
+    activity = MacActive(count, work) if count else MacIdle()
+    if not probes:
+        return activity
+    try:
+        result_keys = cast(object, json.loads(lines[3]))
+    except ValueError:
+        return ActivityCheckFailed("the claim end proof could not be read")
+    keys = {str(probe.fence) for probe in probes}
+    if not isinstance(result_keys, list) or any(
+            not isinstance(key, str) or key not in keys for key in cast(list[object], result_keys)):
+        return ActivityCheckFailed("the claim end proof could not be read")
+    return MacClaimActivity(activity, frozenset(cast(list[str], result_keys)))
 
 
 def claim_idle_clause(run: RunRecord) -> str:
@@ -1474,12 +1499,16 @@ def claim_host(run: RunRecord, config: MacTestConfig) -> str:
     return run["remote_host"] if "remote_host" in run else config.host
 
 
+def claim_holder_ended(run: RunRecord) -> bool:
+    start = process_identity.process_start(run["pid"])
+    return (isinstance(start, (process_identity.Gone, process_identity.Zombie))
+            or isinstance(start, process_identity.Started) and start.start != run["proc_start"])
+
+
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     """Check every live claim once; return whether another pass may still be needed.
 
-    One activity check serves every claim on a host. It counts all of the
-    user's Mac work, since a build process cannot be traced to a repository,
-    so a claim is idle only while the Mac runs nothing at all.
+    One check reads host activity and checks the exact fences of ended holders.
     """
 
     with locked(paths.lock):
@@ -1489,6 +1518,15 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     if paths.platform == "linux":
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
+    from scripts.mac_test import offload
+
+    probes_by_host: dict[str, list[offload.MacClaimEndProbe]] = {}
+    for claim in claims:
+        record = claim.record
+        if "remote_host" in record and "mac_boot" in record and claim_holder_ended(record):
+            fence = offload.start_fence_relative(
+                claim_state.claim_identity(record), paths.target, scope_key=claim.path.stem)
+            probes_by_host.setdefault(record["remote_host"], []).append(offload.MacClaimEndProbe(fence, record["mac_boot"]))
     activity: dict[str, MacActivity] = {}
     traffic: dict[str, transfer_bytes.TransferLedger] = {}
     for claim in claims:
@@ -1496,7 +1534,8 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         if host not in activity:
             traffic[host] = transfer_bytes.TransferLedger()
             with transfer_bytes.measure_transfers(traffic[host]):
-                activity[host] = check_mac_activity(config, host)
+                probes = tuple(probes_by_host.get(host, ()))
+                activity[host] = check_mac_activity(config, host, probes) if probes else check_mac_activity(config, host)
     now = utc_now()
     watched = False
     for claim in claims:
@@ -1512,12 +1551,20 @@ def watch_claim(
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
 
+    from scripts.mac_test import offload
+
     run = claim.record
+    ended: frozenset[str] = activity.ended if isinstance(activity, MacClaimActivity) else frozenset()
+    if isinstance(activity, MacClaimActivity):
+        activity = activity.activity
+    proof = False
+    block_present = False
     with locked(paths.lock):
         current = read_run(claim.path)
         if isinstance(current, NoRun):
             return False
-        if claim_owner(current) != claim_owner(run):
+        if (claim_owner(current) != claim_owner(run) or current.get("remote_host") != run.get("remote_host")
+                or current.get("mac_boot") != run.get("mac_boot")):
             return True
         if not run_is_live(current):
             return False
@@ -1533,35 +1580,56 @@ def watch_claim(
                 write_json(claim.path, current)
             print(f"Mac claim activity check failed: {activity.reason}", flush=True)
             return True
-        if isinstance(activity, MacActive) and activity.work > 0:
-            if "work_idle_since" in current:
-                del current["work_idle_since"]
-                changed = True
-        elif "work_idle_since" not in current:
-            current["work_idle_since"] = timestamp(now)
+        boot_recorded = "remote_host" in current and "mac_boot" in current
+        identity = claim_state.claim_identity(current)
+        fence = offload.start_fence_relative(identity, paths.target, scope_key=claim.path.stem)
+        if boot_recorded and str(fence) in ended and claim_holder_ended(current):
+            remove_settled_claim(claim.path, offload.pending_start_path(paths.target, identity))
+            block_present = not isinstance(read_block(paths.block), NoMacBlock)
+            proof = True
+        elif keep_watching_for_idle(claim.path, current, activity, config, now, changed) or boot_recorded:
+            return True
+    if proof:
+        if block_present:
+            start_watcher(paths)
+    else:
+        release = CliArguments()
+        release.pid, release.target = current["pid"], paths.target
+        release.claim_id, release.episode, release.attempt = identity.claim_id, identity.episode, identity.attempt
+        if command_release(release, paths) != 0:
+            return True
+    report_watched_release(current, config, now, proof)
+    return False
+
+
+def keep_watching_for_idle(path: Path, current: RunRecord, activity: MacActive | MacIdle,
+                           config: MacTestConfig, now: datetime, changed: bool) -> bool:
+    """Update host activity and indicate whether the idle timer has expired."""
+    if isinstance(activity, MacActive) and activity.work > 0:
+        if "work_idle_since" in current:
+            del current["work_idle_since"]
             changed = True
-        if isinstance(activity, MacActive):
-            if "idle_since" in current:
-                del current["idle_since"]
-                changed = True
-            if changed:
-                write_json(claim.path, current)
-            return True
-        if "idle_since" not in current:
-            current["idle_since"] = timestamp(now)
-            write_json(claim.path, current)
-            return True
+    elif "work_idle_since" not in current:
+        current["work_idle_since"] = timestamp(now)
+        changed = True
+    if isinstance(activity, MacActive):
+        if "idle_since" in current:
+            del current["idle_since"]
+            changed = True
         if changed:
-            write_json(claim.path, current)
-        idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
-        if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
-            return True
-    release = CliArguments()
-    release.pid, release.target = current["pid"], paths.target
-    release.claim_id = current["claim_id"]
-    release.episode, release.attempt = current["episode"], current["attempt"]
-    if command_release(release, paths) != 0:
+            write_json(path, current)
         return True
+    if "idle_since" not in current:
+        current["idle_since"] = timestamp(now)
+        write_json(path, current)
+        return True
+    if changed:
+        write_json(path, current)
+    idle_since = aware_timestamp(current["idle_since"], path, "idle_since")
+    return now - idle_since < timedelta(minutes=config.claim_idle_minutes)
+
+
+def report_watched_release(current: RunRecord, config: MacTestConfig, now: datetime, proof: bool) -> None:
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
     quoted_worktree = "'" + current["worktree"].replace("'", "'\"'\"'") + "'"
@@ -1569,10 +1637,11 @@ def watch_claim(
     if "remote_host" in current:
         quoted_host = "'" + current["remote_host"].replace("'", "'\"'\"'") + "'"
         remote_argument = f" --remote {quoted_host}"
+    reason = "its remote run ended" if proof else f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes"
     text = (
         f'Your Mac claim "{current["what"]}" '
         + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
-        + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
+        + f"{reason}, so tests waiting for it can run. "
         + "Claim it again before your next Mac command: "
         + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
         + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
@@ -1583,7 +1652,6 @@ def watch_claim(
             f"session:{current['holder_session']}", "Mac claim released",
             f"mac-claim-idle-{current['pid']}-{current['since']}", 0, text,
         )
-    return False
 
 
 def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
@@ -2174,6 +2242,12 @@ class ClaimReleaseRefused:
     reason: str
 
 
+def remove_settled_claim(path: Path, pending: Path) -> None:
+    """Remove the local start marker and claim after the remote fence settles."""
+    pending.unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+
+
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
@@ -2213,8 +2287,7 @@ def release_exact_claims(
             if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                 return ClaimReleaseRefused("the exact claim changed during cleanup")
             transfers.extend(current.get("transfers", []))
-            pending.unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
+            remove_settled_claim(path, pending)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:

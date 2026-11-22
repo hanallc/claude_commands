@@ -12,6 +12,7 @@ import fcntl
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from uuid import UUID
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
@@ -246,12 +247,39 @@ class ProcessBoundClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity while its process lives."""
 
 
+class MacClaimBoot(TypedDict):
+    """The Mac boot on which this claim can start work."""
+
+    boot_id: str
+    boot_at_us: int
+
+
+class MacBootNotRecorded:
+    """The claim has no recorded Mac boot."""
+
+
+MAC_BOOT_NOT_RECORDED = MacBootNotRecorded()
+
+
+def decode_mac_claim_boot(value: object, path: Path) -> MacClaimBoot:
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        boot_id, boot_at_us = fields.get("boot_id"), fields.get("boot_at_us")
+        if isinstance(boot_id, str) and type(boot_at_us) is int and boot_at_us > 0:
+            try:
+                return {"boot_id": str(UUID(boot_id)), "boot_at_us": boot_at_us}
+            except ValueError:
+                pass
+    raise StateReadError(f"{path} has an invalid mac_boot")
+
+
 class RemoteJobClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity until the named host confirms that its job ends."""
 
     remote_host: str
     cleanup_pending: NotRequired[bool]
     instance_generation: NotRequired[str]
+    mac_boot: NotRequired[MacClaimBoot]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -411,6 +439,8 @@ def read_run(path: Path) -> RunState:
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    if "mac_boot" in values:
+        remote["mac_boot"] = decode_mac_claim_boot(values["mac_boot"], path)
     if 'instance_generation' in values:
         generation = required_string(values, 'instance_generation', path)
         if not generation:

@@ -328,13 +328,13 @@ class Arguments(argparse.Namespace):
 
 
 def blocking_run(
-    args: Arguments, owner: OwningSession | NoOwningSession,
+    args: Arguments, owner: OwningSession | NoOwningSession, *, authorize_launch: bool = False,
 ) -> claim_state.MacBlockState | mac_test.ClaimFinished:
-    if args.kind != "run":
-        return mac_test.NO_MAC_BLOCK
     paths = claim_state.state_paths()
     try:
-        block = mac_test.blocking_claim_block(paths, owner)
+        # Check authorization for the first launch under the block writer's lock.
+        with claim_state.locked(paths.lock) if authorize_launch else contextlib.nullcontext():
+            block = mac_test.blocking_claim_block(paths, owner)
     except (OSError, claim_state.StateReadError):
         if args.is_mac_run:
             return mac_test.unreadable_claim(paths.block)
@@ -356,7 +356,7 @@ def wait_to_retry() -> None:
 
 def run(args: Arguments) -> int:
     since = time.time()
-    owner = owning_session() if args.kind == "run" else NoOwningSession()
+    owner = owning_session()
     if isinstance(owner, NoOwningSession):
         session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         if session:
@@ -448,8 +448,10 @@ def run_attempt(
             else:
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
-                clean_ended_runs(callback_environment)
                 block = blocking_run(args, owner)
+                if isinstance(block, claim_state.NoMacBlock):
+                    clean_ended_runs(callback_environment)
+                    block = blocking_run(args, owner)
                 on_close = ""
                 if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
@@ -469,7 +471,7 @@ def run_attempt(
                 else:
                     status = 0
                 if status == 0 and isinstance(block, claim_state.NoMacBlock):
-                    block = blocking_run(args, owner)
+                    block = blocking_run(args, owner, authorize_launch=True)
                     if isinstance(block, claim_state.NoMacBlock):
                         # Record failure until the Mac reports an exit status.
                         status = 1

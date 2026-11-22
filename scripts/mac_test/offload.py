@@ -540,6 +540,85 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
     return state / "dispatch-fences" / scope_key / pending_start_key(identity)
 
 
+MAC_BOOT_READER = r'''import json, re, subprocess
+from uuid import UUID
+
+def mac_boot():
+    boot_id = str(UUID(subprocess.check_output(["sysctl", "-n", "kern.bootsessionuuid"], text=True).strip()))
+    value = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+    match = re.match(r"\{\s*sec\s*=\s*([0-9]+),\s*usec\s*=\s*([0-9]+)\s*\}", value)
+    if not match:
+        raise ValueError("Invalid Mac boot time")
+    seconds, micros = map(int, match.groups())
+    if seconds <= 0 or not 0 <= micros < 1000000:
+        raise ValueError("Invalid Mac boot time")
+    return {"boot_id": boot_id, "boot_at_us": seconds * 1000000 + micros}
+'''
+
+
+@dataclass(frozen=True)
+class MacClaimEndProbe:
+    """An exact Mac start fence and the boot that authorized it."""
+
+    fence: Path
+    boot: claim_state.MacClaimBoot
+
+
+def mac_claim_end_command(probes: tuple[MacClaimEndProbe, ...]) -> str:
+    """Read one process table after locking the fences that can settle."""
+    program = MAC_BOOT_READER + '''import fcntl, os, pathlib, sys
+from contextlib import ExitStack
+
+current_boot = mac_boot()
+ended = []
+with ExitStack() as locks:
+    candidates = []
+    for name, boot in json.loads(sys.argv[1]):
+        fence = pathlib.Path.home() / name
+        path = fence.with_suffix(".lock")
+        try:
+            lock = locks.enter_context(path.open("r"))
+        except FileNotFoundError:
+            lock = None
+        if lock is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+        if current_boot == boot:
+            try:
+                launch = json.loads(fence.with_suffix(".group").read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(launch, dict) or launch.get("boot") != boot:
+                continue
+            group = launch.get("group")
+            if type(group) is int and group > 1:
+                candidates.append((name, path, lock, group))
+        elif current_boot["boot_id"] != boot["boot_id"] and current_boot["boot_at_us"] > boot["boot_at_us"]:
+            candidates.append((name, path, lock, 0))
+    groups = set()
+    if any(group for _, _, _, group in candidates):
+        groups = set(subprocess.check_output(["ps", "-axo", "pgid="], text=True).split())
+        if not groups or not all(group.isascii() and group.isdecimal() for group in groups):
+            raise ValueError("Invalid Mac process groups")
+    for name, path, lock, group in candidates:
+        if group and str(group) in groups:
+            continue
+        try:
+            current = path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            if lock is None or not os.path.samestat(current, os.fstat(lock.fileno())):
+                continue
+            path.unlink()
+        ended.append(name)
+print(json.dumps(ended))
+'''
+    return shlex.join(["python3", "-c", program, json.dumps([(str(probe.fence), probe.boot) for probe in probes])])
+
+
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Remove inactive fences from older claims in this exact provider scope."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
@@ -557,6 +636,9 @@ for path in base.parent.glob("*.lock"):
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         continue
+for group in base.parent.glob("*.group"):
+    if group != base.with_suffix(".group") and not group.with_suffix(".lock").exists():
+        group.unlink(missing_ok=True)
 '''
     return shlex.join(["python3", "-c", program, encoded])
 
@@ -617,9 +699,26 @@ if not matches:
             + shlex.join(["python3", "-c", program, encoded, key]) + " || exit 75\n")
 
 
-def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
+def fenced_start_command(
+    identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run",
+    mac_boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded = claim_state.MAC_BOOT_NOT_RECORDED,
+) -> str:
     """Remove the prepared identity after the existing remote command ends."""
+    record_group = ""
+    if not isinstance(mac_boot, claim_state.MacBootNotRecorded):
+        program = MAC_BOOT_READER + '''import os, pathlib, sys
+boot = mac_boot()
+group = os.getpgrp()
+if boot != json.loads(sys.argv[2]) or group <= 1:
+    sys.exit(75)
+marker = (pathlib.Path.home() / sys.argv[1]).with_suffix(".group")
+with marker.open("x") as saved:
+    json.dump({"boot": boot, "group": group}, saved)
+'''
+        path = start_fence_relative(identity, target, scope_key=scope_key)
+        record_group = shlex.join(["python3", "-c", program, str(path), json.dumps(mac_boot)]) + " || exit 75\n"
     return (start_fence_command(identity, target, scope_key=scope_key)
+            + record_group
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
@@ -988,6 +1087,7 @@ class ProcessController:
         self.claim_settings: Path | DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS
         self.claim_target: str = ""
         self.claim_scope_key: str = "run"
+        self.mac_boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded = claim_state.MAC_BOOT_NOT_RECORDED
 
     def stop(self) -> None:
         active = self.active
@@ -1814,6 +1914,30 @@ def record_reachable(target: str = "mac") -> None:
             print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
 
 
+def record_mac_claim_boot(controller: ProcessController, identity: claim_state.ClaimIdentity,
+                          target: str, host: str, boot: claim_state.MacClaimBoot) -> None:
+    """Bind the start to the Mac boot before the caller can launch work."""
+    paths = claim_state.state_paths(target)
+    start = process_identity.process_start(os.getpid())
+    with claim_state.locked(paths.lock):
+        for path in claim_state.claim_files(paths):
+            if path.stem != controller.claim_scope_key:
+                continue
+            record = claim_state.read_run(path)
+            if (isinstance(record, claim_state.NoRun) or "remote_host" not in record
+                    or record["remote_host"] != host or record["pid"] != os.getpid()
+                    or start != process_identity.Started(record["proc_start"])
+                    or claim_state.claim_identity(record) != identity):
+                continue
+            if "mac_boot" in record and record["mac_boot"] != boot:
+                raise claim_state.StateReadError("the Mac rebooted while the claim was preparing")
+            record["mac_boot"] = boot
+            write_text_atomic(path, json.dumps(record) + "\n")
+            controller.mac_boot = boot
+            return
+    raise claim_state.StateReadError("the exact Mac claim changed during the probe")
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig | eligibility.SshProbeSettings,
@@ -1855,8 +1979,11 @@ def probe_mac(
         path = pending_start_path(target, identity)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, pending_start_key(identity))
+        boot = "" if linux else shlex.join(
+            ["python3", "-c", MAC_BOOT_READER + 'print("mac_boot=" + json.dumps(mac_boot()))']) + " || exit 1\n"
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
                   + "if [ \"$probe_status\" -eq 0 ]; then\n"
+                  + boot
                   + prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
                   + 'exit "$probe_status"')
     result = controller.capture(
@@ -1876,6 +2003,16 @@ def probe_mac(
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
+            boot_lines = [line.removeprefix("mac_boot=") for line in result.stdout.splitlines()
+                          if line.startswith("mac_boot=")]
+            if not linux and isinstance(identity, claim_state.ClaimIdentity) and boot_lines:
+                try:
+                    if len(boot_lines) != 1:
+                        raise claim_state.StateReadError("the probe returned multiple Mac boots")
+                    mac_boot = claim_state.decode_mac_claim_boot(cast(object, json.loads(boot_lines[0])), mark)
+                    record_mac_claim_boot(controller, identity, target, config.host, mac_boot)
+                except (OSError, ValueError) as error:
+                    return failed(str(error))
             if not linux or not isinstance(config, OffloadConfig):
                 return succeeded(probe)
             expected = expected_linux_parity(controller, config)
@@ -2766,7 +2903,8 @@ def claimed_run(
         identity = controller.claim_identity
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
-            command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
+            command = fenced_start_command(identity, request.target, command,
+                                           scope_key=controller.claim_scope_key, mac_boot=controller.mac_boot)
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),

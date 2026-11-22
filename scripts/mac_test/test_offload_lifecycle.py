@@ -28,6 +28,49 @@ from scripts.lib import process_start as process_identity
 
 
 class PendingDispatchTests(unittest.TestCase):
+    def test_mac_start_evidence_survives_a_lost_launch_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot: claim_state.MacClaimBoot = {
+                "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+            }
+            identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+            fence = offload.start_fence_relative(identity, "mac")
+            sysctl = root / "sysctl"
+            _ = sysctl.write_text("#!/bin/sh\ncase \"$2\" in\n"
+                + "kern.bootsessionuuid) cat \"$HOME/boot-id\" ;;\n"
+                + "kern.boottime) cat \"$HOME/boot-time\" ;;\n"
+                + "*) exit 1 ;;\nesac\n")
+            sysctl.chmod(0o700)
+            _ = (root / "boot-id").write_text(boot["boot_id"] + "\n")
+            _ = (root / "boot-time").write_text("{ sec = 100, usec = 0 } Thu Jan 1\n")
+            ps = root / "ps"
+            _ = ps.write_text("#!/bin/sh\ncat \"$HOME/groups\"\n")
+            ps.chmod(0o700)
+            groups = root / "groups"
+            _ = groups.write_text(f"{os.getpgrp()}\n")
+            environment = {**os.environ, "HOME": str(root), "PATH": str(root) + ":" + os.environ["PATH"]}
+
+            def shell(command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(["bash", "-c", command], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=5)
+
+            self.assertEqual(shell(offload.prepare_start_fence_command(identity, "mac")).returncode, 0)
+            launch = offload.fenced_start_command(identity, "mac", "exit 0", mac_boot=boot)
+            _ = shell(launch)
+            probe = offload.mac_claim_end_command((offload.MacClaimEndProbe(fence, boot),))
+            self.assertEqual(json.loads(shell(probe).stdout), [])
+            _ = groups.write_text(f"{os.getpgrp() + 1}\n")
+            self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
+            self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
+            self.assertNotEqual(shell(launch).returncode, 0)
+
+            self.assertEqual(shell(offload.prepare_start_fence_command(identity, "mac")).returncode, 0)
+            _ = (root / "boot-id").write_text("da89a87b-2fc2-4f08-a3e0-34938b3383b3\n")
+            _ = (root / "boot-time").write_text("{ sec = 120, usec = 0 } Thu Jan 1\n")
+            self.assertNotEqual(shell(launch).returncode, 0)
+            self.assertEqual(json.loads(shell(probe).stdout), [str(fence)])
+
     def test_a_pending_claim_or_start_cannot_release_capacity_before_its_child_settles(self) -> None:
         for operation in ("claim", "start-acknowledged", "start-uncertain"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
