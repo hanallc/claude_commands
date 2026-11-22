@@ -542,12 +542,21 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = (target / "nested/artifact").write_text("warm\n")
         _ = (target / "untracked").symlink_to("nested")
         new = self.trees / "origin/fixture-unit/demo"
+        output = self.root / "build/origin/fixture-unit/demo"
         notices = StringIO()
         with (patch.dict(os.environ, self.environment, clear=True), redirect_stderr(notices),
               patch.object(worktrees, "_worktree_copy_required", return_value=True)):
+            producer = fixture_member("producer", name="fixture-producer",
+                                      worktree=staff.PresentWorktree(host_name(), self.root / "producer-checkout"))
+            plan = staff.ProducerRename(uuid4().hex, producer, replace(producer, name="fixture-renamed"), (output,))
+            with patch.object(staff, "producer_creation_registry", return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+                staff.reserve_producer_rename(plan)
+            with self.assertRaisesRegex(staff.StaffRefused, "has a producer rename reservation"):
+                staff.require_no_producer_rename_paths(host_name(), (output,))
             self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
             completed = worktrees.read_move(worktrees.move_file(old))
         self.assertEqual(completed.stage, worktrees.MoveStage.FINISHED)
+        self.assertFalse(output.exists())
         self.assertFalse((new / "target").is_symlink())
         self.assertEqual((new / "target/nested/.gitkeep").read_text(), "local edit\n")
         self.assertEqual((new / literal).read_text(), "literal file name\n")
@@ -734,12 +743,16 @@ class WorktreeLifecycleTests(unittest.TestCase):
         output.parent.mkdir(parents=True)
         output.symlink_to(endpoint, target_is_directory=True)
         new = self.trees / "origin/fixture-unit/demo"
+        registered = self.git(self.repository, "worktree", "list", "--porcelain")
         with patch.dict(os.environ, self.environment, clear=True):
             with self.assertRaisesRegex(ValueError, "invalid worktree output"):
                 _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
             with self.assertRaisesRegex(ValueError, "expected a real output folder"):
-                worktrees.ensure_target_link(new, output)
-        self.assertEqual((new / "target/artifact").read_text(), "warm")
+                worktrees.ensure_target_link(old, output)
+        self.assertFalse(old.is_symlink())
+        self.assertFalse(os.path.lexists(new))
+        self.assertEqual(self.git(self.repository, "worktree", "list", "--porcelain"), registered)
+        self.assertEqual((old / "target/artifact").read_text(), "warm")
         self.assertEqual(output.readlink(), endpoint)
         self.assertEqual(list(endpoint.iterdir()), [])
 

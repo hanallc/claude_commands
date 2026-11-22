@@ -1441,9 +1441,11 @@ def _is_real_target(target: Path) -> bool:
     return not target.is_symlink() and target.is_dir()
 
 
-def _tracked_target_paths(checkout: Path) -> frozenset[Path]:
-    result = subprocess.run(["git", "-C", str(checkout), "ls-files", "-z", "--", "target"],
-                            capture_output=True, check=True)
+def _tracked_target_paths(checkout: Path, *, git_dir: Path | None = None) -> frozenset[Path]:
+    location = ["-C", str(checkout)]
+    if git_dir is not None:
+        location.extend(("--git-dir", str(git_dir), "--work-tree", str(checkout)))
+    result = subprocess.run(["git", *location, "ls-files", "-z", "--", "target"], capture_output=True, check=True)
     return frozenset(Path(os.fsdecode(name)) for name in result.stdout.split(b"\0") if name)
 
 
@@ -1666,13 +1668,13 @@ def _relocate_worktree_records(journal: MoveJournal) -> WorktreeRecord:
     return record
 
 
-def _check_saved_move_reservations(journal: MoveJournal, *, defer_output: bool
-                                   ) -> tuple[worktree_links.TranscriptLink, ...]:
+def _check_saved_move_reservations(
+    journal: MoveJournal, layout: RecordedWorktreeOutput | UnassignedOutput,
+) -> tuple[worktree_links.TranscriptLink, ...]:
     move = journal.move
     git_entry = journal.git_entry if journal.git_entry.is_absolute() else move.old / journal.git_entry
     copy_paths = (journal.staging, journal.backup) if journal.copy_tag else ()
-    output_paths = ((output_record(move.repo, move.unit, move.short_name).output,)
-                    if move.output is MoveOutput.LIVE_UNIT and not defer_output else ())
+    output_paths = (layout.output,) if isinstance(layout, RecordedWorktreeOutput) else ()
     links = worktree_links.transcript_links(move.old, move.new) if journal.stage is MoveStage.PLANNED else ()
     project_paths = tuple(path for link in links for path in (link.source, link.destination))
     _require_unreserved_paths(move.old, move.new, git_entry, *journal.clone_members, *copy_paths, *output_paths,
@@ -1684,12 +1686,35 @@ def _move_output_deferred(move: WorktreeMove) -> bool:
     return move.output is MoveOutput.LIVE_UNIT and move.repo == "claude" and _legacy_claude_present()
 
 
+def _move_output_layout(journal: MoveJournal, *, defer_output: bool) -> RecordedWorktreeOutput | UnassignedOutput:
+    move = journal.move
+    if move.output is not MoveOutput.LIVE_UNIT or defer_output:
+        return UnassignedOutput()
+    if journal.stage is MoveStage.PLANNED and journal.source.matches(move.old):
+        checkout = move.old
+    elif journal.destination.matches(move.new):
+        checkout = move.new
+    elif (journal.stage is MoveStage.PLANNED and journal.copy_tag and journal.source.matches(journal.backup)
+          and journal.destination.matches(journal.staging)):
+        checkout = journal.staging
+    else:
+        raise ValueError(f"{move.new}: cannot verify the checkout for output placement")
+    # The saved Git directory works before Git repairs a relative pointer in the copy.
+    git_dir = journal.git_entry if journal.git_entry.is_absolute() else None
+    if _tracked_target_paths(checkout, git_dir=git_dir):
+        return UnassignedOutput()
+    return output_record(move.repo, move.unit, move.short_name)
+
+
 def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> MoveJournal:
     if journal.stage is MoveStage.FINISHED:
         return journal
     move = journal.move
     defer_output = _move_output_deferred(move)
-    links = _check_saved_move_reservations(journal, defer_output=defer_output)
+    layout = _move_output_layout(journal, defer_output=defer_output)
+    if isinstance(layout, RecordedWorktreeOutput):
+        _ = checked_output(layout)
+    links = _check_saved_move_reservations(journal, layout)
     if journal.stage is MoveStage.PLANNED:
         journal, record = _publish_move_source(journal, protect, links)
     elif journal.destination.matches(move.new):
@@ -1708,19 +1733,20 @@ def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> Move
     target = move.new / "target"
     has_backup_target = retained_copy and _is_real_target(backup_target)
     tracked_target = bool(_tracked_target_paths(move.new))
-    layout: RecordedWorktreeOutput | UnassignedOutput = UnassignedOutput()
     if tracked_target:
+        layout = UnassignedOutput()
         if has_backup_target:
             report_retained_folder(backup_target, _EARLIER_CARGO_TARGET)
         if os.path.lexists(target):
             report_retained_folder(target, "Git tracks the checkout's target")
-    elif move.output is MoveOutput.LIVE_UNIT:
-        layout = output_record(move.repo, move.unit, move.short_name)
-        output = checked_output(layout)
+    elif isinstance(layout, RecordedWorktreeOutput):
+        output = layout.output
         if has_backup_target and not os.path.lexists(target):
             _link_with_previous_target(move.new, output, backup_target)
         else:
             ensure_target_link(move.new, output)
+    elif move.output is MoveOutput.LIVE_UNIT:
+        raise MigrationPlanChanged("Git stopped tracking target during the move. Retry the move.")
     else:
         if has_backup_target:
             report_retained_folder(backup_target, _EARLIER_CARGO_TARGET)
@@ -2915,7 +2941,8 @@ def _migration_journals(selection: MigrationSelection, folders: MigrationFolders
                     relocated.append(journal)
             case MigrationJournalState.UNMOVED:
                 if not dry_run and selection.includes(move.old):
-                    _ = _check_saved_move_reservations(journal, defer_output=_move_output_deferred(move))
+                    layout = _move_output_layout(journal, defer_output=_move_output_deferred(move))
+                    _ = _check_saved_move_reservations(journal, layout)
                     if journal.copy_tag and os.path.lexists(journal.staging):
                         report_retained_folder(journal.staging, "a discarded move left a staged copy")
                     path.unlink()

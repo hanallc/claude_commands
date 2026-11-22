@@ -1245,7 +1245,7 @@ After the server replies to the browser, it sends the List producer the item num
 The List uses the keeper as the recipient even when another producer owns the work.
 Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after the List producer answers it.
-The row moves to <List producer> answering when the question saves.
+The row moves to `<List producer> answering` when the List saves the question.
 The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
@@ -1276,7 +1276,7 @@ The section does not change the results count.
 The List address preserves a linked item outside the filters when the console reloads.
 It counts in its current status chip.
 Close the linked item or change a filter to dismiss the section.
-An open question adds a <List producer> answering note below the saved state.
+An open question adds a `<List producer> answering` note below the saved state.
 The List producer runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
@@ -1296,7 +1296,8 @@ A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
 The item stays in Parked while its park is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request moves the item to <List producer> answering and shows its confirmation next to Show.
+The request moves the item to `<List producer> answering`.
+The List shows the confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening a row leaves its unread state and status chip unchanged.
@@ -1369,7 +1370,7 @@ The same write clears the park, marks the item unread, and records an Unparked e
 Linked changes supply review information on the List.
 The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
-After Mark read, an open question returns the item to <List producer> answering.
+After Mark read, an open question returns the item to `<List producer> answering`.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells the List producer which action nate completed.
