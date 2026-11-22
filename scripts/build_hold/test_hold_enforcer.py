@@ -892,11 +892,10 @@ class HoldEnforcerTests(unittest.TestCase):
                 table = self.table()
                 stopped_before = len([row for row in self.rows() if row["action"] == "stopped"])
 
-                def send_term(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> bool:
+                def send_term(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> None:
                     self.assertEqual(saved_scope, identity)
                     self.assertEqual(len([row for row in self.rows() if row["action"] == "stopped"]), stopped_before)
                     _ = events.write_text("populated 0\n")
-                    return True
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
                     self.assertEqual(command, scoped_command)
@@ -918,22 +917,24 @@ class HoldEnforcerTests(unittest.TestCase):
                       mock.patch.object(process_stop, "_term_slice", side_effect=send_term),
                       mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 5.0)),
                       mock.patch.object(detached_runs, "_run", side_effect=run),
+                      mock.patch.object(detached_runs, "_complete_stopped_run", return_value="sent: private fixture"),
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
                     self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
 
                 saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
                 self.assertEqual((saved["status"], saved.get("exit_code")), ("finished", exit_code))
                 self.assertEqual(saved.get("stop_reason"), "stopped for timed test; run again after the release")
+                self.assertIs(saved.get("stop_pass_requested"), True)
                 result = detached_runs.result_text(saved, detached_runs.command_result(saved))
                 self.assertIn(f"Result: STOPPED (exit {exit_code})", result)
 
     def test_failed_hold_stop_does_not_resume_after_release(self) -> None:
-        self.assert_failed_hold_stop(supervisor_dies=False)
+        self.assert_no_hold_commit(interrupted=False)
 
-    def test_watcher_request_survives_a_failed_hold_with_the_stop_lock(self) -> None:
-        self.assert_failed_hold_stop(supervisor_dies=True)
+    def test_hold_exit_before_commit_leaves_no_stop_to_recover(self) -> None:
+        self.assert_no_hold_commit(interrupted=True)
 
-    def assert_failed_hold_stop(self, *, supervisor_dies: bool) -> None:
+    def assert_no_hold_commit(self, *, interrupted: bool) -> None:
         runs = self.root / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         record = runs / "failed-hold-stop.json"
@@ -956,68 +957,41 @@ class HoldEnforcerTests(unittest.TestCase):
         waiting = hold_enforcer.WaitingRun(table[10], OwningSession("gate-owner"))
         holder, = build_hold.natedev_holds(self.holders).in_force
         read_end = process_stop.slice_has_ended
-        supervisor_alive = True
+        original = record.read_bytes()
 
-        def supervisor_is_alive(_pid: int, _path: Path) -> bool:
-            return supervisor_alive
-
-        def read_after_request(saved_scope: process_stop.RunSliceIdentity) -> bool:
-            nonlocal supervisor_alive
-            pending = cast(detached_runs.RunRecord, json.loads(record.read_text()))
-            self.assertEqual(list(pending.get("slice_stop_requests", {}).values()), [
-                {"kind": "hold", "reason": "stopped for timed test; run again after the release"},
-            ])
-            self.assertNotIn("stop_reason", pending)
-            if supervisor_dies:
-                supervisor_alive = False
-                with mock.patch.object(os, "setsid"):
-                    self.assertEqual(detached_runs.main(["supervisor-gone", str(record)]), 0)
-                pending = cast(detached_runs.RunRecord, json.loads(record.read_text()))
-                self.assertEqual({item["kind"] for item in pending.get("slice_stop_requests", {}).values()},
-                                 {"hold", "watcher"})
+        def read_before_commit(saved_scope: process_stop.RunSliceIdentity) -> bool:
+            self.assertEqual(record.read_bytes(), original)
+            if interrupted:
+                raise SystemExit("fixture hold exited before commit")
             return read_end(saved_scope)
 
         events = scope / "cgroup.events"
         kill = scope / "cgroup.kill"
         _ = kill.write_text("0\n")
-
-        def finish_scope(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> bool:
-            self.assertEqual(saved_scope, identity)
-            _ = events.write_text("populated 0\n")
-            return True
+        if interrupted:
+            _ = events.write_text("populated 1\n")
+        failure = SystemExit if interrupted else process_stop.SliceStopFailed
+        detail = "fixture hold exited before commit" if interrupted else "cannot read cgroup.events"
 
         with (mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
-              mock.patch("scripts.agents.detached_run_process.supervises", side_effect=supervisor_is_alive),
+              mock.patch("scripts.agents.detached_run_process.supervises", return_value=False),
               mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(0.0, 0.0)),
-              mock.patch.object(process_stop, "_term_slice", side_effect=finish_scope) as term):
-            with (mock.patch.object(process_stop, "slice_has_ended", side_effect=read_after_request),
-                  self.assertRaisesRegex(process_stop.SliceStopFailed, "cannot read cgroup.events")):
+              mock.patch.object(process_stop, "_term_slice") as term):
+            with (mock.patch.object(process_stop, "slice_has_ended", side_effect=read_before_commit),
+                  self.assertRaisesRegex(failure, detail)):
                 _ = hold_enforcer.stop_waiting_run(
                     waiting, holder, table, self.proc,
                     signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
                 )
-            failed = cast(detached_runs.RunRecord, json.loads(record.read_text()))
-            for field in ("scope_error", "stop_reason", "slice_cleanup_pending", "finished_at"):
-                self.assertNotIn(field, failed)
-            remaining = list(failed.get("slice_stop_requests", {}).values())
-            self.assertEqual(remaining, [{"kind": "watcher", "reason": detached_runs.SUPERVISOR_GONE_REASON}]
-                             if supervisor_dies else [])
+            self.assertEqual(record.read_bytes(), original)
             (self.holders / "holder").unlink()
             self.assertEqual(build_hold.natedev_holds(self.holders).in_force, ())
             _ = events.write_text("populated 1\n")
+            self.assertEqual(detached_runs.reap_orphans(str(self.root)), [])
             term.assert_not_called()
-            self.assertEqual(detached_runs.reap_orphans(str(self.root)), [record.stem] if supervisor_dies else [])
-            self.assertEqual(term.call_count, int(supervisor_dies))
         self.assertEqual(kill.read_text(), "0\n")
-        saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
-        if supervisor_dies:
-            self.assertEqual(events.read_text(), "populated 0\n")
-            self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
-            self.assertEqual(saved["status"], "finished")
-            self.assertTrue(saved.get("finished_at"))
-        else:
-            self.assertEqual(events.read_text(), "populated 1\n")
-            self.assertNotIn("finished_at", saved)
+        self.assertEqual(events.read_text(), "populated 1\n")
+        self.assertEqual(record.read_bytes(), original)
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")

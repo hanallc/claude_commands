@@ -1281,9 +1281,7 @@ sys.exit(1)
                 if outcome == "scan error":
                     _ = (step / "cgroup.procs").write_text("unreadable\n")
                 if outcome == "resume":
-                    self.update_record(path, slice_stop_requests={"pane:fixture stop": {
-                        "kind": "pane", "reason": "fixture stop",
-                    }})
+                    self.update_record(path, stop_reason="fixture stop", stop_pass_requested=True)
                 now = 0.0
                 interrupted = False
 
@@ -1298,13 +1296,14 @@ sys.exit(1)
                     self.assertEqual(number, signal.SIGTERM)
                     saved = worker_lifecycle.read_json_object(path)
                     self.assertNotIn("finished_at", saved)
-                    self.assertNotIn("stop_reason", saved)
                     if outcome in ("natural", "cleanup interrupted"):
                         self.assertEqual(saved["exit_code"], 0)
                         self.assertIs(saved["slice_cleanup_pending"], True)
-                        self.assertNotIn("slice_leftovers", saved)
+                        self.assertIs(saved["slice_leftovers"], True)
+                        self.assertNotIn("stop_reason", saved)
                     else:
-                        self.assertTrue(saved["slice_stop_requests"])
+                        self.assertEqual(saved["stop_reason"], "fixture stop")
+                        self.assertIs(saved["stop_pass_requested"], True)
                     if outcome == "cleanup interrupted" and not interrupted:
                         interrupted = True
                         raise SystemExit("fixture supervisor died during cleanup")
@@ -1431,15 +1430,9 @@ sys.exit(1)
                         detail = "cgroup.kill failed" if outcome == "EPERM" else "populated after KILL"
                         self.assertIn(detail, stderr.getvalue())
                         saved = worker_lifecycle.read_json_object(path)
-                        self.assertTrue(saved["slice_stop_requests"])
-                        if outcome == "EPERM":
-                            self.assertNotIn("stop_reason", saved)
-                            self.assertNotIn("stop_pass_requested", saved)
-                            self.assertNotIn("scope_error", saved)
-                        else:
-                            self.assertEqual(saved["stop_reason"], "fixture stop")
-                            self.assertIs(saved["stop_pass_requested"], True)
-                            self.assertIn(detail, str(saved["scope_error"]))
+                        self.assertEqual(saved["stop_reason"], "fixture stop")
+                        self.assertIs(saved["stop_pass_requested"], True)
+                        self.assertNotIn("scope_error", saved)
                         self.assertNotIn("finished_at", saved)
                 if outcome == "scan error":
                     send_term.assert_not_called()
@@ -1448,42 +1441,81 @@ sys.exit(1)
                 killed = outcome in ("KILL", "scan error", "resume", "still populated")
                 self.assertEqual(kill.read_text(), "1\n" if killed else "0\n")
 
-    def test_watcher_stop_survives_a_slice_read_error(self) -> None:
+    def record_populated_slice(self) -> tuple[Path, Path, Path]:
         path = self.record(["fixture command"])
-        cgroups = self.root / "watcher-cgroups"
-        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-watcher.slice"
+        cgroups = self.root / "cgroups"
+        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-r1.slice"
         scope.mkdir(parents=True)
         identity: process_stop.RunSliceIdentity = {
             "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
             "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
         }
-        self.update_record(path, command_slice=identity, exit_code=143)
+        self.update_record(path, command_slice=identity, exit_code=143, pane_dispatch_id="")
         events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        return path, cgroups, events
 
-        def finish_scope(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> bool:
-            self.assertEqual(saved_scope, identity)
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_changed_kill_route_saves_no_stop(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        original = path.read_bytes()
+        checked = False
+
+        def route_is_current() -> bool:
+            nonlocal checked
+            checked = True
+            with path.with_suffix(".scope-stop.lock").open("a") as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(path.read_bytes(), original)
+            return False
+
+        with (patch.object(detached_run_process, "supervises", return_value=False),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "stop_slice") as stop):
+            self.assertFalse(detached_runs.stop_command(path, "Kill route changed.", check=route_is_current))
+            self.assertTrue(checked)
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+            stop.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(events.read_text(), "populated 1\n")
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_watcher_waits_for_the_stop_lock_then_commits(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        lock_path = path.with_suffix(".scope-stop.lock")
+        lock_attempt = Event()
+        guard = LauncherHangGuard("watcher stop lock")
+        flock = fcntl.flock
+
+        def observe_lock(descriptor: int | IO[str], operation: int) -> None:
+            fd = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+            if os.path.samestat(os.fstat(fd), lock_path.stat()):
+                self.assertEqual(operation & fcntl.LOCK_NB, 0)
+                lock_attempt.set()
+            flock(descriptor, operation)
+
+        def finish_scope(_directory: int, _identity: process_stop.RunSliceIdentity) -> None:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
+            self.assertIs(saved.get("stop_pass_requested"), True)
+            self.assertNotIn("finished_at", saved)
             _ = events.write_text("populated 0\n")
-            return True
 
+        original = path.read_bytes()
         with (patch.object(os, "setsid"),
               patch.object(detached_run_process, "supervises", return_value=False),
               patch.object(process_stop, "CGROUP_ROOT", cgroups),
               patch.object(process_stop, "_term_slice", side_effect=finish_scope) as term,
-              contextlib.redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 1)
-            self.assertIn("cannot read cgroup.events", errors.getvalue())
-            term.assert_not_called()
-            saved = worker_lifecycle.read_json_object(path)
-            self.assertEqual(list(cast(dict[str, object], saved["slice_stop_requests"]).values()), [
-                {"kind": "watcher", "reason": detached_runs.SUPERVISOR_GONE_REASON},
-            ])
-            self.assertNotIn("stop_reason", saved)
-            self.assertNotIn("scope_error", saved)
-            self.assertNotIn("stop_pass_requested", saved)
-            self.assertNotIn("slice_cleanup_pending", saved)
-            self.assertNotIn("finished_at", saved)
-            _ = events.write_text("populated 1\n")
-            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+              ThreadPoolExecutor(max_workers=1) as executor):
+            with lock_path.open("a") as held:
+                flock(held, fcntl.LOCK_EX)
+                with patch.object(fcntl, "flock", side_effect=observe_lock):
+                    watcher = executor.submit(detached_runs.main, ["supervisor-gone", str(path)])
+                    self.assertTrue(lock_attempt.wait(timeout=guard.remaining()))
+                    self.assertFalse(watcher.done())
+                    self.assertEqual(path.read_bytes(), original)
+                    term.assert_not_called()
+            self.assertEqual(watcher.result(timeout=guard.remaining()), 0)
             term.assert_called_once()
         saved = worker_lifecycle.read_json_object(path)
         self.assertEqual(saved["status"], "finished")
@@ -1491,6 +1523,27 @@ sys.exit(1)
         self.assertTrue(saved["finished_at"])
         self.assertNotIn("scope_error", saved)
         self.assertEqual(events.read_text(), "populated 0\n")
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_natural_exit_after_stop_commit_reports_stopped(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        self.update_record(path, exit_code=0)
+        stop_slice = process_stop.stop_slice
+        reason = "Stop the private command."
+
+        def end_before_term(scope: process_stop.RunSliceIdentity, grace: float, kill_grace: float) -> None:
+            self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), reason)
+            _ = events.write_text("populated 0\n")
+            stop_slice(scope, grace, kill_grace)
+
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "stop_slice", side_effect=end_before_term),
+              patch.object(process_stop, "_term_slice") as term):
+            self.assertTrue(detached_runs.stop_command(path, reason))
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            term.assert_not_called()
+        (result,) = self.sent
+        self.assertIn("Result: STOPPED (exit 0)", result)
 
     def test_start_rejects_an_unknown_kind(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
@@ -3054,19 +3107,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
         record.update(pid=DEAD_PID, pane_dispatch_id=dispatch, exit_code=0, command_slice=identity)
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
+        original = path.read_bytes()
         with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
               patch.object(process_stop, "_term_slice") as term,
-              patch.object(detached_run_process, "supervises", return_value=True),
-              patch.object(detached_runs, "_stop_caller_is_owner", return_value=False)):
+              patch.object(detached_run_process, "supervises", return_value=True)):
             reason = "Stop the private command."
             with self.assertRaisesRegex(process_stop.SliceStopFailed, "cannot read cgroup.events"):
                 _ = detached_runs.stop_command(path, reason)
-            pending = worker_lifecycle.read_json_object(path)
-            self.assertEqual(list(cast(dict[str, object], pending["slice_stop_requests"]).values()), [
-                {"kind": "pane", "reason": reason},
-            ])
-            for field in ("stop_reason", "stop_pass_requested", "scope_error"):
-                self.assertNotIn(field, pending)
+            self.assertEqual(path.read_bytes(), original)
             _ = events.write_text("populated 0\n")
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -3088,6 +3136,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertNotIn("scope_error", saved)
 
     def test_director_stop_releases_the_owning_pass_without_done(self) -> None:
+        self.assert_committed_stop_cancels_owning_pass(interrupted=False)
+
+    def test_stop_commit_survives_stopper_exit_after_signal(self) -> None:
+        self.assert_committed_stop_cancels_owning_pass(interrupted=True)
+
+    def assert_committed_stop_cancels_owning_pass(self, *, interrupted: bool) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         dispatch, reply = self.begin_pane_pass(row)
@@ -3101,18 +3155,24 @@ class PaneRunDeliveryTests(unittest.TestCase):
             "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
             "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
         }
-        record.update(pid=DEAD_PID, command_slice=identity)
+        record.update(pid=DEAD_PID, command_slice=identity, pane_dispatch_id=dispatch)
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         reason = "Stop the private command."
 
-        def finish_scope(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> bool:
+        signals = 0
+
+        def finish_scope(_directory: int, saved_scope: process_stop.RunSliceIdentity) -> None:
+            nonlocal signals
             self.assertEqual(saved_scope, identity)
             pending = worker_lifecycle.read_json_object(path)
-            self.assertTrue(pending["slice_stop_requests"])
-            self.assertNotIn("stop_reason", pending)
+            self.assertEqual(pending.get("stop_reason"), reason)
+            self.assertIs(pending.get("stop_pass_requested"), True)
+            self.assertNotIn("finished_at", pending)
+            signals += 1
+            if interrupted and signals == 1:
+                raise SystemExit("fixture stopper died after TERM")
             _ = events.write_text("populated 0\n")
-            return True
 
         if not process_stop.supported():
             original = path.read_bytes()
@@ -3123,24 +3183,36 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
             return
 
-        director = self.fixture.parent
-        exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
-        _ = self.fixture.session_record(director.current_session, director.name).replace(exact)
-        self.addCleanup(exact.unlink, missing_ok=True)
         _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", cgroups))
-        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": row.current_session}),
-              patch.object(process_stop, "_term_slice", side_effect=finish_scope) as term):
-            self.assertTrue(detached_runs.stop_command(path, reason))
-            self.assertTrue(detached_runs.stop_command(path, "A repeat."))
-            term.assert_called_once()
-        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
+        with patch.object(process_stop, "_term_slice", side_effect=finish_scope):
+            if interrupted:
+                with self.assertRaisesRegex(SystemExit, "fixture stopper died after TERM"):
+                    _ = detached_runs.stop_command(path, reason)
+                self.assertEqual(events.read_text(), "populated 1\n")
+                pending = worker_lifecycle.read_json_object(path)
+                self.assertNotIn("finished_at", pending)
+                self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir),
+                                      progress_history.ActiveDispatch)
+                with patch.object(detached_run_process, "supervises", return_value=False):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+            else:
+                self.assertTrue(detached_runs.stop_command(path, reason))
+                self.assertTrue(detached_runs.stop_command(path, "A repeat."))
+                self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir),
+                                      progress_history.ActiveDispatch)
+        self.assertEqual(signals, 2 if interrupted else 1)
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
         self.assertEqual(saved.get("stop_reason"), reason)
         self.assertIs(saved.get("stop_pass_requested"), True)
         self.assertTrue(process_stop.slice_has_ended(identity))
         self.assertNotIn("self_stop", saved)
-        saved["exit_code"] = 143
-        write_text_atomic(path, json.dumps(saved))
+        if interrupted:
+            self.assertTrue(saved.get("finished_at"))
+            self.assertIn("Result: STOPPED (no exit status)", detached_runs.result_text(
+                saved, detached_runs.command_result(saved)))
+        else:
+            saved["exit_code"] = 143
+            write_text_atomic(path, json.dumps(saved))
         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
         passed = worker_panes.worker_pass(row, self.run_dir)
@@ -4017,73 +4089,6 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIsInstance(caller, detached_runs.PaneCaller)
                 assert isinstance(caller, detached_runs.PaneCaller)
                 self.assertEqual((caller.staff_id, caller.session_dir), (row.id, str(self.run_dir)))
-
-    def test_self_stop_requires_a_verified_native_owner(self) -> None:
-        row = self.fixture.worker(family="claude")
-        director = self.fixture.parent
-        unregistered = fixture_runtime_id("unregistered-claude-caller")
-        exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
-        self.addCleanup(exact.unlink, missing_ok=True)
-        record = self.record(row)
-        path = Path(record["log"]).with_suffix(".json")
-        cgroups = self.fixture.root / "cgroups"
-        scope = cgroups / "builds.slice/builds-detached.slice/builds-detached-fixture.slice"
-        scope.mkdir(parents=True)
-        events = scope / "cgroup.events"
-        identity: process_stop.RunSliceIdentity = {
-            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
-            "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
-        }
-
-        def finish_scope(_directory: int, _identity: process_stop.RunSliceIdentity) -> bool:
-            _ = events.write_text("populated 0\n")
-            return True
-
-        def assert_owner(owner: staff.StaffId, environment: dict[str, str], expected: bool) -> None:
-            _ = events.write_text("populated 1\n")
-            write_text_atomic(path, json.dumps({**record, "staff_id": owner, "command_slice": identity}))
-            exports = {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", **environment}
-            with (patch.dict(os.environ, exports),
-                  patch.object(process_stop, "CGROUP_ROOT", cgroups),
-                  patch.object(process_stop, "_term_slice", side_effect=finish_scope)):
-                self.assertTrue(detached_runs.stop_command(path, "Stop the check."))
-            saved = worker_lifecycle.read_json_object(path)
-            self.assertIs(saved["stop_pass_requested"], True)
-            self.assertIs(saved.get("self_stop", False), expected)
-
-        cases = (
-            ("native caller", row.current_session, "", "", row.id, True),
-            ("matching export", row.current_session, row.current_session, "", row.id, True),
-            ("different staff ID", row.current_session, "", "", director.id, False),
-            ("conflicting export", row.current_session, director.current_session, "", row.id, False),
-            ("unregistered caller", unregistered, row.current_session, "", row.id, False),
-            ("director", director.current_session, "", row.current_session, row.id, False),
-            ("unreadable native record", "{", row.current_session, "", row.id, False),
-            ("without a native record", "", row.current_session, "", row.id, False),
-            ("with only an inherited Codex ID", "", "", row.current_session, row.id, False),
-        )
-        for case, native, claude, codex, owner, expected in cases:
-            with self.subTest(case=case):
-                if native == "{":
-                    write_text_atomic(exact, native)
-                elif native:
-                    _ = self.fixture.session_record(native, case).replace(exact)
-                environment = {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}
-                with (patch.object(pane_record, "process_parent", return_value=1),
-                      patch.object(pane_record, "process_arguments", return_value=["python"])):
-                    assert_owner(owner, environment, expected)
-                exact.unlink(missing_ok=True)
-
-        _ = self.fixture.session_record(row.current_session, row.name).replace(exact)
-        with patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("invalid staff JSON")):
-            assert_owner(row.id, {}, False)
-        exact.unlink()
-
-        codex = self.fixture.worker("codex-reviewer", family="codex")
-        native = herdr.NativeAgentProcess(herdr.LaunchArgument(codex.current_session), "fixture-start", {})
-        with (patch.object(pane_record, "process_arguments", return_value=["codex", "resume", codex.current_session]),
-              patch.object(herdr, "native_process", return_value=native)):
-            assert_owner(codex.id, {"CODEX_THREAD_ID": codex.current_session}, False)
 
     def test_refused_result_push_finishes_and_can_replay_the_saved_exit(self) -> None:
         row = self.fixture.worker(family="codex")

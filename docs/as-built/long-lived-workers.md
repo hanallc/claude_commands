@@ -726,22 +726,24 @@ If `env` uses another option, the guard refuses the start when a later argument 
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
 
-1. Save the stop request under the record lock.
-2. Take the stop lock.
-3. Send TERM through pidfds to processes that still belong to the run slice.
-4. Give the processes the stop grace to exit.
-5. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
-6. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+1. Wait for the stop lock.
+2. Read the current run record.
+3. Check whether the slice is populated.
+4. Check that the caller's stop route still applies.
+5. Save the stop reason and pane cancellation if both checks pass.
+6. Send TERM through pidfds to processes that still belong to the run slice.
+7. Give the processes the stop grace to exit.
+8. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+9. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
 
 An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
 The record stays running until the supervisor or recovery can confirm that the slice is empty.
 The supervisor saves the exit code and cleanup intent before it releases the watcher.
 The run record saves `finished_at` when it records the confirmed end of the slice.
-The record keeps a set of stop requests separate from the result. A caller can add a request while another caller holds the stop lock.
-Only the holder retracts its own request after a failed hold stop. Recovery can still act on requests from other callers.
-Recovery resumes saved requests even if the supervisor still runs. It resumes pending cleanup if the supervisor is gone.
-A successful TERM or a write to `cgroup.kill` commits the stop result. A read error before that point leaves the result unchanged.
-If multiple requests are pending, a pane cancellation takes priority, followed by a self-stop, a watcher stop, and a hold stop.
+The caller saves the stop commit before it sends a signal. The stop commit is final.
+A read error before the commit leaves the run record unchanged.
+A run that ends by itself just after the stop commit reports as stopped.
+Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.
@@ -751,18 +753,14 @@ The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
-A self-stop requires a native Claude session record or Codex pane report for the caller.
-The caller's worker staff ID must match the run's owner.
-Missing records, unreadable records, and conflicting identities prevent a self-stop.
-The self-stop saves `self_stop: true` with the stop reason.
-The supervisor keeps the pass active and sends the result to the owning worker.
+A committed slice stop cancels the verified owning pass.
+An older group-stop record with `self_stop: true` keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
-A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
 An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-For either stop kind, the supervisor records the leader's exit status.
+The supervisor records the leader's exit status.
 The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.

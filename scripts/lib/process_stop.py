@@ -1,7 +1,7 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
@@ -273,23 +273,20 @@ def _in_slice(process: ProcessLifetime, scope: RunSliceIdentity) -> bool:
     return False
 
 
-def _term_slice(directory: int, scope: RunSliceIdentity) -> bool:
+def _term_slice(directory: int, scope: RunSliceIdentity) -> None:
     try:
         members = _cgroup_processes(directory)
     except (OSError, ValueError):
         # The event file still controls escalation when the member scan fails.
         _check_saved_slice(scope)
-        return False
-    signaled = False
+        return
     for process in members:
         try:
             with pin_process(process) as descriptor:
                 if _in_slice(process, scope):
                     signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-                    signaled = True
         except OSError:
             continue
-    return signaled
 
 
 def slice_ends_by(scope: RunSliceIdentity, deadline: float) -> bool:
@@ -313,19 +310,14 @@ def _slice_ends_on(scope: RunSliceIdentity, descriptor: int, deadline: float) ->
     return True
 
 
-def stop_slice(
-    run_slice: RunSliceIdentity, grace: float, kill_grace: float, *,
-    on_effect: Callable[[], None] = lambda: None,
-) -> None:
+def stop_slice(run_slice: RunSliceIdentity, grace: float, kill_grace: float) -> None:
     """Send TERM, then kill the slice if it stays populated through the grace period."""
     if not supported():
         raise SliceStopFailed("this system does not support pidfd stop")
     with suppress(_SliceRemoved), _slice_events(run_slice) as (directory, events):
         if _slice_is_empty(run_slice, events):
             return
-        signaled = _term_slice(directory, run_slice)
-        if signaled:
-            on_effect()
+        _term_slice(directory, run_slice)
         if _slice_ends_on(run_slice, events, time.monotonic() + grace):
             return
         try:
@@ -338,8 +330,6 @@ def stop_slice(
             if _slice_is_empty(run_slice, events):
                 return
             raise SliceStopFailed(f"cgroup.kill failed: {error}") from error
-        if not signaled:
-            on_effect()
         if not _slice_ends_on(run_slice, events, time.monotonic() + kill_grace):
             raise SliceStopFailed("the slice remains populated after KILL")
 

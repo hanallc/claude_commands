@@ -95,7 +95,6 @@ class ProcessStopTests(unittest.TestCase):
             }
             descriptors: dict[int, int] = {}
             signals: list[tuple[int, int]] = []
-            effects: list[int] = []
 
             def open_pidfd(pid: int) -> int:
                 if pid == 703:
@@ -113,8 +112,7 @@ class ProcessStopTests(unittest.TestCase):
                   patch.object(process_stop, "PROC", fixture.proc),
                   patch.object(os, "pidfd_open", side_effect=open_pidfd),
                   patch.object(signal, "pidfd_send_signal", side_effect=send_term)):
-                process_stop.stop_slice(identity, 0, 0, on_effect=lambda: effects.append(len(signals)))
+                process_stop.stop_slice(identity, 0, 0)
                 self.assertTrue(process_stop.slice_has_ended(identity))
-                process_stop.stop_slice(identity, 0, 0, on_effect=lambda: effects.append(len(signals)))
+                process_stop.stop_slice(identity, 0, 0)
             self.assertEqual(signals, [(701, signal.SIGTERM)])
-            self.assertEqual(effects, [1])
