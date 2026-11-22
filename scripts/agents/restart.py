@@ -2152,14 +2152,14 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
                 replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
 
-    def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
-        if (started_holder and holder.kind == "producer"
+    def remove_started(holder: staff.StaffRow) -> None:
+        if (holder.kind == "producer"
                 and (isinstance(holder.exited, staff.Exited) or isinstance(holder.paused, staff.Paused))):
             _ = staff.resume(str(holder.id))
         resolved = resume_checks.worker_restores.resolved(holder.id)
         done = [member for member in members_by_holder[holder.id]
                 if (member_id := staff.StaffId(member)) not in blocked_workers
-                and (member_id in resolved or (started_holder and record.rows_by_id[member_id].kind != "worker"))]
+                and (member_id in resolved or record.rows_by_id[member_id].kind != "worker")]
         if done:
             try:
                 shutdown_record.remove_started(done)
@@ -2227,10 +2227,10 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                             _ = _restore_workers(current, current_record, observed=observed,
                                                  reports=resume_checks.worker_restores)
                     except WorkerRestoreIncomplete:
-                        remove_started(holder, started_holder=False)
+                        remove_started(holder)
                         raise
                     print(f"{current.name}: unchanged")
-                    remove_started(current, started_holder=True)
+                    remove_started(current)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
@@ -2248,9 +2248,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                       target_account="" if isinstance(account, AllRestartAccounts) else account,
                                       worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
             except WorkerRestoreIncomplete:
-                remove_started(holder, started_holder=False)
+                remove_started(holder)
                 raise
-            remove_started(current, started_holder=True)
+            remove_started(current)
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     restarted: set[Path] = set()
