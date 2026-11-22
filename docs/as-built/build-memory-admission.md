@@ -2368,7 +2368,9 @@ Each confirmed move sets the place of every visible pin to its confirmed positio
 If an absent pin occupies a confirmed place, the service moves it to the next free place.
 The service applies pins after it sorts the waits.
 It inserts present pinned waits in place order and clamps each insertion to the end.
-Continuation claims use the step order before the service applies pins.
+Placement, memory admission, and continuation claims filter the same queue order.
+The page and the head-stall snapshot also filter that order.
+When two steps in one run have the same queue time, the lower PID comes first.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
 An absent step keeps its run identity to recover the run's saved queue time.

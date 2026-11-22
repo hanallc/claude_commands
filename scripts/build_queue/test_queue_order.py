@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import os
 from typing import cast
@@ -9,9 +10,11 @@ import unittest
 from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire
-from scripts.build_queue import admission_records as records, execution_identity, placement
+from scripts.build_queue import admission_records as records, execution_identity, head_stall, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
 from scripts.build_queue.test_placement import PlacementFixture, assignment_for, local_candidate, placement_request, publish_candidate
+from scripts.build_hold import build_hold
+from scripts.build_targets import build_targets
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.production import land_runs
@@ -30,6 +33,114 @@ def ids(line: records.QueueMoveLine) -> list[str]:
 
 
 class QueueMoveTests(unittest.TestCase):
+    def test_remote_only_head_keeps_the_moved_continuation_first_for_the_slot(self) -> None:
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            running = fixture.request(run=run, need=4 * GIB)
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.server.spacing = records.NextStartAt(fixture.clock.now() + 30)
+            fixture.free(0)
+            fixture.hold_starts()
+            remote = placement_request(fixture, since=running.since - 10)
+            remote = replace(remote, local=wire.LocalAdmissionUnavailable("remote only"),
+                             constraints=replace(remote.constraints, selection=placement.MacOnlyHost()))
+            _ = publish_candidate(fixture, remote, placement.TemporaryExclusion("busy"))
+            self.assertIsInstance(fixture.server.handle_request(remote)[0], wire.PlacementWait)
+            first, second = [fixture.request(run=run, need=4 * GIB, since=running.since + index,
+                             owner=fixture.fixture_owner(700000 + index, "4000")) for index in (1, 2)]
+            for request in (first, second):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            remote_row, first_row, second_row = line.members
+            self.assertFalse(remote_row.movable)
+            self.assertNotIn(remote.episode, fixture.server.waiters)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-before-first", second_row.row_id, line.revision, wire.QueueDrop(first_row.row_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(moved.line.members, (remote_row, second_row, first_row))
+            fixture.release(grant)
+            claim = fixture.server.slots[grant.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.waiter_owner(fixture.server.waiters[second.episode].row))
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {second.episode})
+
+    def test_tail_drag_keeps_held_ci_at_the_head_of_the_saved_snapshot(self) -> None:
+        with AdmissionFixture() as fixture:
+            running = fixture.request()
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            ci = fixture.service_request()
+            holder = build_hold.Holder("fixture", datetime.fromtimestamp(fixture.clock.now(), UTC),
+                                       "fixture hold", build_hold.UnknownReleaseEta(), "fixture")
+            ordinary = [fixture.request(since=fixture.clock.now() + index) for index in (1, 2, 3)]
+            with patch.object(build_targets, "hold_waited_on", return_value=holder):
+                for request in (ci, *ordinary):
+                    self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+                line = move_line(fixture)
+                ci_row, first, second, third = line.members
+                moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "move-tail", third.row_id, line.revision, wire.QueueDrop(second.row_id, "before")))
+                assert isinstance(moved, wire.QueueMoved)
+                self.assertEqual(moved.line.members, (ci_row, first, third, second))
+                _ = fixture.run_pass()
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered],
+                                 [request.owner.pid for request in (ci, ordinary[0], ordinary[2], ordinary[1])])
+                stall = head_stall.find_stall(snapshot, snapshot.written_at, snapshot.written_at + 60, 30)
+                assert isinstance(stall, head_stall.HeadStall)
+                self.assertEqual(stall.pid, ci.owner.pid)
+
+    def test_unpinned_readers_keep_main_order_for_remote_local_and_held_ci_waits(self) -> None:
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            running = fixture.request(run=run, need=4 * GIB)
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            ci = fixture.service_request()
+            holder = build_hold.Holder("fixture", datetime.fromtimestamp(fixture.clock.now(), UTC),
+                                       "fixture hold", build_hold.UnknownReleaseEta(), "fixture")
+            fixture.server.priority = records.QueuePriority(({"unit": ci.runner, "why": "fixture",
+                "set_at": fixture.clock.now(), "set_by": "fixture"},))
+            remote = placement_request(fixture, since=running.since - 10)
+            remote = replace(remote, local=wire.LocalAdmissionUnavailable("remote only"),
+                             constraints=replace(remote.constraints, selection=placement.MacOnlyHost()))
+            _ = publish_candidate(fixture, remote, placement.TemporaryExclusion("busy"))
+            first, second = [fixture.request(run=run, since=running.since + index,
+                             owner=fixture.fixture_owner(700000 + index, "4000")) for index in (1, 2)]
+            with patch.object(build_targets, "hold_waited_on", return_value=holder):
+                for request in (second, ci, first, remote):
+                    _ = fixture.server.handle_request(request)
+                result = fixture.run_pass()
+                full = [request.owner.pid for request in (ci, remote, first, second)]
+                self.assertEqual(fixture.queue_pids(), full)
+                self.assertEqual([entry.waiter["pid"] for entry in result.policy.walk], full[2:])
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [full[0], *full[2:]])
+                stall = head_stall.find_stall(snapshot, snapshot.written_at, snapshot.written_at + 60, 30)
+                assert isinstance(stall, head_stall.HeadStall)
+                self.assertEqual(stall.pid, ci.owner.pid)
+                line = move_line(fixture)
+                undo, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "undo-missing", line.members[-1].row_id, line.revision, wire.QueueUndo("missing")))
+                self.assertEqual(undo, wire.QueueMoveConflict(line, "Undo not available"))
+                self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                    "cancel-remote", remote.episode, remote.owner, "fixture")), [wire.Ok()])
+                _ = fixture.run_pass()
+                self.assertEqual(fixture.queue_pids(), [full[0], *full[2:]])
+                fixture.release(grant)
+                claim = fixture.server.slots[grant.reservation]
+                assert isinstance(claim, records.ContinuationSlot)
+                self.assertEqual(claim.owner, records.waiter_owner(fixture.server.waiters[first.episode].row))
+                self.assertEqual(fixture.server.queue_pins, ())
+
     def test_absent_continuation_keeps_its_run_order_after_restart(self) -> None:
         with PlacementFixture() as fixture:
             now = fixture.clock.now()
@@ -97,7 +208,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undone.line), [first, pinned, third, fourth, fifth, last])
             self.assertEqual(fixture.server.queue_pins, ((pinned, 1), (last, 5)))
 
-    def test_tail_drag_keeps_main_continuation_claim_order(self) -> None:
+    def test_tail_drag_keeps_the_shared_continuation_order(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             running = fixture.request(run=run, need=4 * GIB)
@@ -122,7 +233,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.release(grant)
             claim = fixture.server.slots[grant.reservation]
             assert isinstance(claim, records.ContinuationSlot)
-            self.assertEqual(claim.owner, records.run_owner(earlier.owner.pid, earlier.owner.start_time))
+            self.assertEqual(claim.owner, records.run_owner(later.owner.pid, later.owner.start_time))
 
     def test_second_move_sets_all_pins_to_the_confirmed_places(self) -> None:
         with AdmissionFixture() as fixture:

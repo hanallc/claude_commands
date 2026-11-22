@@ -441,7 +441,11 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
         position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
         order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
-    return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
+    return sort_waiters(ranked), context.priority
+
+
+def sort_waiters(rows: Iterable[tuple[Path, RankedWaiter]]) -> list[tuple[Path, RankedWaiter]]:
+    return sorted(rows, key=lambda item: waiter_order(item[1]))
 
 
 
@@ -462,10 +466,9 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
 
 def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
     """Resolve order metadata without adding it to captured waiter rows."""
-    ordered = sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
-                   for path, row in inputs.ordered),
-                  key=lambda item: waiter_order(item[1]))
-    return records.order_moved_waiters(ordered, inputs.move_order, lambda item: item[1].get("move_id", ""))
+    rows = [(path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
+            for path, row in inputs.ordered]
+    return rows if inputs.order_captured else sort_waiters(rows)
 
 
 
@@ -2732,7 +2735,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                        readings: QueueSnapshotReadings,
                        now: float, priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY,
                        unowned: tuple[UnownedSliceMemory, ...] = ()) -> QueueInputs:
-    """Build queue evidence from supplied readings without external reads."""
+    """Build evidence from the ordered rows and supplied readings."""
     if (not isinstance(readings.host, (HostMemory, ReadingUnavailable))
             or isinstance(readings.pressure, ReadingNotTaken)
             or isinstance(readings.spacing, ReadingNotTaken) or isinstance(readings.compilers, ReadingNotTaken)):
@@ -2773,8 +2776,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
             pid=value.pid,
             run=activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
             started_at=activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
-    return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
-                       readings.host, readings.pressure, readings.spacing, now, priority)
+    return QueueInputs(ordered, tuple(running), tuple(rows), readings.host, readings.pressure,
+                       readings.spacing, now, priority, order_captured=True)
 
 
 def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[str]) -> QueueInputs:
