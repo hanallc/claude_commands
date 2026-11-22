@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -14,8 +15,10 @@ from unittest import mock
 
 from scripts.aws_target import ledger
 from scripts.buildlog import machine_facts
-from scripts.buildlog.machine_facts import CommandMissing, MacLink, MachineFacts, ProbeFailed, Probes
+from scripts.buildlog.machine_facts import CommandMissing, FactsUnread, Machine, MachineFacts, ProbeFailed, Probes
 from scripts.buildlog.test_index import use_test_log
+from scripts.lib import conf
+from scripts.mac_test import eligibility, offload
 
 
 use_test_log()
@@ -25,7 +28,8 @@ SSH_SETTINGS = "user natepiano\nhostname mac.example.invalid\nport 22\n"
 MAC_ON_BATTERY = ("{ 19.56 14.16 13.85 }\n12\nNow drawing from 'Battery Power'\n"
                   " -InternalBattery-0 (id=23920739)\t85%; discharging; 2:16 remaining present: true\n")
 MAC_DESKTOP = "{ 2.50 2.00 1.00 }\n24\nNow drawing from 'AC Power'\n"
-LINK = MacLink("mac", 6, 15)
+SETTINGS = eligibility.SshProbeSettings(conf.ConfigRead("mac_test", Path("mac_test.conf"), conf.settings(
+    "host=mac\n# range: 5e-324..\nconnect_timeout_s=6\n# range: 5e-324..\nprobe_timeout_s=15\n"), False))
 
 
 def no_box(_now: float) -> str:
@@ -58,7 +62,7 @@ class MachineFactsTests(unittest.TestCase):
     root: Path = Path()
     path: Path = Path()
     commands: FakeCommands = FakeCommands({})
-    probes: Probes = Probes(run=commands, connect=connected(0), mac_link=lambda: LINK, aws_box=no_box)
+    probes: Probes = Probes(run=commands, connect=connected(0), mac_settings=lambda: SETTINGS, aws_box=no_box)
 
     @override
     def setUp(self) -> None:
@@ -68,9 +72,9 @@ class MachineFactsTests(unittest.TestCase):
         _ = loadavg.write_text("52.70 50.00 48.01 60/8310 2997407\n")
         self.commands = FakeCommands({"upsc": UPS_MAINS, "ssh -G": SSH_SETTINGS, "ssh": MAC_ON_BATTERY})
         self.probes = Probes(run=self.commands, connect=connected(3.2), loadavg=loadavg, cpus=lambda: 32,
-                                     mac_link=lambda: LINK, aws_box=no_box)
+                                     mac_settings=lambda: SETTINGS, aws_box=no_box)
 
-    def sample(self, probes: Probes | None = None) -> dict[str, MachineFacts]:
+    def sample(self, probes: Probes | None = None) -> dict[Machine, MachineFacts]:
         saved = machine_facts.sample_once(self.path, 1000.0, probes or self.probes)
         self.assertEqual(machine_facts.read_facts(self.path), saved)
         return saved["machines"]
@@ -83,13 +87,14 @@ class MachineFactsTests(unittest.TestCase):
                                                               battery={"percent": 85, "mains": False}))
         self.assertEqual(machines["aws"], machine_facts.facts("no_box"))
         ssh = next(arguments for arguments, _ in self.commands.calls if arguments[:2] == ["ssh", "-o"])
-        self.assertEqual(ssh, ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "mac", machine_facts.MAC_COMMAND])
+        self.assertEqual(ssh, ["ssh", *offload.ssh_options(SETTINGS), "mac", machine_facts.MAC_COMMAND])
+        self.assertIn("ConnectTimeout=6", ssh)
         self.assertIn((ssh, 15), self.commands.calls)
         self.assertEqual(json.loads(self.path.read_text())["written"], 1000.0)
 
     def test_natedev_without_ups_shows_no_battery(self) -> None:
         self.commands.answers["upsc"] = CommandMissing("upsc: [Errno 2] No such file or directory: 'upsc'")
-        self.assertIsNone(self.sample()["natedev"]["battery"])
+        self.assertEqual(self.sample()["natedev"]["battery"], "no_battery")
 
     def test_ups_that_does_not_answer_is_unreadable(self) -> None:
         for answer in (ProbeFailed("Error: Driver not connected"), "battery.charge: 90\nups.status: OFF\n",
@@ -125,20 +130,29 @@ class MachineFactsTests(unittest.TestCase):
                 self.commands.answers["ssh"] = answer
                 machines = self.sample()
                 self.assertEqual(machines["mac"]["state"], "load_unreadable")
-                self.assertIsNotNone(machine_facts.read_facts(self.path))
+                self.assertIsNot(machine_facts.read_facts(self.path), FactsUnread.VALUE)
 
     def test_name_lookup_past_its_time_limit_is_a_timeout(self) -> None:
         release = threading.Event()
 
         def slow_lookup(*_arguments: object, **_options: object) -> list[machine_facts.AddressInfo]:
             _ = release.wait(5)
-            return []
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 22))]
 
         try:
             with mock.patch("socket.getaddrinfo", slow_lookup), self.assertRaises(TimeoutError):
                 _ = machine_facts.connect_ms("mac.example", 22, 0.05)
         finally:
             release.set()
+
+    def test_name_lookup_error_fails_at_once(self) -> None:
+        def bad_name(*_arguments: object, **_options: object) -> list[machine_facts.AddressInfo]:
+            raise UnicodeError("encoding with 'idna' codec failed (UnicodeError: label empty or too long)")
+
+        with mock.patch("socket.getaddrinfo", bad_name), self.assertRaises(OSError) as caught:
+            _ = machine_facts.connect_ms("mac..example", 22, 5)
+        self.assertNotIsInstance(caught.exception, TimeoutError)
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
 
     def test_aws_box_running_has_no_reading(self) -> None:
         def running(_now: float) -> str:
@@ -149,13 +163,13 @@ class MachineFactsTests(unittest.TestCase):
         self.assertIn("i-0123456789abcdef0", aws["detail"])
 
     def test_one_failed_probe_keeps_the_others(self) -> None:
-        def broken_link() -> MacLink:
+        def broken_settings() -> eligibility.SshProbeSettings:
             raise RuntimeError("fixture defect")
 
         def ledger_gone(_now: float) -> str:
             raise ledger.LedgerUnavailable("ledger evidence is unavailable")
 
-        machines = self.sample(replace(self.probes, mac_link=broken_link, aws_box=ledger_gone))
+        machines = self.sample(replace(self.probes, mac_settings=broken_settings, aws_box=ledger_gone))
         self.assertEqual(machines["mac"], machine_facts.facts("failed", detail="RuntimeError: fixture defect"))
         self.assertEqual(machines["aws"], machine_facts.facts("failed", detail="ledger evidence is unavailable"))
         self.assertEqual(machines["natedev"]["load"], 52.7)
@@ -167,23 +181,27 @@ class MachineFactsTests(unittest.TestCase):
             _ = barrier.wait()
             return 32
 
-        def link() -> MacLink:
+        def settings() -> eligibility.SshProbeSettings:
             _ = barrier.wait()
-            return LINK
+            return SETTINGS
 
         def box(_now: float) -> str:
             _ = barrier.wait()
             return ""
 
-        machines = self.sample(replace(self.probes, cpus=cpus, mac_link=link, aws_box=box))
-        self.assertEqual([machines[name]["state"] for name in machine_facts.MACHINES], ["read", "read", "no_box"])
+        machines = self.sample(replace(self.probes, cpus=cpus, mac_settings=settings, aws_box=box))
+        states: dict[Machine, str] = {name: facts["state"] for name, facts in machines.items()}
+        self.assertEqual(states, {"natedev": "read", "mac": "read", "aws": "no_box"})
 
-    def test_missing_or_invalid_file_reads_as_none(self) -> None:
-        self.assertIsNone(machine_facts.read_facts(self.path))
-        for text in ("{", "[]", json.dumps({"version": 1, "written": 1.0, "machines": {"mac": {"state": "read"}}})):
+    def test_missing_or_invalid_file_reads_as_unread(self) -> None:
+        self.assertIs(machine_facts.read_facts(self.path), FactsUnread.VALUE)
+        for text in ("{", "[]", json.dumps({"version": 1, "written": 1.0, "machines": {"mac": {"state": "read"}}}),
+                     json.dumps({"version": 1, "written": 1.0, "machines": {"pc": machine_facts.facts("no_box")}}),
+                     json.dumps({"version": 1, "written": 1.0,
+                                 "machines": {"mac": {**machine_facts.facts("read"), "battery": None}}})):
             with self.subTest(text=text):
                 _ = self.path.write_text(text)
-                self.assertIsNone(machine_facts.read_facts(self.path))
+                self.assertIs(machine_facts.read_facts(self.path), FactsUnread.VALUE)
 
     def test_state_path_follows_its_environment_variable(self) -> None:
         with mock.patch.dict(os.environ, {"MACHINE_FACTS_FILE": str(self.path)}):

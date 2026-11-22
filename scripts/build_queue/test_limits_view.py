@@ -908,7 +908,8 @@ class MachineFactsLineTests(unittest.TestCase):
             "mac": machine_facts.facts("read", link_ms=3.2, load=19.56, cpus=12, battery={"percent": 85, "mains": False}),
             "aws": machine_facts.facts("no_box")}}
 
-    def line(self, saved: machine_facts.SavedFacts | None, machine: str, now: float = 1000.0) -> str:
+    def line(self, saved: machine_facts.SavedFacts | machine_facts.FactsUnread, machine: machine_facts.Machine,
+             now: float = 1000.0) -> str:
         return limits_view.facts_line(saved, machine, now, UTC)
 
     def test_each_machine_shows_its_line(self) -> None:
@@ -919,10 +920,10 @@ class MachineFactsLineTests(unittest.TestCase):
 
     def test_failures_show_their_words(self) -> None:
         saved = self.saved()
-        saved["machines"].update(
-            natedev=machine_facts.facts("read", load=52.71, cpus=32),
-            mac=machine_facts.facts("unreachable", detail="timed out"),
-            aws=machine_facts.facts("failed", detail="ledger evidence is unavailable"))
+        saved["machines"].update({
+            "natedev": machine_facts.facts("read", load=52.71, cpus=32),
+            "mac": machine_facts.facts("unreachable", detail="timed out"),
+            "aws": machine_facts.facts("failed", detail="ledger evidence is unavailable")})
         self.assertEqual(self.line(saved, "natedev"), "load 52.7/32")
         self.assertEqual(self.line(saved, "mac"), "link unreachable")
         self.assertEqual(self.line(saved, "aws"), "facts unreadable")
@@ -937,7 +938,7 @@ class MachineFactsLineTests(unittest.TestCase):
         fresh = saved["written"] + machine_facts.STALE_SECONDS
         self.assertEqual(self.line(saved, "mac", fresh), "link 3 ms · load 19.6/12 · battery 85% (on battery)")
         self.assertEqual(self.line(saved, "mac", fresh + 1), "facts not sampled since 14:05")
-        self.assertEqual(self.line(None, "natedev"), "facts not sampled")
+        self.assertEqual(self.line(machine_facts.FactsUnread.VALUE, "natedev"), "facts not sampled")
         del saved["machines"]["aws"]
         self.assertEqual(self.line(saved, "aws", saved["written"]), "facts not sampled")
 

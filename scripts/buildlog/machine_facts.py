@@ -14,14 +14,17 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict, cast, get_args
 
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.mac_test import eligibility
 
 # The cadence of buildlog-sample.timer, which runs this pass.
 SAMPLE_PERIOD_SECONDS = 60
@@ -32,8 +35,8 @@ UPS_NAME = "cyberpower"
 UPS_TIMEOUT_SECONDS = 5.0
 MAC_COMMAND = "sysctl -n vm.loadavg hw.ncpu; pmset -g batt"
 VERSION = 1
-MACHINES = ("natedev", "mac", "aws")
 
+Machine = Literal["natedev", "mac", "aws"]
 FactsState = Literal["read", "load_unreadable", "unreachable", "no_box", "box_running", "failed"]
 AddressInfo = tuple[socket.AddressFamily, socket.SocketKind, int, str,
                     tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]]
@@ -49,14 +52,20 @@ class MachineFacts(TypedDict):
     link_ms: float | None
     load: float | None
     cpus: int | None
-    battery: Battery | Literal["unreadable"] | None
+    battery: Battery | Literal["unreadable", "no_battery"]
     detail: str
 
 
 class SavedFacts(TypedDict):
     version: int
     written: float
-    machines: dict[str, MachineFacts]
+    machines: dict[Machine, MachineFacts]
+
+
+class FactsUnread(Enum):
+    """The facts file is missing or invalid."""
+
+    VALUE = "unread"
 
 
 class ProbeFailed(Exception):
@@ -65,13 +74,6 @@ class ProbeFailed(Exception):
 
 class CommandMissing(ProbeFailed):
     """The command is not installed on this machine."""
-
-
-@dataclass(frozen=True)
-class MacLink:
-    host: str
-    connect_timeout_s: float
-    probe_timeout_s: float
 
 
 def state_path() -> Path:
@@ -93,12 +95,12 @@ def run_command(arguments: Sequence[str], timeout: float) -> str:
 
 def resolve(host: str, port: int, timeout: float) -> AddressInfo:
     """Look up the address in a daemon thread, because getaddrinfo has no time limit of its own."""
-    answer: list[AddressInfo | OSError] = []
+    answer: list[AddressInfo | Exception] = []
 
     def lookup() -> None:
         try:
             answer.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0])
-        except OSError as error:
+        except Exception as error:  # noqa: BLE001 -- a bad name raises UnicodeError; keep it, or resolve waits out the limit
             answer.append(error)
 
     thread = threading.Thread(target=lookup, name="machine-facts-lookup", daemon=True)
@@ -108,6 +110,8 @@ def resolve(host: str, port: int, timeout: float) -> AddressInfo:
         raise TimeoutError(f"name lookup of {host} took more than {timeout:g} s")
     if isinstance(answer[0], OSError):
         raise answer[0]
+    if isinstance(answer[0], Exception):
+        raise OSError(f"name lookup of {host} failed: {answer[0]}") from answer[0]
     return answer[0]
 
 
@@ -119,11 +123,6 @@ def connect_ms(host: str, port: int, timeout: float) -> float:
         started = time.perf_counter()
         connection.connect(address)
         return (time.perf_counter() - started) * 1000
-
-
-def read_mac_link() -> MacLink:
-    config = conf.read("mac_test")
-    return MacLink(config.text("host"), config.number("connect_timeout_s"), config.number("probe_timeout_s"))
 
 
 def running_gate_box(now: float) -> str:
@@ -145,12 +144,13 @@ class Probes:
     connect: Callable[[str, int, float], float] = connect_ms
     loadavg: Path = Path("/proc/loadavg")
     cpus: Callable[[], int | None] = os.cpu_count
-    mac_link: Callable[[], MacLink] = read_mac_link
+    mac_settings: Callable[[], eligibility.SshProbeSettings] = (
+        lambda: eligibility.SshProbeSettings(conf.read("mac_test")))
     aws_box: Callable[[float], str] = running_gate_box
 
 
 def facts(state: FactsState, *, link_ms: float | None = None, load: float | None = None, cpus: int | None = None,
-          battery: Battery | Literal["unreadable"] | None = None, detail: str = "") -> MachineFacts:
+          battery: Battery | Literal["unreadable", "no_battery"] = "no_battery", detail: str = "") -> MachineFacts:
     return {"state": state, "link_ms": link_ms, "load": load, "cpus": cpus, "battery": battery, "detail": detail}
 
 
@@ -174,11 +174,11 @@ def natedev_facts(probes: Probes) -> MachineFacts:
         load: float | None = float(probes.loadavg.read_text().split()[0])
     except (OSError, ValueError, IndexError):
         load = None
-    battery: Battery | Literal["unreadable"] | None
+    battery: Battery | Literal["unreadable", "no_battery"]
     try:
         battery = ups_battery(probes.run(["upsc", UPS_NAME], UPS_TIMEOUT_SECONDS))
     except CommandMissing:
-        battery = None
+        battery = "no_battery"
     except ProbeFailed:
         battery = "unreadable"
     cpus = probes.cpus()
@@ -186,10 +186,10 @@ def natedev_facts(probes: Probes) -> MachineFacts:
     return facts(state, load=load, cpus=cpus, battery=battery)
 
 
-def mac_battery(text: str) -> Battery | None:
+def mac_battery(text: str) -> Battery | Literal["no_battery"]:
     match = re.search(r"InternalBattery\S*\s.*?(\d+)%", text)
     if match is None:
-        return None
+        return "no_battery"
     return {"percent": int(match.group(1)), "mains": "'Battery Power'" not in text}
 
 
@@ -204,29 +204,31 @@ def mac_load(text: str) -> tuple[float, int]:
     return load, cpus
 
 
-def ssh_address(probes: Probes, link: MacLink) -> tuple[str, int]:
+def ssh_address(probes: Probes, alias: str, timeout: float) -> tuple[str, int]:
     """Resolve the SSH alias the way ssh does, without a connection."""
-    settings = dict(line.split(" ", 1) for line in probes.run(["ssh", "-G", link.host], link.connect_timeout_s).splitlines()
-                    if " " in line)
+    settings = dict(line.split(" ", 1) for line in probes.run(["ssh", "-G", alias], timeout).splitlines() if " " in line)
     try:
         return settings["hostname"], int(settings["port"])
     except (KeyError, ValueError) as error:
-        raise ProbeFailed(f"ssh -G {link.host} gave no host name and port") from error
+        raise ProbeFailed(f"ssh -G {alias} gave no host name and port") from error
 
 
 def mac_facts(probes: Probes) -> MachineFacts:
+    # The Mac probe alone needs offload's SSH options; the Builds feed imports this module without it.
+    from scripts.mac_test import offload
+
     try:
-        link = probes.mac_link()
-        host, port = ssh_address(probes, link)
+        settings = probes.mac_settings()
+        connect_timeout, probe_timeout = settings.connect_timeout_s, settings.probe_timeout_s
+        host, port = ssh_address(probes, settings.host, connect_timeout)
     except (ValueError, ProbeFailed) as error:
         return facts("failed", detail=str(error))
     try:
-        link_ms = probes.connect(host, port, link.connect_timeout_s)
+        link_ms = probes.connect(host, port, connect_timeout)
     except OSError as error:
         return facts("unreachable", detail=f"{host}:{port}: {error}")
     try:
-        answer = probes.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={link.connect_timeout_s:g}",
-                             link.host, MAC_COMMAND], link.probe_timeout_s)
+        answer = probes.run([*offload.ssh_prefix(settings), MAC_COMMAND], probe_timeout)
         load, cpus = mac_load(answer)
     except (ProbeFailed, ValueError) as error:
         return facts("load_unreadable", link_ms=link_ms, detail=str(error))
@@ -252,10 +254,13 @@ LIVE_PROBES = Probes()
 
 def sample_once(path: Path, at: float, probes: Probes = LIVE_PROBES) -> SavedFacts:
     """Probe each machine in its own thread and save one file; one failed probe keeps the others."""
-    with ThreadPoolExecutor(max_workers=len(MACHINES)) as pool:
-        futures = {"natedev": pool.submit(natedev_facts, probes), "mac": pool.submit(mac_facts, probes),
-                   "aws": pool.submit(aws_facts, probes, at)}
-        machines: dict[str, MachineFacts] = {}
+    readers: dict[Machine, Callable[[], MachineFacts]] = {
+        "natedev": partial(natedev_facts, probes), "mac": partial(mac_facts, probes),
+        "aws": partial(aws_facts, probes, at)}
+    with ThreadPoolExecutor(max_workers=len(readers)) as pool:
+        futures: dict[Machine, Future[MachineFacts]] = {
+            machine: pool.submit(reader) for machine, reader in readers.items()}
+        machines: dict[Machine, MachineFacts] = {}
         for machine, future in futures.items():
             try:
                 machines[machine] = future.result()
@@ -271,7 +276,7 @@ def finite(value: object) -> bool:
 
 
 def valid_battery(value: object) -> bool:
-    if value is None or value == "unreadable":
+    if value in ("unreadable", "no_battery"):
         return True
     if not isinstance(value, dict):
         return False
@@ -289,17 +294,18 @@ def valid_machine(value: object) -> bool:
             and (cpus is None or type(cpus) is int and cpus > 0) and valid_battery(row["battery"]))
 
 
-def read_facts(path: Path) -> SavedFacts | None:
-    """The saved facts, or None when the file is missing or unreadable."""
+def read_facts(path: Path) -> SavedFacts | FactsUnread:
+    """The saved facts, or `FactsUnread.VALUE` when the file is missing or invalid."""
     try:
         raw = cast(object, json.loads(path.read_text()))
     except (OSError, ValueError, UnicodeError):
-        return None
+        return FactsUnread.VALUE
     if not isinstance(raw, dict):
-        return None
+        return FactsUnread.VALUE
     row = cast(dict[str, object], raw)
     machines = row.get("machines")
     if (row.get("version") != VERSION or not finite(row.get("written")) or not isinstance(machines, dict)
-            or not all(valid_machine(value) for value in cast(dict[str, object], machines).values())):
-        return None
+            or not all(name in get_args(Machine) and valid_machine(value)
+                       for name, value in cast(dict[str, object], machines).items())):
+        return FactsUnread.VALUE
     return cast(SavedFacts, cast(object, row))

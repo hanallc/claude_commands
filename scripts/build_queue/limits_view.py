@@ -841,9 +841,10 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
     return unattributed, "A Mac claim has no repository name that this page can show." if missing_scope else ""
 
 
-def facts_line(saved: machine_facts.SavedFacts | None, machine: str, now: float, zone: tzinfo) -> str:
+def facts_line(saved: machine_facts.SavedFacts | machine_facts.FactsUnread, machine: machine_facts.Machine, now: float,
+               zone: tzinfo) -> str:
     """One line of link delay, load and battery under a machine heading."""
-    if saved is None or machine not in saved["machines"]:
+    if isinstance(saved, machine_facts.FactsUnread) or machine not in saved["machines"]:
         return PAGE_WORDS["facts_missing"]
     if now - saved["written"] > machine_facts.STALE_SECONDS:
         return PAGE_WORDS["facts_stale"].format(time=datetime.fromtimestamp(saved["written"], zone).strftime("%H:%M"))
@@ -861,7 +862,7 @@ def facts_line(saved: machine_facts.SavedFacts | None, machine: str, now: float,
     battery = facts["battery"]
     if battery == "unreadable":
         parts.append(PAGE_WORDS["facts_battery_unreadable"])
-    elif battery is not None:
+    elif battery != "no_battery":
         source = PAGE_WORDS["facts_mains" if battery["mains"] else "facts_on_battery"]
         parts.append(PAGE_WORDS["facts_battery"].format(percent=battery["percent"], source=source))
     return " · ".join(parts)
@@ -870,7 +871,8 @@ def facts_line(saved: machine_facts.SavedFacts | None, machine: str, now: float,
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
                  waits: Sequence[VisibleWait], cloud_names: Mapping[wire.Owner, str],
                  names: Mapping[str, str], saved: Background, zone: tzinfo, *,
-                 mac: MacReading | None = None, facts: machine_facts.SavedFacts | None = None) -> BuildLimits:
+                 mac: MacReading | None = None,
+                 facts: machine_facts.SavedFacts | machine_facts.FactsUnread = machine_facts.FactsUnread.VALUE) -> BuildLimits:
     explanation = reading.explanation
     occupancy = explanation.local_occupancy
     inputs = replace(explanation.decided_from,
@@ -1160,7 +1162,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                    unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
     first_rows = {"claude_commands": 0, "hana": 1}
 
-    def facts_text(machine: str) -> str:
+    def facts_text(machine: machine_facts.Machine) -> str:
         return facts_line(facts, machine, explanation.now, zone)
 
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),

@@ -455,7 +455,7 @@ A failed TCP connect shows `link unreachable`. A failed SSH command after a good
 A UPS that `upsc` cannot read shows `battery unreadable`. A Mac without an `InternalBattery` line in `pmset`, or a machine with no UPS tool, shows no battery part.
 A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.
 A probe that cannot start shows `facts unreadable`.
-A missing or invalid file shows `facts not sampled`.
+A missing or invalid file reads as `machine_facts.FactsUnread.VALUE` and shows `facts not sampled`.
 Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
