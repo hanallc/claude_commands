@@ -18,6 +18,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 import uuid
 from collections import Counter, defaultdict, deque
@@ -10050,28 +10051,72 @@ class NoSplitRecorded:
     """The unit has no completed split scan."""
 
 
-def require_split_table(repo: Path) -> None:
+def require_split_table(database: Path) -> None:
     """Refuse an old stored schema before a split scans its backup."""
-    database = ledger_location(repo).database
-    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True,
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True,
                                 timeout=BUSY_TIMEOUT_SECONDS)) as connection:
         if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
             raise LedgerError("ledger has no refill_results (schema below 25)")
 
 
-def record_split(repo: Path, unit: str, split: RecordedSplit, *,
-                 busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS) -> None:
-    """Save a complete split without changing the last refill result."""
-    database = ledger_location(repo).database
-    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
-                                timeout=busy_timeout_seconds)) as connection, connection:
-        _ = connection.execute(
-            "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
-            + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
-            + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
-            + "structure=excluded.structure,other=excluded.other",
-            (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
-        )
+class SplitTimedOut(TimeoutError):
+    """The split has used all of its time."""
+
+
+@dataclass(frozen=True)
+class SplitDeadline:
+    at: float
+    timeout_minutes: float
+    clock: Callable[[], float] = time.monotonic
+
+    def timeout_error(self) -> SplitTimedOut:
+        return SplitTimedOut(f"time limit of {self.timeout_minutes:g} min reached")
+
+    def remaining_seconds(self) -> float:
+        remaining = self.at - self.clock()
+        if remaining <= 0:
+            raise self.timeout_error()
+        return remaining
+
+
+def record_split(repo: Path, unit: str, split: RecordedSplit) -> None:
+    """Save a complete split for a repository."""
+    database = ledger_location(repo).database.resolve()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+        _upsert_split(connection, unit, split)
+
+
+def record_split_at(database: Path, unit: str, split: RecordedSplit, *, deadline: SplitDeadline) -> None:
+    """Use the deadline until commit starts, then report the commit result."""
+    _ = deadline.remaining_seconds()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)) as connection:
+        remaining = deadline.remaining_seconds()
+        busy_ms = int(1000 * min(BUSY_TIMEOUT_SECONDS, remaining))
+        _ = connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
+        # The ledger uses rollback journaling. An exclusive lock covers both the write and commit.
+        try:
+            _ = connection.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as error:
+            # SQLite rounds the busy timeout to milliseconds.
+            if remaining <= BUSY_TIMEOUT_SECONDS and error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                raise deadline.timeout_error() from error
+            raise
+        _ = deadline.remaining_seconds()
+        _ = connection.execute("PRAGMA busy_timeout = 0")
+        _upsert_split(connection, unit, split)
+        _ = deadline.remaining_seconds()
+        connection.commit()
+
+
+def _upsert_split(connection: sqlite3.Connection, unit: str, split: RecordedSplit) -> None:
+    _ = connection.execute(
+        "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
+        + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
+        + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
+        + "structure=excluded.structure,other=excluded.other",
+        (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
+    )
 
 
 def publication_path(repo: Path, name: str) -> Path:

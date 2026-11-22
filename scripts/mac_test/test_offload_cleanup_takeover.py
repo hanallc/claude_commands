@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import subprocess
 import unittest
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 from scripts.mac_test import claim_state, offload
@@ -11,6 +12,37 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
+    def test_cleanup_releases_its_verified_legacy_claim(self) -> None:
+        _ = subprocess.run(
+            ["git", "-C", str(self.repository), "remote", "add", "origin", "https://example.invalid/repos/hana.git"],
+            check=True, capture_output=True,
+        )
+        _ = self.write_kept_claim()
+        legacy = self.state_directory / "run.json"
+        _ = self.claim_file.rename(legacy)
+
+        result = self.command("--no-fail-fast")
+
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assert_wire("declined", "busy")
+        self.assertFalse(legacy.exists())
+        cleanup, = self.leftover_events()
+        self.assertEqual(cleanup["args"][-2], "previous-mac")
+
+    def test_cleanup_keeps_legacy_claim_with_relative_worktree(self) -> None:
+        record = self.write_kept_claim()
+        legacy = self.state_directory / "run.json"
+        self.claim_file.unlink()
+        _ = legacy.write_text(json.dumps({**record, "worktree": "."}))
+        before = legacy.read_bytes()
+
+        result = self.command("--no-fail-fast")
+
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assert_wire("declined", "busy")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertEqual(self.leftover_events(), [])
+
     def test_takeover_ends_leftovers_on_recorded_host_then_runs_on_settings_host(self) -> None:
         for unacknowledged in (False, True):
             with self.subTest(unacknowledged=unacknowledged):
