@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import fcntl
 import shlex
-import socket
 import subprocess
 import sys
 import time
@@ -489,7 +488,7 @@ class TuneTests(PublicationTestCase):
 
     def test_ambiguous_base_key_refuses_without_a_write_and_names_both_lines(self) -> None:
         repo = self.repository
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         original = (
             "# whole: 1..10\namount=2\n# whole: 1..10\n"
             + f"amount.{host}=5 # host capacity\namount.{host}=8 # ignored duplicate\n"

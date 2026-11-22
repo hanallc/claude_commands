@@ -10,7 +10,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -643,7 +642,7 @@ class OffloadSettingsTests(unittest.TestCase):
                     _ = offload.remote_test_command(config, request, HANA)
 
     def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         source = self.settings.read_text()
         for key, value in ((nextest_log.TAIL_BYTES, 36), (nextest_log.SUMMARY_BYTES, 52)):
             source = re.sub(rf"^{key}=\d+$", f"{key}.{host}={value}", source, flags=re.MULTILINE)

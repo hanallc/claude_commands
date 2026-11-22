@@ -883,7 +883,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     placement_control = _waits_for_live_service(request)
     generation_query = isinstance(request, wire.BuildHistoryRequest)
     slot_waiting = (wire.RepositorySlotWaiting(request.repository, tuple(range(1, request.maximum + 1)),
-                    request.maximum, f"slots.{request.machine}.{request.repository}.max")
+                    request.maximum, f"slots.{conf.host_key_name(request.machine)}.{request.repository}.max")
                     if isinstance(request, wire.RepositorySlotRequest) else None)
     bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport,
                                         wire.RepositorySlotRequest, wire.VerifyRunSlotRequest))
