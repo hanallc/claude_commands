@@ -102,15 +102,8 @@ class OffloadForwardTests(OffloadCommandFixture):
             + 'else over_budget=unknown; fi; '
             + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
             + '"$trim_status" "$trim_elapsed" "$over_budget"; '
-            + 'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
+            + 'if "$HOME/.claude/scripts/lib/py" -B "$HOME/.claude/scripts/lint/sweep.py" '
+            + 'mac-floor-take hana >/dev/null; then echo mac_cleanup=kept; else echo mac_cleanup=$?; fi'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)

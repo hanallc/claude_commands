@@ -9,6 +9,7 @@ import os
 import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from typing import override
@@ -43,6 +44,115 @@ class RemovalGuardTests(unittest.TestCase):
     def guard(self, *mounts: Path) -> removal_guard.RemovalGuard:
         return removal_guard.read(mount_reader=lambda: (Path("/"), self.root, *mounts),
                                   build_top=self.root, names=self.names)
+
+    def mirror_guard(self, *mounts: Path) -> removal_guard.RemovalGuard:
+        mirror = self.home / ".local/state/mac-test/mirror"
+        mirror.mkdir(parents=True, exist_ok=True)
+        return removal_guard.read_mirror(mirror, mount_reader=lambda: (Path("/"), *mounts))
+
+    def test_mirror_guard_accepts_only_cargo_output_forms(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        artifact = target / "debug/deps/libsample-0123456789abcdef.rlib"
+        source = target / "debug/deps/source.rs"
+        artifact.parent.mkdir(parents=True)
+        _ = artifact.write_bytes(b"output")
+        _ = source.write_bytes(b"source")
+        with guard.check(artifact) as checked:
+            self.assertEqual(checked.form, removal_guard.MirrorOutputForm.UNIT)
+        for path in (artifact.parent, source):
+            with self.subTest(path=path), self.assertRaises(removal_guard.Refused):
+                with guard.check(path):
+                    self.fail("The guard approved a path outside the Cargo output forms.")
+
+    def test_mirror_guard_refuses_targets_outside_the_configured_root(self) -> None:
+        guard = self.mirror_guard()
+        for parent in (self.home, self.home / "rust", self.home / ".cargo",
+                       self.home / ".claude", self.fixture / "tmp"):
+            target = parent / "repo/target"
+            target.mkdir(parents=True)
+            with self.subTest(target=target), self.assertRaises(removal_guard.Refused):
+                with guard.check(target):
+                    self.fail("The guard approved output outside the configured mirror root.")
+        with self.assertRaises(removal_guard.Refused):
+            _ = removal_guard.read_mirror(self.home / "rust", mount_reader=lambda: (Path("/"),))
+
+    def test_mirror_inventory_refuses_source_before_any_removal(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        artifact = target / "debug/deps/libsample-0123456789abcdef.rlib"
+        artifact.parent.mkdir(parents=True)
+        _ = artifact.write_bytes(b"output")
+        with guard.check(target) as checked:
+            for source in ("Cargo.toml", ".git"):
+                marker = artifact.parent / source
+                _ = marker.write_bytes(b"source")
+                with self.subTest(source=source), self.assertRaises(removal_guard.Refused):
+                    _ = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+                self.assertEqual(artifact.read_bytes(), b"output")
+                marker.unlink()
+            with self.assertRaises(removal_guard.Refused):
+                _ = removal_guard.inspect_mirror_output(
+                    checked, frozenset({artifact}), lambda: None)
+        self.assertEqual(artifact.read_bytes(), b"output")
+
+    def test_mirror_guard_refuses_links_and_mounts(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        inner = target / "mounted"
+        inner.mkdir(parents=True)
+        external = self.fixture / "outside"
+        external.mkdir()
+        link = target / "link"
+        link.symlink_to(external, target_is_directory=True)
+        with guard.check(target) as checked, self.assertRaises(removal_guard.Refused):
+            _ = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+        with self.assertRaises(removal_guard.Refused):
+            with self.mirror_guard(inner).check(target):
+                self.fail("The guard approved a mount below the candidate.")
+        self.assertTrue(external.is_dir())
+
+    def test_mirror_guard_refuses_a_root_replaced_after_the_check(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        renamed = guard.root.with_name("previous-mirror")
+        with guard.check(target) as checked:
+            _ = guard.root.rename(renamed)
+            target.mkdir(parents=True)
+            _ = (target / "source").write_bytes(b"source")
+            with self.assertRaises(removal_guard.ChangedEntry):
+                with removal_guard.stage_mirror_output(checked):
+                    self.fail("The guard staged output under a replaced root.")
+        self.assertEqual((renamed / "repo/target/output").read_bytes(), b"build output")
+        self.assertEqual((target / "source").read_bytes(), b"source")
+
+    def test_mirror_unlink_refuses_a_replaced_leaf_after_the_name_check(self) -> None:
+        guard = self.mirror_guard()
+        target = guard.root / "repo/target"
+        target.mkdir(parents=True)
+        _ = (target / "output").write_bytes(b"build output")
+        outside = self.fixture / "tracked"
+        _ = outside.write_bytes(b"tracked source")
+        verify = removal_guard.require_identity
+
+        def replace_leaf(parent: int, name: str, expected: removal_guard.Identity) -> None:
+            verify(parent, name, expected)
+            if name == "output":
+                os.rename(name, "previous", src_dir_fd=parent, dst_dir_fd=parent)
+                os.rename(outside, name, dst_dir_fd=parent)
+
+        with guard.check(target) as checked:
+            inventory = removal_guard.inspect_mirror_output(checked, frozenset(), lambda: None)
+            with removal_guard.stage_mirror_output(checked) as staged:
+                with (mock.patch.object(sys, "platform", "darwin"),
+                      mock.patch.object(removal_guard, "mount_id", return_value=checked.mount),
+                      mock.patch.object(removal_guard, "require_identity", side_effect=replace_leaf),
+                      self.assertRaises(removal_guard.ChangedEntry)):
+                    removal_guard.remove(staged, mirror=inventory)
+        self.assertEqual((target / "output").read_bytes(), b"tracked source")
+        self.assertEqual((target / "previous").read_bytes(), b"build output")
 
     def assert_refused(self, path: Path, reason: removal_guard.RefusalReason,
                        *, mounts: tuple[Path, ...] = ()) -> None:

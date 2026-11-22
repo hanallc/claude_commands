@@ -7740,6 +7740,292 @@ class MacFloorTests(SweepCase):
             self.assertEqual(leased.claims_before_removal([str(tree.parent)]), {})
 
 
+class MacMirrorTakeTests(SweepCase):
+    def mirror_target(self, name: str, used: int) -> Path:
+        mirror = self.build_home / ".local/state/mac-test/mirror" / name
+        target = mirror / "target"
+        target.mkdir(parents=True)
+        _ = (mirror / floor_claims.MIRROR_MARK).write_text("registered remote mirror\n")
+        _ = (mirror / floor_claims.MIRROR_RECORD).write_text(json.dumps({
+            "kind": "remote-mirror", "repo": name, "last_use": used,
+        }))
+        _ = (target / "output").write_bytes(b"old build")
+        return target
+
+    def take(self, desired: int, *, timeout: float = 10) -> int:
+        root = self.build_home / ".local/state/mac-test/mirror"
+        guard = removal_guard.read_mirror(root, mount_reader=lambda: (Path("/"),))
+        with (mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+              mock.patch.object(copies, "scan_mirror_processes",
+                                return_value=copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            return sweep.take_mac_mirror_floor(guard, desired, timeout, "sample",
+                                               lint_settings=conf.read("lint"))
+
+    def test_both_mac_floor_commands_use_the_guarded_take(self) -> None:
+        target = self.mirror_target("sample", 100)
+        root = target.parent.parent
+        guard = removal_guard.read_mirror(root, mount_reader=lambda: (Path("/"),))
+        _ = write_config_fixture(conf.path("mac_test"),
+            "mirror_root=~/.local/state/mac-test/mirror\nfree_floor_gib=100\n"
+            + "sweep_floor_gib=150\nfloor_sweep_timeout_s=180\n")
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(removal_guard, "read_mirror", return_value=guard) as read,
+              mock.patch.object(sweep, "take_mac_mirror_floor", return_value=0) as take,
+              mock.patch.object(sweep, "hold_floor") as review):
+            self.assertEqual(sweep.main(["--floor-only", "--host", "mac"]), 0)
+            self.assertEqual(sweep.main(["mac-floor-take", "sample"]), 0)
+        self.assertEqual(read.call_args_list, [mock.call(root), mock.call(root)])
+        self.assertEqual([call.args for call in take.call_args_list],
+            [(guard, 150 * GIB, 180, ""), (guard, 150 * GIB, 180, "sample")])
+        review.assert_not_called()
+
+    def test_mac_floor_refuses_argument_mixes_before_legacy_assessment(self) -> None:
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(sweep, "assess", return_value=0) as legacy,
+              mock.patch.object(sweep, "take_mac_mirror_floor") as take,
+              redirect_stderr(io.StringIO())):
+            for arguments in (
+                ["--floor-only", "--host", "mac", "--floor-only"],
+                ["--floor-only", "--host", "mac", "--dry-run"],
+                ["--host", "natedev", "--host", "mac", "--floor-only"],
+                ["--floor-only", "mac-floor-take", "sample"],
+                ["mac-floor-take", "--dry-run"],
+            ):
+                with self.subTest(arguments=arguments):
+                    self.assertEqual(sweep.main(arguments), 2)
+            legacy.assert_not_called()
+            take.assert_not_called()
+
+    def test_mac_take_refuses_tracked_output_in_an_enclosing_checkout(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+        checkout = older.parent.parent
+        git("init", cwd=checkout)
+        git("add", "-f", "--", str((older / "output").relative_to(checkout)), cwd=checkout)
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 1)
+        self.assertEqual((older / "output").read_bytes(), b"old build")
+        self.assertEqual((newer / "output").read_bytes(), b"old build")
+
+    def old_and_new_fingerprints(self, target: Path) -> tuple[Path, Path]:
+        _ = (target.parent / "Cargo.lock").write_text("version = 4\n")
+        fingerprints = target / "debug/.fingerprint"
+        old, new = (fingerprints / f"crate-{variant:016x}" for variant in (1, 2))
+        for unit, used in ((old, 100), (new, 200)):
+            unit.mkdir(parents=True)
+            marker = unit / "lib-crate"
+            _ = marker.write_text("d0123456789abcde")
+            os.utime(marker, (used, used))
+            os.utime(unit, (used, used))
+        return old, new
+
+    def test_mac_take_stops_when_a_cargo_lock_appears_during_unit_staging(self) -> None:
+        target = self.mirror_target("sample", 100)
+        old, new = self.old_and_new_fingerprints(target)
+        cargo_lock = target / "debug/.cargo-lock"
+        stage = removal_guard.stage_mirror_output
+
+        @contextmanager
+        def stage_with_late_lock(checked: removal_guard.CheckedEntry) -> Generator[removal_guard.CheckedEntry]:
+            with stage(checked) as staged, cargo_lock.open("x") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                yield staged
+
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+              mock.patch.object(removal_guard, "stage_mirror_output", side_effect=stage_with_late_lock)):
+            self.assertEqual(self.take(2 * GIB), 1)
+        for unit in (old, new):
+            self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
+        self.assertEqual(self.trim_rows(), [])
+        cargo_lock.unlink()
+        append = store.append_line
+
+        late_lock = target / "pending-lock"
+        with late_lock.open("x") as reserved:
+            fcntl.flock(reserved, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def append_with_late_lock(path: Path, row: object) -> None:
+                append(path, row)
+                match row:
+                    case {"kind": "sweep_trim_intent"}:
+                        _ = late_lock.rename(cargo_lock)
+                    case _:
+                        pass
+
+            with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+                  mock.patch.object(store, "append_line", side_effect=append_with_late_lock)):
+                self.assertEqual(self.take(2 * GIB), 1)
+            self.assertEqual(os.stat(cargo_lock).st_ino, os.fstat(reserved.fileno()).st_ino)
+        for unit in (old, new):
+            self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_stops_inside_a_whole_target_at_the_floor(self) -> None:
+        target = self.mirror_target("older", 100)
+        _ = (target / "second").write_bytes(b"second")
+        unlink = os.unlink
+        removed: list[str] = []
+
+        def unlink_and_free(path: str, *, dir_fd: int | None = None) -> None:
+            unlink(path, dir_fd=dir_fd)
+            if path in ("output", "second"):
+                removed.append(path)
+
+        def free(_path: str) -> int:
+            return 2 * GIB if removed else GIB
+
+        with (mock.patch.object(sweep, "free_bytes", side_effect=free),
+              mock.patch.object(os, "unlink", side_effect=unlink_and_free)):
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(len(list(target.iterdir())), 1)
+
+    def test_mac_unit_names_do_not_prove_cargo_made_the_entries(self) -> None:
+        target = self.mirror_target("sample", 100)
+        old, new = self.old_and_new_fingerprints(target)
+        for unit in (old, new):
+            (unit / "lib-crate").unlink()
+            _ = (unit / "notes").write_text("keep my notes")
+        incremental = target / "debug/incremental"
+        for name, used in (("customer-notes", 100), ("customer-plan", 200)):
+            path = incremental / name
+            path.mkdir(parents=True)
+            _ = (path / "notes").write_text("keep my notes")
+            os.utime(path / "notes", (used, used))
+            os.utime(path, (used, used))
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 0)
+        for path in (old, new, incremental / "customer-notes", incremental / "customer-plan"):
+            self.assertEqual((path / "notes").read_text(), "keep my notes")
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_stops_when_it_cannot_read_a_fingerprint_time(self) -> None:
+        target = self.mirror_target("sample", 100)
+        old, new = self.old_and_new_fingerprints(target)
+        read_entries = sweep.ScanDirectoryObservations.entries
+
+        def entries(observations: sweep.ScanDirectoryObservations, directory: str) -> list[os.DirEntry[str]]:
+            known = read_entries(observations, directory)
+            if Path(directory) != new:
+                return known
+            return [
+                cast(os.DirEntry[str], mock.Mock(spec=os.DirEntry,
+                    path=entry.path, stat=mock.Mock(side_effect=PermissionError(entry.path))))
+                for entry in known
+            ]
+
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+              mock.patch.object(sweep.ScanDirectoryObservations, "entries", entries)):
+            self.assertEqual(self.take(2 * GIB), 1)
+        for unit in (old, new):
+            self.assertEqual((unit / "lib-crate").read_text(), "d0123456789abcde")
+
+    def test_mac_take_requires_a_buildlog_intent_before_unlink(self) -> None:
+        target = self.mirror_target("older", 100)
+        append = store.append_line
+
+        def fail_intent(path: Path, row: object) -> None:
+            match row:
+                case {"kind": "sweep_trim_intent"}:
+                    raise OSError("The buildlog cannot record the intent")
+                case _:
+                    append(path, row)
+
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+              mock.patch.object(store, "append_line", side_effect=fail_intent)):
+            self.assertEqual(self.take(2 * GIB), 1)
+        self.assertEqual((target / "output").read_bytes(), b"old build")
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 0)
+        rows = self.build_log_rows()
+        intents = [row for row in rows if row.get("kind") == "sweep_trim_intent"]
+        results = [row for row in rows if row.get("kind") == "sweep_trim_entry"]
+        self.assertEqual([row["folder"] for row in intents], [str(target / "output"), str(target)])
+        self.assertEqual([row["intent"] for row in results], [row["id"] for row in intents])
+        for intent, result in zip(intents, results, strict=True):
+            self.assertLess(rows.index(intent), rows.index(result))
+
+    def test_mac_take_keeps_a_target_with_a_live_child_build_lease(self) -> None:
+        held = self.mirror_target("held", 100)
+        idle = self.mirror_target("idle", 200)
+        child = held / "debug/build/sample-0123456789abcdef"
+        child.mkdir(parents=True)
+        _ = (child / "output").write_bytes(b"held build")
+        with (child.with_suffix(".lock").open("w") as lock,
+              mock.patch.object(sweep, "free_bytes", return_value=GIB)):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertEqual((child / "output").read_bytes(), b"held build")
+        self.assertFalse(idle.exists())
+
+    def test_mac_take_never_exceeds_the_shortfall(self) -> None:
+        target = self.mirror_target("large", 100)
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(GIB + 1), 0)
+        self.assertEqual((target / "output").read_bytes(), b"old build")
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_stops_after_the_first_unverified_removal(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+        with (mock.patch.object(sweep, "free_bytes", return_value=GIB),
+              mock.patch.object(removal_guard, "inspect_mirror_output", side_effect=TimeoutError("timed out")) as check):
+            self.assertEqual(self.take(2 * GIB), 1)
+        check.assert_called_once()
+        for target in (older, newer):
+            self.assertEqual((target / "output").read_bytes(), b"old build")
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_stops_at_the_floor_after_removing_the_oldest_target(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+
+        def free(_path: str) -> int:
+            return 2 * GIB if self.trim_rows() else GIB
+
+        with mock.patch.object(sweep, "free_bytes", side_effect=free):
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertFalse(older.exists())
+        self.assertEqual((newer / "output").read_bytes(), b"old build")
+        [row] = self.trim_rows()
+        self.assertEqual((row["folder"], row["cause"], row["last_use"]), (str(older), "floor take", 100))
+
+    def test_mac_take_refuses_tracked_output_in_a_mirror_git_worktree(self) -> None:
+        older = self.mirror_target("older", 100)
+        newer = self.mirror_target("newer", 200)
+        nested = older / "debug/deps/libsource-0123456789abcdef.rlib"
+        nested.parent.mkdir(parents=True)
+        _ = nested.write_bytes(b"tracked source")
+        git("init", cwd=older.parent)
+        git("add", "-f", "--", str(nested.relative_to(older.parent)), cwd=older.parent)
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 1)
+        self.assertEqual(nested.read_bytes(), b"tracked source")
+        self.assertEqual((newer / "output").read_bytes(), b"old build")
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_mac_take_orders_idle_targets_before_old_units_and_keeps_cargo_builds(self) -> None:
+        warm = self.mirror_target("sample", 100)
+        idle = self.mirror_target("idle", 200)
+        _ = (warm.parent / "Cargo.lock").write_text('version = 4\n[[package]]\nname = "current"\n')
+        for crate, variant, used in (("sample", 1, 100), ("sample", 2, 200), ("sample", 3, 300),
+                                     ("current", 4, 100), ("current", 5, 200)):
+            unit = warm / "debug/.fingerprint" / f"{crate}-{variant:016x}"
+            unit.mkdir(parents=True)
+            marker = unit / f"lib-{crate}"
+            _ = marker.write_text("d0123456789abcde")
+            os.utime(marker, (used, used))
+            os.utime(unit, (used, used))
+        with mock.patch.object(sweep, "free_bytes", return_value=GIB):
+            self.assertEqual(self.take(2 * GIB), 0)
+        self.assertEqual([row["folder"] for row in self.trim_rows()],
+                         [str(idle), str(warm / "debug/.fingerprint/sample-0000000000000001"),
+                          str(warm / "debug/.fingerprint/sample-0000000000000002")])
+        self.assertEqual(sorted(path.name for path in (warm / "debug/.fingerprint").iterdir()),
+                         ["current-0000000000000004", "current-0000000000000005", "sample-0000000000000003"])
+
+
 class LockHolderTests(unittest.TestCase):
     def test_the_flock_holder_comes_from_the_locks_listing(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()

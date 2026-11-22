@@ -13,6 +13,7 @@ The guard checks the folder, its maker, and its locks again at removal.
 Use --target-dir to assess one named folder.
 Use --floor-only to omit workspace assessment.
 Use --dry-run to print the assessment without writing a list.
+On macOS, --floor-only --host mac takes eligible mirror output.
 Use rebuilds --days N to report cold rebuild costs from the recorded history.
 """
 
@@ -35,6 +36,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -414,21 +416,39 @@ class DiscoveredTargetRoots(list[str]):
         self.discovered: tuple[str, ...] = tuple(discovered)
 
 
+class WorkspaceScan(Enum):
+    BEST_EFFORT = "allow unreadable output"
+
+
+@dataclass(frozen=True)
+class MirrorScanDirectories:
+    observed: frozenset[str]
+
+
 @dataclass
 class ScanDirectoryObservations:
     """Directory entries and their cached stats, shared only during one scan."""
 
     directories: dict[str, list[os.DirEntry[str]]] = field(default_factory=dict)
+    scope: WorkspaceScan | MirrorScanDirectories = WorkspaceScan.BEST_EFFORT
+
+    def read_entries(self, directory: str) -> list[os.DirEntry[str]]:
+        if isinstance(self.scope, MirrorScanDirectories):
+            if directory not in self.scope.observed:
+                return []
+            with os.scandir(directory) as entries:
+                return list(entries)
+        return listing(directory)
 
     def entries(self, directory: str) -> list[os.DirEntry[str]]:
         if directory not in self.directories:
-            self.directories[directory] = listing(directory)
+            self.directories[directory] = self.read_entries(directory)
         return self.directories[directory]
 
     def consume(self, directory: str) -> list[os.DirEntry[str]]:
         if directory in self.directories:
             return self.directories.pop(directory)
-        return listing(directory)
+        return self.read_entries(directory)
 
     def child_times(self, directory: str) -> tuple[float, float]:
         used, modified = 0.0, 0.0
@@ -436,6 +456,8 @@ class ScanDirectoryObservations:
             try:
                 child = entry.stat(follow_symlinks=False)
             except OSError:
+                if isinstance(self.scope, MirrorScanDirectories):
+                    raise
                 continue
             used = max(used, child.st_atime, child.st_mtime)
             modified = max(modified, child.st_mtime)
@@ -1626,6 +1648,8 @@ def newest_times(directory: os.DirEntry[str], observations: ScanDirectoryObserva
     try:
         modified = directory.stat(follow_symlinks=False).st_mtime
     except OSError:
+        if isinstance(observations.scope, MirrorScanDirectories):
+            raise
         return 0.0, 0.0
     used, children_modified = observations.child_times(directory.path)
     return max(modified, used), max(modified, children_modified)
@@ -1754,10 +1778,12 @@ def group_roots(trees: list[str], scan: Scan, *,
     roots: dict[str, Group] = {}
     head_bytes = lint_settings.whole("sweep_dep_info_head_bytes")
     shared_units: dict[tuple[str, str, str], Group] = {}
+    mirror_scan = isinstance(scan.observations.scope, MirrorScanDirectories)
     for tree in trees:
         tree_path = Path(tree)
-        mappings = OUTPUT_ROOTS.get().mappings_for(tree_path)
-        directories = {source: os.path.normpath(os.path.join(tree, copied)) for source, copied in COPY_DIRS.items()}
+        mappings = () if mirror_scan else OUTPUT_ROOTS.get().mappings_for(tree_path)
+        directories = {} if mirror_scan else {
+            source: os.path.normpath(os.path.join(tree, copied)) for source, copied in COPY_DIRS.items()}
         paired_directories: dict[str, list[str]] = {source: [directory] for source, directory in directories.items()}
         for mapping in mappings:
             if mapping.build_directory != mapping.target_directory and tree_path.is_relative_to(mapping.build_directory):
@@ -1814,6 +1840,8 @@ def group_roots(trees: list[str], scan: Scan, *,
                         state = entry.stat(follow_symlinks=False) if entry is not None else os.lstat(path)
                         mtimes.append(state.st_mtime)
                     except OSError:
+                        if mirror_scan:
+                            raise
                         continue
                 group.last_used = group.compiled = max(mtimes, default=0.0)
         orphans = Group(kind="orphan", build_tree=tree)
@@ -4157,6 +4185,546 @@ class MacFloor:
                 if claims.holds(target, self.mirror)}
 
 
+@dataclass(frozen=True)
+class MacFloorDeadline:
+    expires: float
+
+    def remaining(self) -> float:
+        seconds = self.expires - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("the Mac floor take reached its time limit")
+        return seconds
+
+    def check(self) -> None:
+        _ = self.remaining()
+
+
+@dataclass(frozen=True)
+class MacMirrorTakeTarget:
+    path: Path
+    repository: str
+    last_use: float
+    identity: removal_guard.Identity
+    record_entry: removal_guard.MirrorEntry
+
+
+@dataclass(frozen=True)
+class MacMirrorTakeUnit:
+    target: MacMirrorTakeTarget
+    entries: tuple[Path, ...]
+    last_use: float
+    cargo_lock: removal_guard.MirrorEntry
+
+    def recheck_cargo_lock(self) -> None:
+        path = self.target.path.parent / "Cargo.lock"
+        if removal_guard.MirrorEntry.from_stat(path.lstat()) != self.cargo_lock:
+            raise removal_guard.ChangedEntry(f"the current Cargo.lock changed: {path}")
+
+
+@dataclass(frozen=True)
+class HeldMacFloorLock:
+    path: Path
+    descriptor: int
+
+    def recheck(self) -> None:
+        if not os.path.samestat(os.fstat(self.descriptor), self.path.lstat()):
+            raise removal_guard.ChangedEntry(f"the lock changed: {self.path}")
+
+
+@dataclass(frozen=True)
+class HeldMacTakeTarget:
+    checked: removal_guard.CheckedEntry
+    inventory: removal_guard.MirrorOutputInventory
+    locks: tuple[HeldMacFloorLock, ...]
+    cargo_locks: dict[tuple[str, ...], HeldMacFloorLock]
+
+
+class MacFloorLockBusy(Exception):
+    """A live holder prevents the take."""
+
+
+@contextmanager
+def mac_floor_lock(path: Path, *, create: bool = False) -> Generator[int]:
+    """Hold an exact regular lock file until the take finishes with it."""
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_WRONLY | os.O_CREAT if create else os.O_RDONLY)
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise removal_guard.ChangedEntry(f"unexpected lock type: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise MacFloorLockBusy(str(path)) from error
+        if not os.path.samestat(info, path.lstat()):
+            raise removal_guard.ChangedEntry(f"the lock changed: {path}")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def mac_mirror_take_targets(guard: removal_guard.RemovalGuard,
+                            deadline: MacFloorDeadline) -> list[MacMirrorTakeTarget]:
+    targets: list[MacMirrorTakeTarget] = []
+    for path in removal_guard.mirror_targets(guard, deadline.check):
+        with guard.check(path) as checked:
+            try:
+                mark = os.stat(floor_claims.MIRROR_MARK, dir_fd=checked.parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if len(checked.ancestors) == 2:
+                repo = checked.ancestors[-1][0]
+                for outside in (floor_claims.MIRROR_MARK, ".git"):
+                    try:
+                        _ = os.stat(outside, dir_fd=repo, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise removal_guard.ChangedEntry(f"the slot is inside another mirror or checkout: {path.parent}")
+            if not stat.S_ISREG(mark.st_mode):
+                raise removal_guard.ChangedEntry(f"the mirror mark is not a file: {path.parent}")
+            fd = os.open(floor_claims.MIRROR_RECORD, removal_guard.FILE_FLAGS, dir_fd=checked.parent)
+            with os.fdopen(fd, "rb") as record_file:
+                record_info = os.fstat(record_file.fileno())
+                if not stat.S_ISREG(record_info.st_mode):
+                    raise removal_guard.ChangedEntry(f"the mirror record is not a file: {path.parent}")
+                record = cast(object, json.loads(record_file.read(65536)))
+            match record:
+                case {"kind": "remote-mirror", "repo": str(repo), "last_use": (int() | float()) as used} if _finite_number(used):
+                    name = path.relative_to(guard.root).parts[0]
+                    if repo != name:
+                        raise removal_guard.ChangedEntry(f"the mirror record names a different repository: {path.parent}")
+                    folder = os.open(checked.name, removal_guard.DIRECTORY_FLAGS, dir_fd=checked.parent)
+                    try:
+                        if not os.path.samestat(os.fstat(folder), checked.info):
+                            raise removal_guard.ChangedEntry(f"the mirror target changed: {path}")
+                        try:
+                            stamp = os.stat(USE_STAMP, dir_fd=folder, follow_symlinks=False)
+                        except FileNotFoundError:
+                            used = float(used)
+                        else:
+                            if not stat.S_ISREG(stamp.st_mode):
+                                raise removal_guard.ChangedEntry(f"invalid mirror use stamp: {path}")
+                            used = max(float(used), stamp.st_mtime)
+                    finally:
+                        os.close(folder)
+                    targets.append(MacMirrorTakeTarget(path, name, used,
+                        removal_guard.identity(checked.info), removal_guard.MirrorEntry.from_stat(record_info)))
+                case _:
+                    raise removal_guard.ChangedEntry(f"invalid mirror record: {path.parent}")
+    return sorted(targets, key=lambda target: (target.last_use, target.path))
+
+
+def require_mac_mirror_outside_git(target: Path) -> None:
+    """Refuse Git worktrees because an index can change during the take."""
+    for directory in target.parents:
+        git = directory / ".git"
+        try:
+            _ = git.lstat()
+        except FileNotFoundError:
+            continue
+        raise removal_guard.Refused(removal_guard.RefusalReason.MIRROR_SOURCE, str(git))
+
+
+def mac_cargo_lock_names(inventory: removal_guard.MirrorOutputInventory) -> set[tuple[str, ...]]:
+    return {parts for parts in inventory.entries
+            if parts and (parts[-1] in LOCK_NAMES or parts == ("doc", DOC_LOCK_NAME))}
+
+
+def require_held_mac_cargo_lock(held: HeldMacTakeTarget, parts: tuple[str, ...],
+                                current: removal_guard.Identity) -> None:
+    lock = held.cargo_locks.get(parts)
+    if lock is None or removal_guard.identity(os.fstat(lock.descriptor)) != current:
+        path = held.checked.path.joinpath(*parts)
+        raise removal_guard.ChangedEntry(f"a Cargo lock appeared or changed: {path}")
+
+
+@contextmanager
+def mac_take_target(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
+                    deadline: MacFloorDeadline) -> Generator[HeldMacTakeTarget]:
+    """Hold the mirror, build-folder and Cargo locks through the take."""
+    path = target.path
+    mirror = path.parent
+    with ExitStack() as held:
+        checked = held.enter_context(guard.check(path))
+        locks = [HeldMacFloorLock(mark, held.enter_context(mac_floor_lock(mark, create=True))) for mark in
+                 (floor_claims.mirror_parent_lock_path(mirror), floor_claims.mirror_lock_path(mirror))]
+        record_info = os.stat(floor_claims.MIRROR_RECORD, dir_fd=checked.parent, follow_symlinks=False)
+        if (removal_guard.identity(checked.info) != target.identity
+                or removal_guard.MirrorEntry.from_stat(record_info) != target.record_entry):
+            raise removal_guard.ChangedEntry(f"the selected mirror changed: {path}")
+        require_mac_mirror_outside_git(path)
+        inventory = removal_guard.inspect_mirror_output(checked, frozenset(), deadline.check)
+        lease = held.enter_context(build_folders.folder_removal_lease(
+            path, children=True, wait=False, create=True, root=guard.root))
+        if isinstance(lease, build_folders.RemovalLockHeld):
+            raise MacFloorLockBusy(str(lease.lock))
+        if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+            raise removal_guard.ChangedEntry(f"cannot verify the build-folder lease: {path}")
+        locks.append(HeldMacFloorLock(path.with_name(path.name + ".lock"), lease.descriptor))
+        try:
+            busy = held.enter_context(scratch.busy_locks(path, create=False, raise_if_held=True))
+        except scratch.BusyMarkHeld as error:
+            raise MacFloorLockBusy(str(error)) from error
+        if not busy:
+            raise removal_guard.ChangedEntry(f"cannot verify the busy mark: {path}")
+        cargo_locks: dict[tuple[str, ...], HeldMacFloorLock] = {}
+        for parts in sorted(mac_cargo_lock_names(inventory)):
+            mark = path.joinpath(*parts)
+            lock = HeldMacFloorLock(mark, held.enter_context(mac_floor_lock(mark)))
+            if removal_guard.identity(os.fstat(lock.descriptor)) != inventory.entries[parts].key:
+                raise removal_guard.ChangedEntry(f"the Cargo lock changed: {mark}")
+            cargo_locks[parts] = lock
+        checked.recheck()
+        deadline.check()
+        yield HeldMacTakeTarget(checked, inventory, (*locks, *cargo_locks.values()), cargo_locks)
+
+
+MAC_FINGERPRINT_NAME = re.compile(
+    r"(?:lib|bin|test-lib|test-bin|test-integration-test|build-script|run-build-script)-[A-Za-z0-9_-]+")
+MAC_INCREMENTAL_SESSION = re.compile(r"s-[a-z0-9]+-[a-z0-9]+-[a-z0-9]+")
+
+
+def mac_cargo_fingerprint(guard: removal_guard.RemovalGuard, target: Path, path: Path,
+                          inventory: removal_guard.MirrorOutputInventory,
+                          markers: Sequence[tuple[str, ...]]) -> bool:
+    """Verify Cargo's fingerprint file and its recorded hash."""
+    relative = path.relative_to(target).parts
+    with guard.check(path) as checked:
+        fd = os.open(checked.name, removal_guard.DIRECTORY_FLAGS, dir_fd=checked.parent)
+        try:
+            if removal_guard.MirrorEntry.from_stat(os.fstat(fd)) != inventory.entries[relative]:
+                raise removal_guard.ChangedEntry(f"the Cargo fingerprint changed: {path}")
+            for marker in markers:
+                leaf = os.open(marker[-1], removal_guard.FILE_FLAGS, dir_fd=fd)
+                try:
+                    if removal_guard.MirrorEntry.from_stat(os.fstat(leaf)) != inventory.entries[marker]:
+                        raise removal_guard.ChangedEntry(f"the Cargo fingerprint changed: {path}")
+                    if re.fullmatch(rb"[0-9a-f]{16}", os.read(leaf, 17)):
+                        return True
+                finally:
+                    os.close(leaf)
+        finally:
+            os.close(fd)
+    return False
+
+
+def mac_cargo_markers(inventory: removal_guard.MirrorOutputInventory) -> tuple[
+    dict[tuple[str, ...], list[tuple[str, ...]]], set[tuple[str, ...]]
+]:
+    fingerprints: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
+    incremental: set[tuple[str, ...]] = set()
+    for parts, entry in inventory.entries.items():
+        if not stat.S_ISREG(entry.mode):
+            continue
+        if len(parts) == 4 and parts[1] == FINGERPRINT_DIR and MAC_FINGERPRINT_NAME.fullmatch(parts[-1]):
+            fingerprints.setdefault(parts[:-1], []).append(parts)
+        if (len(parts) == 5 and parts[1] == INCREMENTAL_DIR and MAC_INCREMENTAL_SESSION.fullmatch(parts[-2])
+                and parts[-1] == "dep-graph.bin"):
+            products = inventory.entries.get((*parts[:-1], "work-products.bin"))
+            if products is not None and stat.S_ISREG(products.mode):
+                incremental.add(parts[:-2])
+    return fingerprints, incremental
+
+
+def mac_mirror_take_units(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
+                          inventory: removal_guard.MirrorOutputInventory, deadline: MacFloorDeadline, *,
+                          lint_settings: conf.ConfigRead
+                          ) -> list[MacMirrorTakeUnit]:
+    """Keep current lockfile packages and the newest build of each crate."""
+    try:
+        fd = os.open(target.path.parent / "Cargo.lock", removal_guard.FILE_FLAGS)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, "rb") as lockfile:
+        info = os.fstat(lockfile.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise removal_guard.ChangedEntry(f"the Cargo.lock is not a file: {target.path.parent}")
+        lock_state = removal_guard.MirrorEntry.from_stat(info)
+        packages = cast(dict[str, object], tomllib.load(lockfile)).get("package", [])
+    if not isinstance(packages, list):
+        raise removal_guard.ChangedEntry(f"invalid Cargo.lock packages: {target.path.parent}")
+    current: set[str] = set()
+    for package in cast(list[object], packages):
+        match package:
+            case {"name": str(name)}:
+                current.add(name.replace("-", "_"))
+            case _:
+                raise removal_guard.ChangedEntry(f"invalid Cargo.lock package: {target.path.parent}")
+    profiles = sorted({parts[0] for parts in inventory.entries if len(parts) == 2 and
+                       parts[1] in ("deps", "build", ".fingerprint", "incremental")})
+    scope = MirrorScanDirectories(frozenset(str(target.path.joinpath(*parts))
+                                      for parts, entry in inventory.entries.items() if stat.S_ISDIR(entry.mode)))
+    scan = Scan(observations=ScanDirectoryObservations(scope=scope))
+    _ = group_roots([str(target.path / profile) for profile in profiles], scan, lint_settings=lint_settings)
+    by_crate: dict[str, list[Group]] = {}
+    proven_crates: set[str] = set()
+    fingerprint_files, incremental_output = mac_cargo_markers(inventory)
+    for group in scan.groups:
+        deadline.check()
+        fingerprints = [Path(path) for path in group.entries if Path(path).parent.name == FINGERPRINT_DIR]
+        if len(fingerprints) != 1:
+            continue
+        fingerprint = fingerprints[0]
+        markers = fingerprint_files.get(fingerprint.relative_to(target.path).parts)
+        if markers and mac_cargo_fingerprint(guard, target.path, fingerprint, inventory, markers):
+            crate = fingerprint.name.rpartition("-")[0].replace("-", "_")
+            proven_crates.add(crate)
+            if crate not in current:
+                by_crate.setdefault(crate, []).append(group)
+    for group in scan.groups:
+        if group.kind == "incremental":
+            path = Path(group.entries[0])
+            crate = path.name.rpartition("-")[0].replace("-", "_")
+            if (crate in proven_crates and crate not in current
+                    and path.relative_to(target.path).parts in incremental_output):
+                by_crate.setdefault(crate, []).append(group)
+    units: list[MacMirrorTakeUnit] = []
+    for crate, groups in by_crate.items():
+        for kind in ("unit", "incremental"):
+            builds = sorted((group for group in groups if group.kind == kind),
+                            key=lambda group: (group.compiled, group.last_used, tuple(group.entries)))
+            for group in builds[:-1]:
+                paths: list[Path] = []
+                for entry in group.entries:
+                    path = Path(entry)
+                    try:
+                        form = guard.matching_form(path.relative_to(guard.root).parts)
+                    except removal_guard.Refused:
+                        continue
+                    if form is removal_guard.MirrorOutputForm.UNIT:
+                        stem = path.name.split(".", 1)[0].rpartition("-")[0].replace("-", "_")
+                        if stem == crate or path.parent.name == "deps" and stem == "lib" + crate:
+                            paths.append(path)
+                if paths:
+                    units.append(MacMirrorTakeUnit(target, tuple(paths), group.last_used, lock_state))
+    return units
+
+
+class MacFloorReached(Exception):
+    """The remaining entries no longer fit below the floor."""
+
+
+@dataclass
+class MacFloorBudget:
+    floor: int
+    remaining: int
+
+    def shortfall(self, root: Path) -> int:
+        return max(0, min(self.remaining, self.floor - free_bytes(str(root))))
+
+
+def record_mac_floor_removal(path: Path, size: int, allocated: int, last_use: float,
+                             extent: Literal["whole", "partial"]) -> None:
+    from scripts.buildlog import record
+
+    at = time.time()
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "sweep_trim", "v": record.RECORD_VERSION, "id": f"{host}-{time.time_ns()}",
+        "host": host, "at": store.utc_iso(at), "folder": str(path), "bytes_freed": size,
+        "extent": extent, "cause": "floor take", "last_use": last_use, "bytes_removed": allocated,
+        "reason": "free space below the mirror sweep floor",
+    })
+
+
+def record_mac_floor_entry(path: Path, size: int, last_use: float, *,
+                           kind: Literal["sweep_trim_intent", "sweep_trim_entry"],
+                           fields: dict[str, object]) -> str:
+    from scripts.buildlog import record
+
+    at = time.time()
+    host = store.host_name()
+    row_id = f"{host}-{time.time_ns()}"
+    store.append_line(store.host_file(host, at), {
+        "kind": kind, "v": record.RECORD_VERSION, "id": row_id,
+        "host": host, "at": store.utc_iso(at), "folder": str(path), "last_use": last_use,
+        "bytes": size, "cause": "floor take", "reason": "free space below the mirror sweep floor", **fields,
+    })
+    return row_id
+
+
+def remove_mac_floor_entries(guard: removal_guard.RemovalGuard, target: MacMirrorTakeTarget,
+                             paths: tuple[Path, ...], last_use: float, budget: MacFloorBudget,
+                             deadline: MacFloorDeadline, held: HeldMacTakeTarget, *,
+                             recheck_input: Callable[[], None]) -> bool:
+    """Stage the whole candidate, then check its entries and budget again."""
+    require_mac_mirror_outside_git(target.path)
+    with ExitStack() as opened:
+        checked = [opened.enter_context(guard.check(path)) for path in paths]
+        previous = [removal_guard.inspect_mirror_output(entry, frozenset(), deadline.check) for entry in checked]
+        for entry, expected in zip(checked, previous, strict=True):
+            prefix = entry.path.relative_to(target.path).parts
+            selected = {parts[len(prefix):]: observed for parts, observed in held.inventory.entries.items()
+                        if parts[:len(prefix)] == prefix}
+            if selected != expected.entries:
+                raise removal_guard.ChangedEntry(f"the locked mirror output changed: {entry.path}")
+        size = sum(inventory.bytes for inventory in previous)
+        if size > budget.shortfall(guard.root):
+            return False
+        staged = [opened.enter_context(removal_guard.stage_mirror_output(entry)) for entry in checked]
+        mounts = guard.mirror_mount_points()
+        staged = [replace(entry, mount_points=entry.mount_points | mounts) for entry in staged]
+        require_mac_mirror_outside_git(target.path)
+        for entry, expected in zip(staged, previous, strict=True):
+            if removal_guard.inspect_mirror_output(entry, frozenset(), deadline.check) != expected:
+                raise removal_guard.ChangedEntry(f"the staged mirror output changed: {entry.path}")
+        cargo_lock_sites: list[tuple[str, ...]] = []
+        if all(entry.form is removal_guard.MirrorOutputForm.UNIT for entry in staged):
+            stage_folders = tuple((entry.path.with_name(entry.ancestors[-1][1]), entry.ancestors[-1][2])
+                                  for entry in staged)
+            observed = removal_guard.inspect_mirror_output(
+                replace(held.checked, mount_points=held.checked.mount_points | mounts),
+                frozenset(), deadline.check, staged_folders=stage_folders)
+            for parts in mac_cargo_lock_names(observed):
+                require_held_mac_cargo_lock(held, parts, observed.entries[parts].key)
+            for parts, output in observed.entries.items():
+                if len(parts) <= 1 and stat.S_ISDIR(output.mode):
+                    cargo_lock_sites.extend((*parts, name) for name in LOCK_NAMES)
+            cargo_lock_sites.append(("doc", DOC_LOCK_NAME))
+
+        def require_original_paths_unused() -> None:
+            for original in checked:
+                try:
+                    _ = os.stat(original.name, dir_fd=original.parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                raise removal_guard.ChangedEntry(f"the original path was reused: {original.path}")
+
+        require_original_paths_unused()
+        for lock in held.locks:
+            if not any(lock.path.is_relative_to(path) for path in paths):
+                lock.recheck()
+        recheck_input()
+        if size > budget.shortfall(guard.root):
+            return False
+        for entry, expected in zip(staged, previous, strict=True):
+            if expected.bytes > budget.shortfall(guard.root):
+                return False
+            removed_bytes = 0
+            freed_bytes = 0
+            removed_paths = 0
+            pending_intent = ""
+            pending_path = entry.path
+            pending_size = 0
+
+            def require_space_for(size: int) -> None:
+                deadline.check()
+                shortfall = budget.shortfall(guard.root)
+                if not shortfall or size > shortfall:
+                    raise MacFloorReached
+
+            def before_unlink(path: Path, info: os.stat_result) -> None:
+                nonlocal pending_intent, pending_path, pending_size
+                pending_path = path
+                pending_size = info.st_blocks * 512
+                require_space_for(pending_size)
+                pending_intent = record_mac_floor_entry(path, pending_size, last_use,
+                                                       kind="sweep_trim_intent", fields={})
+                require_original_paths_unused()
+                require_mac_mirror_outside_git(target.path)
+                recheck_input()
+                for parts in cargo_lock_sites:
+                    try:
+                        current = target.path.joinpath(*parts).lstat()
+                    except FileNotFoundError:
+                        if parts in held.cargo_locks:
+                            raise
+                    else:
+                        require_held_mac_cargo_lock(held, parts, removal_guard.identity(current))
+                require_space_for(pending_size)
+
+            def account(path: str, info: os.stat_result) -> None:
+                nonlocal removed_bytes, freed_bytes, removed_paths, pending_intent
+                allocated = info.st_blocks * 512
+                freed = allocated if info.st_nlink == 1 or stat.S_ISDIR(info.st_mode) else 0
+                budget.remaining -= allocated
+                removed_bytes += allocated
+                freed_bytes += freed
+                removed_paths += 1
+                intent, pending_intent = pending_intent, ""
+                _ = record_mac_floor_entry(Path(path), allocated, last_use, kind="sweep_trim_entry",
+                                           fields={"intent": intent, "outcome": "removed", "bytes_freed": freed})
+
+            complete = False
+            try:
+                removal_guard.remove(entry, mirror=expected, check_time=deadline.check,
+                                     before_unlink=before_unlink, account=account)
+                complete = True
+            finally:
+                if pending_intent:
+                    _ = record_mac_floor_entry(pending_path, pending_size, last_use, kind="sweep_trim_entry",
+                                               fields={"intent": pending_intent, "outcome": "kept", "bytes_freed": 0})
+                if removed_paths:
+                    record_mac_floor_removal(entry.path, freed_bytes, removed_bytes, last_use,
+                        "whole" if complete and entry.form is removal_guard.MirrorOutputForm.TARGET else "partial")
+    return True
+
+
+def take_mac_mirror_floor(guard: removal_guard.RemovalGuard, desired: int, timeout: float,
+                          repository: str, *, lint_settings: conf.ConfigRead) -> int:
+    """Take only enough idle Mac mirror output to meet the floor."""
+    from scripts.lint import tmp_sweep
+
+    root = guard.root
+    deadline = MacFloorDeadline(time.monotonic() + timeout)
+    status = 0
+    try:
+        with mac_floor_lock(root / ".floor-take.lock", create=True):
+            budget = MacFloorBudget(desired, desired - free_bytes(str(root)))
+            try:
+                if budget.remaining > 0:
+                    targets = mac_mirror_take_targets(guard, deadline)
+                    claims = floor_claims.read_claims(min(10, deadline.remaining()))
+                    mirrors = tuple(target.path.parent for target in targets)
+                    if sys.platform == "darwin" and mirrors:
+                        paths = tmp_sweep.lsof_paths(tuple(str(mirror) for mirror in mirrors),
+                                                     require_complete=True, same_user_only=True)
+                        processes = copies.MirrorProcessScan(paths, frozenset())
+                    else:
+                        processes = copies.scan_mirror_processes(mirrors)
+                    if "*" in claims.repositories or isinstance(processes.uses, tmp_sweep.ProcessUsesUnavailable):
+                        raise removal_guard.ChangedEntry("the Mac build holders are unknown")
+                    if not repository and len(claims.repositories) == 1:
+                        repository = next(iter(claims.repositories))
+                    units: list[MacMirrorTakeUnit] = []
+                    locked_targets: dict[Path, HeldMacTakeTarget] = {}
+                    with ExitStack() as unit_locks:
+                        for target in targets:
+                            if not budget.shortfall(root):
+                                break
+                            if (claims.holds(str(target.path), root)
+                                    or copies.mirror_has_process(target.path.parent, processes)
+                                    or any(pid != os.getpid() and Path(path).is_relative_to(target.path)
+                                           for path, pid, _ in processes.uses.paths)):
+                                continue
+                            try:
+                                with ExitStack() as candidate_locks:
+                                    held = candidate_locks.enter_context(mac_take_target(guard, target, deadline))
+                                    if (target.repository != repository and remove_mac_floor_entries(
+                                            guard, target, (target.path,), target.last_use, budget, deadline, held,
+                                            recheck_input=deadline.check)):
+                                        continue
+                                    selected = mac_mirror_take_units(guard, target, held.inventory, deadline,
+                                                                     lint_settings=lint_settings)
+                                    if selected:
+                                        units.extend(selected)
+                                        locked_targets[target.path] = held
+                                        _ = unit_locks.enter_context(candidate_locks.pop_all())
+                            except MacFloorLockBusy:
+                                continue
+                        for unit in sorted(units, key=lambda unit: (unit.last_use, unit.entries)):
+                            if not budget.shortfall(root):
+                                break
+                            _ = remove_mac_floor_entries(guard, unit.target, unit.entries, unit.last_use, budget,
+                                deadline, locked_targets[unit.target.path], recheck_input=unit.recheck_cargo_lock)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, removal_guard.Refused) as error:
+                status = 1
+                print(f"Mac floor take stopped. {removal_guard.single_line(error)}", file=sys.stderr)
+    except (MacFloorLockBusy, MacFloorReached):
+        return 0
+    return status
+
+
 class NatedevFloor(Enum):
     """Use the existing Linux process and build hold checks."""
 
@@ -5337,6 +5905,34 @@ def switch_removal_list() -> int:
 
 
 def main(argv: list[str]) -> int:
+    mac_floor_commands = ([FLOOR_ONLY_FLAG, "--host", "mac"], ["--host", "mac", FLOOR_ONLY_FLAG])
+    mac_command = "mac-floor-take"
+    mac_host = any(first == "--host" and second == "mac" for first, second in zip(argv, argv[1:]))
+    if mac_command in argv or sys.platform == "darwin" and (mac_host or FLOOR_ONLY_FLAG in argv):
+        if sys.platform == "darwin" and argv in mac_floor_commands:
+            repository = ""
+        elif (sys.platform == "darwin" and len(argv) == 2 and argv[0] == mac_command
+                and removal_guard.NAME.fullmatch(argv[1]) and ".." not in argv[1]):
+            repository = argv[1]
+        else:
+            print("Use --floor-only --host mac or mac-floor-take <repository> on macOS.", file=sys.stderr)
+            return 2
+        try:
+            mac_settings = conf.read("mac_test")
+            mirror = MacMirrorRoot.read(mac_settings).local_path()
+            minimum = int(mac_settings.number("free_floor_gib") * GIB)
+            desired = int(mac_settings.number("sweep_floor_gib") * GIB)
+            if desired < minimum:
+                raise conf.Unusable("sweep_floor_gib must be at least free_floor_gib")
+            return take_mac_mirror_floor(removal_guard.read_mirror(mirror), desired,
+                                         mac_settings.number("floor_sweep_timeout_s"), repository,
+                                         lint_settings=conf.read("lint"))
+        except (conf.Unusable, OSError, ValueError, RuntimeError, removal_guard.Refused) as error:
+            print(f"Mac floor take stopped. {removal_guard.single_line(error)}", file=sys.stderr)
+            return 1
+    if mac_host and argv not in [command + ["--dry-run"] for command in mac_floor_commands]:
+        print("The Mac floor take requires macOS.", file=sys.stderr)
+        return 2
     if argv == ["--switch-removal-list"]:
         return switch_removal_list()
     if argv and argv[0] == "rebuilds":
@@ -5386,15 +5982,15 @@ def assess(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
+    if host == "mac" and (sys.platform == "darwin" or not floor_only or not dry_run):
+        print("Use the Mac floor take to remove Mac mirror output.", file=sys.stderr)
+        return 2
     try:
         guard = removal_guard.read()
         assess_form_folders(guard, BUILD_LIST.get(), Path(target_dir).absolute() if target_dir else None)
     except removal_guard.Refused as refusal:
         print(f"kept build folders: {refusal}")
     if host == "mac":
-        if not floor_only:
-            print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
-            return 2
         try:
             with conf.diagnostics(report=False):
                 mac_settings = conf.read("mac_test")

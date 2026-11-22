@@ -19,7 +19,7 @@ from typing import Literal, cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
+    ACTIVITY_SELECTOR_STUB, JSON_SHELL, install_nextest_log_writer, write_shell,
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
@@ -239,16 +239,20 @@ case ${2##*/} in
         shift 2
         set -- -B -c ''' + shlex.quote(TRIM_WITHOUT_PROC) + r''' "$@"
         ;;
+    sweep.py)
+        [ "$1" = -B ] && [ "$3" = mac-floor-take ] || exit 99
+        json_args "$3" "$4" > "$CLEANUP_TEST_DIR/floor-arguments.json"
+        exit "$CLEANUP_TEST_FLOOR_STATUS"
+        ;;
     *) exit 99 ;;
 esac
 '''
-        _ = python.write_text(interpreter + "\n" + launcher + body)
+        _ = python.write_text(interpreter + "\n" + JSON_SHELL + launcher + body)
         python.chmod(0o755)
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
-printf '%s' "$CLEANUP_TEST_DF_OUTPUT"
-exit "$CLEANUP_TEST_DF_STATUS"
+printf 'Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80%% /\n'
 ''')
         lint = self.home_directory / ".claude/scripts/lint/lint"
         lint.parent.mkdir(parents=True)
@@ -271,8 +275,7 @@ exit "$CLEANUP_TEST_STATUS"
 
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
-        disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
-        disk_status: int = 0,
+        floor_status: int = 0,
         free_floor_gib: float = 100,
         abandoned_session_minutes: int = 7,
         budget_gib: str = "24",
@@ -300,7 +303,7 @@ exit "$CLEANUP_TEST_STATUS"
             [*shell, "-c", text], cwd=self.home_directory,
             env={**shell_environment(self.root),
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
-                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
+                 "CLEANUP_TEST_FLOOR_STATUS": str(floor_status),
                  "CLEANUP_TEST_TRIM": str(trim), "CLEANUP_TEST_PROC": str(self.root / "mac-proc")},
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
@@ -430,7 +433,7 @@ exit "$CLEANUP_TEST_STATUS"
                                 self.assertEqual((session / "compiler-output").read_text(), "session data")
                                 self.assertEqual(lock.read_text(), "session lock")
 
-    def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
+    def test_remote_text_calls_the_floor_take_after_pass_and_failure(self) -> None:
         target = self.mirror / "target"
         sibling = self.mirror / "keep-source"
         temporary_file = self.temporary_directory / "keep-temporary"
@@ -447,30 +450,23 @@ exit "$CLEANUP_TEST_STATUS"
                     self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                     lines = self.cleanup_lines(answer)
                     self.assertEqual(lines[:2], ["nextest finished", f"mac_exit={status}"])
-                    self.assertEqual(len(lines), 3)
-                    self.assertRegex(lines[2], r"^mac_cleanup=0 [0-9]+ 99$")
-                    cleanup = offload.parse_cleanup(lines[2].removeprefix("mac_cleanup="))
-                    if not isinstance(cleanup, offload.CleanupDone):
-                        self.fail("The removal marker did not report a completed cleanup.")
-                    if not isinstance(cleanup.size, offload.MeasuredCleanupSize):
-                        self.fail("The target size was not measured.")
-                    self.assertGreater(cleanup.size.kib, 0)
+                    self.assertEqual(lines[2:], ["mac_cleanup=kept"])
                     self.assertEqual(answer.stderr, "")
-                    self.assertFalse(target.exists())
+                    self.assertEqual((target / "previous-build").read_text(), "old\n")
                     self.assertEqual((self.root / "sweep-switch").read_text(), "1")
                     self.assertEqual(
-                        cast(list[str], json.loads((self.root / "df-arguments.json").read_text())),
-                        ["-g", str(self.home_directory)],
+                        json.loads((self.root / "floor-arguments.json").read_text()),
+                        ["mac-floor-take", "hana's project"],
                     )
                     for path in (sibling, temporary_file, other_target):
                         self.assertEqual(path.read_text(), "keep\n")
 
         with self.subTest(environment="private"):
             environment_log = self.root / "shell-environment.json"
-            write_shell(self.bin_directory / "df", r'''
+            write_shell(self.bin_directory / "du", r'''
 json_args "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}" \
     "$LINT_SWEEP_STATE_DIR" "$LINT_SWEEP_DOC_INDEX_MIB" > "$CLEANUP_TEST_DIR/shell-environment.json"
-printf '%s' "$CLEANUP_TEST_DF_OUTPUT"
+printf '0\n'
 ''')
             with mock.patch.dict(os.environ, {
                 "GIT_DIR": str(self.root / "caller-git"),
@@ -484,7 +480,7 @@ printf '%s' "$CLEANUP_TEST_DF_OUTPUT"
             self.assertEqual(json.loads(environment_log.read_text()),
                              ["unset", "unset", str(self.root / "sweep-state"), DOC_INDEX_MIB])
 
-    def test_failed_size_measurement_still_removes_the_target_under_sh_and_zsh(self) -> None:
+    def test_failed_size_measurement_still_runs_the_floor_take(self) -> None:
         write_shell(self.bin_directory / "du", r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/du-arguments.json"
 printf '12\t%s\n' "$2"
@@ -495,29 +491,26 @@ exit 1
                 answer = self.run_remote(shell, 0)
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                 self.assertEqual(self.cleanup_lines(answer),
-                                 ["nextest finished", "mac_exit=0", "mac_cleanup=0 - 99"])
+                                 ["nextest finished", "mac_exit=0", "mac_cleanup=kept"])
                 self.assertEqual(answer.stderr, "")
-                self.assertFalse((self.mirror / "target").exists())
+                self.assertTrue((self.mirror / "target" / "nextest-output").exists())
+                self.assertTrue((self.root / "floor-arguments.json").exists())
                 self.assertEqual(json.loads((self.root / "du-arguments.json").read_text()),
                                  ["-sk", str(self.mirror / "target")])
 
-    def test_remote_text_at_or_above_space_floor_keeps_build_output(self) -> None:
+    def test_remote_text_retains_output_and_reports_the_workspace_budget(self) -> None:
         target = self.mirror / "target"
         target.mkdir()
         existing = target / "previous-build"
         _ = existing.write_text("keep\n")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
-                for free_space, floor in ((100, 100), (101, 100), (50, 50)):
-                    with self.subTest(shell=shell, status=status, free_space=free_space, floor=floor):
-                        answer = self.run_remote(
-                            shell, status, free_floor_gib=floor,
-                            disk_output=f"Filesystem GiB Used Available Capacity Mounted\nfixture 500 400 {free_space} 80% /\n",
-                        )
-                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
-                        self.assertEqual(existing.read_text(), "keep\n")
-                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+                with self.subTest(shell=shell, status=status):
+                    answer = self.run_remote(shell, status)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                    self.assertEqual(existing.read_text(), "keep\n")
+                    self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
@@ -537,7 +530,6 @@ exit 1
                         overrides = (("mac_budget_gib.hana's project", str(repository_kib / 1024 ** 2)),) if repository_kib else ()
                         answer = self.run_remote(
                             shell, status, free_floor_gib=100,
-                            disk_output="Filesystem GiB Used Available Capacity Mounted\nfixture 500 300 200 60% /\n",
                             budget_gib=str(default_kib / 1024 ** 2), budget_values=overrides, trim="run",
                         )
                         self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
@@ -559,21 +551,16 @@ exit 1
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         trim=9 if trim_fails else "run",
-                        disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
-                                     + f"fixture 500 300 {99 if trim_fails else 200} 60% /\n"),
                     )
                     self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                    self.assertEqual(retained.exists(), not trim_fails)
+                    self.assertEqual(len(retained.read_bytes()), 128 * 1024)
                     lines = answer.stdout.splitlines()
                     trim_lines = [line for line in lines if line.startswith("mac_trim=")]
                     self.assertEqual(len(trim_lines), 1, answer.stdout)
                     self.assertRegex(trim_lines[0],
                                      rf"^mac_trim=status={9 if trim_fails else 0} elapsed_seconds=[0-9]+ over_budget=yes$")
                     self.assertNotIn("lint sweep:", answer.stdout)
-                    if trim_fails:
-                        self.assertRegex(lines[-1], r"^mac_cleanup=0 [0-9]+ 99$")
-                    else:
-                        self.assertEqual(lines[-1], "mac_cleanup=kept")
+                    self.assertEqual(lines[-1], "mac_cleanup=kept")
 
         with self.subTest(user_zone="caller has no zone"):
             shutil.rmtree(target, ignore_errors=True)
@@ -594,20 +581,19 @@ exit 1
             self.assertIn("last used 2020-02-03 04:05 to 2020-02-03 04:05", report)
             self.assertNotIn("user_zone", (self.root / "trim-config-reads").read_text().splitlines())
 
-    def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
+    def test_remote_text_with_failed_floor_take_keeps_build_output(self) -> None:
         target = self.mirror / "target"
         target.mkdir()
         existing = target / "previous-build"
         _ = existing.write_text("keep\n")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
-                for disk_output, disk_status in (("", 0), ("header\nfixture 500 400 unavailable\n", 0), ("", 1)):
-                    with self.subTest(shell=shell, status=status, disk_output=disk_output, disk_status=disk_status):
-                        answer = self.run_remote(shell, status, disk_output=disk_output, disk_status=disk_status)
-                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
-                        self.assertEqual(existing.read_text(), "keep\n")
-                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+                with self.subTest(shell=shell, status=status):
+                    answer = self.run_remote(shell, status, floor_status=1)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=1"])
+                    self.assertEqual(existing.read_text(), "keep\n")
+                    self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
     def test_remote_text_with_another_target_dir_keeps_every_build_directory(self) -> None:
         target = self.mirror / "target"
@@ -626,7 +612,7 @@ exit 1
                         self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
                         self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])
 
-    def test_remote_text_reports_delete_failure_after_the_test_status(self) -> None:
+    def test_remote_text_never_calls_rm_for_the_floor(self) -> None:
         remove = self.bin_directory / "rm"
         write_shell(remove, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/remove-arguments.json"
@@ -638,10 +624,9 @@ exit 7
                     with self.subTest(shell=shell, status=status):
                         answer = self.run_remote(shell, status)
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
                         self.assertTrue((self.mirror / "target" / "nextest-output").exists())
-                        arguments = cast(list[str], json.loads((self.root / "remove-arguments.json").read_text()))
-                        self.assertEqual([word for word in arguments if not word.startswith("-")], [str(self.mirror / "target")])
+                        self.assertFalse((self.root / "remove-arguments.json").exists())
 
 
 class MacActivityShellTests(unittest.TestCase):

@@ -1933,6 +1933,11 @@ class SweepFailed:
     cause: str
 
 
+def mac_floor_take_command(repository: KnownRepository) -> str:
+    return ('"$HOME/.claude/scripts/lib/py" -B "$HOME/.claude/scripts/lint/sweep.py" mac-floor-take '
+            + shlex.quote(repository.name))
+
+
 def ensure_mac_disk_floor(
     controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
@@ -2113,7 +2118,6 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
         'config.number(sweep.RECENT_KEY)))'
     )
-    floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
         f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
         + 'trim_started=$(date +%s); '
@@ -2128,16 +2132,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + 'else over_budget=unknown; fi; '
         + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
         + '"$trim_status" "$trim_elapsed" "$over_budget"; '
-        + 'if free_gib=$(df -g "$HOME"); then '
-        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-        + 'else free_gib=; fi; '
-        + f'if awk -v free="$free_gib" -v floor={floor} '
-        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-        + f'if rm -rf -- "$HOME"/{target}; then '
-        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+        + f"if {mac_floor_take_command(repository)} >/dev/null; then echo mac_cleanup=kept; "
+        + "else echo mac_cleanup=$?; fi"
     )
 
 

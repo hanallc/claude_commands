@@ -21,7 +21,7 @@ import tempfile
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast, final
@@ -61,6 +61,7 @@ class RefusalReason(Enum):
     UNAVAILABLE_ROOTS = "cannot read the removal path templates"
     UNAVAILABLE_STAFF = "cannot read the staff record"
     UNAVAILABLE_MOUNTS = "cannot verify the mount table"
+    MIRROR_SOURCE = "the mirror output contains source"
 
 
 class Refused(Exception):
@@ -101,6 +102,36 @@ class Form(Enum):
     @property
     def empty(self) -> bool:
         return self in (Form.EMPTY_UNIT, Form.EMPTY_REPO)
+
+
+class MirrorOutputForm(Enum):
+    TARGET = "mirror target"
+    UNIT = "Cargo unit entry"
+
+    @property
+    def empty(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True)
+class MirrorOutputForms:
+    mount_reader: Callable[[], tuple[Path, ...]]
+
+    def match(self, parts: Sequence[str]) -> MirrorOutputForm:
+        prefix = len(parts) if len(parts) in (2, 3) else len(parts) - 3
+        if (prefix not in (2, 3) or parts[prefix - 1] != "target"
+                or not NAME.fullmatch(parts[0]) or ".." in parts[0]
+                or prefix == 3 and not re.fullmatch(r"[1-9][0-9]*", parts[1])):
+            raise Refused(RefusalReason.OUTSIDE_ROOT)
+        if prefix == len(parts):
+            return MirrorOutputForm.TARGET
+        profile, category, name = parts[prefix:]
+        stem = name.split(".", 1)[0]
+        if (NAME.fullmatch(profile) and NAME.fullmatch(name) and ".." not in profile and ".." not in name
+                and ((category in ("deps", "build", ".fingerprint") and re.fullmatch(r".+-[0-9a-f]{16}", stem))
+                     or (category == "incremental" and re.fullmatch(r".+-[a-z0-9]+", name)))):
+            return MirrorOutputForm.UNIT
+        raise Refused(RefusalReason.OUTSIDE_ROOT)
 
 
 @dataclass(frozen=True)
@@ -163,15 +194,17 @@ class CheckedEntry:
     parent: int
     name: str
     info: os.stat_result
-    form: Form
+    form: Form | MirrorOutputForm
     root: Path
     root_identity: Identity
     ancestors: tuple[tuple[int, str, Identity], ...]
     mount: str
+    mount_points: frozenset[Identity] = frozenset()
 
     def recheck(self) -> None:
         """Verify the same directory entries below the build root."""
-        if identity(self.root.stat()) != self.root_identity:
+        if (identity(self.root.stat()) != self.root_identity
+                or isinstance(self.form, MirrorOutputForm) and self.root.resolve(strict=True) != self.root):
             raise ChangedEntry("the build root changed")
         for parent, name, expected in self.ancestors:
             require_identity(parent, name, expected)
@@ -219,16 +252,23 @@ class RemovalGuard:
     root: Path
     root_identity: Identity
     protected: frozenset[Identity]
-    forms: tuple[Form, ...]
+    forms: tuple[Form, ...] | MirrorOutputForms
     names: KnownNames
     mounts: Mounts
 
-    def matching_form(self, parts: Sequence[str]) -> Form:
+    def mirror_mount_points(self) -> frozenset[Identity]:
+        if not isinstance(self.forms, MirrorOutputForms):
+            raise Refused(RefusalReason.OUTSIDE_ROOT)
+        return mount_snapshot(self.forms.mount_reader).points
+
+    def matching_form(self, parts: Sequence[str]) -> Form | MirrorOutputForm:
+        if isinstance(self.forms, MirrorOutputForms):
+            return self.forms.match(parts)
         if form := next((form for form in self.forms if form.matches(parts, self.names)), None):
             return form
         raise Refused(RefusalReason.OUTSIDE_ROOT)
 
-    def checked_location(self, path: Path) -> tuple[Path, Form]:
+    def checked_location(self, path: Path) -> tuple[Path, Form | MirrorOutputForm]:
         if not path.is_absolute() or ".." in path.parts:
             raise Refused(RefusalReason.OUTSIDE_ROOT, str(path))
         try:
@@ -250,8 +290,13 @@ class RemovalGuard:
         """Hold the checked parent until the caller finishes with the entry."""
         resolved, form = self.checked_location(path)
         with ExitStack() as opened:
-            root_fd = os.open(self.root, DIRECTORY_FLAGS)
-            _ = opened.callback(os.close, root_fd)
+            if isinstance(self.forms, MirrorOutputForms):
+                mounts = mount_snapshot(self.forms.mount_reader)
+                root_fd = open_mirror_root(self.home, self.root, mounts, opened)
+            else:
+                mounts = self.mounts
+                root_fd = os.open(self.root, DIRECTORY_FLAGS)
+                _ = opened.callback(os.close, root_fd)
             if identity(os.fstat(root_fd)) != self.root_identity:
                 raise ChangedEntry("the build root changed")
             parent = root_fd
@@ -259,16 +304,24 @@ class RemovalGuard:
             edges: list[tuple[int, str, Identity]] = []
             parts = resolved.relative_to(self.root).parts
             for index, name in enumerate(parts):
-                current = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+                last = index == len(parts) - 1
+                if isinstance(form, MirrorOutputForm) and name not in os.listdir(parent):
+                    raise Refused(RefusalReason.UNVERIFIED_PATH, "the entry has an alias")
+                flags = FILE_FLAGS if last and form is MirrorOutputForm.UNIT else DIRECTORY_FLAGS
+                current = os.open(name, flags, dir_fd=parent)
                 _ = opened.callback(os.close, current)
                 info = os.fstat(current)
                 key = identity(info)
-                if (key[0] != self.root_identity[0] or mount_id(current) != root_mount or key in self.mounts.points
-                        or index == len(parts) - 1 and key in self.mounts.ancestors):
+                if (key[0] != self.root_identity[0] or mount_id(current) != root_mount or key in mounts.points
+                        or last and key in mounts.ancestors):
                     raise Refused(RefusalReason.MOUNT, str(resolved))
                 if key in self.protected:
                     raise Refused(RefusalReason.PROTECTED_PATH)
-                if index == len(parts) - 1:
+                if last:
+                    if isinstance(form, MirrorOutputForm) and not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                        raise Refused(RefusalReason.UNVERIFIED_PATH, str(resolved))
+                    if form is MirrorOutputForm.UNIT and parts[-2] != "deps" and not stat.S_ISDIR(info.st_mode):
+                        raise Refused(RefusalReason.OUTSIDE_ROOT, str(resolved))
                     break
                 edges.append((parent, name, key))
                 parent = current
@@ -277,7 +330,193 @@ class RemovalGuard:
             if form.empty and os.listdir(current):
                 raise Refused(RefusalReason.OUTSIDE_ROOT, "the parent folder is not empty")
             yield CheckedEntry(resolved, parent, name, info, form, self.root, self.root_identity,
-                               tuple(edges), root_mount)
+                               tuple(edges), root_mount, mounts.points)
+
+
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def open_mirror_root(home: Path, root: Path, mounts: Mounts, opened: ExitStack) -> int:
+    """Open each exact directory below the home folder."""
+    parent = os.open(home, DIRECTORY_FLAGS)
+    _ = opened.callback(os.close, parent)
+    device = os.fstat(parent).st_dev
+    mount = mount_id(parent)
+    for name in root.relative_to(home).parts:
+        if name not in os.listdir(parent):
+            raise Refused(RefusalReason.INVALID_ROOT, str(root))
+        parent = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+        _ = opened.callback(os.close, parent)
+        key = identity(os.fstat(parent))
+        if key[0] != device or key in mounts.points or mount_id(parent) != mount:
+            raise Refused(RefusalReason.MOUNT, str(root))
+    return parent
+
+
+def read_mirror(root: Path, *, mount_reader: Callable[[], tuple[Path, ...]] | None = None) -> RemovalGuard:
+    """Read the guard for Cargo output in the configured Mac mirror."""
+    home = Path.home().resolve(strict=True)
+    excluded = (home / "rust", home / ".claude", home / ".cargo")
+    if mount_reader is None:
+        excluded += (Path("/tmp").resolve(),)
+    if (not root.is_relative_to(home) or root == home or ".." in root.parts or root.resolve() != root
+            or any(root.is_relative_to(path) or path.is_relative_to(root) for path in excluded)):
+        raise Refused(RefusalReason.INVALID_ROOT, str(root))
+    if mount_reader is None:
+        mount_reader = _mac_mount_points if sys.platform == "darwin" else _linux_mount_points
+    mounts = mount_snapshot(mount_reader)
+    protected = frozenset(identity(path.stat()) for path in (home, *home.parents))
+    with ExitStack() as opened:
+        info = os.fstat(open_mirror_root(home, root, mounts, opened))
+    if identity(info) in protected:
+        raise Refused(RefusalReason.INVALID_ROOT, str(root))
+    return RemovalGuard(home, root, identity(info), protected, MirrorOutputForms(mount_reader),
+                        KnownNames(frozenset(), frozenset()), mounts)
+
+
+def mirror_targets(guard: RemovalGuard, check_time: Callable[[], None]) -> list[Path]:
+    """Find target folders at the two supported mirror depths."""
+    if not isinstance(guard.forms, MirrorOutputForms):
+        raise Refused(RefusalReason.OUTSIDE_ROOT)
+    targets: list[Path] = []
+    mounts = mount_snapshot(guard.forms.mount_reader)
+    with ExitStack() as opened:
+        root_fd = open_mirror_root(guard.home, guard.root, mounts, opened)
+        if identity(os.fstat(root_fd)) != guard.root_identity:
+            raise ChangedEntry("the mirror root changed")
+        mount = mount_id(root_fd)
+
+        def visit(parent: int, folder: Path, depth: int) -> None:
+            for name in sorted(os.listdir(parent)):
+                check_time()
+                if not NAME.fullmatch(name) or ".." in name:
+                    continue
+                path = folder / name
+                if name == "target" and depth in (1, 2):
+                    if stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+                        targets.append(path)
+                    continue
+                if depth == 2 or depth == 1 and not re.fullmatch(r"[1-9][0-9]*", name):
+                    continue
+                if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+                    continue
+                child = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+                try:
+                    key = identity(os.fstat(child))
+                    if key[0] != guard.root_identity[0] or key in mounts.points or mount_id(child) != mount:
+                        raise Refused(RefusalReason.MOUNT, str(path))
+                    visit(child, path, depth + 1)
+                finally:
+                    os.close(child)
+
+        visit(root_fd, guard.root, 0)
+    return targets
+
+
+@dataclass(frozen=True)
+class MirrorEntry:
+    key: Identity
+    mode: int
+    bytes: int
+    size: int
+    modified: int
+
+    @classmethod
+    def from_stat(cls, info: os.stat_result) -> MirrorEntry:
+        return cls(identity(info), info.st_mode, info.st_blocks * 512, info.st_size, info.st_mtime_ns)
+
+
+@dataclass(frozen=True)
+class MirrorOutputInventory:
+    entries: dict[tuple[str, ...], MirrorEntry]
+    bytes: int
+
+
+def inspect_mirror_output(checked: CheckedEntry, tracked: frozenset[Path],
+                          check_time: Callable[[], None], *,
+                          staged_folders: tuple[tuple[Path, Identity], ...] = ()) -> MirrorOutputInventory:
+    """Verify every entry before the take can move or remove any of them."""
+    if not isinstance(checked.form, MirrorOutputForm):
+        raise Refused(RefusalReason.OUTSIDE_ROOT)
+    selected = tuple(part.casefold() for part in checked.path.parts)
+    for path in tracked:
+        source = tuple(part.casefold() for part in path.parts)
+        shared = min(len(source), len(selected))
+        if source[:shared] == selected[:shared]:
+            raise Refused(RefusalReason.MIRROR_SOURCE, str(checked.path))
+    entries: dict[tuple[str, ...], MirrorEntry] = {}
+
+    def visit(parent: int, name: str, relative: tuple[str, ...]) -> None:
+        check_time()
+        if name.casefold() in (".git", "cargo.toml"):
+            raise Refused(RefusalReason.MIRROR_SOURCE, str(checked.path.joinpath(*relative)))
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if name.startswith(".mac-floor-"):
+            if (checked.path.joinpath(*relative), identity(info)) in staged_folders:
+                return
+            raise ChangedEntry(f"a staged entry requires review: {checked.path.joinpath(*relative)}")
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise Refused(RefusalReason.UNVERIFIED_PATH, str(checked.path.joinpath(*relative)))
+        fd = os.open(name, FILE_FLAGS, dir_fd=parent)
+        try:
+            entry = MirrorEntry.from_stat(os.fstat(fd))
+            if entry != MirrorEntry.from_stat(info):
+                raise ChangedEntry(f"entry changed during assessment: {name}")
+            if (entry.key[0] != checked.root_identity[0] or entry.key in checked.mount_points
+                    or mount_id(fd) != checked.mount):
+                raise Refused(RefusalReason.MOUNT, str(checked.path.joinpath(*relative)))
+            entries[relative] = entry
+            if stat.S_ISDIR(entry.mode):
+                for child in os.listdir(fd):
+                    visit(fd, child, (*relative, child))
+        finally:
+            os.close(fd)
+
+    checked.recheck()
+    visit(checked.parent, checked.name, ())
+    checked.recheck()
+    return MirrorOutputInventory(entries, sum(entry.bytes for entry in entries.values()))
+
+
+@contextmanager
+def stage_mirror_output(checked: CheckedEntry) -> Generator[CheckedEntry]:
+    """Rename a checked entry beside its original location for a second check."""
+    from scripts.lib.session_move import rename_exclusive
+    from uuid import uuid4
+
+    if not isinstance(checked.form, MirrorOutputForm):
+        raise Refused(RefusalReason.OUTSIDE_ROOT)
+    stage = ".mac-floor-" + uuid4().hex
+    checked.recheck()
+    os.mkdir(stage, 0o700, dir_fd=checked.parent)
+    stage_info = os.stat(stage, dir_fd=checked.parent, follow_symlinks=False)
+    try:
+        descriptor = os.open(stage, DIRECTORY_FLAGS, dir_fd=checked.parent)
+        try:
+            key = identity(os.fstat(descriptor))
+            if key != identity(stage_info):
+                raise ChangedEntry("the staging folder changed")
+            require_identity(checked.parent, stage, key)
+            checked.recheck()
+            rename_exclusive(checked.parent, checked.name, descriptor, checked.name)
+            staged = replace(checked, parent=descriptor,
+                             ancestors=(*checked.ancestors, (checked.parent, stage, key)))
+            try:
+                staged.recheck()
+                yield staged
+            finally:
+                try:
+                    _ = os.stat(checked.name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    require_identity(descriptor, checked.name, identity(checked.info))
+                    rename_exclusive(descriptor, checked.name, checked.parent, checked.name)
+        finally:
+            os.close(descriptor)
+    finally:
+        require_identity(checked.parent, stage, identity(stage_info))
+        os.rmdir(stage, dir_fd=checked.parent)
 
 
 def _configured_path_templates(value: str) -> tuple[tuple[Path, Form], ...]:
@@ -322,19 +561,35 @@ def read(*, mount_reader: Callable[[], tuple[Path, ...]] | None = None,
                         tuple(form for _, form in setting.value), names or known_names(), mount_snapshot(mount_reader))
 
 
-def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], None] | None = None) -> None:
+def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], None] | None = None,
+           mirror: MirrorOutputInventory | None = None, check_time: Callable[[], None] | None = None,
+           before_unlink: Callable[[Path, os.stat_result], None] | None = None) -> None:
     """Remove the checked entry below the held parent descriptor."""
+    if isinstance(checked.form, MirrorOutputForm) and mirror is None:
+        raise Refused(RefusalReason.UNVERIFIED_PATH, "the mirror output has no checked inventory")
     parents: list[tuple[int, str, Identity]] = []
 
     def check_position() -> None:
+        if check_time is not None:
+            check_time()
         checked.recheck()
         for parent, name, key in parents:
             require_identity(parent, name, key)
 
+    def prepare_unlink(parent: int, name: str, path: Path, before: os.stat_result) -> None:
+        if before_unlink is not None:
+            before_unlink(path, before)
+        check_position()
+        require_identity(parent, name, identity(before))
+
     def visit(parent: int, name: str, path: Path, before: os.stat_result) -> None:
         key = identity(before)
-        if key[0] != checked.info.st_dev:
+        if key[0] != checked.info.st_dev or mirror is not None and key in checked.mount_points:
             raise Refused(RefusalReason.MOUNT, str(path))
+        if mirror is not None:
+            expected = mirror.entries.get(path.relative_to(checked.path).parts)
+            if expected != MirrorEntry.from_stat(before):
+                raise ChangedEntry(f"mirror entry changed before removal: {path}")
         if stat.S_ISDIR(before.st_mode):
             folder = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
             try:
@@ -351,34 +606,45 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
                         visit(folder, child, path / child, info)
                 finally:
                     _ = parents.pop()
-                check_position()
-                require_identity(parent, name, key)
+                if mirror is not None:
+                    before = os.fstat(folder)
+                prepare_unlink(parent, name, path, before)
+                if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != key:
+                    raise ChangedEntry(f"folder changed before removal: {path}")
                 os.rmdir(name, dir_fd=parent)
             finally:
                 os.close(folder)
         else:
-            if sys.platform == "linux":
-                leaf = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=parent)
+            prepare_unlink(parent, name, path, before)
+            if mirror is not None or sys.platform == "linux":
+                flags = FILE_FLAGS if mirror is not None else os.O_PATH | os.O_NOFOLLOW
+                leaf = os.open(name, flags, dir_fd=parent)
                 try:
-                    if identity(os.fstat(leaf)) != key:
+                    pinned = os.fstat(leaf)
+                    if (identity(pinned) != key
+                            or mirror is not None and MirrorEntry.from_stat(pinned) != MirrorEntry.from_stat(before)):
                         raise ChangedEntry(f"entry changed before open: {path}")
                     if mount_id(leaf) != checked.mount:
                         raise Refused(RefusalReason.MOUNT, str(path))
+                    if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != key:
+                        raise ChangedEntry(f"entry changed before removal: {path}")
+                    os.unlink(name, dir_fd=parent)
                 finally:
                     os.close(leaf)
-            check_position()
-            require_identity(parent, name, key)
-            os.unlink(name, dir_fd=parent)
+            else:
+                os.unlink(name, dir_fd=parent)
         if account is not None:
             account(str(path), before)
 
-    checked.recheck()
+    check_position()
     if checked.form.empty:
         os.rmdir(checked.name, dir_fd=checked.parent)
         if account is not None:
             account(str(checked.path), checked.info)
     else:
-        visit(checked.parent, checked.name, checked.path, checked.info)
+        info = (os.stat(checked.name, dir_fd=checked.parent, follow_symlinks=False)
+                if mirror is not None else checked.info)
+        visit(checked.parent, checked.name, checked.path, info)
 
 
 def _mac_mount_points() -> tuple[Path, ...]:
