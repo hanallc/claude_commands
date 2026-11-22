@@ -14,11 +14,15 @@ import io
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import scratch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -554,6 +558,53 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn("style sync: invalid production", output.getvalue())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+
+@final
+class GateRecoveryTests(MergeGateFixture):
+    def test_tests_only_sigterm_closes_the_active_record(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+        command = [*self.gate_command(), "--tests-only", "--repo", str(self.checkout),
+                   "--module", "hooks/test_first.py"]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                self.assertEqual(len(list(records.glob(f"{process.pid}-*.json"))), 1)
+                process.send_signal(signal.SIGTERM)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(list(records.glob("*.json")), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            directory = gate.gate_run_directory(self.checkout)
+        directory.mkdir(parents=True)
+        unfinished = gate.GateRecovery(directory / "unfinished.json", str(self.checkout), 5_000_001, "dead-owner")
+        unfinished.save()
+        folder = self.root / "retained"
+        canary = folder / "canary"
+        self.write(canary, "fixture data")
+        finished = gate.GateRecovery(directory / "finished.json", str(self.checkout), 5_000_002, "dead-owner",
+                                     folders=[str(folder)], finished=True)
+        finished.save()
+        saved = finished.path.read_text()
+
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(directory.glob("*.json")), [finished.path])
+        self.assertEqual(finished.path.read_text(), saved)
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertNotIn(str(folder), result.stderr)
 
 
 if __name__ == "__main__":

@@ -69,6 +69,7 @@ import statistics
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Literal, TextIO, cast
 
@@ -808,7 +809,11 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
 
 def recover_gate_record(path: Path) -> None:
     """Recover one record under its directory lock."""
-    data = cast(dict[str, object], json.loads(path.read_text()))
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        # The gate can remove its record while the scanner reads the directory.
+        return
     if data.get("finished") is True:
         return
     pid, start = cast(int, data["pid"]), cast(str, data["start"])
@@ -861,14 +866,16 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
         directory = gate_run_directory(repo)
         path = directory / f"{os.getpid()}-{token_hex(12)}.json"
         recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
-        recovery.save()
         token = ACTIVE_GATE_RECOVERY.set(recovery)
         try:
+            with cancellation.defer_cleanup_signals():
+                recovery.save()
             yield recovery
         finally:
-            ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.groups or recovery.tokens or recovery.rollback):
-                recovery.finish()
+            with cancellation.defer_cleanup_signals():
+                ACTIVE_GATE_RECOVERY.reset(token)
+                if not (recovery.groups or recovery.tokens or recovery.rollback):
+                    recovery.finish()
 
 
 @contextmanager
@@ -3038,6 +3045,30 @@ def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: flo
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
+@contextmanager
+def unwind_tests_only_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default SIGTERM action."""
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
+        yield
+        return
+    terminated = False
+
+    def terminate(number: int, _frame: object) -> None:
+        nonlocal terminated
+        if not terminated:
+            terminated = True
+            raise SystemExit(128 + number)
+
+    try:
+        _ = signal.signal(signal.SIGTERM, terminate)
+        yield
+    finally:
+        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if terminated:
+            signal.raise_signal(signal.SIGTERM)
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
@@ -3141,7 +3172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         with test_run_folder():
             return run_tests_only(args, SuiteMode.TARGETED)
     if args.tests_only:
-        return run_tests_only(args, SuiteMode.GATE)
+        with unwind_tests_only_on_sigterm():
+            return run_tests_only(args, SuiteMode.GATE)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)

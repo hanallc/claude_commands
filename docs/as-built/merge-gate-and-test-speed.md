@@ -249,6 +249,10 @@ Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 Gate startup checks recovery records for dead gate processes across checkouts.
+A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Successful recovery removes a record if it names no retained folders.
+Recovery reports retained folders for manual removal and keeps their finished record.
+The scanner skips finished records on later runs.
 If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
 Each gate process reports a refused record once.
 The gate keeps that record and checks the remaining records.
