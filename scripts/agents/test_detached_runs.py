@@ -1525,6 +1525,41 @@ sys.exit(1)
         self.assertEqual(events.read_text(), "populated 0\n")
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
+    def test_watcher_retries_a_read_error_before_committing(self) -> None:
+        path, cgroups, events = self.record_populated_slice()
+        original = path.read_bytes()
+        read_end = process_stop.slice_has_ended
+        first_read = True
+
+        def fail_once(scope: process_stop.RunSliceIdentity) -> bool:
+            nonlocal first_read
+            if first_read:
+                first_read = False
+                self.assertEqual(path.read_bytes(), original)
+                raise process_stop.SliceStopFailed("fixture cgroup.events read failed")
+            return read_end(scope)
+
+        def finish_scope(_directory: int, _scope: process_stop.RunSliceIdentity) -> None:
+            record = worker_lifecycle.read_json_object(path)
+            self.assertEqual(record.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
+            self.assertIs(record.get("stop_pass_requested"), True)
+            _ = events.write_text("populated 0\n")
+
+        with (patch.object(os, "setsid"),
+              patch.object(detached_run_process, "supervises", return_value=False),
+              patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(process_stop, "slice_has_ended", side_effect=fail_once),
+              patch.object(process_stop, "_term_slice", side_effect=finish_scope) as term,
+              patch.object(time, "sleep") as delay):
+            self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+            delay.assert_called_once()
+            term.assert_called_once()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "finished")
+        self.assertTrue(saved["finished_at"])
+        self.assertEqual(events.read_text(), "populated 0\n")
+
+    @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_natural_exit_after_stop_commit_reports_stopped(self) -> None:
         path, cgroups, events = self.record_populated_slice()
         self.update_record(path, exit_code=0)
@@ -2428,6 +2463,7 @@ send.deliver_worker_text = fake_sender
                          patch.object(detached_runs, "record_lock", side_effect=observe_record_lock), \
                          patch.object(fcntl, "flock", side_effect=observe_flock), \
                          patch.object(build_hold, "process_start_time", side_effect=reuse_at_recheck), \
+                         patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds((holder,))), \
                          patch.object(hold_enforcer, "record_build"), patch.object(hold_enforcer, "set_stop_status"), \
                          patch.object(detached_runs, "scope_prefix", return_value=prefix), \
                          patch.object(detached_runs, "_run", side_effect=[1, 0] if prefix else [0]) as run_command:

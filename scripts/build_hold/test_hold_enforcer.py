@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -17,7 +18,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, cast, override
+from typing import IO, Literal, cast, override
 from unittest import mock
 
 from scripts.build_queue import execution_identity
@@ -899,15 +900,14 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
                     self.assertEqual(command, scoped_command)
-                    signals: list[tuple[int, int]] = []
                     waiting = hold_enforcer.WaitingRun(table[10], OwningSession("gate-owner"))
-                    stop = hold_enforcer.stop_waiting_run(
-                        waiting, holder, table, self.proc,
-                        signal_group=lambda pid, signum: signals.append((pid, signum)),
-                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
-                    )
+                    with mock.patch.object(detached_runs, "command_group") as read_group:
+                        stop = hold_enforcer.stop_waiting_run(
+                            waiting, holder, table, self.proc,
+                            signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                        )
+                    read_group.assert_not_called()
                     self.assertIsInstance(stop, hold_enforcer.StoppedRun)
-                    self.assertEqual(signals, [])
                     self.assertTrue(process_stop.slice_has_ended(identity))
                     return exit_code
 
@@ -934,7 +934,10 @@ class HoldEnforcerTests(unittest.TestCase):
     def test_hold_exit_before_commit_leaves_no_stop_to_recover(self) -> None:
         self.assert_no_hold_commit(interrupted=True)
 
-    def assert_no_hold_commit(self, *, interrupted: bool) -> None:
+    def test_hold_release_while_waiting_for_stop_lock_leaves_no_commit(self) -> None:
+        self.assert_no_hold_commit(interrupted=False, released_while_waiting=True)
+
+    def assert_no_hold_commit(self, *, interrupted: bool, released_while_waiting: bool = False) -> None:
         runs = self.root / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         record = runs / "failed-hold-stop.json"
@@ -968,23 +971,47 @@ class HoldEnforcerTests(unittest.TestCase):
         events = scope / "cgroup.events"
         kill = scope / "cgroup.kill"
         _ = kill.write_text("0\n")
-        if interrupted:
+        if interrupted or released_while_waiting:
             _ = events.write_text("populated 1\n")
         failure = SystemExit if interrupted else process_stop.SliceStopFailed
         detail = "fixture hold exited before commit" if interrupted else "cannot read cgroup.events"
+
+        def stop() -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
+            return hold_enforcer.stop_waiting_run(
+                waiting, holder, table, self.proc,
+                signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+            )
 
         with (mock.patch.object(process_stop, "CGROUP_ROOT", cgroups),
               mock.patch("scripts.agents.detached_run_process.supervises", return_value=False),
               mock.patch.object(detached_runs, "_scope_stop_graces", return_value=(0.0, 0.0)),
               mock.patch.object(process_stop, "_term_slice") as term):
-            with (mock.patch.object(process_stop, "slice_has_ended", side_effect=read_before_commit),
-                  self.assertRaisesRegex(failure, detail)):
-                _ = hold_enforcer.stop_waiting_run(
-                    waiting, holder, table, self.proc,
-                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
-                )
+            if released_while_waiting:
+                lock_path = record.with_suffix(".scope-stop.lock")
+                flock = fcntl.flock
+                with lock_path.open("a") as held:
+                    flock(held, fcntl.LOCK_EX)
+                    lock_stat = lock_path.stat()
+
+                    def release_hold_at_lock(descriptor: int | IO[str], operation: int) -> None:
+                        fd = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                        if os.path.samestat(os.fstat(fd), lock_stat):
+                            self.assertEqual(operation, fcntl.LOCK_EX)
+                            with self.assertRaises(BlockingIOError):
+                                flock(fd, operation | fcntl.LOCK_NB)
+                            (self.holders / "holder").unlink()
+                            flock(held, fcntl.LOCK_UN)
+                        flock(fd, operation)
+
+                    with mock.patch.object(fcntl, "flock", side_effect=release_hold_at_lock):
+                        self.assertIsInstance(stop(), hold_enforcer.RunIdentityChanged)
+                self.assertFalse((self.holders / "holder").exists())
+            else:
+                with (mock.patch.object(process_stop, "slice_has_ended", side_effect=read_before_commit),
+                      self.assertRaisesRegex(failure, detail)):
+                    _ = stop()
             self.assertEqual(record.read_bytes(), original)
-            (self.holders / "holder").unlink()
+            (self.holders / "holder").unlink(missing_ok=True)
             self.assertEqual(build_hold.natedev_holds(self.holders).in_force, ())
             _ = events.write_text("populated 1\n")
             self.assertEqual(detached_runs.reap_orphans(str(self.root)), [])
@@ -1062,14 +1089,14 @@ class HoldEnforcerTests(unittest.TestCase):
                         signal_group=signal_group,
                     )
                 self.assertIn(100, inspected)
-                if current:
-                    self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+                self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
+                saved = cast(dict[str, object], json.loads(record.read_text()))
+                if current and not changes:
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
-                    saved = cast(dict[str, object], json.loads(record.read_text()))
                     self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
-                    self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])
+                    self.assertNotIn("stop_reason", saved)
 
     def test_only_confirmed_hold_stops_are_consumed(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force

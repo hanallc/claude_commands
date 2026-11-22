@@ -742,6 +742,9 @@ The supervisor saves the exit code and cleanup intent before it releases the wat
 The run record saves `finished_at` when it records the confirmed end of the slice.
 The caller saves the stop commit before it sends a signal. The stop commit is final.
 A read error before the commit leaves the run record unchanged.
+After supervisor loss, the watcher retries slice reads within the stop grace.
+The hold enforcer checks the active holder set again after it acquires the stop lock.
+Builds Kill recovery uses the same locked route check for a first commit. It can finish a commit that belongs to its action.
 A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.

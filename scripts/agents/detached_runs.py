@@ -481,18 +481,31 @@ def _resume_slice_stop(path: Path, run_slice: process_stop.RunSliceIdentity, *, 
         _finish_slice_stop(path, run_slice, ended=ended, grace=grace, kill_grace=kill_grace, cleanup=cleanup)
 
 
+def _read_slice_end(run_slice: process_stop.RunSliceIdentity, *, retry_seconds: float) -> bool:
+    deadline = time.monotonic() + retry_seconds
+    while True:
+        try:
+            return process_stop.slice_has_ended(run_slice)
+        except process_stop.SliceStopFailed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))
+
+
 def _stop_slice_command(
     path: Path, run_slice: process_stop.RunSliceIdentity, reason: str, *,
-    check: Callable[[], bool],
+    check: Callable[[], bool], retry_slice_read: bool,
 ) -> bool:
     grace, kill_grace = _scope_stop_graces()
     with _scope_stop_lock(path, blocking=True):
+        record = _read_record(path)
+        if record.get("command_slice") != run_slice or record["status"] != "running" or not reason:
+            return False
+        ended = _read_slice_end(run_slice, retry_seconds=grace if retry_slice_read else 0.0)
         with record_lock(path):
             record = _read_record(path)
-            if record.get("command_slice") != run_slice or record["status"] != "running" or not reason:
-                return False
-            ended = process_stop.slice_has_ended(run_slice)
-            if not check():
+            if record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                 return False
             if not record.get("stop_pass_requested"):
                 if ended:
@@ -506,6 +519,7 @@ def _stop_slice_command(
 def stop_command(
     path: Path, reason: str, *, check: Callable[[], bool] = lambda: True,
     stop_pass: bool = True, signal_group: Callable[[int, int], None] | None = None,
+    retry_slice_read: bool = False,
 ) -> bool:
     """Request a stop and confirm that the run slice has ended."""
     if not process_stop.supported():
@@ -516,7 +530,7 @@ def stop_command(
         run_slice = record["command_slice"]
         if not process_stop.is_slice_identity(run_slice):
             raise process_stop.SliceStopFailed("the saved run slice is invalid")
-        return _stop_slice_command(path, run_slice, reason, check=check)
+        return _stop_slice_command(path, run_slice, reason, check=check, retry_slice_read=retry_slice_read)
     starting_command = _recorded_group(record)
     if starting_command is None or record.get("status") != "running":
         return False
@@ -2099,7 +2113,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
         return not _has_saved_cgroup(record) or not detached_run_process.supervises(record["pid"], path)
 
     try:
-        _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone, stop_pass=False)
+        _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone, stop_pass=False, retry_slice_read=True)
     except process_stop.SliceStopFailed as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1
