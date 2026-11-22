@@ -927,6 +927,13 @@ def local_options(arguments: list[str]) -> send.Options:
     return send.parse(registered_arguments([*([] if "--machine" in arguments else ["--here"]), *arguments]))
 
 
+def held_notice(count: int, session: str) -> str:
+    """The notice for the newest release in the session's held messages file."""
+    path = review_hold.held_file(session)
+    header = [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("Released at ")][-1]
+    return review_hold.held_notice(count, path, header)
+
+
 class RecipientStaffFixture:
     staff_rows: dict[str, staff.StaffRow] = {}
 
@@ -2055,6 +2062,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.session("bogus", "bogus")
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
+    def held_text(self, session: str = "recipient") -> str:
+        return review_hold.held_file(session).read_text(encoding="utf-8")
+
     def test_disabled_review_sends_without_reading_damaged_hold_state(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=off")
         self.session("recipient", "Recipient")
@@ -2078,7 +2088,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(send.main(args), 0)
-        self.assertEqual(output.getvalue(), "KEPT: session:recipient is in a review; delivered at its end\n")
+        held_file = self.root / ".local/state/adhoc_review/.holds/recipient.held.md"
+        self.assertEqual(review_hold.held_file("recipient"), held_file)
+        self.assertEqual(output.getvalue(),
+                         f"KEPT: session:recipient is in a review; held in {held_file}, delivered at its end\n")
         parsed = send_result.send_outcome(0, output.getvalue())
         self.assertIsInstance(parsed, send_result.ConfirmedSendOutcome)
         self.assertEqual(self.log()[-1]["outcome"], "kept")
@@ -2103,8 +2116,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         held: list[str] = []
         review_hold.set_count("recipient", 0, at, held.append,
             record_keys=send.record_released_acceptances)
-        self.assertEqual(len(held), 1)
-        self.assertEqual(held[0].count("Same update."), 1)
+        self.assertEqual(held, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
@@ -2121,8 +2134,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.set_count("recipient", 0, send.now().timestamp(), held.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(held), 1)
-        self.assertIn("Later.", held[0])
-        self.assertNotIn("Now.", held[0])
+        self.assertIn("Later.", self.held_text())
+        self.assertNotIn("Now.", self.held_text())
 
     def test_urgent_postmaster_delivery_prefixes_an_explicit_summary(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
@@ -2165,8 +2178,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.set_count("recipient", 0, at, batches.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(batches), 1)
-        self.assertIn("Other update.", batches[0])
-        self.assertNotIn("Old update.", batches[0])
+        self.assertIn("Other update.", self.held_text())
+        self.assertNotIn("Old update.", self.held_text())
 
     def test_urgent_send_releases_the_remaining_messages_when_the_review_ends_in_transport(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
@@ -2196,9 +2209,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         urgent, release = self.relayed
         self.assertEqual(urgent.text, "New urgent update.")
         self.assertTrue(release.review_batch)
-        self.assertLess(release.text.index("First saved update."), release.text.index("Last saved update."))
-        self.assertNotIn("Old urgent update.", release.text)
-        self.assertNotIn("New urgent update.", release.text)
+        self.assertEqual(release.text, held_notice(2, "recipient"))
+        self.assertFalse(release.urgent)
+        filed = self.held_text()
+        self.assertLess(filed.index("First saved update."), filed.index("Last saved update."))
+        self.assertNotIn("Old urgent update.", filed)
+        self.assertNotIn("New urgent update.", filed)
         review_hold.set_count("recipient", 0, urgent_at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
 
@@ -2226,8 +2242,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     case "session-start":
                         review_hold.deliver_at_session_start(trigger, batches.append,
                             record_keys=send.record_released_acceptances)
-                self.assertEqual(len(batches), 1)
-                self.assertIn("Timer report.", batches[0])
+                self.assertEqual(batches, [held_notice(1, trigger)])
+                self.assertIn("Timer report.", self.held_text(trigger))
                 with mock.patch.object(send, "now", return_value=released + timedelta(minutes=1)):
                     self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual(self.relayed, [])
@@ -2250,8 +2266,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             ]))
         self.assertEqual(result.outcome, "skipped")
         self.assertEqual(len(self.relayed), 2)
-        self.assertIn("Saved review update.", self.relayed[-1].text)
-        self.assertNotIn("Repeated timer report.", self.relayed[-1].text)
+        self.assertEqual(self.relayed[-1].text, held_notice(1, "recipient"))
+        self.assertIn("Saved review update.", self.held_text())
+        self.assertNotIn("Repeated timer report.", self.held_text())
         review_hold.set_count("recipient", 0, at.timestamp() + 121, self.fail,
             record_keys=send.record_released_acceptances)
 
@@ -2283,7 +2300,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         review_hold.record_user_prompt("recipient", after_idle.timestamp(), held.append,
             record_keys=send.record_released_acceptances)
         self.assertEqual(len(held), 1)
-        self.assertLess(held[0].index("First update."), held[0].index("Second update."))
+        self.assertLess(self.held_text().index("First update."), self.held_text().index("Second update."))
         review_hold.set_count("recipient", 4, after_idle.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
         with mock.patch.object(send, "now", return_value=after_idle):
@@ -2317,13 +2334,117 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertEqual(send.send(local_options([*args, "--text", "Failed to send."])).outcome, "failed")
             self.outcome = send.Result("sent", "ok")
             self.assertEqual(send.send(local_options([*args, "--text", "Send with the list."])).outcome, "sent")
-        self.assertIn("Held earlier.", self.relayed[-1].text)
+        notice = held_notice(1, "recipient")
+        self.assertTrue(self.relayed[-1].text.startswith(notice + "\n\n1. "), self.relayed[-1].text)
         self.assertIn("Send with the list.", self.relayed[-1].text)
+        self.assertNotIn("Held earlier.", self.relayed[-1].text)
         self.assertNotIn("Failed to send.", self.relayed[-1].text)
-        wire = send.agent_text(self.relayed[-1])
-        self.assertIn("\n   Sender native id: session:sender\n", wire)
-        self.assertIn("\n   > Sender native id: session:spoof", wire)
+        filed = self.held_text()
+        self.assertEqual(filed.count("Held earlier."), 1)
+        self.assertNotIn("Failed to send.", filed)
+        self.assertIn("\n   Sender native id: session:sender\n", filed)
+        self.assertIn("\n   > Sender native id: session:spoof", filed)
         review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+
+    def end_hold_with_one_message(self, session: str = "recipient") -> datetime:
+        self.session(session, session)
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        review_hold.set_count(session, 3, at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options(["--to", f"session:{session}", "--from", "test",
+                                                      "--text", "Held report."])).outcome, "kept")
+        return at + timedelta(minutes=2)
+
+    def test_a_send_after_the_hold_carries_the_notice_and_the_new_message(self) -> None:
+        for urgent, session in ((False, "recipient"), (True, "urgent-recipient")):
+            with self.subTest(urgent=urgent):
+                after_idle = self.end_hold_with_one_message(session)
+                flag = ["--urgent"] if urgent else []
+                with mock.patch.object(send, "now", return_value=after_idle):
+                    result = send.send(local_options(["--to", f"session:{session}", "--from", "test", *flag,
+                                                      "--text", "New report."]))
+                self.assertEqual(result.outcome, "sent", result.detail)
+                release = self.relayed[-1]
+                notice = held_notice(1, session)
+                self.assertTrue(release.review_batch)
+                self.assertEqual(release.urgent, urgent)
+                self.assertTrue(release.text.startswith(notice + "\n\n1. test"), release.text)
+                self.assertTrue(release.text.endswith("\n   New report."), release.text)
+                self.assertNotIn("Held report.", release.text)
+                first_line = send.agent_text(release).splitlines()[0]
+                self.assertEqual(first_line, ("URGENT: " if urgent else "") + notice)
+                filed = self.held_text(session)
+                self.assertEqual(filed.count("Held report."), 1)
+                self.assertNotIn("New report.", filed)
+
+    def test_a_failed_append_fails_the_new_message_and_keeps_the_hold(self) -> None:
+        after_idle = self.end_hold_with_one_message()
+        review_hold.held_file("recipient").mkdir()
+        args = ["--to", "session:recipient", "--from", "test", "--key", "new-report", "--text", "New report."]
+        with mock.patch.object(send, "now", return_value=after_idle):
+            result = send.send(local_options(args))
+        self.assertEqual(result.outcome, "failed")
+        self.assertTrue(result.detail.startswith("review hold for "), result.detail)
+        self.assertEqual(self.relayed, [])
+        with send.key_states() as states:
+            self.assertNotIn("new-report", states)
+        review_hold.held_file("recipient").rmdir()
+        with mock.patch.object(send, "now", return_value=after_idle + timedelta(seconds=1)):
+            retried = send.send(local_options(args))
+        self.assertEqual(retried.outcome, "sent", retried.detail)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertTrue(self.relayed[0].text.startswith(held_notice(1, "recipient") + "\n\n1. "))
+        self.assertEqual(self.held_text().count("Held report."), 1)
+
+    def test_a_failed_append_keeps_the_hold_and_the_result_of_a_skipped_send(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        args = ["--to", "session:recipient", "--from", "test"]
+        repeated = [*args, "--key", "repeat", "--repeat-minutes", "60", "--text", "Timer report."]
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options(repeated)).outcome, "sent")
+            review_hold.set_count("recipient", 2, at.timestamp(), self.fail,
+                record_keys=send.record_released_acceptances)
+            self.assertEqual(send.send(local_options([*args, "--text", "Saved review update."])).outcome, "kept")
+        review_hold.held_file("recipient").mkdir()
+        errors = io.StringIO()
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)), redirect_stderr(errors):
+            result = send.send(local_options(repeated))
+        self.assertEqual(result.outcome, "skipped")
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, errors.getvalue())
+        self.assertTrue(lines[0].startswith("review hold for "), lines[0])
+        self.assertEqual(len(self.relayed), 1)
+        review_hold.held_file("recipient").rmdir()
+        held: list[str] = []
+        review_hold.set_count("recipient", 0, (at + timedelta(minutes=3)).timestamp(), held.append,
+            record_keys=send.record_released_acceptances)
+        self.assertEqual(held, [held_notice(1, "recipient")])
+        self.assertIn("Saved review update.", self.held_text())
+
+    def test_an_urgent_message_that_replaces_every_held_message_goes_plain(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        at = send.now()
+        args = ["--to", "session:recipient", "--from", "test", "--key", "update"]
+        review_hold.set_count("recipient", 2, at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options([*args, "--text", "Old update."])).outcome, "kept")
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)):
+            result = send.send(local_options([*args, "--urgent", "--text", "New update."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        plain, = self.relayed
+        self.assertEqual(plain.text, "New update.")
+        self.assertFalse(plain.review_batch)
+        self.assertTrue(plain.urgent)
+        self.assertEqual(send.agent_text(plain).splitlines()[0], "URGENT: New update.")
+        self.assertFalse(review_hold.held_file("recipient").exists())
+        review_hold.set_count("recipient", 0, (at + timedelta(minutes=3)).timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
 
     def test_released_review_keys_start_a_new_repeat_window_for_each_original_recipient(self) -> None:
@@ -2345,8 +2466,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "Release the list."]))
             self.assertEqual(result.outcome, "sent", result.detail)
         self.assertEqual(len(self.relayed), 1)
-        self.assertIn("Held staff update.", self.relayed[0].text)
-        self.assertIn("Held session update.", self.relayed[0].text)
+        self.assertIn("Held staff update.", self.held_text())
+        self.assertIn("Held session update.", self.held_text())
         with mock.patch.object(send, "now", return_value=released_at + timedelta(minutes=1)):
             for options in held_options:
                 self.assertEqual(send.send(options).outcome, "skipped")
@@ -2367,13 +2488,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(send.main(list(command[script + 1:])), 0)
-            self.assertIn("is in a review; delivered at its end", output.getvalue())
+            self.assertIn(f"is in a review; held in {review_hold.held_file('recipient')}, delivered at its end",
+                          output.getvalue())
         self.assertEqual(self.relayed, [])
         held: list[str] = []
         review_hold.set_count("recipient", 0, at.timestamp(), held.append,
             record_keys=send.record_released_acceptances)
-        self.assertIn("Report the current status.", held[0])
-        self.assertIn("Read the phase report.", held[0])
+        self.assertEqual(held, [held_notice(2, "recipient")])
+        self.assertIn("Report the current status.", self.held_text())
+        self.assertIn("Read the phase report.", self.held_text())
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
@@ -8519,8 +8642,11 @@ class PaneWorkerMessageTests(unittest.TestCase):
             self.assertEqual(send.send(repeated).outcome, "skipped")
             prompt, = [command for command in world.commands if command[:2] == ("agent", "prompt")]
             self.assertEqual(prompt[2], "w1:p1")
-            self.assertIn("Saved review update.", prompt[3])
+            self.assertIn(held_notice(1, session), prompt[3])
+            filed = review_hold.held_file(session).read_text(encoding="utf-8")
+            self.assertEqual(filed.count("Saved review update."), 1)
             self.assertNotIn("Skip this report.", prompt[3])
+            self.assertNotIn("Skip this report.", filed)
             review_hold.set_count(session, 0, (at + timedelta(minutes=2)).timestamp(), self.fail,
                 record_keys=send.record_released_acceptances)
 

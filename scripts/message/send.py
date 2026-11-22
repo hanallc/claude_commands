@@ -5553,10 +5553,14 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         except OSError as error:
             new_message_result = Result("failed", f"review hold for {destination}: {error}")
         else:
-            new_message_result = Result("kept", f"{options.to} is in a review; delivered at its end")
+            new_message_result = Result("kept", f"{options.to} is in a review; held in "
+                                        + f"{review_hold.held_file(review_session)}, delivered at its end")
 
     def review_transport(batch: review_hold.ReleasedMessages, *, batch_only: bool) -> Message:
-        body = review_hold.render(batch.held if batch_only else batch.messages)
+        """Write the held part to the held messages file; the body names the file."""
+        body = review_hold.file_release(review_session, batch, now().timestamp(), batch_only=batch_only)
+        if not batch_only and isinstance(batch.new_message, review_hold.ReviewMessage):
+            body += "\n\n" + review_hold.numbered_entries((batch.new_message,))
         return replace(message, summary="Messages from the review", text=body, review_batch=True,
                        key=None if batch_only else message.key, urgent=message.urgent and not batch_only)
 
@@ -5716,14 +5720,29 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             batch.accepted_at = now().timestamp()
 
     batch_only = new_message_result is not None
-    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
-        result = deliver(review_transport(review_route, batch_only=batch_only), batch_only=batch_only)
+    # With nothing to file (the urgent message replaced every held message), the new message goes plain.
+    if (isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages
+            and (batch_only or review_route.to_file)):
+        try:
+            transport = review_transport(review_route, batch_only=batch_only)
+        except OSError as error:
+            # The release failed, so its messages stay held and the new message fails with it.
+            # A same-key held copy then cannot arrive after the new copy.
+            failure = f"review hold for {destination}: {error}"
+            if new_message_result is None:
+                result = Result("failed", failure)
+            else:
+                print(failure, file=sys.stderr)
+                result = new_message_result
+        else:
+            result = deliver(transport, batch_only=batch_only)
+            confirm_review_delivery(review_route, result)
     elif new_message_result is not None:
         result = new_message_result
     else:
         result = deliver(message)
-    if isinstance(review_route, review_hold.ReleasedMessages):
-        confirm_review_delivery(review_route, result)
+        if isinstance(review_route, review_hold.ReleasedMessages):
+            confirm_review_delivery(review_route, result)
     if new_message_result is not None:
         result = new_message_result
     if result.outcome == "sent" and message.key is not None:
