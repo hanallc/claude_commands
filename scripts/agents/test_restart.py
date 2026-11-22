@@ -48,7 +48,7 @@ from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
-from scripts.lib import conf, file_lock, unit_runs, resume_message
+from scripts.lib import conf, file_lock, socket_test_support, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
@@ -767,10 +767,13 @@ class MixedRestartTests(ShutdownTestCase):
         self.assertEqual(sys.platform, "linux")
         from scripts.herdr import worker_panes
         from scripts.herdr.test_worker_panes import PaneWorld
+        from scripts.production import stall_watch
 
-        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-")))
+        socket_root = Path(fixture.enter_context(socket_test_support.short_socket_directory()))
+        _ = fixture.enter_context(patch.object(stall_watch, "STATE_DIR", root / "state/stall-watch"))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
-        environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
+        environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(socket_root),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),
             "HERDR_PROC": str(root / "proc"), "HERDR_PANE_RECORD_DIR": str(root / "panes"),
             "CLAUDE_CONFIG_DIR": str(root / ".claude2"), "CODEX_HOME": str(root / ".codex1"),
@@ -958,7 +961,7 @@ class MixedRestartTests(ShutdownTestCase):
                     handler.handle()
                 self.assertEqual(stream.getvalue(), b"" if failure else b'{"result": {}}\n')
 
-        endpoint = root / "config/herdr/sessions/agents/herdr.sock"
+        endpoint = socket_root / "herdr/sessions/agents/herdr.sock"
         endpoint.parent.mkdir(parents=True)
         server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
         thread = Thread(target=server.serve_forever, daemon=True)
@@ -1916,7 +1919,7 @@ class RestartTests(RestartTestCase):
     def assert_child_report_survives_launcher(self, outcome: str, row: staff.StaffRow) -> None:
         log_path = Path()
         written = b""
-        notification = self.root / f"notify-{outcome}"
+        notification = Path(self.enterContext(socket_test_support.short_socket_directory())) / "notify"
 
         def create_claim(path: Path, content: str) -> bool:
             if outcome == "full disk" and path.exists():
