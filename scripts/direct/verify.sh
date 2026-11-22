@@ -4012,8 +4012,12 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
+    # The admission service uses the sidecar to tell that the guard allowed the step.
+    if sidecar := os.environ.pop("BUILDLOG_SCOPE_SIDECAR", ""):
+        Path(sidecar).write_text(os.environ["BUILDLOG_STEP_SCOPE"] + "\n")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
+os.environ.pop("BUILDLOG_DEFER_SCOPE_SIDECAR", None)
 sys.exit(shell_status(subprocess.call(command)))
 '
 
@@ -4096,6 +4100,7 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            BUILDLOG_DEFER_SCOPE_SIDECAR=1 \
             VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
