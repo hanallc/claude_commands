@@ -2086,9 +2086,19 @@ cancel_tree_run() {
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
     note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
-    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
     exit "$TREE_CHANGED_STATUS"
+}
+
+remove_tree_watch() {
+    [[ -n "$TREE_WATCH_DIR" ]] || return 0
+    local folder="$TREE_WATCH_DIR" remove_status=0
+    TREE_WATCH_DIR=""
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || remove_status=$?
+    # Status 1 leaves the folder for collection. Status 2 already has a diagnostic.
+    if (( remove_status > 2 )); then
+        printf 'verify.sh: cannot remove the tree watch folder %s (status %s).\n' "$folder" "$remove_status" >&2
+    fi
+    return 0
 }
 
 start_tree_watch() {
@@ -2096,7 +2106,7 @@ start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
-    [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
+    [[ -s "$TREE_WATCH_DIR/start" ]] || { remove_tree_watch; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
@@ -2108,8 +2118,7 @@ start_tree_watch() {
 finish_tree_watch() {
     stop_tree_watch
     cancel_tree_run
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
 }
 
 # Match the checkout selection for Python on standard input.
@@ -4316,8 +4325,7 @@ verify_cleanup() {
     if [[ -n "${DOC_COPY_OWNER_PID:-}" ]]; then step_close_checkout stop; fi
     if [[ -n "${COPY_RUN_WATCH_PID:-}" ]]; then collect_child "$COPY_RUN_WATCH_PID" TERM; fi
     stop_tree_watch
-    [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
-    TREE_WATCH_DIR=""
+    remove_tree_watch
     lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
@@ -4352,6 +4360,17 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
+
+finish_exit_diagnostics() {
+    [[ -n "$exit_diagnostics" ]] || return 0
+    if [[ -s "$exit_diagnostics" ]]; then
+        # Forward diagnostics only after cleanup releases the token and lease.
+        VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+            cat -- "$exit_diagnostics" 2>/dev/null || true
+    fi
+    rm -f -- "$exit_diagnostics" || true
+}
+
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it. $2 is the command
 # that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
@@ -4361,36 +4380,47 @@ verify_cleanup() {
 # unknown here) and writes no pass. Cleanup is best effort: errexit is off,
 # so one failed cleanup command does not end the trap with its status.
 verify_exit() {
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     EXIT_STATUS=$1
     set +e
+    local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
-        interrupt_hold_wait
-        verify_cleanup interrupted
+        outcome=interrupted
+        interrupt_hold_wait >&2
     elif (( EXIT_STATUS == 0 )); then
-        verify_cleanup completed
-    else
-        verify_cleanup error
+        outcome=completed
     fi
-    finish_verify_run "$EXIT_STATUS"
+    verify_cleanup "$outcome" >&2
+    finish_verify_run "$EXIT_STATUS" >&2
+    if [[ "$outcome" == interrupted ]]; then
+        printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" >&2
+    fi
+    finish_exit_diagnostics
     exit "$EXIT_STATUS"
 }
+# The hold folder is removed during cleanup. Keep diagnostics in the run's temp folder.
+exit_diagnostics="$(mktemp "${TMPDIR:-/tmp}/verify-exit.XXXXXX" 2>/dev/null)" || exit_diagnostics=""
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
+    exec 2>/dev/null
+    exec 2>>"${exit_diagnostics:-/dev/null}" || true
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
-    interrupt_hold_wait
+    interrupt_hold_wait >&2
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
-    verify_cleanup interrupted
-    finish_verify_run "$EXIT_STATUS"
+    verify_cleanup interrupted >&2
+    finish_verify_run "$EXIT_STATUS" >&2
+    finish_exit_diagnostics
     stop_interrupted_run_log
     if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
         trap - INT TERM HUP
