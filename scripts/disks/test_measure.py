@@ -74,11 +74,14 @@ class TreeTests(unittest.TestCase):
         self.assertEqual([child["name"] for child in root["children"]], ["data"])
 
     def test_dust_command_runs_at_idle_priority_under_the_memory_cap(self) -> None:
-        command = measure.dust_command("/build", settings(Path("/unused"), "/build"))
         config = Path(measure.__file__).with_name("dust.toml")
-        self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=2G", "--"])
-        self.assertEqual(command[8:], ["nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
-                                       "-z", str(KEEP - 1), "-d", "7", "-n", "128", "--config", str(config), "/build"])
+        for name in ("", "builds-detached-r1.slice"):
+            with self.subTest(slice=name), mock.patch.dict(os.environ, {"DETACHED_RUN_SLICE": name}):
+                command = measure.dust_command("/build", settings(Path("/unused"), "/build"))
+                slice_args = [f"--slice={name}"] if name else []
+                self.assertEqual(command, ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    *slice_args, "-p", "MemoryMax=2G", "--", "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P",
+                    "-o", "b", "-z", str(KEEP - 1), "-d", "7", "-n", "128", "--config", str(config), "/build"])
         self.assertTrue(config.is_file())
 
 

@@ -74,9 +74,12 @@ If the write fails, the route adds the write error to the probe failure.
 Queue placement will read the backoff when item 191 B3 registers `mac-linux` for placement.
 After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
 The setting accepts whole numbers from 1 to 86400 seconds.
-The Mac claim is a placeholder until item 191 B3. The guest run holds a separate lock.
+The route takes the Mac repository claim before the first SSH request.
+The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
-The route sends no more cleanup requests. The guest run keeps its lock until it ends.
+The route sends no more cleanup requests.
+The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
+The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest cannot return a result, the gate fails and reports the guest and the reason.
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.

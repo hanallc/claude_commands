@@ -24,6 +24,7 @@ from pathlib import Path
 import stat
 import select
 import signal
+import shlex
 import socket
 import sys
 import tempfile
@@ -222,7 +223,7 @@ class PlacementStatusTests(unittest.TestCase):
         )
         from scripts.mac_test import claim_state, offload
 
-        for blocker in ("live holder", "pending start"):
+        for blocker in ("live holder", "pending start", "pending start with generation"):
             with self.subTest(blocker=blocker), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
@@ -230,10 +231,12 @@ class PlacementStatusTests(unittest.TestCase):
                 claim = adopt_assignment(fixture, request, assignment)
                 self.assertEqual(fixture.server.handle_request(consume_permission("consume-current", assignment, claim)),
                     [wire.FirstAuthorization(assignment, claim)])
-                if blocker == "pending start":
+                pending: Path | None = None
+                if blocker != "live holder":
                     fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
                     identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
-                    pending = offload.pending_start_path(assignment.destination.target, identity)
+                    scope_key = "run" if blocker == "pending start" else "mirror/" + "a" * 32
+                    pending = offload.pending_start_path(assignment.destination.target, identity, scope_key=scope_key)
                     pending.parent.mkdir(parents=True, exist_ok=True)
                     _ = pending.write_text("pending startup\n")
                 fixture.clock.advance(1)
@@ -247,6 +250,14 @@ class PlacementStatusTests(unittest.TestCase):
                 if blocker == "live holder":
                     waiting, = fixture.server.handle_request(request)
                     self.assertIsInstance(waiting, wire.PlacementWait)
+                if blocker == "pending start with generation":
+                    assert pending is not None
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    pending.unlink()
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
 
     def test_a_kept_claim_frees_its_assignment_when_holder_and_owner_end(self) -> None:
         from scripts.build_queue.test_placement import (
@@ -1192,7 +1203,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                                       provider="ssh", target="linux", host="private-linux")
                 request = replace(request, constraints=replace(request.constraints, candidates=(
                     placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings)),)))
-                paths = claim_state.StatePaths(fixture.root / "claims")
+                paths = claim_state.StatePaths(fixture.root / "claims", platform="linux")
                 record: claim_state.RemoteJobClaim = {"claim_id": "retained", "episode": "old", "attempt": "old-attempt",
                     "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
                     "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}
@@ -1222,6 +1233,65 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
+    def test_execution_observer_reads_the_saved_mac_mirror_after_a_checkout_moves(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, eligibility, mac_test
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "mac_test.conf"
+            mirror_root = ".local/state/mac-test/test-mirror"
+            _ = write_config_fixture(settings, f"mirror_root=~/{mirror_root}\n", template="mac_test")
+            target = target_config.SshTarget("mac", "macos", settings)
+            request = placement_request(fixture)
+            repo_key = "https://fixture.invalid/team/hana"
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, scope=claim_state.RepositoryScope("new_checkout", repo_key))
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
+            paths = claim_state.StatePaths(fixture.root / "claims")
+            paths.claims.mkdir(parents=True)
+            saved_mirror = claim_state.CleanupOnlyMacRepository(repo_key, "old_checkout", "saved.json", "saved")
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "saved", "episode": request.episode, "attempt": "saved-attempt", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": destination.host,
+                "what": "check", "worktree": str(fixture.root / "removed"), "since": "2026-11-17T11:00:00+00:00",
+                "repo_name": "old_checkout", "repo_key": repo_key, "mac_repository": saved_mirror.record(),
+            }
+            mac_test.write_json(paths.claims / saved_mirror.claim_file, record)
+            run = subprocess.run
+
+            def local_ssh(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                self.assertEqual((command[0], command[-2]), ("ssh", destination.host))
+                shell, flag, script = shlex.split(command[-1])
+                fixture_commands = (
+                    "pgrep() { return 1; }\n"
+                    + f"lsof() {{ printf 'p41\\nn/home/fixture/{mirror_root}/old_checkout\\n"
+                    + f"p42\\nn/home/fixture/{mirror_root}/new_checkout\\n'; }}\n"
+                    + "ps() { printf 'fixture-start-%s\\n' \"$2\"; }\n"
+                )
+                return run([shell, flag, fixture_commands + script], capture_output=True, text=True, timeout=5)
+
+            with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                 mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.ExcludedTarget(target, "busy")), \
+                 mock.patch.object(claim_state, "state_paths", return_value=paths), \
+                 mock.patch.object(eligibility, "repository_identity", side_effect=AssertionError("Use the saved Mac mirror")), \
+                 mock.patch.object(subprocess, "run", side_effect=local_ssh) as probe:
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+                evidence = fixture.server.read_provider_evidence(key)
+                _ = record.pop("mac_repository")
+                mac_test.write_json(paths.claims / saved_mirror.claim_file, record)
+                legacy = fixture.server.read_provider_evidence(key)
+            self.assertEqual(probe.call_count, 1)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            adopted, = evidence.claims
+            self.assertEqual(evidence.executions, ((adopted.reference, execution_identity.ObservedExecution(
+                execution_identity.ProcessExecution(destination.host, "", 41, "fixture-start-41"))),))
+            assert isinstance(legacy, placement.FreshHostEvidence)
+            self.assertEqual(legacy.executions, ((adopted.reference, execution_identity.ExecutionEvidenceUnavailable(
+                "the claim has no saved Mac mirror", fixture.clock.now())),))
+
     def test_busy_diagnostic_skips_an_older_kept_claim_and_names_the_live_holder(self) -> None:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import build_targets, target_config
@@ -1231,45 +1301,55 @@ class LocalHoldPlacementTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
             request = placement_request(fixture)
-            destination = request.constraints.candidates[0].destination
+            candidate, = request.constraints.candidates
+            repo_key = "https://fixture.invalid/team/hana"
+            destination = replace(candidate.destination, scope=claim_state.RepositoryScope("hana", repo_key))
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
             paths = claim_state.StatePaths(fixture.root / "claims")
-            paths.directory.mkdir()
+            paths.claims.mkdir(parents=True)
             kept: claim_state.RemoteJobClaim = {
                 "claim_id": "older-kept", "episode": "old", "attempt": "old-attempt",
                 "submitting_session": "old-session", "holder_session": "dead-holder",
                 "pid": request.owner.pid, "proc_start": "dead-start", "remote_host": destination.host,
                 "what": "dead check", "worktree": str(fixture.root), "since": "2026-11-17T10:00:00+00:00",
-                "cleanup_pending": True}
+                "cleanup_pending": True, "repo_name": "hana", "repo_key": repo_key}
             live: claim_state.RemoteJobClaim = {
                 "claim_id": "newer-live", "episode": "new", "attempt": "new-attempt",
                 "submitting_session": "live-session", "holder_session": "live-holder",
                 "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": destination.host,
-                "what": "live check", "worktree": str(fixture.root), "since": "2026-11-17T11:00:00+00:00"}
-            held = (claim_state.HeldClaim(destination.scope, paths.directory / "older.json", kept),
-                    claim_state.HeldClaim(destination.scope, paths.directory / "newer.json", live))
-            originals: dict[Path, bytes] = {}
-            for claim in held:
-                originals[claim.path] = (json.dumps(claim.record, indent=3) + "\n").encode()
-                _ = claim.path.write_bytes(originals[claim.path])
+                "what": "live check", "worktree": str(fixture.root / "removed"),
+                "since": "2026-11-17T11:00:00+00:00", "repo_name": "checkout", "repo_key": repo_key}
+            originals = {paths.claims / name: (json.dumps(record, indent=3) + "\n").encode()
+                         for name, record in (("older.json", kept), ("newer.json", live))}
+            for path, original in originals.items():
+                _ = path.write_bytes(original)
             with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
                  mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)), \
                  mock.patch.object(claim_state, "state_paths", return_value=paths), \
-                 mock.patch.object(claim_state, "read_claims", return_value=held), \
-                 mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
+                 mock.patch.object(claim_state, "target_claim_scope", side_effect=AssertionError("The key is saved")), \
                  mock.patch.object(mac_test, "free_now", return_value="busy"), \
                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Started(request.owner.start_time)), \
                  mock.patch.object(fixture.server, "_observe_provider_execution", return_value=execution_identity.ExecutionNotStarted()):
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 evidence = fixture.server.read_provider_evidence(key)
+                for path, original in originals.items():
+                    self.assertEqual(path.read_bytes(), original)
+                no_key = kept.copy()
+                _ = no_key.pop("repo_key")
+                mac_test.write_json(paths.claims / "older.json", no_key)
+                (paths.claims / "newer.json").unlink()
+                kept_evidence = fixture.server.read_provider_evidence(key)
+            assert isinstance(kept_evidence, placement.FreshHostEvidence)
+            self.assertEqual(kept_evidence.provider_diagnostic,
+                placement.BusyProviderDiagnostic(destination.target, "dead check (kept for cleanup)", kept["since"]))
             assert isinstance(evidence, placement.FreshHostEvidence)
             self.assertEqual(evidence.provider_diagnostic,
                 placement.BusyProviderDiagnostic(destination.target, live["what"], live["since"]))
             self.assertEqual(evidence.holder, placement.ResourceHolderSession("live-holder"))
             self.assertEqual([claim.reference.claim_id for claim in evidence.cleanup_claims], ["older-kept"])
             self.assertEqual([claim.reference.claim_id for claim in evidence.claims], ["newer-live"])
-            for path, original in originals.items():
-                self.assertEqual(path.read_bytes(), original)
 
     def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
         from scripts.build_queue import placement
@@ -1293,6 +1373,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 assert isinstance(evidence, placement.FreshHostEvidence)
                 self.assertEqual(evidence.eligibility, expected)
                 self.assertEqual(free_now.call_args.args[1], target.settings)
+                self.assertEqual(free_now.call_args.kwargs["mac_scope"], destination.scope)
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement

@@ -509,6 +509,8 @@ if has "$@"; then
     if ! has "$@"; then printf 'Cargo.toml\0'; fi
     exit 0
 fi
+wanted=--max-parents=0
+if has "$@"; then printf '1111111111111111111111111111111111111111\n'; exit 0; fi
 for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
@@ -553,6 +555,12 @@ if "--assignment-file" in arguments:
     with redirect_stdout(io.StringIO()):
         claim_status = assigned_mac_test.command_claim(claim_args, paths, watch_claim=False,
             session=assignment.session, assignment=assignment)
+    if claim_status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        from scripts.mac_test import offload
+
+        reason = claim_state.MAC_HISTORY_KEY_UNAVAILABLE
+        _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assignment.episode, assignment.owner, reason))
+        raise SystemExit(offload.write_result(offload.DeclinedMacRun(reason, 0), offload.ResultFile(result)))
     if claim_status != 0:
         raise SystemExit(75)
     held, = [held for held in claim_state.read_claims(paths) if held.record["pid"] == os.getpid()]
