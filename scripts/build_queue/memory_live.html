@@ -1402,12 +1402,13 @@ let killRequest = 0;
 let killRead = false;
 let killConfirmation = null;
 const pendingKills = new Map();
+const KILL_RETRY = "Kill not sent; try again";
 
 function showKillResults() {
   const visible = new Set();
   const statuses = new Map(killInfo.results.map(result => [result.reference, result]));
   for (const [reference, result] of pendingKills) {
-    if (!statuses.has(reference)) statuses.set(reference, result);
+    if (!statuses.has(reference) || statuses.get(reference).stop === KILL_RETRY) statuses.set(reference, result);
   }
   const statusText = result => {
     if (result.stop !== "Stopped") return result.stop;
@@ -1421,28 +1422,26 @@ function showKillResults() {
     const offer = killInfo.offers[reference], status = statuses.get(reference);
     visible.add(reference);
     const oldControl = cell.querySelector("button");
-    if (status) {
+    const available = offer && (!status || status.stop === KILL_RETRY);
+    cell.querySelector(".kill-state")?.remove();
+    if (!available) {
       oldControl?.remove();
-      cell.querySelector(".kill-state")?.remove();
+    } else if (!oldControl) {
+      const control = document.createElement("button");
+      control.className = "kill-run";
+      control.type = "button";
+      control.title = "Kill this run";
+      control.setAttribute("aria-label", control.title);
+      control.setAttribute("aria-haspopup", "dialog");
+      control.setAttribute("aria-expanded", String(reference === killConfirmation?.reference));
+      control.innerHTML = KILL_ICON;
+      cell.append(control);
+    }
+    if (status) {
       const label = document.createElement("span");
       label.className = "kill-state";
       label.textContent = statusText(status);
       cell.append(label);
-    } else {
-      cell.querySelector(".kill-state")?.remove();
-      if (offer && !oldControl) {
-        const control = document.createElement("button");
-        control.className = "kill-run";
-        control.type = "button";
-        control.title = "Kill this run";
-        control.setAttribute("aria-label", control.title);
-        control.setAttribute("aria-haspopup", "dialog");
-        control.setAttribute("aria-expanded", String(reference === killConfirmation?.reference));
-        control.innerHTML = KILL_ICON;
-        cell.append(control);
-      } else if (!offer) {
-        oldControl?.remove();
-      }
     }
     cell.title = offer || status ? "" : "Kill is not available for this run yet";
   }

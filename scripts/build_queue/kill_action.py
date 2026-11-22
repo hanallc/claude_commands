@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Literal, Protocol, TypedDict, cast
 
-from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, snapshot_codec
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
@@ -91,14 +91,25 @@ def candidate(step: admission_records.RunningStep, reservation: admission_record
 
 
 @dataclass(frozen=True)
-class ProgramScope:
-    """A distinct systemd scope whose live members belong to the queue holder."""
+class RunScope:
+    """The path and identity of the cgroup recorded for a stop."""
 
     path: Path
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class ProgramScope(RunScope):
+    """A Cargo scope with an exact live member."""
+
     anchor_pid: int
     anchor_start: str
+
+
+@dataclass(frozen=True)
+class NoLaunchScope:
+    """The record has no verified launch scope."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +121,7 @@ class DetachedCommand:
     started: str
     supervisor: int
     supervisor_start: str
+    scope: RunScope | NoLaunchScope = NoLaunchScope()
 
 
 StopRoute = ProgramScope | DetachedCommand
@@ -132,12 +144,6 @@ class KillTarget:
 
 def live(pid: int, started: str) -> bool:
     return process_start.proc_table_start(pid, PROC) == process_start.Started(started)
-
-
-def ended(pid: int, started: str) -> bool:
-    state = process_start.proc_table_start(pid, PROC)
-    return isinstance(state, (process_start.Gone, process_start.Zombie)) or (
-        isinstance(state, process_start.Started) and state.start != started)
 
 
 def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str:
@@ -171,7 +177,7 @@ def read_scope_file(directory: int, name: str) -> bytes:
         return source.read()
 
 
-def matches_scope(directory: int, scope: ProgramScope) -> bool:
+def matches_scope(directory: int, scope: RunScope) -> bool:
     identity = os.fstat(directory)
     return (identity.st_dev, identity.st_ino) == (scope.device, scope.inode)
 
@@ -224,6 +230,21 @@ def program_scope(run: KillCandidate, processes: dict[int, memory_admit.ProcessI
     return NoStopRoute()
 
 
+def detached_launch_scope(value: object) -> RunScope | NoLaunchScope:
+    """Decode the scope that the detached launcher saved at startup."""
+    match value:
+        case {"unit": str(unit), "path": str(name), "device": int(device), "inode": int(inode)}:
+            path = Path(name)
+            if (type(device) is int and device >= 0 and type(inode) is int and inode > 0
+                    and path.is_absolute() and ".." not in path.parts
+                    and path.parent.name == "builds-detached.slice" and path.name == unit
+                    and unit.endswith(".scope")):
+                return RunScope(Path("/sys/fs/cgroup") / path.relative_to("/"), device, inode)
+        case _:
+            pass
+    return NoLaunchScope()
+
+
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
                      processes: dict[int, memory_admit.ProcessIdentity],
                      descendants: set[int]) -> DetachedCommand | NoStopRoute:
@@ -248,7 +269,9 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                 group = detached_runs.command_group(path)
             except (OSError, ValueError):
                 return NoStopRoute()
-            if (group is not None and group.group == pid and group.started == processes[pid].start
+            scope = detached_launch_scope(raw.get("command_scope"))
+            if (isinstance(scope, RunScope)
+                    and group is not None and group.group == pid and group.started == processes[pid].start
                     and raw.get("command_pid") == pid and raw.get("staff_id") == recipient
                     and isinstance(supervisor := raw.get("pid"), int) and supervisor == parent
                     and isinstance(start := raw.get("supervisor_started"), str)
@@ -256,7 +279,7 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                     and detached_run_process.supervisor_match(supervisor, path) is True
                     and detached_build(raw.get("command"), program(pid, processes))
                     and all(in_group(child, pid) for child in descendants)):
-                return DetachedCommand(path, pid, group.started, supervisor, start)
+                return DetachedCommand(path, pid, group.started, supervisor, start, scope)
         if parent not in processes or int(processes[parent].start) > int(processes[pid].start):
             break
         pid = parent
@@ -283,7 +306,8 @@ def in_group(pid: int, group: int) -> bool:
 def stop_route(run: KillCandidate, recipient: staff.StaffId,
                processes: dict[int, memory_admit.ProcessIdentity]) -> StopRoute | NoStopRoute:
     """Require a live Cargo process with a dedicated stop boundary."""
-    if isinstance(process_stop_api(), NoStopRoute):
+    api = process_stop_api()
+    if isinstance(api, NoStopRoute):
         return NoStopRoute()
     if not live(run.holder_pid, run.holder_start) or not live(run.row_pid, run.row_start):
         return NoStopRoute()
@@ -302,6 +326,8 @@ def stop_route(run: KillCandidate, recipient: staff.StaffId,
     scope = program_scope(run, processes, descendants)
     if isinstance(scope, ScopeNotPublished):
         return detached_command(run, recipient, processes, row_tree)
+    if not callable(getattr(api, "stop_command_tree", None)):
+        return NoStopRoute()
     return scope
 
 
@@ -341,6 +367,7 @@ class StopState(StrEnum):
     STOPPING = "Stopping"
     STOPPED = "Stopped"
     UNCONFIRMED = "Stop unconfirmed"
+    NOT_SENT = "Kill not sent; try again"
 
 
 class DeliveryState(StrEnum):
@@ -363,7 +390,7 @@ class KillResult(TypedDict):
     reference: str
     step: str
     pid: int
-    stop: Literal[StopState.STOPPING, StopState.STOPPED, StopState.UNCONFIRMED]
+    stop: Literal[StopState.STOPPING, StopState.STOPPED, StopState.UNCONFIRMED, StopState.NOT_SENT]
     delivery: Literal[DeliveryState.PENDING, DeliveryState.SENT, DeliveryState.QUEUED, DeliveryState.FAILED]
     time: str
     recipient_name: str
@@ -372,17 +399,19 @@ class KillResult(TypedDict):
 
 @dataclass(frozen=True)
 class StopRequested:
-    """The saved action waits for its target to end."""
+    """The action records the request before it sends TERM."""
 
 
 @dataclass(frozen=True)
-class WatchingStop:
-    """An older action saved this state after it requested the stop."""
+class TermSent:
+    """The stop route returned after it sent TERM."""
 
 
 @dataclass(frozen=True)
 class SendingNotice:
-    """Cleanup is confirmed and the keyed notice needs a result."""
+    """The saved TERM receipt and empty scope allow the keyed notice."""
+
+    term: TermSent
 
 
 @dataclass(frozen=True)
@@ -400,23 +429,23 @@ class SavedKillAction:
     result: KillResult
     recipient: staff.StaffId
     message: str
-    stage: StopRequested | WatchingStop | SendingNotice | FinishedStop
+    stage: StopRequested | TermSent | SendingNotice | FinishedStop
 
 
 def notification(run: KillCandidate, at: datetime) -> str:
     return f'nate killed your run "{run.step}" (pid {run.row_pid}) from the Builds page at {at:%H:%M %Z}'
 
 
-def scope_empty(route: ProgramScope) -> bool:
+def scope_empty(route: RunScope, *, require_events: bool = False) -> bool:
     memory_admit.check_memory_reading(route.path / "cgroup.events")
     try:
         descriptor = os.open(route.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return True
+        return not require_events
     try:
         return matches_scope(descriptor, route) and b"populated 0" in read_scope_file(descriptor, "cgroup.events").splitlines()
     except FileNotFoundError:
-        return not route.path.exists()
+        return not require_events and not route.path.exists()
     finally:
         os.close(descriptor)
 
@@ -424,7 +453,7 @@ def scope_empty(route: ProgramScope) -> bool:
 def stop_program_scope(route: ProgramScope, run: KillCandidate) -> bool:
     """Use the shared scope route with the exact scope and anchor from the handle."""
     api = process_stop_api()
-    if isinstance(api, NoStopRoute):
+    if isinstance(api, NoStopRoute) or not callable(getattr(api, "stop_command_tree", None)):
         return False
     memory_admit.check_memory_reading(route.path / "cgroup.procs")
     descriptor = os.open(route.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -447,8 +476,11 @@ def stop_program_scope(route: ProgramScope, run: KillCandidate) -> bool:
 
 def stop_detached(route: DetachedCommand, run: KillCandidate, reason: str) -> bool:
     """Use the verified stop API published by the shared detached-run change."""
-    from scripts.agents import detached_runs
+    from scripts.agents import detached_runs, worker_lifecycle
 
+    if (not isinstance(route.scope, RunScope)
+            or detached_launch_scope(worker_lifecycle.read_json_object(route.record).get("command_scope")) != route.scope):
+        return False
     stop = cast(Callable[[Path, str, detached_runs.CommandGroup], bool] | None,
                 getattr(detached_runs, "stop_verified_command", None))
     return (stop is not None and live(run.holder_pid, run.holder_start) and live(run.row_pid, run.row_start)
@@ -459,7 +491,7 @@ def stop_complete(action: SavedKillAction) -> bool:
     route = action.route
     if isinstance(route, ProgramScope):
         return scope_empty(route)
-    return ended(route.group, route.started)
+    return isinstance(route.scope, RunScope) and scope_empty(route.scope, require_events=True)
 
 
 @dataclass(frozen=True)
@@ -482,7 +514,10 @@ def deliver(action: SavedKillAction) -> DeliveryState | RetryNotice:
     if (response.returncode == 1 and output.startswith("QUEUED:")
             or response.returncode == 0 and output.startswith(("KEPT:", "SKIPPED:"))):
         return DeliveryState.QUEUED
-    if response.returncode == 2 and output.startswith("REFUSED:"):
+    if response.returncode and any(line.startswith(("REFUSED:", "FAILED:", "HELD:"))
+                                   for line in (output, response.stderr)):
+        return DeliveryState.FAILED
+    if response.returncode == 2 and response.stderr.startswith("send.py: "):
         return DeliveryState.FAILED
     return RetryNotice()
 
@@ -506,7 +541,13 @@ class KillActions:
 
     def _read(self, reference: str) -> SavedKillAction:
         text = (self._folder / f"{reference}.json").read_text()
-        action = admission_wire.parse_record(text, SavedKillAction)
+        raw = cast(object, json.loads(text))
+        if not isinstance(raw, dict):
+            raise ValueError("invalid Builds stop record")
+        record = cast(dict[str, object], raw)
+        if record.get("stage") in ({"kind": "WatchingStop"}, {"kind": "SendingNotice"}):
+            record["stage"] = {"kind": "StopRequested"}
+        action = cast(SavedKillAction, snapshot_codec.parse_snapshot_value(record, SavedKillAction))
         if action.result["reference"] != reference or action.run.reference != reference:
             raise ValueError("the Builds stop record has a different run")
         return action
@@ -542,7 +583,8 @@ class KillActions:
             reference: {"handle": self.handle(target), "pid": target.candidate.row_pid,
                         "started_by": target.starter, "recipient_name": target.recipient_name,
                         "step": target.candidate.step, "message": notification(target.candidate, now_in_zone)}
-            for reference, target in targets.items() if reference not in actions
+            for reference, target in targets.items()
+            if reference not in actions or actions[reference].result["stop"] == StopState.NOT_SENT
         }
         return offers, [action.result for action in actions.values()]
 
@@ -553,8 +595,10 @@ class KillActions:
 
     def _advance(self, action: SavedKillAction, retention: float) -> SavedKillAction:
         """Record each step before proceeding. Recovery only checks or sends."""
-        if isinstance(action.stage, (StopRequested, WatchingStop)) and stop_complete(action):
-            action = replace(action, stage=SendingNotice())
+        if isinstance(action.stage, StopRequested):
+            return self._finish(action, {**action.result, "stop": StopState.NOT_SENT}, retention)
+        if isinstance(action.stage, TermSent) and stop_complete(action):
+            action = replace(action, stage=SendingNotice(action.stage))
             self._save(action)
         if isinstance(action.stage, SendingNotice):
             try:
@@ -624,7 +668,9 @@ class KillActions:
             except FileNotFoundError:
                 pass
             else:
-                if not isinstance(previous.stage, FinishedStop) or previous.stage.visible_until > time.time():
+                if not isinstance(previous.stage, FinishedStop):
+                    return NoStopRoute()
+                if previous.stage.visible_until > time.time() and previous.result["stop"] != StopState.NOT_SENT:
                     return NoStopRoute()
             self._save(action)
             try:
@@ -632,11 +678,12 @@ class KillActions:
                 started = (stop_program_scope(route, run) if isinstance(route, ProgramScope)
                            else stop_detached(route, run, reason))
             except (OSError, ValueError, subprocess.SubprocessError) as error:
-                # A stop can signal before it raises. Keep observing the saved target.
                 print(f"review-links build kill {reference}: {error}", file=sys.stderr)
-            else:
-                if not started:
-                    return self._finish(action, {**result, "stop": StopState.UNCONFIRMED}, retention).result
+                started = False
+            if not started:
+                return self._advance(action, retention).result
+            action = replace(action, stage=TermSent())
+            self._save(action)
             deadline = time.monotonic() + seconds
             while True:
                 try:
@@ -651,7 +698,7 @@ class KillActions:
                 time.sleep(min(remaining, sample))
             # A delivery write can fail after cleanup is saved. Resume the durable state.
             action = self._read(reference)
-            if isinstance(action.stage, (StopRequested, WatchingStop)):
+            if isinstance(action.stage, TermSent):
                 action = replace(action, result={**result, "stop": StopState.UNCONFIRMED})
                 self._save(action)
         self._start_watch(reference, settings)

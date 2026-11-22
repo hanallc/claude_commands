@@ -74,6 +74,9 @@ record = {
     "log": str(path.with_suffix(".log")), "started_at": 10, "pid": os.getpid(),
     "command_pid": process.pid, "command_group": process.pid, "command_started": started.start,
     "supervisor_started": supervisor.start, "director_dir": "", "done_message_file": "",
+    "command_scope": {"unit": "detached-fixture.scope",
+                      "path": "/user.slice/builds-detached.slice/detached-fixture.scope",
+                      "device": 1, "inode": 2},
 }
 with record_lock(path):
     write_text_atomic(path, json.dumps(record))
@@ -230,11 +233,12 @@ class KillActionTests(unittest.TestCase):
             with (patch.object(detached_runs, "stop_verified_command", new=stable_stop, create=True),
                   patch.object(kill_action, "process_stop_api", return_value=Mock())):
                 route = kill_action.stop_route(run, staff.StaffId("worker-id"), memory_admit.process_table())
-                self.assertEqual(route, kill_action.DetachedCommand(path, pid, started, command.pid, self.started(command.pid)))
+                scope = kill_action.RunScope(Path("/sys/fs/cgroup/user.slice/builds-detached.slice/detached-fixture.scope"), 1, 2)
+                self.assertEqual(route, kill_action.DetachedCommand(path, pid, started, command.pid,
+                                                                   self.started(command.pid), scope))
                 assert isinstance(route, kill_action.DetachedCommand)
                 self.assertTrue(kill_action.stop_detached(route, run, "fixture stop"))
             self.assertEqual(command.wait(timeout=TEST_HANG_GUARD_SECS), 0)
-            self.assertTrue(kill_action.ended(route.group, route.started))
             self.assertIsInstance(process_start.proc_table_start(child, Path("/proc")), process_start.Gone)
             self.assertIsNone(detached_runs.command_group(path))
 
@@ -363,92 +367,182 @@ class KillActionTests(unittest.TestCase):
         self.assertEqual(saved.message,
             f'nate killed your run "check" (pid 17) from the Builds page at {response["time"]}\nUse the next slot.')
 
-    def test_recovery_after_term_checks_the_target_and_retries_the_notice(self) -> None:
-        _ = write_config_fixture(self.root / "review_links.conf", "kill_pending_check_seconds=0.1")
-        proc = self.root / "proc"
-        proc.mkdir()
+    def test_restart_before_term_never_reports_a_natural_exit_as_a_kill(self) -> None:
         scope = self.root / "run-recorded.scope"
         scope.mkdir()
         events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
         identity = scope.stat()
-        detached = self.root / "pruned-detached-record.json"
-        routes = ((17, kill_action.ProgramScope(scope, identity.st_dev, identity.st_ino, 20, "125")),
-                  (18, kill_action.DetachedCommand(detached, 18, "123", 19, "122")))
+        route = kill_action.ProgramScope(scope, identity.st_dev, identity.st_ino, 20, "125")
+        run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
         recipient = staff.StaffId("worker-id")
+        target = kill_action.KillTarget(run, route, recipient, "impl3, a worker", "impl3", "worker")
+        actions = kill_action.KillActions(self.root)
+        path = self.root / ".review-link-build-kill" / f"{run.reference}.json"
 
         class FixtureRestart(BaseException):
             pass
 
-        for pid, route in routes:
-            with self.subTest(route=route):
-                run = kill_action.KillCandidate(pid, "123", pid, "123", "session", "check", "at", "")
-                _ = events.write_text("populated 1\n")
-                leader = proc / str(pid)
-                leader.mkdir()
-                stat = leader / "stat"
-                _ = stat.write_text(f"{pid} (fixture) " + " ".join(["S", *(["0"] * 18), run.row_start]))
-                actions = kill_action.KillActions(self.root)
-                target = kill_action.KillTarget(run, route, recipient, "impl3, a worker", "impl3", "worker")
-                path = self.root / ".review-link-build-kill" / f"{run.reference}.json"
+        def exit_before_term(*_arguments: object) -> bool:
+            saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
+            self.assertIsInstance(saved.stage, kill_action.StopRequested)
+            self.assertEqual(saved.result["stop"], kill_action.StopState.STOPPING)
+            self.assertFalse(kill_action.scope_empty(route))
+            raise FixtureRestart
 
-                def term(*_arguments: object) -> bool:
-                    saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
-                    self.assertIsInstance(saved.stage, kill_action.StopRequested)
-                    self.assertEqual(saved.result["stop"], kill_action.StopState.STOPPING)
-                    self.assertEqual((saved.run, saved.route), (run, route))
-                    _ = events.write_text("populated 0\n")
-                    stat.unlink()
-                    raise FixtureRestart
+        with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
+              patch.object(kill_action, "stop_program_scope", new=exit_before_term),
+              self.assertRaises(FixtureRestart)):
+            _ = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
 
-                with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
-                      patch.object(kill_action, "stop_program_scope", new=term),
-                      patch.object(kill_action, "stop_detached", new=term),
-                      self.assertRaises(FixtureRestart)):
-                    _ = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
+        _ = events.write_text("populated 0\n")
+        resumed = kill_action.KillActions(self.root)
+        workers: list[threading.Thread] = []
+        start = threading.Thread.start
 
-                stalled = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
-                self.assertIsInstance(stalled.stage, kill_action.StopRequested)
-                self.assertFalse(detached.exists())
-                attempts: list[list[str]] = []
-                workers: list[threading.Thread] = []
-                start = threading.Thread.start
+        def record_thread(thread: threading.Thread) -> None:
+            workers.append(thread)
+            start(thread)
 
-                def record_thread(thread: threading.Thread) -> None:
-                    workers.append(thread)
-                    start(thread)
+        with (patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "stop_program_scope") as repeated_stop,
+              patch.object(kill_action, "deliver") as send,
+              patch.object(threading.Thread, "start", new=record_thread)):
+            resumed.resume()
+            (worker,) = workers
+            worker.join(TEST_HANG_GUARD_SECS)
+            self.assertFalse(worker.is_alive())
+            offers, (result,) = resumed.options()
+            self.assertEqual(offers, {})
+        self.assertEqual(result["stop"], kill_action.StopState.NOT_SENT)
+        repeated_stop.assert_not_called()
+        send.assert_not_called()
 
-                def send(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-                    attempts.append(argv)
-                    saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
-                    self.assertIsInstance(saved.stage, kill_action.SendingNotice)
-                    self.assertEqual(saved.id, stalled.id)
-                    return (subprocess.CompletedProcess(argv, -signal.SIGTERM, "", "")
-                            if len(attempts) == 1 else subprocess.CompletedProcess(argv, 0, "KEPT: review", ""))
+    def test_detached_restart_waits_for_the_child_and_handles_retirement_once(self) -> None:
+        _ = write_config_fixture(self.root / "review_links.conf", "kill_stop_seconds=0.5\nkill_pending_check_seconds=0.1")
+        folder = self.root / "detached-recorded.scope"
+        child = folder / "child"
+        child.mkdir(parents=True)
+        _ = (folder / "cgroup.procs").write_text("")
+        _ = (child / "cgroup.procs").write_text("20\n")
+        events = folder / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        identity = folder.stat()
+        scope = kill_action.RunScope(folder, identity.st_dev, identity.st_ino)
+        route = kill_action.DetachedCommand(self.root / "pruned-detached-record.json", 18, "123", 19, "122", scope)
+        run = kill_action.KillCandidate(18, "123", 18, "123", "session", "check", "at", "")
+        target = kill_action.KillTarget(run, route, staff.StaffId("retired"), "founder, a producer", "founder", "producer")
+        actions = kill_action.KillActions(self.root)
+        with (patch.object(kill_action, "live_targets", return_value={run.reference: target}),
+              patch.object(kill_action, "stop_detached", return_value=True),
+              patch.object(actions, "_start_watch"),
+              patch.object(kill_action, "deliver") as send):
+            response = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
+        assert not isinstance(response, kill_action.NoStopRoute)
+        self.assertEqual(response["stop"], kill_action.StopState.UNCONFIRMED)
+        send.assert_not_called()
+        path = self.root / ".review-link-build-kill" / f"{run.reference}.json"
+        saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
+        self.assertIsInstance(saved.stage, kill_action.TermSent)
+        self.assertFalse(route.record.exists())
 
-                resumed = kill_action.KillActions(self.root)
-                with (patch.object(kill_action, "PROC", proc),
-                      patch.object(kill_action, "live_targets", return_value={}),
-                      patch.object(kill_action, "stop_program_scope") as scope_stop,
-                      patch.object(kill_action, "stop_detached") as detached_stop,
-                      patch.object(send_budget, "seconds", return_value=1),
-                      patch.object(subprocess, "run", new=send),
-                      patch.object(threading.Thread, "start", new=record_thread)):
-                    resumed.resume()
-                    for worker in workers:
-                        worker.join(TEST_HANG_GUARD_SECS)
-                        self.assertFalse(worker.is_alive())
-                    result = next(row for row in resumed.options()[1] if row["reference"] == run.reference)
-                self.assertEqual((result["stop"], result["delivery"]),
-                                 (kill_action.StopState.STOPPED, kill_action.DeliveryState.QUEUED))
-                self.assertEqual(len(attempts), 2)
-                self.assertEqual(attempts[0], attempts[1])
-                self.assertEqual(attempts[0][attempts[0].index("--key") + 1], f"builds-kill:{stalled.id}")
-                self.assertEqual(attempts[0][attempts[0].index("--text") + 1], stalled.message)
-                self.assertTrue(stalled.message.endswith("\nUse the next slot."))
-                scope_stop.assert_not_called()
-                detached_stop.assert_not_called()
+        observed = threading.Event()
+        workers: list[threading.Thread] = []
+        start = threading.Thread.start
+        read_scope = kill_action.scope_empty
 
-    def test_unconfirmed_stop_does_not_send_a_message(self) -> None:
+        def record_thread(thread: threading.Thread) -> None:
+            workers.append(thread)
+            start(thread)
+
+        def read(route: kill_action.RunScope, *, require_events: bool = False) -> bool:
+            empty = read_scope(route, require_events=require_events)
+            observed.set()
+            return empty
+
+        response_text = "send.py: staff:retired: founder is a retired producer"
+        refusal = subprocess.CompletedProcess(["send.py"], 2, "", response_text)
+        resumed = kill_action.KillActions(self.root)
+        with (patch.object(kill_action, "scope_empty", new=read),
+              patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "stop_detached") as repeated_stop,
+              patch.object(send_budget, "seconds", return_value=1),
+              patch.object(subprocess, "run", return_value=refusal) as send,
+              patch.object(threading.Thread, "start", new=record_thread)):
+            resumed.resume()
+            try:
+                self.assertTrue(observed.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(read_scope(scope, require_events=True))
+                self.assertEqual(resumed.options()[1][0]["stop"], kill_action.StopState.UNCONFIRMED)
+                send.assert_not_called()
+            finally:
+                _ = (child / "cgroup.procs").write_text("")
+                _ = events.write_text("populated 0\n")
+                for worker in workers:
+                    worker.join(TEST_HANG_GUARD_SECS)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            recovered = kill_action.KillActions(self.root)
+            recovered.resume()
+            self.assertEqual(len(workers), 1)
+            (_, (result,)) = recovered.options()
+        self.assertEqual((result["stop"], result["delivery"]),
+                         (kill_action.StopState.STOPPED, kill_action.DeliveryState.FAILED))
+        repeated_stop.assert_not_called()
+        send.assert_called_once()
+
+    def test_recovery_retries_an_unconfirmed_send_with_the_same_key(self) -> None:
+        scope = self.root / "run-recorded.scope"
+        scope.mkdir()
+        _ = (scope / "cgroup.events").write_text("populated 0\n")
+        identity = scope.stat()
+        route = kill_action.ProgramScope(scope, identity.st_dev, identity.st_ino, 20, "125")
+        run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
+        target = kill_action.KillTarget(run, route, staff.StaffId("worker"), "impl3, a worker", "impl3", "worker")
+        actions = kill_action.KillActions(self.root)
+        attempts: list[list[str]] = []
+
+        def send(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            attempts.append(argv)
+            return (subprocess.CompletedProcess(argv, -signal.SIGTERM, "", "")
+                    if len(attempts) == 1 else subprocess.CompletedProcess(argv, 0, "KEPT: review", ""))
+
+        with (patch.object(send_budget, "seconds", return_value=1),
+              patch.object(subprocess, "run", new=send),
+              patch.object(kill_action, "live_targets", return_value={run.reference: target}),
+              patch.object(kill_action, "stop_program_scope", return_value=True),
+              patch.object(actions, "_start_watch")):
+            _ = actions.stop(run.reference, actions.handle(target), "Use the next slot.")
+        path = self.root / ".review-link-build-kill" / f"{run.reference}.json"
+        saved = admission_wire.parse_record(path.read_text(), kill_action.SavedKillAction)
+        self.assertIsInstance(saved.stage, kill_action.SendingNotice)
+        self.assertEqual(len(attempts), 1)
+
+        workers: list[threading.Thread] = []
+        start = threading.Thread.start
+
+        def record_thread(thread: threading.Thread) -> None:
+            workers.append(thread)
+            start(thread)
+
+        resumed = kill_action.KillActions(self.root)
+        with (patch.object(send_budget, "seconds", return_value=1),
+              patch.object(subprocess, "run", new=send),
+              patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(threading.Thread, "start", new=record_thread)):
+            resumed.resume()
+            (worker,) = workers
+            worker.join(TEST_HANG_GUARD_SECS)
+            self.assertFalse(worker.is_alive())
+            (_, (result,)) = resumed.options()
+        self.assertEqual((result["stop"], result["delivery"]),
+                         (kill_action.StopState.STOPPED, kill_action.DeliveryState.QUEUED))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(attempts[0][attempts[0].index("--key") + 1], f"builds-kill:{saved.id}")
+        self.assertEqual(attempts[0][attempts[0].index("--text") + 1], saved.message)
+        self.assertTrue(saved.message.endswith("\nUse the next slot."))
+
+    def test_refused_stop_does_not_send_a_message(self) -> None:
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", "check", "at", "")
         route = kill_action.ProgramScope(self.root / "run-fixture.scope", 1, 2, 17, "123")
         target = kill_action.KillTarget(run, route, staff.StaffId("producer"), "founder, a producer", "founder", "producer")
@@ -462,7 +556,7 @@ class KillActionTests(unittest.TestCase):
         assert not isinstance(outcome, kill_action.NoStopRoute)
         self.assertEqual((outcome["reference"], outcome["step"], outcome["pid"]), (run.reference, "check", 17))
         self.assertEqual((outcome["stop"], outcome["delivery"]),
-                         (kill_action.StopState.UNCONFIRMED, kill_action.DeliveryState.PENDING))
+                         (kill_action.StopState.NOT_SENT, kill_action.DeliveryState.PENDING))
 
 
 if __name__ == "__main__":

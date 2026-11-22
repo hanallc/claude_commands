@@ -190,7 +190,8 @@ try {
           server.emit('kill-post');
         });
       } else {
-        res.end(JSON.stringify({token:killToken,offers:killResults.length ? {} : {[killRef]:killOffer},results:killResults}));
+        const canTry = !killResults.length || killResults[0].stop === 'Kill not sent; try again';
+        res.end(JSON.stringify({token:killToken,offers:canTry ? {[killRef]:killOffer} : {},results:killResults}));
       }
       return;
     }
@@ -357,6 +358,11 @@ try {
               ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
             assert.equal(confirmation.preview,killOffer.message);
             assert.equal(confirmation.recipient,killOffer.recipient_name);
+            killResults = [{...killedResult,stop:'Kill not sent; try again',delivery:''}];
+            assert.deepEqual(await evaluate(`(async () => {
+              await refreshKill();
+              return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.kill-run').length];
+            })()`),['Kill not sent; try again',1]);
             await evaluate(`document.querySelector('#kill-submit').click()`);
             assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
             // Remove the fixture row while the action is pending.
