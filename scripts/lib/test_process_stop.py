@@ -6,8 +6,9 @@ import os
 from pathlib import Path
 import signal
 from tempfile import TemporaryDirectory
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from scripts.lib import process_stop
 
@@ -71,3 +72,53 @@ class ProcessStopTests(unittest.TestCase):
             write_process(fixture.proc, 703, 33, session=703)
             self.assertCountEqual(fixture.stop(signal.SIGTERM),
                                   [(701, signal.SIGTERM), (702, signal.SIGTERM)])
+
+    def test_receipt_failure_still_kills_a_scope_that_ignores_term(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            fixture = StopFixture(root)
+            cgroups = root / "cgroup"
+            scope = cgroups / "builds.slice" / "fixture.scope"
+            scope.mkdir(parents=True)
+            relative = "/" + str(scope.relative_to(cgroups))
+            _ = (fixture.proc / str(LEADER.pid) / "cgroup").write_text(f"0::{relative}\n")
+            _ = (scope / "cgroup.procs").write_text(f"{LEADER.pid}\n")
+            events = scope / "cgroup.events"
+            _ = events.write_text("populated 1\n")
+            kill = scope / "cgroup.kill"
+            _ = kill.write_text("0\n")
+            identity_stat = scope.stat()
+            identity: process_stop.ScopeIdentity = {
+                "path": relative, "unit": scope.name, "device": identity_stat.st_dev, "inode": identity_stat.st_ino,
+            }
+            now = 0.0
+            failure = OSError("cannot save the TERM receipt")
+
+            def receipt(count: int) -> None:
+                self.assertEqual(count, 1)
+                self.assertEqual(kill.read_text(), "0\n")
+                raise failure
+
+            def advance_clock(_descriptor: int, seconds: float) -> None:
+                nonlocal now
+                if kill.read_text() == "1\n":
+                    self.assertGreaterEqual(now, 2)
+                    _ = events.write_text("populated 0\n")
+                now += seconds
+
+            def open_pidfd(pid: int) -> int:
+                self.assertEqual(pid, LEADER.pid)
+                return os.open(os.devnull, os.O_RDONLY)
+
+            with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                  patch.object(process_stop, "PROC", fixture.proc),
+                  patch.object(os, "pidfd_open", side_effect=open_pidfd),
+                  patch.object(signal, "pidfd_send_signal") as send,
+                  patch.object(time, "monotonic", side_effect=lambda: now),
+                  patch.object(process_stop, "_wait_scope_event", side_effect=advance_clock)):
+                with self.assertRaises(OSError) as raised:
+                    _ = process_stop.stop_scope(identity, 2, 2, on_term=receipt)
+                self.assertIs(raised.exception, failure)
+                send.assert_called_once_with(ANY, signal.SIGTERM)
+                self.assertEqual(kill.read_text(), "1\n")
+                self.assertTrue(process_stop.scope_has_ended(identity))

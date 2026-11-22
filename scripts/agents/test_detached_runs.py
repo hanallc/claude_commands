@@ -2026,6 +2026,17 @@ exit 143
             self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
         self.assertEqual(json.loads(path.read_text())["status"], "finished")
 
+    def test_orphan_reaping_recovers_after_an_interrupted_scan(self) -> None:
+        path = self.record(["fixture command"])
+        self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
+        # An interrupted scan could leave this claim under the old reaper.
+        path.with_suffix(".reap").touch()
+        listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} Z\n", "")
+        with (patch.object(process_start, "process_start", return_value=process_start.Zombie("fixture-start")),
+              patch.object(subprocess, "run", return_value=listing)):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+        self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "finished")
+
     def test_orphan_reaping_keeps_the_run_pending_when_the_group_is_unreadable(self) -> None:
         path = self.record(["bash", "verify.sh"])
         self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")

@@ -384,15 +384,17 @@ def stop_scopes(
             except ScopeStopFailed as error:
                 errors.append((scope["unit"], error))
         total = sum(item.term_reached for item in pending)
-        if on_term is not None:
-            on_term(total)
-        for item in pending:
-            try:
-                _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
-            except _ScopeRemoved:
-                continue
-            except ScopeStopFailed as error:
-                errors.append((item.scope["unit"], error))
+        try:
+            if on_term is not None:
+                on_term(total)
+        finally:
+            for item in pending:
+                try:
+                    _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
+                except _ScopeRemoved:
+                    continue
+                except ScopeStopFailed as error:
+                    errors.append((item.scope["unit"], error))
     if errors:
         if len(scopes) == 1:
             raise errors[0][1]

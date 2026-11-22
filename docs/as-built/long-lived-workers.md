@@ -694,6 +694,7 @@ The supervisor records the command exit before it starts delivery.
 After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
 A failed push saves the send error as pending delivery.
 The finished run leaves the live-run limit and keeps its record and log.
+The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
@@ -725,6 +726,7 @@ The samples used private records outside the expected scope and measured the lau
 It sends TERM through individual pidfds to verified members of the saved scope tree.
 The optional callback reports the total TERM count once, after all TERM sends and before any exit wait.
 Empty and removed scopes contribute zero to the total.
+If the callback raises, the stop completes the exit wait and any KILL attempt before it raises the callback error.
 It also checks the scope of a verified leader that runs a nested systemd scope.
 It uses `cgroup.kill` after the stop grace if the scope stays populated.
 A failed scope kill reports a stop error if the scope stays populated.

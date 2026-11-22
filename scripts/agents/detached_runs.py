@@ -781,7 +781,7 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     """Recover results after the command and owned group processes end.
 
     Deliver the saved command status when available.
-    A claim file prevents duplicate delivery.
+    The start lock serializes orphan scans.
     """
     runs = _runs_dir(session_dir)
     if not runs.is_dir():
@@ -814,11 +814,6 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         if raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path):
             continue
-        claim = path.with_suffix(".reap")
-        try:
-            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except FileExistsError:
-            continue
         try:
             with record_lock(path), contextlib.ExitStack() as scope_lock:
                 record = _read_record(path)
@@ -845,8 +840,6 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             result.run_ids.append(record["run_id"])
         except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
             print(" ".join(str(error).splitlines()), file=sys.stderr)
-        finally:
-            claim.unlink(missing_ok=True)
     return result
 
 
@@ -967,7 +960,7 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
+_RUN_FILES = ("{}.log", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
               "{}" + CONFIRMED_STOP_SUFFIX, "{}" + PENDING_STOP_SUFFIX,
               "{}.json", "{}.record.lock", "{}.scope-stop.lock")
 
