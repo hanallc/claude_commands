@@ -360,7 +360,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                 late_main = route == "resumed after gate"
                 if late_main:
                     _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
-                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 if fault == "origin and result writes fail":
@@ -433,11 +433,11 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         cases = (
             ("main hook", "hook rejected the merge �"),
             ("row hook", "hook rejected the merge �"),
-            ("operator merge during red gate", "merge test 1 failed"),
+            ("operator merge during red gate", "repair merge test 1"),
             ("operator merge before main merge", "You have not concluded your merge"),
             ("committed merge", "fixture failed after Git moved HEAD"),
-            ("operator commit", "merge test 1 failed"),
-            ("resumed main merge", "You have not concluded your merge"),
+            ("operator commit", "repair merge test 1"),
+            ("resumed main merge", "origin/main conflicts: src/beta.txt"),
             ("no-commit option", "git merge left MERGE_HEAD open"),
             ("empty merge head", "hook rejected the merge �"),
             ("unreadable merge head", "hook rejected the merge �"),
@@ -508,7 +508,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                         operator_tip = self.git("commit-tree", f"{main}^{{tree}}", "-p", start, "-m", "Operator change")
                         _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
                         publish_main = case == "operator merge before main merge"
-                        self.executable(self.bin / "checkpoint-test", STUB + f'''
+                        self.executable(self.bin / "checkpoint-test", STUB + rf'''
 import subprocess
 conflict = subprocess.run(["git", "merge", "--no-ff", "--no-commit", {operator_tip!r}],
                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
@@ -996,7 +996,7 @@ raise SystemExit(1)
                 self.bind_fixture(self.root)
                 self.promotions = str(self.promote)
                 self.production_doc()
-                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 start = self.git("rev-parse", "HEAD")
@@ -1208,7 +1208,7 @@ raise SystemExit(1)
                 self.bind_fixture(self.root)
                 alpha = self.checkpoint()
                 beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
-                self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 alpha_row = self.batch_line("alpha", "2", alpha)

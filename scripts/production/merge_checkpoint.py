@@ -199,8 +199,13 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
 
 
 def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True,
-                          errors="replace" if args[:1] == ("merge",) else None, check=False)
+    command = ["git", "-C", str(checkout), *args]
+    if args[:1] == ("merge",):
+        result = subprocess.run(command, capture_output=True, check=False)
+        return subprocess.CompletedProcess(command, result.returncode,
+                                           result.stdout.decode(errors="replace"),
+                                           result.stderr.decode(errors="replace"))
+    return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
 def good(result: subprocess.CompletedProcess[str], step: str) -> str:
