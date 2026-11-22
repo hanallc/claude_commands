@@ -519,7 +519,7 @@ body.queue-unavailable .card { display: none; }
       <dt>Progress</dt><dd id="kill-progress"></dd>
       <dt>Started by</dt><dd id="kill-starter"></dd>
     </dl>
-    <p>The work in this run will be lost. The Builds page sends this message after the stop.</p>
+    <p>The work in this run will be lost. This message goes to <span id="kill-recipient"></span>:</p>
     <p id="kill-message"></p>
     <label for="kill-words">Your own words (optional)</label>
     <textarea id="kill-words" name="words" rows="2"></textarea>
@@ -1265,6 +1265,7 @@ function render(d) {
   setTimeout(fitLabels, 650);
 
   renderWalk(d);
+  showKillResults();
   renderSwap(d);
   renderLeftovers(d);
   restoreReportView(view);
@@ -1396,7 +1397,6 @@ window.addEventListener("resize", placeLimitLabels);
 
 const KILL_PATH = "/console/build-kill";
 const KILL_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86zM15 9l-6 6m0-6 6 6"/></svg>';
-const KILL_UNAVAILABLE = "Kill is not available for this run yet";
 let killInfo = {token: "", offers: {}, results: []};
 let killRequest = 0;
 let killRead = false;
@@ -1409,7 +1409,13 @@ function showKillResults() {
   for (const [reference, result] of pendingKills) {
     if (!statuses.has(reference)) statuses.set(reference, result);
   }
-  const statusText = result => [result.stop, result.delivery].filter(Boolean).join(" · ");
+  const statusText = result => {
+    if (result.stop !== "Stopped") return result.stop;
+    const delivery = result.delivery === "Message sent" ? `${result.recipient_role} ${result.recipient_name} informed`
+      : result.delivery === "Message queued" ? `Message queued for ${result.recipient_role} ${result.recipient_name}`
+      : `Message failed for ${result.recipient_role} ${result.recipient_name}`;
+    return `Killed by you at ${result.time} · ${delivery}`;
+  };
   for (const cell of document.querySelectorAll("td.pid[data-kill-ref]")) {
     const reference = cell.dataset.killRef;
     const offer = killInfo.offers[reference], status = statuses.get(reference);
@@ -1438,7 +1444,7 @@ function showKillResults() {
         oldControl?.remove();
       }
     }
-    cell.title = offer || status ? "" : KILL_UNAVAILABLE;
+    cell.title = offer || status ? "" : "Kill is not available for this run yet";
   }
   const strip = $("kill-results");
   const text = [...statuses.values()].filter(result => !visible.has(result.reference))
@@ -1479,12 +1485,13 @@ document.addEventListener("click", event => {
   if (!offer || !row || killConfirmation) return;
   const duration = row.started_at ? ago(row.started_at, latest.read_at) : "";
   const done = doneText(row);
-  $("kill-name").textContent = row.name;
+  $("kill-name").textContent = [rowUnit(row), offer.step].filter(Boolean).join(" · ");
   $("kill-pid").textContent = `${offer.pid} and its child processes`;
   $("kill-progress").textContent = done !== "—"
     ? `${done} done${duration ? ` after ${duration}` : ""}`
     : duration ? `Running for ${duration}` : "Progress unavailable";
   $("kill-starter").textContent = offer.started_by;
+  $("kill-recipient").textContent = offer.recipient_name;
   $("kill-message").textContent = offer.message;
   $("kill-words").value = "";
   killConfirmation = {reference, offer, token: killInfo.token, step: row.name};
@@ -1534,7 +1541,7 @@ function renderWalk(d) {
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—", killRef = "") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid"${killRef ? ` data-kill-ref="${esc(killRef)}"` : ""} title="${KILL_UNAVAILABLE}">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid"${killRef ? ` data-kill-ref="${esc(killRef)}"` : ""} title="Kill is not available for this run yet">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1600,7 +1607,6 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
-  showKillResults();
   fitLabels();
 }
 

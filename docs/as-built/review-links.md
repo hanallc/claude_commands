@@ -1813,7 +1813,8 @@ The server limits the form to `kill_request_bytes`.
 Both requests require the Tailscale login in `kill_operator_login`.
 The default admits the user ID that owns the untagged local Tailscale node.
 The server checks the socket peer with Tailscale WhoIs.
-The Builds queue verifies the scope or detached command before it stops a run.
+The Builds queue verifies the Verify shell, Cargo scope, or detached command before it stops a run.
+The server defers a code restart while a Builds stop has a pending notice.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.

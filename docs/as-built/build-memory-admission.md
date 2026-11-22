@@ -1813,10 +1813,15 @@ The server determines the caller from the reservation's session ID and the curre
 1. The feed publishes an opaque reference for each eligible reservation.
 2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
 3. The server reads the reservation and process evidence again when the operator confirms.
-4. The server stops a dedicated program scope through the user manager or requests a stop through the detached run record.
-5. The holder or supervisor completes its normal cleanup.
-6. The server sends the caller the stop notice after it confirms the stop.
+4. The server signals the exact Verify shell through a pidfd.
+5. The server uses the user manager to stop a dedicated Cargo scope.
+6. The server uses the detached stop record when the supervisor supports a verified stop.
+7. The Verify shell, holder, or supervisor follows its usual cleanup path.
+8. The server confirms that Verify ended and its observed scopes are empty.
+9. The server sends the notice after it confirms the stop.
 
+The server keeps the pending notice after the confirmation deadline.
+It checks for late confirmation for `kill_late_confirmation_seconds`.
 The server supplies the first line of the notice.
 The operator can add words in the confirmation.
 The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.

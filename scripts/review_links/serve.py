@@ -1948,6 +1948,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             for path, stamp in stamps.items():
                 if (stamp is ModuleStampUnavailable.UNREADABLE or stamp[0] >= STARTED_NS
                         or (path in self.module_stamps and self.module_stamps[path] != stamp)):
+                    if self.kill_actions.has_pending():
+                        return
                     with self.delivery_status.locked():
                         if self.delivery_status.request_attempts or self.delivery_status.question_jobs:
                             return

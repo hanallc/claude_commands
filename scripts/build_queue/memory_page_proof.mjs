@@ -160,7 +160,10 @@ try {
   const killPath = '/console/build-kill';
   const killRef = 'a'.repeat(64);
   const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
-    message:'nate killed your run check (pid 2712994) from the Builds page at 19:41 EST'};
+    recipient_name:'impl3',step:'check',
+    message:'nate killed your run "check" (pid 2712994) from the Builds page at 19:41 EST'};
+  const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
+    time:'19:41 EST',recipient_role:'worker',recipient_name:'impl3'};
   const killToken = 'fixture-token';
   let killPost;
   let killPostReply;
@@ -181,10 +184,10 @@ try {
         req.on('end', () => {
           killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
           killPostReply = () => {
-            const result = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent'};
-            killResults = [result];
-            res.end(JSON.stringify({result}));
+            killResults = [killedResult];
+            res.end(JSON.stringify({result:killedResult}));
           };
+          server.emit('kill-post');
         });
       } else {
         res.end(JSON.stringify({token:killToken,offers:killResults.length ? {} : {[killRef]:killOffer},results:killResults}));
@@ -324,6 +327,7 @@ try {
               unavailable:document.querySelector('tr[data-tip="row:unavailable-fixture"] .pid').title,
               fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
               preview:document.querySelector('#kill-message').textContent,
+              recipient:document.querySelector('#kill-recipient').textContent,
               clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
                 width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
                 height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
@@ -332,13 +336,27 @@ try {
           if (killShot) {
             const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:confirmation.clip});
             await writeFile(join(folder,'kill-dark.png'),Buffer.from(shot.data,'base64'));
+            killResults = [killedResult];
+            const killedClip = await evaluate(`(async () => {
+              document.querySelector('#kill-dialog').close();
+              await refreshKill();
+              const walk = document.querySelector('#walk').getBoundingClientRect();
+              const heading = document.querySelector('#walk-title').getBoundingClientRect();
+              const left = Math.max(0,walk.left-8), top = Math.max(0,heading.top-8);
+              return {x:left+scrollX,y:top+scrollY,width:Math.min(innerWidth,walk.right+8)-left,
+                height:walk.bottom+8-top,scale:1};
+            })()`);
+            const killed = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:killedClip});
+            await writeFile(join(folder,'killed-row-dark.png'),Buffer.from(killed.data,'base64'));
             console.log(join(folder,'kill-dark.png'));
+            console.log(join(folder,'killed-row-dark.png'));
           } else {
             assert.equal(confirmation.icons,1);
             assert.equal(confirmation.unavailable,'Kill is not available for this run yet');
             assert.deepEqual(confirmation.fields,
-              ['unit-board check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+              ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
             assert.equal(confirmation.preview,killOffer.message);
+            assert.equal(confirmation.recipient,killOffer.recipient_name);
             await evaluate(`document.querySelector('#kill-submit').click()`);
             assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
             // Remove the fixture row while the action is pending.
@@ -354,7 +372,7 @@ try {
             assert.equal(await evaluate(`(async () => {
               await refreshKill();
               return document.querySelector('#kill-results').textContent;
-            })()`),'check (pid 2712994) · Stopped · Message sent');
+            })()`),'check (pid 2712994) · Killed by you at 19:41 EST · worker impl3 informed');
             console.log(JSON.stringify({pass:true,proof:'Kill control'}));
           }
           break browserProof;
