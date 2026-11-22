@@ -42,14 +42,6 @@
       ]
     },
     {
-      "root": "scripts/model_study",
-      "extraPaths": [
-        ".",
-        "scripts/model_study",
-        "scripts/lib"
-      ]
-    },
-    {
       "root": "scripts/hooks",
       "extraPaths": [
         ".",

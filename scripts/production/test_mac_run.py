@@ -233,6 +233,36 @@ def run_mac_test(*arguments):
     return mac_test.main()
 
 if args[0] == "place-step":
+    wait_reply = os.environ.get("MAC_RUN_QUEUE_WAIT_REPLY")
+    if wait_reply and not (wait_reply == "pending-evidence" and (state / "wait-reply").exists()):
+        from unittest.mock import patch
+        from scripts.build_queue import admission_client, admission_wire as wire, placement
+        from scripts.mac_test import claim_state
+
+        if (state / "wait-reply").exists():
+            raise SystemExit("the runner retried the wait reply")
+        (state / "wait-reply").touch()
+        episode, since = option("--episode"), float(option("--since"))
+        destination = placement.PlacementDestination("mac", "mac", "natemccoy@mac", claim_state.WHOLE_MAC)
+        if wait_reply in ("busy", "blocked"):
+            eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion(wait_reply))
+            diagnostics = ()
+            if wait_reply == "busy" and os.environ.get("MAC_RUN_QUEUE_BUSY_DIAGNOSTIC") != "0":
+                diagnostics = (placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00"),)
+            if wait_reply == "blocked":
+                print("fixture queue warning", file=sys.stderr)
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,),
+                wire.PlacementResourceWait("mac", wait_reply), provider_diagnostics=diagnostics)
+        elif wait_reply == "pending-evidence":
+            eligibility = placement.CandidateEligibility(destination, placement.EvidenceNeeded("host evidence is pending"))
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,))
+        elif wait_reply == "damaged-claim":
+            claim_state.state_paths().run.write_text("damaged\n")
+            reply = wire.PlacementWait(episode, since, 1, ())
+        else:
+            raise SystemExit("unknown wait reply in the fixture")
+        with patch.object(admission_client, "request_placement", return_value=reply):
+            raise SystemExit(admission_client.main(args))
     with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
         status = run_mac_test("claim", "--identity", "--pid", option("--pid"),
             "--what", "mac run " + os.environ["MAC_RUN_SHA"][:9], "--worktree", option("--repo-root"), "--wait", "0")
@@ -461,6 +491,12 @@ class MacRunTests(unittest.TestCase):
     def assert_claim_released(self) -> None:
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def assert_placement_wait_cancelled(self) -> None:
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "cancel-placement"])
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+
     def wait_for_path(self, path: Path, process: subprocess.Popen[str]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         if process.poll() is not None:
@@ -566,6 +602,81 @@ class MacRunTests(unittest.TestCase):
         self.assertIn(f"state unreadable: {block}", result.stdout)
         self.assert_no_build_started()
         self.assert_claim_released()
+
+    def test_queue_busy_reply_exits_nine_without_starting_build(self) -> None:
+        for diagnostic in ("1", "0"):
+            with self.subTest(diagnostic=diagnostic):
+                self.clear_events()
+                (self.stub_state / "wait-reply").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "busy",
+                                             "MAC_RUN_QUEUE_BUSY_DIAGNOSTIC": diagnostic},
+                                      timeout=TEST_HANG_GUARD_SECS)
+
+                self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                busy_lines = [line for line in result.stderr.splitlines()
+                              if line.startswith("busy:") or line == "Mac is busy"]
+                self.assertEqual(len(busy_lines), 1, result.stderr)
+                if diagnostic == "1":
+                    self.assertRegex(busy_lines[0], r"busy: unit tests since \d\d:\d\d")
+                else:
+                    self.assertEqual(busy_lines[0], "Mac is busy")
+                self.assert_placement_wait_cancelled()
+                self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+                self.assert_no_build_started()
+                self.assert_claim_released()
+                self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
+
+    def test_queue_blocked_reply_exits_nine_without_starting_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "blocked"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("fixture queue warning", result.stderr.splitlines())
+        self.assertEqual(result.stderr.splitlines().count("Mac is blocked"), 1, result.stderr)
+        self.assert_placement_wait_cancelled()
+        self.assert_no_build_started()
+        self.assert_claim_released()
+
+    def test_pending_host_evidence_retries_placement_and_starts_the_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence",
+                                     "MAC_TEST_ADVANCE_WAIT": "1"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "place-step", "cancel-placement"])
+        self.assertEqual(queue_events[0], queue_events[1])
+        self.assertTrue(any(event["command"] == "ssh" and "cargo build" in event["args"][-1]
+                            for event in self.events()))
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+        self.assert_claim_released()
+
+    def test_damaged_claim_exits_nine_without_starting_build(self) -> None:
+        self.state_directory.mkdir()
+        _ = (self.state_directory / "run.json").write_text("damaged\n", encoding="utf-8")
+
+        result = self.mac_run(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assertFalse((self.stub_state / "queue-events").exists())
+
+    def test_damaged_claim_during_placement_exits_nine_without_retry(self) -> None:
+        self.state_directory.mkdir()
+
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "damaged-claim"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assert_placement_wait_cancelled()
+
+    def assert_damaged_claim_refusal(self, result: subprocess.CompletedProcess[str]) -> None:
+        claim = self.state_directory / "run.json"
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, f"state unreadable: {claim}\n")
+        self.assertEqual(list(self.state_directory.iterdir()), [claim])
+        self.assertEqual(claim.read_text(), "damaged\n")
+        self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+        self.assert_no_build_started()
 
     def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
         self.write_production_config(
