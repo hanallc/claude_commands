@@ -3376,6 +3376,31 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         release.assert_not_called()
         self.assertEqual(self.read_claim(), changed)
 
+    def test_idle_watcher_releases_a_later_claim_after_a_lease_open_error(self) -> None:
+        from scripts.copies import copies
+
+        expired = mac_test.timestamp(self.now - timedelta(minutes=20))
+        records = self.write_repository_claims(idle_since=expired)
+        oldest = self.paths.claims / "cargo-liner.json"
+        _ = oldest.write_text(json.dumps({**records["cargo-liner"], "idle_since": expired,
+                                         "since": mac_test.timestamp(self.now - timedelta(hours=1)),
+                                         "remote_host": "blocked-mac"}))
+        before = oldest.read_bytes()
+        registry = self.root / "mirror-registry"
+        lease = registry / (copies.remote_key("blocked-mac", "") + ".host-lease")
+        lease.mkdir(parents=True)
+        with mock.patch.object(copies, "remote_registry", return_value=registry), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
+             mock.patch.object(mac_test, "send_message") as send:
+            output = self.watch_once()
+        self.assertEqual(oldest.read_bytes(), before)
+        self.assertFalse((self.paths.claims / "hana.json").exists())
+        self.assertIn("Mac claim cleanup lease unavailable", output)
+        self.assertIn(str(lease), output)
+        self.assertLess(output.index(str(lease)), output.index('Your Mac claim "hana tests"'))
+        send.assert_called_once()
+        self.assertIn('Your Mac claim "hana tests"', cast(str, send.call_args.args[4]))
+
     def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import eligibility, offload, claim_state

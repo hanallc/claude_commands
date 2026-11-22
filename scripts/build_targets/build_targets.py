@@ -649,7 +649,7 @@ def command_recover_probe(args: CliArguments) -> int:
             mirror = claim_state.mac_repository_identity(args.repo_root)
             if isinstance(mirror, claim_state.WholeMacScope):
                 return 0
-            saved = mirror.with_history(Path(args.repo_root))
+            saved = mirror.claim_repository()
             if not isinstance(saved, claim_state.MacRepositoryIdentity):
                 return 0
             mac_repository = saved

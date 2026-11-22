@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import subprocess
@@ -96,21 +97,38 @@ def git_common_dir(directory: str) -> str | None:
         return None
 
 
-def mac_source_repository(common: str) -> tuple[str, str]:
-    """Read the source Git folder and its origin through local clone links."""
+@dataclass(frozen=True)
+class MacSourceRepository:
+    """The source Git folder and key from one checkout origin read."""
+
+    git_dir: str
+    key: str
+    checkout_origin: str = field(repr=False)
+
+
+def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
+    """Follow local clone origins from the checkout to the source repository."""
+    checkout_origin = _mac_origin(["-C", worktree])
+    origin, directory = checkout_origin, worktree
     seen = {common}
-    while True:
-        result = subprocess.run(["git", "-C", os.path.dirname(common), f"--git-dir={common}", "remote", "get-url", "origin"],
-                                capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
-        if result.returncode == 2:
-            return common, ""
-        result.check_returncode()
-        origin = result.stdout.strip()
-        source = local_origin_git_dir(origin, os.path.dirname(common))
+    while origin:
+        source = local_origin_git_dir(origin, directory)
         if source is None or source in seen:
-            return common, origin
+            return MacSourceRepository(common, remote_identity(origin, directory), checkout_origin)
         seen.add(source)
         common = source
+        directory = os.path.dirname(common)
+        origin = _mac_origin(["-C", directory, f"--git-dir={common}"])
+    return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
+
+
+def _mac_origin(git_location: list[str]) -> str:
+    result = subprocess.run(["git", *git_location, "remote", "get-url", "origin"],
+                            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    if result.returncode == 2:
+        return ""
+    result.check_returncode()
+    return result.stdout.strip()
 
 
 def source_git_dir(common: str) -> str:

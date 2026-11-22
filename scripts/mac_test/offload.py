@@ -3394,7 +3394,7 @@ def run_offload(
             resolved = claim_state.mac_repository_identity(str(request.repo_root))
             if isinstance(resolved, claim_state.WholeMacScope):
                 return declined("repo" if config.enabled else "off", started)
-            executable = resolved.with_history(request.repo_root)
+            executable = resolved.claim_repository()
             if not isinstance(executable, claim_state.MacRepositoryIdentity):
                 return declined("repo" if config.enabled else "off", started)
             mac_repository = policy_repository = executable

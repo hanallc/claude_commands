@@ -784,7 +784,7 @@ raise SystemExit(offload.main())
         repository = claim_state.mac_repository_identity(str(self.repository))
         if isinstance(repository, claim_state.WholeMacScope):
             self.fail(f"The fixture repository has no Mac identity: {self.repository}")
-        saved = repository.with_history(self.repository)
+        saved = repository.claim_repository()
         if not isinstance(saved, claim_state.MacRepositoryIdentity):
             self.fail(f"The fixture repository has no history key: {self.repository}")
         return saved

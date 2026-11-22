@@ -1606,14 +1606,16 @@ def watch_claim(
         from scripts.copies import copies
         from scripts.mac_test import offload
 
-        try:
-            with offload.mac_cleanup_lease(claim_state.saved_mac_repository(run), run["remote_host"], paths.target):
-                return apply_claim_activity(paths, config, claim, activity, now, release_remote=True)
-        except copies.BusyRemoteMirror:
-            return True
-        except copies.CopyError as error:
-            print(f"Mac claim cleanup lease unavailable: {error}", flush=True)
-            return True
+        with ExitStack() as lease:
+            try:
+                lease.enter_context(offload.mac_cleanup_lease(
+                    claim_state.saved_mac_repository(run), run["remote_host"], paths.target))
+            except copies.BusyRemoteMirror:
+                return True
+            except (OSError, copies.CopyError) as error:
+                print(f"Mac claim cleanup lease unavailable: {error}", flush=True)
+                return True
+            return apply_claim_activity(paths, config, claim, activity, now, release_remote=True)
     return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
 
 
@@ -2219,7 +2221,7 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
         return 1
     args.worktree = str(worktree)
     args.what = f"{args.verb} {args.package or 'workspace'}"
-    saved = mac_repository.with_history(worktree) if isinstance(mac_repository, claim_state.MacMirrorIdentity) else WHOLE_MAC
+    saved = mac_repository.claim_repository() if isinstance(mac_repository, claim_state.ResolvedMacMirror) else WHOLE_MAC
     return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment,
                          mac_repository=saved)
 
@@ -2247,7 +2249,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             mac_repository = claim_state.mac_repository_record(cast(object, json.loads(args.mac_repository)))
         elif isinstance(mac_repository, claim_state.ResolveMacRepository):
             mirror = claim_state.mac_repository_identity(args.worktree)
-            mac_repository = mirror.with_history(Path(args.worktree)) if isinstance(mirror, claim_state.MacMirrorIdentity) else WHOLE_MAC
+            mac_repository = mirror.claim_repository() if isinstance(mirror, claim_state.ResolvedMacMirror) else WHOLE_MAC
     if isinstance(mac_repository, claim_state.ResolveMacRepository):
         mac_repository = WHOLE_MAC
     if not isinstance(assignment, UnassignedClaim):

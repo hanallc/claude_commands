@@ -185,9 +185,9 @@ class MacRunTests(unittest.TestCase):
 
         resolve = repository.mac_source_repository
 
-        def resolve_outside_lock(common: str) -> tuple[str, str]:
+        def resolve_outside_lock(worktree: str, common: str) -> repository.MacSourceRepository:
             self.assertEqual(claim_state.coordination_depth.get(), 0)
-            return resolve(common)
+            return resolve(worktree, common)
 
         with mock.patch.object(repository, "mac_source_repository", side_effect=resolve_outside_lock) as lookup:
             self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False, assignment=assignment), 0)
@@ -283,7 +283,9 @@ class MacRunTests(unittest.TestCase):
         for origin in (str(self.repo), "../.claude"):
             with self.subTest(origin=origin):
                 _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", origin], check=True)
-                self.assertEqual(claim_state.mac_repository_identity(str(self.checkout)), source)
+                mirror = claim_state.mac_repository_identity(str(self.checkout))
+                assert isinstance(mirror, claim_state.MacMirrorIdentity)
+                self.assertEqual(mirror.record(), source.record())
         native = self.native_claim(self.repo)
         self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
         self.addCleanup(mac_test.command_release, native, self.paths)
@@ -567,6 +569,54 @@ class MacRunTests(unittest.TestCase):
             args, self.paths, watch_claim=False, mac_repository=identity), 12)
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
+    def test_runner_uses_one_checkout_origin_for_the_saved_claim(self) -> None:
+        with (self.root / "mac_test.conf").open("a") as settings:
+            _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
+        other = self.repository("source-b")
+        set_origin = ["git", "-C", str(self.checkout), "remote", "set-url", "origin"]
+        _ = subprocess.run([*set_origin, str(self.repo)], check=True)
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("fixture-mac", 1, 1),
+                                           1, 1, 1, "1", {"linux_only..claude": ""})
+        request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
+                                         "verify", "", target="mac")
+        run_git = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        launch = cast(Callable[..., object], subprocess.Popen)
+        origin_reads: list[str] = []
+
+        def change_origin(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            result = run_git(command, **options)
+            if command[:3] == set_origin[:3] and command[-3:] == ["remote", "get-url", "origin"]:
+                origin_reads.append(result.stdout.strip())
+                if len(origin_reads) == 1:
+                    _ = run_git([*set_origin, str(other)], check=True)
+            return result
+
+        def claim_child(command: list[str], **options: object) -> object:
+            if command[0] == "git":
+                return launch(command, **options)
+            self.assertEqual(command[2], "claim")
+            args = mac_test.parser().parse_args(command[2:], namespace=mac_test.CliArguments())
+            output = StringIO()
+            with redirect_stdout(output):
+                status = mac_test.command_claim(args, self.paths, watch_claim=False)
+            return mock.Mock(returncode=status, communicate=mock.Mock(return_value=(output.getvalue(), "")),
+                             poll=mock.Mock(return_value=status))
+
+        controller = offload.ProcessController()
+        with mock.patch.object(subprocess, "run", side_effect=change_origin), \
+             mock.patch.object(subprocess, "Popen", side_effect=claim_child), \
+             mock.patch.object(offload, "claimed_run", return_value=offload.PassedOnMac(1)):
+            self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()), offload.PassedOnMac)
+        held, = claim_state.read_claims(self.paths)
+        saved = claim_state.saved_mac_repository(held.record)
+        assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        stem = claim_state.mac_claim_stem(REPOSITORY_KEY, 0)
+        self.assertEqual((saved.mirror_name, saved.key, held.path.name, saved.fence_directory),
+                         (self.repo.name, REPOSITORY_KEY, f"{stem}.json", stem))
+        self.assertEqual(saved.history_key, str(self.repo))
+        self.assertEqual(controller.attempt_evidence.repository_key, saved.history_key)
+        self.assertEqual(origin_reads, [str(self.repo)])
+
     def test_fresh_takeover_waits_for_the_previous_hosts_cleanup_lease(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:
             _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
@@ -659,9 +709,8 @@ class MacRunTests(unittest.TestCase):
                         self.assertTrue(queue_repository.key.startswith("git-root:"))
                     waiting = self.native_claim(checkout)
                     waiting.repo_root, waiting.verb, waiting.target = str(checkout), "check", "mac"
-                    with mock.patch.object(repository, "repository_key", wraps=repository.repository_key) as read_key:
+                    with mock.patch.object(repository, "repository_key", side_effect=AssertionError("Use the checkout origin")):
                         self.assertEqual(mac_test.command_claim_wait(waiting, self.paths), 0)
-                    read_key.assert_called_once_with(str(checkout))
                     held, = claim_state.read_claims(self.paths)
                     saved = claim_state.saved_mac_repository(held.record)
                     assert isinstance(saved, claim_state.MacRepositoryIdentity)

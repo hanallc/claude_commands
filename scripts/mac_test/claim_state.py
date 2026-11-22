@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 import fcntl
@@ -305,14 +305,6 @@ class MacMirrorIdentity:
     claim_file: str
     fence_directory: str
 
-    def with_history(self, worktree: Path) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
-        from scripts.buildlog import repository
-
-        key = repository.repository_key(str(worktree))
-        if not key or key == store.UNKNOWN_IDENTITY:
-            return CleanupOnlyMacRepository(self.key, self.mirror_name, self.claim_file, self.fence_directory)
-        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, key)
-
     def for_slot(self, slot: int) -> Self:
         fence = mac_claim_stem(self.key, slot)
         return replace(self, claim_file=f"{fence}.json", fence_directory=fence)
@@ -325,6 +317,23 @@ class MacMirrorIdentity:
 @dataclass(frozen=True)
 class CleanupOnlyMacRepository(MacMirrorIdentity):
     """The saved mirror identifies work for cleanup."""
+
+
+@dataclass(frozen=True)
+class ResolvedMacMirror(MacMirrorIdentity):
+    """The mirror and the checkout origin used to find it."""
+
+    worktree: str
+    checkout_origin: str = field(repr=False)
+
+    def claim_repository(self) -> MacRepositoryIdentity | CleanupOnlyMacRepository:
+        from scripts.buildlog import repository
+
+        history_key = (repository.remote_identity(self.checkout_origin, self.worktree) if self.checkout_origin
+                       else repository.git_root_key(self.worktree))
+        if not history_key or history_key == store.UNKNOWN_IDENTITY:
+            return CleanupOnlyMacRepository(self.key, self.mirror_name, self.claim_file, self.fence_directory)
+        return MacRepositoryIdentity(self.key, self.mirror_name, self.claim_file, self.fence_directory, history_key)
 
 
 @dataclass(frozen=True)
@@ -574,22 +583,21 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
     return value
 
 
-def mac_repository_identity(worktree: str) -> MacMirrorIdentity | WholeMacScope:
+def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
     from scripts.buildlog import repository
 
     common = repository.git_common_dir(worktree)
     if common is None:
         return WHOLE_MAC
     try:
-        source, origin = repository.mac_source_repository(common)
-        folder = Path(source).parent
-        key = repository.remote_identity(origin, str(folder)) if origin else "git-dir:" + source
+        source = repository.mac_source_repository(worktree, common)
     except (OSError, SubprocessError, ValueError):
         return WHOLE_MAC
-    if not valid_mac_path_component(folder.name):
+    mirror = Path(source.git_dir).parent.name
+    if not valid_mac_path_component(mirror):
         return WHOLE_MAC
-    fence = mac_claim_stem(key, 0)
-    return MacMirrorIdentity(key, folder.name, f"{fence}.json", fence)
+    fence = mac_claim_stem(source.key, 0)
+    return ResolvedMacMirror(source.key, mirror, f"{fence}.json", fence, worktree, source.checkout_origin)
 
 
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:

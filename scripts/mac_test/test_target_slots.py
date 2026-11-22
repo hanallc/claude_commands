@@ -261,8 +261,8 @@ class RepositorySlotTests(unittest.TestCase):
         for worktree, pid in ((main, 101), (clone, 102)):
             args = self.arguments("mac", worktree, pid)
             mirror = claim_state.mac_repository_identity(args.worktree)
-            assert isinstance(mirror, claim_state.MacMirrorIdentity)
-            saved = mirror.with_history(worktree)
+            assert isinstance(mirror, claim_state.ResolvedMacMirror)
+            saved = mirror.claim_repository()
             assert isinstance(saved, claim_state.MacRepositoryIdentity)
             scope = claim_state.RepositoryScope(saved.mirror_name, saved.key)
             with claim_state.locked(paths.lock):
