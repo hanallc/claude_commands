@@ -1757,7 +1757,7 @@ function mountCard(page,replaceCard=false){
   +(entry.filed ? '<time datetime="'+new Date(entry.filed*1000).toISOString()+'">'+reviewAge(entry.filed*1000)+'</time>' : '')
   +reviewWaiting(entry)+(urgency ? '<span>'+escapeText(urgency)+'</span>' : '')+'</div></header>'
   +'<div class="review-box-scroll" role="region" aria-label="Review details" tabindex="0"><div data-review-detail></div></div>';
- row.dialogDetails=row.querySelector('[data-review-detail]');
+ row.openDetails=row.querySelector('[data-review-detail]');
  installReviewBody(row,page.querySelector('[data-card-body]').innerHTML);
  const title=plainReviewText(titleText);
  for(const section of row.querySelectorAll('[data-review-body] > section,[data-review-body] > .change-text > section')){
