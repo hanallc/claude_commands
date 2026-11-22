@@ -87,16 +87,34 @@ class NoTimeLimit:
 UNLIMITED_GIT = NoTimeLimit()
 
 
+def _git_quote(value: str) -> str:
+    """Quote a field for Git's GIT_CONFIG_PARAMETERS parser."""
+    return "'" + value.replace("'", r"'\''").replace("!", r"'\!'") + "'"
+
+
+def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
+    if not git_config:
+        return None
+    environment = os.environ.copy()
+    parameters = [environment.get("GIT_CONFIG_PARAMETERS", "")]
+    for setting in git_config:
+        key, separator, value = setting.partition("=")
+        quoted_value = _git_quote(value) if separator else ""
+        parameters.append(f"{_git_quote(key)}={quoted_value}")
+    environment["GIT_CONFIG_PARAMETERS"] = " ".join(filter(None, parameters))
+    return environment
+
+
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
          git_config: Sequence[str] = ()) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
-    config_options = [argument for setting in git_config for argument in ("-c", setting)]
+    environment = _git_config_environment(git_config)
 
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(["git", "-C", str(checkout), *config_options, *arguments],
-                                  capture_output=True, text=True, check=False,
+            return subprocess.run(["git", "-C", str(checkout), *arguments],
+                                  capture_output=True, text=True, check=False, env=environment,
                                   timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
         except subprocess.TimeoutExpired as error:
             details = "; ".join(output.decode(errors="replace").strip()

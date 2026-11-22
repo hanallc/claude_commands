@@ -74,20 +74,26 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertFalse(any("push" in cast(list[str], call.args[0]) for call in commands.call_args_list))
 
     def test_landing_git_commands_use_only_the_requested_config(self) -> None:
-        config = "core.fsync=committed"
+        inherited = "'core.fsync'='none'"
+        settings = ("core.fsync=committed", "fixture.message=Let's land! key=value", "fixture.flag")
+        appended = r"'core.fsync'='committed' 'fixture.message'='Let'\''s land'\!' key=value' 'fixture.flag'="
         for use_config in (True, False):
-            with self.subTest(use_config=use_config):
+            with self.subTest(use_config=use_config), mock.patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": inherited}):
                 commit = self.next_commit(f"Config {use_config}\n")
+                expected_environment = ({**os.environ, "GIT_CONFIG_PARAMETERS": f"{inherited} {appended}"}
+                                        if use_config else None)
                 with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
                     if use_config:
-                        result = land_main.land(self.repo, commit, git_config=(config,))
+                        result = land_main.land(self.repo, commit, git_config=settings)
                     else:
                         result = land_main.land(self.repo, commit)
                 self.assertIsInstance(result.push, land_main.Pushed)
-                prefix = ["git", "-C", str(self.repo), *(["-c", config] if use_config else [])]
-                arguments = [call.args[0] for call in commands.call_args_list]
-                self.assertIn([*prefix, "fetch", "origin", "main"], arguments)
-                self.assertIn([*prefix, "push", "origin", f"{commit}:refs/heads/main"], arguments)
+                prefix = ["git", "-C", str(self.repo)]
+                for command in ([*prefix, "fetch", "origin", "main"],
+                                [*prefix, "push", "origin", f"{commit}:refs/heads/main"]):
+                    commands.assert_any_call(command, capture_output=True, text=True, check=False,
+                                             timeout=None, env=expected_environment)
+                self.assertEqual(os.environ["GIT_CONFIG_PARAMETERS"], inherited)
 
     def test_a_failed_hook_keeps_the_cli_successful_and_retries_on_the_same_tip(self) -> None:
         self.install_hook()
