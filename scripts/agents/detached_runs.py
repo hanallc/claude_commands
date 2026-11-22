@@ -12,9 +12,6 @@ stops the command group and delivers the STOPPED result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
 """
 
-# Each platform check needs only the suppression for the other platform's exit watch.
-# pyright: reportUnnecessaryTypeIgnoreComment=false
-
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -46,7 +43,9 @@ from importlib.machinery import ModuleSpec, SourceFileLoader
 from importlib.util import spec_from_file_location
 from pathlib import Path
 from types import CodeType, ModuleType
-from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard, cast, override
+from typing import (
+    IO, TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, TypeGuard, cast, override, runtime_checkable,
+)
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -2071,19 +2070,44 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 
 def _wait_for_leader(command: CommandGroup) -> None:
     """Wait for the leader to save its exit status and exit."""
+    waits = {"darwin": _wait_for_leader_kqueue, "linux": _wait_for_leader_pidfd}
     with contextlib.suppress(ProcessLookupError):
-        if sys.platform == "darwin":
-            with contextlib.closing(select.kqueue()) as watcher:  # pyright: ignore[reportUnreachable]
-                event = select.kevent(command.group, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                      select.KQ_NOTE_EXIT)
-                _ = watcher.control([event], 0)
-                _wait_for_leader_exit(command, lambda timeout: bool(watcher.control(None, 1, timeout)))
-        else:
-            leader = os.pidfd_open(command.group)  # pyright: ignore[reportUnreachable]
-            try:
-                _wait_for_leader_exit(command, lambda timeout: bool(select.select([leader], [], [], timeout)[0]))
-            finally:
-                os.close(leader)
+        waits[sys.platform](command)
+
+
+class _LeaderExitQueue(Protocol):
+    def control(self, changes: list[object] | None, max_events: int, timeout: float | None = None, /) -> list[object]: ...
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class _LeaderExitKqueueAPI(Protocol):
+    KQ_FILTER_PROC: int
+    KQ_EV_ADD: int
+    KQ_EV_ONESHOT: int
+    KQ_NOTE_EXIT: int
+
+    def kqueue(self) -> _LeaderExitQueue: ...
+    def kevent(self, pid: int, filter: int, flags: int, fflags: int, /) -> object: ...
+
+
+def _wait_for_leader_kqueue(command: CommandGroup) -> None:
+    # The type stubs expose kqueue only on its native platform.
+    api = select
+    assert isinstance(api, _LeaderExitKqueueAPI)
+    with contextlib.closing(api.kqueue()) as watcher:
+        event = api.kevent(command.group, api.KQ_FILTER_PROC, api.KQ_EV_ADD | api.KQ_EV_ONESHOT, api.KQ_NOTE_EXIT)
+        _ = watcher.control([event], 0)
+        _wait_for_leader_exit(command, lambda timeout: bool(watcher.control(None, 1, timeout)))
+
+
+def _wait_for_leader_pidfd(command: CommandGroup) -> None:
+    pidfd_open = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+    leader = pidfd_open(command.group)
+    try:
+        _wait_for_leader_exit(command, lambda timeout: bool(select.select([leader], [], [], timeout)[0]))
+    finally:
+        os.close(leader)
 
 
 def _wait_for_leader_exit(command: CommandGroup, wait_for_exit: Callable[[float | None], bool]) -> None:
