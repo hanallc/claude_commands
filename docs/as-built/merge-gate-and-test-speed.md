@@ -52,6 +52,20 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Whole gate route
+
+The Mac Linux guest runs the whole test selection when `enabled.mac-linux=on` and the queue assigns the gate to `mac-linux`.
+The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
+It reads the guest switch only for a `mac-linux` target.
+The assignment must match the gate's placement episode and submitting process.
+The queue must confirm that the saved attempt is current.
+The gate uses the cloud route when the guest is off or the queue has no `mac-linux` assignment for this gate.
+The guest test timer uses `run.time_limit_seconds`.
+The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
+When the test timer expires, the gate returns the guest's time-limit report.
+If the guest cannot return a result, the gate prints `Mac Linux gate falls back: <reason>` and tries the cloud route.
+If the cloud route returns a fallback reason, natedev runs the selection.
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
@@ -1277,9 +1291,14 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
 
-The merge gate owns module folders through `temporary_build_folder` contexts.
-The contexts remove folders after success or an exception.
-Style lint uses the same context and keeps its standing Cargo target.
+The merge gate owns each module folder through a `tool_folder` context.
+The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
+The runner puts its config-read log, scratch root, and review root inside that folder.
+The runner supervisor removes these folders after it reaps the test processes, including after gate death on Linux.
+The gate repairs permissions if necessary when it removes the module folder.
+After gate death, recovery reports the retained gate folder for removal.
+Standalone runners keep separate leases for their folders.
+Style lint uses a temporary leased folder and keeps its standing Cargo target.
 Style review keeps its input folder because the review worker reads it after preparation exits.
 
 
