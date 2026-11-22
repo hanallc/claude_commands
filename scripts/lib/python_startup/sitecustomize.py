@@ -34,7 +34,12 @@ STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/p
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
-                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf")
+                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
+                     "config/test_times.conf")
+_DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
+_SESSION_STARTUP = "session_python_startup"
+_DIRECT_TEST_LIMIT_KEY = "direct_test.time_limit_seconds"
+GATE_PARENT_SOURCE_FD = "DEVTOOLS_GATE_PARENT_SOURCE_FD"
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
 DATACLASS_CODE_FLAGS = 0
@@ -61,6 +66,18 @@ def inherited_paths(value: str) -> list[str]:
     return [entry for entry in value.split(os.pathsep) if value
             and not os.path.isdir(os.path.join(entry or os.curdir, "scripts"))
             and not entry.rstrip(os.sep).endswith(os.sep + "lib/python_startup")]
+
+
+def startup_pythonpath(inherited: str) -> str:
+    """Keep general Python paths and put this startup hook first."""
+    # Older copies skip paths that end in lib/python_startup.
+    library = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    other_paths = (entry for entry in inherited_paths(inherited) if not _session_startup(entry))
+    return os.pathsep.join((os.path.join(library, _SESSION_STARTUP), *other_paths))
+
+
+def _session_startup(entry: str) -> bool:
+    return entry.rstrip(os.sep).endswith(os.sep + "lib" + os.sep + _SESSION_STARTUP)
 
 
 def _selection_inputs(paths: list[str]) -> tuple[tuple[str, ...], str, bool, str]:
@@ -94,7 +111,8 @@ def select_checkout(arguments: list[str]) -> str:
     paths = [entry for entry in sys.path
              if os.path.realpath(entry) == selected
              or (not os.path.isdir(os.path.join(entry or os.curdir, "scripts"))
-                 and not entry.rstrip(os.sep).endswith(os.sep + "lib/python_startup"))]
+                 and not entry.rstrip(os.sep).endswith(os.sep + "lib/python_startup")
+                 and not _session_startup(entry))]
     if not any(os.path.realpath(entry) == selected for entry in paths):
         script_folder = os.path.dirname(os.path.abspath(arguments[0])) if arguments else ""
         position = int(bool(paths) and os.path.realpath(paths[0]) == script_folder and not getattr(sys.flags, "safe_path", False))
@@ -218,42 +236,356 @@ class DataclassCodeFinder:
 
 
 def start_process(arguments: list[str]) -> str:
-    """Select the checkout at interpreter startup and give a direct test run its folder."""
+    """Select the checkout and register the direct test boundary."""
     selected = select_checkout(arguments)
     if (os.environ.get("CLAUDE_DISABLE_DATACLASS_CODE_CACHE") != "1"
             and "dataclasses" not in sys.modules
             and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
         sys.meta_path.insert(0, DataclassCodeFinder())
-    _start_test_run(selected, arguments)
+    _install_unittest_boundary()
     return selected
 
 
-def gate_parent_pid(consume: bool = False) -> str:
-    """Read the gate parent and optionally clear both names before tests start."""
-    # Chunk 6 removes the old parent variable read.
+def _gate_source_descriptor(parent: str) -> int:
+    """Check that the gate passed an open descriptor for its source file."""
+    raw = os.environ.get(GATE_PARENT_SOURCE_FD, "")
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 10:
+        return -1
+    descriptor = int(raw)
+    if descriptor < 3:
+        return -1
+    try:
+        parent_file = f"/proc/{parent}/fd/{descriptor}"
+        target = os.readlink(parent_file)
+        opened = os.fstat(descriptor)
+        if (target.endswith("/scripts/production/gate.py")
+                and checkout_root(os.path.dirname(target))
+                and stat.S_ISREG(opened.st_mode)
+                and os.path.samestat(os.stat(parent_file), opened)):
+            return descriptor
+    except OSError:
+        pass
+    return -1
+
+
+def _gate_command(pid: str) -> bool:
+    """Recognize an installed gate that starts a module from a newer checkout."""
+    import re
+    from pathlib import Path
+    from pwd import getpwuid
+
+    proc = Path("/proc", pid)
+    try:
+        if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)?)?", (proc / "exe").readlink().name) is None:
+            return False
+        command = (proc / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        arguments = iter(os.fsdecode(item) for item in command[1:])
+        cwd = (proc / "cwd").resolve(strict=True)
+        for item in arguments:
+            if item in ("-P", "-B", "-u"):
+                continue
+            if item == "-m":
+                item = next(arguments, "").replace(".", "/") + ".py"
+            elif item.startswith("-"):
+                return False
+            entry = (cwd / item).resolve(strict=True)
+            installed = Path(getpwuid(os.getuid()).pw_dir, ".claude").resolve()
+            roots = (Path(__file__).resolve().parents[3], installed)
+            return (entry.name in {"gate.py", "merge_gate.py", "targeted_test.py", "merge_checkpoint.py"}
+                    and any(entry.parent == root / "scripts/production" for root in roots))
+    except (KeyError, OSError, ValueError):
+        pass
+    return False
+
+
+def _gate_identity() -> tuple[str, int]:
     parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
-    if consume:
+    if sys.platform != "linux":
+        return parent, -1
+    if parent != str(os.getppid()):
+        return "", -1
+    descriptor = _gate_source_descriptor(parent)
+    return (parent, descriptor) if descriptor >= 0 or _gate_command(parent) else ("", -1)
+
+
+def _remember_gate(parent: str) -> bool:
+    state = sys.modules["_devtools_checkout"]
+    if "test_gate_pidfd" not in state.__dict__:
+        try:
+            state.__dict__["test_gate_pidfd"] = os.pidfd_open(int(parent))
+        except ProcessLookupError:
+            return False
+    return True
+
+
+def gate_parent_pid(consume: bool = False) -> str:
+    """Return only a gate parent that the current process can verify."""
+    parent, descriptor = _gate_identity()
+    if parent and sys.platform == "linux" and not _remember_gate(parent):
+        parent = ""
+    if consume or not parent:
         _ = os.environ.pop("GATE_PARENT_PID", None)
         _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
+        _ = os.environ.pop(GATE_PARENT_SOURCE_FD, None)
+        if descriptor >= 0:
+            os.close(descriptor)
+    elif descriptor >= 0:
+        os.set_inheritable(descriptor, False)
     return parent
 
 
-def _start_test_run(selected: str, arguments: list[str]) -> None:
-    # Decide before any import; module_run.py removes the gate variables later.
-    if gate_parent_pid():
-        return
-    original = sys.orig_argv
-    unittest_module = ("-munittest" in original
-                       or any(original[index:index + 2] == ["-m", "unittest"] for index in range(len(original))))
-    target = arguments[0] if arguments else ""
-    if not (unittest_module or target == "unittest" or os.path.basename(target) == "module_run.py"):
-        return
-    # Partial fixture checkouts can contain only the startup files.
-    if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):
-        return
-    from scripts.lib.testing_folders import start_test_run
+def _unittest_boundary(module: ModuleType) -> None:
+    """Start the limit when the process first loads or runs tests."""
+    from _thread import allocate_lock
+    from functools import wraps
+    from unittest import TestCase, TestLoader, TestProgram, TestSuite, TextTestRunner
+    from unittest.suite import BaseTestSuite
 
-    start_test_run()
+    if module.__dict__.get("_devtools_test_boundary"):
+        return
+    module.__dict__["_devtools_test_boundary"] = True
+    lock = allocate_lock()
+    started = False
+
+    def begin() -> None:
+        nonlocal started
+        if not started:
+            with lock:
+                if not started:
+                    _begin_direct_test()
+                    started = True
+
+    def wrap(owner: type[object], method: Callable[..., object]) -> None:
+        @wraps(method)
+        def run(*args: object, **kwargs: object) -> object:
+            begin()
+            return method(*args, **kwargs)
+
+        setattr(owner, method.__name__, run)
+
+    for owner, methods in (
+        (TestLoader, (TestLoader.discover, TestLoader.loadTestsFromModule, TestLoader.loadTestsFromName,
+                      TestLoader.loadTestsFromNames, TestLoader.loadTestsFromTestCase)),
+        (TestProgram, (TestProgram.runTests,)),
+        (TextTestRunner, (TextTestRunner.run,)),
+        (BaseTestSuite, (BaseTestSuite.run, BaseTestSuite.debug)),
+        (TestSuite, (TestSuite.run, TestSuite.debug)),
+        (TestCase, (TestCase.run, TestCase.debug)),
+    ):
+        for method in methods:
+            wrap(owner, method)
+
+
+class UnittestBoundary:
+    """Install the test boundary when Python imports unittest."""
+
+    def find_spec(self, name: str, path: Sequence[str] | None, target: ModuleType | None = None, /) -> ModuleSpec | None:
+        if name != "unittest":
+            return None
+        spec = PathFinder.find_spec(name, path, target)
+        loader = spec.loader if spec is not None else None
+        if loader is not None:
+            load = loader.exec_module
+
+            def exec_module(module: ModuleType) -> None:
+                sys.meta_path.remove(self)
+                load(module)
+                _unittest_boundary(module)
+
+            vars(loader)["exec_module"] = exec_module
+        return spec
+
+
+def _install_unittest_boundary() -> None:
+    state = sys.modules["_devtools_checkout"]
+    if state.__dict__.get("unittest_boundary"):
+        return
+    state.__dict__["unittest_boundary"] = True
+    if "unittest" in sys.modules:
+        _unittest_boundary(sys.modules["unittest"])
+    else:
+        sys.meta_path.insert(0, UnittestBoundary())
+
+
+def _verified_gate() -> bool:
+    """Check the parent proof that the module supervisor can pass through a fork."""
+    import select
+
+    running_gate: object = sys.modules["_devtools_checkout"].__dict__.get("test_gate_pidfd")
+    if isinstance(running_gate, int):
+        readable, _, _ = select.select([running_gate], [], [], 0)
+        if readable:
+            return False
+        if "GATE_PARENT_PID" in os.environ or "MERGE_GATE_PARENT_PID" in os.environ:
+            _ = gate_parent_pid()
+        return True
+    return bool(gate_parent_pid())
+
+
+def _begin_direct_test() -> None:
+    if _verified_gate():
+        return
+    from contextlib import AbstractContextManager, nullcontext
+    from pathlib import Path
+    from typing import cast
+
+    linux = sys.platform == "linux"
+    # An older checkout can predate the private test folder.
+    checkout = Path(sys.modules["_devtools_checkout"].__path__[0])
+    has_test_folder = (checkout / "scripts/lib/testing_folders.py").is_file()
+    if not (linux or has_test_folder):
+        return
+
+    from scripts.lib import conf
+
+    # Older checkouts may lack the recorder or this API.
+    recorder = sys.modules.get("scripts.lib.conf_reads")
+    without_recording = cast(Callable[[], AbstractContextManager[None]],
+                             getattr(recorder, "without_recording", nullcontext))
+
+    try:
+        with without_recording():
+            if linux:
+                settings = conf.read("test_times")
+                limit = settings.origin(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
+                if isinstance(limit, conf.UnavailableValue):
+                    # The enforcing hook can come from a newer checkout than the test.
+                    template = Path(__file__).resolve().parents[3] / "config/test_times.conf"
+                    seconds = conf.read(template).value(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
+                else:
+                    seconds = limit.value
+                unit = _direct_test_unit(_cgroup(os.getpid()))
+                if unit:
+                    _verify_direct_test_scope(unit, seconds)
+                else:
+                    _adopt_direct_test_scope(seconds)
+            if has_test_folder:
+                from scripts.lib.testing_folders import start_test_run
+
+                start_test_run()
+    except (OSError, conf.Unusable, ValueError) as error:
+        print(f"direct test: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+def _cgroup(pid: int) -> str:
+    with open(f"/proc/{pid}/cgroup", encoding="utf-8") as rows:
+        return next((row[3:].strip() for row in rows if row.startswith("0::")), "")
+
+
+def _direct_test_unit(cgroup: str) -> str:
+    import re
+
+    unit = os.path.basename(cgroup)
+    return unit if re.fullmatch(_DIRECT_TEST_UNIT_PREFIX + r"[0-9a-f]{32}\.scope", unit) else ""
+
+
+def _verify_direct_test_scope(unit: str, seconds: int) -> None:
+    """Check the inherited scope before it can permit a later test to run."""
+    import re
+    import signal
+    import subprocess
+
+    service = "org.freedesktop.systemd1"
+    path = "/org/freedesktop/systemd1/unit/" + unit.replace("-", "_2d").replace(".", "_2e")
+    result = subprocess.run(["busctl", "--user", "get-property", service, path,
+                             service + ".Scope", "RuntimeMaxUSec", "KillSignal"],
+                            capture_output=True, text=True, check=False)
+    if result.returncode == 0 and (limits := re.fullmatch(r"t ([0-9]+)\ni ([0-9]+)\n", result.stdout)):
+        if 0 < int(limits[1]) <= seconds * 1_000_000 and int(limits[2]) == signal.SIGKILL.value:
+            return
+    raise ValueError("cannot verify the inherited direct test limit")
+
+
+def _start_transient_unit(unit: str, properties: Sequence[Sequence[str]], descriptors: tuple[int, ...]) -> None:
+    import subprocess
+
+    service = "org.freedesktop.systemd1"
+    command = ["busctl", "--user", "--", "call", service, "/org/freedesktop/systemd1", service + ".Manager",
+               "StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail", str(len(properties)),
+               *(field for property_fields in properties for field in property_fields), "0"]
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            pass_fds=descriptors, check=False)
+    if result.returncode:
+        raise ValueError(f"systemd could not start {unit}")
+
+
+def _adopt_direct_test_scope(seconds: int) -> None:
+    """Move this process into a deadline scope at the first unittest call.
+
+    Known limit: a child that started before this call stays outside the scope.
+    The deadline does not stop that child.
+    """
+    from contextlib import ExitStack
+    from secrets import token_hex
+
+    pid = os.getpid()
+    arguments = [sys.executable, "-IS", os.path.realpath(__file__), str(pid), str(seconds)]
+    unit = f"{_DIRECT_TEST_UNIT_PREFIX}{token_hex(16)}"
+    reader, writer = os.pipe()
+    with os.fdopen(reader, encoding="utf-8") as ready, ExitStack() as close:
+        _ = close.callback(os.close, writer)
+        descriptor = os.pidfd_open(pid)
+        _ = close.callback(os.close, descriptor)
+        errors = os.dup(2)
+        _ = close.callback(os.close, errors)
+        _start_transient_unit(unit + ".service", (
+            ("Type", "s", "exec"),
+            ("CollectMode", "s", "inactive-or-failed"),
+            ("ExecStartEx", "a(sasas)", "1", sys.executable, str(len(arguments)), *arguments, "1", "no-env-expand"),
+            ("StandardInputFileDescriptor", "h", str(descriptor)),
+            ("StandardOutputFileDescriptor", "h", str(writer)),
+            ("StandardErrorFileDescriptor", "h", str(errors)),
+        ), (descriptor, writer, errors))
+        close.close()
+        scope = ready.readline().strip()
+    if not scope or scope != _direct_test_unit(_cgroup(pid)):
+        raise ValueError("systemd did not place the process in a direct test scope")
+
+
+def _settle_direct_test_scope(unit: str) -> bool:
+    """Stop any descendants and read the result before systemd removes the scope."""
+    import subprocess
+
+    show = subprocess.run(["systemctl", "--user", "show", "--property=Result,ActiveState", "--", unit],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+    state = show.stdout.splitlines()
+    if "ActiveState=failed" in state:
+        _ = subprocess.run(["systemctl", "--user", "reset-failed", "--", unit],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    elif "ActiveState=active" in state or "ActiveState=deactivating" in state:
+        _ = subprocess.run(["systemctl", "--user", "stop", "--", unit],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return "Result=timeout" in state
+
+
+def _observe_direct_test(pid: int, seconds: int) -> None:
+    """Set the scope limit and report an expired limit after the test exits."""
+    import select
+    import signal
+    import subprocess
+    from secrets import token_hex
+
+    unit = f"{_DIRECT_TEST_UNIT_PREFIX}{token_hex(16)}.scope"
+    cgroup = _cgroup(pid)
+    slice_name = next((part for part in reversed(cgroup.split("/")) if part.endswith(".slice")), "app.slice")
+    # The manager passes the main process pidfd as the observer's standard input.
+    descriptor = os.dup(0)
+    try:
+        _start_transient_unit(unit, (
+            ("PIDFDs", "ah", "1", str(descriptor)),
+            ("Slice", "s", slice_name),
+            ("RuntimeMaxUSec", "t", str(seconds * 1_000_000)),
+            ("KillSignal", "i", str(signal.SIGKILL.value)),
+        ), (descriptor,))
+        _ = subprocess.run(["systemctl", "--user", "start", "--", unit], check=True)
+        print(unit, flush=True)
+        _ = select.select([descriptor], [], [])
+        if _settle_direct_test_scope(unit):
+            print(f"stopped at the {seconds}-second direct test limit; run longer tests with targeted_test.py --module",
+                  file=sys.stderr, flush=True)
+    finally:
+        os.close(descriptor)
 
 
 def after_startup(callback: Callable[[], None]) -> None:
@@ -320,3 +652,7 @@ if __name__ == "sitecustomize":
     _ = start_process(sys.argv)
     next_sitecustomize(__file__, following)
     finish_startup(__file__, sys.argv)
+
+
+if __name__ == "__main__":
+    _observe_direct_test(int(sys.argv[1]), int(sys.argv[2]))

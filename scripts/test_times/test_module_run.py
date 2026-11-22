@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
 
 from dataclasses import dataclass
 import json
@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -709,9 +710,9 @@ class FixtureCPU(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
-            env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
-                   "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            env["PYTHONPATH"] = str(root)
+            env = direct_test_fixture_environment(root)
+            env.update(TEST_TIMES_OUT=str(output), HOME=str(root / "home"),
+                       BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
             result = subprocess.run(
                 [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -731,35 +732,50 @@ class ModuleProcessCleanupTests(unittest.TestCase):
                 root = Path(self.enterContext(tempfile.TemporaryDirectory()))
                 processes = OwnedTestProcesses()
                 self.addCleanup(processes.finish)
-                environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-                    "PYTHONPATH": str(root)})
-                _ = environment.pop("TEST_TIMES_OUT", None)
-                _ = (root / "test_parent.py").write_text("""import signal, unittest
+                environment = processes.environment(direct_test_fixture_environment(root))
+                environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
+                case = root / "test_parent.py"
+                _ = case.write_text("""import unittest
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
         print('ready', flush=True)
-        signal.pause()
+        import select
+        select.select([], [], [])
 """, encoding="utf-8")
-                parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                repository = RUNNER.parents[2]
+                log = root / "runner.log"
+                shim = repository / "scripts/lib/py"
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
+                source = f"""import os, sys
+from pathlib import Path
+from scripts.production import gate
+job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
+                         Path({str(repository)!r}), dict(os.environ), Path({str(log)!r}))
+print(job.process.pid, flush=True)
+sys.exit(job.process.wait())
+"""
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
                 processes.track(parent)
-                _ = environment.pop("GATE_PARENT_PID", None)
-                _ = environment.pop("MERGE_GATE_PARENT_PID", None)
-                environment[parent_name] = str(parent.pid)
-                runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
-                    env=environment, cwd=root, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-                processes.track(runner)
-                output = runner.stdout
+                output = parent.stdout
                 assert output is not None
                 self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-                self.assertEqual(cast(str, output.readline()), "ready\n")
-                parent.send_signal(signal.SIGTERM)
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                self.addCleanup(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                parent.terminate()
                 self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-                stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
-                self.assertNotIn("Traceback", stderr)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -826,12 +842,9 @@ class InheritedSignal(unittest.TestCase):
         source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
                   .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
         _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
-        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-            "PYTHONDONTWRITEBYTECODE": "1"})
-        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
-            _ = environment.pop(name, None)
-        environment["PYTHONPATH"] = str(root)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(root))
         process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)
