@@ -16,7 +16,7 @@ from typing import Callable, TypedDict, cast, override
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, fake_memory_readings, write_config_fixture
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -448,7 +448,7 @@ source() {
             f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-            + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
+            + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",

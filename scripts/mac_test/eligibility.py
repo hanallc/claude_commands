@@ -194,8 +194,16 @@ NO_BACKOFF = NoBackoff()
 ACTIVE_BACKOFF = ActiveBackoff()
 
 
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+
+
 def config_path() -> Path:
     return conf.path("mac_test")
+
+
+def unreachable_wait_seconds() -> int:
+    """Read how long a machine can stay silent before its run ends as unreachable."""
+    return conf.read_or_repository("build_targets").whole(UNREACHABLE_WAIT_KEY)
 
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:

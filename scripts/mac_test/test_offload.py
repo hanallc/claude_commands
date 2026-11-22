@@ -570,7 +570,7 @@ class OffloadSettingsTests(unittest.TestCase):
             "offload=on\nhost=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "linux_only.cargo-liner=\nmac_budget_gib=24\nconnect_timeout_s=6\n"
             + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\nunreachable_wait_seconds=45\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **copies_environment(self.root),
@@ -780,6 +780,14 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = unknown.write_text("offload=on\n")
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
             _ = eligibility.read_config(unknown)
+
+    def test_ssh_keepalive_count_follows_the_unreachable_wait(self) -> None:
+        for wait, count in ((45, 3), (50, 4), (600, 40)):
+            with self.subTest(wait=wait):
+                _ = write_config_fixture(self.root / "build_targets.conf",
+                                         f"platform.mac=macos\nunreachable_wait_seconds={wait}\n")
+                options = offload.ssh_options(eligibility.read_config(self.settings).connection)
+                self.assertEqual(options[-4:], ["-o", "ServerAliveInterval=15", "-o", f"ServerAliveCountMax={count}"])
 
     def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
         _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", template="mac_test")

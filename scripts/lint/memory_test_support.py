@@ -38,6 +38,10 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
+# Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
+UNREACHABLE_WAIT_FIXTURE = "# whole: 1..86400\nunreachable_wait_seconds=45\n"
+
+
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
     """Merge the template, existing settings, and explicit overrides in that order.
 

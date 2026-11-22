@@ -403,7 +403,9 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
   A failed check or a remaining process keeps the remote claim.
 
-- Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
+- Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, and
+  `ServerAliveCountMax` = `unreachable_wait_seconds` (`build_targets.conf`) / 15, rounded up. A session with no answer
+  for that wait ends, and the routed run ends as lost.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 

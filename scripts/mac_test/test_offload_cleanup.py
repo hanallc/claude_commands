@@ -21,12 +21,13 @@ from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
 
 
-MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE
 DOC_INDEX_MIB = "250"
 LINT_TRIM_CONFIG = f"""\
 # range: 0..

@@ -1566,16 +1566,21 @@ def write_backoff(until: float, target: str = "mac", *, wait: bool = True, stric
             raise
 
 
+SERVER_ALIVE_INTERVAL_SECONDS = 15
+
+
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
+    # SSH ends a session after this count of unanswered keepalive checks: a lost run ends after the unreachable wait.
+    alive_count = math.ceil(eligibility.unreachable_wait_seconds() / SERVER_ALIVE_INTERVAL_SECONDS)
     return [
         "-o",
         "BatchMode=yes",
         "-o",
         f"ConnectTimeout={config.connect_timeout_s:g}",
         "-o",
-        "ServerAliveInterval=15",
+        f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}",
         "-o",
-        "ServerAliveCountMax=3",
+        f"ServerAliveCountMax={alive_count}",
     ]
 
 

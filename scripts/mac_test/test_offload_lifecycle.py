@@ -20,7 +20,7 @@ from unittest import mock
 from collections.abc import Sequence
 from scripts.mac_test import offload, mac_test, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
 from scripts.lib import test_hang_guard
@@ -36,7 +36,7 @@ class PendingDispatchTests(unittest.TestCase):
                 paths.directory.mkdir()
                 (root / "mac_test.conf").touch()
                 _ = (root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE,
                     encoding="utf-8",
                 )
                 owner = process_identity.process_start(os.getpid())
@@ -192,7 +192,7 @@ class PendingDispatchTests(unittest.TestCase):
                                    "MAC_TEST_STATE_DIR": str(root / ".local/state/mac-test")}
                     _ = (root / "build_targets.conf").write_text(
                         "targets=mac,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n")
+                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                     settings = root / ("mac_test.conf" if target == "mac" else "linux_target.conf")
                     for name in ("mac_test.conf", "linux_target.conf"):
                         _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
