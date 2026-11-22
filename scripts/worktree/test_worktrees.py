@@ -2366,6 +2366,78 @@ class WorktreeLifecycleTests(unittest.TestCase):
         for path in (tree, output):
             self.assertIn(f"kept for a manual removal list: {path}", gone.stderr)
 
+    def test_make_carries_direnv_permission_only_for_the_allowed_source_file(self) -> None:
+        self.layout_fixture()
+        source = self.home / "rust/origin"
+        source.parent.mkdir()
+        _ = self.git(self.root, "clone", str(self.repository), str(source))
+        _ = self.git(source, "remote", "set-url", "origin", str(self.origin))
+        source_rc = source / ".envrc"
+        original = b"export FIXTURE=tracked\n"
+        _ = source_rc.write_bytes(original)
+        _ = self.git(source, "add", ".envrc")
+        _ = self.git(source, "commit", "-m", "Add the fixture environment")
+
+        log = self.root / "direnv.log"
+        direnv = self.root / "direnv"
+        _ = direnv.write_text(rf"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["DIRENV_TEST_LOG"]).open("a") as log:
+    log.write(json.dumps([os.getcwd(), *args]) + "\n")
+if args == ["status", "--json"]:
+    path = os.environ.get("DIRENV_TEST_PATH", str(Path.cwd() / ".envrc"))
+    print(json.dumps({{"state": {{"foundRC": {{"path": path, "allowed": int(os.environ["DIRENV_TEST_STATUS"])}}}}}}))
+    raise SystemExit(0)
+if len(args) == 2 and args[0] == "allow":
+    raise SystemExit(int(os.environ["DIRENV_TEST_ALLOW_EXIT"]))
+raise SystemExit(2)
+""")
+        direnv.chmod(0o755)
+        self.environment["PATH"] = str(self.root) + os.pathsep + self.environment["PATH"]
+        self.environment["DIRENV_TEST_LOG"] = str(log)
+
+        for name, expected_commands, warning in (
+            ("equal", ["status", "allow"], False),
+            ("different", [], True),
+            ("unallowed", ["status"], True),
+            ("other-file", ["status"], True),
+            ("allow-failed", ["status", "allow"], True),
+            ("absent", [], False),
+        ):
+            with self.subTest(name=name):
+                self.environment["DIRENV_TEST_STATUS"] = "1" if name == "unallowed" else "0"
+                self.environment["DIRENV_TEST_ALLOW_EXIT"] = "1" if name == "allow-failed" else "0"
+                found = source.parent / ".envrc" if name == "other-file" else source_rc
+                self.environment["DIRENV_TEST_PATH"] = str(found)
+                if name == "absent":
+                    _ = self.git(source, "checkout", "--detach", self.base)
+                else:
+                    _ = source_rc.write_bytes(b"export FIXTURE=modified\n" if name == "different" else original)
+                _ = log.write_text("")
+                command = [sys.executable, "-B", str(WORKTREES), "make", "origin", "demo", name]
+                result = self.command(self.repository, command)
+                tree = self.trees / "origin/demo" / name
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(tree))
+                notice = f"make: .envrc not allowed. Run direnv allow {shlex.quote(str(tree))}"
+                notices = [line for line in result.stderr.splitlines() if line.startswith("make: .envrc")]
+                self.assertEqual(notices, [notice] if warning else [])
+                calls = {"status": [str(source), "status", "--json"],
+                         "allow": [str(self.repository), "allow", str(tree)]}
+                self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                                 [calls[command] for command in expected_commands])
+                if name == "equal":
+                    _ = log.write_text("")
+                    repeated = self.command(self.repository, command)
+                    self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                    self.assertEqual(repeated.stdout.strip(), str(tree))
+                    self.assertEqual(log.read_text(), "")
+
     def test_make_assigns_output_to_a_legacy_checkout_on_its_recorded_branch(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "probe")

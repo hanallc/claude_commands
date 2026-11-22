@@ -727,7 +727,7 @@ def create_checkout(path: Path, source: Path,
                     layout: RecordedWorktreeOutput | UnassignedOutput, *,
                     owner: str = "", merge_branch: str = "", allow_empty: bool = False,
                     allow_existing: bool = False, fixed_base: bool = False,
-                    use_recorded_branch: bool = False) -> Path:
+                    use_recorded_branch: bool = False, carry_envrc_permission: bool = False) -> Path:
     """Finish a recorded checkout or make one through the shared allocator."""
     path = path.absolute()
     repo = main_checkout(source)
@@ -782,6 +782,8 @@ def create_checkout(path: Path, source: Path,
             write_record(record)
         _finish_checkout(path, source, branch, replace(record, owner=owner, merge_branch=merge_branch),
                          registered=registered)
+    if carry_envrc_permission:
+        _allow_copied_envrc(source, path)
     return path
 
 
@@ -863,6 +865,32 @@ class FrozenWorktreeSource:
     commit: str
 
 
+def _allow_copied_envrc(source: Path, checkout: Path) -> None:
+    """Allow the new checkout's .envrc when the source has the same allowed bytes."""
+    new_rc = checkout / ".envrc"
+    try:
+        if not new_rc.is_file() or (direnv := shutil.which("direnv")) is None:
+            return
+        source_rc = source / ".envrc"
+        contents = new_rc.read_bytes()
+        if source_rc.is_file() and source_rc.read_bytes() == contents:
+            status = subprocess.run([direnv, "status", "--json"], cwd=source,
+                                    capture_output=True, check=True, timeout=5)
+            match cast(object, json.loads(status.stdout)):
+                case {"state": {"foundRC": {"path": str(found), "allowed": int(allowed)}}} if (
+                    found == str(source_rc) and type(allowed) is int and allowed == 0
+                    and source_rc.read_bytes() == contents == new_rc.read_bytes()
+                ):
+                    _ = subprocess.run([direnv, "allow", str(checkout)],
+                                       capture_output=True, check=True, timeout=5)
+                    return
+                case _:
+                    pass
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    print(f"make: .envrc not allowed. Run direnv allow {shlex.quote(str(checkout))}", file=sys.stderr)
+
+
 def make(repo: str, unit: str, short_name: str, snapshot: staff.StaffSnapshot | FrozenWorktreeSource) -> Path:
     """Make a named worktree from the selected source."""
     path = build_folders.worktree_path(repo, unit, short_name)
@@ -877,7 +905,8 @@ def make(repo: str, unit: str, short_name: str, snapshot: staff.StaffSnapshot | 
         start = "HEAD"
     return create_checkout(path, source, build_folders.NewWorktreeBranch(f"{unit}-{short_name}", start),
                            output_record(repo, unit, short_name), owner=owner, merge_branch=merge_branch,
-                           fixed_base=isinstance(snapshot, FrozenWorktreeSource), use_recorded_branch=True)
+                           fixed_base=isinstance(snapshot, FrozenWorktreeSource), use_recorded_branch=True,
+                           carry_envrc_permission=True)
 
 
 def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, retain_record: bool = False,
