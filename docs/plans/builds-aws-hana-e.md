@@ -53,7 +53,7 @@ The target name occurs in configuration and fixtures, never in production select
 | File | Proposed new entries |
 | --- | --- |
 | `config/build_targets.conf` | `kind.hana-aws=ssh`, `platform.hana-aws=linux`, `settings.hana-aws=hana_aws.conf`. |
-| `config/hana_aws.conf` | `execution_transport=hana-control`, `host=aws-hana`, `repository_identity=https://github.com/natepiano/hana`, `kinds=check,lint`. |
+| `config/hana_aws.conf` | `execution_transport=hana-control`, `host=aws-hana`, `repository_identity=https://github.com/hanallc/hana`, `kinds=check,lint`. |
 | `config/hana_aws.conf` | `max_steps=1` and `free_floor_gib=30`, as required by the parent plan. |
 
 `host` is a reporting alias, not a network address.

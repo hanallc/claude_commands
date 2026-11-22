@@ -2724,7 +2724,7 @@ class ChangePageTests(unittest.TestCase):
         self.assert_no_delivery_controls(landed)
 
     def test_a_failed_browser_save_returns_plain_words_and_accepts_the_same_typed_answer_again(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         path, forms, body = self.browser()
         del body
         fields = self.browser_fields(forms, "page-owner/C1", "not works", "Keep <my> words & outcome")
@@ -4263,7 +4263,7 @@ class ChangePageTests(unittest.TestCase):
         return cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
 
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         configured = self.temporary / "configured-lists"
         configured.mkdir()
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=configured))
@@ -4310,7 +4310,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
 
     def test_works_with_feedback_lands_the_proposal_after_saving_the_verdict(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         self.assertEqual(self.request(self.page_path, self.answer(feedback="The numbers are clear")).status, 303)
         self.assertEqual(self.proposal("page-owner/C1")["status"], "landed")
@@ -4322,7 +4322,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Saved: works: The numbers are clear", self.request(self.page_path, {}).body)
 
     def test_a_negative_verdict_that_starts_with_dashes_drops_the_proposal_and_saves_the_words(self) -> None:
-        _ = self.git("remote", "add", "origin", "git@github.com:natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "git@github.com:hanallc/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works", feedback="--help")).status, 303)
         self.assertEqual(self.proposal("page-owner/C1")["status"], "dropped")
@@ -4331,7 +4331,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([target for target, _, _ in self.messages], ["builder-unit", "page-owner"])
 
     def test_a_landing_replacement_supersedes_the_old_note(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands")
         self.feature_command("add", *self.note_arguments("claude", "Old numbers"))
         self.feature_command("propose", "--review", "page-owner/C1", "--old", "Old numbers",
                              *self.note_arguments("claude", "Numbered moves"))
@@ -4341,7 +4341,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual((old["state"], old["replaced_by"]), ("superseded", ["numbered moves"]))
 
     def test_a_malformed_proposal_keeps_the_row_open_and_tells_the_showrunner(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         before = self.review_list.read_bytes()
         _ = (feature_log.state_dir() / "proposals/page-owner/C1.json").write_text("{", encoding="utf-8")
@@ -4354,7 +4354,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("cannot read proposal", self.messages[0][2])
 
     def test_a_saved_answer_needs_no_delivery_control_or_feature_log_proposal(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
             self.assertEqual(self.request(self.page_path, self.answer()).status, 303)
@@ -4364,7 +4364,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([target for target, _, _ in self.messages], [])
 
     def test_other_projects_close_the_row_without_a_feature_log_proposal(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/nixos.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/nixos.git")
         self.assertEqual(self.request(self.page_path, self.answer()).status, 303)
         self.assertIn("Saved: works", self.request(self.page_path, {}).body)
         self.assertFalse((feature_log.state_dir() / "proposals").exists())
@@ -4383,7 +4383,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
 
     def test_the_project_policy_can_skip_the_feature_log_operation(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         project = feature_log.PROJECTS["claude"]._replace(closes_by_change_review=False)
         with patch.dict(feature_log.PROJECTS, {"claude": project}):
             self.assertEqual(self.request(self.page_path, self.answer()).status, 303)
@@ -4391,7 +4391,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertFalse((feature_log.state_dir() / "proposals").exists())
 
     def test_the_hana_list_uses_a_bare_review_id(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/hana.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/hana.git")
         review_list = self.review_list.with_name("change-review - hana.md")
         _ = self.review_list.rename(review_list)
         path = urlsplit(change_page.publish(self.production, review_list, ["C1"])).path
@@ -4557,7 +4557,7 @@ class ChangePageTests(unittest.TestCase):
         self.assert_record_cleared()
 
     def test_a_failed_feature_log_save_keeps_the_form_and_hides_error_details(self) -> None:
-        _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        _ = self.git("remote", "add", "origin", "https://github.com/hanallc/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         proposal = feature_log.state_dir() / "proposals/page-owner/C1.json"
         original = proposal.read_bytes()
