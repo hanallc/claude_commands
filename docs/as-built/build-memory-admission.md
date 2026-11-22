@@ -1318,11 +1318,13 @@ Verify asks for placement first and takes no slot before it.
 A Verify run takes its natedev repository slot with its first local memory grant, in the same admission decision.
 The slot belongs to the outer Verify process.
 If the caller returns all local grants before any step starts, the service releases the slot.
-After a local step starts, the run keeps its place between steps until the outer Verify process exits.
+After a local step starts, the run keeps its natedev slot until the outer Verify process exits.
+The run keeps the slot between steps and during later Mac or AWS steps.
 Later local steps of the run reuse the slot.
 A child Verify uses a live ancestor Verify's slot for the same repository.
 The service verifies each process in that chain by PID, start time, and parent PID.
-A run that only waits, a run placed on the Mac or AWS, and the exempt unit take no natedev slot.
+A run that never receives a local grant takes no natedev slot.
+The exempt unit takes no natedev slot.
 A run that waits only for its repository limit holds back no step of another repository.
 The service saves slots with their local grant and restores the owner watches after restart.
 Local `gate` and `test-affected` runs count while they hold a reservation.

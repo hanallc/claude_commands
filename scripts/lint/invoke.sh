@@ -110,7 +110,23 @@ fi
 # variables and the variables that rustc dependency data names. No crate reads
 # BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
 BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='
+exec 2>&3 3>&-
+{ : > "$0"; } 2>/dev/null || exit 125
+cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+if [ "${BUILDLOG_DEFER_SCOPE_SIDECAR:-0}" = 1 ]; then
+    export BUILDLOG_SCOPE_SIDECAR="$0.cgroup"
+else
+    printf "%s\n" "$cgroup" > "$0.cgroup"
+fi
+{ echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true
+export BUILDLOG_STEP_SCOPE="$cgroup"
+"$@"
+s=$?
+cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true
+cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true
+cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null
+exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2

@@ -4449,9 +4449,10 @@ done
                 if saved is not None and (isinstance(saved.permission, placement.PermissionAvailable)
                         or saved.assignment.destination.provider == "local"):
                     if saved.assignment.destination.provider == "local" and request.episode in self.reservations:
-                        reservation = self.reservations[request.episode]
-                        with retry_cleanup(Path(reservation.path)):
+                        try:
                             self._end(request.episode, LocalGrantReturned())
+                        except (OSError, ValueError, TypeError, KeyError) as error:
+                            return [wire.Refused(f"cannot return the local grant: {error}")]
                     report = saved.terminal_report
                     if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):

@@ -7899,6 +7899,77 @@ class VerifyRunSlotTests(unittest.TestCase):
                     self.assertEqual(reply.assignment.destination, mac.destination)
                     self.assertEqual(bool(fixture.server.verify_run_slots), started)
 
+    def test_scoped_verify_grant_only_keeps_its_slot_if_the_guard_allows_the_step(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, publish_candidate
+        from scripts.buildlog.cgroup_test_support import write_cgroup
+        from scripts.lint.test_invoke_scope import scope_command
+
+        scripts = Path(__file__).resolve().parents[1]
+        verify = (scripts / "direct/verify.sh").read_text()
+        guard = verify.split("STEP_OWNER_PY='\n", 1)[1].split("\n'\n", 1)[0]
+        scope_script = scope_command()
+        for taken in (False, True):
+            with self.subTest(taken=taken), PlacementFixture() as fixture:
+                self.configure(fixture, 1)
+                scope = fixture.root / "scope"
+                write_cgroup(scope)
+                sidecar = fixture.root / "peak.cgroup"
+                marker = sidecar.with_suffix("")
+                lock = fixture.root / "locks/cargo.d"
+                lock.mkdir(parents=True)
+                _ = (lock / "holder_pid").write_text("caller" if taken else "other")
+                lost = fixture.root / "token-lost"
+                request = self.verify_step(fixture)
+                assert isinstance(request.local, wire.LocalAdmissionContext)
+                request = replace(request, local=replace(request.local, sidecar=str(sidecar)))
+                grant = self.grant(fixture, request)
+                result = subprocess.run(
+                    ["/bin/sh", "-c", 'exec 3>&2; exec /bin/sh -c "$@"', "scope-test",
+                     scope_script.replace('"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"'),
+                     str(marker), sys.executable, "-c", guard, str(lock), "caller", "cat", str(sidecar)],
+                    env={**os.environ, "BUILDLOG_DEFER_SCOPE_SIDECAR": "1",
+                         "VERIFY_PROCESS_GROUP_LIB": str(scripts / "lib"), "VERIFY_TOKEN_LOST_FILE": str(lost)},
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual(result.returncode, 0 if taken else 125, result.stderr)
+                self.assertEqual(result.stdout, f"{scope}\n" if taken else "")
+                self.assertEqual(lost.exists(), not taken)
+                path = fixture.root / "grant.json"
+                client.write_assignment(path, grant)
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, placement.TemporaryExclusion("blocked"))
+                with fixture.serving():
+                    _ = client.finish_step(path, result.returncode,
+                        "execution token ownership changed" if lost.exists() else "")
+                self.assertNotIn(request.episode, fixture.server.reservations)
+                self.assertEqual(bool(fixture.server.verify_run_slots), taken)
+                self.assertEqual(grant.grant.reservation in fixture.server.slots, taken)
+
+    def test_cancel_local_grant_reports_a_sidecar_read_failure_and_can_retry(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            self.configure(fixture, 1)
+            request = self.verify_step(fixture)
+            sidecar = fixture.root / "unreadable.cgroup"
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            request = replace(request, local=replace(request.local, sidecar=str(sidecar)))
+            grant = self.grant(fixture, request)
+            cancel = wire.CancelPlacement("cancel-grant", request.episode, request.owner, "token wait ended")
+            sidecar.mkdir()
+            reply, = fixture.server.handle_request(cancel)
+            self.assertIsInstance(reply, wire.Refused)
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertIn(request.episode, fixture.server.current_assignments)
+            slot, = fixture.server.verify_run_slots.values()
+            self.assertEqual(slot.use, service.PendingVerifyGrants(frozenset({grant.grant.reservation})))
+
+            sidecar.rmdir()
+            self.assertEqual(fixture.connect(cancel).replies(), [wire.Ok()])
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            self.assertNotIn(request.episode, fixture.server.current_assignments)
+            self.assertFalse(fixture.server.verify_run_slots)
+
     def test_memory_wait_and_mac_assignment_take_no_run_slot(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate
 
