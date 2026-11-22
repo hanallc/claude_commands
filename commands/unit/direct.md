@@ -527,6 +527,10 @@ Read `~/.claude/docs/direct/authorization.md` in full when an action needs user 
 
 @~/.claude/docs/decision_criteria.md
 
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
+
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:
 

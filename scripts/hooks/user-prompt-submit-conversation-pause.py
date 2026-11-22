@@ -61,6 +61,26 @@ def _record_activity(session_id: str, source: str, prompt: str, record: staff.St
         print(f"conversation-pause: auto silence: {type(error).__name__}: {detail}", file=sys.stderr)
 
 
+def _idle_update_context(session_id: str, typed: bool, now: int, record: staff.StaffSnapshot) -> str:
+    """Record nate's typed time, or return the idle update context for any other prompt."""
+    from scripts.lib import conf
+
+    try:
+        from scripts.hooks import idle_update
+
+        if not idle_update.has_role(record):
+            return ""
+        if typed:
+            idle_update.typed(session_id, now)
+            return ""
+        return idle_update.context(session_id, now, idle_update.limits())
+    except (OSError, ValueError, conf.Unusable) as error:
+        lines = str(error).splitlines()
+        detail = lines[0] if lines else ""
+        print(f"conversation-pause: idle update: {type(error).__name__}: {detail}", file=sys.stderr)
+        return ""
+
+
 def main(*, budgeted: bool = False) -> None:
     payload = cast(PromptPayload, json.loads(sys.stdin.read()))
     try:
@@ -121,6 +141,7 @@ def main(*, budgeted: bool = False) -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
+        idle_context = _idle_update_context(session_id, source is conversation_pause.PromptSource.TYPED, now, record)
         reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
         mac_context = ""
         if source is conversation_pause.PromptSource.TYPED and "/Users/" in prompt:
@@ -135,7 +156,7 @@ def main(*, budgeted: bool = False) -> None:
         def emit(held_messages: str = "") -> None:
             nonlocal emitted
             pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
-            context = "\n\n".join(filter(None, (pause_context, held_messages, mac_context)))
+            context = "\n\n".join(filter(None, (pause_context, held_messages, mac_context, idle_context)))
             if not context:
                 return
             result: dict[str, object] = {

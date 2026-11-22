@@ -94,6 +94,10 @@ The question form for every question to the user is defined by this import:
 
 @~/.claude/docs/question_template.md
 
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
+
 ---
 
 <Throughout>
