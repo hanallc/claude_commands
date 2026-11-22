@@ -34,7 +34,7 @@ class BuildLimitsTests(unittest.TestCase):
     def test_limits_use_real_policy_shapes_and_keep_each_wait_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as index:
             root = Path(directory)
-            workspace = root / "scratch-checkout"
+            workspace = root / "workspace"
             clone = root / "clone"
             worktree = root / "worktree"
             fixture = root / "fixture"
@@ -128,6 +128,7 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertTrue(stale_saved.history_stale)
             self.assertIs(stale_saved.history, history)
             self.assertEqual(stale_saved.aws_money, failed.aws_money)
+            self.assertEqual(stale_saved.origins.mac_scopes, history.origins.mac_scopes)
             refresh.pending = Future()
             refresh.pending.set_result(updated)
             self.assertIs(refresh.current(14, 60), updated)
@@ -137,7 +138,7 @@ class BuildLimitsTests(unittest.TestCase):
             _ = (root / "build_admission.conf").write_text(
                 "[disk]\n# whole: 1..\nfree_floor_gib=31\n[]\n# whole: 1..\ncloud_gate_slots=4\n")
             _ = (root / "cloud_gate.conf").write_text("enabled=on\n")
-            _ = (root / "mac_test.conf").write_text("offload=on\nlinux_only..claude=\nlinux_only.workspace=\n" +
+            _ = (root / "mac_test.conf").write_text("offload=on\nlinux_only..claude=\nlinux_only.workspace=\nlinux_only.tools=\n" +
                                                    "# range: 1..\nmac_budget_gib=18\n# range: 1..\nmac_budget_gib.workspace=27\n" +
                                                    "# range: 1..\nfree_floor_gib=100\n")
             _ = (root / "build_folders.conf").write_text(f"roots.slot_cargo={root}\n")
@@ -284,6 +285,11 @@ class BuildLimitsTests(unittest.TestCase):
                 unknown_run = replace(build, folder=unknown_folder)
                 unknown_claim: claim_state.RemoteJobClaim = {**kept, "worktree": unknown_folder}
                 same_name = "https://example.invalid/other-team/workspace"
+                other_workspace = root / "other-team" / "workspace"
+                other_workspace.mkdir(parents=True)
+                git(other_workspace, "init", "-q")
+                git(other_workspace, "remote", "add", "origin", same_name)
+                self.assertEqual(history.origins.resolve("", str(other_workspace), read_checkout=True), same_name)
                 duplicate = replace(saved, history=replace(history, machines={**history.machines, same_name: {"mac"}}))
                 for background in (saved, duplicate):
                     for scope in (claim_state.RepositoryScope("workspace"), claim_state.WHOLE_MAC):
@@ -303,6 +309,29 @@ class BuildLimitsTests(unittest.TestCase):
                                     if row.name in affected:
                                         self.assertEqual((row.mac.used, row.mac.limit, row.mac.note),
                                                          (1, 1, "Mac slot claimed"))
+                for record, label in ((claim, "nextest"), (kept, "matching run")):
+                    named_scope = replace(held, scope=claim_state.RepositoryScope("workspace"), record=record)
+                    occupied = limits_view.build_limits(current, (replace(mac, claims=(named_scope,)), hana), names,
+                        memory, folders, duplicate, UTC, ((build, "matching run"),))
+                    self.assertEqual(occupied.mac.runs, ())
+                    cells = {row.name: row.mac for row in occupied.repositories}
+                    original = cells[route_origin.removeprefix("https://")]
+                    other_cell = cells[same_name.removeprefix("https://")]
+                    self.assertEqual((original.used, original.runs), (1, [label]))
+                    self.assertEqual((other_cell.used, other_cell.runs, other_cell.note), (1, [], "Mac slot claimed"))
+                tools_origin = "https://example.invalid/team/tools"
+                tools_checkout = root / "tools-local"
+                tools_checkout.mkdir()
+                git(tools_checkout, "init", "-q")
+                git(tools_checkout, "remote", "add", "origin", tools_origin)
+                self.assertEqual(history.origins.resolve("", str(tools_checkout), read_checkout=True), tools_origin)
+                tools_background = replace(saved, history=replace(history, machines={**history.machines, tools_origin: {"mac"}}))
+                unrelated = replace(held, scope=claim_state.RepositoryScope("tools"), record=unknown_claim)
+                tools_limits = limits_view.build_limits(current, (replace(mac, claims=(unrelated,)), hana), names,
+                    memory, folders, tools_background, UTC, ((unknown_run, "tools run"),))
+                self.assertEqual(tools_limits.mac.runs, ("tools run",))
+                tools_cell = next(row.mac for row in tools_limits.repositories if row.name == "tools")
+                self.assertEqual((tools_cell.used, tools_cell.limit, tools_cell.runs), (0, 1, []))
                 unreadable = replace(mac, states=(targets.StateUnreadable("Cannot read fixture claims"),), claims=())
                 claim_status = limits_view.build_limits(current, (unreadable, hana), names, memory,
                                                        folders, saved, UTC, mac_runs)

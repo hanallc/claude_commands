@@ -118,6 +118,8 @@ class Origins:
     aliases: dict[str, str] = field(default_factory=dict[str, str])
     identities: dict[str, str] = field(default_factory=dict[str, str])
     active_folders: set[str] = field(default_factory=set[str])
+    mac_scopes: dict[str, set[claim_state.RepositoryScope]] = field(
+        default_factory=dict[str, set[claim_state.RepositoryScope]])
 
     def key(self, identity: str) -> str:
         if identity not in self.identities:
@@ -140,7 +142,11 @@ class Origins:
             return ""
         if read_checkout:
             if folder not in self.folders:
-                self.folders[folder] = self.read(folder)
+                origin = self.folders[folder] = self.read(folder)
+                if origin:
+                    scope = claim_state.checkout_claim_scope(folder, "macos")
+                    if isinstance(scope, claim_state.RepositoryScope):
+                        self.mac_scopes.setdefault(origin, set()).add(scope)
         else:
             self.active_folders.add(folder)
         return self.canonical(self.folders.get(folder, ""))
@@ -200,8 +206,9 @@ def recent_steps(connection: sqlite3.Connection, now: float,
         if Path(folder).is_absolute():
             if origins.key(key):
                 checkout_origins.setdefault(folder, set()).add(origin)
-            if origin not in checkouts and (Path(folder) / ".git").exists():
-                checkouts[origin] = Path(folder)
+            if (Path(folder) / ".git").exists():
+                _ = origins.resolve("", folder, read_checkout=True)
+                _ = checkouts.setdefault(origin, Path(folder))
         machine = target if isinstance(target, str) and target else "aws" if host in aws_hosts else str(host)
         machines.setdefault(origin, set()).add(machine)
     # Prefer a checkout that has recorded both the old URL and the current URL.
@@ -596,7 +603,10 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     whole_mac = False
     shared_mac_claims = 0
     shared_mac_runs: list[str] = []
-    shared_mac_scopes: list[claim_state.RepositoryScope] = []
+    mac_claim_scopes: list[claim_state.RepositoryScope] = []
+    mac_scopes: dict[str, set[claim_state.RepositoryScope]] = {}
+    for origin, scopes in origins.mac_scopes.items():
+        mac_scopes.setdefault(origins.canonical(origin), set()).update(scopes)
     claimed: set[str] = set()
     repositories_with_claims: set[str] = set()
     cloud_repositories: set[str] = set()
@@ -657,8 +667,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if not kept and not mac_test.run_is_live(record):
             continue
         key = f'{record["episode"]}/{record["attempt"]}'
+        first = key not in claimed
+        matching = mac_placements.get(key, ()) if first else ()
         claimed.add(key)
-        matching = mac_placements.get(key, ())
         if isinstance(claim.scope, claim_state.WholeMacScope):
             whole_mac = True
             shared_mac_claims += 1
@@ -669,21 +680,20 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 else:
                     shared_mac_runs.append(label)
             continue
+        mac_claim_scopes.append(claim.scope)
         project = origins.resolve(claim.scope.key, record["worktree"])
         if not project:
             shared_mac_claims += 1
-            shared_mac_scopes.append(claim.scope)
             shared_mac_runs.extend(label for _, label in matching)
-            if not matching and not kept:
+            if first and not matching and not kept:
                 shared_mac_runs.append(claim_name(record, names))
             continue
+        mac_scopes.setdefault(project, set()).add(claim.scope)
         cell = row(project).mac
-        cell.used = (cell.used or 0) + 1
-        repositories_with_claims.add(project)
         if kept:
             cell.runs.extend(label for _, label in matching)
             cell.note = "Claim held for cleanup"
-        else:
+        elif first:
             cell.runs.append(claim_name(record, names))
     for build, label in mac_runs:
         matched = build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in claimed
@@ -762,8 +772,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         mac_names = {name, ".claude"} if name == "claude_commands" else {name}
         mac_allowed = (bool(mac_names & mac_settings.repositories) if mac_settings is not None else None)
         cell = current.mac
-        scope_claimed = any(mac_test.scopes_overlap(scope, claim_state.RepositoryScope(scope_name, origin))
-                            for scope in shared_mac_scopes for scope_name in mac_names)
+        scope_claimed = any(mac_test.scopes_overlap(claim_scope, checkout_scope)
+                            for claim_scope in mac_claim_scopes for checkout_scope in mac_scopes.get(origin, ()))
         if scope_claimed or origin in repositories_with_claims or cell.other or cell.waits:
             mac_allowed = True
         cell.available = mac_allowed if not cell.waits else True
@@ -776,7 +786,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.note = "Whole Mac claimed"
             elif scope_claimed:
                 cell.used = max(1, cell.used or 0)
-                cell.note = cell.note or "Mac slot claimed"
+                if not cell.runs:
+                    cell.note = cell.note or "Mac slot claimed"
             elif mac_claims_unavailable:
                 cell.used = None
         elif cell.waits:

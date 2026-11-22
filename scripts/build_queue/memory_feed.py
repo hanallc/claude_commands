@@ -3266,6 +3266,8 @@ class LimitsRefresh:
                         and isinstance(previous.history, limits_view.RecentRepositories)):
                     current.origins.aliases.update(previous.history.origins.aliases)
                     current.origins.folders = {**previous.history.origins.folders, **current.origins.folders}
+                    for origin, scopes in previous.history.origins.mac_scopes.items():
+                        current.origins.mac_scopes.setdefault(origin, set()).update(scopes)
                     current = replace(current, history=previous.history, cloud_routes=previous.cloud_routes,
                                       history_stale=True)
                 self.saved = current

@@ -449,14 +449,20 @@ def required_string(values: dict[str, object], key: str, path: Path) -> str:
 
 
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
+    return checkout_claim_scope(worktree, paths.platform)
+
+
+def checkout_claim_scope(worktree: str, platform: target_config.Platform) -> ClaimScope:
     from scripts.buildlog import repository, store
 
     name = repository.repo_name(worktree)
-    common = repository.git_common_dir(worktree)
-    if name is None or common is None:
+    if name is None:
         return WHOLE_MAC
-    if target_config.uses_legacy_mac_layout(paths.platform):
+    if target_config.uses_legacy_mac_layout(platform):
         return RepositoryScope(name)
+    common = repository.git_common_dir(worktree)
+    if common is None:
+        return WHOLE_MAC
     source = Path(repository.source_git_dir(common))
     if not (source / "config").is_file():
         return RepositoryScope(name)
