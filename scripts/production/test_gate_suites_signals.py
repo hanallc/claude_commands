@@ -26,9 +26,10 @@ from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib import build_folder_lock, build_folders, process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
-from scripts.lib.process_start import Gone, Zombie, process_start
+from scripts.lib.process_start import Gone, Started, Unreadable, Zombie, process_start
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import gate, gate_suites_test_support
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.gate_test_support import gate_suites
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -54,8 +55,8 @@ class GateProcessStateTests(unittest.TestCase):
               mock.patch.object(admission_records, "read_memory_config",
                                 return_value=mock.Mock(program_stop_seconds=0)),
               redirect_stderr(io.StringIO()) as error):
-            gate.recover_gate_directory(directory)
-            gate.recover_gate_directory(directory)
+            gate.recover_gate_directory(directory, own_directory=directory)
+            gate.recover_gate_directory(directory, own_directory=directory)
         self.assertEqual(error.getvalue().splitlines(), [
             f"kept for a manual removal list: {folder} (gate, the gate owner ended)"
             for folder in recovery.folders
@@ -87,11 +88,60 @@ class GateProcessStateTests(unittest.TestCase):
 
             with (mock.patch.object(Path, "is_symlink", autospec=True, side_effect=check_marker),
                   redirect_stdout(io.StringIO()) as report):
-                gate.recover_gate_directory(root)
+                gate.recover_gate_directory(root, own_directory=root)
             self.assertIn(f"fixture denies search in {blocked}", report.getvalue())
             self.assertEqual(gate.read_gate_recovery(recovery.path), recovery)
             self.assertEqual(blocked_marker.readlink(), recovery.path)
             self.assertFalse((available / build_folders.RECOVERY_MARKER).is_symlink())
+
+    def test_recovery_reports_foreign_refusals_and_recovers_later_records(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="gate-recovery-test-")))
+        checkout, other = root / "checkout", root / "other"
+        _ = self.enterContext(mock.patch.object(gate, "gate_state_dir", return_value=root / "state"))
+        directory = gate.gate_run_directory(other)
+        directory.mkdir(parents=True)
+        unreadable_owner = gate.GateRecovery(directory / "a-owner.json", str(other), 5000001, "fixture")
+        unreadable_group = gate.GateRecovery(directory / "b-group.json", str(other), 5000002, "fixture",
+                                             groups={5000003: "fixture"})
+        recoverable = gate.GateRecovery(directory / "c-dead.json", str(other), 5000004, "fixture")
+        for recovery in (unreadable_owner, unreadable_group, recoverable):
+            recovery.save()
+        identities = {
+            unreadable_owner.pid: Unreadable("owner status\ncannot be read"),
+            unreadable_group.pid: Gone(),
+            5000003: Unreadable("group status cannot be read"),
+            recoverable.pid: Gone(),
+            os.getpid(): Started("caller"),
+        }
+        with (mock.patch.object(gate, "process_start", side_effect=identities.__getitem__) as read_start,
+              mock.patch.object(admission_records, "read_memory_config",
+                                return_value=mock.Mock(program_stop_seconds=0)),
+              redirect_stderr(io.StringIO()) as report):
+            gate.recover_gate_runs(checkout)
+            with gate.gate_recovery(checkout) as current:
+                self.assertTrue(current.path.is_file())
+        self.assertEqual(read_start.call_args_list.count(mock.call(unreadable_owner.pid)), 2)
+        self.assertEqual(report.getvalue().splitlines(), [
+            f"Gate recovery kept {str(unreadable_owner.path)!r}: cannot recover gate 5000001: owner status cannot be read",
+            f"Gate recovery kept {str(unreadable_group.path)!r}: cannot recover gate group 5000003: group status cannot be read",
+        ])
+        self.assertTrue(unreadable_owner.path.is_file())
+        self.assertTrue(unreadable_group.path.is_file())
+        self.assertFalse(recoverable.path.exists())
+
+    def test_recovery_refuses_the_callers_checkout(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="gate-recovery-test-")))
+        checkout = root / "checkout"
+        _ = self.enterContext(mock.patch.object(gate, "gate_state_dir", return_value=root / "state"))
+        directory = gate.gate_run_directory(checkout)
+        directory.mkdir(parents=True)
+        recovery = gate.GateRecovery(directory / "unreadable.json", str(checkout), 5000001, "fixture")
+        recovery.save()
+        with (mock.patch.object(gate, "process_start", return_value=Unreadable("owner status cannot be read")),
+              self.assertRaisesRegex(GateRefused, "cannot recover gate 5000001: owner status cannot be read"),
+              gate.gate_recovery(checkout)):
+            self.fail("the gate started with an unreadable owner in its checkout")
+        self.assertEqual(list(directory.iterdir()), [recovery.path])
 
     def test_process_exit_counts_as_stopped_at_stat_read_or_pidfd_event(self) -> None:
         fixture = GateSuitesFixture()
@@ -285,7 +335,7 @@ sys.stdin.read(1)
             output = io.StringIO()
             with redirect_stdout(output):
                 for _ in range(2):
-                    gate.recover_gate_directory(directory)
+                    gate.recover_gate_directory(directory, own_directory=directory)
                     self.assertEqual(self.jobserver_tokens(), b"RQ")
                     saved = gate.read_gate_recovery(recovery.path)
                     assert saved is not None
@@ -329,7 +379,7 @@ sys.stdin.read(1)
             with redirect_stdout(output), \
                     mock.patch.object(gate, "process_start", wraps=process_start) as read_start, \
                     mock.patch.object(process_group, "send_process_group") as send:
-                gate.recover_gate_directory(directory)
+                gate.recover_gate_directory(directory, own_directory=directory)
             read_start.assert_called_once_with(os.getpid())
             send.assert_not_called()
             self.assertFalse(valid.path.exists())
@@ -436,12 +486,12 @@ sys.stdin.read(1)
             self.assertEqual(self.git(self.checkout, "show", "-s", "--format=%P", amended),
                              self.git(self.checkout, "show", "-s", "--format=%P", merged))
             with self.assertRaisesRegex(gate.GateRollbackMismatch, "differs from the recorded merge"):
-                gate.recover_gate_directory(record.parent)
+                gate.recover_gate_directory(record.parent, own_directory=record.parent)
             self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), amended)
             self.assertEqual(gate.read_gate_recovery(record), recovery)
             recovery.rollback_head = self.base
             recovery.save()
-            gate.recover_gate_directory(record.parent)
+            gate.recover_gate_directory(record.parent, own_directory=record.parent)
             self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
             self.assertFalse(record.exists())
 
@@ -457,7 +507,7 @@ sys.stdin.read(1)
             second.save()
             with (copy.with_suffix(".lock").open("w") as holder, redirect_stdout(io.StringIO()) as output):
                 fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                gate.recover_shared_gate_runs()
+                gate.recover_shared_gate_runs(copy)
             self.assertIn("numbered copy is busy", output.getvalue())
             self.assertEqual(gate.read_gate_recovery(first.path), first)
             self.assertFalse(second.path.exists())
@@ -503,7 +553,7 @@ sys.stdin.read(1)
                 self.assertEqual(self.jobserver_tokens(), b"Q")
                 self.assertFalse(marker.is_symlink())
             marker.symlink_to(first.path)
-            gate.recover_gate_directory(first.path.parent)
+            gate.recover_gate_directory(first.path.parent, own_directory=first.path.parent)
             self.assertTrue(build_folders.reclaim_build_folder(parent, wait=False))
             self.assertFalse(parent.exists())
 
@@ -535,7 +585,7 @@ sys.stdin.read(1)
             recovery.save()
             marker.symlink_to(recovery.path)
             with mock.patch.object(gate.GateRecovery, "save", autospec=True, side_effect=compete_at_save):
-                gate.recover_gate_directory(directory)
+                gate.recover_gate_directory(directory, own_directory=directory)
             self.assertEqual(attempts, [False])
             saved = gate.read_gate_recovery(recovery.path)
             assert saved is not None
@@ -546,7 +596,7 @@ sys.stdin.read(1)
     @gate_suites("hooks")
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            root = build_folders.tmpfs_gate_root()
+            root = build_folders.configured_gate_root()
             for index, machine in enumerate((gate.SHARED_MACHINE, gate.WholeMachine()), start=1):
                 with self.subTest(machine=type(machine).__name__):
                     tool = build_folders.GATE_RECOVERY_TOOL
@@ -760,7 +810,7 @@ gate.run_suites(Path.cwd(), full=True)
             marker.unlink()
             self.assertFalse(build_folders.reclaim_build_folder(folder, wait=False))
             with mock.patch.object(gate, "process_start", return_value=Zombie("ended-owner")):
-                gate.recover_gate_directory(recovery.path.parent)
+                gate.recover_gate_directory(recovery.path.parent, own_directory=recovery.path.parent)
             self.assertFalse(retained_marker.is_symlink())
             self.assertTrue(build_folders.reclaim_build_folder(folder, wait=False))
 

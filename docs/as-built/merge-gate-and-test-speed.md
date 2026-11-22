@@ -248,6 +248,15 @@ Merge gates and nightly runs use all modules.
 Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
+Gate startup checks recovery records for dead gate processes across checkouts.
+A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Successful recovery removes a record if it names no retained folders.
+Recovery reports retained folders for manual removal and keeps their finished record.
+The scanner skips finished records on later runs.
+If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
+Each gate process reports a refused record once.
+The gate keeps that record and checks the remaining records.
+A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
 After the parallel pass, up to eight failed modules run once more, alone.
@@ -290,6 +299,14 @@ The completion case retains its strict socket send.
 **One test hang guard.** Tests import `TEST_HANG_GUARD_SECS` and `LauncherHangGuard` directly from `scripts.lib.test_hang_guard`. The shared limit is 600 seconds. `scripts/lib/test_one_hang_guard.py` parses every Python file under `scripts/` and refuses local assignments or imports through other modules. Each refusal gives its path and line. Fixture script text is data and can receive the shared value through a placeholder. Expected events use the shared guard; negative observation windows, product timeout settings and elapsed-time assertions keep their behavior.
 
 ## How it works
+
+### Mac gate journal cleanup
+
+Each Mac gate attempt stores its process groups in `~/.local/state/mac-gate/<attempt>/run.json` on the Mac.
+When a task has an end receipt, cleanup checks each live recorded group against its saved process start.
+Cleanup stops the confirmed groups and removes the journal, even when the temporary build folder is gone.
+The receipt stays with a retained checkout.
+See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
 ### Targeted tests: `scripts/production/targeted_test.py`
 
@@ -564,16 +581,21 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The per-gate job limit applies. Admission and token waits retain the checkout's shared busy lock.
   Memory waits print when the need or hold reason changes. Otherwise, they print a reminder at most once a minute.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
-- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
+- Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
+  The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  Both modes use the configured gate root for top-level runs.
+  If that root contains the calling module folder, the nested gate uses the module folder as its parent.
+  The outer gate removes the nested gate files when it removes the module folder.
+  The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
   The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `targeted_test.py` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
+  `gate.py --affected` uses the same test-folder context for its outer run.
+  These folders use `<inherited TMPDIR>/test-runs/r*`.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that test-runs parent.
+  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -956,9 +978,6 @@ Repository imports use `scripts.<folder>` package names, including mock patch ta
 Entry scripts load that helper after their docstring and future imports.
 Bare `python3 <path>` therefore imports the entry's own checkout from any caller folder.
 A copied entry without the helper can use an existing `PYTHONPATH`.
-`package_imports.py bootstrap <checkout>` adds the four-line block to new entry scripts.
-It preserves CRLF and skips test and test-support modules.
-The command provides no import converter.
 
 The gate starts test modules through the checked tree's `scripts/lib/py`.
 It removes the caller's `PYTHONPATH` before the shim sets the checked tree's package root.

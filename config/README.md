@@ -681,9 +681,8 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
-recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
-roster.
+The zone reader ignores a production document's old `User zone` line.
+A time stored without an offset keeps its original zone.
 
 ## statusline.conf
 
@@ -753,14 +752,6 @@ Cleanup ignores zombies and retains ownership when it cannot inspect a live proc
 Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
 Disk cleanup failures retain the separate `mac_cleanup=1` result.
 `leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
-
-`loopback.*` settings control the manual Tailscale SSH proof on natedev.
-`loopback.port` selects the SSH port. An empty value uses the SSH default.
-`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
-A selected known_hosts file requires strict host key checking for SSH and rsync.
-The proof creates a managed scratch home and a tiny Rust fixture.
-It uses private memory files and executes test, check, and staged doc in one warm slot.
-It removes the scratch home when the proof ends. Automated tests never execute this proof.
 
 ## dev_shell.conf
 
