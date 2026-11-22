@@ -1303,7 +1303,7 @@ function limitWaits(waits) {
 }
 function limitStartup(names) {
   if (!names?.length) return "";
-  const label = names.length === 1 ? "1 reserved for startup" : `${names.length} reserved for startup`;
+  const label = names.length === 1 ? "1 pending start" : `${names.length} pending starts`;
   return `<div class="build-limit-note">${label}</div>${limitNames(names.filter(Boolean))}`;
 }
 function limitCell(cell, mac = false) {

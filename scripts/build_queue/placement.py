@@ -1,7 +1,7 @@
 """Placement decisions keep submitting owners separate from remote executions."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -498,7 +498,6 @@ class CandidateEligibility:
     """The result pairs a placement destination with its eligibility."""
     destination: PlacementDestination
     eligibility: HostEligibility
-    mac_decision: MacDecision | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

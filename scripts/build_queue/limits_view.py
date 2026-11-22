@@ -505,9 +505,9 @@ MAC_WAIT_LABELS: dict[claim_state.MacBlocker, str] = {
     "disk-floor": "Disk floor",
     "cleanup": "Claim held for cleanup",
     "copy-yield": "Waiting for a copy to stop",
-    "older-request": "Earlier request",
+    "whole-mac-cleanup": "Claim held for cleanup",
 }
-MAC_SHARED_BLOCKERS = frozenset(("whole-mac-full", "machine-held", "disk-floor"))
+MAC_SHARED_BLOCKERS = frozenset(("whole-mac-full", "whole-mac-cleanup", "machine-held", "disk-floor"))
 
 
 def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_target: str,
@@ -516,7 +516,8 @@ def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_targe
         if block.provider == "mac":
             decision = block.mac_decision
             blocker = decision.blocker if decision is not None else None
-            label = MAC_WAIT_LABELS[blocker] if blocker is not None else placement_reason(block.reason)
+            label = (MAC_WAIT_LABELS[blocker] if blocker is not None and blocker != "older-request"
+                     else placement_reason(block.reason))
             if mac_target and block.target != mac_target:
                 return None, f"{block.target} · {label}"
             return "mac", label
@@ -575,8 +576,10 @@ def with_mac_claim_waits(reading: records.QueueRead, snapshots: target_availabil
             index = matched.get(wait.episode) if wait.episode else callers.get(caller)
             if index is not None:
                 previous = waiting[index].placement_block
-                if previous is None or previous.provider != "mac" or previous.target == block.target:
-                    waiting[index] = replace(waiting[index], placement_block=block, placement_pending=False)
+                if previous is not None and previous.provider == "mac" and (
+                        previous.target != block.target or previous.mac_decision is not None and wait.decision is None):
+                    continue
+                waiting[index] = replace(waiting[index], placement_block=block, placement_pending=False)
                 continue
             if wait.episode:
                 matched[wait.episode] = len(waiting)
@@ -699,10 +702,10 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         first = key not in claimed
         matching = mac_placements.get(key, ()) if first else ()
         claimed.add(key)
-        scope = claim.recorded_scope
+        scope = claim.scope
         if isinstance(scope, claim_state.WholeMacScope):
             whole_mac = True
-        elif isinstance(scope, claim_state.RepositoryScope):
+        else:
             mac_occupied_scopes.append(scope)
         cell = recorded_mac_cell(scope, record["worktree"])
         if cell is None:
@@ -722,10 +725,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if decision is None or decision.target != mac_name or step.mac_placement in claimed:
             continue
         scope = decision.scope
-        if isinstance(scope, claim_state.WholeMacScope):
-            whole_mac = True
-        else:
-            mac_occupied_scopes.append(scope)
         cell = recorded_mac_cell(scope, step.folder)
         label = step.unit or names.sessions.get(step.session_id) or step.step
         if step.mac_placement.partition("/")[0] in waiting_episodes:
@@ -827,7 +826,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             occupied = any(mac_test.scopes_overlap(recorded, scope) for recorded in mac_occupied_scopes)
             enabled = mac_test.standard_mac_builds_enabled(mac_config, scope) if mac_config is not None else None
             slot.standard_mac_builds = enabled
-            has_slot = bool(enabled or occupied or slot.runs or slot.waits)
+            has_slot = bool(enabled or occupied or slot.runs or slot.waits or slot.starting)
             if not has_slot:
                 continue
             if has_slot:
@@ -836,7 +835,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 if not slot.note:
                     if whole_mac:
                         slot.note = "Whole Mac in use"
-                    elif occupied and not (slot.runs or slot.starting):
+                    elif occupied and not slot.runs:
                         slot.note = "Mac slot claimed"
                 if mac_config is not None:
                     slot.budgets = (mac_budget(mac_config, scope),)

@@ -244,7 +244,6 @@ class ClaimOwnerRecord(TypedDict):
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
-    whole_mac: NotRequired[bool]
     transfers: NotRequired[list[TransferBytes]]
 
 
@@ -290,13 +289,6 @@ class HeldClaim:
     scope: ClaimScope
     path: Path
     record: RunRecord
-    scope_recorded: bool = True
-
-    @property
-    def recorded_scope(self) -> ClaimScope | None:
-        if self.record.get("whole_mac") is True:
-            return WHOLE_MAC
-        return self.scope if self.scope_recorded else None
 
 
 class NoRun:
@@ -419,8 +411,6 @@ def read_run(path: Path) -> RunState:
         if type(slot) is not int or slot < 1:
             raise StateReadError(f"{path} has an invalid slot")
         record["slot"] = slot
-    if values.get("whole_mac") is True:
-        record["whole_mac"] = True
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -490,7 +480,7 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
 
 
 MacBlocker = Literal["limit-full", "whole-mac-full", "mirror-backoff", "starting", "ineligible",
-                     "machine-held", "disk-floor", "cleanup", "copy-yield", "older-request"]
+                     "machine-held", "disk-floor", "cleanup", "whole-mac-cleanup", "copy-yield", "older-request"]
 
 
 @dataclass(frozen=True)
@@ -548,7 +538,7 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
 
 def claim_wait_decision(row: dict[str, object], target: str) -> MacDecision | None:
     blocker = row.get("blocker")
-    if row.get("target") != target or blocker not in ("limit-full", "whole-mac-full", "copy-yield"):
+    if row.get("target") != target or blocker not in ("limit-full", "whole-mac-full", "cleanup", "whole-mac-cleanup", "copy-yield"):
         return None
     scope = row.get("scope")
     if scope == "whole":
@@ -618,7 +608,7 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             scope = target_claim_scope(paths, worktree) if Path(worktree).is_absolute() else WHOLE_MAC
         else:
             scope = RepositoryScope(path.stem)
-        held.append(HeldClaim(scope, path, record, "repo_name" in record))
+        held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
 

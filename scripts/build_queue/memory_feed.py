@@ -2703,6 +2703,23 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
+def mac_activity_host(reading: queue_view.MacBuildReading, snapshots: target_availability.Snapshots) -> str:
+    if reading.host:
+        return reading.host
+    found = snapshots if isinstance(snapshots, tuple) else ()
+    target = next((snapshot.target for snapshot in found
+                   if isinstance(snapshot.target, target_config.SshTarget)
+                   and snapshot.target.platform == "macos" and snapshot.target.name == reading.target), None)
+    if not reading.target:
+        target = queue_view.selected_mac_target(snapshot.target for snapshot in found)
+    if target is not None:
+        try:
+            return conf.read(target.settings).text("host")
+        except conf.Unusable:
+            pass
+    return reading.target or "mac"
+
+
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, limit_background: limits_view.Background | None = None) -> MemoryPage:
@@ -2724,7 +2741,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     folder_settings = conf.read_or_repository("build_folders")
     slot_roots = folder_settings.values()
     mac_reading = queue_view.read_mac_builds()
-    mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
+    mac_machine = mac_activity_host(mac_reading, snapshots)
     machine = host_name()
     slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     with staff.supplied_snapshot(staff_display.members):

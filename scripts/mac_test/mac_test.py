@@ -667,6 +667,13 @@ def run_holds_work(run: RunRecord) -> bool:
     return run_is_live(run) and not run_is_kept(run)
 
 
+def claim_blocker(claim: HeldClaim, *, owner_live: bool = False) -> claim_state.MacBlocker:
+    whole = isinstance(claim.scope, WholeMacScope)
+    if claim.record.get("cleanup_pending") is True or (not owner_live and run_is_kept(claim.record)):
+        return "whole-mac-cleanup" if whole else "cleanup"
+    return "whole-mac-full" if whole else "limit-full"
+
+
 def copy_gives_way(run: RunRecord) -> bool:
     """A live test copy whose process still runs, so a new step can stop it.
 
@@ -1907,8 +1914,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
-        return ClaimBusy(overlapping[0].record, "whole-mac-full"
-                         if any(isinstance(claim.scope, WholeMacScope) for claim in overlapping) else "limit-full")
+        return ClaimBusy(overlapping[0].record, claim_blocker(overlapping[0]))
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -1936,8 +1942,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["repo_key"] = scope.key
         if scope.slot:
             claimed["slot"] = scope.slot
-    else:
-        claimed["whole_mac"] = True
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
@@ -2278,19 +2282,22 @@ def free_now(
             if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
                 raise
             return "state"
-    whole_mac_busy = False
+    blocker: claim_state.MacBlocker = "limit-full"
 
     def holds_scope(claim: HeldClaim, candidate: ClaimScope) -> bool:
-        nonlocal whole_mac_busy
+        nonlocal blocker
         if (scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
                 and (copy or not copy_gives_way(claim.record))):
-            whole_mac_busy |= isinstance(claim.scope, WholeMacScope)
+            if note_busy is not None:
+                reason = claim_blocker(claim, owner_live=True)
+                if reason in ("whole-mac-full", "whole-mac-cleanup") or blocker == "limit-full":
+                    blocker = reason
             return True
         return False
 
     if all(any(holds_scope(claim, candidate) for claim in claims) for candidate in scopes):
         if note_busy is not None:
-            note_busy("whole-mac-full" if whole_mac_busy else "limit-full")
+            note_busy(blocker)
         return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"

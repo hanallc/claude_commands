@@ -27,7 +27,7 @@ from scripts.buildlog import charts, repository, store
 from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state, eligibility
+from scripts.mac_test import claim_state, eligibility, mac_test
 
 
 class BuildLimitsTests(unittest.TestCase):
@@ -260,6 +260,11 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(current.view.waiting[1].placement_block,
                                  records.PlacementBlock("mac", "mac", "busy", "mac-episode",
                                                         claim_state.MacDecision("mac", held.scope, "limit-full")))
+                structured = replace(reply.reading, view=replace(reply.reading.view, waiting=current.view.waiting))
+                with mock.patch.object(claim_state, "read_claim_waits", return_value=(
+                        claim_state.ClaimWait(2, "matched", str(worktree), "nextest", "mac", "mac-episode", "busy", now),)):
+                    merged = limits_view.with_mac_claim_waits(structured, (mac,))
+                self.assertEqual(merged.view.waiting, structured.view.waiting)
                 self.assertEqual(current.view.waiting[10].episode, "other-episode")
                 self.assertTrue(current.view.waiting[10].placement_pending)
                 self.assertEqual(current.view.waiting[11].caller_start, "old")
@@ -318,7 +323,13 @@ class BuildLimitsTests(unittest.TestCase):
                 for background in (saved, duplicate):
                     for scope in (claim_state.RepositoryScope("workspace"), claim_state.WHOLE_MAC):
                         with self.subTest(scope=scope, duplicate=background is duplicate):
-                            retained = replace(mac, claims=(replace(held, scope=scope, record=unknown_claim),))
+                            path = mac_test.claim_path(paths, scope)
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            _ = path.write_text(json.dumps(unknown_claim))
+                            old_claims = claim_state.read_claims(paths)
+                            self.assertEqual([claim.scope for claim in old_claims], [scope])
+                            path.unlink()
+                            retained = replace(mac, claims=old_claims)
                             shared_limits = limits_view.build_limits(current, (retained, hana), names, memory,
                                 folders, background, UTC, ((unknown_run, "unknown origin"),), mac_activity_target=activity.target)
                             self.assertEqual(shared_limits.mac.claims, 1)
@@ -444,9 +455,13 @@ class BuildLimitsTests(unittest.TestCase):
             return limits_view.VisibleWait(queue_view.WaitingBuild(1, step), name)
 
         other_file = worktree.parent / "other-mac.conf"
-        _ = other_file.write_text("# range: 1..\nfree_floor_gib=200\n")
+        _ = other_file.write_text("host=other-fixture-mac\n# range: 1..\nfree_floor_gib=200\n")
         other = replace(mac, target=target_config.SshTarget("other-mac", "macos", other_file))
         self.assertEqual(queue_view.selected_mac_target((other.target, mac.target)), mac.target)
+        activity = queue_view.MacBuildReading(1, (build,), target="mac")
+        self.assertEqual(memory_feed.mac_activity_host(activity, (other, mac)), "fixture-mac")
+        self.assertEqual(memory_feed.mac_activity_host(replace(activity, target="other-mac"), (mac, other)),
+                         "other-fixture-mac")
         startup = records.RunningStep("", "", "explicit command", str(worktree), 0,
             records.RemoteMemoryUnavailable("fixture"), pid=records.PidNotRecorded(), mac_placement="start/attempt",
             mac_startup=claim_state.MacDecision("mac", claim_state.RepositoryScope("saved-slot"), "starting"))
@@ -462,7 +477,7 @@ class BuildLimitsTests(unittest.TestCase):
         slots = {slot.name: slot.cell for slot in current.mac_slots}
         recorded = slots["saved-slot"]
         self.assertEqual(recorded.waits, {"Waiting for the mirror": ["mirror"], "Limit full": ["full"]})
-        self.assertEqual((recorded.used, recorded.limit, recorded.starting), (1, 1, ["explicit command"]))
+        self.assertEqual((recorded.used, recorded.limit, recorded.starting), (0, 1, ["explicit command"]))
         self.assertIs(recorded.standard_mac_builds, False)
         self.assertEqual(slots["workspace"].waits, {})
         self.assertEqual(current.unplaced, {"other-mac · Limit full": ["other target"]})
@@ -471,6 +486,13 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(result.mac.other, ())
         self.assertEqual(result.mac.shared, (limits_view.Metric("Free disk", None, 100, "GiB", "minimum"),))
 
+        whole_start = replace(startup, mac_startup=claim_state.MacDecision("mac", claim_state.WHOLE_MAC, "starting"))
+        with_whole_start = replace(reading, view=replace(reading.view, running=(whole_start,)))
+        result = limits_view.build_limits(with_whole_start, (no_claim, hana), wait_names, memory, folders,
+                                          saved, UTC, ())
+        self.assertEqual((result.mac.claims, result.mac.startup), (0, ("explicit command",)))
+        self.assertTrue(all(slot.cell.used == 0 for row in result.repositories for slot in row.mac_slots))
+
         cleanup: claim_state.RemoteJobClaim = {**claim_record, "remote_host": "fixture-mac", "cleanup_pending": True}
         with_cleanup = replace(mac, claims=(replace(claim, record=cleanup),))
         for runs, expected in (((), []), (((build, "verified process"),), ["verified process"])):
@@ -478,6 +500,16 @@ class BuildLimitsTests(unittest.TestCase):
                 folders, saved, UTC, runs, mac_activity_target="mac")
             cell = next(row.mac for row in result.repositories if row.name == "workspace")
             self.assertEqual((cell.note, cell.runs), ("Claim held for cleanup", expected))
+        paths = claim_state.StatePaths(worktree.parent / "test-cleanup")
+        for scope, blocker in ((claim.scope, "cleanup"), (claim_state.WHOLE_MAC, "whole-mac-cleanup")):
+            with (mock.patch.object(mac_test, "read_claims", return_value=(replace(claim, scope=scope, record=cleanup),)),
+                  mock.patch.object(eligibility, "read_backoff", return_value=eligibility.NO_BACKOFF),
+                  mock.patch.object(eligibility, "read_mirror_busy", return_value=eligibility.NO_BACKOFF)):
+                note = mock.Mock()
+                self.assertIsInstance(mac.target, target_config.SshTarget)
+                assert isinstance(mac.target, target_config.SshTarget)
+                self.assertEqual(mac_test.free_now(paths, mac.target.settings, worktree, note_busy=note), "busy")
+                note.assert_called_once_with(blocker)
         whole = replace(mac, claims=(replace(claim, scope=claim_state.WHOLE_MAC),))
         result = limits_view.build_limits(reading, (whole, hana), names, memory, folders, saved, UTC, ())
         self.assertEqual((result.mac.claims, result.mac.runs), (1, ("nextest",)))
@@ -508,12 +540,12 @@ class BuildLimitsTests(unittest.TestCase):
             assert isinstance(reply, wire.PlacementWait)
             reply = wire.parse_reply(wire.encode_reply(reply))
             assert isinstance(reply, wire.PlacementWait)
-            self.assertEqual(reply.eligibility[0].mac_decision,
-                             claim_state.MacDecision("mac", destination.scope, "mirror-backoff"))
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                destination, placement.TemporaryExclusion("busy")),))
             current = fixture.server._placement_wait_reading(head_reading())  # pyright: ignore[reportPrivateUsage]
             block = current.view.waiting[-1].placement_block
             assert block is not None
-            self.assertEqual(block.mac_decision, reply.eligibility[0].mac_decision)
+            self.assertEqual(block.mac_decision, claim_state.MacDecision("mac", destination.scope, "mirror-backoff"))
 
             _ = test_placement.publish_candidate(fixture, request)
             _ = fixture.run_pass()
@@ -538,23 +570,17 @@ class BuildLimitsTests(unittest.TestCase):
             assert isinstance(refused, wire.DispatchStatus)
             self.assertEqual(refused.state, placement.ClosedAssignment("disk"))
 
+            self.assertEqual(fixture.server.placement_refusals.get(request.episode), "disk")
+            self.assertNotIn(request.episode, fixture.server.current_assignments)
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            self.assertNotIn(request.episode, {step.episode for step in view.reading.view.waiting})
+
             fixture.clock.advance(1)
-            next_request = test_placement.placement_request(fixture)
             _ = test_placement.publish_candidate(fixture, request)
-            _ = test_placement.publish_candidate(fixture, next_request)
             _ = fixture.run_pass()
-            _ = test_placement.assignment_for(fixture, next_request)
-            for restart in (False, True):
-                if restart:
-                    fixture.restart()
-                    _ = test_placement.publish_candidate(fixture, request)
-                    _ = fixture.run_pass()
-                replay, = fixture.server.handle_request(request)
-                self.assertEqual(replay, refused)
-                self.assertNotIn(request.episode, fixture.server.current_assignments)
-                view, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(view, wire.ViewReply)
-                self.assertNotIn(request.episode, {step.episode for step in view.reading.view.waiting})
+            self.assertEqual(test_placement.assignment_for(fixture, request).episode, request.episode)
+            self.assertNotIn(request.episode, fixture.server.placement_refusals)
 
     def check_placement_tooltips(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
@@ -594,7 +620,7 @@ class BuildLimitsTests(unittest.TestCase):
                              records.PlacementBlock("ssh", "aws", "memory", request.episode))
             reply = fixture.server._placement_reply(request, placement.ResourceHolderUnknown())  # pyright: ignore[reportPrivateUsage]
             assert isinstance(reply, wire.PlacementWait)
-            self.assertEqual(reply.wait, wire.PlacementResourceWait("aws", "memory"))
+            self.assertIsInstance(reply.wait, wire.PlacementEvidenceWait)
             fixture.server.placement_eligibility[request.episode] = (
                 placement.CandidateEligibility(target, placement.EvidenceNeeded("no reading")), disk)
             pending = fixture.server._placement_wait_reading(head_reading())  # pyright: ignore[reportPrivateUsage]
@@ -604,15 +630,22 @@ class BuildLimitsTests(unittest.TestCase):
             decoded = wire.parse_reply(wire.encode_reply(wire.ViewReply(pending)))
             assert isinstance(decoded, wire.ViewReply)
             self.assertEqual(decoded.reading.ordered[-1][1].get("placement_episode"), request.episode)
+            local = test_placement.local_candidate(fixture).destination
+            fixture.server.placement_eligibility[request.episode] = (
+                placement.CandidateEligibility(local, placement.TemporaryExclusion("blocked")),
+                placement.CandidateEligibility(target, placement.EvidenceNeeded("no reading")))
+            reply = fixture.server._placement_reply(request, placement.ResourceHolderUnknown())  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertIsInstance(reply.wait, wire.PlacementEvidenceWait)
+            report = fixture.server._placement_wait_reading(head_reading())  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(report.view.waiting[-1].placement_block,
+                             records.PlacementBlock("local", local.target, "blocked", request.episode))
+            fixture.server.placement_eligibility[request.episode] = (disk,)
             mac_only = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
             fixture.server.placement_requests[request.episode] = mac_only
             reply = fixture.server._placement_reply(mac_only, placement.ResourceHolderUnknown())  # pyright: ignore[reportPrivateUsage]
             assert isinstance(reply, wire.DispatchStatus)
             self.assertEqual(reply.state, placement.ClosedAssignment("disk"))
-            for reading in (head_reading(), pending):
-                filtered = fixture.server._placement_wait_reading(reading)  # pyright: ignore[reportPrivateUsage]
-                self.assertEqual(filtered.view.waiting, head_reading().view.waiting)
-                self.assertEqual(filtered.ordered, head_reading().ordered)
 
         self.check_older_placement()
 
@@ -632,4 +665,7 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertEqual(younger.target, "mac")
             reply = fixture.server._placement_reply(order.younger, placement.ResourceHolderUnknown())  # pyright: ignore[reportPrivateUsage]
             assert isinstance(reply, wire.PlacementWait)
-            self.assertEqual(reply.wait, wire.PlacementResourceWait("mac", younger.reason))
+            self.assertIsInstance(reply.wait, wire.PlacementEvidenceWait)
+            step = next(step for step in initial.reading.view.waiting if step.episode == order.younger.episode)
+            self.assertEqual(limits_view.queue_wait(step, limits_view.wait_cause(step), "natedev", "mac", frozenset()),
+                             ("mac", younger.reason))
