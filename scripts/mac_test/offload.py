@@ -1905,6 +1905,21 @@ class MacDiskReady:
 
 
 @dataclass(frozen=True)
+class MacDiskShort:
+    """The probe reports less free space than the floor."""
+
+    free_gib: float
+    floor_gib: float
+
+
+def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDiskReady | MacDiskShort:
+    """Compare the probe reading with the floor."""
+    if probe.free_gib >= free_floor_gib:
+        return MacDiskReady(probe.free_gib)
+    return MacDiskShort(probe.free_gib, free_floor_gib)
+
+
+@dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
 
@@ -1925,8 +1940,9 @@ def ensure_mac_disk_floor(
     """Run one shared floor sweep, then read the Mac disk space again."""
     floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
              else config.configuration.number("free_floor_gib"))
-    if probe.free_gib >= floor:
-        return MacDiskReady(probe.free_gib)
+    disk = check_mac_disk_floor(probe, floor)
+    if isinstance(disk, MacDiskReady):
+        return disk
     try:
         directory = eligibility.state_directory()
         directory.mkdir(parents=True, exist_ok=True)
@@ -1972,9 +1988,10 @@ def ensure_mac_disk_floor(
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
-            if after.free_gib < floor:
-                return SweepShort(after.free_gib)
-            return MacDiskReady(after.free_gib)
+            disk = check_mac_disk_floor(after, floor)
+            if isinstance(disk, MacDiskShort):
+                return SweepShort(disk.free_gib)
+            return disk
     except (OSError, ValueError) as error:
         if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
             raise
@@ -2676,7 +2693,7 @@ def claimed_run(
                     return DeclinedMacRun("state", elapsed_seconds(started), probe.detail)
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
-            if probe.free_gib < config.free_floor_gib:
+            if isinstance(check_mac_disk_floor(probe, config.free_floor_gib), MacDiskShort):
                 checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
