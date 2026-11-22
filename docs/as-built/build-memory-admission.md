@@ -1046,6 +1046,7 @@ With a usable configuration, the service waits for the settle interval before it
 A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+One case keeps the delay: a source change found while the service restores its state at start, with an unusable first configuration, stops the service before it takes the inherited socket. systemd then restarts it after its normal delay.
 The service logs the changed source paths before `execv`.
 The replacement sends `READY=1`, then hashes the Python sources under `scripts` and logs the hash.
 The hash includes sources that load only after startup.
