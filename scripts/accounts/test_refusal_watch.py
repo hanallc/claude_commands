@@ -1291,6 +1291,100 @@ class RefusalWatchTests(unittest.TestCase):
         _ = refusal_watch.run(NOW + timedelta(minutes=1))
         self.assertEqual([call.session_id for call in self.moves.calls], ["available", "claimed"])
 
+    def test_completion_keeps_a_by_hand_move_until_the_group_selects_again(self) -> None:
+        selected_at = WatchTime.fromisoformat((NOW - timedelta(minutes=1)).isoformat())
+        _ = accounts.set_group_account("showrunners", "claude1", why="original selection", now=selected_at)
+        transition = accounts.group_transition("showrunners")
+        assert isinstance(transition, accounts.GroupTransition)
+        self.assertEqual(transition.at, selected_at)
+        role_map_copy = role_map.decode_role_map(role_map.encode_role_map(role_map.read_role_map()))
+        with role_map.supplied_role_map(role_map_copy):
+            self.assertEqual(accounts.group_transition("showrunners"), transition)
+        owner = self.owner("manual", host="herdr")
+        self.live[0]["procStart"] = owner["proc_start"]
+        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(stop_resume, "datetime", WatchTime),
+              patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(pane_launch, "current_kind", return_value="claude"),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("manual")),
+              patch.object(stop_resume, "_resume_move",
+                           return_value=stop_resume.ClaudeUp("manual", "w1:p1", "claude3", pid=owner["pid"])),
+              patch.object(sessions, "process_start", return_value=owner["proc_start"])):
+            result = accounts.move("manual", "claude3", why="manual account choice")
+        self.assertIsInstance(result, accounts.MoveStarted)
+        self.moved(MoveCall("manual", "claude3", "manual account choice"))
+        with patch.object(moves, "read_moves", wraps=moves.read_moves) as read_moves:
+            _ = refusal_watch.run(NOW + timedelta(minutes=1), recover_units=False)
+        self.assertEqual(read_moves.call_args_list, [call(), call()])
+        self.assertEqual(self.moves.calls, [])
+
+        _ = self.owner("late", host="herdr")
+        _ = accounts.set_group_account("showrunners", "claude2", why="new selection", now=selected_at + timedelta(minutes=3))
+        _ = refusal_watch.run(NOW + timedelta(minutes=3), recover_units=False)
+        _ = refusal_watch.run(NOW + timedelta(minutes=4), recover_units=False)
+        self.assertCountEqual(self.moves.calls, [
+            MoveCall("manual", "claude2", "complete showrunners move to claude2"),
+            MoveCall("late", "claude2", "complete showrunners move to claude2"),
+        ])
+
+    def test_completion_reads_a_by_hand_request_after_the_run_starts(self) -> None:
+        _ = self.groups(units="claude3", showrunners="claude1")
+        _ = self.owner("unit", host="unit")
+        _ = self.owner("manual", host="herdr")
+        read_members = accounts.live_group_members
+        reads = 0
+
+        def observe() -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                moves.append_move(moves.RequestedMove(kind="requested", tool="claude", at=NOW.isoformat(),
+                    subject="manual: owner manual", move_id="manual-move", cause="by hand", window="unknown",
+                    why="manual account choice", **{"from": "claude1", "to": "claude3"}))
+                self.moved(MoveCall("manual", "claude3", "manual account choice"))
+            return read_members()
+
+        with (patch.object(accounts, "live_group_members", side_effect=observe),
+              patch.object(moves, "read_moves", wraps=moves.read_moves) as read_moves):
+            _ = refusal_watch.run(NOW + timedelta(minutes=1), recover_units=False)
+
+        self.assertEqual(reads, 2)
+        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude3", "complete units move to claude3")])
+        self.assertEqual(read_moves.call_args_list, [call(), call()])
+
+    def test_completion_keeps_a_by_hand_move_with_an_undated_selection(self) -> None:
+        path = self.groups(showrunners="claude1")
+        _ = self.owner("manual", host="herdr", label="claude3")
+        _ = self.owner("late", host="herdr", label="claude3")
+        moves.append_move(moves.RequestedMove(kind="requested", tool="claude", at=NOW.isoformat(),
+            subject="manual: owner manual", move_id="manual-move", cause="by hand", window="unknown",
+            why="manual account choice", **{"from": "claude1", "to": "claude3"}))
+
+        for selection in ({"label": "claude1", "move_id": "legacy-move",
+                           "cause": "by hand", "window": "unknown"},):
+            with self.subTest(selection=selection):
+                _ = path.write_text(json.dumps({"showrunners": selection}))
+                self.moved(MoveCall("late", "claude3", "fixture"))
+                self.moves.calls.clear()
+                _ = refusal_watch.run(NOW + timedelta(minutes=1), recover_units=False)
+                _ = refusal_watch.run(NOW + timedelta(minutes=2), recover_units=False)
+                self.assertEqual(self.moves.calls, [MoveCall("late", "claude1", "complete showrunners move to claude1")])
+                self.assertEqual(json.loads(path.read_text())["showrunners"], selection)
+
+    def test_first_completion_dates_a_legacy_string_selection(self) -> None:
+        path = self.groups(units="claude3")
+        _ = self.owner("unit", host="unit")
+        at = WatchTime.now(timezone.utc)
+
+        _ = refusal_watch.run(at, recover_units=False)
+
+        selection = cast(dict[str, object], json.loads(path.read_text())["units"])
+        self.assertEqual((selection["label"], selection["at"]), ("claude3", at.isoformat()))
+
     def test_direct_and_watcher_moves_stop_each_group_member_once(self) -> None:
         _ = self.groups()
         _ = self.owner("direct", host="unit")
