@@ -546,9 +546,11 @@ class PushoverTests(unittest.TestCase):
 
     def test_missing_keys_send_nothing(self) -> None:
         _ = self.keys.write_text("PUSHOVER_USER=u123\nPUSHOVER_TOKEN=\n")
-        code, form = self.run_send(["--no-action", "t", "m"])
+        with redirect_stderr(io.StringIO()) as errors:
+            code, form = self.run_send(["--no-action", "t", "m"])
         self.assertEqual((code, form), (2, {}))
-        self.assert_log("0", "t", footed("No action needed.\nm"), "keys missing")
+        self.assertIn("pushover: refused before sending: keys missing", errors.getvalue())
+        self.assert_log("0", "t", footed("No action needed.\nm"), "refused before sending: keys missing")
 
     def test_bad_usage_sends_nothing(self) -> None:
         for argv in (["--priority", "3", "t", "m"], ["only title"], ["t", " "]):
