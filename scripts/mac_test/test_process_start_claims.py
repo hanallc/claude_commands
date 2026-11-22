@@ -183,9 +183,10 @@ class ClaimProcessStartTests(unittest.TestCase):
                   redirect_stdout(output)):
                 with mac_test.locked(paths.lock):
                     result = mac_test.take_over_kept_claim(args, held, {**record}, session=session)
-                self.assertEqual(result, mac_test.ClaimFinished(13))
+                self.assertEqual(result, mac_test.ClaimFinished(13, ("leftovers: fixture-box", "slot: 2")))
+                self.assertEqual(output.getvalue(), "")
                 self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, session=session), 13)
-            self.assertEqual(output.getvalue().splitlines(), ["leftovers: fixture-box", "slot: 2"] * 2)
+            self.assertEqual(output.getvalue().splitlines(), ["leftovers: fixture-box", "slot: 2"])
             saved, = mac_test.read_claims(paths)
             self.assertEqual(saved.scope, scope)
             self.assertEqual(claim_state.claim_identity(saved.record), claim_state.claim_identity(record))
@@ -242,8 +243,9 @@ class ClaimProcessStartTests(unittest.TestCase):
                 with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stderr(errors), \
                         redirect_stdout(io.StringIO()):
                     result = mac_test.adopt_wait_claim(args, paths, scope, session=session)
-                self.assertEqual(result, mac_test.ClaimFinished(11 if check == "leased slot" else 12))
-                self.assertEqual(errors.getvalue().splitlines(), [f"cannot adopt the Mac claim: {check}"])
+                self.assertEqual(result, mac_test.ClaimDenied(11 if check == "leased slot" else 12,
+                                                             f"cannot adopt the Mac claim: {check}", to_stderr=True))
+                self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(mac_test.read_claims(paths), before)
 
     def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
@@ -370,8 +372,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                         before = paths.run.read_bytes()
                         unrelated = mac_test.adopt_wait_claim(
                             args, paths, mac_test.WHOLE_MAC, session=OwningSession("unrelated-session"))
-                        self.assertIsInstance(unrelated, mac_test.ClaimFinished)
-                        assert isinstance(unrelated, mac_test.ClaimFinished)
+                        assert isinstance(unrelated, mac_test.ClaimDenied)
                         self.assertEqual(unrelated.status, 12)
                         self.assertEqual(paths.run.read_bytes(), before)
                     if cleanup and expected == 13:
@@ -381,12 +382,11 @@ class ClaimProcessStartTests(unittest.TestCase):
                             placement.SubmittingOwner("natedev", 42, new_start), session, 0)
                         result_status = mac_test.command_claim(args, paths, watch_claim=False,
                             session=session, assignment=assigned)
-                        result = mac_test.ClaimFinished(result_status)
                     else:
                         result = mac_test.adopt_wait_claim(args, paths, mac_test.WHOLE_MAC, session=session)
-                self.assertIsInstance(result, mac_test.ClaimFinished)
-                assert isinstance(result, mac_test.ClaimFinished)
-                self.assertEqual(result.status, expected)
+                        assert isinstance(result, (mac_test.ClaimFinished, mac_test.ClaimDenied))
+                        result_status = result.status
+                self.assertEqual(result_status, expected)
                 saved = mac_test.read_run(paths.run)
                 self.assertNotIsInstance(saved, mac_test.NoRun)
                 assert not isinstance(saved, mac_test.NoRun)

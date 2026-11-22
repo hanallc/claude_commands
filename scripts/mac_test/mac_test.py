@@ -106,9 +106,19 @@ MAC_LINUX_CLAIM_ID_PREFIX = "mac-linux-"
 
 @dataclass(frozen=True)
 class ClaimFinished:
-    """A claim attempt that ended with its exit status."""
+    """A new claim or a claim retained for cleanup."""
+
+    status: Literal[0, 13]
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClaimDenied:
+    """A claim attempt that ended without transferring ownership."""
 
     status: int
+    reason: str
+    to_stderr: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,7 +135,7 @@ class ClaimHeldByCopy:
     holders: tuple[RunRecord, ...]
 
 
-ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy
+ClaimAttempt = ClaimFinished | ClaimDenied | ClaimBusy | ClaimHeldByCopy
 
 
 class NoRemoteJob:
@@ -545,9 +555,8 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
     return block
 
 
-def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
-    print(f"blocked by {holder_name(block.holder)}: {block.reason}")
-    return ClaimFinished(10)
+def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimDenied:
+    return ClaimDenied(10, f"blocked by {holder_name(block.holder)}: {block.reason}")
 
 
 def timestamp(value: datetime) -> str:
@@ -690,7 +699,10 @@ def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
 
     if isinstance(scope, RepositoryScope):
         key = eligibility.KnownRepository(scope.name, scope.key).path_key if scope.key else quote(scope.name, safe="")
-        suffix = f".slot-{scope.slot}" if scope.slot else ""
+        if not scope.slot:
+            return paths.claims / f"{key}.json"
+        # Quoting encodes ! in repository names and keys.
+        suffix = f"!{scope.slot}" if paths.platform == "macos" else f".slot-{scope.slot}"
         return paths.claims / f"{key}{suffix}.json"
     return paths.run
 
@@ -739,12 +751,12 @@ def mac_claim_slot(claims: tuple[HeldClaim, ...], capacity: int, *, use_mirror: 
     if len(claims) >= capacity or any(isinstance(claim.scope, WholeMacScope) for claim in claims):
         return MacClaimSlotsBusy()
     slots = {claim.scope.slot for claim in claims if isinstance(claim.scope, RepositoryScope)}
-    # Mac mirror work uses the unnumbered claim. Other work can use the extra places.
-    if 0 not in slots:
-        return MacClaimSlot(0)
+    # Reserve the unnumbered claim for mirror work when a numbered claim is free.
     if not use_mirror:
-        return MacClaimSlot(next(number for number in range(2, capacity + 1) if number not in slots))
-    return MacClaimSlotsBusy()
+        for number in range(2, capacity + 1):
+            if number not in slots:
+                return MacClaimSlot(number)
+    return MacClaimSlot(0) if 0 not in slots else MacClaimSlotsBusy()
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1830,11 +1842,17 @@ def requested_showrunner(name: str) -> Showrunner:
     return NamedShowrunner(name) if name else NO_SHOWRUNNER
 
 
-def print_claim_identity(args: CliArguments, record: RunRecord) -> None:
+def finished_claim(args: CliArguments, record: RunRecord, *, adopted: bool = False) -> ClaimFinished:
+    lines: list[str] = []
     if args.identity:
         identity = claim_state.claim_identity(record)
-        print("claim_identity=" + json.dumps({"claim_id": identity.claim_id,
-              "episode": identity.episode, "attempt": identity.attempt}))
+        lines.append("claim_identity=" + json.dumps({"claim_id": identity.claim_id,
+                     "episode": identity.episode, "attempt": identity.attempt}))
+    slot = (f"slot: {record['slot']}",) if "slot" in record else ()
+    if "remote_host" in record and record.get("cleanup_pending"):
+        leftovers = f"leftovers: {record['remote_host']}"
+        return ClaimFinished(13, (*lines, *slot, leftovers) if adopted else (*lines, leftovers, *slot))
+    return ClaimFinished(0, (*lines, *slot, "claimed") if adopted else (*lines, "claimed", *slot))
 
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim,
@@ -1842,8 +1860,7 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     """Transfer cleanup ownership without granting permission to run."""
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
-        print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
-        return ClaimFinished(1)
+        return ClaimDenied(1, f"cannot claim: process {args.pid} is not running", to_stderr=True)
     kept["pid"] = args.pid
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
@@ -1856,11 +1873,7 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     else:
         _ = kept.pop("copy", None)
     write_json(claim.path, kept)
-    print_claim_identity(args, kept)
-    print(f"leftovers: {kept['remote_host']}")
-    if "slot" in kept:
-        print(f"slot: {kept['slot']}")
-    return ClaimFinished(13)
+    return finished_claim(args, kept)
 
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
@@ -1870,32 +1883,25 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
-        print(f"state unreadable: {error.path}")
-        return ClaimFinished(12)
+        return ClaimDenied(12, f"state unreadable: {error.path}")
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
     try:
         block = blocking_claim_block(paths, session)
     except (OSError, StateReadError):
-        print(f"state unreadable: {paths.block}")
-        return ClaimFinished(12)
+        return ClaimDenied(12, f"state unreadable: {paths.block}")
     for claim in overlapping:
         record = claim.record
         if ("remote_host" in record and record.get("cleanup_pending")
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and not run_is_kept(record)
                 and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
-            print_claim_identity(args, record)
-            print(f"leftovers: {record['remote_host']}")
-            if "slot" in record:
-                print(f"slot: {record['slot']}")
-            return ClaimFinished(13)
+            return finished_claim(args, record)
     if paths.platform == "macos" and isinstance(scope, RepositoryScope) and isinstance(block, NoMacBlock):
         try:
             capacity = slot_capacity(paths, scope)
         except (OSError, ConfigError) as error:
-            print(f"state unreadable: {error}")
-            return ClaimFinished(12)
+            return ClaimDenied(12, f"state unreadable: {error}")
         use_mirror = isinstance(args.remote, str) or reserve_wait or not isinstance(assignment, UnassignedClaim)
         slot = mac_claim_slot(overlapping, capacity, use_mirror=use_mirror)
         if isinstance(slot, MacClaimSlot):
@@ -1909,20 +1915,18 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             if args.leased_slots:
                 slots = tuple(slot for slot in slots if slot in args.leased_slots)
         except (OSError, StateReadError, ConfigError) as error:
-            print(f"state unreadable: {error}")
-            return ClaimFinished(12)
+            return ClaimDenied(12, f"state unreadable: {error}")
         for claim in overlapping:
             if (claim.record["pid"] == args.pid and recorded_worktree_matches(claim.record["worktree"], Path(args.worktree))
                     and claim_state.claim_identity(claim.record) == identity
                     and not run_is_kept(claim.record) and "slot" in claim.record
                     and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
                     and isinstance(block, NoMacBlock)):
-                print_claim_identity(args, claim.record)
-                print(f"claimed\nslot: {claim.record['slot']}")
-                return ClaimFinished(0)
+                return finished_claim(args, claim.record)
         for slot in slots:
             selected = RepositoryScope(scope.name, scope.key, slot)
-            if not any(scopes_overlap(claim.scope, selected) for claim in claims):
+            selected_path = claim_path(paths, selected)
+            if not any(claim.path == selected_path or scopes_overlap(claim.scope, selected) for claim in claims):
                 scope = selected
                 overlapping = ()
                 break
@@ -1935,7 +1939,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
     if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
             and args.leased_slots and scope.slot not in args.leased_slots):
-        return ClaimFinished(11)
+        return ClaimDenied(11, "the assigned claim slot is unavailable")
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
@@ -1951,8 +1955,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         return ClaimBusy(overlapping[0].record)
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
-        print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
-        return ClaimFinished(1)
+        return ClaimDenied(1, f"cannot claim: process {args.pid} is not running", to_stderr=True)
     claimed: RunRecord = {
         "claim_id": args.claim_id or uuid.uuid4().hex,
         "episode": args.episode or uuid.uuid4().hex,
@@ -1977,15 +1980,14 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if scope.slot:
             claimed["slot"] = scope.slot
     path = claim_path(paths, scope)
+    for claim in claims:
+        if claim.path == path:
+            return ClaimBusy(claim.record)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
-    print_claim_identity(args, claimed)
     if paths.platform == "linux" and isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
-    print("claimed")
-    if isinstance(scope, RepositoryScope) and scope.slot:
-        print(f"slot: {scope.slot}")
-    return ClaimFinished(0)
+    return finished_claim(args, claimed)
 
 
 def copy_yield_seconds() -> float:
@@ -2006,9 +2008,8 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
-def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) -> ClaimFinished:
-    print(check.diagnostic, file=sys.stderr)
-    return ClaimFinished(status)
+def refuse_wait_claim(check: WaitClaimCheck, *, status: Literal[11, 12] = 12) -> ClaimDenied:
+    return ClaimDenied(status, check.diagnostic, to_stderr=True)
 
 
 def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
@@ -2065,16 +2066,9 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not cleanup_only:
         record["worktree"] = str(claim_worktree_path(record["worktree"]))
     write_json(claim.path, record)
-    print_claim_identity(args, record)
-    if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
-        if not cleanup_only:
-            remember_slot(paths, claim.scope, record)
-        print(f"slot: {claim.scope.slot}")
-    if cleanup_only:
-        print(f"leftovers: {record['remote_host']}")
-        return ClaimFinished(13)
-    print("claimed")
-    return ClaimFinished(0)
+    if isinstance(claim.scope, RepositoryScope) and claim.scope.slot and not cleanup_only:
+        remember_slot(paths, claim.scope, record)
+    return finished_claim(args, record, adopted=True)
 
 
 def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
@@ -2126,8 +2120,12 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
                        else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
+        if isinstance(attempt, ClaimDenied):
+            print(attempt.reason, file=sys.stderr if attempt.to_stderr else sys.stdout)
+            return attempt.status
         if isinstance(attempt, ClaimFinished):
-            if watch_claim and attempt.status in (0, 13):
+            print("\n".join(attempt.lines))
+            if watch_claim:
                 start_claim_watcher(paths)
             return attempt.status
         if isinstance(attempt, ClaimHeldByCopy):
@@ -2304,9 +2302,11 @@ def free_now(
             capacity = slot_capacity(paths, scope)
         except (OSError, ConfigError):
             return "state"
-        overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope)
+        path = claim_path(paths, scope)
+        overlapping = tuple(claim for claim in claims if (claim.path == path or scopes_overlap(claim.scope, scope))
                             and run_holds_work(claim.record) and (copy or not copy_gives_way(claim.record)))
-        held = isinstance(mac_claim_slot(overlapping, capacity, use_mirror=True), MacClaimSlotsBusy)
+        held = (any(claim.path == path for claim in overlapping)
+                or isinstance(mac_claim_slot(overlapping, capacity, use_mirror=True), MacClaimSlotsBusy))
     else:
         held = all(any(
             scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)

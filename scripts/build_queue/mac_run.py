@@ -1,7 +1,6 @@
 """Hold the repository claim for a mac-linux run."""
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stdout
-from io import StringIO
+from contextlib import contextmanager
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -18,7 +17,7 @@ class MacRunRefused(Exception):
 
 @contextmanager
 def held(repo: Path, target: str, work: SuiteMode | StepJob,
-         gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
+         gate_job: StepJob | GateJobNotRecorded, *, repository: str = "claude_commands") -> Generator[None]:
     """Hold the Mac repository claim until the guest run ends."""
     try:
         paths = claim_state.state_paths(target)
@@ -26,10 +25,10 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         raise MacRunRefused(str(error)) from error
     if paths.platform != "macos":
         raise MacRunRefused(f"{target} is not a Mac claim target")
+    if not repository.strip():
+        raise MacRunRefused("a Mac repository claim needs a repository name")
+    scope = claim_state.RepositoryScope(".claude" if repository == "claude_commands" else repository)
     worktree = str(repo.resolve())
-    scope = claim_state.target_claim_scope(paths, worktree)
-    if not isinstance(scope, claim_state.RepositoryScope):
-        raise MacRunRefused(f"{worktree} has no repository claim scope")
     if isinstance(work, StepJob):
         step = work.step
     else:
@@ -43,9 +42,8 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
     args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
     acquired = False
     try:
-        output = StringIO()
         try:
-            with cancellation.defer_cleanup_signals(), claim_state.locked(paths.lock), redirect_stdout(output):
+            with cancellation.defer_cleanup_signals(), claim_state.locked(paths.lock):
                 attempt = mac_test.claim_once(args, paths, scope, session=session)
                 acquired = isinstance(attempt, mac_test.ClaimFinished) and attempt.status == 0
         except (OSError, ValueError) as error:
@@ -54,8 +52,10 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
             raise MacRunRefused(f"{target} is busy with {attempt.holder['what']}")
         if isinstance(attempt, mac_test.ClaimHeldByCopy):
             raise MacRunRefused(f"{target} is busy with {attempt.holders[0]['what']}")
+        if isinstance(attempt, mac_test.ClaimDenied):
+            raise MacRunRefused(attempt.reason)
         if not acquired:
-            raise MacRunRefused(output.getvalue().strip() or f"{target} refused the repository claim")
+            raise MacRunRefused(f"{target} needs cleanup before the run can start")
         yield
     finally:
         if acquired:
