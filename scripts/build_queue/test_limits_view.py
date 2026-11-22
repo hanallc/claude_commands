@@ -914,9 +914,15 @@ class MachineFactsLineTests(unittest.TestCase):
 
     def test_each_machine_shows_its_line(self) -> None:
         saved = self.saved()
-        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32 · battery 100% (mains)")
-        self.assertEqual(self.line(saved, "mac"), "link 3 ms · load 19.6/12 · battery 85% (on battery)")
+        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32 · battery 100% charged · not in use")
+        self.assertEqual(self.line(saved, "mac"), "link 3 ms · load 19.6/12 · battery 85% · in use")
         self.assertEqual(self.line(saved, "aws"), "no box running")
+
+    def test_a_charging_battery_on_mains_is_not_in_use(self) -> None:
+        saved = self.saved()
+        saved["machines"]["natedev"] = machine_facts.facts("read", load=52.71, cpus=32,
+                                                           battery={"percent": 80, "mains": True})
+        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32 · battery 80% · not in use")
 
     def test_failures_show_their_words(self) -> None:
         saved = self.saved()
@@ -936,7 +942,7 @@ class MachineFactsLineTests(unittest.TestCase):
     def test_stale_and_missing_facts(self) -> None:
         saved = self.saved(written=datetime(2026, 11, 22, 14, 5, tzinfo=UTC).timestamp())
         fresh = saved["written"] + machine_facts.STALE_SECONDS
-        self.assertEqual(self.line(saved, "mac", fresh), "link 3 ms · load 19.6/12 · battery 85% (on battery)")
+        self.assertEqual(self.line(saved, "mac", fresh), "link 3 ms · load 19.6/12 · battery 85% · in use")
         self.assertEqual(self.line(saved, "mac", fresh + 1), "facts not sampled since 14:05")
         self.assertEqual(self.line(machine_facts.FactsUnread.VALUE, "natedev"), "facts not sampled")
         del saved["machines"]["aws"]
@@ -948,8 +954,8 @@ class MachineFactsLineTests(unittest.TestCase):
         background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None))
         shown = limits_view.build_limits(reading, (), (), {}, {}, background, UTC, facts=saved)
         self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
-                         ("load 52.7/32 · battery 100% (mains)",
-                          "link 3 ms · load 19.6/12 · battery 85% (on battery)", "no box running"))
+                         ("load 52.7/32 · battery 100% charged · not in use",
+                          "link 3 ms · load 19.6/12 · battery 85% · in use", "no box running"))
         missing = limits_view.build_limits(reading, (), (), {}, {}, background, UTC)
         self.assertEqual(missing.aws.facts, "facts not sampled")
         rendered = test_memory_hover.MemoryHoverTests().page_expression("""(() => {
@@ -957,5 +963,5 @@ class MachineFactsLineTests(unittest.TestCase):
             return $('build-limits-content').innerHTML;
         })()""", {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True)
         assert isinstance(rendered, str)
-        self.assertIn('<div class="build-limit-facts">link 3 ms · load 19.6/12 · battery 85% (on battery)</div>', rendered)
+        self.assertIn('<div class="build-limit-facts">link 3 ms · load 19.6/12 · battery 85% · in use</div>', rendered)
         self.assertIn('<div class="build-limit-facts">no box running</div>', rendered)

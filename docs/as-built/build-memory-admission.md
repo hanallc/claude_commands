@@ -449,8 +449,9 @@ An empty value hides the alert on the page.
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
 The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
 `limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
-Examples: natedev `load 52.7/32 · battery 100% (mains)`, Mac `link 3 ms · load 19.6/12 · battery 85% (on battery)`, AWS `no box running`.
+Examples: natedev `load 52.7/32 · battery 100% charged · not in use`, Mac `link 3 ms · load 19.6/12 · battery 85% · in use`, AWS `no box running`.
 natedev has no link part. A machine without a battery has no battery part.
+On mains a battery is `not in use`, and a full one shows `battery 100% charged · not in use`. Without mains it shows `battery 54% · in use`.
 A failed TCP connect shows `link unreachable`. A failed SSH command after a good connect shows `link 3 ms · load unreadable`.
 A UPS that `upsc` cannot read shows `battery unreadable`. A Mac without an `InternalBattery` line in `pmset`, or a machine with no UPS tool, shows no battery part.
 A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.

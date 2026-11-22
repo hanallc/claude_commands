@@ -2747,7 +2747,7 @@ process.stdout.write(JSON.stringify({
         _ = (self.root / "machine-facts.json").write_text(json.dumps(saved))
         shown = limits()
         self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
-                         ("load 8.0/32", "link 3 ms · load 1.5/12 · battery 85% (mains)", "no box running"))
+                         ("load 8.0/32", "link 3 ms · load 1.5/12 · battery 85% · not in use", "no box running"))
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())

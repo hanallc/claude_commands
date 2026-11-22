@@ -75,9 +75,9 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "facts_link": "link {ms} ms",
     "facts_load": "load {load}/{cpus}",
     "facts_load_unreadable": "load unreadable",
-    "facts_battery": "battery {percent}% ({source})",
-    "facts_mains": "mains",
-    "facts_on_battery": "on battery",
+    "facts_battery_full": "battery 100% charged · not in use",
+    "facts_battery_mains": "battery {percent}% · not in use",
+    "facts_battery_in_use": "battery {percent}% · in use",
     "facts_battery_unreadable": "battery unreadable",
     "facts_unreachable": "link unreachable",
     "facts_no_box": "no box running",
@@ -863,8 +863,10 @@ def facts_line(saved: machine_facts.SavedFacts | machine_facts.FactsUnread, mach
     if battery == "unreadable":
         parts.append(PAGE_WORDS["facts_battery_unreadable"])
     elif battery != "no_battery":
-        source = PAGE_WORDS["facts_mains" if battery["mains"] else "facts_on_battery"]
-        parts.append(PAGE_WORDS["facts_battery"].format(percent=battery["percent"], source=source))
+        # On mains the machine does not use its battery; a full charge says so.
+        word = ("facts_battery_in_use" if not battery["mains"]
+                else "facts_battery_full" if battery["percent"] >= 100 else "facts_battery_mains")
+        parts.append(PAGE_WORDS[word].format(percent=battery["percent"]))
     return " · ".join(parts)
 
 
