@@ -584,8 +584,9 @@ def _direct_test_unit(cgroup: str) -> str:
 def _user_test_manager_available() -> bool:
     """Check for a user systemd manager without starting one.
 
-    Only a proven absence returns False: no user bus, or a bus where no process owns
-    the systemd name. Any other failed check raises ValueError.
+    Only a proven absence returns False: no user bus, a bus socket path that does not exist,
+    or a bus where no process owns the systemd name. Any other failed check raises
+    ValueError or OSError.
     """
     import re
     import subprocess

@@ -186,6 +186,7 @@ unittest.TextTestRunner().run(case)
         self.assertNotIn("fixture started", result.stdout)
 
     @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
+    @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
     def test_unreadable_bus_socket_stops_before_the_test(self) -> None:
         locked = self.root / "locked"
         locked.mkdir(mode=0)
