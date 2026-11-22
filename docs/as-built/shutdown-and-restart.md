@@ -974,6 +974,7 @@ Manual starts through a pane command, `accounts.py exec`, `cli_agent.sh`, or nat
 A shell wrapper can start an agent after a resume times out, and a fork without exec can retain the lock.
 All staff tooling shares one `XDG_CONFIG_HOME`, because a process with a different config home locks a different file.
 A slow Ghostty window or pending Linux service can start the server after its shared lock closes and reboot takes the exclusive lock.
+A remote attach started during a reboot can start the server through the Herdr SSH bridge without the lock. Attach after the reboot prints its Attach line.
 The `agents resume` command holds the lock while it changes staff or recovery records.
 The direct resume API also holds the lock for starts in an existing pane.
 The `agents restart` and `agents move` commands hold the lock while they save restart or move records.
