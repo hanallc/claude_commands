@@ -829,8 +829,8 @@ Both commands change nothing.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
 The record holds only rows that a restart starts:
 - `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
-- `worker.not_restored` names that worker: a Codex worker in self-actualize mode, or a worker with no active dispatch and no detached run.
-- `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
+- `worker.not_restored` names no worker, so every saved worker goes to `worker.restore`. In self-actualize mode, `worker.restore` skips each Codex worker and prints `<worker>: not resumed: self-actualize mode`.
+- `restart` removes a saved id with no staff row.
 - The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
 - `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.

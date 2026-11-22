@@ -91,7 +91,7 @@ Dispatch gates, demo builds, merges, fetches, pushes, CI watches, and promotion 
 Apply <LongLivedWorkers/>, <DispatchContract/>, and <WorkerLaunchFailure/>.
 Use existing worker roles; command execution can use `--role test`.
 When no worker is free, retain the order and wait for a worker result or capacity notice.
-The self-actualize mode and launch-failure shell fallbacks do not apply to merge operations.
+The shell fallbacks for self-actualize mode and for a launch failure do not apply to merge operations.
 
 Store the operation's inputs under `OP="$SESSION_DIR/phases/$ORDER_ID"`.
 Apply <WritePromptContract/> with <MergeWorkerCommands/> and <MergeWorkerPaths/>.
