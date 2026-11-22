@@ -54,15 +54,32 @@ def isolate_fixture_git(test: unittest.TestCase, root: Path) -> None:
 def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str]:
     """Give worktree creation private roots and records."""
     configuration.mkdir(parents=True, exist_ok=True)
-    _ = (configuration / "build_folders.conf").write_text(
-        f"roots.workspace={root / 'worktrees'}\nroots.build={root / 'build'}\n"
-        + "# range: 0..\nlocks.probe_wait_seconds=1\n"
-        + "# range: 0.001..\nlocks.probe_retry_seconds=0.01\n")
+    source = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
+    lock_settings = {
+        "locks.probe_wait_seconds": "# range: 0..\nlocks.probe_wait_seconds=1\n",
+        "locks.probe_retry_seconds": "# range: 0.001..\nlocks.probe_retry_seconds=0.01\n",
+    }
+    lines: list[str] = []
+    for line in source.read_text(encoding="utf-8").splitlines(keepends=True):
+        key, separator, _value = line.partition("=")
+        if separator and key.startswith("roots."):
+            root_name = key.removeprefix("roots.").partition(".")[0]
+            folder = "worktrees" if root_name == "workspace" else root_name
+            replacement = f"{key}={root / folder}\n"
+        elif key in lock_settings:
+            replacement = lock_settings[key]
+        else:
+            lines.append(line)
+            continue
+        if lines and lines[-1].lstrip().startswith(("# range:", "# whole:")):
+            del lines[-1]
+        lines.append(replacement)
+    _ = (configuration / source.name).write_text("".join(lines), encoding="utf-8")
     copies = configuration / "copies.conf"
     _ = copies.write_text("# range: 0.001..\ngit_timeout_seconds=30\n")
     templates = root / "git-templates"
     templates.mkdir()
-    return {"HOME": str(root), "CONF_DIR": str(configuration), "COPIES_CONFIG": str(copies),
+    return {"HOME": str(root), "TMPDIR": str(root), "CONF_DIR": str(configuration), "COPIES_CONFIG": str(copies),
             "WORKTREES_STATE_DIR": str(root / "worktree-records"), "GIT_TEMPLATE_DIR": str(templates)}
 
 
