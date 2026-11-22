@@ -587,6 +587,7 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
                 backoff: eligibility.BackoffState | eligibility.ReadBackoff,
                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                mac_claim: claim_state.AcquiredMacClaim | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
@@ -594,16 +595,16 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
               else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
-    first, *rest = eligibility.remote_step_kinds(kind)
-    repository = eligibility.mac_step_eligibility(config, repo_root, package,
-        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff)
-    if isinstance(repository, eligibility.IneligibleMacStep):
-        return ExcludedTarget(target, repository.reason)
-    for step in rest:
-        policy = eligibility.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
+    repository: eligibility.KnownRepository | ExcludedTarget = ExcludedTarget(target, "command")
+    for step in eligibility.remote_step_kinds(kind):
+        if isinstance(mac_claim, claim_state.ResolveMacRepository):
+            policy = eligibility.mac_step_eligibility(config, repo_root, package,
+                remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
+        else:
+            policy = eligibility.claimed_mac_step_eligibility(config, mac_claim.repository, package, step, name, backoff)
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
+        repository = policy
     return repository
 
 
@@ -740,6 +741,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
+                           mac_claim: claim_state.AcquiredMacClaim | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -748,11 +750,16 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = (eligibility.SshProbeSettings(configuration) if isinstance(configuration, conf.ConfigRead)
-                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
+        if not isinstance(mac_claim, claim_state.ResolveMacRepository):
+            settings = target.settings if isinstance(target, SshTarget) else eligibility.config_path()
+            configuration = configuration if isinstance(configuration, conf.ConfigRead) else conf.read(settings)
+            config = eligibility.SshProbeSettings(configuration, mac_claim.host)
+        else:
+            config = (eligibility.SshProbeSettings(configuration) if isinstance(configuration, conf.ConfigRead)
+                      else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
         repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF,
-                                 configuration=configuration)
+                                 configuration=configuration, mac_claim=mac_claim)
         if isinstance(repository, ExcludedTarget):
             return repository
         if isinstance(answer, CapacityNotRead):

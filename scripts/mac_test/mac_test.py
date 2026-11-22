@@ -1600,13 +1600,38 @@ def watch_claim(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
+    run = claim.record
+    if "remote_host" in run and isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now):
+        from scripts.copies import copies
+        from scripts.mac_test import offload
 
+        try:
+            with offload.mac_cleanup_lease(claim_state.saved_mac_repository(run), run["remote_host"], paths.target):
+                return apply_claim_activity(paths, config, claim, activity, now, release_remote=True)
+        except copies.BusyRemoteMirror:
+            return True
+        except copies.CopyError as error:
+            print(f"Mac claim cleanup lease unavailable: {error}", flush=True)
+            return True
+    return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
+
+
+def claim_idle_expired(run: RunRecord, path: Path, config: MacTestConfig, now: datetime) -> bool:
+    return ("idle_since" in run and now - aware_timestamp(run["idle_since"], path, "idle_since")
+            >= timedelta(minutes=config.claim_idle_minutes))
+
+
+def apply_claim_activity(
+    paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
+    *, release_remote: bool,
+) -> bool:
+    """Check the saved claim again before updating or releasing it."""
     run = claim.record
     with locked(paths.lock):
         current = read_run(claim.path)
         if isinstance(current, NoRun):
             return False
-        if claim_owner(current) != claim_owner(run):
+        if not same_cleanup_claim(current, run):
             return True
         if not run_is_live(current):
             return False
@@ -1642,8 +1667,9 @@ def watch_claim(
             return True
         if changed:
             write_json(claim.path, current)
-        idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
-        if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
+        if not claim_idle_expired(current, claim.path, config, now):
+            return True
+        if "remote_host" in current and not release_remote:
             return True
     release = CliArguments()
     release.pid, release.target = current["pid"], paths.target
@@ -2315,6 +2341,13 @@ class ClaimReleaseRefused:
     reason: str
 
 
+def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
+    return (claim_owner(current) == claim_owner(record)
+            and current.get("remote_host") == record.get("remote_host")
+            and current.get("mac_repository") == record.get("mac_repository")
+            and current.get("slot") == record.get("slot"))
+
+
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
@@ -2348,13 +2381,11 @@ def release_exact_claims(
                     return ClaimReleaseRefused(f"the cleanup lease is unavailable: {error}")
             pending = offload.pending_start_path(paths.target, identity)
             fence_pending = pending.exists()
-            count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
-                            and isinstance(remote_work, EndStoppedWork))
-            if "remote_host" in record and (fence_pending or count_legacy):
+            if "remote_host" in record and (fence_pending or isinstance(remote_work, EndStoppedWork)):
                 if isinstance(remote_work, EndStoppedWork):
                     with nullcontext() if provider_lock_held else locked(paths.lock):
                         current = read_run(path)
-                        if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                        if isinstance(current, NoRun) or not same_cleanup_claim(current, record):
                             return ClaimReleaseRefused("the exact claim changed before cleanup")
                 connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
                 if isinstance(remote_work, EndStoppedWork):
@@ -2377,7 +2408,7 @@ def release_exact_claims(
             with nullcontext() if provider_lock_held else locked(paths.lock):
                 # The watcher can update its fields during cleanup.
                 current = read_run(path)
-                if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                if isinstance(current, NoRun) or not same_cleanup_claim(current, record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
                 transfers.extend(current.get("transfers", []))
                 pending.unlink(missing_ok=True)

@@ -368,6 +368,14 @@ def saved_mac_repository(record: RunRecord) -> MacRepositoryIdentity | NoSavedMa
     return mac_repository_record(record["mac_repository"]) if "mac_repository" in record else NO_SAVED_MAC_REPOSITORY
 
 
+@dataclass(frozen=True)
+class AcquiredMacClaim:
+    """The saved repository and host for provider evidence."""
+
+    repository: MacRepositoryIdentity | NoSavedMacRepository
+    host: str
+
+
 def claim_fence_directory(path: Path, record: RunRecord) -> str:
     saved = saved_mac_repository(record)
     return saved.fence_directory if isinstance(saved, MacRepositoryIdentity) else path.stem
