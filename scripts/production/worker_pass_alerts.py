@@ -27,8 +27,14 @@ class AlertReason(StrEnum):
     BLOCKED = "worker pane is blocked"
 
 
+class WaitingForRunsReceipt(Protocol):
+    @property
+    def results_pending(self) -> bool: ...
+
+
 class WorkerReceipts(Protocol):
     DispatchComplete: type[object]
+    DispatchWaitingForRuns: type[WaitingForRunsReceipt]
 
     def dispatch_receipt(self, row: staff.StaffRow, line: str, dispatch_id: str, *,
                          run: Path, require_transcript: bool, require_done: bool) -> object: ...
@@ -54,6 +60,8 @@ def recovery_instruction(director: StaffId, worker_name: str, run: Path, instanc
                                                   run=run, require_transcript=True, require_done=True)
                 if isinstance(receipt, worker.DispatchComplete):
                     return "The result is complete. The completion notice follows."
+                if isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.results_pending:
+                    return "The pass is waiting for detached results. The completion notice follows."
             pane = worker_panes.observe_worker(director, row, record)
     except (OSError, ValueError, herdr_types.HerdrFailure, recorder_state.OldRecorderState):
         pass

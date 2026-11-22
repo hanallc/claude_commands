@@ -2645,6 +2645,29 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn("worker.py", detail)
         self.assertEqual(self.agent.submitted, [(pane, line)])
 
+    def test_changed_prompt_refusal_reports_pending_detached_results_after_done(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, line = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        instance = worker_panes.worker_pass(row, self.run_dir)["instance_id"]
+        path, record = self.detached_record(row, "live-check")
+        record.update(status="running", pid=101)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        atomic_file.write_text_atomic(self.prompt, "This is changed work.\n")
+
+        with (patch.object(detached_run_process, "supervises", return_value=True),
+              redirect_stderr(io.StringIO()) as error):
+            receipt = self.receipt()
+            assert isinstance(receipt, worker.DispatchWaitingForRuns)
+            self.assertTrue(receipt.results_pending)
+            self.assertIsInstance(receipt.reply, worker.DispatchComplete)
+            self.assertIs(self.dispatch(), worker.ExitCode.BUSY)
+        conflict = f"impl: active pass {instance} has different prompt content."
+        instruction = "The pass is waiting for detached results. The completion notice follows."
+        self.assertEqual(error.getvalue().splitlines(), [f"{conflict} {instruction}"])
+        self.assertEqual(self.agent.submitted, [(pane, line)])
+
     def test_answer_refuses_during_detached_compaction(self) -> None:
         opened = self.opened()
         backend = staff.backend(opened.row)
