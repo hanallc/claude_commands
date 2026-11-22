@@ -229,6 +229,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lint/sweep.py` | read | local_snapshot, StaffSnapshot (type), StaffId; holder_sessions names the parent director of a detached worker run |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
+| `scripts/maintenance/folder_size.py` | read | snapshot and active select producers. LiveDoc supplies the recorded path. StaffId identifies the notice recipient. |
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
@@ -374,7 +375,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-222 accessor rows: 41 write, 180 read, 1 owner.
+The table has 231 accessor rows (41 write, 189 read, and 1 owner).
 
 ## Approved copies
 
