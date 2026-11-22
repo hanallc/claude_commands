@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
@@ -28,12 +29,12 @@ from pathlib import Path
 from threading import Event, current_thread
 from types import SimpleNamespace
 from typing import IO, Literal, cast, override
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
-from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, pane_record, worker_lifecycle
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
@@ -43,13 +44,13 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, herdr_types, turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
-from scripts.message import send
+from scripts.message import roster, send, sessions
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
-from scripts.production import staff, session_staff, test_worker, worker, worker_admission
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
+from scripts.production import staff, session_staff, test_worker, unit_lookup, worker, worker_admission
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
 THREAD_ONE = fixture_runtime_id("detached-run-thread-one")
@@ -371,8 +372,10 @@ class DetachedRunsTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads(records[0].read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record["pid"], record["worker"], record["staff_id"]),
                          ("running", 4321, WORKER, self.worker_id))
+        self.assertTrue(records[0].stem.endswith(f"@{self.worker_id}"))
         self.assertNotIn("thread_id", record)
         self.assertEqual(record["command"], ["bash", "verify.sh", "check"])
+        self.assertEqual(record.get("kind"), "detect")
         self.assertNotIn("port", record)
         self.assertIn("next message", output.getvalue())
         records[0].unlink()
@@ -389,6 +392,51 @@ class DetachedRunsTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads(path.read_text()))
         self.assertEqual(record["session_dir"], str(self.session))
         self.assertTrue(Path(cast(str, record["log"])).is_absolute())
+
+    def test_start_refuses_systemd_run_without_an_exact_scope_prefix(self) -> None:
+        for command in (
+            ["systemd-run", "--user", "--quiet", "--pipe", "--wait", "-p", "MemoryMax=4G", "true"],
+            ["env", "/usr/bin/systemd-run", "--user", "--", "true", "--scope"],
+            ["systemd-run", "--user", "true", "--scope"],
+            ["systemd-run", "--description", "--scope", "true"],
+            ["systemd-run", "--descript", "--scope", "--wait", "true"],
+            ["systemd-run", "--scop", "true"],
+            ["systemd-run", "--quiet", "--scope", "true"],
+            ["env", "-u", "X", "A=B", "systemd-run", "--wait", "true"],
+            ["env", "-S", "systemd-run --wait true"],
+            ["env", "-vu", "X", "systemd-run", "--wait", "true"],
+            ["env", "--split-string=systemd-run --wait true"],
+        ):
+            with (self.subTest(command=command), self.supervisor_spawns() as popen,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(detached_runs.main(["start", "--", *command]), 2)
+                popen.assert_not_called()
+                self.assertFalse((self.session / detached_runs.DETACHED_RUNS_DIR).exists())
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    "detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                    + "Use the exact option names in that order.",
+                ])
+
+    def test_start_accepts_scope_plain_command_and_shell_text(self) -> None:
+        for command in (
+            ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=2G", "--", "true"],
+            ["env", "/usr/bin/systemd-run", "--scope", "true"],
+            ["env", "-u", "X", "A=B", "systemd-run", "--scope", "true"],
+            ["true"],
+            ["printf", "%s", "/usr/bin/systemd-run"],
+            ["env", "--unset", "X", "A=B", "printf", "%s", "/usr/bin/systemd-run"],
+            ["env", "-i", "true"],
+            ["sh", "-c", "systemd-run --user --wait true"],
+            ["/bin/sh", "-c", "exec /usr/bin/systemd-run"],
+        ):
+            with self.subTest(command=command):
+                popen, _ = self.start(command)
+                popen.assert_called_once()
+                arguments = cast(list[str], popen.call_args.args[0])
+                path = Path(arguments[-1])
+                record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                self.assertEqual(record["command"], command)
+                path.unlink()
 
     def test_run_uses_the_start_folder_instead_of_the_staff_worktree(self) -> None:
         start_folder = self.root / "repair-checkout"
@@ -473,7 +521,7 @@ class DetachedRunsTests(unittest.TestCase):
         write_text_atomic(path, "".join(json.dumps(entry) + "\n" for entry in entries))
         write_text_atomic(reply_file, reply + "\n")
         progress_history.save_dispatch_delivery(self.session, "pass-1",
-            progress_history.DispatchDelivery(line, completion_id, str(reply_file)))
+            pass_recorder.DispatchDelivery(line, completion_id, str(reply_file)))
 
     def run_files(self, run_id: str) -> list[str]:
         folder = self.session / detached_runs.DETACHED_RUNS_DIR
@@ -726,6 +774,13 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.save_pass_receipt("later-result")
         self.assertEqual(detached_runs.prune_finished(path.parent), ["later-result"])
+
+    def test_prune_keeps_a_pending_push_without_a_completion_event(self) -> None:
+        path = self.finished_run("pending-push", staff_id="retired-worker", completion_pending=False,
+                                 delivery=detached_runs.FAILED_RESULT_PUSH + "refused: fixture error")
+        self.assertEqual(detached_runs.prune_finished(path.parent), [])
+        self.assertTrue(path.exists())
+        self.assertTrue(path.with_suffix(".log").exists())
 
     def test_a_start_deletes_the_owners_earlier_finished_runs(self) -> None:
         _ = self.finished_run("director-done", worker="director", staff_id="")
@@ -1108,9 +1163,43 @@ sys.exit(1)
                 self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
         self.assertIn("--slice=builds-detached.slice", prefix)
+        self.assertIn("--unit=detached-detect-r1.scope", prefix)
         self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
+
+    def test_declared_test_kind_names_the_scope_and_stays_in_the_record(self) -> None:
+        runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
+        (runtime / "systemd").mkdir(parents=True)
+        with self.supervisor_spawns(), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(detached_runs.main([
+                "start", "--session-dir", str(self.session), "--to", WORKER,
+                "--kind", "python-tests", "--", "env", "PYTHONPATH=.", "sh", "tests.sh",
+            ]), 0)
+        path, = (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+
+        run_id, separator, staff_id = path.stem.partition("@")
+        self.assertEqual((separator, staff_id), ("@", self.worker_id))
+
+        def run(command: list[str], _environment: dict[str, str], log: Path) -> int:
+            self.assertIn(f"--unit=detached-python-tests-{run_id}.scope", command)
+            self.assertEqual(command[-4:], ["env", "PYTHONPATH=.", "sh", "tests.sh"])
+            log.with_suffix(".scope").touch()
+            return 0
+
+        with (socket.socket(socket.AF_UNIX) as manager,
+              patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime), "BUILDLOG_SCOPE": "1"}),
+              patch("shutil.which", return_value="/bin/systemd-run"),
+              patch("scripts.agents.detached_runs._run", side_effect=run)):
+            manager.bind(str(runtime / "systemd" / "private"))
+            record = self.supervise(path)
+        self.assertEqual(record.get("kind"), "python-tests")
+
+    def test_start_rejects_an_unknown_kind(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
+            _ = detached_runs.main(["start", "--kind", "unknown", "--", "true"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--kind", error.getvalue())
 
     # On 2026-11-17 a director sent TERM to a lint run's supervisor group. The supervisor died and its
     # verify.sh ran on for 3 hours with the cargo token. Each supervisor end now stops the command group.
@@ -1525,7 +1614,7 @@ sys.exit(status)
             with (patch.object(detached_runs, "record_lock", side_effect=prune_then_lock),
                   self.assertRaisesRegex(SystemExit, "is not a run record")):
                 _ = deliver_in_fixture(path)
-            self.assertEqual(len(self.sent), 1)
+            self.assertEqual(self.sent, [])
             self.assertFalse(path.exists())
             self.assertFalse(path.with_suffix(".log").exists())
 
@@ -1992,12 +2081,13 @@ send.deliver_worker_text = fake_sender
                             run_command.assert_called_with([sys.executable, "-c", "pass"], ANY, Path(record["log"]))
                 message, = cast(list[str], self.pending()["messages"])
                 self.assertTrue(cancelled.is_set())
-                self.assertIn("Result: PASS (exit 0)", message)
                 self.assertNotIn(reason, message)
                 if previous:
+                    self.assertIn("Result: STOPPED (exit 0)", message)
                     self.assertEqual(record.get("stop_reason"), previous)
                     self.assertIn("Stop reason: " + previous, message)
                 else:
+                    self.assertIn("Result: PASS (exit 0)", message)
                     self.assertNotIn("stop_reason", record)
                 if timing == "during recheck":
                     self.assertIn("Stage 2: go", message)
@@ -2012,6 +2102,21 @@ send.deliver_worker_text = fake_sender
         self.assertNotIn("FAIL", message)
         self.assertNotIn("Stage 2: go", message)
         self.assertEqual(record.get("exit_code"), 76)
+
+    def test_stopped_results_keep_the_exit_instructions(self) -> None:
+        record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        record["stop_reason"] = "Build hold."
+        cancellation = "verify.sh: cancelled — The worktree changed."
+        _ = Path(record["log"]).write_text(cancellation + "\n" + "cleanup\n" * 30, encoding="utf-8")
+
+        for code, instruction in ((76, "Read the newer call's result."), (77, "Resubmit after your edits.")):
+            with self.subTest(code=code):
+                message = detached_runs.result_text(record, detached_runs.CompletedCommand(code))
+                self.assertIn(f"Result: STOPPED (exit {code})", message)
+                self.assertIn("Stop reason: Build hold.", message)
+                self.assertIn(instruction, message)
+                if code == 77:
+                    self.assertIn(cancellation, message)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         _ = write_config_fixture(self.root / "config/detached_runs.conf",
@@ -2085,6 +2190,7 @@ send.deliver_worker_text = fake_sender
 
 class PaneRunDeliveryTests(unittest.TestCase):
     fixture: pane_support.WorkerPaneTests = pane_support.WorkerPaneTests()
+    holder_sender: contextlib.ExitStack  # pyright: ignore[reportUninitializedInstanceVariable]
     inputs: list[tuple[str, str]] = []
     notices: list[tuple[str, str]] = []
     interrupt_after_input: bool = False
@@ -2143,7 +2249,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return send.Result("sent", "holder received the result")
 
         _ = self.enterContext(patch.object(self.fixture.world, "run", input_line))
-        _ = self.enterContext(patch.object(send, "_send", holder_notice))
+        self.holder_sender = self.enterContext(contextlib.ExitStack())
+        _ = self.holder_sender.enter_context(patch.object(send, "_send", holder_notice))
         _ = self.enterContext(patch.object(detached_runs, "deliver_in_fresh_process",
                                           side_effect=deliver_in_fixture))
 
@@ -2217,6 +2324,32 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(f"Detached run: {record['run_id']}", text)
         self.assertIn("Private land completed.", text)
 
+    def test_a_showrunner_starts_a_new_session_and_hears_its_result_with_a_shared_name(self) -> None:
+        showrunner, = staff.snapshot().find(kind="showrunner")
+        unit = fixture_member("unit", name=showrunner.name, parent=showrunner.id)
+        self.assertEqual(unit.name, showrunner.name)
+        self.assertNotEqual(unit.id, showrunner.id)
+        run_dir = self.fixture.root / "showrunner-state"
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]),
+                             0, output.getvalue())
+        spawn.assert_called_once()
+        self.assertIs(cast(object, spawn.call_args.kwargs["start_new_session"]), True)
+        path, = (run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"], record.get("pane_dispatch_id")),
+                         (str(run_dir), showrunner.name, showrunner.id, ""))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        (target, message), = self.notices
+        self.assertEqual(target, showrunner.id)
+        self.assertIn(f"Detached run: {record['run_id']}", message)
+        self.assertIn("Private land completed.", message)
+
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")
         other = self.fixture.worker("TEST-impl", family="codex")
@@ -2263,7 +2396,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({
                     "owner_staff_id": self.fixture.parent.id,
                     "history_file": str(self.fixture.root / "history.jsonl"),
-                    "phase": {"id": "40", "instance_id": "private-phase", "status": "active"},
+                    "open_phases": [{"id": "40", "instance_id": "private-phase", "status": "active"}],
                 }))
                 dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="test", phase="40", role="test",
                     worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
@@ -2304,7 +2437,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}."
                     reply = self.fixture.root / "finished-reply.txt"
                     progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        progress_history.DispatchDelivery(line, dispatch_id, str(reply)))
+                        pass_recorder.DispatchDelivery(line, dispatch_id, str(reply)))
                     agent.append(pane, "user", line)
                     agent.append(pane, "assistant", "The command is complete.\nDONE " + dispatch_id)
                     self.fixture.world.locations[pane]["agent_status"] = "done"
@@ -2325,16 +2458,259 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(state, json.dumps({
             "owner_staff_id": self.fixture.parent.id,
             "history_file": str(self.fixture.root / "history.jsonl"),
-            "phase": {"id": "40", "instance_id": "private-phase", "status": "active"},
+            "open_phases": [{"id": "40", "instance_id": "private-phase", "status": "active"}],
         }))
         dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="40", role="impl",
             worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
             kind="impl", lens="")
         progress_history.save_dispatch_delivery(self.run_dir, dispatch,
-            progress_history.DispatchDelivery(str(prompt), dispatch, str(reply)))
+            pass_recorder.DispatchDelivery(str(prompt), dispatch, str(reply)))
         return dispatch, reply
 
-    def test_explicit_stop_releases_the_owning_pass_without_done(self) -> None:
+    def test_result_from_an_earlier_pass_does_not_reach_the_holder(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        self.assertNotEqual(dispatch, "earlier-pass")
+        for state in ("closed", "blocked"):
+            with self.subTest(state=state):
+                if state == "blocked":
+                    self.fixture.world.add(row, "w1:p1", family="codex")
+                    self.fixture.world.locations["w1:p1"]["agent_status"] = state
+                record = self.record(row, state)
+                record.update(status="finished", pane_dispatch_id="earlier-pass")
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+
+                self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                                 detached_runs.OTHER_PASS_DELIVERY)
+                self.assertEqual(worker_lifecycle.read_json_object(path).get("delivery"),
+                                 detached_runs.OTHER_PASS_DELIVERY)
+                self.assertEqual(self.inputs, [])
+                self.assertEqual(self.notices, [])
+
+    def test_unconfirmed_result_from_an_earlier_pass_alerts_once(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        original, _ = self.begin_pane_pass(row)
+        progress_history.complete_dispatch(self.run_dir, row.name, original)
+        current, _ = self.begin_pane_pass(row)
+        self.assertNotEqual(current, original)
+
+        for name, prefix in (("worker", detached_runs.UNCONFIRMED_WORKER_RESULT),
+                             ("push", detached_runs.UNCONFIRMED_RESULT_PUSH)):
+            with self.subTest(name=name):
+                pending = prefix + "the result has no receipt"
+                record = self.record(row, f"earlier-unconfirmed-{name}")
+                record.update(status="finished", pid=DEAD_PID, exit_code=7, pane_dispatch_id=original,
+                              delivery=pending)
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+
+                with (patch.object(send, "deliver_worker_text") as resend,
+                      patch.object(send, "send", return_value=send.Result("sent", "alert received")) as alert):
+                    self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(7)), pending)
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+                resend.assert_not_called()
+                alert.assert_called_once()
+                options = cast(send.Options, alert.call_args.args[0])
+                self.assertEqual(options.to, self.fixture.parent.id)
+                self.assertIn("Result delivery is unconfirmed.", options.text or "")
+                self.assertIn(record["run_id"], options.text or "")
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved["delivery"], pending)
+                self.assertIs(saved["push_alert_attempted"], True)
+                self.assertNotIn("delivered_at", saved)
+
+    def test_earlier_self_stop_does_not_block_done_in_a_stopped_pane(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        done = f"DONE {dispatch}"
+        agent.append(pane, "user", delivery.line)
+        agent.append(pane, "assistant", done)
+        self.assertTrue(self.fixture.world.stop(row, self.fixture.world))
+        self.assertIsInstance(worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot()),
+                              worker_panes.StoppedWorker)
+        record = self.record(row)
+        record.update(status="finished", exit_code=143, self_stop=True, stop_pass_requested=True,
+                      stop_reason="The check is obsolete.", pane_dispatch_id="earlier-pass",
+                      delivery="deferred: worker is stopped", completion_pending=True)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        self.assertIs(turn_end.run_finished(row.id), detached_runs.CompletionReplay.HANDLED)
+        self.assertEqual(worker_lifecycle.read_json_object(path).get("delivery"), detached_runs.OTHER_PASS_DELIVERY)
+        self.assertEqual(reply.read_text().rstrip(), done)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+        self.assertEqual(self.inputs, [])
+
+    def test_linked_result_defers_when_the_pass_read_fails(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        with patch.object(worker_panes, "worker_pass", side_effect=(passed, OSError("private pass read failure"))):
+            delivery = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(delivery, "deferred: worker pass is unavailable: private pass read failure")
+        self.assertEqual(saved.get("delivery"), delivery)
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+
+        result = detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE)
+        self.assertIs(result, detached_runs.WorkerResultReplay.SUBMITTED)
+        self.assertEqual(len(self.inputs), 1)
+
+    def test_reaped_result_reaches_only_the_pass_that_started_it(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        for case in ("earlier-pass", "current-pass", "current-done"):
+            with self.subTest(case=case):
+                self.inputs.clear()
+                row = self.fixture.worker(case, family="codex")
+                pane = "w1:p1"
+                self.fixture.world.add(row, pane, family="codex")
+                original, reply = self.begin_pane_pass(row)
+                record = self.record(row, case)
+                record.update(pid=DEAD_PID, pane_dispatch_id=original, exit_code=0)
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+                current = original
+                if case == "earlier-pass":
+                    progress_history.complete_dispatch(self.run_dir, row.name, original)
+                    self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+                    current, reply = self.begin_pane_pass(row)
+                    self.assertNotEqual(current, original)
+                delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+                agent.append(pane, "user", delivery.line)
+                done = f"DONE {current}"
+                self.fixture.world.locations[pane]["agent_status"] = "idle"
+                if case != "current-pass":
+                    agent.append(pane, "assistant", done)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+
+                with patch.object(detached_run_process, "supervises", return_value=False):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+                saved = worker_lifecycle.read_json_object(path)
+                if case == "earlier-pass":
+                    self.assertEqual(saved["delivery"], detached_runs.OTHER_PASS_DELIVERY)
+                    self.assertEqual(self.inputs, [])
+                else:
+                    self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+                    self.assertEqual(len(self.inputs), 1)
+                    self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+                    self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                    agent.append(pane, "assistant", done)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+                    event = turn_end.WorkerEvent(str(row.current_session), reply=done)
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.DONE)
+                self.assertEqual(reply.read_text().rstrip(), done)
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+
+    def test_hook_recovers_done_after_a_result_from_an_earlier_pass(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        record = self.record(row, "earlier-result")
+        record.update(status="finished", pane_dispatch_id="earlier-pass",
+                      delivery=f"sent: worker {row.name} at {pane}")
+        write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        done = f"DONE {dispatch}"
+        later = "The earlier check passed."
+        agent.append(pane, "user", delivery.line)
+        agent.append(pane, "assistant", done)
+        agent.append(pane, "user", "Detached run: earlier-result")
+        agent.append(pane, "assistant", later)
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+
+        self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=later)),
+                         turn_end.TurnOutcome.DONE)
+        self.assertEqual(reply.read_text().rstrip(), done)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+        self.assertEqual(self.inputs, [])
+
+    def test_a_worker_stop_delivers_the_result_and_keeps_its_pass(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        active = progress_history.active_dispatch(row.id, self.run_dir)
+        self.assertIsInstance(active, progress_history.ActiveDispatch)
+        record = self.record(row)
+        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start",
+                      pane_dispatch_id=dispatch)
+        record["worker"] = "former-worker-name"
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        reason = "The newer check replaces this run."
+        pid, _, arguments = self.fixture.world.foreground[pane]
+
+        def caller_arguments(current: int) -> list[str]:
+            return arguments if current == pid else ["python"]
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": row.current_session, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(pane_record, "process_parent", return_value=pid),
+              patch.object(pane_record, "process_arguments", side_effect=caller_arguments),
+              patch.object(detached_run_process, "supervisor_match", return_value=True),
+              patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
+              patch.object(process_group, "send_process_group") as signal_group,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(detached_runs.main(["stop", "--reason", reason, str(path)]), 0)
+            signal_group.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+        stopped = worker_lifecycle.read_json_object(path)
+        self.assertEqual(stopped.get("stop_reason"), reason)
+        self.assertIs(stopped.get("self_stop"), True)
+        self.assertIs(stopped.get("stop_pass_requested"), True)
+        self.assertTrue(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
+        group_live = True
+
+        def group_is_live(_group: int) -> bool:
+            return group_live
+
+        def finish_group(_seconds: float) -> None:
+            nonlocal group_live
+            running = worker_lifecycle.read_json_object(path)
+            self.assertEqual((running.get("status"), running.get("exit_code")), ("running", 143))
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
+            self.assertIn("the command group has no confirmed end", errors.getvalue())
+            self.assertEqual(self.inputs, [])
+            self.assertEqual(self.notices, [])
+            group_live = False
+
+        with (patch.object(detached_runs, "_run", return_value=143),
+              patch.object(detached_runs, "_group_is_live", side_effect=group_is_live),
+              patch.object(time, "sleep", side_effect=finish_group) as wait_for_group,
+              patch.object(detached_runs, "scope_prefix", return_value=[])):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        wait_for_group.assert_called_once()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual((saved.get("status"), saved.get("exit_code")), ("finished", 143))
+        self.assertFalse(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
+        (target, text), = self.inputs
+        self.assertEqual(target, pane)
+        self.assertIn("Result: STOPPED (exit 143)", text)
+        self.assertIn(f"Stop reason: {reason}", text)
+        self.assertEqual(progress_history.active_dispatch(row.id, self.run_dir), active)
+        self.assertIn(pane, self.fixture.world.locations)
+        self.assertEqual(self.notices, [])
+        self.assertFalse(reply.exists())
+
+    def test_director_stop_releases_the_owning_pass_without_done(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         dispatch, reply = self.begin_pane_pass(row)
@@ -2344,7 +2720,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(path, json.dumps(record))
         reason = "Stop the private command."
         stop = ["stop", "--reason", reason, str(path)]
-        with (patch.object(detached_run_process, "supervisor_match", return_value=True),
+        director = self.fixture.parent
+        exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        _ = self.fixture.session_record(director.current_session, director.name).replace(exact)
+        self.addCleanup(exact.unlink, missing_ok=True)
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": row.current_session}),
+              patch.object(detached_run_process, "supervisor_match", return_value=True),
               patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
               patch.object(process_group, "send_process_group") as signal_group,
               contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
@@ -2355,6 +2736,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), first_stop)
         self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertIs(saved.get("stop_pass_requested"), True)
+        self.assertNotIn("self_stop", saved)
         saved["exit_code"] = 143
         write_text_atomic(path, json.dumps(saved))
         with patch.object(detached_runs, "_group_is_live", return_value=False):
@@ -2420,7 +2803,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(error.getvalue(), "")
                 self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), original)
                 self.assertFalse(reply.exists())
-        self.assertEqual(len(self.inputs), sum(not live for _, _, live, _ in cases))
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn("Detached run: no-pane-pass", self.inputs[0][1])
         self.assertEqual(self.notices, [])
 
     def create_stopped_run(self, row: staff.StaffRow, dispatch: str) -> Path:
@@ -2430,6 +2814,38 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         return path
+
+    def test_canceled_pass_recovers_late_done_after_a_result_from_an_earlier_pass(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        line = f'Read the unchanged prompt file "private.txt". End your final reply with DONE {dispatch}.'
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+            progress_history.DispatchDelivery(line, dispatch, str(reply)))
+        agent.append(pane, "user", line)
+        path = self.create_stopped_run(row, dispatch)
+        with patch.object(detached_runs, "_group_is_live", return_value=False):
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir).get("status"), "canceled")
+
+        record = self.record(row, "earlier-result")
+        record.update(status="finished", pane_dispatch_id="earlier-pass",
+                      delivery=f"sent: worker {row.name} at {pane}")
+        write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        done = f"DONE {dispatch}"
+        agent.append(pane, "assistant", done)
+        agent.append(pane, "user", "Detached run: earlier-result")
+        agent.append(pane, "assistant", "The earlier check passed.")
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+
+        fallback_line = "An earlier version of the assignment prompt."
+        receipt = progress_history.StoppedPassReceipt(dispatch, fallback_line, dispatch, str(reply))
+        self.assertEqual(worker.dispatch_receipt(row, fallback_line, dispatch, run=self.run_dir, pane_pass=receipt),
+                         worker.DispatchComplete(done))
+        self.assertIs(turn_end.run_finished(row.id), detached_runs.CompletionReplay.HANDLED)
+        self.assertEqual(reply.with_name(f"reply_late_{dispatch}.txt").read_text().rstrip(), done)
 
     def test_stop_and_turn_hook_keep_one_outcome_for_verified_done(self) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
@@ -2445,7 +2861,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.fixture.world.add(row, pane, family="codex")
                 dispatch, reply = self.begin_pane_pass(row)
                 reply.unlink(missing_ok=True)
-                delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+                delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
                 result = f"The work is complete.\nDONE {dispatch}"
                 agent.append(pane, "user", delivery.line)
                 if before_stop:
@@ -2679,7 +3095,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        old_delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        old_delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", old_delivery.line)
         path = self.create_stopped_run(row, dispatch)
         with patch.object(detached_runs, "_group_is_live", return_value=False):
@@ -2692,7 +3108,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         new_reply = reply.with_name("replacement-reply.txt")
         new_line = f"Read the unchanged prompt file {prompt}. End your final reply with DONE {replacement}."
         progress_history.save_dispatch_delivery(self.run_dir, replacement,
-            progress_history.DispatchDelivery(new_line, replacement, str(new_reply)))
+            pass_recorder.DispatchDelivery(new_line, replacement, str(new_reply)))
         agent.append(pane, "user", new_line)
         self.fixture.world.locations[pane]["agent_status"] = pane_status
         state_path = self.run_dir / unit_runs.STATE_FILE
@@ -2777,7 +3193,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", delivery.line)
         result = "The work needs more time."
         agent.append(pane, "assistant", result)
@@ -2788,7 +3204,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(state, json.dumps({
             "owner_staff_id": self.fixture.parent.id,
             "history_file": str(other_run / "history.jsonl"),
-            "phase": {"id": "40", "instance_id": "other-phase", "status": "active"},
+            "open_phases": [{"id": "40", "instance_id": "other-phase", "status": "active"}],
         }))
         prompt = reply.with_name("other-assignment.txt")
         write_text_atomic(prompt, "Run the other private command.")
@@ -2886,7 +3302,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
         dispatch, reply = self.begin_pane_pass(row)
-        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", delivery.line)
         result = f"The work is complete.\nDONE {dispatch}"
         agent.append(pane, "assistant", result)
@@ -2981,6 +3397,32 @@ class PaneRunDeliveryTests(unittest.TestCase):
         confirmed = worker_lifecycle.read_json_object(path.with_suffix(".stop-confirmed"))
         self.assertEqual(confirmed.get("stop_reason"), "Pane stop.")
         self.assertIs(confirmed.get("stop_pass_requested"), True)
+
+    def test_reap_recovers_a_staged_self_stop_without_canceling_the_pass(self) -> None:
+        row = self.fixture.worker(family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start",
+                      pane_dispatch_id=dispatch, exit_code=143)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        reason = "The check is obsolete."
+        staged = {**record, "stop_pass_requested": True, "stop_reason": reason, "self_stop": True}
+        write_text_atomic(path.with_suffix(".stop-staged"), json.dumps(staged))
+        path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).touch()
+
+        with patch.object(detached_runs, "_group_is_live", return_value=False):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual((saved.get("status"), saved.get("self_stop")), ("finished", True))
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir),
+                              progress_history.ActiveDispatch)
+        (pane, text), = self.inputs
+        self.assertEqual(pane, "w1:p1")
+        self.assertIn("Result: STOPPED (exit 143)", text)
+        self.assertIn(f"Stop reason: {reason}", text)
+        self.assertEqual(self.notices, [])
 
     def test_confirmed_stop_keeps_the_pane_request_after_a_failed_record_rename(self) -> None:
         row = self.fixture.worker("impl", family="codex")
@@ -3139,7 +3581,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                       ) -> progress_history.StoppedPassNotice | progress_history.StopDispatchRefused:
                     if phase_first:
                         finish_phase()
-                    with patch.object(progress_history, "write_text_atomic", side_effect=observe_write):
+                    with patch.object(pass_recorder, "write_text_atomic", side_effect=observe_write):
                         return commit(run, slot, instance_id, owner, director, run_id=run_id, reason=reason)
 
                 with (patch.object(detached_runs, "_group_is_live", return_value=False),
@@ -3176,29 +3618,613 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 assert isinstance(caller, detached_runs.PaneCaller)
                 self.assertEqual((caller.staff_id, caller.session_dir), (row.id, str(self.run_dir)))
 
-    def test_failed_result_delivery_recovers_the_original_command_result(self) -> None:
-        row = self.fixture.worker()
+    def test_self_stop_requires_a_verified_native_owner(self) -> None:
+        row = self.fixture.worker(family="claude")
+        director = self.fixture.parent
+        unregistered = fixture_runtime_id("unregistered-claude-caller")
+        exact = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        self.addCleanup(exact.unlink, missing_ok=True)
         record = self.record(row)
-        record["command"] = [sys.executable, "-c", "raise SystemExit(9)"]
-        record["pid"] = DEAD_PID
+        path = Path(record["log"]).with_suffix(".json")
+
+        def assert_owner(owner: staff.StaffId, environment: dict[str, str], expected: bool) -> None:
+            write_text_atomic(path, json.dumps({**record, "staff_id": owner}))
+            exports = {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", **environment}
+            with (patch.dict(os.environ, exports),
+                  patch.object(detached_runs, "stop_with_reason", return_value=True) as stop):
+                self.assertTrue(detached_runs.stop_command(path, "Stop the check."))
+            stop.assert_called_once_with(path, "Stop the check.", verify_group=ANY,
+                                         signal_group=process_group.send_process_group, stop_pass=True,
+                                         self_stop=expected)
+
+        cases = (
+            ("native caller", row.current_session, "", "", row.id, True),
+            ("matching export", row.current_session, row.current_session, "", row.id, True),
+            ("different staff ID", row.current_session, "", "", director.id, False),
+            ("conflicting export", row.current_session, director.current_session, "", row.id, False),
+            ("unregistered caller", unregistered, row.current_session, "", row.id, False),
+            ("director", director.current_session, "", row.current_session, row.id, False),
+            ("unreadable native record", "{", row.current_session, "", row.id, False),
+            ("without a native record", "", row.current_session, "", row.id, False),
+            ("with only an inherited Codex ID", "", "", row.current_session, row.id, False),
+        )
+        for case, native, claude, codex, owner, expected in cases:
+            with self.subTest(case=case):
+                if native == "{":
+                    write_text_atomic(exact, native)
+                elif native:
+                    _ = self.fixture.session_record(native, case).replace(exact)
+                environment = {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}
+                with (patch.object(pane_record, "process_parent", return_value=1),
+                      patch.object(pane_record, "process_arguments", return_value=["python"])):
+                    assert_owner(owner, environment, expected)
+                exact.unlink(missing_ok=True)
+
+        _ = self.fixture.session_record(row.current_session, row.name).replace(exact)
+        with patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("invalid staff JSON")):
+            assert_owner(row.id, {}, False)
+        exact.unlink()
+
+        codex = self.fixture.worker("codex-reviewer", family="codex")
+        native = herdr.NativeAgentProcess(herdr.LaunchArgument(codex.current_session), "fixture-start", {})
+        with (patch.object(pane_record, "process_arguments", return_value=["codex", "resume", codex.current_session]),
+              patch.object(herdr, "native_process", return_value=native)):
+            assert_owner(codex.id, {"CODEX_THREAD_ID": codex.current_session}, False)
+
+    def test_refused_result_push_finishes_and_can_replay_the_saved_exit(self) -> None:
+        row = self.fixture.worker(family="codex")
+        record = self.record(row)
+        record.update(pid=DEAD_PID, tree_key="fixture-tree")
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
 
-        def failed_holder(options: send.Options, *, membership: staff.StaffSnapshot | None = None) -> send.Result:
-            del options, membership
-            return send.Result("failed", "daemon unavailable")
-
-        with patch.object(send, "_send", failed_holder):
+        refusal = send.RefusedRelayRequest("failed", "the relay refused the fixture request")
+        with (patch.object(send, "_send", return_value=refusal),
+              patch.object(send, "send", return_value=send.Result("sent", "director received the alert")),
+              patch.object(time, "sleep"),
+              patch.object(detached_runs, "_run", return_value=9)):
             self.assertEqual(detached_runs.main(["supervise", str(path)]), 1)
-            pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-            self.assertEqual(pending["status"], "running")
+        pending = worker_lifecycle.read_json_object(path)
+        self.assertEqual((pending["status"], pending["exit_code"]), ("finished", 9))
+        self.assertTrue(pending["finished_at"])
+        self.assertEqual(pending["delivery"], detached_runs.FAILED_RESULT_PUSH + "failed: " + refusal.detail)
+        self.assertNotIn("delivered_at", pending)
+        with patch.object(detached_run_process, "supervises", return_value=True):
+            self.assertEqual(detached_runs.live_runs(path.parent, row.name), [])
+            self.assertIsNone(detached_runs.live_twin(path.parent, row.name, record["command"], "fixture-tree"))
+        self.assertEqual(detached_runs.worker_results(path.parent, row, since=0),
+                         ({record["run_id"]: detached_runs.WorkerResultDeferred.PENDING}, set()))
+
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.SUBMITTED)
+        (_, text), = self.inputs
+        self.assertIn("FAIL (exit 9)", text)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"sent: worker {row.name} at w1:p1")
+
+    def test_exhausted_result_push_alerts_the_director_once(self) -> None:
+        row = self.fixture.worker()
+        for outcome, response in (
+            ("sent", send.Result("sent", "fixture alert result")),
+            ("failed", send.Result("failed", "fixture alert result")),
+            ("sender-exit", SystemExit(2)),
+        ):
+            with self.subTest(outcome=outcome):
+                record = self.record(row, f"alert-{outcome}")
+                path = Path(record["log"]).with_suffix(".json")
+                refusal = send.RefusedRelayRequest("failed", "fixture push error")
+                deferred = send.Result("retry", "worker is working")
+                with (patch.object(send, "deliver_worker_text", side_effect=[refusal, deferred, refusal, deferred]) as deliver,
+                      patch.object(send, "send", side_effect=[response]) as alert,
+                      patch.object(time, "sleep") as delay,
+                      patch.object(detached_runs, "_run", return_value=7),
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 1)
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(deliver.call_count, 4)
+                self.assertEqual(delay.call_args_list, [call(5)] * 3)
+                alert.assert_called_once()
+                options = cast(send.Options, alert.call_args.args[0])
+                self.assertEqual(options.to, self.fixture.parent.id)
+                self.assertIn("Result delivery failed.", options.text or "")
+                for detail in (path.stem, record["label"], row.name, "exit 7", refusal.detail):
+                    self.assertIn(detail, options.text or "")
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertIs(saved["push_alert_attempted"], True)
+                self.assertEqual(saved["push_retries"], 3)
+                self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "failed: " + refusal.detail)
+                self.assertEqual(errors.getvalue().count("anomaly:"), int(outcome != "sent"))
+                if outcome == "sender-exit":
+                    self.assertIn("could not alert the director: 2", errors.getvalue())
+
+    def test_alert_reports_one_anomaly_when_the_director_lookup_fails(self) -> None:
+        row = self.fixture.worker()
+        record = self.record(row, "alert-owner-unreadable")
+        path = Path(record["log"]).with_suffix(".json")
+        record.update(status="finished", exit_code=7, delivery=detached_runs.FAILED_RESULT_PUSH + "fixture refusal")
+        write_text_atomic(path, json.dumps(record))
+        self.assertIsNotNone(staff.retire(row.id))
+        state_path = self.run_dir / unit_runs.STATE_FILE
+        write_text_atomic(state_path, "{")
+
+        with (patch.object(send, "send") as alert, contextlib.redirect_stderr(io.StringIO()) as errors):
+            detached_runs._alert_failed_push(path)  # pyright: ignore[reportPrivateUsage]
+            detached_runs._alert_failed_push(path)  # pyright: ignore[reportPrivateUsage]
+        alert.assert_not_called()
+        self.assertEqual(errors.getvalue().count("anomaly:"), 1)
+        self.assertIn(str(state_path), errors.getvalue())
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIs(saved["push_alert_attempted"], True)
+        self.assertEqual(saved["delivery"], record.get("delivery"))
+        self.assertNotIn("delivered_at", saved)
+
+    def test_result_delivery_matrix(self) -> None:
+        all_owners = ("worker", "director", "retired", "self-stop")
+        relay_owners = ("worker", "director", "retired")
+        remote_owners = ("director", "retired")
+        pane_owners = ("worker", "self-stop")
+        mismatch = "SendMessage used a different target or payload"
+        cases = (
+            ("local-sent", all_owners, send.Result("sent", "received"), "sent"),
+            ("local-refused", relay_owners, send.RefusedRelayRequest("failed", "fixture refusal"), "retry"),
+            ("local-relay-failed", relay_owners, send.Result("failed", mismatch), "receipt"),
+            ("pane-launch-failed", pane_owners, send.WorkerResultNotSubmitted("retry", "fixture launch failed"), "retry"),
+            ("remote-sent", remote_owners, (0, "SENT: received\n", ""), "sent"),
+            ("remote-refused", remote_owners, (2, "REFUSED: fixture refusal\n", ""), "retry"),
+            ("remote-relay-failed", remote_owners, (3, f"FAILED: {mismatch}\n", ""), "receipt"),
+            ("lost-ssh-reply", remote_owners, (255, "", "connection lost"), "receipt"),
+            ("staff-lookup-failed", all_owners, None, "retry"),
+            ("pane-unconfirmed", all_owners, send.WorkerResultUnconfirmed("retry", "no receipt"), "receipt"),
+        )
+        read_staff = staff.authority_snapshot
+        director = self.fixture.parent
+        for name, owners, first, action in cases:
+            for owner in owners:
+                for recovered in (True, False) if action == "retry" else (False,):
+                    with self.subTest(outcome=name, owner=owner, recovered=recovered):
+                        row = director if owner == "director" else self.fixture.worker()
+                        retired_after_input = owner == "retired" and name == "pane-unconfirmed"
+                        record = self.record(row, f"matrix-{name}-{owner}-{recovered}")
+                        record["pid"] = DEAD_PID
+                        if owner in ("retired", "self-stop"):
+                            record.update(self_stop=True, stop_reason="The check is obsolete.")
+                        if owner == "retired" and not retired_after_input:
+                            self.assertIsNotNone(staff.retire(row.id))
+                        path = Path(record["log"]).with_suffix(".json")
+                        write_text_atomic(path, json.dumps(record))
+                        results: list[send.Result] = []
+                        alerts: list[str] = []
+                        receipt_checks: list[staff.StaffId] = []
+                        lookup_failures = 0
+
+                        def lookup_staff() -> staff.StaffSnapshot:
+                            nonlocal lookup_failures
+                            if first is None and lookup_failures < (1 if recovered else 4):
+                                lookup_failures += 1
+                                raise staff.StaffUnreadable("fixture staff lookup failed")
+                            return read_staff()
+
+                        def transport_result(options: send.Options | None = None) -> send.Result:
+                            reply = first
+                            if reply is not None and not isinstance(reply, send.Result):
+                                assert options is not None
+                                message = send.Message(options.to, "detached-runs", name, options.text or "", None)
+                                response = (0, "SENT: received\n", "") if results and recovered else reply
+                                with patch.object(send, "run", return_value=response):
+                                    reply = send.remote(message, "fixture-host", options)
+                            elif reply is None or (results and recovered):
+                                reply = send.Result("sent", "received")
+                            elif isinstance(reply, send.WorkerResultUnconfirmed) and options is not None:
+                                reply = send.WorkerMessageUnconfirmed("failed", reply.detail)
+                            results.append(reply)
+                            return reply
+
+                        def send_result(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
+                            del membership
+                            self.assertEqual(options.to, director.id)
+                            body = options.text or ""
+                            if body.startswith(f"Detached run: {path.stem}\n"):
+                                self.assertIn(owner, remote_owners)
+                                return transport_result(options)
+                            alerts.append(body)
+                            return send.Result("sent", "alert received")
+
+                        def send_to_worker(member: staff.StaffRow, _membership: staff.StaffSnapshot, _text: str, *,
+                                           receipt: send.WorkerResultReceipt, **_options: object) -> send.Result:
+                            self.assertEqual(member.id, row.id)
+                            self.assertTrue(owner in pane_owners or retired_after_input)
+                            self.assertEqual(receipt.worker_only, owner in ("self-stop", "retired"))
+                            result = transport_result()
+                            if retired_after_input:
+                                self.assertIsNotNone(staff.retire(row.id))
+                            return result
+
+                        def check_receipt(member: staff.StaffRow, _membership: staff.StaffSnapshot, _marker: str) -> bool:
+                            delivery = str(worker_lifecycle.read_json_object(path).get("delivery", ""))
+                            if delivery.startswith(detached_runs.UNCONFIRMED_WORKER_RESULT):
+                                receipt_checks.append(member.id)
+                            return False
+
+                        accepted = action == "sent" or recovered
+                        with (patch.object(staff, "authority_snapshot", side_effect=lookup_staff),
+                              patch.object(send, "_send", side_effect=send_result),
+                              patch.object(send, "deliver_worker_text", side_effect=send_to_worker),
+                              patch.object(detached_runs, "_result_received", side_effect=check_receipt),
+                              patch.object(detached_runs, "_complete_worker_dispatch",
+                                           return_value=detached_runs.CompletionReplay.HANDLED),
+                              patch.object(detached_runs, "_run", return_value=7),
+                              patch.object(time, "sleep") as delay):
+                            self.assertEqual(detached_runs.main(["supervise", str(path)]), int(not accepted))
+                            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+                        attempts = 1 if action != "retry" else (2 if recovered else 4)
+                        self.assertEqual(len(results) + lookup_failures, attempts)
+                        self.assertEqual(sum(result.outcome == "sent" for result in results), int(accepted))
+                        self.assertEqual(delay.call_args_list, [call(5)] * (0 if action == "sent" else
+                                                                             1 if recovered else 3))
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual((saved["status"], saved["exit_code"]), ("finished", 7))
+                        self.assertEqual(len(alerts), int(not accepted))
+                        self.assertEqual("push_alert_attempted" in saved, not accepted)
+                        self.assertEqual("delivered_at" in saved, accepted)
+                        if action == "receipt":
+                            targets = [director.id] if owner in remote_owners else [row.id]
+                            if name == "local-relay-failed" and owner == "worker":
+                                targets.append(director.id)
+                            self.assertEqual(receipt_checks, targets * 3)
+                            self.assertIn("The result may have arrived.", alerts[0])
+                            if "relay-failed" in name:
+                                self.assertIn(mismatch, alerts[0])
+                            if name == "remote-relay-failed":
+                                self.assertIn("on fixture-host:", alerts[0])
+                        else:
+                            self.assertEqual(receipt_checks, [])
+
+    def test_ambiguous_result_push_checks_receipts_and_never_resends(self) -> None:
+        director = self.fixture.parent
+        cases = (
+            ("timeout", send.Result("failed", "timed out after 1 s"), True),
+            ("interrupted", TimeoutError("the transport started"), False),
+        )
+        for name, result, received in cases:
+            with self.subTest(name=name):
+                record = self.record(director, f"push-{name}")
+                path = Path(record["log"]).with_suffix(".json")
+
+                def send_result(options: send.Options) -> send.Result:
+                    if (options.text or "").startswith("Detached run: "):
+                        pending = worker_lifecycle.read_json_object(path)
+                        self.assertTrue(str(pending["delivery"]).startswith(detached_runs.UNCONFIRMED_RESULT_PUSH))
+                        if isinstance(result, TimeoutError):
+                            raise result
+                        return result
+                    return send.Result("sent", "director received the alert")
+
+                def first_delivery(record_path: Path) -> int:
+                    try:
+                        return deliver_in_fixture(record_path)
+                    except TimeoutError:
+                        return 1
+
+                with (patch.object(send, "send", side_effect=send_result) as push,
+                      patch.object(detached_runs, "_result_received", return_value=received) as receipt,
+                      patch.object(detached_runs, "deliver_in_fresh_process", side_effect=first_delivery),
+                      patch.object(detached_runs, "_run", return_value=7),
+                      patch.object(time, "sleep") as delay):
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), int(not received))
+                    self.assertEqual(push.call_count, 1 if received else 2)
+                    self.assertEqual(receipt.call_count, 1 if received else 3)
+                    self.assertEqual(delay.call_args_list, [call(5)] * (1 if received else 3))
+                    if not received:
+                        alert = cast(send.Options, push.call_args.args[0])
+                        self.assertIn("Result delivery is unconfirmed. The result may have arrived.", alert.text or "")
+                        self.assertIn("the transport started", alert.text or "")
+                saved = worker_lifecycle.read_json_object(path)
+                if received:
+                    self.assertEqual(saved["delivery"], f"already delivered: {path.stem}")
+                else:
+                    self.assertNotIn("delivered_at", saved)
+                    self.assertIs(saved["push_alert_attempted"], True)
+                    self.assertTrue(str(saved["delivery"]).startswith(detached_runs.UNCONFIRMED_RESULT_PUSH))
+                    self.assertIn("the transport started", str(saved["delivery"]))
+
+    def test_publish_finished_preserves_a_concurrent_delivery(self) -> None:
+        publish = detached_runs._finish_record  # pyright: ignore[reportPrivateUsage]
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                record = self.record(self.fixture.parent, f"concurrent-delivery-{accepted}")
+                path = Path(record["log"]).with_suffix(".json")
+                refusal = send.RefusedRelayRequest("failed", "fixture refusal")
+                concurrent = send.Result("sent", "received") if accepted else TimeoutError("reply lost")
+
+                def publish_after_delivery(target: Path, stale: detached_runs.RunRecord) -> detached_runs.CompletionReplay:
+                    self.assertEqual(stale.get("delivery"), detached_runs.FAILED_RESULT_PUSH + "failed: fixture refusal")
+                    if accepted:
+                        self.assertEqual(detached_runs.deliver(stale, detached_runs.CompletedCommand(7)), "sent: received")
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, "reply lost"):
+                            _ = detached_runs.deliver(stale, detached_runs.CompletedCommand(7))
+                    return publish(target, stale)
+
+                with (patch.object(send, "send", side_effect=[
+                          refusal, concurrent, send.Result("sent", "alert received")]) as push,
+                      patch.object(detached_runs, "_finish_record", side_effect=publish_after_delivery),
+                      patch.object(detached_runs, "_run", return_value=7),
+                      patch.object(detached_runs, "_result_received", return_value=False) as receipt,
+                      patch.object(time, "sleep") as delay):
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), int(not accepted))
+
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual((saved["status"], saved["exit_code"]), ("finished", 7))
+                messages = [cast(send.Options, attempt.args[0]).text or "" for attempt in push.call_args_list]
+                self.assertEqual(sum(body.startswith(f"Detached run: {path.stem}\n") for body in messages), 2)
+                self.assertEqual(len(messages), 2 if accepted else 3)
+                if accepted:
+                    self.assertEqual(saved["delivery"], "sent: received")
+                    delay.assert_not_called()
+                    receipt.assert_not_called()
+                else:
+                    self.assertTrue(str(saved["delivery"]).startswith(detached_runs.UNCONFIRMED_RESULT_PUSH))
+                    self.assertIn("The result may have arrived.", messages[-1])
+                    self.assertEqual(receipt.call_count, 3)
+
+    def test_reaper_alerts_after_the_supervisor_exits_during_a_retry_delay(self) -> None:
+        record = self.record(self.fixture.parent, "orphan-during-delay")
+        path = Path(record["log"]).with_suffix(".json")
+        refusal = send.RefusedRelayRequest("failed", "fixture refusal")
+
+        def exit_during_delay(_delay: float) -> None:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["status"], "finished")
+            self.assertNotIn("ended", saved)
+            with patch.object(detached_run_process, "supervises", return_value=True) as live:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                live.assert_called_once()
+            self.assertNotIn("push_alert_attempted", worker_lifecycle.read_json_object(path))
+            raise SystemExit("supervisor exited during retry delay")
+
+        with (patch.object(send, "send", side_effect=[refusal, send.Result("sent", "alert received")]) as push,
+              patch.object(detached_runs, "_run", return_value=7),
+              patch.object(time, "sleep", side_effect=exit_during_delay) as delay):
+            with self.assertRaisesRegex(SystemExit, "supervisor exited during retry delay"):
+                _ = detached_runs.main(["supervise", str(path)])
+            with patch.object(detached_run_process, "supervises", return_value=False) as gone:
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                gone.assert_called_once()
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
-        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
-        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-        self.assertEqual(finished["status"], "finished")
-        self.assertEqual(len(self.notices), 1)
-        self.assertIn("FAIL (exit 9)", self.notices[0][1])
-        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+
+        delay.assert_called_once_with(5)
+        self.assertEqual(push.call_count, 2)
+        alert = cast(send.Options, push.call_args.args[0])
+        self.assertEqual(alert.to, self.fixture.parent.id)
+        self.assertIn("Result delivery failed.", alert.text or "")
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIs(saved["push_alert_attempted"], True)
+        self.assertNotIn("delivered_at", saved)
+
+    def test_reaper_recovers_an_interrupted_alert(self) -> None:
+        record = self.record(self.fixture.parent, "interrupted-alert")
+        record.update(status="finished", pid=DEAD_PID, exit_code=7,
+                      delivery=detached_runs.FAILED_RESULT_PUSH + "fixture refusal")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        attempts = 0
+
+        def alert_director(options: send.Options) -> send.Result:
+            nonlocal attempts
+            self.assertEqual(options.to, self.fixture.parent.id)
+            self.assertNotIn("push_alert_attempted", worker_lifecycle.read_json_object(path))
+            with path.with_name(f".{path.stem}.delivery.lock").open("r") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            attempts += 1
+            return send.Result("sent", "director received the alert")
+
+        def save_alert(target: Path, text: str) -> None:
+            if target == path and attempts == 1 and '"push_alert_attempted": true' in text:
+                raise SystemExit("process exited before it saved the alert outcome")
+            write_text_atomic(target, text)
+
+        with (patch.object(send, "send", side_effect=alert_director),
+              patch.object(detached_runs, "write_text_atomic", side_effect=save_alert),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertNotIn("push_alert_attempted", worker_lifecycle.read_json_object(path))
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertIs(worker_lifecycle.read_json_object(path)["push_alert_attempted"], True)
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertIn("process exited before it saved the alert outcome", errors.getvalue())
+        self.assertEqual(attempts, 2)
+
+    def test_reaper_confirms_an_unconfirmed_result_before_alerting(self) -> None:
+        row = self.fixture.worker(family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        record = self.record(row, "receipt-before-alert")
+        record.update(status="finished", pid=DEAD_PID, exit_code=7)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.interrupt_after_input = True
+
+        with patch.object(send, "send") as alert:
+            with self.assertRaisesRegex(SystemExit, "interrupted after pane input"):
+                _ = detached_runs.deliver(record, detached_runs.CompletedCommand(7))
+            pending = worker_lifecycle.read_json_object(path)
+            self.assertTrue(str(pending["delivery"]).startswith(detached_runs.UNCONFIRMED_WORKER_RESULT))
+            self.assertIn("interrupted after pane input", str(pending["delivery"]))
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        alert.assert_not_called()
+        self.assertEqual(len(self.inputs), 1)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], f"already delivered: {path.stem}")
+        self.assertIn("delivered_at", saved)
+        self.assertNotIn("push_alert_attempted", saved)
+
+    def test_reap_saves_finished_before_a_staff_lookup_fails(self) -> None:
+        row = self.fixture.worker(family="codex")
+        record = self.record(row, "orphan-lookup")
+        finished_at = "2026-11-19T13:00:00+00:00"
+        record.update(pid=DEAD_PID, exit_code=9, finished_at=finished_at)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        def unreadable_staff() -> staff.StaffSnapshot:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual((saved["status"], saved["exit_code"], saved["finished_at"]),
+                             ("finished", 9, finished_at))
+            self.assertTrue(str(saved["delivery"]).startswith(detached_runs.DEFERRED_WORKER_RESULT))
+            raise staff.StaffUnreadable("fixture staff lookup failed")
+
+        def lookup_staff() -> staff.StaffSnapshot:
+            if worker_lifecycle.read_json_object(path)["delivery"] == detached_runs.ORPHAN_RESULT_PENDING:
+                return unreadable_staff()
+            return staff.local_snapshot()
+
+        with (patch.object(staff, "snapshot", side_effect=lookup_staff) as lookup,
+              patch.object(send, "send", return_value=send.Result("sent", "alert received")) as alert,
+              patch.object(detached_runs, "_retry_failed_push") as retry):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertEqual(lookup.call_count, 2)
+        alert.assert_called_once()
+        retry.assert_not_called()
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["status"], "finished")
+        self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "fixture staff lookup failed")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.SUBMITTED)
+
+    def test_reap_alerts_once_when_a_director_result_push_fails(self) -> None:
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                row = self.fixture.worker() if retired else self.fixture.parent
+                record = self.record(row, f"orphan-director-result-{retired}")
+                record.update(pid=DEAD_PID, exit_code=7)
+                if retired:
+                    record.update(self_stop=True, stop_reason="The check is obsolete.")
+                    self.assertIsNotNone(staff.retire(row.id))
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+
+                refusal = send.RefusedRelayRequest("failed", "fixture refusal")
+                with (patch.object(send, "send", side_effect=[
+                          refusal, send.Result("sent", "alert received")]) as push,
+                      patch.object(detached_runs, "_retry_failed_push") as retry):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                retry.assert_not_called()
+                self.assertEqual(push.call_count, 2)
+                result, alert = [cast(send.Options, attempt.args[0]) for attempt in push.call_args_list]
+                self.assertEqual(result.to, self.fixture.parent.id)
+                self.assertEqual(alert.to, self.fixture.parent.id)
+                self.assertIn(f"Detached run: {path.stem}", result.text or "")
+                self.assertIn("Result delivery failed.", alert.text or "")
+                self.assertIn("exit 7", alert.text or "")
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved["status"], "finished")
+                self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "failed: " + refusal.detail)
+                self.assertIs(saved["push_alert_attempted"], True)
+                self.assertNotIn("push_retries", saved)
+                self.assertNotIn("delivered_at", saved)
+
+    def test_remote_staff_lookup_failure_precedes_the_result_checkpoint(self) -> None:
+        record = self.record(self.fixture.parent, "remote-staff-lookup")
+        path = Path(record["log"]).with_suffix(".json")
+        error = f"{staff.OWNER_MACHINE} not reached"
+        def fail_lookup(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn("show --snapshot", command[-1])
+            self.assertNotIn("delivery", worker_lifecycle.read_json_object(path))
+            return subprocess.CompletedProcess(command, 255, stdout="", stderr="connection lost")
+
+        with (patch.object(staff, "is_owner", return_value=False),
+              patch.object(subprocess, "run", side_effect=fail_lookup) as remote,
+              patch.object(send, "send") as push):
+            self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(7)),
+                             detached_runs.FAILED_RESULT_PUSH + error)
+        remote.assert_called_once()
+        push.assert_not_called()
+        self.assertNotIn("delivered_at", worker_lifecycle.read_json_object(path))
+
+    def test_supervisor_retries_after_staff_lookup_fails_before_the_send(self) -> None:
+        record = self.record(self.fixture.parent)
+        path = Path(record["log"]).with_suffix(".json")
+        snapshot = staff.local_snapshot()
+
+        def check_failure(_delay: float) -> None:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual((saved["status"], saved["exit_code"]), ("finished", 9))
+            self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "fixture staff lookup failed")
+
+        with (patch.object(staff, "snapshot", side_effect=[
+                  staff.StaffUnreadable("fixture staff lookup failed"), snapshot]),
+              patch.object(send, "send", return_value=send.Result("sent", "result received")) as push,
+              patch.object(time, "sleep", side_effect=check_failure) as delay,
+              patch.object(detached_runs, "_run", return_value=9)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        delay.assert_called_once_with(5)
+        push.assert_called_once()
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], "sent: result received")
+
+    def test_supervisor_retries_if_the_delivery_process_exits_before_the_send(self) -> None:
+        for launched in (False, True):
+            with self.subTest(launched=launched):
+                record = self.record(self.fixture.parent, f"delivery-start-{launched}")
+                path = Path(record["log"]).with_suffix(".json")
+
+                def delivery_process(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    if not launched:
+                        raise FileNotFoundError(2, "fixture launch error", command[0])
+                    return subprocess.CompletedProcess(command, 1, stderr="fixture process error\n")
+
+                def first_delivery(record_path: Path) -> int:
+                    with patch.object(subprocess, "run", side_effect=delivery_process):
+                        return deliver_in_fresh_process(record_path)
+
+                def check_failure(_delay: float) -> None:
+                    saved = worker_lifecycle.read_json_object(path)
+                    self.assertEqual((saved["status"], saved["exit_code"]), ("finished", 9))
+                    self.assertTrue(str(saved["delivery"]).startswith(detached_runs.FAILED_RESULT_PUSH))
+                    self.assertIn("fixture process error" if launched else "fixture launch error", str(saved["delivery"]))
+
+                with (patch.object(detached_runs, "deliver_in_fresh_process", side_effect=first_delivery),
+                      patch.object(send, "send", return_value=send.Result("sent", "result received")) as push,
+                      patch.object(time, "sleep", side_effect=check_failure) as delay,
+                      patch.object(detached_runs, "_run", return_value=9)):
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                delay.assert_called_once_with(5)
+                push.assert_called_once()
+                self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], "sent: result received")
+
+    def test_start_does_not_wait_for_another_runs_push_retry(self) -> None:
+        director = self.fixture.parent
+        record = self.record(director, "old-result")
+        path = Path(record["log"]).with_suffix(".json")
+        record["tree_key"] = "private-tree"
+        write_text_atomic(path, json.dumps(record))
+
+        def start_during_delay(_delay: float) -> None:
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual((saved["status"], saved["exit_code"]), ("finished", 9))
+            for lock_path in (path.with_suffix(".completion.lock"), path.parent / ".start.lock",
+                              path.with_name(f".{path.stem}.delivery.lock"), path.with_suffix(".record.lock")):
+                with lock_path.open("r") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(detached_runs.live_runs(path.parent, director.name), [])
+            with patch.object(detached_run_process, "supervises", return_value=True):
+                self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--", "true"]), 0)
+
+        refusal = send.Result("refused", "fixture refusal")
+        accepted = send.Result("sent", "result received")
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=DEAD_PID)) as spawn,
+              patch.object(send, "send", side_effect=[refusal, accepted]),
+              patch.object(detached_runs, "_run", return_value=9),
+              patch.object(time, "sleep", side_effect=start_during_delay) as delay):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.args[0][2], "supervise")
+        delay.assert_called_once_with(5)
 
     def test_a_failed_completion_event_keeps_other_orphans_and_retries_next_pass(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -3282,12 +4308,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.fixture.world, "run", side_effect=launch):
-            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
             saved = worker_lifecycle.read_json_object(path)
             self.assertTrue(str(saved.get("delivery")).startswith("submission failed: "))
             self.assertEqual(self.inputs, [])
             saved.update(status="finished", exit_code=0, completion_pending=True, pid=DEAD_PID)
             write_text_atomic(path, json.dumps(saved))
+            self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+                worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.SUBMITTED)
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
             self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(attempts, 2)
@@ -3315,12 +4343,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
             return run(*arguments, deadline=deadline)
 
         with patch.object(self.fixture.world, "run", side_effect=expire_before_launch):
-            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
         saved = worker_lifecycle.read_json_object(path)
         self.assertEqual(saved.get("delivery"), "submission failed: deadline passed")
         self.assertEqual(self.inputs, [])
         saved.update(status="finished", exit_code=0, completion_pending=True, pid=DEAD_PID)
         write_text_atomic(path, json.dumps(saved))
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.SUBMITTED)
 
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
@@ -3336,7 +4366,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(path, json.dumps(record))
         self.defer_transcript = True
 
-        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
         event = turn_end.WorkerEvent(str(row.current_session))
         self.assertIs(turn_end.handle(event), turn_end.TurnOutcome.RETRY_EVIDENCE)
@@ -3347,6 +4377,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         (source, receipt), = self.pending_transcripts
         write_text_atomic(source, source.read_text() + receipt)
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.NONE)
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(len(self.inputs), 1)
         saved = worker_lifecycle.read_json_object(path)
@@ -3409,10 +4441,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(finished.get("completion_pending"), True)
         (source, receipt), = self.pending_transcripts
         write_text_atomic(source, source.read_text() + receipt)
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.NONE)
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(len(self.inputs), 1)
         self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
-        self.assertEqual(self.notices, [])
+        (target, alert), = self.notices
+        self.assertEqual(target, self.fixture.parent.id)
+        self.assertIn("The result may have arrived.", alert)
 
     def test_pane_result_arrives_after_the_launcher_exits(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -3541,6 +4577,150 @@ class PaneRunDeliveryTests(unittest.TestCase):
         source = worker_admission.transcript_source(row, staff.CodexBackend(self.fixture.root / "codex"))
         source.unlink()
         self.assert_holder_result(self.record(row), "worker transcript is unavailable")
+
+    def test_self_stop_result_waits_for_the_worker_transcript(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        source = worker_admission.transcript_source(row, staff.CodexBackend(self.fixture.root / "codex"))
+        transcript = source.read_text()
+        source.unlink()
+        record = self.record(row)
+        record.update(status="finished", stop_reason="The check is obsolete.", self_stop=True, stop_pass_requested=True, exit_code=143)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertIn("deferred: worker transcript is unavailable", str(saved.get("delivery")))
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.inputs, [])
+
+        write_text_atomic(source, transcript)
+        self.fixture.world.remove_pane(pane)
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.RETRY)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), "deferred: worker pane is closed")
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.inputs, [])
+
+        self.fixture.world.add(row, pane, family="codex")
+        self.assertIs(detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE), detached_runs.WorkerResultReplay.SUBMITTED)
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        (target, text), = self.inputs
+        self.assertEqual(target, pane)
+        self.assertIn("Result: STOPPED (exit 143)", text)
+        self.assertIn("Stop reason: The check is obsolete.", text)
+        self.assertEqual(self.notices, [])
+
+    def test_retired_worker_self_stop_reaches_the_director_and_can_be_pruned(self) -> None:
+        for case in ("direct", "deferred", "unreadable", "offline"):
+            with self.subTest(case=case):
+                row = self.fixture.worker(f"retired-{case}")
+                record = self.record(row, f"retired-result-{case}")
+                record.update(status="finished", exit_code=143, stop_reason="The check is obsolete.",
+                              self_stop=True, stop_pass_requested=True)
+                if case == "deferred":
+                    record.update(delivery="deferred: worker pane is closed", completion_pending=False)
+                if case == "offline":
+                    record.update(status="running", pid=DEAD_PID, tree_key="private-tree")
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+                self.assertIsNotNone(staff.retire(row.id))
+                if case == "offline":
+                    self.assert_offline_director_result(record, path)
+                    continue
+                if case == "unreadable":
+                    state_path = self.run_dir / unit_runs.STATE_FILE
+                    state = state_path.read_text()
+                    write_text_atomic(state_path, "{")
+                    try:
+                        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+                        self.assertEqual(self.notices, [])
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertTrue(str(saved.get("delivery")).startswith("deferred: director unavailable"))
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(detached_runs.prune_finished(path.parent), [])
+                    finally:
+                        write_text_atomic(state_path, state)
+                if case in ("deferred", "unreadable"):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+                self.assertEqual(self.inputs, [])
+                target, message = self.notices.pop()
+                self.assertEqual(self.notices, [])
+                self.assertEqual(target, self.fixture.parent.id)
+                self.assertIn("Result: STOPPED (exit 143)", message)
+                self.assertIn("Stop reason: The check is obsolete.", message)
+                self.assertIn("delivered_at", worker_lifecycle.read_json_object(path))
+                self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+
+    def test_retired_worker_self_stop_checks_receipts_without_resending(self) -> None:
+        self.defer_transcript = True
+        for earlier_refusal in (False, True):
+            with self.subTest(earlier_refusal=earlier_refusal):
+                row = self.fixture.worker(f"retired-unconfirmed-{earlier_refusal}", family="codex")
+                pane = "w1:p1"
+                self.fixture.world.add(row, pane, family="codex")
+                record = self.record(row, f"retired-unconfirmed-{earlier_refusal}")
+                record.update(status="finished", exit_code=143, stop_reason="The check is obsolete.",
+                              self_stop=True, stop_pass_requested=True)
+                if earlier_refusal:
+                    record["delivery"] = detached_runs.FAILED_RESULT_PUSH + "refused: fixture refusal"
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+                result = detached_runs.CompletedCommand(143)
+                pending = detached_runs.deliver(record, result)
+                prefix = (detached_runs.UNCONFIRMED_RESULT_PUSH if earlier_refusal
+                          else detached_runs.UNCONFIRMED_WORKER_RESULT)
+                self.assertEqual(pending, prefix + "the worker transcript has no result receipt")
+                self.fixture.world.remove_pane(pane)
+                self.assertIsNotNone(staff.retire(row.id))
+
+                with (patch.object(send, "send") as push,
+                      patch.object(detached_runs, "_result_received", side_effect=[False, True]) as receipt):
+                    self.assertEqual(detached_runs.deliver(record, result), pending)
+                    self.assertNotIn("delivered_at", worker_lifecycle.read_json_object(path))
+                    self.assertEqual(detached_runs.deliver(record, result), f"already delivered: {path.stem}")
+                push.assert_not_called()
+                self.assertEqual(receipt.call_count, 2)
+                for checked in receipt.call_args_list:
+                    director = cast(staff.StaffRow, checked.args[0])
+                    self.assertEqual(director.id, self.fixture.parent.id)
+        self.assertEqual(len(self.inputs), 2)
+        self.assertEqual(self.notices, [])
+
+    def assert_offline_director_result(self, record: detached_runs.RunRecord, path: Path) -> None:
+        self.holder_sender.close()
+        self.fixture.world.remove_pane("w1:p0")
+        tree_key = "private-tree"
+        name, command = record["worker"], record["command"]
+        destination = f"staff:{self.fixture.parent.id}"
+        self.assertIsNotNone(detached_runs.live_twin(path.parent, name, command, tree_key))
+        with (patch.object(send, "STATE", self.fixture.root / "messages"),
+              patch.object(roster, "roster", return_value=roster.Roster([], [])),
+              patch.object(roster, "peer_roster", return_value=roster.Roster([], [])),
+              patch.object(unit_lookup, "checked_conversation", return_value=unit_lookup.ProvedAbsentUnit()),
+              patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ()))):
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved.get("status"), "finished")
+            self.assertTrue(str(saved.get("delivery")).startswith("queued: "))
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+            queued, = send.read_queue(send.queue_path(destination))
+            self.assertIn(f"Detached run: {record['run_id']}", queued["text"])
+            self.assertIn("Result: STOPPED (exit 143)", queued["text"])
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(treekey, "tree_key", return_value=tree_key),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn):
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--to", name,
+                                                "--", *command]), 0)
+        spawn.assert_called_once()
 
 
 if __name__ == "__main__":

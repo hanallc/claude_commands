@@ -73,9 +73,12 @@ class HeldRolePaneFixture:
         self.recorder_commands: list[list[str]] = []
         self.router.recorder_commands = self.recorder_commands
         write_text_atomic(self.root / "design.md", "# Private design\n")
+        config = Path(os.environ["CONF_DIR"]) / "design_roles.conf"
+        write_text_atomic(config, "[ownership]\nhost=natedev\n\n[roles]\nnew_open=true\n")
         _ = cast(object, case.enterContext(patch.dict(os.environ, {
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"),
+            "DESIGN_ROLES_CONFIG": str(config),
             "ASTRA_ROLES_STATE": str(self.root / "holds"),
             "DESIGN_ROLES_HOST": "natedev",
             "CODEX_HOME": str(self.root / "codex"),

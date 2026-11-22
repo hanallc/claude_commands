@@ -15,8 +15,10 @@ import unittest
 from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib import copy_record, scratch
+from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -286,6 +288,17 @@ if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
 
 @final
 class MacRunTests(unittest.TestCase):
+    helper_home: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="mac-run-helpers-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.helper_home = Path(temporary.name)
+        _ = copy_helpers(cls.helper_home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -302,9 +315,14 @@ class MacRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
-        self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
-                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+        environment = fixture_git_environment(self.root)
+        environment.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")})
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        installed = self.home / ".claude"
+        installed.mkdir(parents=True)
+        helpers = self.helper_home / ".claude"
+        (installed / "scripts").symlink_to(helpers / "scripts", target_is_directory=True)
+        _ = shutil.copytree(helpers / "config", installed / "config", symlinks=True)
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -325,7 +343,7 @@ class MacRunTests(unittest.TestCase):
             + "\nterminate_grace_seconds=3\n")
         copies_config = self.config_path.parent / "copies.conf"
         _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
-                                 + "owner.verify=verify\nwait_seconds=0.01\n"
+                                 + "owner.verify=verify\n"
                                  + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
@@ -340,12 +358,13 @@ class MacRunTests(unittest.TestCase):
         seed_interpreter_cache(self.root / "cache")
         self.environment = {
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
-            "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "COPIES_CONFIG": str(copies_config),
+            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
@@ -357,10 +376,11 @@ class MacRunTests(unittest.TestCase):
         }
 
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
 
     def write_production_config(self, **overrides: str) -> None:
         settings = MAC_RUN_CONFIG | overrides
-        _ = (self.config_path.parent / "production.conf").write_text(
+        _ = write_config_fixture(self.config_path.parent / "production.conf",
             "".join(f"{name}={value}\n" for name, value in settings.items())
         )
 
@@ -447,6 +467,15 @@ class MacRunTests(unittest.TestCase):
             output, errors = process.communicate()
             self.fail("mac_run exited before the build marker: " + output + errors)
         self.assertTrue(path.exists())
+
+    def test_mac_run_refuses_a_port_above_65535(self) -> None:
+        self.write_production_config(mac_run_port="65536")
+
+        result = self.mac_run()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("mac_run_port='65536': outside range 1..65535", result.stderr)
+        self.assert_no_build_started()
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(
@@ -796,7 +825,7 @@ cleanup_mac_run
                     for mirror in copies.remote_mirrors()]
 
     def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
-                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> None:
+                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> str:
         source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
                                          {"source.txt": "content\n"}).checkout
         head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
@@ -831,7 +860,8 @@ cleanup_mac_run
             self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
             self.assertEqual(before_local[0]["host"], "natemccoy@mac")
             self.assertEqual(before_remote[0]["host"], "localhost")
-            prepare_cleanup(Path(str(before_local[0]["path"])))
+            with mock.patch.dict(os.environ, {"COPIES_CONFIG": local_environment["COPIES_CONFIG"]}):
+                prepare_cleanup(Path(str(before_local[0]["path"])))
             send_process_group(process.pid, signal.SIGTERM)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
@@ -851,11 +881,12 @@ cleanup_mac_run
                     self.assertIn(before[0], records)
                 else:
                     self.assertEqual(records, [])
+        return after.stderr
 
     def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
-        self.assert_clone_records_after_cleanup(0)
+        _ = self.assert_clone_records_after_cleanup(0)
 
-    def test_old_mirror_cleanup_removes_the_clone_and_both_registry_records(self) -> None:
+    def test_old_mirror_cleanup_keeps_the_clone_and_removes_both_registry_records(self) -> None:
         checkouts: list[Path] = []
 
         def remove_exclusions(checkout: Path) -> None:
@@ -867,12 +898,20 @@ cleanup_mac_run
             status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
             self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
 
-        self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
+        errors = self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
         self.assertEqual(len(checkouts), 1)
-        self.assertFalse(checkouts[0].exists())
+        [checkout] = checkouts
+        self.assertEqual((checkout / "source.txt").read_text(), "content\n")
+        record = copy_record.read_record(checkout / copy_record.RECORD)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(record))
+        expected = f"kept for a manual removal list: {checkout} (scratch, task {record.task} ended)"
+        self.assertEqual([line for line in errors.splitlines() if line.startswith(
+            f"kept for a manual removal list: {checkout} (")], [expected])
 
     def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
-        self.assert_clone_records_after_cleanup(23)
+        _ = self.assert_clone_records_after_cleanup(23)
 
     def test_build_marker_wait_reports_a_failed_child(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],
@@ -939,7 +978,7 @@ cleanup_mac_run
                 else:
                     self.assertEqual(ends, [], self.events())
                     self.assertIn("cleanup of an ended run failed", after.stderr)
-                    self.assertEqual(len(self.ended_runs()), 1)
+                    self.assertEqual(len(self.ended_runs()), 2)
                     for kept in self.ended_runs():
                         shutil.rmtree(kept)
                 self.assert_claim_released()

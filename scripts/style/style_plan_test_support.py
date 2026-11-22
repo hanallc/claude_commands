@@ -30,6 +30,7 @@ from scripts.style import style_proposals
 from scripts.production import proposal_issue
 
 from scripts.lib import berth_board
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
 from scripts.style.style_reader_test_support import oracle_reader
@@ -172,7 +173,13 @@ class StylePlanFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        fixture_parent = Path(tempfile.mkdtemp(prefix="style-plan-fixture-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, fixture_parent)
+        environment = fixture_git_environment(fixture_parent)
+        for key in ("BASH_ENV", "RIPGREP_CONFIG_PATH", "STAFF_CONFIG"):
+            _ = environment.pop(key, None)
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
+        cls.template_repo = fixture_parent / "sample"
         cls.template_repo.mkdir()
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
@@ -829,6 +836,14 @@ class StylePlanFixture(unittest.TestCase):
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
 
     def reference_gate(self, ticket: str) -> tuple[int, str]:
+        try:
+            with style_ledger.open_ledger(self.repo) as ledger:
+                if ledger.ticket_get(ticket)["state"] == "queued":
+                    ledger.ticket_assign(ticket, "main")
+        except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+            return 2, f"error: {error}\n"
+        except ValueError as error:
+            return 1, f"review: {error}\n"
         output = io.StringIO()
         with redirect_stdout(output):
             result = style_plan.gate(self.repo, ticket)

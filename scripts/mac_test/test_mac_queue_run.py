@@ -12,10 +12,11 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import cast
+from typing import TextIO, cast
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
@@ -32,6 +33,9 @@ def option(name):
 with (root / "events").open("a") as stream:
     stream.write(json.dumps(args)+"\n")
 if args[0] == "place-step":
+    if os.environ.get("FAKE_QUEUE_BUSY") == "1":
+        print("waiting for the Mac")
+        raise SystemExit(78)
     if os.environ.get("FAKE_QUEUE_WAIT") == "1":
         (root / "waiting").write_text("waiting")
         time.sleep(60)
@@ -61,6 +65,7 @@ if "mac_stopped=" in args[-1]:
 print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
     (root / "running").write_text(str(os.getpid()))
+    print("Mac command started", flush=True)
     # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
     _ = sys.stdin.read()
     (root / "input_closed").write_text("closed")
@@ -103,19 +108,20 @@ def signal_handlers(root: Path, names: tuple[str, ...]) -> list[str]:
     return findings
 
 
-class QueueRunTests(unittest.TestCase):
-    def fixture(self, root: Path) -> dict[str, str]:
-        queue = root / "queue.py"
-        _ = queue.write_text(QUEUE)
-        ssh = root / "ssh"
-        _ = ssh.write_text(f"#!{sys.executable}\n" + SSH)
-        ssh.chmod(0o755)
-        environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
-                       "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
-        _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
-                                 + shlex.join([sys.executable, str(queue)]) + "\n")
-        return environment
+def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
+    queue = root / "queue.py"
+    _ = queue.write_text(QUEUE)
+    ssh = root / "ssh"
+    _ = ssh.write_text(f"#!{sys.executable}\n" + ssh_source)
+    ssh.chmod(0o755)
+    environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
+                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
+    _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
+                             + shlex.join([sys.executable, str(queue)]) + "\n")
+    return environment
 
+
+class QueueRunTests(unittest.TestCase):
     def command(self, root: Path, kind: str = "shot") -> list[str]:
         return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
@@ -133,7 +139,7 @@ class QueueRunTests(unittest.TestCase):
                     self.check_returned_placement(Path(temporary), kind, status, queue_refuses, return_fails)
 
     def check_returned_placement(self, root: Path, kind: str, status: int, queue_refuses: bool, return_fails: bool) -> None:
-        environment = {**self.fixture(root), "FAKE_MAC_STATUS": str(status),
+        environment = {**queue_fixture(root), "FAKE_MAC_STATUS": str(status),
                        "FAKE_QUEUE_REFUSE": "1" if queue_refuses else "0", "FAKE_RETURN_FAIL": "1" if return_fails else "0"}
         result = subprocess.run(self.command(root, kind), capture_output=True, text=True, env=environment,
                                 timeout=TEST_HANG_GUARD_SECS)
@@ -165,16 +171,168 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(work[4:], self.command(root)[-3:])
             self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
 
+    def test_no_wait_returns_the_busy_status_after_one_queue_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_QUEUE_BUSY": "1"}
+            command = self.command(root, "run")
+            command.insert(command.index("--"), "--no-wait")
+            result = subprocess.run(command, capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, mac_queue_run.MAC_BUSY_STATUS, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+            self.assertFalse((root / "remote").exists())
+
+    def test_caller_watch_must_be_ready_before_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            reader, writer = os.pipe()
+            os.close(writer)
+            try:
+                command = self.command(root)
+                command[3:3] = ["--caller-fd", str(reader)]
+                result = subprocess.run(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            finally:
+                os.close(reader)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("caller watch did not start", result.stderr)
+            self.assertFalse((root / "events").exists())
+
+    def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_SSH_HOLD": "1"}
+            reader, writer = os.pipe()
+            try:
+                command = self.command(root)
+                command[3:3] = ["--caller-fd", str(reader)]
+                with subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                    try:
+                        assert queue.stdout is not None
+                        queue_output = cast(TextIO, queue.stdout)
+                        self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                        self.assertEqual(queue_output.readline().strip(), "Mac command started")
+                        processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True)
+                        watchers: list[int] = []
+                        for line in processes.splitlines():
+                            fields = line.split(maxsplit=2)
+                            if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
+                                watchers.append(int(fields[0]))
+                        self.assertEqual(len(watchers), 1)
+                        os.kill(watchers[0], signal.SIGKILL)
+                        output, errors = queue.communicate(timeout=10)
+                    finally:
+                        if queue.poll() is None:
+                            send_process_group(queue.pid, signal.SIGKILL)
+                            _ = queue.communicate()
+                self.assertEqual(queue.returncode, -signal.SIGTERM, output + errors)
+                self.assertIn("caller watch ended unexpectedly", errors)
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertIn("signal_group TERM", (root / "stop").read_text())
+            finally:
+                os.close(reader)
+                os.close(writer)
+
+    def test_ended_gate_uses_the_installed_script_with_an_old_or_missing_callback(self) -> None:
+        for old_exists in (False, True):
+            with self.subTest(old_exists=old_exists), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root)
+                stale = root / mac_queue_run.RUNS / "stale"
+                stale.mkdir(parents=True)
+                (stale / "lock").touch()
+                receipt = root / mac_queue_run.RECEIPTS / "stale.json"
+                receipt.parent.mkdir(parents=True)
+                _ = receipt.write_text("{}")
+                old = root / "old worktree/mac_gate.py"
+                if old_exists:
+                    old.parent.mkdir()
+                    write_stdlib_tool(old, "raise SystemExit('The queue used the old callback')\n")
+                installed = root / ".claude/scripts/mac_test/mac_gate.py"
+                installed.parent.mkdir(parents=True)
+                write_stdlib_tool(installed, "import os, sys\nprint(os.environ['MAC_QUEUE_HOST'], *sys.argv[1:])\n")
+                attempt = root / "mac-gate-fixture"
+                _ = (stale / "run.json").write_text(json.dumps({"lifecycle_script": str(old),
+                    "arguments": [str(attempt), "1"], "host": "saved-mac"}))
+                result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                        text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"saved-mac cleanup-ended {stale / 'argv.json'} {attempt} 1", result.stdout)
+                self.assertNotIn("cleanup of an ended run failed", result.stderr)
+                self.assertFalse(stale.exists())
+                self.assertFalse(receipt.exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+
+    def test_failed_cleanup_leaves_the_record_for_the_next_run(self) -> None:
+        lifecycle = """
+import json, os, sys
+from pathlib import Path
+phase, argv_file, *command = sys.argv[1:]
+if phase == 'prepare':
+    Path(argv_file).write_text(json.dumps(command))
+else:
+    with (Path(os.environ['FAKE_QUEUE_STATE']) / 'cleanup_calls').open('a') as out:
+        print(sys.argv[0], phase, argv_file, file=out)
+    raise SystemExit(int(os.environ.get('FAKE_CLEANUP_STATUS', '0')))
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            callback = root / "mac_gate.py"
+            installed = root / ".claude/scripts/mac_test/mac_gate.py"
+            installed.parent.mkdir(parents=True)
+            for script in (callback, installed):
+                write_stdlib_tool(script, lifecycle)
+            command = self.command(root, "run")
+            command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
+            result = subprocess.run(command, env={**environment, "FAKE_CLEANUP_STATUS": "19"},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+            (saved,) = (root / mac_queue_run.RUNS).glob("*/run.json")
+            recovered = subprocess.run(self.command(root, "run"), env=environment,
+                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            called = str(saved.with_name("argv.json"))
+            self.assertEqual((root / "cleanup_calls").read_text().splitlines(),
+                             [f"{callback} cleanup {called}", f"{installed} cleanup-ended {called}"])
+            self.assertFalse(saved.exists())
+
+    def test_ended_custom_callback_uses_its_saved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            directory = root / mac_queue_run.RUNS / "ended"
+            directory.mkdir(parents=True)
+            (directory / "lock").touch()
+            callback = root / "custom_callback"
+            write_stdlib_tool(callback, "import sys\nprint(*sys.argv[1:])\n")
+            _ = (directory / "run.json").write_text(json.dumps({"lifecycle_script": str(callback),
+                "arguments": ["fixture-argument"], "host": "fake-mac"}))
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"cleanup {directory / 'argv.json'} fixture-argument", result.stdout)
+            self.assertFalse(directory.exists())
+
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
                                 (False, signal.SIGINT)):
             with self.subTest(waiting=waiting, signum=signum), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                environment = {**self.fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
+                environment = {**queue_fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, env=environment, start_new_session=True) as process:
                     try:
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
+                        if signum == signal.SIGINT:
+                            # The queue reads the group before it forwards this line.
+                            assert process.stdout is not None
+                            queue_output = cast(TextIO, process.stdout)
+                            self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(queue_output.readline().strip(), "Mac command started")
                         if waiting:
                             # A signal to the group also ends the queue call that waits.
                             send_process_group(process.pid, signum)

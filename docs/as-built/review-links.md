@@ -19,7 +19,7 @@ The flow:
 
 1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later. Inline programs import from the shim’s repository root through `PYTHONPATH` and `-P`. File scripts keep their existing import path behavior.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
-3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
+3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, each as the full URL in plain text. The user's terminal cannot open a Markdown link.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.
 
 ### Publisher
@@ -132,14 +132,14 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, Builds, Disks, Images, List and Review, in alphabetical order.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List and Review.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`.
 Each page centers its main column in the console frame, with a maximum width of 1124px.
 A page whose `main` has the `page-wide` class uses the full pane width instead; the Builds page is the only one.
 The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
-The title, status line and content use the same centered column on all seven pages.
+The title, status line and content use the same centered column on all console pages.
 Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
@@ -173,7 +173,16 @@ An older response cannot replace a newer response.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.
-Builds reads `memory.json` at its feed interval.
+On machines that read staff over SSH, GET, HEAD, News polls, and background Review builds share a staff snapshot.
+The server reuses this snapshot for `staff_snapshot_seconds`.
+After a cache read fails, readers use direct staff reads for the same interval.
+The staff owner reads its local file directly.
+POST routes that can save answers, change staff, or send messages read staff directly.
+These routes clear the snapshot when the action ends.
+Accounts preferences, News polls, and Disks polls keep the snapshot.
+Builds revalidates `memory.json` at its feed interval.
+The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
+The server sends static JSON with gzip when the client accepts gzip.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
@@ -241,7 +250,7 @@ Older browser folders still accept answers that a page posts to them.
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
-The entries are Accounts, AWS, Builds, Disks, Images, List and Review.
+AWS Machines follows AWS in the navigation.
 The configuration has no Changes, Investigations or Questions entries or age limits.
 The console renders every configured entry without a skip rule for Review.
 The URL value has the form `python:<module>:<function>`.
@@ -262,6 +271,48 @@ The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
+The AWS Machines entry calls `machines_page.page_url`.
+The function returns the URL for `machines.html` in `aws_page.output_folder()`.
+The entry shows **Not available** until the publisher writes that file.
+`serve.published_console_page` identifies the published path as `aws_machines`.
+The server adds the shared page owner control for the configured AWS Machines owner.
+The AWS Machines entry uses the Lucide `server` icon.
+
+A page includes `__PAGE_SETTING_CONTROLS__` once in its head.
+`page_frame.template` replaces that slot with the style and script from `setting_controls.py`.
+The page renders these controls with the following functions.
+
+1. `slider` takes the label, bounds, step, chosen value, live value, decimal places and an optional live note.
+   `pageSettingControls.connectSlider(root)` connects the native range input to the display.
+   Read `value` for the choice or `live` for the saved value.
+   Use `setValue(value)`, `setLive(value, note)` and `format(value)` to update or display a value.
+   Use `input` to listen for the native range input events.
+2. `amount_box` takes the text before and after the USD field, its minimum, step and value.
+   Read or write the field through `valueAsNumber`.
+   Listen for its native `change` event to apply the amount to the slider.
+3. `go_button` takes the button label and the page and key for the setting.
+   Call `pageSettingControls.connectGo(root, slider, amount, describe)` with the slider and the amount input.
+   Return `newValue`, `monthlyChange` in USD, and an optional `liveNote` from `describe`.
+   Go uses the slider live value as the old value in each confirmation.
+   The Go button shows the confirmation line before Confirm can send the choice.
+   Cancel closes the confirmation. Confirm disables the controls while the server saves.
+   Go updates the Now mark from the live value in the reply.
+   A successful save with a live value emits `setting-saved` with `detail.value`.
+   A refusal or failure shows one line below Go and keeps the proposed value.
+   Use `setLabel(label)` to update the button and `cancelConfirmation()` to close an obsolete confirmation.
+
+Go reads the request token from `GET /console/tune`.
+`POST /console/tune` accepts the fields `page`, `key`, `value`, and `token`.
+The POST requires a same-origin Origin header and the current request token.
+`console_tune.SETTINGS` registers allowed page and key pairs with the target document, range and step.
+The server validates exact decimal steps from the minimum.
+It refuses pairs absent from the table.
+The AWS Machines page uses `aws_machines` in this table and in the POST.
+The frame leaves the table empty for a page to register its settings.
+The route calls `tune.py` with the page and Go button in the reason and user words.
+It returns Saved with HTTP 200, Refused with HTTP 400, or SaveFailed with HTTP 503.
+Each result includes `live_value` from a fresh configuration read.
+An unavailable live value is `null`.
 
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
@@ -288,6 +339,7 @@ That function returns `/console/rebuilds.html`.
 `?page=rebuilds` still selects that page for commit details.
 The shell refreshes its grouped details while that page is visible.
 The status line separates session `Review:` counts from the global `For you:` action count.
+`assignment.py` reads both counts before it replaces itself with jq.
 The Mac requests `/console/for-you.json?view=count` to read the count without command text.
 The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this count.
 `tailscale ip -4` returns the peer address.
@@ -412,10 +464,12 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The State row offers Open, Validating and All below the Type row.
-Responses uses Open and All.
+The State row sets the Show filter.
+It offers Open, Validating and All below the Type row.
+With Responses selected, it offers Open and All.
 Old Waiting links open All.
-The Owner row follows the Show row.
+Old Done links use the default Open filter.
+The Owner row follows the State row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
@@ -437,6 +491,7 @@ The browser uses the index for every count and filter.
 The Show chips replace the right count text.
 Open and Validating select their states.
 All includes the active records.
+The Review table excludes Done records.
 **Ask showrunner to check** moves a change to Validating.
 **Ask question** and **Send feedback** move an open change to Waiting.
 The change leaves Open and its counts when the request starts.
@@ -521,8 +576,8 @@ An Efficiency save checks the ledger in the production document retained for its
 An unreadable Proposal prerequisite leaves its relationship empty in both the snapshot and the save.
 The save checks the revision under the store's write lock.
 The server returns HTTP 409 if the record is missing or its revision differs from the form revision.
-A current Done card accepts Later.
 The browser refreshes the index and shows a conflict reason above the table.
+The refresh keeps the selected filters.
 The reason stays visible if the refresh removes the card.
 After a save, the server reads and publishes the saved record if it can.
 If publication fails, the server retains the current snapshot and requests a full rebuild.
@@ -548,7 +603,6 @@ The body uses the time zone from the snapshot.
 A change to the time zone changes the snapshot version.
 A proposal body includes its issue text without front matter.
 An item fragment selects its summary before any body request.
-A Done item uses the same direct body request.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
@@ -666,15 +720,24 @@ The mark is `waiting` after Ask question and `done` after Approve or Send feedba
 
 Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server keeps the last good page and its render times under one lock.
+The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
-A later request returns the kept page at once and starts one background render.
-A request during a render returns the kept page and starts no second render.
+The server records the usage store file metadata before it starts each render.
+File absence is a revision.
+A request returns the kept page at once if its revision matches the store and its age is at most `page_refresh_seconds`.
+It starts a background render if no render is in progress.
+A request for an older page can share an active render if its revision still matches the store when the render ends.
+A request for a changed store uses the first render that starts after it reads the store revision.
+Requests can share that render and use its result if the store changes again during the render.
+The next request checks the store revision again.
+The server reads `page_refresh_seconds` from `config/review_links.conf` when it checks the page age.
+If the server cannot read this setting, it returns the last good page with a read error.
+It returns 503 if it has no good page.
 Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
 A failed or late first render gives 503 with **The Accounts page is not available.**
-A failed background render keeps the last good page and writes one line to stderr.
+A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
@@ -766,51 +829,71 @@ The render value's hover text shows the median of at most 10 successful renders.
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
+The **+ New item** button beside the title opens the shared Review dialog.
+The **To** field selects the List page owner from `page.list.owner` in `config/console.conf`.
+**Send** saves the native Review item and a linked List row for the recipient shown in **To**.
+The dialog keeps the draft key when it reopens after a failed send.
+A retry reuses the newest saved item whose original or current owner appears in **To**.
+For a different owner, the server uses the draft key and that owner to save a separate item once.
+The List refreshes and opens the new row after the server confirms the save.
+If a row save is in progress, the List refreshes when that save ends.
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
 Past times and past range end times use the same warning color as Check overdue.
-The default order uses `the_list.order`, which the CLI also uses.
+The ETA, next check, and parking time use the local date and time in the form Nov 20 09:00 EST.
+The Park picker uses this date form for the selected time.
+Active parking hides the next check.
+When parking ends, the row shows the current check.
+The server puts parked items after other items in the default order.
+Within each group, the List uses `the_list.order`.
 User decisions come first, then unread updates, then the earliest next check.
-A column button sorts its values; a second click reverses that order.
+The page uses the order from the latest server response.
+A column button sorts all matching items by its values.
+A second click reverses that order.
 
 The List starts with All selected in the Owner, Producer, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
+When the box contains text, it uses the same accent as a selected chip and shows the Clear filter button.
+Click Clear filter or press Escape in the box to remove the words.
+The other filters stay selected.
+The address stores the words as `q` and restores them on reload.
+The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
 An unread delivery release belongs to Needs me even if the question remains open.
-Morty answering includes other unparked items with an open question, including items that need Resend.
+Morty answering includes unparked items with an open question and no unread answer.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
-All excludes parked items and includes unparked Done items.
-The Unread only switch limits the visible items and chip counts to unread items.
+All includes every open item, including parked items and Done items.
+The State cell shows the parking end time or delivery condition under the saved state.
+The Unread only switch shows and counts unread items.
 Each chip count reflects the words box and the filters in the other rows.
+In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 The chip rows wrap when the available width decreases.
 
-The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
-They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
-Each button applies to all items that match the current filters.
-Each button applies the current text in the words box before it selects the items.
-Hidden items keep their open or closed state.
+Opening a row closes the previous row on both List and Review.
+The two pages use the same code to open a row.
+The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
 The table can change Show to All to reveal the target.
-A link to an item in Parked selects Parked.
+A direct link with no filters opens a parked item in All.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
 A missing target shows “Item #N is not on the List”.
 Changing a filter or the sort order clears this notice.
-Back restores the previous filters, open rows, and scroll position even when the address stays the same.
+Back restores the previous filters, open row, and scroll position even when the address stays the same.
 
 Each List record stores unique `ReviewItem.key` values in link order, without duplicates.
 `the_list.py link L<n> --review <id> [--review <id> ...] --source <who>` adds links.
@@ -848,29 +931,48 @@ An item without links shows no review line.
 The open row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
-Review links use the console place query, so the navigator remains visible.
-A card link opens and highlights that card in the full Review list.
-The link uses the current Review filters. The same jump rule applies to List and Review.
-If the filters hide the target, the jump sets Show and Owner to All.
-The jump also clears other filters that hide the target.
-The linked parked card stays visible while its details are open, including after reload.
-A successful action that closes the linked card removes its target from the address.
-Back restores the List search text, scroll position, and surviving open rows for that history entry.
-The List saves the search text that is in the box when the user clicks the link.
-The List removes stale filters after it restores the open rows.
-The browser tab keeps at most eight return records for up to one hour.
-Repeated Back navigation can use the same record until it expires or the tab removes it.
-Reload keeps the Review card open with the current filters.
-A summary for one available review opens its card in the full list.
-A summary for multiple available reviews selects those reviews through the All view.
-The Linked reviews chip clears that selection with one click.
-A summary without an available review shows plain text.
-If the linked card disappears after the List renders, Review shows a missing-card message.
+A review ID opens one card in a dialog on the List.
+A summary links to the card when exactly one review is available.
+A summary for zero or multiple available reviews is plain text.
+The List loads the card document only when the dialog opens.
+The existing Review body route supplies the summary, body, styles, and controls.
+The Review table uses the same card renderer and action code.
+The dialog reads a Done card on demand and shows it without actions.
+A Validating card lets the user ask the validator a question.
+If the record disappears, the dialog shows a message.
+Escape, Close, and a click outside the card close the dialog.
+Focus returns to the List link.
+The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
+On a desktop, the List centers the dialog.
+Switching browser tabs keeps the dialog and its draft.
+Changing console pages closes an idle dialog when it has no draft.
+The dialog preserves the List and Review addresses and filters.
+The dialog uses the Review save path for its actions.
+During a save, the dialog stays open and disables its buttons.
+A failed save keeps the draft and shows the reason.
+Review and the dialog use the same recovery code to load the current revision and keep the draft.
+The draft store uses the record key and tracks edits across form replacements.
+Recovery preserves edits made after the conflict, including cleared words.
+The recovery lock applies to the stale revision.
+After a save, Close, Escape, and a click outside work while the List refreshes.
+A completed refresh fades the card out and closes the dialog.
+A revision replacement fades the old card out and slides the new card in.
+Both transitions use the configured card durations and respect reduced motion.
+If the List request fails or times out, the next periodic refresh can update the row.
+List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
+Periodic and console visibility refreshes skip a pending List action.
+A refused List action restores the confirmed row and shows the reason.
+A refresh for a saved Review change or a new item waits until pending List actions end.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
 Linked counts use only the selected cards, including selected parked cards.
 The List number column and the Review ID column use the shared no-wrap rule.
+
+On desktop, the List sizes the Owner column to the widest owner name within the available space.
+Item and Next step share the remaining width in their original proportion.
+On desktop and phone, owner names wrap at hyphens first.
+A segment wraps within a word only if the segment exceeds the available width.
 
 The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
@@ -895,6 +997,8 @@ A short log has no scroll bar.
 On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
 The setting starts at 16 rem.
 Refresh keeps the first visible log entry at the same offset when new entries arrive.
+Refresh restores open Evidence Details by item and log entry before it restores the scroll position.
+Each Details summary has a stable ID based on its item and log entry so refresh can restore keyboard focus.
 A log at the top stays at the top to show the newest entry.
 The List keeps the position by item while a filter hides the row.
 The log restores that position when the row returns.
@@ -903,6 +1007,19 @@ The table and log use the same format for staff names, local ETAs, and field val
 The table, log, and Park response show parking times in the user zone.
 At local midnight, the label shows the date.
 The log uses plain field labels, such as Next step and Latest status.
+The List replays the log in record order to find the previous value of each field.
+Replay starts with the creation defaults for fields that Added omits, except the requester.
+If Added omits the requester, the first update that records it shows the value.
+New Added entries record the effective requester.
+Replay applies linked delivery, Close, and Reopen before it compares later updates.
+An Updated entry shows its time, source, and the fields that changed.
+An Updated entry compares Evidence lines with the last Evidence value that a field change recorded.
+The comparison ignores line endings.
+The entry shows new lines in order or shows “Not recorded” when the update clears Evidence.
+It omits Evidence in other updates with no new lines.
+Evidence cleanup entries remain in the log and do not affect this comparison.
+Added keeps all its recorded fields.
+The Evidence in Added and Updated starts inside a closed Details control.
 The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
 An old entry keeps its text if the reader cannot parse it.
 The reader requires the fields for each event.
@@ -951,8 +1068,9 @@ Tell morty shows “sent to morty; update remains unread” in both cases.
 Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
-The page uses the question and delivery code shared with Images.
-The server replies to the browser before it sends morty the item number, title, question, and answer command.
+List and Images share the code that saves and sends the question.
+After the server replies to the browser, it sends morty the item number, title, question, and answer command.
+The List uses the keeper as the recipient even when another producer owns the work.
 Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
 The row moves to Morty answering when the question saves.
@@ -960,18 +1078,16 @@ The row shows a waiting note when each unanswered question has a live sender or 
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
-The next List refresh shows the delivery notice and Resend when a question needs another send.
-An unknown result shows “Question Qn may not have reached morty.”
-The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
-Images shows the same reason when it cannot retry the question.
+The page shows “Question not delivered.” after a confirmed failure.
+List, Images, and Review use the same text.
 All attempts for one question use the same sender lock.
-A damaged delivery record keeps the question visible and cannot grant Resend while the lock is held.
-A released sender lock lets Resend proceed even if the previous process identity is unreadable.
-Resend uses the saved question, its ID, and the current recipient to repair a mismatched delivery record.
-The question reader checks the stored question words and answer command.
-A List title edit preserves the delivery state. Recovery sends the prepared message with its original title.
-Only an explicit Resend question action can retry that delivery on the List.
-Repeating the same signed resend request does not authorize another send.
+List, Images, and Review question sends use the same retry loop.
+An unconfirmed send keeps its saved message ID for the next attempt.
+The server retries unresolved attempts during recovery.
+If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
+The question reader checks the saved question words and answer command.
+A List title edit preserves the delivery state.
+Recovery sends the prepared message with its original title.
 If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
 After a failed POST restores the row, the List waits for the animation before it returns focus to the submit button.
 After a successful Ask keeps the row visible, the row toggle receives lost focus and keeps it through refresh.
@@ -981,7 +1097,7 @@ Column sort buttons keep focus through refresh.
 A waiting row shows “The producer will answer.”
 The panel shows each open question with its asked time and the linked review cards.
 An actively parked waiting row shows the parking condition and Unpark.
-A waiting row with an unread delivery release shows Mark read.
+A waiting row with an unread answer or delivery release shows Mark read.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
@@ -996,11 +1112,13 @@ The entry keeps the question ID, words, and time.
 The question no longer accepts answers or retries.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
-The check runs before the first send and each retry.
+List, Images, and Review use the same send loop.
+The loop checks the saved source before each attempt.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.
-Startup recovery skips Closed items.
+Recovery skips closed or answered questions.
+The server checks deferred questions again after the sender locks become free.
 A new Ask on a Closed item is refused.
 A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
@@ -1009,15 +1127,14 @@ A signed Unpark request from an earlier page can clear parking while the item wa
 That request moves the item to Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
-Opening an individual row with an unread answer uses the same signed read operation.
-The List sends this request after the text of each unread answer enters the viewport while the row is open.
-This rule also applies to direct links and to answers that appear in linked details after refresh.
-The tab and console frame must also be visible.
-Expand all leaves answers unread.
+Opening a row leaves its unread state and status chip unchanged.
+This rule also applies to direct links, refreshes, and reloads.
 A newer update stays unread if it arrives before the read saves.
-With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
-Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
+Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
+The List and Review use the same question color rule.
+An unread answer puts an unparked item in Needs me.
+Park until moves the item to Parked and preserves its unread state.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1030,9 +1147,11 @@ A job holds the question's sender lock from claim through result publication.
 The sender publishes `sending` before it calls the transport.
 The transport can confirm `sent`, `queued`, or `failed`.
 A missing confirmation leaves the outcome `unknown`.
-Recovery claims unsent work only after the shared question reader verifies the delivery.
-Recovery leaves uncertain outcomes for the user.
-An older pending attempt with no live sender appears as uncertain.
+Startup recovery verifies the saved question and claims work when the sender lock is free.
+If a sender stopped after it wrote the send marker, recovery reuses the same message ID.
+A closed item or a question that has an answer requires no send.
+The server clears that claim without a failure notice.
+If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
 **Unpark** and **Park until** sit at the right edge of the row.
@@ -1067,22 +1186,13 @@ It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
 If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
+After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
-A direct link to a parked item selects Parked.
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
-When morty records Delivered, the List writer clears this parking condition in the same write.
-The Review snapshot worker checks each snapshot after it publishes it.
-It checks linked change rows that the snapshot shows as ready for the user.
-Requests can use the published snapshot while the worker checks the parked items.
-The worker tries the List lock, the Review delivery lock, and the change list lock in that order.
-List Ask takes the List lock before the Review delivery lock.
-The worker skips a busy lock or unreadable change row and can retry after a later snapshot.
-List GET reads saved items and published question delivery records without the release locks.
-Console news reads the saved List records.
-The worker holds all three locks while it checks the current Review row and saves a release.
-The same parking event and link must still be current.
-The writer clears parking, sets Delivered, and marks the item unread.
-Both delivery signals save an Unparked event with the reason.
+The List ends this park automatically when the producer sets the item state to Delivered.
+The same write clears the park, marks the item unread, and records an Unparked event.
+Linked changes supply review information on the List.
+The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
@@ -1092,7 +1202,8 @@ The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove hides the item at once and closes it when the save succeeds.
-Park moves an item to Parked at once.
+Park moves an item to the parked group at once.
+The item stays visible in All if it matches the other filters.
 With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
@@ -1154,7 +1265,7 @@ It shows a save or send notice as soon as the user submits a form.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
-A refresh retains the search text, selection, focus, scroll position, open rows, and filters.
+A refresh retains the search text, selection, focus, scroll position, open row, and filters.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.
@@ -1167,7 +1278,6 @@ A refresh keeps the current counts until the next counts request succeeds.
 A refresh lets an active counts request finish.
 The response updates linked Review status only when the row version matches the request and the response.
 If a row starts waiting for linked Review status during a request, the List starts a follow-up when that request ends.
-`page_request_timeout_seconds` sets the request time limit.
 The counts strip uses the status line readers for questions, changes, and rebuilds.
 Each count links to its existing page.
 The strip omits proposals and efficiencies.
@@ -1269,7 +1379,7 @@ An agent deletes an image with this command:
 
 `/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
 The status line shows an action count or Unavailable.
-Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
+Each render checks whether the rebuild cache needs a refresh.
 The page combines the cached system comparison with open rebuild needs.
 The server serves it only in a folder that holds the browser manifest.
 It has no navigation entry; `?page=rebuilds` opens it.
@@ -1408,6 +1518,7 @@ An older row without Kind shows no kind line.
 The page shows every row with its recorded kind.
 
 The Review address is `/console/review.html`.
+A link can name a row by its key or by the ID the row shows.
 Each Change card shows its check text and recorded proof as plain paragraphs that keep their line breaks.
 A showrunner Answer on a Change or Investigation card, and a Reply on a Question card, show code blocks with a copy control.
 A code block is fenced code or a line that holds only one backtick span.
@@ -1582,14 +1693,15 @@ The server reads the owner and its production document at use through `StaffRout
 `ValidationRequested` keeps validation ownership and feedback after delivery or an alert.
 Only a showrunner answer returns an open question to the user.
 The page shows **Saved: <answer>**, **The showrunner will validate this**, or **The showrunner will answer this**.
-The page shows no delivery state, attention links, or resend buttons.
+The page shows “Question not delivered.” after a confirmed delivery failure.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
 Each page render reads `feedback_rows` once to set every feedback box's height.
 `delivery_tries` starts at 3; `delivery_pause_seconds` starts at 5.
 Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
-The server pauses once between rounds and retries only failed recipients.
+The server pauses once between rounds.
+For questions, it retries failed or unconfirmed sends.
 The showrunner receives its first attempt before any recipient receives a second attempt.
 Review uses the record and saved attempt to identify each message.
 Retries and recovery use the same key for each staff recipient.
@@ -1611,7 +1723,9 @@ If the showrunner is the failed recipient, the server records the failure withou
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
 Each saved alert has its own key.
-Recovery uses that key again if the server cannot clear an alert after sending it.
+Recovery reuses the alert key after an unconfirmed send or a failed clear.
+The server sends saved alerts outside the delivery lock.
+It takes the lock to clear an alert after confirmed acceptance or final failure.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
@@ -1670,10 +1784,12 @@ The setting starts at 8765.
 `--port` overrides the setting for one server run.
 
 Use `--list-fixture FOLDER` to serve a private List from an existing folder.
+The practice List opens the New item dialog with Send disabled.
 The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
 Open `/console/list.html` on the fixture port.
 Remove uses the normal List save path in the fixture store.
-The fixture serves only the List page and accepts only Remove.
+The fixture serves the List page and reads its New item recipients.
+Remove is the only action that the fixture accepts.
 The fixture omits counts from other pages.
 It skips message delivery, recovery, snapshot sweeps, and code restarts.
 The server checks the fixture folder before it checks the Tailscale address.
@@ -1682,6 +1798,14 @@ It exits with status 0 when the folder disappears.
 
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
+
+The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+These requests require a single `Host` header for the server's bound address and port.
+The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
+On port 80, the server also accepts either host without a port.
+If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
+A Go change (`POST /console/tune`) must supply `Origin` and the token.
+The server returns 403 when the host or origin check fails.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
@@ -1703,7 +1827,7 @@ The server reads the current settings when it needs them.
   A failed process replacement or new start exits 1, and the service manager starts the service again.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
 - `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.
-- A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
+- The server renders a published `changes.html` with a private manifest from the review record. A published console page, such as `memory_live.html`, gets HTTP 200 with no validator. For other regular files, it sends `ETag` and `Last-Modified` with HTTP 200 or 304. A matching `If-None-Match` gives HTTP 304. HTTP 200 also includes `Content-Type`, `Content-Length` and `X-Content-Type-Options: nosniff`.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
 

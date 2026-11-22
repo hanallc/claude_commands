@@ -6,7 +6,7 @@ from __future__ import annotations
 from scripts.buildlog import repository
 from scripts.lib import test_phase
 
-from scripts.build_queue import admission_records, placement, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records, memory_feed, placement, snapshot_codec as codec, step_estimator
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
 
@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sqlite3
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
@@ -146,7 +148,7 @@ def sample_anon_once(sidecar: Path, maximum: Path) -> subprocess.CompletedProces
     program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
     return subprocess.run(["bash", "-c", "buildlog_sample_anon() {" + program +
         '\n}\nsleep() { exit 0; }\nbuildlog_sample_anon "$1" "$2" "$$"',
-        "sampler-test", str(sidecar), str(maximum)], capture_output=True, text=True,
+        "sampler-test", str(sidecar), str(maximum)], env=verify_test_environment(), capture_output=True, text=True,
         timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
 
@@ -334,7 +336,7 @@ class CloudFinalizationTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             sidecar = fixture.root / "cloud.cgroup"
             _ = sidecar.write_text("")
-            request = replace(fixture.request(step="merge-gate"),
+            request = replace(fixture.request(step="gate"),
                 place=wire.CloudPlace("aws"), sidecar=str(sidecar))
             grant = only_admitted(fixture.server.handle_request(request))
             cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 16, 0, fixture.clock.now()))
@@ -1079,14 +1081,14 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_gate_history_remains_saved_without_entering_cargo_estimates(self) -> None:
         self.samples([3 * GIB] * 5, scope="full")
-        self.samples([20 * GIB] * 10, scope="full", step="merge-gate", indexed=False)
+        self.samples([20 * GIB] * 10, scope="full", step="gate", indexed=False)
         path = self.root / "admission/anon_peaks.jsonl"
         before = path.read_bytes()
         peak = step_estimator.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                   first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         self.assertEqual(peak, admission_records.ExpectedPeak(3 * GIB, "measured", 5))
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(sum(row["step"] == "merge-gate" for row in step_estimator.anonymous_history_rows(path)), 10)
+        self.assertEqual(sum(row["step"] == "gate" for row in step_estimator.anonymous_history_rows(path)), 10)
 
     def promise(self, filters: tuple[str, ...] = ("native_rate",), *,
                 repository: admission_records.RepositoryIdentity = HANA, package: str = "hana",
@@ -1798,15 +1800,19 @@ class RepositoryHistoryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
         cls.repository_seed = Path(temporary.name)
+        environment = verify_test_environment()
         for arguments in (("init", "-q"), ("config", "user.email", "test@example.org"),
                           ("config", "user.name", "Test"), ("config", "commit.gpgSign", "false"),
                           ("config", "core.hooksPath", "/dev/null")):
-            _ = subprocess.run(["git", "-C", str(cls.repository_seed), *arguments], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(cls.repository_seed), *arguments], env=environment,
+                               check=True, capture_output=True)
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
+        self.enterContext(patch.dict(os.environ, {
+            **verify_test_environment(), **fake_memory_readings(self.root),
+        }, clear=True))
         self.admission = self.root / "admission"
         self.admission.mkdir()
 
@@ -2410,15 +2416,15 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 class QueueLifetimeReaderTests(unittest.TestCase):
     def test_overlapping_gates_keep_sampled_unsampled_and_cancelled_lifetimes(self) -> None:
         with AdmissionFixture() as fixture:
-            first = fixture.request(step="merge-gate", need=2 * GIB, since=fixture.clock.now() - 10)
+            first = fixture.request(step="gate", need=2 * GIB, since=fixture.clock.now() - 10)
             first = replace(first, sidecar=str(fixture.scope(first.owner)))
             first_grant = only_admitted(fixture.server.handle_request(first))
             fixture.scoped_peak(first_grant, GIB)
             fixture.clock.advance(5)
-            second = fixture.request(step="merge-gate", need=3 * GIB, since=fixture.clock.now() - 3)
+            second = fixture.request(step="gate", need=3 * GIB, since=fixture.clock.now() - 3)
             second_grant = only_admitted(fixture.server.handle_request(second))
             fixture.free(0)
-            cancelled = fixture.request(step="merge-gate")
+            cancelled = fixture.request(step="gate")
             peer = fixture.connect(cancelled)
             self.assertIsInstance(peer.replies()[0], wire.Wait)
             fixture.clock.advance(4)
@@ -2433,7 +2439,7 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             self.assertEqual(set(lifetimes), {first.owner.pid, second.owner.pid, cancelled.owner.pid})
             sampled, unsampled, left = (lifetimes[request.owner.pid] for request in (first, second, cancelled))
             self.assertEqual((sampled.start_time, sampled.since, sampled.step),
-                             (first.owner.start_time, first.since, "merge-gate"))
+                             (first.owner.start_time, first.since, "gate"))
             self.assertEqual((sampled.memory_wait_s, unsampled.memory_wait_s), (10, 3))
             self.assertEqual(len(sampled.intervals), 1)
             self.assertEqual(len(unsampled.intervals), 1)
@@ -3556,17 +3562,17 @@ class ProgramProfileTests(MemoryQueueFixture):
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         self.assertFalse(history.exists())
         self.assertEqual(list(step_estimator.anonymous_history_rows(history)), [])
-        self.assertEqual(step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+        self.assertEqual(step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB),
                          admission_records.FirstProgramPeak(4 * GIB))
 
     def test_unfinished_rows_do_not_change_the_program_estimate(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         _ = history.write_text(json.dumps({
-            "step": "merge-gate", "host": "host", "anon_peak_bytes": 3 * GIB,
+            "step": "gate", "host": "host", "anon_peak_bytes": 3 * GIB,
             "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
         }) + "\n")
         assert_unfinished_history_ignored(
-            self, history, lambda: step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB))
+            self, history, lambda: step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB))
 
     @override
     def setUp(self) -> None:
@@ -3579,8 +3585,8 @@ class ProgramProfileTests(MemoryQueueFixture):
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         excluded = [
             {"step": "nextest", "host": "host", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
-            {"step": "merge-gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
-            {"step": "merge-gate", "host": "host", "anon_peak_bytes": 100 * GIB,
+            {"step": "gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
+            {"step": "gate", "host": "host", "anon_peak_bytes": 100 * GIB,
              "ended_at": store.utc_iso((NOW - timedelta(days=step_estimator.HISTORY_DAYS + 1)).timestamp())},
         ]
         cases: list[tuple[tuple[int, ...], int]] = [
@@ -3591,42 +3597,42 @@ class ProgramProfileTests(MemoryQueueFixture):
         for peaks, expected in cases:
             with self.subTest(peaks=peaks):
                 self.assertEqual(step_estimator.percentile(list(reversed(peaks))), expected)
-                rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": peak,
+                rows = [{"step": "gate", "host": "host", "anon_peak_bytes": peak,
                          "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
                         for peak in peaks]
                 _ = history.write_text("".join(json.dumps(row) + "\n" for row in [*rows, *excluded]))
-                self.assertEqual(step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+                self.assertEqual(step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB),
                                  admission_records.MeasuredProgramPeak(expected, len(peaks)))
 
     def test_expired_measured_gate_profile_retains_its_original_fallback_cap(self) -> None:
-        profile = admission_records.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+        profile = admission_records.ProgramProfile("gate", "installed/.claude", "checkout",
             admission_records.HistoryPeakSizing(4 * GIB, admission_records.MeasuredProgramPeak(GIB, 1),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
         with patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")):
-            result = step_estimator.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
+            result = step_estimator.step_estimate(["gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         self.assertEqual(result.profile.peak, admission_records.ExpectedPeak(4 * GIB, "fallback", 0))
         assert isinstance(result.profile, admission_records.ProgramProfile)
         self.assertEqual(result.profile.sizing.estimate, admission_records.FirstProgramPeak(4 * GIB))
         self.assertEqual((result.profile.repo, result.profile.step, result.profile.worktree),
-                         ("installed/.claude", "merge-gate", "checkout"))
+                         ("installed/.claude", "gate", "checkout"))
 
     def test_expired_gate_profile_refreshes_outside_lock_without_cargo_inference(self) -> None:
-        profile = admission_records.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+        profile = admission_records.ProgramProfile("gate", "installed/.claude", "checkout",
             admission_records.HistoryPeakSizing(4 * GIB, admission_records.FirstProgramPeak(4 * GIB),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
         def estimate(program: str, host: str, now: datetime, root: Path, cap: int, *,
                      share_percent: int | progress.ConfiguredPeakShare) -> admission_records.MeasuredProgramPeak:
-            self.assertEqual((program, cap, now, root), ("merge-gate", 4 * GIB, NOW, self.root))
+            self.assertEqual((program, cap, now, root), ("gate", 4 * GIB, NOW, self.root))
             self.assertIs(share_percent, progress.CONFIGURED_PEAK_SHARE)
             self.assertTrue(host)
             return admission_records.MeasuredProgramPeak(6 * GIB, 2)
         with patch.object(step_estimator, "program_peak_estimate", side_effect=estimate) as refreshed, \
              patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")), \
              patch.object(fcntl, "flock", side_effect=AssertionError("the estimate acquired an admission lock")):
-            result = step_estimator.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
+            result = step_estimator.step_estimate(["gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         refreshed.assert_called_once()
         self.assertEqual((result.profile.repo, result.profile.step, result.profile.worktree, result.profile.peak.bytes),
-                         ("installed/.claude", "merge-gate", "checkout", 6 * GIB))
+                         ("installed/.claude", "gate", "checkout", 6 * GIB))
         self.assertEqual(result.profile.estimated_at, NOW_EPOCH)
 
 
@@ -4071,6 +4077,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
         self.record = self.root / "expected-live-memory-reads.jsonl"
         (self.root / "proc").mkdir()
@@ -4339,12 +4346,30 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
 
+    def test_queue_identity_skips_unusable_names_before_the_environment_and_registry(self) -> None:
+        from scripts.message import session_records
+
+        for session, saved, exported, expected in (
+            ("", "unregistered session", "environment caller", "environment caller"),
+            ("fixture", "unregistered session", "", "registry caller"),
+            ("", "$CALLER", "—", "registry caller"),
+        ):
+            with self.subTest(session=session, saved=saved), \
+                    patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ())), \
+                    patch.object(gate, "environment_values", return_value={
+                        "CODEX_THREAD_ID": "fixture", "CLAUDE_SESSION_NAME": exported}):
+                reader = gate.QueueIdentityReader({123: gate.ProcessIdentity(1, "start")}, self.root / "proc")
+                reader.names["fixture"] = "registry caller"
+                identity = reader.identity(123, {"start_time": "start", "session_id": session, "session_name": saved,
+                                                "step": "nextest", "folder": "/private/widget"})
+                self.assertEqual((identity["session_id"], identity["session_name"]), ("fixture", expected))
+
     def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
         with patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
-            identity = admission_records.waiter_identity("merge-gate", "tree")
+            identity = admission_records.waiter_identity("gate", "tree")
             self.assertEqual(identity.get("unit"), "queue-unit")
             self.assertEqual(identity["session_id"], "showrunner")
-            self.assertEqual(gate.waiter_unit_name(identity, 123), "queue-unit")
+            self.assertEqual(gate.waiter_unit_name(identity), "queue-unit")
 
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
@@ -4547,7 +4572,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertEqual(gate.reservation_profile_key(first, "host"), gate.reservation_profile_key(second, "host"))
 
     def test_a_late_merge_gate_profile_lowers_only_the_remaining_keep_aside(self) -> None:
-        row = self.reservation("merge-gate", need=4 * GIB)
+        row = self.reservation("gate", need=4 * GIB)
         reading = admission_records.MeasuredMemory(9 * GIB, swap_bytes=5 * GIB,
             anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, reading, gate.AttributedStepUse(reading.anonymous, True),
@@ -4576,10 +4601,10 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 self.assertIn(f"build:1, {expected} done", gate.progress_text(reading))
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
-        first = self.reservation("merge-gate")
-        first["shape"] = gate.merge_gate_shape(["merge-gate"])
+        first = self.reservation("gate")
+        first["shape"] = gate.merge_gate_shape(["gate"])
         second: admission_records.Reservation = {**first, "worktree": "/another/gate"}
-        nightly: admission_records.Reservation = {**second, "shape": gate.merge_gate_shape(["merge-gate", "--type-dirs", "scripts"])}
+        nightly: admission_records.Reservation = {**second, "shape": gate.merge_gate_shape(["gate", "--type-dirs", "scripts"])}
 
         self.assertEqual(gate.reservation_profile_key(first, "host"),
                          gate.reservation_profile_key(second, "host"))
@@ -4657,6 +4682,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
             service.mkdir(parents=True)
             _ = (service / "memory.current").write_text(str(9 * GIB) + "\n")
             _ = (service / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\ninactive_file 0\n")
+            _ = (service.parent / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\n")
             _ = (service / "cgroup.procs").write_text("10\n11\n12\n13\n")
             proc = root / "proc"
             scope = "/cgroup/run-build.scope"
@@ -4671,12 +4697,75 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 _ = (folder / "status").write_text(f"VmRSS:\t{kib} kB\nRssAnon:\t{kib} kB\nRssShmem:\t0 kB\n")
             with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice")}):
                 reading, = gate.sccache_memory(proc)
+                (proc / "12" / "environ").unlink()
+                missing_environment, = gate.sccache_memory(proc)
+                _ = (proc / "12" / "environ").write_bytes(b"BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0")
+                status = proc / "12" / "status"
+                status.unlink()
+                status.mkdir()
+                unreadable_status, = gate.sccache_memory(proc)
+                step = admission_records.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
+                                                     unreadable_status, pid=10)
+                entry = admission_records.ExplainedRunningStep(
+                    step, admission_records.AdmissionTimeNotRecorded(), 0, 7 * GIB, 7 * GIB)
+                tools = memory_feed.build_tool_ram((entry,), queued_use=2 * GIB)
+            self.assertEqual(tools, memory_feed.BuildToolRam(rust_analyzer=0, sccache=6 * GIB, other=0))
             assert isinstance(reading, admission_records.CompilerServiceMemory)
             self.assertEqual(reading.pid, 10)
             self.assertEqual(reading.jobs, (
                 admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(4 * GIB)),
                 admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
             self.assertEqual(reading.bytes, 3 * GIB)
+            assert isinstance(missing_environment, admission_records.CompilerServiceMemory)
+            self.assertEqual(missing_environment.anonymous_source, admission_records.NoSource())
+            self.assertEqual(missing_environment.jobs, (
+                admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(3 * GIB)),
+                admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
+            self.assertEqual(missing_environment.bytes, 4 * GIB)
+            assert isinstance(unreadable_status, admission_records.CompilerServiceMemory)
+            self.assertEqual(unreadable_status.anonymous_source, reading.anonymous_source)
+            self.assertEqual(unreadable_status.bytes, 7 * GIB)
+            self.assertEqual(len(unreadable_status.jobs), 2)
+            self.assertIsInstance(unreadable_status.jobs[0].use, admission_records.RunUseUnavailable)
+            self.assertEqual(unreadable_status.jobs[1:], (reading.jobs[1],))
+
+    def test_sccache_reading_distinguishes_no_job_from_an_incomplete_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "builds.slice" / "sccache.service"
+            service.mkdir(parents=True)
+            _ = (service / "memory.current").write_text(str(GIB))
+            _ = (service / "memory.stat").write_text(f"anon {GIB}\nshmem 0\ninactive_file 0\n")
+            member = root / "proc" / "7"
+            member.mkdir(parents=True)
+            _ = (member / "comm").write_text("sccache\n")
+            environment = member / "environ"
+            _ = environment.write_bytes(b"HOME=/h\0")
+            members = service / "cgroup.procs"
+            _ = members.write_text("7\n")
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(service.parent)}):
+                complete, = gate.sccache_memory(member.parent)
+                environment.unlink()
+                missing_environment, = gate.sccache_memory(member.parent)
+                members.unlink()
+                missing_members, = gate.sccache_memory(member.parent)
+                members.mkdir()
+                unreadable_members, = gate.sccache_memory(member.parent)
+            self.assertEqual(complete, admission_records.CompilerServiceMemory(GIB, pid=7,
+                anonymous_source=admission_records.ScopeSource(service, frozenset({7}))))
+            step = admission_records.RunningStep("", "sccache.service", "compile", "builds.slice", 0, complete, pid=7)
+            inputs = replace(self.inputs((), ()), running=(step,))
+            captured = gate.queue_read_from(inputs, admission_policy_fixture())
+            self.assertEqual(captured.explanation.decided_from.running, (step,))
+            self.assertEqual(captured.view.running, (
+                replace(step, measured=admission_records.CompilerServiceMemory(GIB, pid=7)),))
+            for name, reading, pid in (
+                ("missing environment", missing_environment, 7),
+                ("missing members", missing_members, admission_records.PidNotRecorded()),
+                ("unreadable members", unreadable_members, admission_records.PidNotRecorded()),
+            ):
+                with self.subTest(name=name):
+                    self.assertEqual(reading, admission_records.CompilerServiceMemory(GIB, pid=pid))
 
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))
@@ -4721,7 +4810,7 @@ class ProcessRunUseTests(unittest.TestCase):
             _ = path.write_text(scope)
             sidecar = str(path)
         row: dict[str, object] = {
-            "pid": pid, "start_time": str(pid), "need": need, "repo": "test", "step": "merge-gate",
+            "pid": pid, "start_time": str(pid), "need": need, "repo": "test", "step": "gate",
             "worktree": "/tmp/fixture", "sidecar": sidecar,
             "admitted_at": store.utc_iso(self.fixture.clock.now() - 180),
             "test_threads": None, "call_id": None, "reservation_id": name,
@@ -4955,12 +5044,12 @@ class ProcessRunUseTests(unittest.TestCase):
     def test_merge_gate_context_holder_without_a_scope_gets_a_cap_value(self) -> None:
         from scripts.build_queue.queue_place import queue_place
 
-        self.fixture.configure(**{"program_first_peak_gib.merge-gate": 6})
+        self.fixture.configure(**{"program_first_peak_gib.gate": 6})
         pid = os.getpid()
         owner = self.fixture.fixture_owner(pid, str(pid))
         self.process(pid, parent=1, resident=4 * GIB, anonymous=2 * GIB, swap=GIB)
         with patch.object(admission_records, "process_start_time", return_value=owner.start_time), self.fixture.serving():
-            with queue_place("merge-gate", self.fixture.root):
+            with queue_place("gate", self.fixture.root):
                 with self.fixture.loop_turn():
                     _ = self.fixture.run_pass()
                     records = list(self.fixture.server.reservations.values())
@@ -4968,7 +5057,7 @@ class ProcessRunUseTests(unittest.TestCase):
                     record = records[0]
                     path, row = Path(record.path), service.reservation_row(record)
                     self.assertEqual(row["pid"], pid)
-                    self.assertEqual(row["step"], "merge-gate")
+                    self.assertEqual(row["step"], "gate")
                     self.assertEqual(Path(row["sidecar"]).read_text(), "")
                     reading = gate.reservation_memory(path, row,
                         datetime.fromtimestamp(self.fixture.clock.now(), UTC),
@@ -5039,6 +5128,67 @@ class ProcessMemoryTests(unittest.TestCase):
                 self.assertIsInstance(result.rows[0].blocker, gate.NoSingleBlocker)
 
 
+class ValidateCIAdmissionTests(SeededExampleWorkspaceFixture):
+    def test_validate_ci_passes_the_showrunner_session_to_nextest(self) -> None:
+        from scripts.build_queue.admission_test_support import caller_admission
+        from scripts.production import staff
+
+        _ = self.package("fixture")
+        git = self.root / "stubs/git"
+        git_commands = (
+            '    *" diff "*|*" ls-files "*|*" ls-tree "*|*" read-tree "*|*" add -A "*) : ;;',
+            '    *" write-tree "*) printf "fixed-tree\\n" ;;',
+            '    *"rev-parse --git-path "*) printf "%s/%s\\n" "$PACKAGE_ROOT" "$3" ;;',
+        )
+        _ = git.write_text(git.read_text().replace(
+            '    *" ls-tree "*) : ;;', "\n".join(git_commands)))
+        session = staff.StaffId("b6374931-fe3a-4f6d-96b7-ad20415a8346")
+        runner = staff.StaffRow(session, "showrunner", "spacetime", staff.StaffRoot(), current_session=session)
+        _ = Path(self.environment["STAFF_FILE"]).write_text(json.dumps({"schema": 2, "rows": [runner.to_json()]}))
+        cargo = self.root / "stubs/cargo"
+        _ = cargo.write_text("""#!/bin/sh
+if [ "$1" = metadata ]; then
+    printf '%s\n' "$TEST_METADATA"
+else
+    printf '%s\n' "$*" >> "$CARGO_CALLS"
+fi
+""")
+        taplo = self.root / "stubs/taplo"
+        _ = taplo.write_text("#!/bin/sh\nexit 0\n")
+        taplo.chmod(0o755)
+        lint_config = self.root / ".claude/scripts/lint/lint_config.sh"
+        _ = lint_config.write_text('lint_config_enabled() { [ "$1" != mend ]; }\n'
+                                    + 'lint_config_skip_notice() { :; }\n')
+        self.environment.update({
+            "TEST_METADATA": json.dumps(workspace_metadata(self.root)), "VALIDATE_QUICK": "0",
+            "BUILDLOG_OFF": "0", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": "",
+            "CLAUDE_CODE_SESSION_ID": session, "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "spacetime",
+            "CARGO_TARGET_DIR": str(self.root / "target"),
+            "LINT_SKIP_SWEEP": "1", "BUILDLOG_SYNC": "1",
+        })
+        fixture = caller_admission(self, self.root, self.environment)
+        observed: dict[str, tuple[str, str, str]] = {}
+
+        def capture(reply: wire.Reply) -> wire.Reply:
+            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
+            if isinstance(grant, wire.Admitted):
+                reservation, = (record for record in fixture.server.reservations.values()
+                                 if record.reservation_id == grant.reservation)
+                if reservation.step == "nextest":
+                    row = reservation.queue_waiter
+                    observed[grant.reservation] = (row.get("session_id", ""), row.get("session_name", ""), row.get("unit", ""))
+            return reply
+
+        fixture.server.reply_filter = capture
+        validate = Path(__file__).resolve().parents[1] / "validate_and_push/validate_ci.sh"
+        result = subprocess.run(["bash", str(validate)], cwd=self.root, env=self.environment, capture_output=True,
+                                text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        nextest, = [line.split() for line in self.calls.read_text().splitlines() if line.startswith("nextest run ")]
+        self.assertEqual(nextest[-3:], ["--workspace", "--all-features", "--tests"])
+        self.assertEqual(list(observed.values()), [(session, "spacetime", "")])
+
+
 class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
     def test_detached_verify_cargo_and_lint_steps_ask_the_private_queue(self) -> None:
         _ = self.package("sample")
@@ -5074,12 +5224,16 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             return reply
 
         admission.server.reply_filter = capture
-        for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
-            with self.subTest(command=command):
+        cases = (("check", ("--no-cache",), "check", ""), ("lint", ("--check",), "clippy", ""),
+                 ("check", ("--no-cache",), "check", str(self.root / "outer-copy")),
+                 ("lint", ("--check",), "clippy", str(self.root / "outer-copy")))
+        for command, options, step, enclosing_copy in cases:
+            with self.subTest(command=command, enclosing_copy=enclosing_copy):
                 grants.clear()
                 observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
-                    env=self.environment, start_new_session=True, capture_output=True, text=True,
+                    env={**self.environment, "COPIES_STEP_SOURCE": enclosing_copy},
+                    start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual([grant[0] for grant in grants], [step])
@@ -5093,6 +5247,7 @@ class ShellTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, verify_test_environment(), clear=True)))
         self.admission = self.enterContext(AdmissionFixture())
         self.admission.clock.epoch = time.time()
         _ = self.enterContext(self.admission.serving())
@@ -5239,7 +5394,12 @@ class ShellTests(unittest.TestCase):
     def test_launch_wait_limit_refuses_without_a_reservation(self) -> None:
         self.admission.free(0)
         self.admission.hold_starts()
-        result = self.shell('buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1")
+        client_script = self.admission.root / "clocked-queue-client.py"
+        _ = client_script.write_text("from __future__ import annotations\nimport sys\n"
+            + inspect.getsource(queue_leave_client_main) + "\nsys.exit(queue_leave_client_main(sys.argv[1:]))\n")
+        result = self.shell('BUILDLOG_QUEUE_PLACE_SCRIPT="$TEST_QUEUE_CLIENT"; '
+            + 'buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1",
+            TEST_QUEUE_CLIENT=str(client_script), PYTHONPATH=str(Path(__file__).resolve().parents[2]))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
@@ -5349,17 +5509,19 @@ class ShellTests(unittest.TestCase):
         for contents in ("", "MemTotal: 67108864 kB\n"):
             with self.subTest(contents=contents):
                 _ = path.write_text(contents)
-                result = self.shell('buildlog_wait_for_memory "$@"; printf "step started\\n"')
+                result = self.shell('buildlog_wait_for_memory "$@"; printf "step started\\n"',
+                    BUILDLOG_MEM_CHECK_RETRY_S="2")
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertIn(f"memory admission check failed (cannot read MemAvailable from {path}); step refused", result.stderr)
 
 
 def queue_leave_client_main(argv: list[str]) -> int:
-    """Advance the client clock at its first held answer."""
+    """Advance the client clock when the service sends its first wait reply."""
+    import os
     import time
     from unittest.mock import patch
-    from scripts.build_queue import admission_client as client, admission_records, queue_place
+    from scripts.build_queue import admission_client as client, queue_place
 
     class HeldWaitClock:
         def __init__(self) -> None:
@@ -5377,16 +5539,28 @@ def queue_leave_client_main(argv: list[str]) -> int:
 
     clock = HeldWaitClock()
     report = client.WaitOutput.__call__
-    advanced = False
+    start_schedule = client.AcquisitionRetry.start_leave_schedule
+    leave_at = float("inf")
+    first_wait = False
+
+    def record_leave_deadline(retry: client.AcquisitionRetry, interval: float) -> None:
+        nonlocal leave_at
+        start_schedule(retry, interval)
+        leave_at = retry.next_leave
 
     def held(output: client.WaitOutput, reply: wire.Wait) -> None:
-        nonlocal advanced
+        nonlocal first_wait
         report(output, reply)
-        if not advanced:
-            clock.elapsed += admission_records.read_memory_config().running_pass_seconds
-            advanced = True
+        if first_wait:
+            return
+        first_wait = True
+        if argv[0] == "launch":
+            clock.elapsed += int(os.environ["BUILDLOG_MEM_WAIT_LIMIT_S"])
+        elif leave_at != float("inf"):
+            clock.elapsed = leave_at
 
-    with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
+    with (patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held),
+          patch.object(client.AcquisitionRetry, "start_leave_schedule", record_leave_deadline)):
         return queue_place.main(argv)
 
 
@@ -5428,22 +5602,35 @@ class QueueLeaveTests(unittest.TestCase):
         _ = (scripts / "buildlog/step_context.py").write_text((scripts / "buildlog/record.py").read_text())
         config = self.root / "config.sh"
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
-        self.environment = {**os.environ, **gate_isolation_environment(self.root),
+        self.environment = {**verify_test_environment(), **gate_isolation_environment(self.root),
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
                             "LINT_CONFIG_READER": str(config),
                             # No jobserver pool unless a case makes one: test runs take no tokens.
                             "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}"}
-        _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission.configure(wait_reply_seconds=0.1, running_pass_seconds=5)
+        handle_request = self.admission.server.handle_request
+
+        def save_width(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                       ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            # Save the new width before Cargo can read the private state file.
+            if isinstance(request, wire.WidthRequest):
+                self.admission.server.persist()
+            return replies
+
+        _ = self.enterContext(patch.object(self.admission.server, "handle_request", side_effect=save_width))
         capture = self.root / "capture-width.py"
-        _ = capture.write_text("import json\nfrom scripts.build_queue import admission_client as client\n"
+        _ = capture.write_text("import json\nimport os\nfrom pathlib import Path\n"
             + "from scripts.build_queue.admission_records import RequestedTestWidth\n"
-            + "row, = client.view().explanation.reservations\n"
-            + "width = row['test_threads']\nassert isinstance(width, RequestedTestWidth)\n"
+            + "from scripts.build_queue.admission_service import read_state\n"
+            + f"record, = read_state(Path({str(self.admission.state_dir)!r})).reservations.values()\n"
+            + "reservation_id, _, _ = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t')\n"
+            + "assert record.reservation_id == reservation_id\n"
+            + "width = record.test_width\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
         queue_client = self.root / "queue-client.py"
         _ = queue_client.write_text("from __future__ import annotations\nimport sys\n"
@@ -5458,7 +5645,7 @@ class QueueLeaveTests(unittest.TestCase):
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
         self.admission.free(0)
         self.admission.hold_starts()
-        environment = dict(self.environment)
+        environment = {name: value for name, value in self.environment.items() if name != "NEXTEST_TEST_THREADS"}
         if hook is not None:
             environment["LINT_QUEUE_LEAVE_HOOK"] = f'echo poll >> "{self.calls}"; {hook}'
         waits = 0
@@ -5518,12 +5705,15 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(self.recorder_actions(), ["step-context", "step"])
 
     def test_declining_hook_and_no_hook_wait_alike(self) -> None:
-        free_on_second = 'if (( sleeps == 2 )); then printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi;'
+        # Keep the grant pending until the client calls the hook.
+        free_after_wait = ('if (( sleeps >= 2 )) && '
+            f'[[ -z ${{LINT_QUEUE_LEAVE_HOOK:-}} || -e {shlex.quote(str(self.calls))} ]]; '
+            'then printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi;')
         outputs: list[tuple[str, list[str]]] = []
         for hook in ("exit 1", None):
             with self.subTest(hook=hook):
                 self.ran.unlink(missing_ok=True)
-                result = self.run_step(hook, free_on_second)
+                result = self.run_step(hook, free_after_wait)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(self.ran.exists())
                 self.assertEqual(self.reservations(), [])
@@ -5550,9 +5740,19 @@ class QueueLeaveTests(unittest.TestCase):
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
         with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
             _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
-        pool, calls = self.root / "pool", self.root / "cargo-calls"
-        ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
-        listing = self.root / "test-list.json"
+        for inherited_width in ("", "1"):
+            with self.subTest(inherited_width=inherited_width), patch.dict(self.environment):
+                case = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
+                if inherited_width:
+                    self.environment["NEXTEST_TEST_THREADS"] = inherited_width
+                elif "NEXTEST_TEST_THREADS" in self.environment:
+                    del self.environment["NEXTEST_TEST_THREADS"]
+                self.assert_waiting_run_reserves_token_width(case)
+
+    def assert_waiting_run_reserves_token_width(self, case: Path) -> None:
+        pool, calls = case / "pool", case / "cargo-calls"
+        ran_args, reservation, waited = case / "args", case / "reservation", case / "waited"
+        listing = case / "test-list.json"
         _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
             f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
         }}}}), encoding="utf-8")
@@ -5560,7 +5760,7 @@ class QueueLeaveTests(unittest.TestCase):
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
         _ = os.write(keeper, bytes(6))
-        bin_dir = self.root / "bin"
+        bin_dir = case / "bin"
         bin_dir.mkdir()
         cargo = bin_dir / "cargo"
         _ = cargo.write_text("#!/usr/bin/env bash\n"
@@ -5572,13 +5772,13 @@ class QueueLeaveTests(unittest.TestCase):
         cargo.chmod(0o755)
         self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
-        self.environment["TMPDIR"] = str(self.root)
+        self.environment["TMPDIR"] = str(case)
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"], result.stdout + result.stderr)
         # The memory wait ends before the build. The build ends before the launcher takes tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
         self.assertEqual(calls.read_text().splitlines(), [

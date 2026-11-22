@@ -74,6 +74,81 @@ class TheListTests(unittest.TestCase):
         return the_list.add(MORTY.id, title, owner=RUNNER.id, source="nate", number=number,
                             changes=changes if changes is not None else {})
 
+    def test_log_field_changes_replays_linked_delivery(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        delivered = the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered("sdlc/C1"))
+        update = the_list.FieldChange("Updated", {"state": the_list.ItemState.DELIVERED, "next_step": "Read the page."})
+        item = replace(item, log=(*item.log, the_list.ItemChange(START, delivered, "the List"),
+                                  the_list.ItemChange(START, update, "morty")))
+        self.assertEqual(list(the_list.log_field_changes(item))[-2:], [{}, {"next_step": "Read the page."}])
+
+    def test_log_field_changes_replays_legacy_reopened(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + '\n- 2026-11-16 18:10:00+00:00 Closed: Done. — nate\n'
+            + '- 2026-11-16 18:20:00+00:00 Reopened — nate\n'
+            + '- 2026-11-16 18:30:00+00:00 Updated state: "New"; next_step: "Read the page." — morty\n')
+        restored = the_list.load(MORTY.id, item.id)
+        self.assertEqual(list(the_list.log_field_changes(restored))[-1], {"next_step": "Read the page."})
+
+    def test_log_field_changes_replays_the_saved_requester(self) -> None:
+        for requester in the_list.RequestedBy:
+            with self.subTest(requester=requester):
+                item = the_list.add(MORTY.id, "Track the requester", owner=RUNNER.id, source="nate",
+                                    requested_by=requester, changes={})
+                _ = the_list.update(MORTY.id, item.id, {"requested_by": requester, "next_step": "Read the page."},
+                                    source="morty")
+                added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+                self.assertEqual(added["requested_by"], requester)
+                self.assertEqual(updated, {"next_step": "Read the page."})
+
+    def test_log_field_changes_uses_defaults_for_fields_that_legacy_added_omits(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated evidence: "" — morty\n')
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added, {"title": item.title})
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_only_the_append_after_legacy_evidence_cleanup(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nMigration copy."})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + "\n- 2026-11-16 18:10:00+00:00 Removed the migration copy of checkins.json from Evidence — morty\n"
+            + r'- 2026-11-16 18:20:00+00:00 Updated evidence: "Keep this line.\nAppended line." — morty' + "\n")
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{}, {"evidence": "Appended line."}])
+
+    def test_log_field_changes_shows_only_added_evidence_lines_in_order(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nRemove this line."})
+        _ = the_list.update(MORTY.id, item.id,
+                            {"evidence": "First addition.\nKeep this line.\nSecond addition."}, source="morty")
+        updated = the_list.update(MORTY.id, item.id, {"evidence": "Keep this line."}, source="morty")
+        changes = list(the_list.log_field_changes(updated))
+        self.assertEqual(changes[1:], [{"evidence": "First addition.\nSecond addition."}, {}])
+
+    def test_log_field_changes_ignores_evidence_line_ending_changes(self) -> None:
+        item = self.add(changes={"evidence": "First line.\r\nSecond line.\r\n"})
+        _ = the_list.update(MORTY.id, item.id, {"evidence": "First line.\nSecond line.\n"}, source="morty")
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added["evidence"], "First line.\r\nSecond line.\r\n")
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_the_first_requester_after_legacy_added_omits_it(self) -> None:
+        item = self.add(changes={"requested_by": the_list.RequestedBy.DWIGHT})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated requested_by: "nate" — morty\n'
+            + '- 2026-11-16 18:20:00+00:00 Updated requested_by: "nate" — morty\n')
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{"requested_by": the_list.RequestedBy.NATE}, {}])
+
     def test_commands_preserve_fields_text_and_history(self) -> None:
         content = "Use the result.\r\n\n\n## Latest status\n\nThis heading stays in the text.\n"
         self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
@@ -351,6 +426,18 @@ class TheListTests(unittest.TestCase):
         self.assertEqual([call.args[0][2:8] for call in send.call_args_list],
                          [["--to", OTHER.id, "--recipient-kind", "producer", "--from", "morty"],
                           ["--to", RUNNER.id, "--recipient-kind", "showrunner", "--from", "morty"]])
+
+    def test_assignment_accepts_a_showrunner_notice_held_for_review(self) -> None:
+        item = self.add()
+        self.send_patch.stop()
+        with patch.object(subprocess, "run", side_effect=(
+            subprocess.CompletedProcess([], 0, "SENT: delivered\n", ""),
+            subprocess.CompletedProcess([], 0, "KEPT: showrunner is in a review; delivered at its end\n", ""),
+        )) as send:
+            result = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual(result, (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+        self.assertEqual([call.args[0][3] for call in send.call_args_list], [OTHER.id, RUNNER.id])
 
     def test_assignment_notifies_showrunner_if_the_producer_retires_after_save(self) -> None:
         item = self.add()
@@ -1040,8 +1127,6 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.close(MORTY.id, item.id, closed.closing_words, source="nate"), closed)
         self.assertEqual(self.command("answer", item.id, "--question", "Q2", "--text", "The report."),
                          (1, "", "the_list: Unknown question id.\n"))
-        self.assertIsInstance(the_list.resend_question(MORTY.id, item.id, "Q2", "retry", status),
-                              change_page.NoMessageDelivery)
         self.assertIsInstance(the_list.ask_question(MORTY.id, item.id, pending, status),
                               change_page.NoMessageDelivery)
         with self.assertRaisesRegex(question_record.AnswerRefused, "This item is Closed"):
@@ -1051,23 +1136,30 @@ class TheListTests(unittest.TestCase):
             list_page.deliver(list_page.ListQuestionDelivery(sent, status))
             change_page.deliver(claimed, status)
             path = status.path(claimed.page, claimed.row)
-            change_page.recover_page_question(status, path, change_page.read_question_attempt(path))
+            closed_attempt = change_page.read_question_attempt(path)
+            self.assertIs(closed_attempt.state, delivery_state.QuestionSendState.UNKNOWN)
+            self.assertIsInstance(closed_attempt.owner, delivery_state.NoQuestionSendOwner)
+            self.assertEqual(closed_attempt.error, "")
+            change_page.recover_page_question(status, path, closed_attempt)
             send.assert_not_called()
         _ = the_list.reopen(MORTY.id, item.id, source="nate")
         _ = the_list.ask_question(MORTY.id, item.id, replace(pending, request="new"), status)
         self.assertEqual([question.question_id for question in the_list.load(MORTY.id, item.id).questions],
                          ["Q1", "Q3"])
 
-    def test_close_stops_question_retries_and_retains_the_transport_result(self) -> None:
+    def test_close_stops_question_retries_and_keeps_confirmed_acceptance(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
-        for expected in (delivery_state.QuestionSendState.SENT, delivery_state.QuestionSendState.FAILED):
-            with self.subTest(outcome=expected):
+        state = delivery_state.QuestionSendState
+        cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
+            ("sent", state.SENT), ("failed", state.UNKNOWN), ("pending", state.UNKNOWN),
+        )
+        for outcome, expected in cases:
+            with self.subTest(outcome=outcome):
                 item = self.add()
                 delivery = the_list.ask_question(MORTY.id, item.id,
                     the_list.PageRequest("ask", "question", "Which check passed?"), status)
                 assert isinstance(delivery, change_page.PageQuestionSend)
-                header = send_result.OutcomeHeader(
-                    "sent" if expected is delivery_state.QuestionSendState.SENT else "failed", "Test result", "")
+                header = send_result.OutcomeHeader(outcome, "Test result", "")
 
                 def close_during_send(*_args: object) -> tuple[send_result.ConfirmedSendOutcome, str]:
                     _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
@@ -1081,7 +1173,12 @@ class TheListTests(unittest.TestCase):
                 send.assert_called_once()
                 alert.assert_not_called()
                 path = status.path(delivery.page, delivery.row)
-                self.assertEqual(change_page.read_question_attempt(path).state, expected)
+                saved = change_page.read_question_attempt(path)
+                self.assertEqual(saved.state, expected)
+                self.assertIsInstance(saved.owner, delivery_state.NoQuestionSendOwner)
+                self.assertFalse(saved.earlier_unconfirmed)
+                self.assertEqual(saved.error, "")
+                self.assertFalse(status.has_deferred_questions())
 
     def test_retry_read_error_preserves_the_confirmed_failure(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
@@ -1468,6 +1565,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
                              (0, "", ""))
             delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
             self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual(delivered.unread_since, START + timedelta(days=30))
             self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))

@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Source this file from the statusLine command with statusline set to this folder.
 # Read the account, colors, zone, and quota labels with shell builtins.
-# assignment.py reads the assignment and counts, then replaces itself with jq.
+# assignment.py reads the action count and renders the status line.
 
 if [ -n "${CONF_READ_LOG:-}" ]; then
   # shellcheck source=/dev/null
@@ -44,16 +44,8 @@ export TZ="${zone:-America/New_York}"
 # NixOS's glibc finds zone files only through TZDIR; a bare environment would get UTC.
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
-# The Mac uses the console host's action count.
-case $(uname -s) in
-  Darwin) action_source=--for-you-console ;;
-  *) action_source=--for-you ;;
-esac
-for_you_count=$(STAFF_FILE="$staff" "$statusline/../lib/py" --isolated "$statusline/counts_row.py" "$action_source") ||
-  for_you_count=unavailable
-
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
-STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" -r --arg pwd "$PWD" --arg account "$account" \
-  --arg for_you "$for_you_count" --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
+STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" \
+  -r --arg pwd "$PWD" --arg account "$account" --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

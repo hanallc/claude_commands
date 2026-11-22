@@ -45,7 +45,7 @@ Each producer loads the common command and reads its job and current work from i
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
 | `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:produce` | Manages the user's personal notes and task list. |
+| `brain` | `producer` | `/producer:produce` | Does the Obsidian operations in the user's personal vault and in the hanadocs vault, and produces its List items for vault, security and accounts work. |
 | `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
@@ -106,6 +106,10 @@ Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) pub
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.
 A row lock protects one member during a worker change.
+The process that takes the lock records its PID and command in the lock file.
+The process clears its record before it releases the lock.
+A joined child leaves that record intact.
+The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
@@ -148,6 +152,7 @@ The shared pane launch builder uses `set_home`.
 | `docs/as-built/session-notifier.md` | write | staff.py clear-run (documented shell command) |
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
+| `scripts/accounts/move_test_support.py` | read | StaffId (fixture type) |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
@@ -172,12 +177,14 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
 | `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
 | `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
+| `scripts/build_queue/snapshot_codec.py` | read | StaffSnapshot, StaffId, by_id; resolves a stored caller staff id to its current name from the snapshot a reader supplies |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
+| `scripts/direct/pass_record.py` | read | StaffRow, StaffSnapshot, StaffId, SessionHome, WorktreeUnfilled, ReportsTo, initial_snapshot, by_id |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
@@ -189,6 +196,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
+| `scripts/direct/verify_hold_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
+| `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
@@ -210,6 +219,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
+| `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |
@@ -258,8 +268,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/ci_points.py` | read | Production.owner.id |
 | `scripts/production/fast_track.py` | read | copies.source_owner |
 | `scripts/production/waiting.py` | read | Production.owner.id |
+| `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
-| `scripts/production/merge_gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
@@ -332,6 +343,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
+| `scripts/agents/set_model.py` | read | initial_snapshot and active select members by role. by_id checks each member's current conversation on the peer. |
 | `scripts/agents/shutdown.py` | write | initial_snapshot, pause, exit, resume, set_hold |
 | `scripts/agents/shutdown_record.py` | read | snapshot |
 | `scripts/agents/stop_results.py` | read | StaffRow and backend types (type check only) |
@@ -342,6 +354,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
+| `scripts/style/crate_run.py` | read | local_snapshot, owner_of; worktree_names names the unit of a crate run |
 | `scripts/style/ledger_test_support.py` | write | apply_seed, initial_snapshot, set_doc |
 | `scripts/style/selection_capture.py` | read | record_path copies staff.json into a capture |
 | `scripts/style/style_config.py` | read | StaffRow, StaffSnapshot.find, StaffSnapshot.parent_of, LiveDoc, WrappedDoc |
@@ -361,7 +374,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-192 accessor rows: 40 write, 151 read, 1 owner.
+222 accessor rows: 41 write, 180 read, 1 owner.
 
 ## Approved copies
 

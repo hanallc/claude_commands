@@ -18,13 +18,13 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 from scripts.buildlog import store, parse
@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 45
 
 
 # These indexes support repeated queries over the current schema.
@@ -161,6 +161,7 @@ STEP_COLUMNS: list[Column] = [
     ("tests_skipped", "INTEGER", "skipped"),
     ("tests_flaky", "INTEGER", "passed on a retry"),
     ("tests_retried", "INTEGER", "tests that took more than one attempt"),
+    ("observed_tests", "TEXT", "JSON test names by nextest binary ID and whether all results appeared"),
     ("mend_fixes", "INTEGER", "fixes 'mend: applied' reports; 0 when none were available"),
     ("mend_check_s", "REAL", "mend's cargo check time"),
     ("mend_s", "REAL", "mend's own analysis time"),
@@ -194,7 +195,7 @@ TEST_COLUMNS: list[Column] = [
 
 GATE_RUN_COLUMNS: list[Column] = [
     ("vcpus", "INTEGER", "vCPU count; absent for old records"),
-    ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
+    ("step", "TEXT", "test-affected or gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
@@ -415,6 +416,20 @@ SAMPLE_COLUMNS: list[Column] = [
     ("zram", "TEXT", "JSON zram storage at the sample time"),
 ]
 
+SCCACHE_SAMPLE_COLUMNS: list[Column] = [
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "machine's short host name"),
+    ("at", "TEXT", "UTC ISO sample time"),
+    ("boot_id", "TEXT", "kernel boot ID for the server start time"),
+    ("server_started_us", "INTEGER", "service main process start in microseconds since boot"),
+    ("rust_compile_requests", "INTEGER", "Rust cache hits plus misses since server start"),
+    ("rust_hits", "INTEGER", "Rust cache hits since server start"),
+    ("rust_misses", "INTEGER", "Rust cache misses since server start"),
+    ("rust_hit_rate", "REAL", "Rust hit fraction since server start; NULL without requests"),
+    ("cache_size", "INTEGER", "cache disk use in bytes; NULL when unavailable"),
+    ("max_cache_size", "INTEGER", "cache capacity in bytes; NULL when unavailable"),
+]
+
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "machine's short host name"),
@@ -501,7 +516,7 @@ SSH_ATTEMPT_COLUMNS: list[Column] = [
 
 TABLES: dict[str, tuple[list[Column], str, str]] = {
     "gate_runs": (
-        GATE_RUN_COLUMNS, "", "one row per targeted-test or merge-gate run",
+        GATE_RUN_COLUMNS, "", "one row per test-affected or gate run",
     ),
     "gate_suites": (GATE_SUITE_COLUMNS, "PRIMARY KEY (run_id, suite)", "one row per gate suite"),
     "gate_modules": (
@@ -532,6 +547,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
+    "sccache_samples": (SCCACHE_SAMPLE_COLUMNS, "", "one hourly sccache reading; counters reset on restart"),
     "memory_snapshots": (MEMORY_SNAPSHOT_COLUMNS, "", "slice and zram counters at a requested instant"),
 }
 
@@ -707,6 +723,7 @@ def schema_statements() -> list[str]:
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
     statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
+    statements.append("CREATE INDEX sccache_samples_host_at ON sccache_samples (host, at)")
     statements.append("CREATE INDEX memory_snapshots_at ON memory_snapshots (at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
@@ -903,6 +920,10 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
     return CargoBuildKey(json.dumps(base, sort_keys=True, separators=(",", ":")), tuple(sorted(items)))
 
 
+def _is_string_list(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and all(isinstance(item, str) for item in cast(list[object], value))
+
+
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
     charge = record.get("test_phase_charge")
@@ -914,9 +935,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
     if not target_directory or not build_directory:
         target_directory = build_directory = store.UNKNOWN_IDENTITY
     checkout = record.get("worktree") or record.get("cwd")
-    key = (build_keys(cast(list[str], argv))
-           if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
-           else NonCargoBuild())
+    key = build_keys(argv) if _is_string_list(argv) else NonCargoBuild()
     record = {
         **record,
         "src": src,
@@ -954,6 +973,52 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
                 TEST_COLUMNS,
             ),
         )
+
+
+class NextestGpuClass(StrEnum):
+    GPU = "gpu"
+    NO_GPU = "no-gpu"
+    UNKNOWN = "unknown"
+
+
+def nextest_gpu_class(connection: sqlite3.Connection, step_id: str,
+                      proof: Mapping[tuple[str, str], NextestGpuClass]) -> NextestGpuClass:
+    """Classify a step with proof keyed by nextest binary ID and test name."""
+    step = cast(tuple[object, object, object, object] | None, connection.execute(
+        "SELECT observed_tests, tests_run, argv, status FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
+    ).fetchone())
+    if step is None:
+        return NextestGpuClass.UNKNOWN
+    saved, ran, argv_json, status = step
+    if status != 0 or not isinstance(saved, str):
+        return NextestGpuClass.UNKNOWN
+    try:
+        if isinstance(argv_json, str):
+            argv = cast(object, json.loads(argv_json))
+            if not _is_string_list(argv) or not parse.nextest_status_is_trusted(argv, {}):
+                return NextestGpuClass.UNKNOWN
+        observed = cast(object, json.loads(saved))
+    except (ValueError, RecursionError):
+        return NextestGpuClass.UNKNOWN
+    if not isinstance(observed, dict):
+        return NextestGpuClass.UNKNOWN
+    fields = cast(dict[str, object], observed)
+    by_binary = fields.get("by_binary")
+    if fields.get("complete") is not True or not isinstance(by_binary, dict):
+        return NextestGpuClass.UNKNOWN
+    names: list[tuple[str, str]] = []
+    for binary, tests in cast(dict[str, object], by_binary).items():
+        if not _is_string_list(tests):
+            return NextestGpuClass.UNKNOWN
+        names.extend((binary, test) for test in tests)
+    if len(names) != ran or len(set(names)) != len(names):
+        return NextestGpuClass.UNKNOWN
+    classes = {proof.get(name, NextestGpuClass.UNKNOWN) for name in names}
+    if NextestGpuClass.GPU in classes:
+        return NextestGpuClass.GPU
+    if classes == {NextestGpuClass.NO_GPU}:
+        return NextestGpuClass.NO_GPU
+    return NextestGpuClass.UNKNOWN
 
 
 def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
@@ -1021,6 +1086,10 @@ def add_call(connection: sqlite3.Connection, record: dict[str, object], src: str
 
 def add_sample(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     insert(connection, "samples", pick({**record, "src": src}, SAMPLE_COLUMNS))
+
+
+def add_sccache_sample(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "sccache_samples", pick({**record, "src": src}, SCCACHE_SAMPLE_COLUMNS))
 
 
 def add_memory_snapshot(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
@@ -1101,7 +1170,7 @@ def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], s
 
 
 ADDERS = {"gate_run": add_gate_run, "ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
-          "memory_snapshot": add_memory_snapshot}
+          "memory_snapshot": add_memory_snapshot, "sccache_sample": add_sccache_sample}
 
 
 def forget(connection: sqlite3.Connection, src: str) -> None:

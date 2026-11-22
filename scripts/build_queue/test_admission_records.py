@@ -19,3 +19,9 @@ class ProcessStartTimeTests(unittest.TestCase):
 
             with patch.object(records, "Path", return_value=proc):
                 self.assertEqual(records.process_start_time(123), "4200")
+
+
+class QueueCallerTests(unittest.TestCase):
+    def test_an_unknown_worktree_does_not_get_a_terminal_prefix(self) -> None:
+        caller = records.queue_caller("", "", "", "", "/private/unregistered session")
+        self.assertEqual(caller.name, "unregistered session")

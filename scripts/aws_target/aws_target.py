@@ -8,10 +8,12 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
+from functools import partial
 import json
 from pathlib import Path
 import re
@@ -19,15 +21,18 @@ import os
 import subprocess
 import sys
 import time
+from time import monotonic
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, price_days, run_cost
+from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.message import send_budget, send_result
+from scripts.message.session_send import send_argv
 from scripts.notify import push_texts
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -44,6 +49,7 @@ SNAPSHOT_ERROR_PATTERNS = (
 SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
+HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -51,7 +57,7 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     return max((run_cost.gate_vcpus(name) for name in instance_types), default=0)
 
 
-def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
+def spot_quota(api: AwsCli, code: str = quota_requests.STANDARD_SPOT_QUOTA) -> Decimal:
     """Read the applied regional Spot quota in vCPUs."""
     reply = api.call('get-service-quota', '--service-code', 'ec2',
                      '--quota-code', code, service='service-quotas')
@@ -138,6 +144,18 @@ def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
     """Every type a cloud gate can launch or compare."""
     return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
                                 *gpu_price_sizes(values))))
+
+
+def hours_check_scope(gate: conf.ConfigRead) -> run_cost.SpotHoursScope:
+    sizes = gate_sizes(gate)
+    try:
+        configuration = conf.read_or_repository('hana_aws')
+        region = configuration.text('region')
+        primary = configuration.text('instance_type')
+        hana = (primary, *hana_spend.read_fallback_instance_types(configuration, primary))
+    except conf.Unusable:
+        return run_cost.SpotHoursScope(sizes, {})
+    return run_cost.SpotHoursScope(tuple(dict.fromkeys((*sizes, *hana))), {region: hana})
 
 
 def spot_placement_requests(values: conf.ConfigRead) -> tuple[ledger.SpotPlacementRequest, ...]:
@@ -281,23 +299,45 @@ def placement_snapshot(settings_path: Path, directory: Path, *, execute: AwsExec
         print(f'aws_target: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
 
 
-def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:
-    gap = f'{check.hours_gap_ratio:.0%}' if check.hours_gap_ratio is not None else 'all billed hours'
-    return push_texts.render('aws.hours_gap', day=day, size=size, region=region, billed=f'{check.billed_hours or 0:.2f}',
-                             box=f'{check.box_hours:.2f}', gap=gap, limit=f'{limit:.0%}')
+def hours_gap_message(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> str:
+    gap = (f'The gap is {check.hours_gap_ratio:.0%}.' if check.hours_gap_ratio is not None
+           else 'The gap covers all billed hours.')
+    reservation = ((f'The ledger also reserves {check.hana_reserved_hours:.2f} h of Hana box time in that region for that day.',)
+                   if check.hana_reserved_hours else ())
+    return '\n'.join((
+        'AWS Spot hours differ from the cost ledger.',
+        f'On {day} UTC, AWS billed {check.billed_hours or 0:.2f} h of {size} Spot in {region}.',
+        f'The cost ledger records {check.box_hours:.2f} h for that size, region, and day.',
+        *reservation,
+        f'{gap} The limit is {limit:.0%}.',
+        'File an investigation for this gap and add it to the list.',
+    ))
 
 
-def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time,
-                      notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
-    """Send one user notice for each gate type, region and UTC day whose billed hours differ from its box hours."""
+def send_hours_gap(message: str, delivery_timeout: float) -> bool:
+    """Check whether send.py confirms delivery or accepts the message for bob's queue."""
+    command = send_argv('--to', HOURS_GAP_RECIPIENT, '--from', 'AWS hours check',
+                        '--timeout', f'{delivery_timeout:g}', '--text', message)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                timeout=send_budget.seconds(delivery_timeout))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    return isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ('sent', 'skipped', 'queued')
+
+
+def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time) -> int:
+    """Send bob one message per type, region, and UTC day above the gap limit."""
     configuration = conf.read(settings_path)
     limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
     end = datetime.fromtimestamp(clock(), UTC)
-    start = end - timedelta(days=configuration.whole('run_cost_days'))
+    days = configuration.whole('run_cost_days')
+    start = end - timedelta(days=days)
     try:
+        scope = hours_check_scope(conf.read_or_repository('cloud_gate'))
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
-                                           configuration.text('instance_type'),
-                                           gate_sizes(conf.read_or_repository('cloud_gate')), limit)
+                                           configuration.text('instance_type'), scope, limit)
     except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
         return 1
@@ -313,24 +353,74 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
         key = f'aws-hours-gap:{size}:{region}:{day}'
         if not check.hours_gap_over or key in claimed:
             continue
-        # Save the claim before delivery so a slow send never repeats.
-        claimed.add(key)
-        save()
-        if not notify(key, hours_gap_push(day, size, region, check, limit), configuration.number('snapshot_notification_timeout_s')):
-            claimed.discard(key)
+        message = hours_gap_message(day, size, region, check, limit)
+        if send_hours_gap(message, configuration.number('snapshot_notification_timeout_s')):
+            claimed.add(key)
+            save()
+        else:
             print(f'aws_target: hours gap notice for {size} in {region} on {day} remains pending', file=sys.stderr)
             status = 1
     save()
     return status
 
 
+def read_snapshot_quota_requests(regions: tuple[str, ...], timeout: float,
+                                 execute: AwsExecutor) -> tuple[quota_requests.RegionalQuotaRequests, ...]:
+    """Collect independent quota request readings with the plan identity."""
+    from scripts.aws_target import plan_identity, plan_run
+
+    if not regions:
+        return ()
+    deadline = monotonic() + timeout
+    missed_deadline = quota_requests.QuotaRequestsNotMeasured('The quota request history deadline expired.')
+    plan = plan_run.PlanRun(plan_identity.plan_credentials, execute, time.sleep)
+
+    def read(region: str, code: str) -> quota_requests.QuotaRequestReading:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return missed_deadline
+        api = plan.api(region, remaining)
+        try:
+            requests = quota_requests.read_quota_requests(api, code)
+            reading: quota_requests.QuotaRequestReading = max(requests, key=lambda request: request.order_time,
+                                                              default=quota_requests.NoQuotaRequest())
+        except Exception as error:
+            code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+            known_codes = {'AccessDenied', 'AccessDeniedException', 'NoSuchResourceException',
+                           'ServiceException', 'ThrottlingException', 'TooManyRequestsException'}
+            reading = quota_requests.QuotaRequestReadFailed(
+                code_text if code_text in known_codes else 'QuotaHistoryUnavailable')
+        return reading if monotonic() < deadline else missed_deadline
+
+    workers = ThreadPoolExecutor(max_workers=8)
+    try:
+        try:
+            _ = workers.submit(lambda: plan.credential).result(timeout=max(0, deadline - monotonic()))
+        except TimeoutError:
+            return tuple(quota_requests.RegionalQuotaRequests(region, missed_deadline, missed_deadline)
+                         for region in regions)
+        except plan_identity.PlanIdentityRefused as error:
+            not_measured = quota_requests.QuotaRequestsNotMeasured(str(error))
+            return tuple(quota_requests.RegionalQuotaRequests(region, not_measured, not_measured)
+                         for region in regions)
+        codes = (quota_requests.STANDARD_SPOT_QUOTA, quota_requests.GPU_SPOT_QUOTA)
+        pending = {(region, code): workers.submit(read, region, code) for region in regions for code in codes}
+        done, _ = wait(pending.values(), timeout=max(0, deadline - monotonic()))
+        readings = {key: future.result() if future in done else missed_deadline for key, future in pending.items()}
+        return tuple(quota_requests.RegionalQuotaRequests(
+            region, readings[region, codes[0]], readings[region, codes[1]]) for region in regions)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
+
+
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
              notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
-             force: bool = False) -> int:
+             force: bool = False, allow_aws_unavailable: bool = False) -> int:
     """Replace successful regional reads and preserve failed regional reads.
 
-    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
+    Use force to read early without moving the refresh interval.
+    Use allow_aws_unavailable to accept AWS read failures."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
@@ -359,6 +449,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        aws_unavailable = False
         read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
@@ -368,7 +459,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 read_name = 'Standard quota'
                 standard = spot_quota(target)
                 read_name = 'G and VT quota'
-                gpu = spot_quota(target, 'L-3819A6DF')
+                gpu = spot_quota(target, quota_requests.GPU_SPOT_QUOTA)
                 prices = [row for row in prices if row.get('region') != region]
                 prices.extend(dict(region=row.region, zone=row.zone, instance_type=row.instance_type,
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
@@ -389,11 +480,24 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
                 print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
                 failures[region] = SnapshotFailure(region, now, read_name, type(error).__name__, reason)
-                status = 1
+                if isinstance(error, AwsUnavailable):
+                    aws_unavailable = True
+                else:
+                    status = 1
         current_failures = tuple(failures[region] for region in regions if region in failures)
         output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
             dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
             for row in current_failures]}
+        try:
+            request_readings = read_snapshot_quota_requests(regions, api.timeout_s, execute)
+        except Exception:
+            unavailable = quota_requests.QuotaRequestReadFailed('QuotaHistoryUnavailable')
+            request_readings = tuple(quota_requests.RegionalQuotaRequests(region, unavailable, unavailable)
+                                     for region in regions)
+        output['quota_requests'] = [
+            {'region': row.region, 'standard': quota_requests.request_record(row.standard),
+             'gpu': quota_requests.request_record(row.gpu)}
+            for row in request_readings]
         # Success drops an unsent notice because no user action remains.
         streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
         if current_failures:
@@ -423,7 +527,9 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             _ = lock.seek(0)
             _ = lock.truncate()
             _ = lock.write(str(now))
-        return status
+        if aws_unavailable and allow_aws_unavailable:
+            print('aws_target: AWS not available', file=sys.stderr)
+        return status or int(aws_unavailable and not allow_aws_unavailable)
 
 
 USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
@@ -538,13 +644,17 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
     return 0
 
 
-def hourly(settings_path: Path, directory: Path) -> int:
+def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool = False) -> int:
     """Read prices and placement scores and check billed hours."""
     status = 0
-    for label, operation in (('price snapshot', snapshot), ('hours-gap check', hours_gap_notices)):
+    read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot
+    for label, operation in (('price snapshot', read_prices), ('hours-gap check', hours_gap_notices)):
         try:
             status = max(status, operation(settings_path, directory))
         except Exception as error:
+            if allow_aws_unavailable and isinstance(error, AwsUnavailable):
+                print(f'aws_target: {label}: AWS not available', file=sys.stderr)
+                continue
             print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
             status = max(status, 1)
     try:

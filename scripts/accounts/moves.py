@@ -6,12 +6,16 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib import import_module
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
+from scripts.agents.stop_results import MoveHandedOff, StopFailed
+from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -136,6 +140,112 @@ JournalEntry = MoveEntry | RoutingEntry
 
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "accounts" / "moves.jsonl"
+
+
+@dataclass(frozen=True)
+class MoveInProgress(MoveHandedOff):
+    account: str
+
+
+@dataclass(frozen=True)
+class MoveWaitingForRow(StopFailed):
+    """The batch could not take the row lock. A new command can retry the move."""
+
+
+class ExplicitMoveTarget(Enum):
+    REQUESTED_ACCOUNT = "use the requested account"
+
+
+@dataclass(frozen=True)
+class FollowGroupAccount:
+    group: role_map.ClaudeGroup
+
+
+@dataclass(frozen=True)
+class MoveMember:
+    reference: str
+    name: str
+
+
+@dataclass(frozen=True)
+class MoveBatchResult:
+    target: str | FollowGroupAccount
+    pending: tuple[MoveMember, ...]
+
+
+def native_row_key(reference: str) -> str:
+    return "native-" + sha256(reference.encode()).hexdigest()
+
+
+def _batch_path(batch_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
+        raise ValueError("invalid move batch id")
+    return store_file().parent / "move-results" / f"{batch_id}.json"
+
+
+def move_batch_id(decision: str, target: str | FollowGroupAccount, references: frozenset[str]) -> str:
+    """Retry a saved batch when only its pending members remain."""
+    prefix = sha256(json.dumps([decision, target.group if isinstance(target, FollowGroupAccount) else target]).encode()).hexdigest()[:16]
+    batch_id = prefix + sha256(json.dumps(sorted(references)).encode()).hexdigest()[:16]
+    path = _batch_path(batch_id)
+    if path.is_file():
+        return batch_id
+    for candidate in sorted(path.parent.glob(f"{prefix}*.json")):
+        try:
+            saved = read_batch_result(candidate.stem)
+        except (OSError, ValueError):
+            continue
+        if saved.target == target and references <= {member.reference for member in saved.pending}:
+            return candidate.stem
+    return batch_id
+
+
+def read_batch_result(batch_id: str) -> MoveBatchResult:
+    value = cast(object, json.loads(_batch_path(batch_id).read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError("invalid move batch result")
+    fields = cast(dict[str, object], value)
+    group, target, pending = fields.get("group"), fields.get("target"), fields.get("pending")
+    if group is not None:
+        if group not in role_map.CLAUDE_GROUPS:
+            raise ValueError("invalid move batch group")
+        target = FollowGroupAccount(group)
+    if not isinstance(target, (str, FollowGroupAccount)) or not isinstance(pending, list):
+        raise ValueError("invalid move batch result")
+    members: list[MoveMember] = []
+    for member in cast(list[object], pending):
+        if not isinstance(member, dict):
+            raise ValueError("invalid move batch member")
+        saved = cast(dict[str, object], member)
+        reference, name = saved.get("reference"), saved.get("name")
+        if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
+            raise ValueError("invalid move batch member")
+        members.append(MoveMember(reference, name))
+    return MoveBatchResult(target, tuple(members))
+
+
+def save_batch_result(batch_id: str, target: str | FollowGroupAccount, pending: tuple[MoveMember, ...],
+                      finished: frozenset[str]) -> MoveBatchResult:
+    """Keep pending members from other attempts until a move resolves them."""
+    path = _batch_path(batch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            previous = read_batch_result(batch_id)
+        except FileNotFoundError:
+            previous = MoveBatchResult(target, ())
+        if previous.target != target:
+            raise ValueError("move batch intent changed")
+        members = {member.reference: member for member in previous.pending}
+        members.update((member.reference, member) for member in pending)
+        result = MoveBatchResult(target, tuple(sorted(
+            (member for member in members.values() if member.reference not in finished),
+            key=lambda member: (member.name, member.reference))))
+        destination = {"group": target.group} if isinstance(target, FollowGroupAccount) else {"target": target}
+        write_text_atomic(path, json.dumps({**destination, "pending": [
+            {"reference": member.reference, "name": member.name} for member in result.pending]}), new_file_mode=0o600)
+        return result
 
 
 def _valid(value: object) -> bool:
@@ -315,21 +425,24 @@ def append_move(entry: MoveEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output, path)
-        if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
-            _ = output.seek(0)
-            for line in output:
+        lines = worker_names.migrate_locked_journal(output, path)
+        if entry["kind"] in ("requested", "confirmed", "wait ended", "room again", "failed"):
+            for line in lines:
                 try:
                     previous = cast(object, json.loads(line))
                 except ValueError:
                     continue
-                if _valid(previous):
-                    held = cast(dict[str, object], previous)
-                    if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
-                            and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
-                            and (entry["kind"] != "confirmed" or
-                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
-                        return
+                if not _valid(previous):
+                    continue
+                held = cast(dict[str, object], previous)
+                if held.get("kind") != entry["kind"] or held.get("move_id") != entry["move_id"]:
+                    continue
+                if entry["kind"] == "requested":
+                    return
+                if (held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
+                        and (entry["kind"] != "confirmed" or
+                             (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
+                    return
         _ = output.seek(0, os.SEEK_END)
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 

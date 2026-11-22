@@ -36,16 +36,6 @@ ENTRIES = (
          PushExample("regional_permissions", {
             "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
         purpose="AWS denied a regional read that the gate deployment can repair."),
-    PushText("aws.hours_gap", "buildlog", "note", "AWS billed hours differ from gate boxes",
-        ActionTemplate("To find the cause, ask builds to check the {size} hours in {region} on {day}"),
-        "On {day} UTC, AWS billed {billed} h of {size} Spot in {region}.\n"
-        + "The cost ledger records {box} h of gate boxes there. The gap is {gap}, above the {limit} limit.\n"
-        + "More billed hours can mean a box ran without a gate record. Fewer can mean the bill is not complete.",
-        (PushExample("more_billed", {"day": "2026-11-13", "billed": "5.40", "size": "c7a.8xlarge",
-                                     "region": "us-east-2", "box": "4.69", "gap": "15%", "limit": "15%"}),
-         PushExample("no_box", {"day": "2026-11-13", "billed": "0.50", "size": "c7a.4xlarge",
-                                "region": "eu-south-2", "box": "0.00", "gap": "all billed hours", "limit": "15%"})),
-        purpose="A gate type, region and day billed more or fewer hours than its boxes."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
@@ -186,6 +176,11 @@ ENTRIES = (
         (PushExample("uncovered_low", {"account": "claude3", "remaining": "2%"}),
          PushExample("uncovered_empty", {"account": "claude4", "remaining": "0%"})),
         purpose="A Claude account runs low, and no move is set up for it."),
+    PushText("quota.claude_expiry", "quota_alert", "note", "{account} runs out {empty_at}",
+        ActionTemplate("Type /agents move <role> <account>"),
+        "",
+        (PushExample("forecast", {"account": "claude3", "empty_at": "Sun 11-22 07:00 EST"}),),
+        purpose="A Claude account is expected to run out soon and has no scheduled move."),
     PushText("quota.codex_next_move", "quota_alert", "note", "{account} Codex workers will {outcome_title}",
         ActionTemplate("Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to {fallback}"),
         "{account} has {remaining} of its weekly usage left{outcome_body} Nothing is needed.",

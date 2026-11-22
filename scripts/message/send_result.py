@@ -4,9 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept", "pending", "retry"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept", "pending", "retry", "closed", "absent"]
 SEND_RETRY_EXIT = 6
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0, "pending": 5, "retry": SEND_RETRY_EXIT}
+SEND_CLOSED_EXIT = 7
+SEND_ABSENT_EXIT = 8
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0, "pending": 5, "retry": SEND_RETRY_EXIT, "closed": SEND_CLOSED_EXIT, "absent": SEND_ABSENT_EXIT}
 OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
 
 
@@ -51,3 +53,12 @@ def send_outcome(returncode: int | None, stdout: str) -> ConfirmedSendOutcome | 
         return ConfirmedSendOutcome(header)
     return UnconfirmedSendOutcome()
 
+
+
+def delivered_or_kept(returncode: int | None, stdout: str, *, accept_skipped: bool = False) -> bool:
+    """Check delivery or durable storage. Accept skips when the caller permits them."""
+    outcome = send_outcome(returncode, stdout)
+    if isinstance(outcome, UnconfirmedSendOutcome):
+        return False
+    result = outcome.header.outcome
+    return result in ("sent", "kept") or (accept_skipped and result == "skipped")

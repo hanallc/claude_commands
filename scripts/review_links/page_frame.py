@@ -14,10 +14,11 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
+from scripts.review_links import setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
-OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "rebuilds", "review"))
+OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "rebuilds", "review"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
@@ -63,7 +64,9 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
 HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
                  + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
-                 + 'max-width:100%;margin-inline-start:auto}')
+                 + 'max-width:100%;margin-inline-start:auto}'
+                 + '@media(max-width:360px){.page-heading-compact{flex-wrap:nowrap;column-gap:8px}'
+                 + '.page-heading-compact>.page-heading-actions{min-width:0;gap:6px}}')
 
 
 OWNER_STYLE = """<style>
@@ -103,7 +106,7 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, action: str = "") -> str:
+def title(text: str, page: str, *, action: str = "", compact_actions: bool = False) -> str:
     """Build the title and refresh status with an optional action beside the title."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
@@ -116,7 +119,8 @@ def title(text: str, page: str, *, action: str = "") -> str:
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     if action:
-        heading = f'<div class="page-heading">{heading}{HEADING_ACTIONS}{action}</div></div>'
+        layout = "page-heading page-heading-compact" if compact_actions else "page-heading"
+        heading = f'<div class="{layout}">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -135,7 +139,8 @@ def rendered(content: bytes, started: float, read_at: float) -> bytes:
 def template(source: str, text: str, page: str) -> str:
     """Fill the shared title, style and script in a static page template."""
     return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
-            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT))
+            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
+            .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
 
 
 REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){

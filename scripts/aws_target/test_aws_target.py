@@ -14,11 +14,12 @@ from typing import override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_target, ledger, run_cost, spot_table
+from scripts.aws_target import aws_target, ledger, plan_identity, price_days, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import AwsSettingsFixture, CostFixture
+from scripts.build_targets import target_config
+from scripts.buildlog import cli
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class AwsErrorCodeTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class AwsErrorCodeTests(unittest.TestCase):
 
 class HanaGpuSnapshotTests(CostFixture):
     def test_snapshot_reads_and_displays_hana_gpu_prices(self) -> None:
-        _ = write_config_fixture(conf.path('cloud_gate'), 'spot_candidate_regions=us-east-1\n'
+        self.configure_gate('spot_candidate_regions=us-east-1\n'
                                   + 'gpu_instance_types=g6.2xlarge\n'
                                   + 'hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge')
         now = 1768478400
@@ -73,7 +74,9 @@ class HanaGpuSnapshotTests(CostFixture):
             self.assertIn('get-service-quota', arguments)
             return subprocess.CompletedProcess(arguments, 0, '{"Quota":{"Value":8}}', '')
 
-        status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
+        with mock.patch.object(plan_identity, 'plan_credentials',
+                               side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')):
+            status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
         self.assertEqual(status, 0)
         self.assertEqual(reads.count('g6.2xlarge'), 1)
         self.assertEqual(reads.count('g4dn.2xlarge'), 1)
@@ -81,6 +84,40 @@ class HanaGpuSnapshotTests(CostFixture):
         self.assertEqual({price.usd_per_hour for price in prices if price.instance_type == 'g4dn.2xlarge'}, {Decimal('.52')})
         _, gpu = spot_table.spot_tables(self.state, now, settings_path=self.settings).prices
         self.assertEqual(gpu.rows[0][gpu.headers.index('g4dn.2xlarge')], '0.5200')
+
+
+class BuildlogAwsSnapshotTests(AwsSettingsFixture):
+    def test_buildlog_snapshot_accepts_auth_failure_and_reports_local_write_error(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-east-1')
+        auth_failure = ('aws: [ERROR]: An error occurred (AuthFailure) '
+                        + 'when calling the DescribeSpotPriceHistory operation: fixture')
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            del capture_output, text, timeout, check, env
+            self.assertIn('describe-spot-price-history', arguments)
+            return subprocess.CompletedProcess(arguments, 255, '', auth_failure)
+
+        read_prices = partial(aws_target.snapshot, execute=execute, clock=lambda: 1768478400)
+        for local_error, expected in ((None, 0), (OSError('fixture disk error'), 1)):
+            with self.subTest(local_error=local_error):
+                directory = self.state / str(expected)
+                with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+                      mock.patch.object(aws_target, 'snapshot', side_effect=read_prices),
+                      mock.patch.object(aws_target, 'read_snapshot_quota_requests', return_value=()),
+                      mock.patch.object(aws_target, 'hours_gap_notices', return_value=0) as hours,
+                      mock.patch.object(aws_target, 'placement_snapshot') as placement,
+                      mock.patch.object(price_days, 'record', side_effect=local_error),
+                      redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(cli.aws_snapshot(), expected)
+                self.assertIn('AWS not available', errors.getvalue())
+                if local_error is not None:
+                    self.assertIn('daily Spot prices not saved: OSError: fixture disk error', errors.getvalue())
+                failure, = aws_target.snapshot_failures(aws_target.read_snapshot(directory))
+                self.assertEqual(failure.error, 'AwsUnavailable')
+                self.assertIn('AuthFailure', failure.reason)
+                hours.assert_called_once_with(self.settings, directory)
+                placement.assert_called_once_with(self.settings, directory)
 
 
 class SpotPlacementTests(CostFixture):
@@ -97,7 +134,7 @@ class SpotPlacementTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = write_config_fixture(conf.path('cloud_gate'), 'regions=' + ' '.join(self.regions) + '\ninstance_types='
+        self.configure_gate('regions=' + ' '.join(self.regions) + '\ninstance_types='
                                  + ' '.join(self.types))
         self.credential_file = self.root / '.config/aws-build/credentials'
         self.credential_file.parent.mkdir(parents=True)

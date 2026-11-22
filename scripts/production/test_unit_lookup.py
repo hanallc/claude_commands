@@ -783,7 +783,16 @@ print(observed.row.id)
                 pane, = observed.labels
                 self.assertEqual(pane.place, place)
                 if blocks:
-                    self.assertEqual(pane.claude, ClaudeUnknown("no foreground agent"))
+                    ancestry = {
+                        "suspended": "inside the shell tree",
+                        "same terminal": "outside the shell tree",
+                        "unreadable holder terminal": "outside the shell tree",
+                        "unreadable shell terminal": "outside the shell tree",
+                    }.get(case, "shell tree position unknown")
+                    processes = f"claude ({ancestry})"
+                    if case == "unreadable shell terminal":
+                        processes = "python3 (outside the shell tree), " + processes
+                    self.assertEqual(pane.claude, ClaudeUnknown("no foreground agent. Blocking processes are " + processes))
                     if case == "unreadable shell terminal":
                         self.assertEqual(pane.identity, session_staff.UnprovedPaneIdentity(
                             frozenset({row.current_session, "pane-candidate", "detached-candidate"})))
@@ -795,6 +804,43 @@ print(observed.row.id)
                     self.assertEqual(pane.empty, herdr.ObservedEmpty(place, shell))
                     self.assertEqual(pane.identity, session_staff.UnprovedPaneIdentity(
                         frozenset({row.current_session})))
+
+    def test_non_agent_foreground_blocks_resume_even_without_process_placement(self) -> None:
+        row = unit_membership("show", "trunk")
+        place = herdr.HerdrPlace("native", "w1:p1")
+        self.hosts({"pane": labeled(place.session, place.pane, row.name,
+                                    CLAUDE_CODE_SESSION_ID=row.current_session)})
+        with (mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{
+                  "pane_id": place.pane, "agent_session": {"kind": "id", "value": row.current_session}}]),
+              mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                  "shell_pid": 991001, "foreground_process_group_id": 991002,
+                  "foreground_processes": [{"pid": 991002, "argv": ["sleep", "1"]}],
+              }})):
+            marked = unit_lookup.observed_session_labels(running=(), probe_address=False)
+        with mock.patch.object(unit_lookup, "observed_session_labels", return_value=marked):
+            owner = unit_lookup.checked_unit("show", row.name)
+        self.assertEqual(owner, unit_lookup.NonAgentPaneHolders(
+            "no foreground agent. Blocking processes are sleep (shell tree position unknown)"))
+
+    def test_empty_foreground_list_reports_a_known_descendant(self) -> None:
+        row = unit_membership("show", "trunk")
+        place = herdr.HerdrPlace("native", "w1:p1")
+        shell, holder = 991001, 991002
+        ancestry = herdr.ProcessAncestry({holder: shell})
+        processes = [herdr.HerdrProcess(holder, place, {}, "sleep", str(self.root), ancestry)]
+        with (mock.patch.object(herdr, "herdr_processes", return_value=processes),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{
+                  "pane_id": place.pane, "agent_session": {"kind": "id", "value": row.current_session}}]),
+              mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                  "shell_pid": shell, "foreground_process_group_id": shell, "foreground_processes": [],
+              }})):
+            marked = unit_lookup.observed_session_labels(running=(), probe_address=False)
+        grouped = unit_lookup.group_labeled_sessions(marked)
+        self.assertEqual(grouped.checked_unit("show", row.name), unit_lookup.UnknownUnit(
+            "no foreground agent. Blocking processes are sleep (inside the shell tree)"))
 
 
     def test_registered_claude_with_a_headless_claude_child_of_the_same_id_stays_live(self) -> None:
@@ -1347,6 +1393,19 @@ print(observed.row.id)
         self.assertIs(unit_lookup.run_state(worktree), UnitState.RUNNING)
         _ = self.record("second", worktree, 2.0, "phase_started", "run_finished")
         self.assertIs(unit_lookup.run_state(worktree), UnitState.RUN_FINISHED)
+
+    def test_run_state_uses_the_real_path_for_a_saved_worktree_alias(self) -> None:
+        current, old = self.root / "current", self.root / "old"
+        current.mkdir()
+        old.symlink_to(current, target_is_directory=True)
+        _ = self.record("old-path", current, 1.0, "run_finished")
+        row = staff.snapshot().unit_by_worktree(remote.local_machine(), current)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), old), expected=row.worktree)
+        states = unit_lookup.read_run_states()
+        self.assertEqual(set(states.records), {str(current)})
+        self.assertIs(states.state(old), UnitState.RUN_FINISHED)
+        self.assertIs(states.state(current), UnitState.RUN_FINISHED)
 
     def test_run_records_that_cannot_be_read_are_an_error_not_a_state(self) -> None:
         (self.root / "history/runs/unreadable.jsonl").mkdir(parents=True)

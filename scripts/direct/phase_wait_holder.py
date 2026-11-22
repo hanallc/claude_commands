@@ -12,6 +12,8 @@ import sys
 from typing import cast
 from uuid import UUID
 
+from scripts.direct import recorder_state
+
 
 def text(value: object) -> str:
     return value.strip() if isinstance(value, str) and not any(c in value for c in "\r\n\t\0") else ""
@@ -49,7 +51,9 @@ def token_owner(payload: str, board: Path) -> tuple[str, str]:
         worker = fields(read(path))
         if text(worker.get("slot")) == payload or path.stem == "impl_worker_" + payload:
             matches.append(worker)
-    state = fields(read(board / "progress_history_state.json"))
+    state_path = board / recorder_state.STATE_FILENAME
+    state = fields(read(state_path))
+    recorder_state.require_current_shape(state_path, state)
     if matches:
         reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""
     else:
@@ -138,4 +142,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error

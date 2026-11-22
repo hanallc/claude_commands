@@ -86,54 +86,6 @@
       "time": "2026-11-06T06:23:02.002895-05:00"
     }
   },
-  "aws.hours_gap": {
-    "more_billed": {
-      "objections": [
-        {
-          "quote": "ask builds",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "To find the cause, ask builds to check the c7a.8xlarge hours in us-east-2 on 2026-11-13",
-          "rule": "say-where-to-act"
-        },
-        {
-          "quote": "The gap is 15%, above the 15% limit.",
-          "rule": "short-plain-sentences"
-        },
-        {
-          "quote": "More billed hours can mean a box ran without a gate record. Fewer can mean the bill is not complete.",
-          "rule": "what-happened-why-what-you-do"
-        }
-      ],
-      "reviewer": "user-spec: just approve it; reviewer: claude-opus-5-5",
-      "sha256": "9a38bba1d37f4c4d9ad767978593264457f6c3ae4c1f77fc9b773b7ba0bd48fc",
-      "time": "2026-11-14T19:44:08.838108-05:00"
-    },
-    "no_box": {
-      "objections": [
-        {
-          "quote": "ask builds",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "To find the cause, ask builds to check the c7a.4xlarge hours in eu-south-2 on 2026-11-13",
-          "rule": "say-where-to-act"
-        },
-        {
-          "quote": "ask builds to check the c7a.4xlarge hours in eu-south-2 on 2026-11-13",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "AWS bill shows Spot hours with no gate record",
-          "rule": "push-title-under-45"
-        }
-      ],
-      "reviewer": "user-spec: just approve it; reviewer: claude-opus-5-5",
-      "sha256": "9a38bba1d37f4c4d9ad767978593264457f6c3ae4c1f77fc9b773b7ba0bd48fc",
-      "time": "2026-11-14T19:44:21.523754-05:00"
-    }
-  },
   "aws.snapshot_failed": {
     "permission": {
       "objections": [],
@@ -536,6 +488,35 @@
       "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
       "sha256": "061af204971c2047ec7a469ce023c71a37cd03f865fc18f633003f2ce13e965f",
       "time": "2026-11-06T06:23:34.421590-05:00"
+    }
+  },
+  "quota.claude_expiry": {
+    "forecast": {
+      "objections": [
+        {
+          "quote": "claude3 runs out",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "claude3 runs out Sun 11-22 07:00 EST",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Type /agents move <role> <account>",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "<role> <account>",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "claude3 runs out Sun 11-22 07:00 EST",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain session 2026-11-21 14:59 EST: yes i approve it (the text he dictated at 14:50 EST); reviewer: claude-opus-5-5",
+      "sha256": "964b14fafa06f30bad3cfe02fea2d0a5870a639315a97f6d4f33270220561ea6",
+      "time": "2026-11-21T15:02:51.944273-05:00"
     }
   },
   "quota.claude_next_move": {
