@@ -795,12 +795,14 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     def refuse(reason: str, *, checker: bool = False) -> wire.Refused:
         return _refused(reason, checker=checker) if report_refusal else wire.Refused(reason)
 
-    if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.PlacementRequest)):
+    if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
+                            wire.PlacementRequest, wire.VerifyRunSlotRequest)):
         reason = nested_reservation_reason()
         if reason:
             return refuse(reason)
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
-        wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
+        wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest,
+        wire.VerifyRunSlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
@@ -885,7 +887,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     request.maximum, f"slots.{request.machine}.{request.repository}.max")
                     if isinstance(request, wire.RepositorySlotRequest) else None)
     bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport,
-                                        wire.RepositorySlotRequest))
+                                        wire.RepositorySlotRequest, wire.VerifyRunSlotRequest))
     if bound_outage:
         retry.start_leave_schedule(configuration.running_pass_seconds if isinstance(configuration, records.MemoryConfig)
                                    else configuration.reconnect_seconds)
@@ -905,6 +907,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     last_valid = last_notice = CLOCK.monotonic()
     restarted = False
     showed_slot = False
+    verify_wait_text = ""
     while True:
         if retry.left_queue():
             return LeftQueue()
@@ -951,6 +954,17 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
                         return reply if generation_query or placement_control else refuse(reply.reason)
+                    if isinstance(request, wire.VerifyRunSlotRequest):
+                        if isinstance(reply, wire.Ok):
+                            return reply
+                        if not isinstance(reply, wire.VerifyRunSlotWaiting):
+                            raise CheckerFailure("invalid Verify run slot answer")
+                        text = records.run_limit_text(reply.reason)
+                        if text != verify_wait_text:
+                            print(text, file=sys.stderr, flush=True)
+                            verify_wait_text = text
+                        last_valid = CLOCK.monotonic()
+                        continue
                     if slot_waiting is not None:
                         if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired)):
                             return reply
@@ -1453,6 +1467,24 @@ def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotR
     if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired, wire.Refused)):
         return reply
     return wire.Refused("left the repository slot queue")
+
+
+def _take_verify_run_slot(pid: int, cwd: str) -> int:
+    """Wait on the admission connection for the Verify process's slot."""
+    from scripts.build_queue import step_estimator, admission_records as records
+
+    identity = step_identity("", cwd)
+    start = records.process_start_time(pid)
+    if start is None:
+        print("verify.sh: cannot identify the Verify process", file=sys.stderr)
+        return 2
+    repository, _ = step_estimator.git_identity(["cargo", "check"], cwd)
+    name = repository.name if isinstance(repository, records.RepositoryIdentity) else Path(cwd).name
+    request = wire.VerifyRunSlotRequest(wire.Owner(pid, start), name, identity.session_id, identity.unit)
+    reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+    if isinstance(reply, wire.Ok):
+        return 0
+    return 75 if isinstance(reply, LeftQueue) else 2
 
 
 def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],
@@ -2132,6 +2164,8 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
+    run_parser = subcommands.add_parser("verify-run-slot")
+    _ = run_parser.add_argument("--pid", type=int, required=True)
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
@@ -2179,6 +2213,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
+    if args.command == "verify-run-slot":
+        return _take_verify_run_slot(args.pid, os.getcwd())
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
         if reason:

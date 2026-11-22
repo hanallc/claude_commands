@@ -1561,6 +1561,18 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     fi
 fi
 
+VERIFY_RUN_SLOT_HELD=0
+admit_verify_run() {
+    [[ "${OSTYPE:-}" != darwin* && "$VERIFY_RUN_SLOT_HELD" == 0 ]] || return 0
+    local status=0
+    "$PY" "$BUILDLOG_MEM_ADMIT_SCRIPT" verify-run-slot --pid "$$" </dev/null &
+    HOLD_WAITER_PID=$!
+    wait "$HOLD_WAITER_PID" || status=$?
+    HOLD_WAITER_PID=""
+    (( status == 0 )) || return "$status"
+    VERIFY_RUN_SLOT_HELD=1
+}
+
 shift
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
@@ -3090,6 +3102,7 @@ take_local_placement() {
 
 route_test() {
     local last_decline="" wait_reason="" wait_holder="" name eligibility reason settings platform refresh_source=0
+    local mac_cache_candidate=0
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -3101,10 +3114,15 @@ route_test() {
     done <<< "$STEP_TARGET_TABLE"
     # A placement wait holds no cargo token, also after an earlier step; a local grant takes it again.
     release_token || return $?
+    if [[ "$MAC_ONLY" == 1 ]] && cache_lookup --probe; then
+        # Verify the current route before replaying a cached Mac result.
+        mac_cache_candidate=1
+    fi
     while :; do
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
+        if (( ! mac_cache_candidate )); then admit_verify_run || exit $?; fi
         placement_once "$refresh_source" || placement_status=$?
         refresh_source=0
         if (( placement_status == 78 )); then
@@ -3139,8 +3157,14 @@ route_test() {
             require_nextest
         fi
         collect_routing_wait
-        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then
-            exit "$LOOKUP_STATUS"
+        if (( mac_cache_candidate )); then
+            if cache_lookup; then exit "$LOOKUP_STATUS"; fi
+            # The cache changed during placement. Release the assignment before the slot wait.
+            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                --pid "$PLACEMENT_OWNER_PID" --reason "the cached Mac result changed" >/dev/null || return $?
+            PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE=""
+            mac_cache_candidate=0
+            continue
         fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
@@ -3407,6 +3431,7 @@ cache_lookup() {
     # Old pass records have no status line.
     if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
     [[ -n "${status_line#status=}" ]] || return 1
+    [[ "${1:-}" != --probe ]] || return 0
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true

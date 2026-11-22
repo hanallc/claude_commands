@@ -7798,6 +7798,98 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.reservations[request.episode].test_width, records.RequestedTestWidth(2))
 
 
+class VerifyRunSlotTests(unittest.TestCase):
+
+    def configure(self, fixture: AdmissionFixture, maximum: int) -> None:
+        fixture.configure(slot_gap_seconds=60)
+        config = fixture.root / "build_admission.conf"
+        _ = config.write_text(config.read_text() +
+            f"\nmax_runs.{fixture.server.host}.fixture={maximum}\nmax_runs_exempt_unit=natemerge\n")
+
+    def slot_request(self, run: wire.RunIdentity, session_id: str = "") -> wire.VerifyRunSlotRequest:
+        return wire.VerifyRunSlotRequest(wire.Owner(run.pid, run.start_time), "fixture", session_id)
+
+    def test_third_run_waits_until_a_verify_owner_exits_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture, 2)
+            first, second, third = (fixture.run_owner() for _ in range(3))
+            first_request = self.slot_request(first)
+            for request in (first_request, first_request, self.slot_request(second)):
+                self.assertEqual(fixture.server.handle_request(request), [wire.Ok()])
+            self.assertEqual(len(fixture.server.verify_run_slots), 2)
+            fixture.restart()
+            self.assertEqual(len(fixture.server.verify_run_slots), 2)
+            self.assertIn(service.OwnerWatch(first_request.owner), fixture.server.watchers.values())
+
+            peer = fixture.connect(self.slot_request(third))
+            held = wire.VerifyRunSlotWaiting(records.RunLimitWait(2, 2, "fixture", fixture.server.host))
+            self.assertIn(held, peer.replies())
+            self.assertFalse(fixture.server.waiters)
+            self.assertFalse(fixture.server.reservations)
+
+            fixture.end_run(first)
+            _ = fixture.run_pass()
+            self.assertIn(wire.Ok(), peer.replies())
+            self.assertEqual({slot.owner.pid for slot in fixture.server.verify_run_slots.values()},
+                             {second.pid, third.pid})
+
+    def test_restart_releases_a_slot_when_the_verify_owner_died_during_the_outage(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture, 1)
+            first = self.slot_request(fixture.run_owner())
+            self.assertEqual(fixture.server.handle_request(first), [wire.Ok()])
+            fixture.server.close()
+            fixture.proc.kill(first.owner)
+            fixture.restart()
+
+            self.assertFalse(fixture.server.verify_run_slots)
+            self.assertNotIn(service.OwnerWatch(first.owner), fixture.server.watchers.values())
+            self.assertEqual(fixture.server.handle_request(self.slot_request(fixture.run_owner())), [wire.Ok()])
+
+    def test_run_slot_wait_does_not_change_cargo_claims_or_spacing(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture, 1)
+            started = fixture.run_owner()
+            self.assertEqual(fixture.server.handle_request(self.slot_request(started)), [wire.Ok()])
+            waiting = fixture.connect(self.slot_request(fixture.run_owner()))
+            self.assertIn(wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 1, "fixture", fixture.server.host)),
+                          waiting.replies())
+
+            preparation = fixture.run_owner()
+            prepared = fixture.finish_step(fixture.request(run=preparation, need=GIB))
+            first = fixture.finish_step(fixture.request(run=started, need=GIB))
+            self.assertEqual(set(fixture.server.slots), {prepared.reservation, first.reservation})
+            spacing = fixture.server.spacing
+            assert isinstance(spacing, records.NextStartAt)
+            self.assertGreater(spacing.at, fixture.clock.now())
+
+            continuation = fixture.request(run=started, need=GIB)
+            _ = only_admitted(fixture.server.handle_request(continuation))
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            row, = result.rows
+            self.assertIsInstance(row.decision.run_limit, records.RunLimitFree)
+            self.assertIsInstance(row.decision.room.basis, records.WithinSlot)
+            self.assertEqual(fixture.server.spacing, spacing)
+            self.assertEqual(set(fixture.server.slots), {prepared.reservation})
+            self.assertEqual(len(fixture.server.verify_run_slots), 1)
+
+    def test_zero_holds_a_new_run_and_counts_the_exempt_unit(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure(fixture, 0)
+            peer = fixture.connect(self.slot_request(fixture.run_owner()))
+            self.assertIn(wire.VerifyRunSlotWaiting(records.RunLimitWait(0, 0, "fixture", fixture.server.host)),
+                          peer.replies())
+            exempt = self.slot_request(fixture.run_owner(), "merge-session")
+            labels = {exempt.session_id: UnitLabels("director", unit="natemerge")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                self.assertEqual(fixture.server.handle_request(exempt), [wire.Ok()])
+            _ = peer.replies()
+            _ = fixture.run_pass()
+            self.assertIn(wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 0, "fixture", fixture.server.host)),
+                          peer.replies())
+
+
 class RunPlaceTests(unittest.TestCase):
     def reading(self, fixture: AdmissionFixture) -> records.QueueRead:
         reply, = fixture.server.handle_request(wire.ViewRequest())
