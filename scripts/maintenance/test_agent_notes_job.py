@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from scripts.maintenance import agent_notes_job as job
 from scripts.maintenance import vault_commit
@@ -41,28 +41,29 @@ class JobTests(unittest.TestCase):
         from scripts.accounts import refusal_watch, moves
         from scripts.agents import stop_resume
         from scripts.herdr import turn_end
-
-        decision = "fixture-decision"
+        from scripts.message import sessions
 
         def refusal_pass(**_options: object) -> list[str]:
             results = stop_resume.move_sessions(["member"], "claude5", why="auto: head", cause="auto",
-                                               source_accounts={"member": "claude4"}, batch_id=decision)
+                                               source_accounts={"member": "claude4"})
             self.assertEqual(results, [stop_resume.MoveHandedOff("member")])
             return []
 
         with (patch.dict(os.environ, {"HOME": str(self.root)}),
               patch.object(refusal_watch, "run", side_effect=refusal_pass),
               patch.object(stop_resume, "_detach") as detach,
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
               patch.object(stop_resume, "_stop") as stop,
               patch.object(moves, "append_move") as append,
               patch.object(turn_end, "report_quota_refusals", return_value=[]) as quota_refusals):
-            batch = moves.move_batch_id(decision, "claude5", frozenset({"member"}))
             self.assertEqual(job._perform(Part.REFUSALS), 0)  # pyright: ignore[reportPrivateUsage]
         quota_refusals.assert_called_once_with()
         stop.assert_not_called()
         append.assert_not_called()
         detach.assert_called_once_with(["batch", "--target", "claude5", "--why", "auto: head", "--cause", "auto",
-            "--warn-seconds", "0", "--move-id", batch, "--source-account", "member=claude4", "--", "member"], "move")
+            "--warn-seconds", "0", "--request-id", ANY,
+            "--source-account", "member=claude4", "--", "member"], "move")
 
     def test_successful_parts_are_saved_and_a_rerun_retries_only_the_failure(self) -> None:
         def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
