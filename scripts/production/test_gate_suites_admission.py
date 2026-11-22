@@ -17,10 +17,11 @@ import tempfile
 import threading
 from dataclasses import replace
 from typing import cast, final, override
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import AbstractContextManager, redirect_stdout, redirect_stderr
 from unittest import mock
 from scripts.production import gate
 from scripts.lib import build_folders
+from scripts.production.cli_fixture import locked_environment
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import progress_profile as progress, step_estimator
@@ -64,6 +65,9 @@ class GateProgressHistoryTests(unittest.TestCase):
 
 
 class ServiceGateFixture(GateSuitesFixture):
+    def admission_environment(self, **overrides: str) -> AbstractContextManager[None]:
+        return locked_environment({**os.environ, **self.environment, **overrides}, self.admission.loop_access)
+
     def reservation(self) -> tuple[Path, admission_records.Reservation]:
         record, = self.admission.server.reservations.values()
         return Path(record.path), service.reservation_row(record)
@@ -131,7 +135,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
             return False if Path(path) == gate_root else access(path, mode)
 
-        with mock.patch.dict(os.environ, self.environment), \
+        with self.admission_environment(), \
              mock.patch.object(build_folders, "configured_gate_root", return_value=gate_root), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(gate, "gate_reservation") as admission:
@@ -156,7 +160,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         foreign = tmpfs / "foreign"
         foreign.mkdir()
         (tmpfs / "foreign.lock").touch()
-        with (mock.patch.dict(os.environ, self.environment),
+        with (self.admission_environment(),
               mock.patch.object(build_folders, "configured_gate_root", return_value=tmpfs),
               mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
               redirect_stderr(io.StringIO()) as report):
@@ -176,7 +180,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         config = self.root / "invalid-config" / "build_admission.conf"
         _ = write_config_fixture(config, "safety_gib=invalid")
         diagnostics = io.StringIO()
-        with mock.patch.dict(os.environ, {**self.environment, "CONF_DIR": str(config.parent)}), \
+        with self.admission_environment(CONF_DIR=str(config.parent)), \
              mock.patch.object(step_estimator, "memory_config", wraps=step_estimator.memory_config) as read_config, \
              mock.patch.object(client, "admit", wraps=client.admit) as checked, \
              redirect_stderr(diagnostics):
@@ -194,7 +198,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
 
     def test_invalid_first_peak_refuses_before_admission(self) -> None:
         self.configure_gate("program_first_peak_gib.gate=0")
-        with mock.patch.dict(os.environ, self.environment), \
+        with self.admission_environment(), \
              mock.patch.object(client, "admit", wraps=client.admit) as acquire:
             with self.assertRaisesRegex(GateRefused, "program_first_peak_gib.gate"):
                 with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
@@ -218,7 +222,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             calls.append("connection attempt")
             return connect(sockets, request, deadline)
 
-        with (mock.patch.dict(os.environ, self.environment),
+        with (self.admission_environment(),
               mock.patch.object(gate, "queue_place", wraps=queue.queue_place) as acquire,
               mock.patch.object(hold, "wait_until_free", wraps=hold.wait_until_free) as before_check,
               mock.patch.object(hold, "admits", check_hold),
@@ -249,7 +253,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                         "ended_at": datetime.fromtimestamp(self.admission.clock.now() - 1, UTC).isoformat(),
                         "status": 0, "outcome": "completed",
                     }) + "\n")
-                with mock.patch.dict(os.environ, self.environment):
+                with self.admission_environment():
                     with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
                         with self.admission.loop_turn():
                             _ = self.admission.server.run_pass()
@@ -303,7 +307,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
-        with mock.patch.dict(os.environ, self.environment), \
+        with self.admission_environment(), \
              mock.patch.object(fixture.server, "handle_request", side_effect=keep_older_waiting), \
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
@@ -712,7 +716,7 @@ class MergeGateRecordedPeakTests(ServiceGateFixture):
             return {os.getpid(): 24.0 + sum(measured.values()), **measured}
 
         output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), \
+        with self.admission_environment(), \
                 mock.patch.object(gate, "start_gate_job", side_effect=start_held), \
                 mock.patch.object(gate.SampledRSSAdmission, "reserve", autospec=True, side_effect=record_reservation), \
                 mock.patch.object(gate, "process_memory_mib", side_effect=sample_and_release), \
