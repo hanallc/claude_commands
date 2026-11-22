@@ -101,7 +101,7 @@ def mac_owner(resource: str, repository: str) -> str:
     scope = mac_test.target_claim_scope(paths, repository)
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for claim in mac_test.read_claims(paths):
-        if mac_test.scopes_overlap(claim.scope, scope) and mac_test.run_is_live(claim.record):
+        if mac_test.claim_blocks_scope(paths, claim, scope) and mac_test.run_holds_work(claim.record):
             candidate = text(claim.record.get("holder_session"))
             if candidate and candidate != session:
                 return candidate

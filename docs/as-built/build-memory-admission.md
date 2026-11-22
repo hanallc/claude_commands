@@ -527,7 +527,9 @@ Release compares the exact claim identity under the provider lock.
 The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
 The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
 Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
-The provider keeps its existing repository scopes and cleanup policy.
+The Mac resolves the repository key before it takes the claim lock and saves the key with the claim.
+The claim reader uses the saved key without running Git.
+A Mac claim with no saved key blocks new claims for all repositories until it ends.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.

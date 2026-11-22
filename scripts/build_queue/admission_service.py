@@ -3210,9 +3210,11 @@ class AdmissionServer:
             held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
-        scope = claim_state.target_claim_scope(paths, request.constraints.repository)
+        scope = destination.scope
+        if paths.platform == "linux" or (isinstance(scope, claim_state.RepositoryScope) and not scope.key):
+            scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
-            if (mac_test.scopes_overlap(claim.scope, scope)
+            if (mac_test.claim_blocks_scope(paths, claim, scope)
                     and mac_test.run_holds_work(claim.record)):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
@@ -3224,7 +3226,15 @@ class AdmissionServer:
             record = claim.record
             if "remote_host" not in record:
                 continue
-            reference = placement.ProviderClaimReference(destination.provider, destination.target, claim.scope,
+            reference_scope = claim.scope
+            if paths.platform == "macos":
+                saved = self.assignments.get(execution_identity.attempt_key(record["episode"], record["attempt"]))
+                if saved is not None:
+                    assigned = saved.assignment.destination
+                    if (assigned.provider == destination.provider and assigned.target == destination.target
+                            and claim.matches_mac_assignment_scope(assigned.scope)):
+                        reference_scope = assigned.scope
+            reference = placement.ProviderClaimReference(destination.provider, destination.target, reference_scope,
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()

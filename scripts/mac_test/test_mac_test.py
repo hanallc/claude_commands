@@ -1245,9 +1245,9 @@ finally:
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def repository(self, name: str) -> Path:
-        """A folder that repository.repo_name reads as the named repository."""
+        """Create a Git repository without an origin."""
         directory = self.root / "repositories" / name
-        (directory / ".git").mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(directory)], check=True)
         return directory
 
     def repository_claim(self, name: str) -> RunState:
@@ -1434,7 +1434,7 @@ finally:
         _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
         return record
 
-    def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
+    def test_machine_wide_record_holds_every_repository_with_a_known_worktree(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         self.write_config(offload="on")
         owner, other = self.start_child(), self.start_child()
@@ -1443,11 +1443,12 @@ finally:
         before = legacy.read_bytes()
         self.assert_command(self.claim_in(other.pid, "hana tests", hana), 11, self.busy_line(record))
         self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
-        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
-        self.assert_command(self.claim_in(other.pid, "liner tests", liner), 0, "claimed\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 1, "busy\n")
+        self.assert_command(self.claim_in(other.pid, "liner tests", liner), 11, self.busy_line(record))
         self.assertEqual(legacy.read_bytes(), before)
         self.assert_command(self.release_claim(owner.pid), 0, "")
         self.assertFalse(legacy.exists())
+        self.assert_command(self.claim_in(other.pid, "liner tests", liner), 0, "claimed\n")
         self.assertEqual(self.claim_names(), ["cargo-liner.json"])
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
 

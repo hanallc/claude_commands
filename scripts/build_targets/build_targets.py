@@ -898,13 +898,14 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
     if not isinstance(start, process_identity.Started):
         return claim_state.NO_CLAIM_IDENTITY
     try:
-        scope = mac_test.target_claim_scope(paths, repo_root)
+        worktree = claim_state.claim_worktree_path(repo_root)
+        scope = mac_test.target_claim_scope(paths, str(worktree))
         block = mac_test.blocking_claim_block(paths, session)
         return next((claim_state.claim_identity(claim.record) for claim in mac_test.read_claims(paths)
-                     if mac_test.scopes_overlap(claim.scope, scope)
-                     and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
+                     if claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                      and claim.record["submitting_session"] == claim_state.session_id(session)
                      and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
+                     and mac_test.wait_claim_matches(paths, claim, scope, worktree)
                      and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)),
                     claim_state.NO_CLAIM_IDENTITY)
     except (OSError, mac_test.StateReadError):
@@ -926,7 +927,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         return
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
-                       if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
+                       if mac_test.claim_scope_matches(paths, claim, scope) and "remote_host" in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
@@ -947,8 +948,9 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:
+            cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
             checked = offload.check_leftovers(config, claim.record["remote_host"],
-                                              eligibility.KnownRepository(scope.name, scope.key), target.name,
+                                              eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key), target.name,
                                               claim.record.get("slot", 1))
         except conf.Unusable as error:
             print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
@@ -1014,8 +1016,10 @@ def reserve_assigned(args: CliArguments) -> int:
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78
+                scope = assignment.destination.scope
                 matches = [held for held in mac_test.read_claims(paths)
-                    if held.scope == assignment.destination.scope and held.record["pid"] == args.pid
+                    if (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
+                    and held.record["pid"] == args.pid
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
                     and (claim_state.claim_identity(held.record) == expected
@@ -1106,7 +1110,7 @@ def command_reserve(args: CliArguments) -> int:
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
             with mac_test.locked(paths.lock):
-                retained = any(mac_test.scopes_overlap(claim.scope, scope)
+                retained = any(mac_test.claim_scope_matches(paths, claim, scope)
                                and mac_test.run_is_kept(claim.record)
                                for claim in mac_test.read_claims(paths))
             if not retained:

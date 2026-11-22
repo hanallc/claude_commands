@@ -11,6 +11,7 @@ from enum import StrEnum
 import fcntl
 import json
 from pathlib import Path
+from subprocess import SubprocessError
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -278,26 +279,20 @@ WHOLE_MAC = WholeMacScope()
 
 
 @dataclass(frozen=True)
-class UseSavedClaimScope:
-    """Use the saved scope for capacity checks."""
-
-
-USE_SAVED_CLAIM_SCOPE = UseSavedClaimScope()
-
-
-@dataclass(frozen=True)
 class HeldClaim:
     """One claim record and the file that holds it."""
 
     scope: ClaimScope
     path: Path
     record: RunRecord
-    checkout_scope: RepositoryScope | UseSavedClaimScope = USE_SAVED_CLAIM_SCOPE
 
-    @property
-    def capacity_scope(self) -> ClaimScope:
-        """Use the checkout scope for capacity and keep the saved scope for recovery."""
-        return self.checkout_scope if isinstance(self.checkout_scope, RepositoryScope) else self.scope
+    def matches_mac_assignment_scope(self, scope: ClaimScope) -> bool:
+        """Match the scope from an assignment with the same claim identity."""
+        if self.scope == scope:
+            return True
+        if isinstance(scope, RepositoryScope) and not scope.key:
+            return self.record.get("repo_name") == scope.name and self.record.get("slot", 0) == scope.slot
+        return False
 
 
 class NoRun:
@@ -411,8 +406,9 @@ def read_run(path: Path) -> RunState:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
         record["copy"] = True
-    if "repo_key" in values or "repo_name" in values:
+    if "repo_key" in values:
         record["repo_key"] = required_string(values, "repo_key", path)
+    if "repo_name" in values or "repo_key" in values:
         record["repo_name"] = required_string(values, "repo_name", path)
     if "slot" in values:
         slot = values["slot"]
@@ -462,21 +458,26 @@ def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
     common = repository.git_common_dir(worktree)
     if common is None:
         return WHOLE_MAC
-    source, origin = repository.source_repository(common)
-    folder = Path(source).parent
-    name = folder.name
+    if paths.platform == "macos":
+        try:
+            source, origin = repository.mac_source_repository(common)
+            folder = Path(source).parent
+            key = repository.remote_identity(origin, str(folder)) if origin else "git-dir:" + source
+        except (OSError, SubprocessError, ValueError):
+            return WHOLE_MAC
+        name = (key.rsplit("/", 1)[-1] or folder.name) if origin else folder.name
+        return RepositoryScope(".claude" if name == "claude_commands" else name, key) if name else WHOLE_MAC
+    source = Path(repository.source_git_dir(common))
+    name = source.parent.name
     if not name:
         return WHOLE_MAC
-    if origin is not None:
-        key = repository.remote_identity(origin, str(folder))
-        name = key.rsplit("/", 1)[-1] or name
-    elif not target_config.uses_legacy_mac_layout(paths.platform) and (Path(source) / "config").is_file():
-        key = repository.repository_key(str(folder))
-    else:
-        key = store.UNKNOWN_IDENTITY
-    if target_config.uses_legacy_mac_layout(paths.platform):
-        return RepositoryScope(".claude" if name == "claude_commands" else name)
-    return RepositoryScope(name, "" if key == store.UNKNOWN_IDENTITY else key)
+    if not (source / "config").is_file():
+        return RepositoryScope(name)
+    key = repository.repository_key(str(source.parent))
+    if key == store.UNKNOWN_IDENTITY:
+        return RepositoryScope(name)
+    policy_name = key.rsplit("/", 1)[-1] if key and not key.startswith("git-root:") else name
+    return RepositoryScope(policy_name, key)
 
 
 def claim_files(paths: StatePaths) -> tuple[Path, ...]:
@@ -488,9 +489,8 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
-    """Read claims from oldest to newest and resolve old Mac checkout names."""
+    """Read saved claim scopes from oldest to newest."""
     held: list[HeldClaim] = []
-    checkout_scopes: dict[str, ClaimScope] = {}
     for path in claim_files(paths):
         try:
             record = read_run(path)
@@ -498,21 +498,14 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             raise ClaimStateUnreadable(path, error) from error
         if isinstance(record, NoRun):
             continue
-        worktree = record["worktree"]
-        if (path == paths.run or paths.platform == "macos") and Path(worktree).is_absolute():
-            if worktree not in checkout_scopes:
-                checkout_scopes[worktree] = target_claim_scope(paths, worktree)
-        checkout = checkout_scopes.get(worktree, WHOLE_MAC)
-        if "repo_name" in record:
-            scope: ClaimScope = RepositoryScope(record["repo_name"], record.get("repo_key", ""), record.get("slot", 0))
+        key = record.get("repo_key", "")
+        if paths.platform == "macos" and not key:
+            scope: ClaimScope = WHOLE_MAC
+        elif "repo_name" in record:
+            scope = RepositoryScope(record["repo_name"], key, record.get("slot", 0))
         else:
-            scope = checkout if path == paths.run else RepositoryScope(path.stem)
-        checkout_scope: RepositoryScope | UseSavedClaimScope = USE_SAVED_CLAIM_SCOPE
-        if paths.platform == "macos" and isinstance(scope, RepositoryScope) and isinstance(checkout, RepositoryScope):
-            resolved = RepositoryScope(checkout.name, checkout.key, scope.slot)
-            if resolved != scope:
-                checkout_scope = resolved
-        held.append(HeldClaim(scope, path, record, checkout_scope))
+            scope = WHOLE_MAC if path == paths.run else RepositoryScope(path.stem)
+        held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
 

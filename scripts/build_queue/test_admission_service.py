@@ -1231,31 +1231,33 @@ class LocalHoldPlacementTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
             request = placement_request(fixture)
-            destination = request.constraints.candidates[0].destination
+            candidate, = request.constraints.candidates
+            repo_key = "https://fixture.invalid/team/hana"
+            destination = replace(candidate.destination, scope=claim_state.RepositoryScope("hana", repo_key))
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
             paths = claim_state.StatePaths(fixture.root / "claims")
-            paths.directory.mkdir()
+            paths.claims.mkdir(parents=True)
             kept: claim_state.RemoteJobClaim = {
                 "claim_id": "older-kept", "episode": "old", "attempt": "old-attempt",
                 "submitting_session": "old-session", "holder_session": "dead-holder",
                 "pid": request.owner.pid, "proc_start": "dead-start", "remote_host": destination.host,
                 "what": "dead check", "worktree": str(fixture.root), "since": "2026-11-17T10:00:00+00:00",
-                "cleanup_pending": True}
+                "cleanup_pending": True, "repo_name": "hana", "repo_key": repo_key}
             live: claim_state.RemoteJobClaim = {
                 "claim_id": "newer-live", "episode": "new", "attempt": "new-attempt",
                 "submitting_session": "live-session", "holder_session": "live-holder",
                 "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": destination.host,
-                "what": "live check", "worktree": str(fixture.root), "since": "2026-11-17T11:00:00+00:00"}
-            held = (claim_state.HeldClaim(destination.scope, paths.directory / "older.json", kept),
-                    claim_state.HeldClaim(destination.scope, paths.directory / "newer.json", live))
-            originals: dict[Path, bytes] = {}
-            for claim in held:
-                originals[claim.path] = (json.dumps(claim.record, indent=3) + "\n").encode()
-                _ = claim.path.write_bytes(originals[claim.path])
+                "what": "live check", "worktree": str(fixture.root / "removed"),
+                "since": "2026-11-17T11:00:00+00:00", "repo_name": "checkout", "repo_key": repo_key}
+            originals = {paths.claims / name: (json.dumps(record, indent=3) + "\n").encode()
+                         for name, record in (("older.json", kept), ("newer.json", live))}
+            for path, original in originals.items():
+                _ = path.write_bytes(original)
             with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
                  mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)), \
                  mock.patch.object(claim_state, "state_paths", return_value=paths), \
-                 mock.patch.object(claim_state, "read_claims", return_value=held), \
-                 mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
+                 mock.patch.object(claim_state, "target_claim_scope", side_effect=AssertionError("The key is saved")), \
                  mock.patch.object(mac_test, "free_now", return_value="busy"), \
                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Started(request.owner.start_time)), \
                  mock.patch.object(fixture.server, "_observe_provider_execution", return_value=execution_identity.ExecutionNotStarted()):

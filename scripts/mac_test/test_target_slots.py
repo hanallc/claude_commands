@@ -64,6 +64,20 @@ class RepositoryKeyTests(unittest.TestCase):
     def test_real_repository_without_commits_keeps_the_repository_name(self) -> None:
         self.assertEqual(eligibility.repository_identity(self.root), eligibility.KnownRepository("project"))
 
+    def test_linux_uses_the_same_key_for_a_clone_with_a_quoted_local_origin(self) -> None:
+        _ = commit_repository(self.root, "Fixture", allow_empty=True)
+        _ = self.git("remote", "add", "origin", "https://github.com/nate/project.git")
+        clone = self.root.parent / "clone"
+        _ = subprocess.run(["git", "clone", "-q", str(self.root), str(clone)], check=True)
+        config = clone / ".git/config"
+        _ = config.write_text(config.read_text().replace(f"url = {self.root}", f'url = "{self.root}"'))
+        self.assertIn(f'url = "{self.root}"', config.read_text())
+        paths = claim_state.StatePaths(self.root.parent / "state", "linux", platform="linux")
+
+        scope = claim_state.target_claim_scope(paths, str(clone))
+
+        self.assertEqual(scope, claim_state.RepositoryScope("project", str(self.root.resolve())))
+
     def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
         log_root = self.root.parent / "buildlog"
         request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (), owner="verify",

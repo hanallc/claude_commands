@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 import os
 from pathlib import Path
 import subprocess
@@ -21,15 +20,6 @@ def output(args: list[str], cwd: str, timeout: float) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout if result.returncode == 0 else None
-
-
-def git_origin(directory: str, *, git_dir: str = "") -> str | None:
-    """Read the first origin URL with Git's configuration rules."""
-    command = ["git", "-C", directory]
-    if git_dir:
-        command.append(f"--git-dir={git_dir}")
-    remote = output([*command, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
-    return remote.strip() if remote and remote.strip() else None
 
 
 def remote_identity(remote: str, directory: str) -> str:
@@ -69,9 +59,9 @@ def repository_key(directory: str) -> str:
             manifest = parent / "Cargo.toml"
             if manifest.is_file():
                 return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
-    remote = git_origin(directory)
-    if remote is not None:
-        return remote_identity(remote, directory)
+    remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
+    if remote and remote.strip():
+        return remote_identity(remote.strip(), directory)
     roots = output(["git", "-C", directory, "rev-list", "--max-parents=0", "--reverse", "HEAD"],
                    directory, GIT_TIMEOUT_S)
     return "git-root:" + roots.strip().splitlines()[0] if roots and roots.strip() else store.UNKNOWN_IDENTITY
@@ -101,11 +91,7 @@ def git_common_dir(directory: str) -> str | None:
         return None
 
 
-def _git_dir_origin(common: str) -> str | None:
-    return git_origin(os.path.dirname(common), git_dir=common)
-
-
-def source_repository(common: str, *, read_origin: Callable[[str], str | None] = _git_dir_origin) -> tuple[str, str | None]:
+def mac_source_repository(common: str) -> tuple[str, str]:
     """Read the source Git folder and its origin through local clone links."""
     seen = {common}
     while True:
@@ -114,8 +100,13 @@ def source_repository(common: str, *, read_origin: Callable[[str], str | None] =
             common = borrowed
             seen.add(common)
             continue
-        origin = read_origin(common)
-        source = local_origin_git_dir(origin) if origin else None
+        result = subprocess.run(["git", "-C", os.path.dirname(common), f"--git-dir={common}", "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+        if result.returncode == 2:
+            return common, ""
+        result.check_returncode()
+        origin = result.stdout.strip()
+        source = local_origin_git_dir(origin)
         if source is None or source in seen:
             return common, origin
         seen.add(source)
@@ -124,8 +115,13 @@ def source_repository(common: str, *, read_origin: Callable[[str], str | None] =
 
 def source_git_dir(common: str) -> str:
     """Follow local clone sources without a Git command."""
-    source, _ = source_repository(common, read_origin=_stored_origin_url)
-    return source
+    seen = {common}
+    while True:
+        source = borrowed_git_dir(common) or _stored_local_origin_git_dir(common)
+        if source is None or source in seen:
+            return common
+        seen.add(source)
+        common = source
 
 
 def borrowed_git_dir(common: str) -> str | None:
@@ -145,8 +141,8 @@ def local_origin_git_dir(origin: str) -> str | None:
     return git_common_dir(url) if os.path.isabs(url) and os.path.isdir(url) else None
 
 
-def _stored_origin_url(common: str) -> str | None:
-    """Read origin from the repository configuration without a Git command."""
+def _stored_local_origin_git_dir(common: str) -> str | None:
+    """Read a local origin from the repository configuration without a Git command."""
     try:
         with open(os.path.join(common, "config"), encoding="utf-8") as handle:
             lines = handle.read().splitlines()
@@ -158,5 +154,5 @@ def _stored_origin_url(common: str) -> str | None:
         if text.startswith("["):
             in_origin = text == '[remote "origin"]'
         elif in_origin and text.partition("=")[0].strip() == "url":
-            return text.partition("=")[2].strip()
+            return local_origin_git_dir(text.partition("=")[2].strip())
     return None
