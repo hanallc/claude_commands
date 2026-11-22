@@ -153,6 +153,7 @@ class GpuTestSlots:
 GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected"})
+RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
 
 
 @dataclass(frozen=True)
@@ -1588,9 +1589,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             # The admission policy also accepts zero for keys with older file limits.
             run_limits = {
                 key.removeprefix("max_runs."): value(key, _repository_run_maximum, use_file_limits=False)
-                for key in values if key.startswith("max_runs.")
+                for key in values if key.startswith("max_runs.") and key != RUN_LIMIT_EXEMPT_KEY
             }
-            exempt_unit = value("max_runs_exempt_unit", str) if run_limits else ""
+            exempt_unit = value(RUN_LIMIT_EXEMPT_KEY, str) if run_limits else ""
             if "cargo" not in first_peaks:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(

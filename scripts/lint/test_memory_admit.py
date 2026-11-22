@@ -6529,7 +6529,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         original = self.config.read_text()
         for limit in (0, 2, 3):
             _ = self.config.write_text(original + f"\n# whole: 1..\nmax_runs.natedev.claude_commands={limit}\n"
-                                       + "# whole: 1..\nmax_runs.mac.other.repo=4\nmax_runs_exempt_unit=natemerge\n")
+                                       + "# whole: 1..\nmax_runs.mac.other.repo=4\nmax_runs.exempt_unit=natemerge\n")
             runs = admission_records.read_memory_config().policy.repository_runs
             self.assertEqual(runs.for_step("natedev", "claude_commands", "gate"),
                              admission_records.RepositoryRunLimit(limit))

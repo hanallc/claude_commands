@@ -1331,7 +1331,7 @@ The gap is about ten seconds with the current configuration.
 Local `gate` and `test-affected` runs count while they hold a reservation.
 `max_runs.natedev.claude_commands` permits two concurrent runs and applies this rule to the repository's `gate` and `test-affected` steps.
 The admission service uses the Git repository name when a gate profile supplies an absolute path.
-The unit in `max_runs_exempt_unit` can start above the limit. Its runs use slots.
+The unit in `max_runs.exempt_unit` can start above the limit. Its runs use slots.
 Verify prints the count, limit, repository, and machine while it waits.
 The slot request uses the Verify Python helper, including when detached output goes to a file.
 The slot wait ignores the queue leave hooks.

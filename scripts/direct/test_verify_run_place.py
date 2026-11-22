@@ -123,7 +123,7 @@ fi
         """Write a run limit of one with the exempt unit the reader requires."""
         config = fixture.root / "build_admission.conf"
         _ = config.write_text(config.read_text()
-            + f"\nmax_runs.{fixture.server.host}.repository=1\nmax_runs_exempt_unit=natemerge\n")
+            + f"\nmax_runs.{fixture.server.host}.repository=1\nmax_runs.exempt_unit=natemerge\n")
 
     def test_verify_requests_a_slot_with_its_own_process_identity(self) -> None:
         with AdmissionFixture() as fixture:
