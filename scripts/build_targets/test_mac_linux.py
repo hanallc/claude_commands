@@ -26,7 +26,7 @@ from unittest.mock import call, patch
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import mac_run
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_targets import mac_linux
+from scripts.build_targets import mac_linux, target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -345,7 +345,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         config = self.root / 'config'
         config.mkdir()
         self.registry = config / 'build_targets.conf'
-        _ = write_config_fixture(self.registry, f'enabled.mac-linux=on\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n')
+        _ = write_config_fixture(self.registry, f'enabled.mac-linux=on\n{target_config.UNREACHABLE_WAIT_KEY}=20\n')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
             + 'run.time_limit_seconds=7\n',
@@ -529,7 +529,7 @@ fi
         self.assert_guest_clean('probe')
 
     def test_unreachable_wait_refuses_a_missing_key_without_a_committed_value(self) -> None:
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         settings = mac_linux.read_settings(conf.read(self.registry))
         self.assertEqual(settings.unreachable_wait_seconds, 20)
         _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20\n', ''))
@@ -546,13 +546,13 @@ fi
         _ = registry.write_text(original)
         _ = self.git('add', 'config/build_targets.conf')
         _ = self.git('commit', '-qm', 'Add the target registry')
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         _ = registry.write_text(original.replace(f'{key}=20\n', ''))
         settings = mac_linux.read_settings(conf.read(registry))
         self.assertEqual(settings.unreachable_wait_seconds, 20)
 
     def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         configuration = self.registry
         original = configuration.read_text()
         for value, reason in (
@@ -770,7 +770,7 @@ fi
 
     def test_proof_wait_expires_and_a_second_route_cannot_take_the_guest_lock(self) -> None:
         configuration = self.registry
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=2'))
         settings = mac_linux.read_settings(conf.read(self.registry))
         attempts: list[mac_linux.ArmedGuestAttempt] = []
@@ -965,7 +965,7 @@ fi
 
     def test_full_stderr_pipe_does_not_extend_the_proof_wait(self) -> None:
         configuration = self.registry
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
         started: list[float] = []
         reader, writer = os.pipe()
@@ -1001,7 +1001,7 @@ fi
 
     def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
         configuration = self.registry
-        key = mac_linux.UNREACHABLE_WAIT_KEY
+        key = target_config.UNREACHABLE_WAIT_KEY
         _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
         helper = Path(process_group.__file__)
         read_text = Path.read_text

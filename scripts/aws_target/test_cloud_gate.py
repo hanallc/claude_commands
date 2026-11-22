@@ -1968,6 +1968,37 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.execute(), {'status': 'fallback', 'reason': 'The instance stopped without a final result'})
         self.assertTrue(self.fake.terminated)
 
+    def test_a_silent_box_ends_as_unreachable_and_frees_its_place(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+        with mock.patch.object(time, 'monotonic', side_effect=lambda: self.now):
+            outcome = self.execute()
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertRegex(str(outcome['reason']),
+                         r'^unreachable: the box sent no log for 3\d seconds \(unreachable_wait_seconds=30\)$')
+        self.assertLess(self.now - started, 40)
+        self.assertTrue(self.fake.terminated)
+
+    def test_a_box_that_keeps_sending_its_log_is_not_unreachable(self) -> None:
+        _ = write_config_fixture(self.root / 'build_targets.conf', f'{target_config.UNREACHABLE_WAIT_KEY}=30\n')
+        self.fake.has_result = False
+        started = self.now
+
+        def pause(seconds: float) -> None:
+            # The box pushes a heartbeat line each pause and its result after 90 seconds.
+            self.now += seconds
+            self.fake.log += 'heartbeat\n'
+            self.fake.has_result = self.now - started >= 90
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=pause)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: self.now),
+              redirect_stdout(StringIO())):
+            outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        self.assertGreaterEqual(self.now - started, 90)
+
     def test_stopped_instance_reports_a_confirmed_spot_interruption(self) -> None:
         self.fake.has_result = False
         self.fake.state = 'shutting-down'
