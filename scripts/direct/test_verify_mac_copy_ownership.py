@@ -9,6 +9,7 @@ import sys
 import json
 from pathlib import Path
 from typing import cast, final
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
@@ -52,9 +53,7 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         with self.subTest(launch="direct"):
             self.check_natedev_copy_result(self)
         with self.subTest(launch="copies"):
-            fixture = VerifyMacOffloadFixture()
-            fixture.setUp()
-            self.addCleanup(fixture.doCleanups)
+            fixture = set_up_fixture(self.addCleanup, VerifyMacOffloadFixture())
             real_git = shutil.which("git")
             assert real_git is not None
             shutil.rmtree(fixture.root / ".git")

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
@@ -259,8 +260,7 @@ class AssignLauncherFixture(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
-        self.native.setUp()
-        self.addCleanup(self.native.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.native)
         _ = self.enterContext(assignment_helpers(bytecode_setting))
         self.home = Path.home()
         self.session_dir = self.native.run_dir
