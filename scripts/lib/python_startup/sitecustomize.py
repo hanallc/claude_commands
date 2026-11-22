@@ -43,6 +43,7 @@ _SESSION_STARTUP = "session_python_startup"
 _SYSTEMD_SERVICE = "org.freedesktop.systemd1"
 _SYSTEMD_INFINITE_RUNTIME = (1 << 64) - 1
 _DIRECT_TEST_LIMIT_KEY = "direct_test.time_limit_seconds"
+_WATCHDOG_READY = b"ready\n"
 GATE_PARENT_SOURCE_FD = "DEVTOOLS_GATE_PARENT_SOURCE_FD"
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
@@ -598,8 +599,11 @@ def _user_test_manager_available() -> bool:
     else:
         local = re.fullmatch(r"unix:path=([^,;]+)", address)
         socket = local[1] if local else ""
-    if socket and not os.path.exists(socket):
-        return False
+    if socket:
+        try:
+            _ = os.stat(socket)
+        except FileNotFoundError:
+            return False
     result = subprocess.run(
         ["busctl", "--user", "--timeout=5s", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
          "org.freedesktop.DBus", "NameHasOwner", "s", _SYSTEMD_SERVICE],
@@ -618,32 +622,42 @@ def _direct_test_limit_line(seconds: int) -> str:
 def _start_direct_test_watchdog(seconds: int) -> None:
     """Bound a direct test with a watchdog process when no user systemd manager runs.
 
+    The test starts only after the watchdog reports that it is ready.
     Known limit: the watchdog stops only this process. Its children outlive the deadline.
     """
-    pid = os.getpid()
-    descriptor = os.pidfd_open(pid)
+    descriptor = os.pidfd_open(os.getpid())
+    ready_read, ready_write = os.pipe()
     try:
         _ = os.posix_spawn(
             sys.executable, [sys.executable, "-IS", os.path.realpath(__file__), "watchdog", str(seconds)],
             os.environ,
-            file_actions=[(os.POSIX_SPAWN_DUP2, descriptor, 0),
-                          (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0)],
+            file_actions=[(os.POSIX_SPAWN_DUP2, descriptor, 0), (os.POSIX_SPAWN_DUP2, ready_write, 1)],
             setsid=True)
+        os.close(ready_write)
+        ready_write = -1
+        answer = os.read(ready_read, len(_WATCHDOG_READY))
     finally:
-        os.close(descriptor)
+        for opened in (descriptor, ready_read, ready_write):
+            if opened >= 0:
+                os.close(opened)
+    if answer != _WATCHDOG_READY:
+        raise ValueError("the direct test watchdog did not start")
 
 
 def _watch_direct_test(seconds: int) -> None:
-    """Stop the test at its deadline. Standard input is the test's pidfd."""
+    """Stop the test at its deadline. Standard input is the test's pidfd; standard output takes the ready report."""
     import select
     import signal
     from contextlib import suppress
 
+    _ = os.write(1, _WATCHDOG_READY)
+    os.close(1)
     readable, _, _ = select.select([0], [], [], seconds)
     if not readable:
-        print(_direct_test_limit_line(seconds), file=sys.stderr, flush=True)
         with suppress(ProcessLookupError):
             signal.pidfd_send_signal(0, signal.SIGKILL)
+        # Stop the test first: a full stderr pipe can block this line.
+        print(_direct_test_limit_line(seconds), file=sys.stderr, flush=True)
 
 
 def _direct_test_scope_enforces_deadline(unit: str) -> bool:

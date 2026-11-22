@@ -185,6 +185,22 @@ unittest.TextTestRunner().run(case)
         self.assertIn("direct test: could not check the user systemd manager: fixture bus refused", result.stderr)
         self.assertNotIn("fixture started", result.stdout)
 
+    @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
+    def test_unreadable_bus_socket_stops_before_the_test(self) -> None:
+        locked = self.root / "locked"
+        locked.mkdir(mode=0)
+        self.addCleanup(locked.chmod, 0o700)
+        self.environment.update(DBUS_SESSION_BUS_ADDRESS=f"unix:path={locked / 'bus'}",
+                                PYTHONPATH=startup.startup_pythonpath(""))
+        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+import unittest
+case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_long")
+unittest.TextTestRunner().run(case)
+""")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("direct test: [Errno 13] Permission denied", result.stderr)
+        self.assertNotIn("fixture started", result.stdout)
+
     @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
     def test_scope_name_without_enforcement_cannot_bypass_the_direct_limit(self) -> None:
         for properties in (f"t {2**64 - 1}\ni {signal.SIGKILL.value}\n", f"t 90000000\ni {signal.SIGTERM.value}\n"):
