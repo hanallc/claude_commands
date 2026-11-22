@@ -64,9 +64,12 @@ class MacRunTests(unittest.TestCase):
         _ = (self.root / "build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
                                                         + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         _ = (self.root / "mac_test.conf").write_text("offload=on\nslots.claude_commands=99\n")
+        copies_config = self.root / "copies.conf"
+        _ = copies_config.write_text("# range: 5e-324..\ngit_timeout_seconds=5\n")
         self.configure_limit(1)
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(self.root / "state"),
+            "CONF_DIR": str(self.root), "COPIES_CONFIG": str(copies_config),
+            "MAC_TEST_STATE_DIR": str(self.root / "state"),
         }))
         _ = self.enterContext(mock.patch.object(claim_state, "submitting_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(copies, "remote_registry", return_value=self.root / "remote-registry"))
@@ -349,6 +352,29 @@ class MacRunTests(unittest.TestCase):
         with self.assertRaises(mac_run.MacRunRefused), mac_run.held(
                 self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             self.fail("The clone exceeded the repository limit")
+
+    def test_separate_git_directory_with_a_relative_origin_shares_capacity(self) -> None:
+        separate = self.root / "separate"
+        metadata = self.root / "metadata" / "git" / "repo.git"
+        metadata.parent.mkdir(parents=True)
+        _ = subprocess.run(["git", "clone", "-q", "--separate-git-dir", str(metadata),
+                            str(self.repo), str(separate)], check=True)
+        for checkout, origin in ((separate, "../.claude"), (self.checkout, "../separate")):
+            _ = subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "origin", origin], check=True)
+
+        linked = self.root / "linked" / "worktree"
+        _ = subprocess.run(["git", "-C", str(separate), "config", "core.worktree", str(separate)], check=True)
+        _ = subprocess.run(["git", "-C", str(separate), "worktree", "add", "-q", "--detach", str(linked)], check=True)
+        native = self.native_claim(self.repo)
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        self.addCleanup(mac_test.command_release, native, self.paths)
+        for checkout in (separate, self.checkout, linked):
+            with self.subTest(checkout=checkout.name):
+                self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
+                                 claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
+                with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with native Mac run"):
+                    with mac_run.held(checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                        self.fail("The guest took the native run's place")
 
     def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
         other = self.root / "other"

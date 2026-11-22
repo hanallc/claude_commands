@@ -91,8 +91,13 @@ def repo_name(directory: str) -> str | None:
 
 def git_common_dir(directory: str) -> str | None:
     """Return the Git folder that the repository worktrees share."""
+    checkout = _git_checkout(directory)
+    return str(checkout.common_dir) if checkout is not None else None
+
+
+def _git_checkout(directory: str) -> git_files.Checkout | None:
     try:
-        return str(git_files.locate(Path(directory)).common_dir)
+        return git_files.locate(Path(directory))
     except git_files.GitFilesError:
         return None
 
@@ -108,24 +113,37 @@ class MacSourceRepository:
 
 def mac_source_repository(worktree: str, common: str) -> MacSourceRepository:
     """Follow local clone origins from the checkout to the source repository."""
-    checkout_origin = _mac_origin(["-C", worktree])
+    checkout_origin = _mac_origin(worktree)
     origin = checkout_origin
-    # Use the shared Git directory to locate the checkout that owns the relative origin.
-    directory = os.path.dirname(common)
+    directory = worktree
     seen = {common}
     while origin:
-        source = local_origin_git_dir(origin, directory)
-        if source is None or source in seen:
+        if _relative_local_origin(origin):
+            directory = _relative_origin_directory(directory)
+        source = _local_origin_checkout(origin, directory)
+        if source is None or str(source.common_dir) in seen:
             return MacSourceRepository(common, remote_identity(origin, directory), checkout_origin)
-        seen.add(source)
-        common = source
-        directory = os.path.dirname(common)
-        origin = _mac_origin(["-C", directory, f"--git-dir={common}"])
+        common = str(source.common_dir)
+        seen.add(common)
+        directory = str(source.toplevel)
+        origin = _mac_origin(directory)
     return MacSourceRepository(common, "git-dir:" + common, checkout_origin)
 
 
-def _mac_origin(git_location: list[str]) -> str:
-    result = subprocess.run(["git", *git_location, "remote", "get-url", "origin"],
+def _relative_origin_directory(directory: str) -> str:
+    checkout = git_files.locate(Path(directory))
+    if checkout.git_dir == checkout.common_dir:
+        return str(checkout.toplevel)
+    from scripts.lib.build_slots import SlotGitFailure, source_checkout
+
+    try:
+        return str(source_checkout(checkout.toplevel))
+    except SlotGitFailure as error:
+        raise ValueError(str(error)) from error
+
+
+def _mac_origin(directory: str) -> str:
+    result = subprocess.run(["git", "-C", directory, "remote", "get-url", "origin"],
                             capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
     if result.returncode == 2:
         return ""
@@ -157,10 +175,19 @@ def borrowed_git_dir(common: str) -> str | None:
 
 def local_origin_git_dir(origin: str, directory: str = "") -> str | None:
     """Return the shared Git folder when origin names a local directory."""
+    checkout = _local_origin_checkout(origin, directory)
+    return str(checkout.common_dir) if checkout is not None else None
+
+
+def _relative_local_origin(origin: str) -> bool:
+    return ":" not in origin and not os.path.isabs(origin)
+
+
+def _local_origin_checkout(origin: str, directory: str) -> git_files.Checkout | None:
     url = origin.removeprefix("file://")
-    if directory and "://" not in origin and ":" not in url and not os.path.isabs(url):
+    if directory and _relative_local_origin(origin):
         url = os.path.join(directory, url)
-    return git_common_dir(url) if os.path.isabs(url) and os.path.isdir(url) else None
+    return _git_checkout(url) if os.path.isabs(url) and os.path.isdir(url) else None
 
 
 def _stored_local_origin_git_dir(common: str) -> str | None:
