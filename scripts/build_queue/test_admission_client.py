@@ -1523,6 +1523,23 @@ class ClientTests(unittest.TestCase):
                 f"queue reached again: 3 of 3 fixture runs on {fixture.server.host}",
             ])
 
+    def test_verify_run_slot_reports_the_answer_after_a_silence_on_the_same_connection(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.run_owner()
+            waiting = wire.VerifyRunSlotWaiting(records.RunLimitWait(1, 1, "fixture", fixture.server.host))
+            transport = self.use_transport(fixture, Exchange(
+                reply_bytes(waiting), TimeoutError(), reply_bytes(waiting) + reply_bytes(wire.Ok())))
+            with redirect_stderr(io.StringIO()) as errors:
+                status = client.main(["verify-run-slot", "--pid", str(owner.pid)])
+            self.assertEqual(status, 0, errors.getvalue())
+            self.assertEqual(len(transport.requests), 1)
+            text = records.run_limit_text(waiting.reason)
+            lines = errors.getvalue().splitlines()
+            self.assertIn("admission service not answering since", errors.getvalue())
+            self.assertEqual(lines.count(text), 1, lines)
+            self.assertEqual([line for line in lines if line.startswith("queue reached again")],
+                             [f"queue reached again: {text}"])
+
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):
             with self.subTest(failure=failure), AdmissionFixture() as fixture:

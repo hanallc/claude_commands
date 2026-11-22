@@ -869,12 +869,14 @@ class ReconnectNotice:
             print("admission service restarted; waiting again", file=sys.stderr)
             self.restart_reported = True
 
-    def reached(self, reply: wire.Reply) -> None:
+    def reached(self, reply: wire.Reply) -> bool:
+        """Print the reconnect line once after a loss of contact; return whether it printed."""
         if not self.pending:
-            return
+            return False
         self.pending = False
         reason = " ".join(_reconnect_wait_reason(reply).splitlines())
         print("queue reached again" + (f": {reason}" if reason else ""), file=sys.stderr, flush=True)
+        return True
 
 
 def _reconnect_wait_reason(reply: wire.Reply) -> str:
@@ -978,12 +980,13 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                         if retry.launch_without_wait:
                             return deadline_reply()
                         _silence_notice(last_valid)
+                        reconnect.disconnected()
                         last_notice = CLOCK.monotonic()
                         continue
                     reply = _parse_acquisition_reply(line, request)
                     if CLOCK.monotonic() > retry.deadline:
                         return deadline_reply()
-                    reconnect.reached(reply)
+                    rejoined = reconnect.reached(reply)
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
@@ -996,9 +999,9 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                         if not isinstance(reply, wire.VerifyRunSlotWaiting):
                             raise CheckerFailure("invalid Verify run slot answer")
                         text = records.run_limit_text(reply.reason)
-                        if text != verify_wait_text:
+                        if text != verify_wait_text and not rejoined:
                             print(text, file=sys.stderr, flush=True)
-                            verify_wait_text = text
+                        verify_wait_text = text
                         last_valid = CLOCK.monotonic()
                         continue
                     if slot_waiting is not None:
@@ -1006,7 +1009,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                             return reply
                         if not isinstance(reply, wire.RepositorySlotWaiting):
                             raise CheckerFailure("invalid repository slot answer")
-                        if reply != slot_waiting or not showed_slot:
+                        if (reply != slot_waiting or not showed_slot) and not rejoined:
                             print(reply.text, file=sys.stderr)
                         slot_waiting = reply
                         showed_slot = True
@@ -1246,7 +1249,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
             # A wait that arrived in the same read as the answer is the first answer after a reconnect.
             owner_stream = sockets.streams.get(sockets.owner) if sockets.owner is not None else None
             replies = owner_stream.replies if owner_stream is not None else ()
-            reconnect.reached(next((reply for reply in replies if isinstance(reply, wire.Wait)), answer))
+            _ = reconnect.reached(next((reply for reply in replies if isinstance(reply, wire.Wait)), answer))
             return request, None
         if retry.launch_without_wait and any(stream.error is not None for stream in sockets.streams.values()):
             return request, AcquisitionDeadline.LAUNCH
@@ -1263,7 +1266,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         message = sockets.next_reply()
         if message is not None and message[0] is sockets.owner and isinstance(message[1], wire.Wait):
             wait = message[1]
-            reconnect.reached(wait)
+            _ = reconnect.reached(wait)
             last_valid = last_notice = now
             if refreshing is None or sockets.streams[message[0]].history_lookup is None:
                 reconnect_at = math.inf
