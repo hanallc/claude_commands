@@ -16,7 +16,7 @@ Check the light mode and phone width yourself when the change needs them.
 ## Steps
 
 1. Write a caption. A caption is the change in the fewest plain words that stay accurate, such as "Not Approved button removed".
-   Add a Look for part only when the change is hard to find.
+   Add a second line, `Look for: <place>`, only when the change is hard to find.
    File the before and after shots of a change as one pair. The page labels each image, so the caption needs no `Before:` or `After:`.
 2. Find your fixed staff id: the `id` in your staff row.
    `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <your worktree path>` prints the row.

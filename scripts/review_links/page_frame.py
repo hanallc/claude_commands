@@ -516,7 +516,7 @@ document.addEventListener('click',async event=>{
 # A plain click on a data-image-zoom link shows its image over the page; Escape returns focus to that link.
 # A click with a modifier key, or any other button, keeps the browser's link action.
 # In a data-image-zoom-group, the left and right arrow keys show the previous and next image,
-# and the caption names the shown image (Before or After for a pair).
+# and a badge names the shown image (Before or After for a pair).
 # The zoom keeps hrefs, not link nodes, so a page refresh while it is open changes nothing.
 ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
@@ -524,26 +524,26 @@ ZOOM_STYLE = '''
 [data-image-zoom-dialog]{position:fixed;inset:0;box-sizing:border-box;width:100vw;height:100dvh;
 max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;outline:none;overflow:hidden}
 [data-image-zoom-dialog][open]{display:grid;place-items:center;align-content:center;gap:8px}
-[data-image-zoom-dialog] [data-image-zoom-caption]{padding:4px 12px;border-radius:8px;background:#000c;color:#fff;
+[data-image-zoom-dialog] [data-image-zoom-badge]{padding:4px 12px;border-radius:8px;background:#000c;color:#fff;
 font:600 14px/20px system-ui,sans-serif}
-[data-image-zoom-dialog]:has([data-image-zoom-caption]:not([hidden])) img{max-height:calc(100dvh - 68px)}
+[data-image-zoom-dialog]:has([data-image-zoom-badge]:not([hidden])) img{max-height:calc(100dvh - 68px)}
 [data-image-zoom-dialog]::backdrop{background:transparent}
 [data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100dvh - 32px);
 border:0;border-radius:0;cursor:zoom-out}
 '''
 
 ZOOM_SCRIPT = r'''(() => {
-const dialog=document.createElement('dialog'), image=document.createElement('img'), label=document.createElement('div');
+const dialog=document.createElement('dialog'), image=document.createElement('img'), badge=document.createElement('div');
 dialog.dataset.imageZoomDialog='';dialog.setAttribute('role','dialog');
 dialog.setAttribute('aria-modal','true');dialog.tabIndex=-1;
-label.dataset.imageZoomCaption='';label.setAttribute('aria-live','polite');label.hidden=true;
-dialog.append(label,image);document.body.append(dialog);
+badge.dataset.imageZoomBadge='';badge.setAttribute('aria-live','polite');badge.hidden=true;
+dialog.append(badge,image);document.body.append(dialog);
 let opener='', shown='', position=[0,0];
 const live=href=>[...document.querySelectorAll('a[data-image-zoom]')].find(link=>link.getAttribute('href')===href);
 function show(link){
  const thumbnail=link.querySelector('img');
  shown=link.getAttribute('href');image.alt=thumbnail.alt;image.src=link.href;
- label.textContent=link.dataset.imageZoomLabel || '';label.hidden=!label.textContent;
+ badge.textContent=link.dataset.imageZoomLabel || '';badge.hidden=!badge.textContent;
  dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
 }
 function close(){

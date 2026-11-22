@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
@@ -88,6 +89,27 @@ class ImagesFixture(unittest.TestCase):
 
     def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+
+    def run_firefox(self, handler: type[BaseHTTPRequestHandler], name: str, *, timeout: int = 45,
+                    release: Callable[[], None] = lambda: None) -> None:
+        """Serve one headless Firefox screenshot load; release frees held requests before the server stops."""
+        with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+            # Join the handlers before the fixture folder is deleted.
+            server.daemon_threads = False
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / f"{name}-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / f"{name}.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"],
+                                     capture_output=True, text=True, timeout=timeout)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                release()
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
 
 
 class ImagesNewsTests(ImagesFixture):
@@ -485,20 +507,7 @@ class ImagesTests(ImagesFixture):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-            thread.start()
-            try:
-                profile = self.temporary / "browser-profile"
-                profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=45)
-                self.assertEqual(run.returncode, 0, run.stderr)
-            finally:
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        self.run_firefox(BrowserProbe, "browser", release=probe_complete.set)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
         self.assertEqual(len(gets), 12, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
@@ -1531,23 +1540,11 @@ async (find, whenPageShows, check, controlRefresh) => {
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            # Join the handlers before the fixture folder is deleted.
-            server.daemon_threads = False
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                profile = self.temporary / 'question-browser-profile'
-                profile.mkdir()
-                done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', '1200,900', '--screenshot', str(self.temporary/'question-browser.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=60)
-                self.assertEqual(done.returncode, 0, done.stderr)
-            finally:
-                complete.set()
-                first_delivery_released.set()
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        def release() -> None:
+            complete.set()
+            first_delivery_released.set()
+
+        self.run_firefox(Probe, 'question-browser', timeout=60, release=release)
         self.assertEqual(results, [[]])
         return requests
 
@@ -1664,12 +1661,12 @@ class ImagePairTests(ImagesFixture):
 (async () => {
  const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
  const zoom = document.querySelector('[data-image-zoom-dialog]');
- const label = zoom.querySelector('[data-image-zoom-caption]');
+ const label = zoom.querySelector('[data-image-zoom-badge]');
  const [before, after] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
  const press = key => zoom.dispatchEvent(new KeyboardEvent('keydown', {key, bubbles:true, cancelable:true}));
  const shows = (link, text, step) => {
   check(zoom.open && zoom.querySelector('img').src === link.href, step + ' shows the ' + text + ' picture');
-  check(!label.hidden && label.textContent === text, step + ' labels the picture ' + text);
+  check(!label.hidden && label.textContent === text, step + ' badges the picture ' + text);
   check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, step + ' names the zoom ' + text);
  };
  after.click();
@@ -1693,7 +1690,7 @@ class ImagePairTests(ImagesFixture):
  check(!zoom.open && document.activeElement === freshAfter, 'Escape returns focus to the link that opened the zoom');
  const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
  single.click();
- check(zoom.open && label.hidden && label.textContent === '', 'A single image has no label');
+ check(zoom.open && label.hidden && label.textContent === '', 'A single image has no badge');
  press('ArrowLeft');
  check(zoom.querySelector('img').src === single.href, 'The arrows keep a single image');
  press('Escape');
@@ -1731,21 +1728,7 @@ class ImagePairTests(ImagesFixture):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(("127.0.0.1", 0), Probe) as server:
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-            thread.start()
-            try:
-                profile = self.temporary / "pair-zoom-profile"
-                profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "pair-zoom.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=45)
-                self.assertEqual(run.returncode, 0, run.stderr)
-            finally:
-                complete.set()
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        self.run_firefox(Probe, "pair-zoom", release=complete.set)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
 
     def test_pair_feedback_names_the_before_and_after_images(self) -> None:
