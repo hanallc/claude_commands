@@ -709,7 +709,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertTrue(tree.is_dir())
         self.assertTrue(artifact.is_file())
 
-    def test_remove_reports_output_before_listing_a_missing_checkout(self) -> None:
+    def test_remove_lists_a_missing_checkout_before_reporting_output(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "probe")
         output = (tree / "target").readlink()
@@ -720,8 +720,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
               redirect_stderr(notices),
               self.assertRaisesRegex(worktrees.Refused, "Git listing failed")):
             worktrees.remove_git_checkout(tree, self.home / "rust/origin")
-        self.assertEqual(notices.getvalue(),
-                         f"kept for a manual removal list: {output} (worktrees, the checkout is selected for removal)\n")
+        self.assertEqual(notices.getvalue(), "")
+        self.assertTrue(output.is_dir())
 
     def test_retire_lists_the_unit_folders_from_each_repo(self) -> None:
         self.layout_fixture()
