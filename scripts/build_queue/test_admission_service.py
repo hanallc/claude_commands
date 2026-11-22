@@ -4479,6 +4479,25 @@ class QueueLifecycleTests(unittest.TestCase):
         with path.open("rb") as stream:
             return [row for row in reversed(list(gate.queue_times_backward(stream))) if row.get("kind") == kind]
 
+    def test_gate_cap_uses_the_same_repository_name_in_the_checkout_and_slot(self) -> None:
+        from scripts.production.cli_fixture import ImmutableGitSeed
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed = ImmutableGitSeed.create(root / "seed", "main", "Fixture", "fixture@example.invalid",
+                {"tracked": "fixture\n"})
+            slot = root / "1"
+            _ = subprocess.run(["git", "remote", "set-url", "origin",
+                "git@github.com:hanallc/claude_commands.git"], cwd=seed.checkout, check=True, capture_output=True)
+            _ = subprocess.run(["git", "worktree", "add", "--detach", str(slot)], cwd=seed.checkout,
+                               check=True, capture_output=True)
+            given = str(root / ".claude")
+            for worktree in (seed.checkout, slot):
+                for step in ("gate", "test-affected"):
+                    with self.subTest(worktree=worktree, step=step):
+                        self.assertEqual(service.gate_repository_name(step, given, str(worktree)), "claude_commands")
+            self.assertEqual(service.gate_repository_name("gate", given, str(root / "missing")), given)
+
     def test_gate_admission_keeps_original_arrival_and_uncut_need(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

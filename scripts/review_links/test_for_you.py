@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from scripts.for_you.action import ActionStore
 from scripts.production import staff
 from scripts.rebuild import need
-from scripts.review_links import for_you
+from scripts.review_links import change_browser, for_you
 from scripts.statusline import rebuild_row
 
 
@@ -36,6 +37,7 @@ class ForYouTests(unittest.TestCase):
             f"rebuild.repo={self.root / 'nixos'}", "rebuild.ref=main", "rebuild.natedev=natedev", "rebuild.mac=MacBook-Pro",
             f"rebuild.cwd.natedev={self.root / 'nixos'}", "rebuild.cwd.mac=/fixture/mac/nixos",
             "rebuild.ssh=mac", "rebuild.interval=60", "rebuild.eval_timeout=120", "rebuild.eval_retry_seconds=600",
+            f"rebuild.generations={self.root / 'generations.log'}",
             f"rebuild.cache={self.cache}")), encoding="utf-8")
         self.write_comparison()
         self.store = ActionStore(self.root / "actions")
@@ -118,12 +120,18 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(snapshot.rows[0].key, "rebuild/mac")
         self.assertEqual(snapshot.rows[0].status, "open")
         self.assertEqual(snapshot.rows[0].requests, ())
+        self.assertEqual(snapshot.rows[0].reason, "The running system differs from the configured system. "
+                         + "The configured revision is aaaaaaa.")
         self.assertEqual(snapshot.open_count, for_you.KnownOpenCount(1))
 
     def test_completed_needs_provide_one_history_row_per_machine(self) -> None:
         self.complete_need()
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].status, "done")
+        self.assertEqual(snapshot.rows[0].reason, "")
+        self.assertEqual(snapshot.rows[0].requested_by, "")
+        self.assertEqual(snapshot.rows[0].requests[0].reason, "Apply completed settings.")
+        self.assertEqual(snapshot.rows[0].requests[0].requested_by, "Alice")
         self.assertIn("switch 1", snapshot.rows[0].evidence)
         self.assertEqual(snapshot.rows[0].completion, "automatic")
         self.assertEqual(snapshot.open_count, for_you.KnownOpenCount(0))
@@ -132,6 +140,110 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(len(current.rows), 1)
         self.assertEqual(current.rows[0].status, "open")
         self.assertEqual(len(current.rows[0].requests), 2)
+        self.assertEqual(current.rows[0].reason, "Apply new settings. Requester: Alice. Concerns: console.")
+        self.assertEqual(current.rows[0].requested_by, "Alice")
+
+    def refresh_with_revision_history(self, listing: str, *, dirty: bool = False) -> None:
+        self.cache.unlink()
+        running = "/nix/store/running-linux"
+        configured = "87bbeb2" + "0" * 33
+        switched = "03c7c81" + "0" * 33
+
+        def run(command: list[str], *, timeout: int = 30) -> str:
+            _ = timeout
+            if command[0] == "git":
+                if command[3] == "rev-parse":
+                    return configured
+                self.assertEqual(command[-1], f"{switched}..{configured}")
+                result = subprocess.CompletedProcess(command, 0, listing + "\n", "")
+                with patch("subprocess.run", return_value=result):
+                    return rebuild_row.command_output(command)
+            if command[0] == "nix":
+                return json.dumps({"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"})
+            if command[0] == "sh":
+                revision = switched + "-dirty" if dirty else switched
+                return f"{running}\nt switch system-1-link {revision} {running}"
+            return running if command[0] == "realpath" else "/nix/store/expected-mac"
+
+        rebuild_row.write(self.config, run, clock=lambda: 9_999_999_900)
+        rebuild_row.write_changes(self.config, run)
+
+    def test_comparison_uses_pending_commits_and_keeps_completed_requests_as_history(self) -> None:
+        self.complete_need()
+        at = "2026-11-21T12:00:00Z"
+        self.refresh_with_revision_history(
+            f"{'87bbeb2' + '0' * 33}\x1f{at}\x1fUpdate the editor\x1f\n"
+            + f"{'b722af7' + '0' * 33}\x1f{at}\x1fUpdate the shell\x1f")
+        row, = self.read().rows
+        self.assertEqual(row.status, "open")
+        self.assertEqual(row.requested_by, "")
+        self.assertEqual(row.reason, "Pending commits\n87bbeb2 Update the editor\nb722af7 Update the shell")
+        self.assertEqual(row.requests[0].reason, "Apply completed settings.")
+        self.assertIn("switch 1", row.evidence)
+
+    def test_comparison_names_known_revisions_when_commit_history_is_unavailable(self) -> None:
+        self.refresh_with_revision_history("")
+        row, = self.read().rows
+        self.assertEqual(row.reason, "The running system differs from the configured system. "
+                         + "The running revision is 03c7c81. The configured revision is 87bbeb2.")
+
+    def test_stale_comparison_does_not_list_pending_commits(self) -> None:
+        self.refresh_with_revision_history(
+            f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f")
+        answer = rebuild_row.read(self.config, clock=lambda: 10_000_000_000)
+        snapshot = for_you.read(self.config, rebuild=answer)
+        row, = snapshot.rows
+        self.assertEqual(snapshot.open_count, for_you.UnavailableOpenCount(1))
+        self.assertEqual(row.reason, "The running system differs from the configured system. "
+                         + "The configured revision is 87bbeb2.")
+
+    def test_dirty_running_revision_does_not_list_pending_commits(self) -> None:
+        self.refresh_with_revision_history(
+            f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f", dirty=True)
+        row, = self.read().rows
+        self.assertEqual(row.reason, "The running system has local changes on 03c7c81. "
+                         + "It differs from the configured revision 87bbeb2.")
+
+    def test_rebuilds_lists_changes_after_a_dirty_switch(self) -> None:
+        self.refresh_with_revision_history(
+            f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f", dirty=True)
+        body = change_browser.rebuild_list(rebuild_row.read(self.config), rebuild_row.read_changes(self.config),
+                                           staff.snapshot())
+        self.assertIn('<article data-machine="natedev"><h2>Rebuild natedev</h2>', body)
+        self.assertIn("<dd>Update the editor</dd>", body)
+
+    def test_old_change_cache_cannot_prove_the_running_revision_is_clean(self) -> None:
+        self.refresh_with_revision_history("")
+        changes = rebuild_row.changes_path(self.cache)
+        commit = rebuild_row.Change("87bbeb2" + "0" * 33, "2026-11-21T12:00:00Z", "Update the editor", "")
+        _ = changes.write_text(json.dumps({"natedev": {"running_path": "/nix/store/running-linux",
+            "running_revision": "03c7c81" + "0" * 33, "configured_revision": "87bbeb2" + "0" * 33,
+            "commits": [vars(commit)]}}))
+        row, = self.read().rows
+        self.assertEqual(row.reason, "The running system differs from the configured system. "
+                         + "The configured revision is 87bbeb2.")
+        self.assertEqual(rebuild_row.read_changes(self.config)["natedev"], (commit,))
+
+    def test_global_count_does_not_read_compared_changes(self) -> None:
+        self.write_comparison("rebuild natedev")
+        with (patch.object(rebuild_row, "DEFAULT_CONFIG", self.config),
+              patch.object(rebuild_row, "read_compared_changes", return_value={}) as changes):
+            self.assertEqual(for_you.global_action_count(), "1")
+        changes.assert_not_called()
+
+    def test_comparison_uses_only_commits_for_its_running_system_and_configured_revision(self) -> None:
+        self.refresh_with_revision_history(f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f")
+        answer = rebuild_row.read(self.config)
+        expected = answer.expected
+        assert isinstance(expected, rebuild_row.ExpectedSystems)
+        for comparison in (
+            replace(answer, running_paths={"natedev": "/nix/store/another-system"}),
+            replace(answer, expected=replace(expected, commit="b" * 40)),
+        ):
+            with self.subTest(comparison=comparison):
+                row, = for_you.read(self.config, rebuild=comparison).rows
+                self.assertTrue(row.reason.startswith("The running system differs from the configured system."))
+                self.assertNotIn("Update the editor", row.reason)
 
     def test_stale_comparison_never_proves_completion(self) -> None:
         self.complete_need()
