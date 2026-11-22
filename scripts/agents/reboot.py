@@ -378,7 +378,11 @@ def run(*, dry_run: bool = False) -> int:
         return 2
     terminal = sys.stdout
     settings = conf.read_or_repository("shutdown")
-    directory = stop_resume.reboot_directory(settings)
+    folder = settings.value("REBOOT_LOG_FOLDER", str, default="reboot")
+    if folder in ("", ".", "..") or Path(folder).name != folder:
+        raise ValueError("REBOOT_LOG_FOLDER must be one folder name")
+    state = stop_resume.reboot_state_directory()
+    directory = state.with_name(folder)
     interval = settings.number("REBOOT_SPINNER_SECONDS")
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("REBOOT_SPINNER_SECONDS must be finite and greater than zero")
@@ -398,12 +402,16 @@ def run(*, dry_run: bool = False) -> int:
                 latest.unlink(missing_ok=True)
             if dry_run:
                 return int(not show_plan(terminal, log))
-            with stop_resume.reboot_lock(directory, exclusive=True):
+            with stop_resume.reboot_lock(exclusive=True):
                 if herdr.shared_session() != herdr.SHARED_SESSION:
                     raise ValueError("The shared Herdr session must be named agents")
-                checkpoint = directory / "reboot.json"
+                checkpoint = state / "reboot.json"
                 if not checkpoint.exists():
-                    Checkpoint().save(checkpoint)
+                    # Move any checkpoint from the earlier log folder layout.
+                    try:
+                        _ = (directory / checkpoint.name).replace(checkpoint)
+                    except FileNotFoundError:
+                        Checkpoint().save(checkpoint)
                 failed, issues = run_steps(checkpoint, path, terminal, log, interval)
         except stop_resume.RebootLockBusy:
             failed = True

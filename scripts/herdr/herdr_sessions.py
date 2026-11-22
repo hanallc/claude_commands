@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.herdr import herdr, pane_launch
+from scripts.agents import stop_resume
 from scripts.message import sessions as native_sessions
 from scripts.herdr import herdr_types
 
@@ -131,7 +132,14 @@ def _launch(verb: str, arguments: list[str]) -> int:
         _ = parser.add_argument("--attach", action="store_true")
     separator = arguments.index("--") if "--" in arguments else len(arguments)
     options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
-    claude_arguments = arguments[separator + 1:]
+    with stop_resume.reboot_lock():
+        pane = _start(verb, options, arguments[separator + 1:])
+    if verb == "start" or options.attach:
+        _attach(pane)
+    return 0
+
+
+def _start(verb: str, options: LaunchOptions, claude_arguments: list[str]) -> str:
     session_kind = herdr.security_session()
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():
@@ -180,9 +188,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
         print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
-    if verb == "start" or options.attach:
-        _attach(pane)
-    return 0
+    return pane
 
 
 def _claude_name(owner: pane_launch.ProvedPaneConversation) -> str:
@@ -258,7 +264,8 @@ def _main(argv: list[str]) -> int:
         if not any(session["name"] == shared for session in herdr.live_sessions()):
             if argv[1] == "list":
                 return 0
-            _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
+            with stop_resume.reboot_lock():
+                _ = herdr.restore_server(shared, 90_000, session_kind=herdr.security_session())
         if argv[1] == "sort-tabs":
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")
@@ -288,6 +295,9 @@ def _main(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     try:
         return _main(argv)
+    except stop_resume.RebootLockBusy as error:
+        print(error, file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("herdr_sessions: stopped", file=sys.stderr)
         return 130

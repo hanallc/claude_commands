@@ -233,9 +233,6 @@ else:
         self.assertEqual(set(shutdown_record.read()), {"alpha", "beta"})
 
     def test_server_retry_refuses_start_commands_between_the_check_and_stop(self) -> None:
-        self.directory = self.directory.with_name("custom-reboot")
-        _ = (self.root / "config" / "shutdown.conf").write_text(
-            "REBOOT_LOG_FOLDER=custom-reboot\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
         self.directory.mkdir(parents=True)
         reboot.Checkpoint(reboot.Step.SERVER).save(self.directory / "reboot.json")
         shutdown_record.save(["alpha"])
@@ -277,6 +274,39 @@ else:
         with patch.object(shutdown, "_lifecycle", side_effect=resume) as start:
             self.assertEqual(shutdown.main(["resume", "alpha"]), 0)
         start.assert_called_once()
+
+    def test_log_folder_change_does_not_change_the_start_lock_or_checkpoint(self) -> None:
+        config = self.root / "config" / "shutdown.conf"
+        old_logs = self.directory.with_name("old-logs")
+        new_logs = self.directory.with_name("new-logs")
+        _ = config.write_text("REBOOT_LOG_FOLDER=old-logs\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+        old_logs.mkdir(parents=True)
+        reboot.Checkpoint(reboot.Step.SERVER).save(old_logs / "reboot.json")
+        shutdown_record.save(["alpha"])
+        stop_server = reboot.stop_server
+
+        def server(log: reboot.RunLog) -> None:
+            self.assertTrue((self.directory / "reboot.json").is_file())
+            self.assertFalse((old_logs / "reboot.json").exists())
+            _ = config.write_text("REBOOT_LOG_FOLDER=new-logs\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(shutdown.main(["resume", "alpha"]), 1)
+            self.assertEqual(errors.getvalue(), "A reboot is running; wait for it to end.\n")
+            stop_server(log)
+
+        with (patch.object(reboot, "stop_server", side_effect=server),
+              patch.object(shutdown, "_lifecycle", side_effect=AssertionError("Resume passed the lock"))):
+            code, lines = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(lines[0]).parent, old_logs)
+        self.assertEqual(self.events, ["check", "server", "move", "start"])
+        self.assertTrue((self.directory / "lock").is_file())
+        self.assertFalse((self.directory / "reboot.json").exists())
+        self.assertFalse((old_logs / "lock").exists())
+        self.assertFalse(new_logs.exists())
+        code, lines = self.invoke("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(lines[0]).parent, new_logs)
 
     def test_concurrent_workers_use_the_report_count_and_total(self) -> None:
         terminal = io.StringIO()

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Collection, Generator, Mapping
-from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
@@ -1576,16 +1576,15 @@ class RebootLockBusy(Exception):
     pass
 
 
-def reboot_directory(settings: conf.ConfigRead) -> Path:
-    folder = settings.value("REBOOT_LOG_FOLDER", str, default="reboot")
-    if folder in ("", ".", "..") or Path(folder).name != folder:
-        raise ValueError("REBOOT_LOG_FOLDER must be one folder name")
+def reboot_state_directory() -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
-    return state / "agents" / folder
+    return state / "agents" / "reboot"
 
 
 @contextmanager
-def reboot_lock(directory: Path, *, exclusive: bool) -> Generator[None]:
+def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
+    """Hold a launch or reboot lock without waiting."""
+    directory = reboot_state_directory()
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         try:
@@ -1596,17 +1595,12 @@ def reboot_lock(directory: Path, *, exclusive: bool) -> Generator[None]:
         yield
 
 
-def start_lock() -> AbstractContextManager[None]:
-    """Hold a shared lock through a session start."""
-    return reboot_lock(reboot_directory(conf.read_or_repository("shutdown")), exclusive=False)
-
-
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     with ExitStack() as locks:
         try:
+            locks.enter_context(reboot_lock())
             settings = conf.read("shutdown")
-            locks.enter_context(reboot_lock(reboot_directory(settings), exclusive=False))
             for key in ("START_SECONDS", "STAY_SECONDS"):
                 _ = settings.number(key)
         except (conf.Unusable, RebootLockBusy) as error:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import nullcontext, redirect_stderr
+from contextlib import ExitStack, nullcontext, redirect_stderr
 from dataclasses import replace
 import errno
 import fcntl
@@ -526,6 +526,27 @@ class HealTests(NixFixture):
             self.assertEqual(heal.sweep(), 0)
         resume.assert_called_once_with(self.session.session_id, why="nix shell heal")
         self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
+
+    def test_reboot_after_stop_preserves_the_next_sweep_relaunch(self) -> None:
+        _held, _ensure, run = self.install_sweep([self.session])
+        command = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+        with ExitStack() as reboot:
+            def stop_before_reboot(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(arguments[2], "stop")
+                result = command(arguments, **options)
+                reboot.enter_context(stop_resume.reboot_lock(exclusive=True))
+                return result
+
+            run.side_effect = stop_before_reboot
+            self.assertEqual(heal.sweep(), 0)
+        history = heal.read_history(heal.state_directory())[self.session.session_id]
+        self.assertEqual(history["pending"]["kind"], "stopping")
+        self.assertEqual(history["action"], "pending")
+        self.assertEqual(history["reason"], "A reboot is running; wait for it to end.")
+        run.side_effect = command
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
+        self.assertEqual([cast(list[str], item.args[0])[2] for item in run.call_args_list], ["stop", "resume"])
 
     def test_relaunch_failure_keeps_pending_and_pushes_once_without_a_duplicate_launch(self) -> None:
         for failure in ("timeout", "nonzero", "oserror"):

@@ -964,19 +964,23 @@ Use `agents reboot --dry-run` to see the plan without running the four steps.
 If session move returns an error, the plan reports that it is incomplete and omits the totals. The dry run returns status 1.
 
 The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
-The reboot also holds its exclusive lock across the four steps.
+The reboot also holds `agents/reboot/lock` exclusively under the user state folder across the four steps.
 `agents resume`, `agents restart`, `agents add-producer`, `agents transfer`, and `agents move` take a shared lock without waiting.
+The `herdr_sessions.py start` and `resume` commands take the same shared lock.
 These commands report a single refusal line while the reboot holds its lock.
 Detached restarts take the shared lock when they enter the command again. Account moves take it when they call resume.
 The reboot calls the restart code directly with its exclusive lock held.
-A failed stop, server stop, or restart leaves the next step in `reboot.json`.
+The Nix healer takes the shared lock before it saves a launch reservation.
+If reboot holds the lock, the healer keeps the stop record and resumes the session on its next available sweep.
+A failed stop, server stop, or restart leaves the next step in `agents/reboot/reboot.json` under the user state folder.
 Run `agents reboot` again to continue at that step.
 A retry at the server stop checks for resumed sessions. Step 1 saves and stops those sessions and keeps the earlier restart entries.
 If an interrupt ends the reboot, the report lists the saved sessions that still need a restart.
 A folder move failure permits restart to proceed.
 The final report names the failed copy folder if available and assigns the move failure to the verify owner.
 
-The first output line gives the log path under `~/.local/state/agents/reboot/`.
+The first output line gives the log path in the folder set by `REBOOT_LOG_FOLDER`.
+The default log folder is `~/.local/state/agents/reboot/`.
 The command adds the time to each log line. It keeps older logs and sets `latest.log` to the most recent run.
 A terminal shows each step on one line with an elapsed time and a spinner.
 Stop and restart progress includes the current session name.

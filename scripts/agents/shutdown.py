@@ -766,7 +766,7 @@ def main(argv: list[str] | None = None) -> int:
     locks = ExitStack()
     try:
         if options.command in ("resume", "restart", "add-producer", "transfer", "move"):
-            locks.enter_context(stop_resume.start_lock())
+            locks.enter_context(stop_resume.reboot_lock())
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
