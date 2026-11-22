@@ -187,6 +187,14 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assert_model_worktree_refused(
             "1", self.main, "Move the unit home into the worktree model by the showrunner's order.")
 
+    def test_claim_refuses_a_home_without_a_git_checkout(self) -> None:
+        home = self.session.parent / "non-git-home"
+        home.mkdir()
+        row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", home), expected=row.worktree)
+        self.assert_model_worktree_refused(
+            "1", home, "no Git checkout. Move the unit home into the worktree model by the showrunner's order.")
+
     def test_claim_uses_the_model_home_without_a_phase_worktree_file(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertEqual(self.claim("1", self.first), (0, ""))
@@ -289,11 +297,18 @@ class WorktreeAttributionTests(unittest.TestCase):
                                       mock.ANY)
 
     def test_claim_refuses_a_missing_head_without_publishing_a_baseline(self) -> None:
-        _ = subprocess.run(["git", "-C", str(self.first), "checkout", "-q", "--orphan", "unborn"],
-                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        code, errors = self.claim("1", self.first)
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def fail_head_read(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if command == ["git", "-C", str(self.first), "rev-parse", "--verify", "--quiet", "--end-of-options",
+                           "HEAD^{commit}"]:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            return run(command, **options)
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_head_read):
+            code, errors = self.claim("1", self.first)
         self.assertEqual(code, 2)
-        self.assertIn("phase_reservation:", errors)
+        self.assertIn(f"phase_reservation: 'HEAD' names no single commit in {self.first}", errors)
         directory = phase_reservation.phase_directory(self.session, "1")
         self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
         self.assertFalse((directory / phase_reservation.BASELINE_STATUS_FILE).exists())

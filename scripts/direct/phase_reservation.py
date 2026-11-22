@@ -58,7 +58,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, cast, overload
@@ -78,6 +78,7 @@ BASELINE_FILE = "phase_baseline"
 BASELINE_STATUS_FILE = "progress_baseline_status"
 FILES_FILE = "files"
 WORKTREE_FILE = "worktree"
+MOVE_UNIT_HOME = "Move the unit home into the worktree model by the showrunner's order."
 AWAITING_FIRST_TOUCH = "enrolled_awaiting_first_touch"
 ACTIVE = "active"
 NOT_ENROLLED = "repository_not_enrolled"
@@ -424,7 +425,7 @@ def _require_model_worktree(root: Path, home: _PhaseRunHome) -> None:
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
     except (OSError, ValueError, worktrees.Refused) as error:
         if root == home.root.resolve():
-            fix = "Move the unit home into the worktree model by the showrunner's order."
+            fix = MOVE_UNIT_HOME
         else:
             fix = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>."
         raise StateRefused(f"{root}: {error}. {fix}") from error
@@ -989,6 +990,11 @@ def _claim_command(args: argparse.Namespace) -> int:
             requested = recorded
     root = repository_root(requested)
     if root is None:
+        with suppress(StateRefused, OSError):
+            if ((session_dir / unit_runs.STATE_FILE).is_file()
+                    and requested.resolve() == home_worktree(directory).resolve()):
+                print(f"phase_reservation: {requested}: no Git checkout. {MOVE_UNIT_HOME}", file=sys.stderr)
+                return 2
         print("phase reservation: no repository or no files to claim; still awaiting first touch")
         return 0
     root = root.resolve()
