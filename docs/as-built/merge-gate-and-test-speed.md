@@ -579,16 +579,21 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
   Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
-- Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
+- Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
+  The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  Both modes use the configured gate root for top-level runs.
+  If that root contains the calling module folder, the nested gate uses the module folder as its parent.
+  The outer gate removes the nested gate files when it removes the module folder.
+  The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
   The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `targeted_test.py` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
+  `gate.py --affected` uses the same test-folder context for its outer run.
+  These folders use `<inherited TMPDIR>/test-runs/r*`.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that test-runs parent.
+  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.

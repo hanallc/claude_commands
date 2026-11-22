@@ -261,6 +261,49 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
 
+    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
+        gate_root = self.fixture_root.parent
+        missing = gate_root / "missing-module"
+        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
+              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
+        self.assert_all_modules_started()
+
+    @gate_suites("hooks", "message")
+    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+        prepare = gate.test_module_environment
+        gate_root = self.fixture_root.parent
+        legacy_run = Path("test-runs/test-run-abcdefgh")
+        inherited_run = gate_root / legacy_run
+        inherited_run.mkdir(parents=True)
+        deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
+        deep_tmpdir.mkdir()
+        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
+                   Path("style-socket-abcdefgh/outside.sock"))
+        for flag in ("--tests-only", "--affected"):
+            for inherited in (gate_root, inherited_run, deep_tmpdir):
+                with self.subTest(mode=flag, inherited=inherited):
+                    job_folders: list[Path] = []
+
+                    def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                        job_folders.append(root)
+                        return prepare(root, environment)
+
+                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                          mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
+                        result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
+                    for root in job_folders:
+                        self.assertEqual(root.parent.parent, gate_root)
+                        relative = root.relative_to(gate_root)
+                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
+                            for suffix in sockets:
+                                socket_path = platform_root / relative / legacy_run / suffix
+                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
+
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"
         self.write(scripts / "empty" / "helper.py", "raise AssertionError('helper was run')\n")

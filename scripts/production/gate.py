@@ -116,6 +116,7 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
+GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -1158,6 +1159,7 @@ raise SystemExit(99)
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
+            GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
             session_folder.ROOT_ENV: str(root / "session"),
@@ -1439,6 +1441,16 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def _gate_job_parent() -> Path:
+    """Keep jobs below the module folder that the outer gate removes."""
+    root = build_folders.configured_gate_root()
+    if inherited_module := os.environ.get(GATE_MODULE_TEMP_DIR):
+        module = Path(inherited_module)
+        if module.is_dir() and (resolved := module.resolve()).is_relative_to(root.resolve()):
+            return resolved
+    return root
+
+
 def gate_test_parent(tmpfs: Path) -> Path:
     """Return the parent of the merge gate test fixtures."""
     return tmpfs / "merge-gate-tests"
@@ -1490,7 +1502,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = build_folders.tmpfs_temporary_parent()
+    tmpfs = _gate_job_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
@@ -1602,8 +1614,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    # Folder keys stay unchanged until chunk 6.
-    folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
+    folder_tool = "g" if mode is SuiteMode.GATE else "t"
+    module_number = 0
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
@@ -1763,7 +1775,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
+                    # Each attempt gets a short name in this gate's private folder.
+                    module_number += 1
+                    module_folder = build_folders.BuildFolderSpec(
+                        kind="tool", parent=temporary, purpose=f"m{module_number:04x}", suffix_length=0)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(module_folder))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
