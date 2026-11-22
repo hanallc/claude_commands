@@ -23,7 +23,7 @@ import signal
 import subprocess
 import sys
 import tarfile
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -31,12 +31,14 @@ from uuid import uuid4
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib import build_folders, conf, process_group
+from scripts.mac_test import eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
-TARGET = 'mac-linux'
+TARGET = eligibility.MAC_LINUX_TARGET
+UNREACHABLE_WAIT_KEY = 'run.unreachable_wait_seconds'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -72,18 +74,13 @@ class GuestRepositoryRefused(GuestUnavailable):
         super().__init__(f'the Mac Linux guest accepts claude_commands, but the source repository is {repository}')
 
 
-class GuestSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
-
-
 @dataclass(frozen=True)
 class GuestSettings:
     ssh_hops: tuple[str, str]
     guest_user: str
     jobs: int
     run_time_limit_seconds: int
-    end_proof_wait_seconds: int
+    unreachable_wait_seconds: int
 
     @property
     def guest_timeout_seconds(self) -> int:
@@ -99,16 +96,12 @@ class GuestSettings:
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
-    if (registry.text(f'kind.{TARGET}', recover_invalid=False) != 'ssh'
-            or registry.text(f'platform.{TARGET}', recover_invalid=False) != 'linux'):
-        raise GuestUnavailable(f'{TARGET} must use SSH and the Linux platform')
-    settings_file = Path(registry.text(f'settings.{TARGET}', recover_invalid=False)).expanduser()
-    settings = conf.read(registry.source.parent / settings_file)
+    settings = conf.read(eligibility.mac_linux_target(registry).settings)
     hops = settings.value('ssh.hops', str.split, recover_invalid=False)
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
-    proof_wait = settings.value('run.end_proof_wait_seconds', int, recover_invalid=False)
+    proof_wait = settings.value(UNREACHABLE_WAIT_KEY, int, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
@@ -116,7 +109,7 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
     if proof_wait < 1:
-        raise GuestUnavailable('run.end_proof_wait_seconds must be positive')
+        raise GuestUnavailable(f'{UNREACHABLE_WAIT_KEY} must be positive')
     return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
 
 
@@ -664,7 +657,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                         stream = stream_guest_bundle(repo, arguments, bootstrap, settings.transfer_timeout_seconds)
                     now = monotonic()
                     if proof_deadline is None:
-                        proof_deadline = now + settings.end_proof_wait_seconds
+                        proof_deadline = now + settings.unreachable_wait_seconds
                     remaining = proof_deadline - now
                     if retry_proof and remaining > 0:
                         if not reported_hold:
@@ -700,7 +693,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     if not proof_obtained:
         guest = settings.ssh_hops[-1]
         error = GuestUnavailable(f'guest unreachable: {guest} did not confirm the run ended '
-                                 + f'within {settings.end_proof_wait_seconds} seconds')
+                                 + f'within {settings.unreachable_wait_seconds} seconds ({UNREACHABLE_WAIT_KEY})')
         if detail:
             error.add_note(detail)
         raise error
@@ -720,7 +713,17 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
 
 
 def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
-    guest = read_guest_main(settings)
+    try:
+        guest = read_guest_main(settings)
+    except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
+        from scripts.mac_test import offload
+
+        try:
+            delay = conf.read('mac_test').number('unreachable_backoff_s')
+            offload.write_backoff(time() + delay, TARGET)
+        except conf.Unusable as backoff_error:
+            error.add_note(f'Cannot record the {TARGET} backoff: {backoff_error}')
+        raise
     with bundle_refs(repo, source, request['attempt']) as prefix:
         if isinstance(guest, EmptyGuestMain):
             reason = BundleReason.FIRST_RUN
@@ -779,9 +782,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 
     try:
         registry = conf.read('build_targets')
-        if registry.value(f'enabled.{TARGET}', GuestSwitch, recover_invalid=False) is GuestSwitch.OFF:
+        if not eligibility.mac_linux_enabled(registry):
             return f'{TARGET} is off (build_targets.conf enabled.{TARGET}=off)'
         settings = read_settings(registry)
+        if isinstance(eligibility.read_backoff(time(), TARGET), eligibility.ActiveBackoff):
+            return f'{TARGET}: guest unreachable during retry backoff'
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()

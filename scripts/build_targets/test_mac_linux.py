@@ -22,6 +22,8 @@ from unittest.mock import call, patch
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
 from scripts.lib import build_folders, conf
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.mac_test import eligibility, mac_test
 from scripts.production import gate
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
@@ -265,14 +267,17 @@ class MacLinuxRouteTests(unittest.TestCase):
         config.mkdir()
         self.registry = config / 'build_targets.conf'
         _ = self.registry.write_text(
-            'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
+            'targets=natedev\nkind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n'
             + 'enabled.mac-linux=on\n',
             encoding='utf-8')
         _ = (config / 'mac_linux.conf').write_text(
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + 'run.time_limit_seconds=7\nrun.end_proof_wait_seconds=20\n',
+            + f'run.time_limit_seconds=7\n{mac_linux.UNREACHABLE_WAIT_KEY}=20\n',
             encoding='utf-8')
+        _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
+            'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
             'GATE_BASEDPYRIGHT': str(binaries / 'basedpyright'), 'GATE_UV': str(binaries / 'uv'),
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
@@ -368,11 +373,33 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_transport_failure_returns_reason(self) -> None:
-        result = self.route('offline')
+    def test_probe_failure_records_target_backoff(self) -> None:
+        paths = mac_test.state_paths(mac_linux.TARGET)
+        configuration = self.registry.with_name('mac_linux.conf')
+        self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
+        now = time.time()
+        with patch.object(mac_linux, 'time', return_value=now):
+            result = self.route('offline')
         self.assertIsInstance(result, str)
         self.assertIn('fixture SSH refused the connection', str(result))
+        self.assertIs(eligibility.read_backoff(now + 29, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+        self.assertIs(eligibility.read_backoff(now + 31, mac_linux.TARGET), eligibility.NO_BACKOFF)
+        self.assertIs(eligibility.read_backoff(now), eligibility.NO_BACKOFF)
+        self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'backoff')
+        self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
+
+    def test_unreachable_wait_key_loads_and_missing_key_refuses(self) -> None:
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 20)
+        configuration = self.registry.with_name('mac_linux.conf')
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20\n', ''))
+        result = self.route()
+        self.assertIsInstance(result, str)
+        self.assertIn(key, str(result))
+        self.assertIn('key is missing', str(result))
+        self.assert_guest_clean()
 
     def test_other_repository_is_refused_before_ssh(self) -> None:
         _ = self.git('remote', 'set-url', 'origin', 'https://example.test/other-repo.git')
@@ -524,8 +551,8 @@ fi
 
     def test_proof_wait_expires_and_a_second_route_cannot_take_the_guest_lock(self) -> None:
         configuration = self.registry.with_name('mac_linux.conf')
-        _ = configuration.write_text(configuration.read_text().replace('end_proof_wait_seconds=20',
-                                                                        'end_proof_wait_seconds=2'))
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=2'))
         settings = mac_linux.read_settings(conf.read(self.registry))
         attempts: list[mac_linux.ArmedGuestAttempt] = []
         arm_guest = mac_linux.arm_guest
@@ -550,7 +577,9 @@ fi
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
                 result = self.route('disconnect-before-copy')
                 first, = attempts
-                self.assertIn('guest unreachable: fixture-guest did not confirm the run ended within 2 seconds', str(result))
+                self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
+                              + f'within 2 seconds ({key})', str(result))
+                self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
                 proof.assert_called_once_with(settings, first, timeout_seconds=2.0)
                 self.assertEqual(now, 2.0)
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])

@@ -63,7 +63,8 @@ If `enabled.mac-linux=off`, the assigned gate fails and reports the switch.
 The guest test timer uses `run.time_limit_seconds`.
 The guest and SSH deadlines allow extra time for setup, cleanup, and result transfer.
 When the test timer expires, the gate returns the guest's time-limit report.
-After the SSH transfer ends, `run.end_proof_wait_seconds` limits the wait for the guest to prove the run ended.
+If the first guest probe fails, the route records a retry backoff for `mac-linux`.
+After the SSH transfer ends, `run.unreachable_wait_seconds` limits the wait for the guest to prove the run ended.
 The gate holds its Mac claim while it waits. A valid proof lets the gate release the claim.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
 The route sends no more cleanup requests. The guest run keeps its lock until it ends.

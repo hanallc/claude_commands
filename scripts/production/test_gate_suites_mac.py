@@ -383,7 +383,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
         for reason in ("mac-linux: fixture guest unavailable",
-                       "mac-linux: guest unreachable: fixture-guest did not confirm the run ended within 2 seconds"):
+                       "mac-linux: guest unreachable: fixture-guest did not confirm the run ended "
+                       + f"within 2 seconds ({mac_linux.UNREACHABLE_WAIT_KEY})"):
             with (self.subTest(reason=reason), mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
                   mock.patch.object(mac_linux, "route", return_value=reason) as guest,
                   mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):

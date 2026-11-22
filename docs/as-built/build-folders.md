@@ -7,8 +7,9 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 The build root is `/build` on natedev and `~/build` on the Mac and the Hana AWS guest. The table uses `/build` for the build root.
 
 The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
-After a run starts, the route releases the Mac claim only when the guest confirms it wrote the cancel record under the run lock.
-If the guest is unreachable, the route holds the claim and retries until the guest proves the run ended.
+The route holds the Mac claim while it waits for proof that the guest run ended.
+The route releases the claim when it receives proof or the wait reaches the limit in `run.unreachable_wait_seconds`.
+If the wait expires, the gate fails and the guest run keeps its lock until it ends.
 
 | Form | Path | Cargo output |
 | --- | --- | --- |
