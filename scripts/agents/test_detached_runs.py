@@ -1348,38 +1348,18 @@ with (patch.object(time, 'sleep', fixture_sleep), patch.object(time, 'monotonic'
             watcher = self.root / "watcher.py"
             _ = watcher.write_text(f"""import json, os, socket, sys
 sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})
-from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
-from scripts.lib import process_start
-command = detached_runs.command_group(Path(sys.argv[-1]))
-assert command is not None
-read_start = process_start.process_start
-reap = detached_runs.reap_orphans
-leader_reads = []
-reads_before_reap = []
 texts = []
-def read_identity(pid):
-    if pid != command.group:
-        return read_start(pid)
-    state = read_start(pid) if leader_reads else process_start.Unreadable('fixture unreadable identity')
-    leader_reads.append(type(state).__name__)
-    return state
-def reap_orphans(directory):
-    reads_before_reap[:] = leader_reads
-    return reap(directory)
 def deliver(record, result):
     texts.append(detached_runs.result_text(record, result))
     return 'fixture delivery'
-with (patch.object(os, 'pidfd_open', side_effect=OSError('fixture pidfd unavailable'), create=True),
-      patch.object(process_start, 'process_start', read_identity),
-      patch.object(detached_runs, 'reap_orphans', reap_orphans),
-      patch.object(detached_runs, 'deliver', deliver),
+with (patch.object(detached_runs, 'deliver', deliver),
       patch.object(detached_runs, '_complete_worker_dispatch', lambda record: None)):
     status = detached_runs.main(sys.argv[1:])
 with socket.socket(socket.AF_UNIX) as connection:
     connection.connect(os.environ["FIXTURE_READY_SOCKET"])
-    row = dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts), leader_reads=reads_before_reap)
+    row = dict(role='delivery', verb=sys.argv[1], text=chr(10).join(texts))
     connection.sendall((json.dumps(row) + chr(10)).encode())
 sys.exit(status)
 """)
@@ -1523,10 +1503,6 @@ sys.exit(status)
                                 self.assertEqual(delivered["scan_failures"], 2)
                         else:
                             self.assertEqual(delivered["verb"], "supervisor-gone")
-                            reads = cast(list[str], delivered["leader_reads"])
-                            self.assertGreaterEqual(len(reads), 2)
-                            self.assertEqual(reads[0], "Unreadable")
-                            self.assertIn(reads[-1], ("Gone", "Zombie"))
                             self.assertIn("Result: STOPPED (no exit status)", str(delivered["text"]))
                             self.assertIn(f"Stop reason: {detached_runs.SUPERVISOR_GONE_REASON}",
                                           str(delivered["text"]))
@@ -1574,6 +1550,62 @@ sys.exit(status)
             run.assert_not_called()
             self.assertEqual(refused.get("exit_code"), 125)
             self.assertIn("the supervisor cannot retain the leader", Path(refused["log"]).read_text())
+
+    @unittest.skipUnless(sys.platform == "linux", "pidfd leader wait requires Linux")
+    def test_wait_for_leader_with_pidfd(self) -> None:
+        command = detached_runs.CommandGroup(DEAD_PID, "fixture start")
+        wait_for_leader = cast(Callable[[detached_runs.CommandGroup], None], getattr(detached_runs, "_wait_for_leader"))
+        descriptor = 42
+        started = process_start.Started(command.started)
+        unreadable = process_start.Unreadable("fixture identity unavailable")
+        timeout = detached_runs.LEADER_IDENTITY_TIMEOUT_SECONDS
+        interval = detached_runs.STOPPED_GROUP_CHECK_SECONDS
+        rows: tuple[tuple[str, list[process_start.ProcessStart], list[float], list[list[int]],
+                          list[float | None], bool], ...] = (
+            ("exit", [started], [0.0], [[descriptor]], [None], False),
+            ("saved start mismatch", [process_start.Started("other start")], [0.0], [], [], False),
+            ("identity recovers", [unreadable, started], [0.0, 0.0], [[], [descriptor]],
+             [interval, None], False),
+            ("identity stays unreadable", [unreadable, unreadable], [0.0, timeout - interval / 2, timeout],
+             [[]], [interval / 2], True),
+        )
+        for name, identities, clock, events, waits, anomaly in rows:
+            with (self.subTest(name=name),
+                  patch.object(os, "pidfd_open", return_value=descriptor, create=True) as open_pid,
+                  patch.object(os, "close") as close_pid,
+                  patch.object(select, "select", side_effect=[(ready, [], []) for ready in events]) as select_exit,
+                  patch.object(process_start, "process_start", side_effect=identities),
+                  patch.object(time, "monotonic", side_effect=clock),
+                  patch.object(unit_runs, "report_anomaly") as report):
+                wait_for_leader(command)
+            open_pid.assert_called_once_with(command.group)
+            close_pid.assert_called_once_with(descriptor)
+            self.assertEqual(select_exit.call_args_list, [call([descriptor], [], [], wait) for wait in waits])
+            if anomaly:
+                report.assert_called_once_with(
+                    f"anomaly: detached command leader {command.group}: the start identity is unreadable")
+            else:
+                report.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "kqueue leader wait requires Darwin")
+    def test_wait_for_leader_with_kqueue(self) -> None:
+        command = detached_runs.CommandGroup(DEAD_PID, "fixture start")
+        wait_for_leader = cast(Callable[[detached_runs.CommandGroup], None], getattr(detached_runs, "_wait_for_leader"))
+        event = object()
+        control = MagicMock(side_effect=[[], [event]])
+        close = MagicMock()
+        watcher = SimpleNamespace(control=control, close=close)
+        open_queue = MagicMock(return_value=watcher)
+        make_event = MagicMock(return_value=event)
+        proc_filter, add, oneshot, note_exit = -5, 1, 16, 0x80000000
+        with (patch.multiple(select, create=True, kqueue=open_queue, kevent=make_event, KQ_FILTER_PROC=proc_filter,
+                             KQ_EV_ADD=add, KQ_EV_ONESHOT=oneshot, KQ_NOTE_EXIT=note_exit),
+              patch.object(process_start, "process_start", return_value=process_start.Started(command.started))):
+            wait_for_leader(command)
+        open_queue.assert_called_once_with()
+        make_event.assert_called_once_with(command.group, proc_filter, add | oneshot, note_exit)
+        self.assertEqual(control.call_args_list, [call([event], 0), call(None, 1, None)])
+        close.assert_called_once_with()
 
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])

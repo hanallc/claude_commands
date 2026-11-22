@@ -12,6 +12,9 @@ stops the command group and delivers the STOPPED result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
 """
 
+# Each platform check needs only the suppression for the other platform's exit watch.
+# pyright: reportUnnecessaryTypeIgnoreComment=false
+
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -27,6 +30,7 @@ import json
 import math
 import os
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -88,6 +92,7 @@ SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watche
 CONFIRMED_STOP_SUFFIX = ".stop-confirmed"
 STAGED_STOP_SUFFIX = ".stop-staged"
 STOPPED_GROUP_CHECK_SECONDS = 0.25
+LEADER_IDENTITY_TIMEOUT_SECONDS = 5.0
 
 
 class PaneDispatchUnavailable(TypedDict):
@@ -2065,9 +2070,38 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
 
 
 def _wait_for_leader(command: CommandGroup) -> None:
-    """Wait until the command leader exits, so the reap reads the status that the command saved."""
-    while isinstance(_saved_process(command.group, command.started), (process_start.Started, process_start.Unreadable)):
-        time.sleep(STOPPED_GROUP_CHECK_SECONDS)
+    """Wait for the leader to save its exit status and exit."""
+    with contextlib.suppress(ProcessLookupError):
+        if sys.platform == "darwin":
+            with contextlib.closing(select.kqueue()) as watcher:  # pyright: ignore[reportUnreachable]
+                event = select.kevent(command.group, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                      select.KQ_NOTE_EXIT)
+                _ = watcher.control([event], 0)
+                _wait_for_leader_exit(command, lambda timeout: bool(watcher.control(None, 1, timeout)))
+        else:
+            leader = os.pidfd_open(command.group)  # pyright: ignore[reportUnreachable]
+            try:
+                _wait_for_leader_exit(command, lambda timeout: bool(select.select([leader], [], [], timeout)[0]))
+            finally:
+                os.close(leader)
+
+
+def _wait_for_leader_exit(command: CommandGroup, wait_for_exit: Callable[[float | None], bool]) -> None:
+    """Check the identity after the exit watch starts, so PID reuse cannot delay the reap."""
+    deadline = time.monotonic() + LEADER_IDENTITY_TIMEOUT_SECONDS
+    while True:
+        identity = _saved_process(command.group, command.started)
+        if isinstance(identity, process_start.Started):
+            _ = wait_for_exit(None)
+            return
+        if not isinstance(identity, process_start.Unreadable):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            unit_runs.report_anomaly(f"anomaly: detached command leader {command.group}: the start identity is unreadable")
+            return
+        if wait_for_exit(min(remaining, STOPPED_GROUP_CHECK_SECONDS)):
+            return
 
 
 def command_record_exit(args: argparse.Namespace) -> int:
