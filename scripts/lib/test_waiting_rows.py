@@ -252,9 +252,33 @@ class WaitingRowsTests(unittest.TestCase):
         with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
             self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
         self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3 # local note").replace("limit=5", "limit=8"))
-        self.assertEqual(self.output("show", f"origin/main:{relative}"), SETTINGS.replace("amount=2", "amount=3"))
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), SETTINGS.replace("amount=2", "amount=3 # local note"))
         with pending_rows() as changes:
             self.assertEqual(changes, [])
+
+    def test_two_legacy_saves_publish_with_the_first_rows_comment(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        _ = path.write_text(SETTINGS + "AMOUNT=3 # local note\nLIMIT=8\n")
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        changes = [
+            {"stem": "example", "key": "AMOUNT", "value": "3", "save_order": 3, "message": "tune(example): Save amount"},
+            {"stem": "example", "key": "LIMIT", "value": "8", "save_order": 4, "message": "tune(example): Save limit"},
+        ]
+        _ = journal.write_text(json.dumps({"last_order": 4, "register": {}, "changes": changes}))
+
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
+
+        first = SETTINGS.replace("amount=2", "amount=3 # local note")
+        both = first.replace("limit=5", "limit=8")
+        self.assertEqual(self.output("show", f"origin/main^:{relative}"), first)
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), both)
+        self.assertEqual(path.read_text(), both)
+        self.assertEqual(self.output("status", "--porcelain"), "")
+        with pending_rows() as pending:
+            self.assertEqual(pending, [])
 
     def test_a_staged_setting_refuses_before_the_plan_is_written(self) -> None:
         relative = "config/example.conf"

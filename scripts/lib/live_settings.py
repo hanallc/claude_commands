@@ -24,9 +24,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.waiting_rows import (
     ORDER_PATH, AcceptedSave, LockedJournal, SaveOrders, WaitingChange as WaitingChange,
     append_setting, apply_move, check_move, git,
-    journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
+    journal_path as journal_path, live_text, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
     migrated_setting_name,
-    published_orders, replace_value, show, tree_value,
+    publish_setting_text, published_orders, replace_value, show, tree_value,
 )
 
 SAVE_ORDER_ENV = "LIVE_SETTINGS_SAVE_ORDER"
@@ -115,9 +115,7 @@ def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: Sa
     """Commit only this row onto HEAD; other waiting rows stay live and uncommitted."""
     entry = git(checkout, "ls-tree", "HEAD", "--", relative)
     head = show(checkout, "HEAD", relative) if entry else ""
-    setting = conf.settings(head).get(change.key)
-    text = (replace_value(head, setting.line, change.value) if setting
-            else append_setting(head, change.key, change.value))
+    text = publish_setting_text(head, live_text(checkout / relative) or "", change)
     mode = entry.split()[0] if entry else "100644"
     orders.setdefault(change.stem, {})[change.key] = change.save_order
     parent = git(checkout, "rev-parse", "HEAD").strip()

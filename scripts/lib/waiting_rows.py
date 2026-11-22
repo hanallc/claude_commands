@@ -309,6 +309,32 @@ def replace_value(source: str, index: int, value: str) -> str:
     return "".join(lines)
 
 
+def _replay_inline_comment(lines: list[str], setting: conf.Setting | None, local_line: str, value: str) -> None:
+    if not re.search(r"[ \t]#", local_line.partition("=")[2]):
+        return
+    row = replace_value(local_line, 0, value)
+    if setting is None:
+        lines.extend(("\n" if lines and not lines[-1].endswith("\n") else "", row))
+    else:
+        target_line = lines[setting.line]
+        ending = target_line[len(target_line.rstrip("\r\n")):]
+        lines[setting.line] = row.rstrip("\r\n") + ending
+
+
+def publish_setting_text(head: str, local: str, change: WaitingChange) -> str:
+    """Apply one Save to HEAD with the inline comment that replay keeps."""
+    setting = conf.settings(head).get(change.key)
+    text = (replace_value(head, setting.line, change.value) if setting
+            else append_setting(head, change.key, change.value))
+    local_setting = conf.settings(local).get(change.key)
+    if local_setting is None or local_setting.value != change.value:
+        return text
+    lines = text.splitlines(keepends=True)
+    local_line = local.splitlines(keepends=True)[local_setting.line]
+    _replay_inline_comment(lines, setting or conf.settings(text).get(change.key), local_line, change.value)
+    return "".join(lines)
+
+
 def git(checkout: Path, *arguments: str, input_text: str | None = None,
         environment: dict[str, str] | None = None) -> str:
     done = subprocess.run(["git", "-C", str(checkout), *arguments], input=input_text, text=True,
@@ -529,13 +555,8 @@ def replay_settings(path: str, head: str, local: str, target: str | None,
         if isinstance(save := saves.get(key), AcceptedSave):
             line = lines[setting.line]
             same_save = new and new.value == save.value and settled.get(key) == save.order
-            if (key not in settled or same_save) and re.search(r"[ \t]#", line.partition("=")[2]):
-                if new:
-                    ending = "\n" if target_lines[new.line].endswith("\n") else ""
-                    target_lines[new.line] = replace_value(line, 0, save.value).rstrip("\r\n") + ending
-                else:
-                    target_lines.extend(("\n" if target_lines and not target_lines[-1].endswith("\n") else "",
-                                         replace_value(line, 0, save.value)))
+            if key not in settled or same_save:
+                _replay_inline_comment(target_lines, new, line, save.value)
             lines[setting.line] = head_lines[old.line] if old else ""
         elif old is None and new and new.value == setting.value and (
                 saves or (conf.full_model_color_key(Path(path).stem, key) and model_color_value(setting.value)
