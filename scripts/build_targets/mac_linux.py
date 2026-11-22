@@ -203,8 +203,7 @@ if [ -L "$checkout" ] || [ -L "$checkout/.git" ]; then
 fi'''
 
 
-def guest_checkout_shell(settings: GuestSettings) -> str:
-    return guest_shell(settings) + '''
+GUEST_CHECKOUT_SETUP = '''
 umask 077
 mkdir -p -- "$checkout/.git"
 cd "$checkout"'''
@@ -243,13 +242,31 @@ fi'''
     return GuestMain(commit)
 
 
-@dataclass(frozen=True)
-class ArmedGuestAttempt:
-    """Identify the run and its deadline on the guest."""
+class ArmedGuestAttemptRecord(TypedDict):
+    """Save the proof inputs for a kept guest claim."""
 
     attempt: str
+    machine_id: str
     boot_id: str
     deadline_ns: int
+
+
+@dataclass(frozen=True)
+class ArmedGuestAttempt:
+    """Identify the guest, the run, and its deadline."""
+
+    attempt: str
+    machine_id: str
+    boot_id: str
+    deadline_ns: int
+
+    def to_record(self) -> ArmedGuestAttemptRecord:
+        return ArmedGuestAttemptRecord(attempt=self.attempt, machine_id=self.machine_id,
+                                       boot_id=self.boot_id, deadline_ns=self.deadline_ns)
+
+    @classmethod
+    def from_record(cls, record: ArmedGuestAttemptRecord) -> ArmedGuestAttempt:
+        return cls(**record)
 
 
 class GuestEndUnproven(GuestUnavailable):
@@ -268,6 +285,10 @@ import time
 prefix, attempt, window = sys.argv[1:]
 if not attempt or any(character not in '0123456789abcdefghijklmnopqrstuvwxyz-' for character in attempt):
     sys.exit('The guest attempt ID is invalid.')
+with open('/etc/machine-id', encoding='ascii') as identity:
+    machine = identity.read().rstrip('\\n')
+if len(machine) != 32 or any(character not in '0123456789abcdef' for character in machine):
+    sys.exit('The guest machine ID is invalid.')
 with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
     boot = identity.read().strip()
 git = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -276,7 +297,7 @@ record = f'{prefix}.{boot}.{deadline}.{attempt}'
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 os.close(os.open(record, flags, 0o600, dir_fd=git))
 os.close(git)
-print(f'armed {boot} {deadline}', flush=True)
+print(f'armed {machine} {boot} {deadline}', flush=True)
 '''
 
 
@@ -294,7 +315,7 @@ def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
 def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt,
                       str(SSH_CONNECT_TIMEOUT_SECONDS)))
-    command = settings.command(guest_checkout_shell(settings) + f'\nexec {arm}')
+    command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
     with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True) as process:
         try:
@@ -305,10 +326,19 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     if process.returncode:
         diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f-]{36}) ([0-9]{1,20})\n', output)
+    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20})\n', output)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
-    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), int(reply[2]))
+    return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]))
+
+
+def armed_guest_checkout_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
+    return guest_shell(settings) + f'''
+machine_id=$(cat /etc/machine-id) || exit {GUEST_END_PENDING_STATUS}
+if [ "$machine_id" != {shlex.quote(armed.machine_id)} ]; then
+    printf 'A different guest answered the SSH request. The machine ID differs from the armed guest.\\n' >&2
+    exit {GUEST_END_PENDING_STATUS}
+fi''' + GUEST_CHECKOUT_SETUP
 
 
 OPEN_RUN_LOCK = '''\
@@ -473,7 +503,7 @@ umask 022
     locked_run = f'''set -euo pipefail
 {lock}
 exec timeout --signal=KILL {settings.guest_timeout_seconds} {start} "$BASHPID" {shlex.quote(checkout)}'''
-    return guest_checkout_shell(settings) + f'\nexec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'
+    return armed_guest_checkout_shell(settings, armed) + f'\nexec setsid --wait {open_run_lock_command(RUN_LOCK_FD, locked_run)}'
 
 
 def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
@@ -508,7 +538,7 @@ done
 prove_end || :
 printf 'The guest run lock is still held.\\n' >&2
 exit {GUEST_END_PENDING_STATUS}'''
-    return guest_checkout_shell(settings) + f'\nexec {open_run_lock_command(8, cleanup)}'
+    return armed_guest_checkout_shell(settings, armed) + f'\nexec {open_run_lock_command(8, cleanup)}'
 
 
 @dataclass(frozen=True)
@@ -587,13 +617,27 @@ def bundle_refs(repo: Path, source: CandidateSource, attempt: str) -> Generator[
     from scripts.production.gate import checked_git
 
     prefix = f'refs/mac-linux/{attempt}'
+    active_error: BaseException | None = None
     try:
         _ = checked_git(repo, 'update-ref', f'{prefix}/candidate', source.commit)
         _ = checked_git(repo, 'update-ref', f'{prefix}/main', source.origin_main)
         yield prefix
+    except BaseException as error:
+        active_error = error
+        raise
     finally:
-        _ = checked_git(repo, 'update-ref', '-d', f'{prefix}/candidate')
-        _ = checked_git(repo, 'update-ref', '-d', f'{prefix}/main')
+        failure = active_error
+        for tip in ('candidate', 'main'):
+            ref = f'{prefix}/{tip}'
+            try:
+                _ = checked_git(repo, 'update-ref', '-d', ref)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                else:
+                    failure.add_note(f'Cannot remove bundle ref {ref}: {error}')
+        if active_error is None and failure is not None:
+            raise failure
 
 
 def empty_delta_header(repo: Path, source: CandidateSource, basis: DeltaBundle, prefix: str) -> str:
