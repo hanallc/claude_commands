@@ -373,7 +373,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 232 accessor rows (41 write, 190 read, and 1 owner).
+The table has 228 accessor rows (41 write, 186 read, and 1 owner).
 
 ## Approved copies
 
