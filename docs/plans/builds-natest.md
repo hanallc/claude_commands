@@ -1014,7 +1014,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. The reader's measured cost is stated before any gate carries it.
   2. The table's CPU total is compared with the gate record's module CPU.
 
-### Phase 415 — the Python start hook does not import typing  · status: todo
+### Phase 415 — the Python start hook does not import typing  · status: done (main 3cd7ff76e3)
 **Depends on:** Phase 355
 
 #### Work Order
@@ -1118,7 +1118,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. A test starts the helper's browser stand-in from a child process, SIGKILLs that child, and proves the browser process ends within 10 s.
   2. Each changed page test module passes; basedpyright zero errors and warnings on changed files.
 
-### Phase 420 — the drain never counts a test fixture as a waiting gate  · status: todo
+### Phase 420 — the drain never counts a test fixture as a waiting gate  · status: done (main f2f03fb1e7)
 **Depends on:** none
 
 #### Work Order
@@ -1319,7 +1319,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Workers:** 1 writer.
 - **Acceptance gate:** the test passes with a live `SCCACHE_DIR` set; the reservation test reads no live pressure file; the module passes in one tests-only gate after the builds go; basedpyright zero on the changed file; one blind review.
 
-### Phase 433 — two test fixtures name hanallc/hana  · status: todo
+### Phase 433 — two test fixtures name hanallc/hana  · status: done (main b3d4297a16)
 **Depends on:** none (builds 01:24: start after 431 and 432)
 
 #### Work Order
@@ -1352,3 +1352,20 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/test_times/module_cost.py`.
 - **Workers:** 1 writer.
 - **Acceptance gate:** basedpyright zero on the file; the test_times module tests pass in the affected run before the hash; one blind review.
+
+### Phase 436 — test_worker and test_detached_runs pass on the Mac  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 04:44: `scripts/production/test_worker.py` and `scripts/agents/test_detached_runs.py` pass on the Mac at the phase tip, and `config/mac_gate_modules.txt` no longer lists `scripts/agents/test_detached_runs.py` (user rule 2026-11-16: tests run on the Mac too).
+- **Facts (Mac run at main f77f3cf66e):**
+  1. test_worker: 8F/6E. One cause: on darwin, `detached_run_process.process_args` uses `ps` and reads `PROCESS_CHECK_SECONDS` from `detached_runs.conf`; the test CONF_DIR has that file only in `start_orphaned_worker_run` (test_worker.py:445). Cause commit e13524a5bb (sdlc-phases 70).
+  2. test_detached_runs: 40F/16E. Tests patch `subprocess.Popen` while `staff.runtime_id` and process checks run `ps` through it on darwin (TypeError on SimpleNamespace, ValueError on unpack). Other tests expect `/proc` results (reap_orphans returns [], group scans not called); one config fixture lacks `PROCESS_CHECK_SECONDS`; one socket test binds an address in use.
+- **Spec:**
+  1. test_worker: write `detached_runs.conf` in the shared setUp (near test_worker.py:336); `start_orphaned_worker_run` stops writing its own copy.
+  2. test_detached_runs: fix the tests, not the product, unless a product defect shows on darwin (then name it in the reply). Patch the narrow seam (for example the process-identity reader) instead of global `subprocess.Popen` where `ps` runs; give darwin the same expectations as Linux through the module's own process readers; every config fixture carries the keys its path reads.
+  3. Remove the `scripts/agents/test_detached_runs.py` line from `config/mac_gate_modules.txt`.
+  4. Keep every test; delete none; same assertions on Linux.
+- **Files:** `scripts/production/test_worker.py`, `scripts/agents/test_detached_runs.py`, `config/mac_gate_modules.txt`.
+- **Workers:** 1 writer.
+- **Acceptance gate:** both modules pass on the Mac through the queue (director runs them) and on natedev in the affected run; basedpyright zero on changed files; one blind review.
