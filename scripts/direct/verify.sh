@@ -221,24 +221,6 @@
 
 set -euo pipefail
 
-RUN_LOG_PIDS=()
-RUN_LOG_STDERR_SAVED=0
-quiet_dead_run_log() {
-    if [[ ${RUN_LOG_STDERR_SAVED:-0} == 0 ]]; then
-        exec 80>&2 || exec 80>/dev/null
-        RUN_LOG_STDERR_SAVED=1
-    fi
-    local pid
-    for pid in "${RUN_LOG_PIDS[@]}"; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            exec 2>/dev/null
-            break
-        fi
-    done
-}
-# Reserve fd 80 before doc_checkout can use it for a lease.
-quiet_dead_run_log
-
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
         /^# End usage\./d
@@ -1952,6 +1934,7 @@ if [[ "$CMD" == test ]]; then
     export VERIFY_TEST_ENV_NAMES="${MAC_ENV_NAMES[*]}"
 fi
 RUN_LOG=""
+RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -4277,7 +4260,7 @@ run_log_tee() {
 start_run_log() {
     exec > >(run_log_tee)
     RUN_LOG_PIDS+=("$!")
-    exec 2> >(run_log_tee >&80)
+    exec 2> >(run_log_tee >&2)
     RUN_LOG_PIDS+=("$!")
 }
 
@@ -4377,6 +4360,17 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
+
+finish_exit_diagnostics() {
+    [[ -n "$exit_diagnostics" ]] || return 0
+    if [[ -s "$exit_diagnostics" ]]; then
+        # Forward diagnostics only after cleanup releases the token and lease.
+        VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+            cat -- "$exit_diagnostics" 2>/dev/null || true
+    fi
+    rm -f -- "$exit_diagnostics" || true
+}
+
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it. $2 is the command
 # that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
@@ -4386,44 +4380,45 @@ verify_cleanup() {
 # unknown here) and writes no pass. Cleanup is best effort: errexit is off,
 # so one failed cleanup command does not end the trap with its status.
 verify_exit() {
-    quiet_dead_run_log
+    exec 2>>"${exit_diagnostics:-/dev/null}"
     EXIT_STATUS=$1
     set +e
     local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
         outcome=interrupted
-        interrupt_hold_wait
+        interrupt_hold_wait >&2
     elif (( EXIT_STATUS == 0 )); then
         outcome=completed
     fi
-    verify_cleanup "$outcome"
-    finish_verify_run "$EXIT_STATUS"
+    verify_cleanup "$outcome" >&2
+    finish_verify_run "$EXIT_STATUS" >&2
     if [[ "$outcome" == interrupted ]]; then
-        # A full stderr pipe must not delay release of the source snapshot lease.
-        VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
-            printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" \
-            >&80 2>/dev/null || true
+        printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" >&2
     fi
+    finish_exit_diagnostics
     exit "$EXIT_STATUS"
 }
+# The hold folder is removed during cleanup. Keep diagnostics in the run's temp folder.
+exit_diagnostics="$(mktemp "${TMPDIR:-/tmp}/verify-exit.XXXXXX" 2>/dev/null)" || exit_diagnostics=""
 trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
-    quiet_dead_run_log
+    exec 2>>"${exit_diagnostics:-/dev/null}"
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
-    interrupt_hold_wait
+    interrupt_hold_wait >&2
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
-    verify_cleanup interrupted
-    finish_verify_run "$EXIT_STATUS"
+    verify_cleanup interrupted >&2
+    finish_verify_run "$EXIT_STATUS" >&2
+    finish_exit_diagnostics
     stop_interrupted_run_log
     if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
         trap - INT TERM HUP
