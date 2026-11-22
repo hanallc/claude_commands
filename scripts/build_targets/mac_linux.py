@@ -5,6 +5,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 from dataclasses import dataclass
 from enum import StrEnum
+import fcntl
 from io import BytesIO
 import json
 import math
@@ -23,7 +24,7 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
@@ -35,6 +36,9 @@ SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-
 # Give the transfer, checkout, and result time outside the guest runner deadline.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
+GUEST_KILL_AFTER_SECONDS = 3
+GUEST_CLEANUP_LOCK_SECONDS = 5
+GUEST_CLEANUP_TIMEOUT_SECONDS = 25
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 
@@ -45,6 +49,14 @@ class GuestUnavailable(RuntimeError):
 
 class GuestMissingPrerequisite(GuestUnavailable):
     """The guest needs the full Git bundle."""
+
+
+class GuestRepositoryRefused(GuestUnavailable):
+    """The source repository cannot use the Mac Linux route."""
+
+    def __init__(self, repository: str) -> None:
+        self.repository: str = repository
+        super().__init__(f'the Mac Linux guest accepts claude_commands, but the source repository is {repository}')
 
 
 class GuestSwitch(StrEnum):
@@ -58,6 +70,10 @@ class GuestSettings:
     guest_user: str
     jobs: int
     run_time_limit_seconds: int
+
+    @property
+    def transfer_timeout_seconds(self) -> int:
+        return self.run_time_limit_seconds + TRANSFER_ALLOWANCE_SECONDS
 
     def command(self, shell: str) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
@@ -125,6 +141,9 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
     from scripts.aws_target import cloud_gate
     from scripts.production.gate import checked_git
 
+    repository = build_folders.repo_word(repo)
+    if repository != 'claude':
+        raise GuestRepositoryRefused(repository)
     head = checked_git(repo, 'rev-parse', 'HEAD')
     origin_main = checked_git(repo, 'rev-parse', '--verify', f'{ORIGIN_MAIN}^{{commit}}')
     tree, dirty = cloud_gate.working_tree(repo)
@@ -198,14 +217,19 @@ fi'''
     return GuestMain(commit)
 
 
-def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int) -> str:
-    object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
+def guest_attempt_shell(settings: GuestSettings, attempt: str) -> str:
     return guest_shell(settings) + f'''
+state="$checkout/.git/mac-linux-runs"/{shlex.quote(attempt)}'''
+
+
+def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str) -> str:
+    object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
+    return guest_attempt_shell(settings, attempt) + f'''
 umask 077
 mkdir -p -- "$checkout"
 cd "$checkout"
 exec 9< .
-flock -x 9
+flock -x -n 9 || {{ printf 'The guest main checkout is in use.\\n' >&2; exit 1; }}
 if [ ! -f .git/mac-linux-owned ]; then
     if [ -n "$(find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit)" ] ||
        {{ [ -f .git/HEAD ] && [ -n "$(git for-each-ref --count=1)" ]; }}; then
@@ -226,15 +250,22 @@ unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
 if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
+mkdir -p -- "$state"
+if [ -e "$state/cancelled" ]; then
+    rm -rf -- "$state"
+    printf 'The caller cancelled the guest run.\\n' >&2
+    exit 1
+fi
 bootstrap="$checkout/.git/mac-linux"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
-trap 'rm -rf -- "$bootstrap"' EXIT
+trap 'rm -rf -- "$bootstrap"; touch "$state/finished" 2>/dev/null || :' EXIT
 export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
 head -c {bootstrap_bytes} | tar -xf - -C "$bootstrap"
 if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
     cat "$bootstrap/bundle-error" >&2
     if grep -Fq {shlex.quote(MISSING_PREREQUISITE_MESSAGE)} "$bootstrap/bundle-error"; then
+        rm -rf -- "$state"
         exit {MISSING_PREREQUISITE_STATUS}
     fi
     exit 1
@@ -253,7 +284,68 @@ git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
 umask 022
-./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json" "$state"
+rm -rf -- "$state"'''
+
+
+def cleanup_shell(settings: GuestSettings, attempt: str) -> str:
+    return guest_attempt_shell(settings, attempt) + f'''
+umask 077
+mkdir -p -- "$state"
+exec 8< "$state"
+flock -x -w {GUEST_CLEANUP_LOCK_SECONDS} 8
+touch -- "$state/cancelled"
+if [ ! -f "$state/copy" ]; then
+    printf 'no numbered copy was registered\\n'
+    if [ -e "$state/finished" ]; then
+        rm -rf -- "$state"
+    fi
+    exit 0
+fi
+mapfile -d '' -t paths < "$state/copy"
+group_file="${{paths[0]}}"
+lock_file="${{paths[1]}}"
+stopped=''
+if [ -f "$group_file" ] && read -r group started < "$group_file"; then
+    if [[ ! "$group" =~ ^[1-9][0-9]*$ || "$group" -le 1 || ! "$started" =~ ^[0-9]+$ ]]; then
+        printf 'The guest process group record is invalid.\\n' >&2
+        exit 1
+    fi
+    if stat=$(cat "/proc/$group/stat" 2>/dev/null); then
+        read -r -a fields <<< "${{stat##*) }}"
+        if [[ "${{fields[2]}}" = "$group" && "${{fields[3]}}" = "$group" &&
+              "${{fields[19]}}" = "$started" && "${{fields[0]}}" != Z ]]; then
+            if kill -KILL -- "-$group" 2>/dev/null; then
+                stopped="stopped guest process group $group; "
+            fi
+        fi
+    fi
+fi
+flock -u 8
+exec 7< "$lock_file"
+if ! flock -x -w {GUEST_CLEANUP_LOCK_SECONDS} 7; then
+    printf '%snumbered copy lock is still held\\n' "$stopped" >&2
+    exit 1
+fi
+if [ -L "$lock_file" ] || ! [ "$lock_file" -ef "/proc/$$/fd/7" ]; then
+    printf '%snumbered copy lock changed\\n' "$stopped" >&2
+    exit 1
+fi
+printf '%snumbered copy lock is free\\n' "$stopped"
+rm -rf -- "$state"'''
+
+
+def failed_guest_run(settings: GuestSettings, attempt: str, detail: str) -> GuestUnavailable:
+    try:
+        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt)), stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, errors='replace',
+                               timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return GuestUnavailable(f'{detail}. Guest cleanup unconfirmed: {error}')
+    if reply.returncode:
+        reason = reply.stderr.strip() or f'SSH exited {reply.returncode}'
+        return GuestUnavailable(f'{detail}. Guest cleanup unconfirmed: {reason}')
+    return GuestUnavailable(f'{detail}. Guest cleanup: {reply.stdout.strip()}')
 
 
 class BundleForm(StrEnum):
@@ -352,27 +444,29 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     else:
         base, header = '', ''
         form, reason = BundleForm.FIRST, bundle.reason
-    timeout = settings.run_time_limit_seconds + TRANSFER_ALLOWANCE_SECONDS
-    command = settings.command(run_shell(settings, source, len(bootstrap)))
-    with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
-                           *command], cwd=repo, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as stream:
-        try:
-            output, errors = stream.communicate(bootstrap, timeout=timeout)
-        except BaseException as error:
+    timeout = settings.transfer_timeout_seconds
+    transport = uuid4().hex
+    command = settings.command(run_shell(settings, source, len(bootstrap), transport))
+    try:
+        with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
+                               *command], cwd=repo, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as stream:
             try:
-                os.killpg(stream.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            if isinstance(error, subprocess.TimeoutExpired):
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds') from error
-            raise
-        if stream.returncode:
-            diagnostics = errors.decode(errors='replace')
-            if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
-                raise GuestMissingPrerequisite(diagnostics.strip())
-            detail = ' '.join(diagnostics.split())[-1200:]
-            raise GuestUnavailable(f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
+                output, errors = stream.communicate(bootstrap, timeout=timeout)
+            except BaseException:
+                try:
+                    os.killpg(stream.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raise
+    except subprocess.TimeoutExpired as error:
+        raise failed_guest_run(settings, transport, f'SSH or guest run exceeded {timeout} seconds') from error
+    if stream.returncode:
+        diagnostics = errors.decode(errors='replace')
+        if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
+            raise GuestMissingPrerequisite(diagnostics.strip())
+        detail = ' '.join(diagnostics.split())[-1200:]
+        raise failed_guest_run(settings, transport, f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
     result, _, count = output.rstrip().rpartition(b'\n')
     return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
 
@@ -460,9 +554,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return f'{TARGET}: {error}'
 
 
-def run_guest(request_path: Path) -> int:
+def run_guest(request_path: Path, state: Path) -> int:
     """Take a numbered copy before starting the guest gate."""
-    from scripts.lib import build_folders, build_slots
+    from scripts.lib import build_slots
 
     request = guest_request(request_path)
     main = Path.cwd()
@@ -492,9 +586,39 @@ def run_guest(request_path: Path) -> int:
                        str(Path(__file__).resolve()), str(request_path), '--run-copy']
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
-            return subprocess.run(command, cwd=copy.path, env=environment,
-                                  pass_fds=build_folders.held_build_folder_descriptors(),
-                                  stdin=subprocess.DEVNULL, check=False).returncode
+            command[:0] = ['timeout', f'--kill-after={GUEST_KILL_AFTER_SECONDS}', str(request['run_time_limit_seconds'])]
+            return run_guest_group(command, state, runtime, copy.path, environment)
+
+
+def run_guest_group(command: list[str], state: Path, runtime: Path, copy: Path, environment: dict[str, str]) -> int:
+    from scripts.lib.process_start import Started, Zombie, proc_table_start
+
+    guard = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        if (state / 'cancelled').exists():
+            raise GuestUnavailable('The caller cancelled the guest run.')
+        group_file = runtime / f'{state.name}.group'
+        lock_file = copy.with_name(copy.name + '.lock')
+        _ = (state / 'copy').write_bytes(os.fsencode(group_file) + b'\0' + os.fsencode(lock_file) + b'\0')
+        with subprocess.Popen(command, cwd=copy, env=environment, start_new_session=True,
+                              pass_fds=build_folders.held_build_folder_descriptors(), stdin=subprocess.DEVNULL) as child:
+            try:
+                start = proc_table_start(child.pid, Path('/proc'))
+                if not isinstance(start, (Started, Zombie)):
+                    raise GuestUnavailable('The guest process group identity is unavailable.')
+                _ = group_file.write_text(f'{child.pid} {start.start}\n', encoding='ascii')
+            except BaseException:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raise
+            finally:
+                fcntl.flock(guard, fcntl.LOCK_UN)
+            return child.wait()
+    finally:
+        os.close(guard)
 
 
 def guest_request(path: Path) -> GuestRequest:
@@ -539,4 +663,4 @@ if __name__ == '__main__':
     if sys.argv[2:] == ['--run-copy']:
         run_copy(Path(sys.argv[1]))
     else:
-        raise SystemExit(run_guest(Path(sys.argv[1])))
+        raise SystemExit(run_guest(Path(sys.argv[1]), Path(sys.argv[2])))
