@@ -70,11 +70,24 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
 
 
-def mac_placement_is_busy_or_blocked(output: str) -> bool:
+@dataclass(frozen=True)
+class NoMacPlacementRefusal:
+    pass
+
+
+@dataclass(frozen=True)
+class MacPlacementRefusal:
+    reason: str
+    has_provider_diagnostic: bool
+
+
+def mac_placement_refusal(output: str) -> MacPlacementRefusal | NoMacPlacementRefusal:
     reply = wire.parse_reply(output)
-    return (isinstance(reply, wire.PlacementWait)
+    if (isinstance(reply, wire.PlacementWait)
             and isinstance(reply.wait, wire.PlacementResourceWait)
-            and reply.wait.resource == "mac" and reply.wait.reason in ("busy", "blocked"))
+            and reply.wait.resource == "mac" and reply.wait.reason in ("busy", "blocked")):
+        return MacPlacementRefusal(reply.wait.reason, any(item.target == "mac" for item in reply.provider_diagnostics))
+    return NoMacPlacementRefusal()
 
 
 def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
@@ -413,18 +426,20 @@ def run_attempt(
                     block = blocking_run(args, owner)
                 if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
                     print(errors, end="", file=sys.stderr, flush=True)
-                mac_refused = (code == MAC_BUSY_STATUS and mac_run and isinstance(block, claim_state.NoMacBlock)
-                               and mac_placement_is_busy_or_blocked(output))
-                if code != MAC_BUSY_STATUS or args.no_wait or mac_refused or not isinstance(block, claim_state.NoMacBlock):
+                refusal = (mac_placement_refusal(output)
+                           if code == MAC_BUSY_STATUS and mac_run and isinstance(block, claim_state.NoMacBlock)
+                           else NoMacPlacementRefusal())
+                if (code != MAC_BUSY_STATUS or args.no_wait or isinstance(refusal, MacPlacementRefusal)
+                        or not isinstance(block, claim_state.NoMacBlock)):
                     break
                 if not mac_run:
                     print(output, end="", flush=True)
                 wait_to_retry()
             if not isinstance(block, claim_state.NoMacBlock):
                 status = 0
-            elif mac_refused:
-                if not errors:
-                    print("waiting for the Mac", file=sys.stderr, flush=True)
+            elif isinstance(refusal, MacPlacementRefusal):
+                if not errors or not refusal.has_provider_diagnostic:
+                    print(f"Mac is {refusal.reason}", file=sys.stderr, flush=True)
                 status = MAC_RUN_REFUSED_STATUS
             elif code:
                 if code != MAC_BUSY_STATUS or not mac_run:

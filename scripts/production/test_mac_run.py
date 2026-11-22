@@ -247,8 +247,10 @@ if args[0] == "place-step":
         if wait_reply in ("busy", "blocked"):
             eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion(wait_reply))
             diagnostics = ()
-            if wait_reply == "busy":
+            if wait_reply == "busy" and os.environ.get("MAC_RUN_QUEUE_BUSY_DIAGNOSTIC") != "0":
                 diagnostics = (placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00"),)
+            if wait_reply == "blocked":
+                print("fixture queue warning", file=sys.stderr)
             reply = wire.PlacementWait(episode, since, 1, (eligibility,),
                 wire.PlacementResourceWait("mac", wait_reply), provider_diagnostics=diagnostics)
         elif wait_reply == "pending-evidence":
@@ -602,24 +604,36 @@ class MacRunTests(unittest.TestCase):
         self.assert_claim_released()
 
     def test_queue_busy_reply_exits_nine_without_starting_build(self) -> None:
-        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "busy"}, timeout=TEST_HANG_GUARD_SECS)
+        for diagnostic in ("1", "0"):
+            with self.subTest(diagnostic=diagnostic):
+                self.clear_events()
+                (self.stub_state / "wait-reply").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "busy",
+                                             "MAC_RUN_QUEUE_BUSY_DIAGNOSTIC": diagnostic},
+                                      timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "")
-        busy_lines = [line for line in result.stderr.splitlines() if line.startswith("busy:")]
-        self.assertEqual(len(busy_lines), 1, result.stderr)
-        self.assertRegex(busy_lines[0], r"busy: unit tests since \d\d:\d\d")
-        self.assert_placement_wait_cancelled()
-        self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
-        self.assert_no_build_started()
-        self.assert_claim_released()
-        self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
+                self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                busy_lines = [line for line in result.stderr.splitlines()
+                              if line.startswith("busy:") or line == "Mac is busy"]
+                self.assertEqual(len(busy_lines), 1, result.stderr)
+                if diagnostic == "1":
+                    self.assertRegex(busy_lines[0], r"busy: unit tests since \d\d:\d\d")
+                else:
+                    self.assertEqual(busy_lines[0], "Mac is busy")
+                self.assert_placement_wait_cancelled()
+                self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+                self.assert_no_build_started()
+                self.assert_claim_released()
+                self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
 
     def test_queue_blocked_reply_exits_nine_without_starting_build(self) -> None:
         result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "blocked"}, timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
+        self.assertIn("fixture queue warning", result.stderr.splitlines())
+        self.assertEqual(result.stderr.splitlines().count("Mac is blocked"), 1, result.stderr)
         self.assert_placement_wait_cancelled()
         self.assert_no_build_started()
         self.assert_claim_released()
