@@ -6,12 +6,41 @@ try:
 except FileNotFoundError:
     pass
 
+import sys
+
+def _usage() -> str:
+    from scripts.agents import set_model
+
+    return f"""usage: agents COMMAND
+  agents help
+  agents status [ACCOUNT] [--json] [--here]
+  agents pause NAME [--finish-step] --why TEXT
+  agents exit NAME [--finish-step] --why TEXT
+  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
+  agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
+  agents resume --production SHOWRUNNER
+  agents retire NAME [--to PRODUCER]
+  agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
+  agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
+  agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
+  agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
+  agents remove-stray NAME SESSION
+  agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+"""
+
+if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
+    from scripts.agents import status_entry
+
+    raise SystemExit(status_entry.main(sys.argv[1:], usage=_usage))
+
 import argparse
 import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -55,28 +84,18 @@ from scripts.agents import (
     restart_support,
     shutdown_record,
     stop_resume,
+    status_entry,
     remote_control,
     remote,
     pane_record,
-)
-from scripts.agents.inventory import (
-    CheckoutState,
-    Host,
-    InvalidInventory,
-    Inventory,
-    Session,
-    inventory,
-    parse_inventory,
 )
 from scripts.agents.remote import other_machine, run_remote as run_remote, local_machine
 from scripts.agents.stop_results import StopResult, ResumeResult
 from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import (
-    Account,
     UnknownAccountName,
     UnreadableAccount,
     named_claude_account,
-    own_claude_account,
 )
 
 
@@ -111,108 +130,6 @@ class CommandLine(argparse.Namespace):
     job: str = ""
 
 
-class UnreachableMachine(TypedDict):
-    machine: str
-    unreachable: Literal[True]
-
-class UnavailableMachine(TypedDict):
-    machine: str
-    status: Literal["unavailable"]
-    rc: int
-    reason: str
-
-MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
-
-
-def _selected_account(requested: str | None) -> Account:
-    return own_claude_account() if requested is None else named_claude_account(requested)
-
-def _host_text(host: Host) -> str:
-    match host["kind"]:
-        case "unit":
-            return f"unit {host['unit']} (herdr {host['session_name']})"
-        case "legacy tmux" | "legacy tmux unit":
-            return f"{host['kind']} {host['session_name']} (manual recovery)"
-        case "herdr":
-            return f"herdr {host['herdr_session']}"
-        case "ghostty" | "zed":
-            desktop = host["desktop"]
-            return (
-                f"{host['kind']} on {desktop['name']}"
-                if desktop["kind"] == "named"
-                else host["kind"]
-            )
-        case kind:
-            return kind
-
-def _checkout_text(checkout: CheckoutState) -> str:
-    if checkout["kind"] == "not a checkout":
-        return "not a checkout"
-    head = checkout["head"]
-    name = head["name"] if head["kind"] == "branch" else head["commit"][:12]
-    upstream = checkout["upstream"]
-    tracking = (
-        f"ahead {upstream['ahead']}"
-        if upstream["kind"] == "tracking"
-        else "no upstream"
-    )
-    return f"{name} {tracking}, {len(checkout['dirty'])} dirty"
-
-def _session_lines(session: Session, _report: Inventory) -> list[str]:
-    summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
-    summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
-    lines = [summary]
-    lines.extend(f"    timer {timer}" for timer in session["timers"])
-    return lines
-
-def _inventory_lines(report: Inventory) -> list[str]:
-    lines = [f"{report['machine']}:"]
-    for session in report["sessions"]:
-        lines.extend(_session_lines(session, report))
-    lines.extend(
-        f"  unknown account · {item['pid']} {item['name']} · {item['reason']}"
-        for item in report["unattributed"]
-    )
-    if not report["sessions"] and not report["unattributed"]:
-        lines.append(f"  no sessions on {report['label']}")
-    return lines
-
-def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
-    return {
-        "machine": machine,
-        "status": "unavailable",
-        "rc": rc,
-        "reason": reason.strip() or "remote command failed",
-    }
-
-def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
-    local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
-    reports: list[MachineStatusReport] = [local]
-    if here:
-        return reports
-    arguments = ["status", selected.login, "--json", "--here"]
-    status, output = run_remote(arguments)
-    machine = other_machine()
-    if status == 255:
-        reports.append({"machine": machine, "unreachable": True})
-        return reports
-    if status != 0:
-        reports.append(_unavailable(machine, status, output))
-        return reports
-    try:
-        remote = parse_inventory(output)
-    except InvalidInventory as error:
-        reports.append(_unavailable(machine, status, str(error)))
-        return reports
-    if only:
-        remote["sessions"] = [session for session in remote["sessions"]
-            if session["session_id"] in only or (session["kind"] == "worker"
-                and session["owner"]["kind"] == "director" and session["owner"]["session_id"] in only)]
-        remote["unattributed"] = []
-    reports.append(remote)
-    return reports
-
-
 def wait_for_workers(record: staff.StaffSnapshot) -> None:
     """Name local worker turns and wait until each turn ends."""
     from scripts.herdr import worker_panes
@@ -238,27 +155,6 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         if not waiting:
             return
         time.sleep(1)
-
-
-USAGE = f"""usage: agents COMMAND
-  agents help
-  agents status [ACCOUNT] [--json] [--here]
-  agents pause NAME [--finish-step] --why TEXT
-  agents exit NAME [--finish-step] --why TEXT
-  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
-  agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
-  agents resume PRODUCER --resend-opening-prompt
-  agents resume --production SHOWRUNNER
-  agents retire NAME [--to PRODUCER]
-  agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
-  agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
-  agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
-  agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
-  agents remove-stray NAME SESSION
-  agents transfer NAME [--model MODEL --effort EFFORT]
-  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
-"""
 
 
 def _result_code(result: StopResult | ResumeResult) -> int:
@@ -668,8 +564,10 @@ def _restart_account(requested: str | None) -> restart.AllRestartAccounts | acco
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["status"]:
+        return status_entry.main(arguments, usage=_usage)
     if not arguments or arguments in (["help"], ["--help"], ["-h"]):
-        print(USAGE, end="")
+        print(_usage(), end="")
         return 0
     if arguments[0] == set_model.LOCAL_COMMAND:
         try:
@@ -679,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
-    parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
+    parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
@@ -738,10 +636,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--only", default="")
     _ = command.add_argument("--here", action="store_true")
     _ = command.add_argument("account", nargs="?")
-    command = commands.add_parser("status")
-    _ = command.add_argument("account", nargs="?")
-    _ = command.add_argument("--json", action="store_true", dest="as_json")
-    _ = command.add_argument("--here", action="store_true")
+    status_entry.add_arguments(commands.add_parser("status"))
     command = commands.add_parser("records")
     _ = command.add_argument("--json", action="store_true", dest="as_json")
     _ = command.add_argument("--here", action="store_true")
@@ -829,21 +724,6 @@ def main(argv: list[str] | None = None) -> int:
             result = remote_control.fix(options.session, options.pid, options.proc_start,
                                         options.who, options.account or "")
             return int(isinstance(result, remote_control.Failed))
-        if options.command == "status":
-            selected = _selected_account(options.account)
-            reports = _status(selected, options.here)
-            if options.as_json:
-                print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
-            else:
-                print(f"{selected.label} · {selected.login}")
-                for report in reports:
-                    if "sessions" in report:
-                        print("\n".join(_inventory_lines(report)))
-                    elif "unreachable" in report:
-                        print(f"{report['machine']}: unreachable")
-                    else:
-                        print(f"{report['machine']}: unavailable (rc {report['rc']})")
-            return 0
         if options.command == "rename":
             if (producer_lifecycle.pending_rename(options.old)
                     or producer_lifecycle.pending_admission(options.old)
@@ -891,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
         return 2
     except (OSError, ValueError, staff.StaffNotFound, UnknownAccountName, UnreadableAccount,
-            InvalidInventory, herdr_types.HerdrFailure) as error:
+            herdr_types.HerdrFailure) as error:
         print(f"shutdown: {error}", file=sys.stderr)
         return 2
 

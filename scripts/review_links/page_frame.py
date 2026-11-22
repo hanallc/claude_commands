@@ -23,25 +23,44 @@ TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
 
-def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
-               dialog: Callable[[], str]) -> bytes:
+class OwnerNewItem(StrEnum):
+    FOR_SHOWN_OWNER = "shown"
+    CHOOSE_RECIPIENT = "choose-recipient"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class NoShownOwner:
+    """There is no staff name to show in the page heading."""
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
+               dialog: Callable[[], str], *,
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
     """Add the shared owner control to one served console document."""
     from scripts.review_links import staff_names
 
     main = re.search(rb"<main(?=[\s>])[^>]*>", content)
     if main is None or b'data-page-owner="' in content:
         return content
-    name = staff_names.StaffNames(members).html(owner.id, owner.name)
-    label = html.escape(f"New item for {owner.name}", quote=True)
-    control = (f'<div class="page-owner" data-page-owner="{page}"><span class="page-owner-name">{name}</span>'
-               + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
-               + icon_svg("message-circle-question") + '</button></div>').encode()
+    name = ""
+    if isinstance(owner, staff.StaffRow):
+        rendered = staff_names.StaffNames(members).html(owner.id, owner.name)
+        name = f'<span class="page-owner-name">{rendered}</span>'
+    button = ""
+    if recipient is not OwnerNewItem.UNAVAILABLE:
+        label = "New item"
+        if recipient is OwnerNewItem.FOR_SHOWN_OWNER and isinstance(owner, staff.StaffRow):
+            label = f"New item for {owner.name}"
+        elif not isinstance(recipient, OwnerNewItem):
+            label = f"New item for {recipient}"
+        label = html.escape(label, quote=True)
+        button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+                  + icon_svg("message-circle-question") + '</button>')
+    control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
-    if heading is not None and content.startswith(actions, heading.end()):
-        at = heading.end() + len(actions)
-        content = content[:at] + control + content[at:]
-    elif heading is not None:
+    if heading is not None:
         row = b'<div class="page-heading">' + heading[0] + actions + control + b'</div></div>'
         content = content[:heading.start()] + row + content[heading.end():]
     else:
@@ -56,17 +75,18 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
     if row_style not in content:
         style = b'<style>' + row_style + b'</style>' + style
     content = content.replace(b'</head>', style + b'</head>', 1)
-    if b'id="review-new-item"' not in content:
-        content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
+    if button:
+        markup = dialog()
+        if CONSOLE_DIALOG_ASSETS.encode() in content:
+            markup = markup.replace(CONSOLE_DIALOG_ASSETS, '', 1)
+        content = content.replace(b'</body>', markup.encode() + b'</body>', 1)
     return content
 
 
 HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
                  + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
-                 + 'max-width:100%;margin-inline-start:auto}'
-                 + '@media(max-width:360px){.page-heading-compact{flex-wrap:nowrap;column-gap:8px}'
-                 + '.page-heading-compact>.page-heading-actions{min-width:0;gap:6px}}')
+                 + 'max-width:100%;margin-inline-start:auto}')
 
 
 OWNER_STYLE = """<style>
@@ -106,8 +126,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, action: str = "", compact_actions: bool = False) -> str:
-    """Build the title and refresh status with an optional action beside the title."""
+def title(text: str, page: str) -> str:
+    """Build the title and refresh status."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -118,9 +138,6 @@ def title(text: str, page: str, *, action: str = "", compact_actions: bool = Fal
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
-    if action:
-        layout = "page-heading page-heading-compact" if compact_actions else "page-heading"
-        heading = f'<div class="{layout}">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -141,6 +158,13 @@ def template(source: str, text: str, page: str) -> str:
     return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
             .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
             .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
+
+
+CONSOLE_READY_SCRIPT = """(() => {
+ const ready = () => window.frameElement?.dispatchEvent(new Event('console-document-ready'));
+ document.addEventListener('DOMContentLoaded', ready, {once:true});
+ addEventListener('pageshow', event => { if (event.persisted) ready(); });
+})();"""
 
 
 REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
@@ -257,6 +281,11 @@ CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\
 def code_block_html(block: re.Match[str]) -> str:
     """Build a code block with the shared copy button."""
     text = block[1] if block[1] is not None else block[2]
+    return copy_code_block(text)
+
+
+def copy_code_block(text: str) -> str:
+    """Show plain text with the shared copy button."""
     return ('<div class="code-block"><pre><code>' + html.escape(text)
             + '</code></pre>' + COPY_BUTTON + '</div>')
 
@@ -320,6 +349,16 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .review-actions{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap}
 .review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
 .review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}
+.review-actions label.action-select{display:inline-flex;align-items:center;gap:8px;margin:0;font:inherit;max-width:100%}
+.action-select select{box-sizing:border-box;min-height:44px;max-width:min(23ch,65vw);padding:6px 10px;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font:inherit}
+@supports (appearance:base-select){
+.action-select select,.action-select select::picker(select){appearance:base-select}
+.action-select select::picker(select){max-height:20rem;overflow:auto;padding:4px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink)}
+.action-select option{padding:5px 10px;border-radius:4px}
+.action-select option:hover{background:var(--bg)}
+}
 .review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
@@ -328,6 +367,70 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 class ReturningActionHeading(StrEnum):
     ITEM_RETURNS = "The item returns to you"
     SENDS_TO_SHOWRUNNER = "Sends to showrunner"
+
+
+def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
+                   before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
+    """Render a console dialog with its shared assets."""
+    wrapper = 'form' if form else 'div'
+    markup = (f'<dialog id="{dialog_id}" aria-labelledby="{title_id}" data-console-dialog>'
+              f'<{wrapper} class="console-dialog-frame"><header><h2 id="{title_id}">{title}</h2>'
+              '<button type="button" data-close aria-label="Close">×</button></header>'
+              f'{before_body}'
+              f'<div class="console-dialog-body{(" " + body_class) if body_class else ""}">'
+              f'{body}</div>{footer}</{wrapper}></dialog>')
+    return CONSOLE_DIALOG_ASSETS + markup
+
+
+CONSOLE_DIALOG_STYLE = '''
+[data-console-dialog] {
+ position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
+ width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
+ color: var(--ink, #f0efec); background: var(--card, #1a1a19); border: 1px solid var(--line, #34332f);
+ border-radius: 12px; box-shadow: 0 20px 60px #0006; overflow: hidden;
+ font: 15px/1.45 system-ui, sans-serif;
+}
+[data-console-dialog] *, [data-console-dialog] *::before, [data-console-dialog] *::after { box-sizing: border-box; }
+[data-console-dialog] [hidden] { display: none; }
+[data-console-dialog]::backdrop { background: #0009; }
+.console-dialog-frame { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; margin: 0;
+ max-height: calc(100dvh - 34px); }
+.console-dialog-frame > :is(header, footer) { padding-inline: 24px; }
+.console-dialog-frame > header {
+ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-block: 20px 16px;
+}
+.console-dialog-frame > header h2 { margin: 0; font-size: 22px; line-height: 1.2; }
+.console-dialog-frame > header [data-close] {
+ flex: none; min-height: 30px; margin: 0; padding: 0; cursor: pointer;
+ border: 0; border-radius: 6px; background: transparent; width: 30px; height: 30px;
+ color: var(--ink-2, #c3c2b7); font-size: 22px; line-height: 1;
+}
+.console-dialog-body {
+ min-width: 0; padding: 4px 24px 20px; overflow-y: auto; overscroll-behavior: contain;
+ scrollbar-width: thin; scrollbar-color: var(--ink-3, #9a988f) var(--card, #1a1a19);
+}
+@media (max-width: 480px) {
+ .console-dialog-frame > :is(header, footer), .console-dialog-body { padding-inline: 16px; }
+ .console-dialog-frame > header { padding-block: 14px 12px; }
+}
+'''
+
+
+CONSOLE_DIALOG_SCRIPT = '''
+function bindConsoleDialog(dialog,close){
+ dialog.querySelector('[data-close]').addEventListener('click',()=>close());
+ dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
+ let pressedBackdrop=false;
+ dialog.addEventListener('pointerdown',event=>{pressedBackdrop=event.target===dialog;});
+ dialog.addEventListener('click',event=>{
+  if(pressedBackdrop && event.target===dialog) close();
+  pressedBackdrop=false;
+ });
+}
+'''
+
+
+CONSOLE_DIALOG_ASSETS = f'<style>{CONSOLE_DIALOG_STYLE}</style><script>{CONSOLE_DIALOG_SCRIPT}</script>'
 
 
 def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
@@ -343,6 +446,12 @@ def review_action_groups(closing_buttons: str, returning_buttons: str, later_con
         + f'<div{controls_class}>{controls}</div></div>'
         for label, controls, group_class, controls_class in groups if controls
     ) + '</div>'
+
+
+def action_select(name: str, label: str, options: str) -> str:
+    """Render a select next to the action that uses it."""
+    return (f'<label class="action-select">{html.escape(label)}'
+            + f'<select name="{html.escape(name, quote=True)}">{options}</select></label>')
 
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
