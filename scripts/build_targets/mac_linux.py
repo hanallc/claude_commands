@@ -4,8 +4,8 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
-import fcntl
 from io import BytesIO
 import json
 import math
@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import time
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -33,14 +34,16 @@ TARGET = 'mac-linux'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
        '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
-# Give the transfer, checkout, and result time outside the guest runner deadline.
+# Give SSH time to connect and return the result.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
-GUEST_KILL_AFTER_SECONDS = 3
-GUEST_CLEANUP_LOCK_SECONDS = 5
+GUEST_KILL_GRACE_SECONDS = 3
 GUEST_CLEANUP_TIMEOUT_SECONDS = 25
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
+GUEST_END_PENDING_STATUS = 76
+RUN_LOCK_PATH = '.git/mac-linux-run.lock'
+RUN_LOCK_FD = 9
 
 
 class GuestUnavailable(RuntimeError):
@@ -217,19 +220,28 @@ fi'''
     return GuestMain(commit)
 
 
-def guest_attempt_shell(settings: GuestSettings, attempt: str) -> str:
-    return guest_shell(settings) + f'''
-state="$checkout/.git/mac-linux-runs"/{shlex.quote(attempt)}'''
+@dataclass(frozen=True)
+class GuestRunDeadline:
+    """Give the guest and the reservation the same deadline."""
+
+    utc_microseconds: int
+    monotonic: float
+
+    @classmethod
+    def from_now(cls, seconds: int) -> GuestRunDeadline:
+        return cls(time.time_ns() // 1000 + seconds * 1_000_000, time.monotonic() + seconds)
+
+    def wait_past_kill_grace(self) -> str:
+        bound = self.monotonic + GUEST_KILL_GRACE_SECONDS
+        time.sleep(max(0, bound - time.monotonic()))
+        utc_bound = self.utc_microseconds / 1_000_000 + GUEST_KILL_GRACE_SECONDS
+        return datetime.fromtimestamp(utc_bound, timezone.utc).isoformat(timespec='milliseconds')
 
 
-def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str) -> str:
+def run_shell(settings: GuestSettings, source: CandidateSource, bootstrap_bytes: int, attempt: str,
+              deadline: GuestRunDeadline) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
-    return guest_attempt_shell(settings, attempt) + f'''
-umask 077
-mkdir -p -- "$checkout"
-cd "$checkout"
-exec 9< .
-flock -x -n 9 || {{ printf 'The guest main checkout is in use.\\n' >&2; exit 1; }}
+    checkout = f'''set -euo pipefail
 if [ ! -f .git/mac-linux-owned ]; then
     if [ -n "$(find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit)" ] ||
        {{ [ -f .git/HEAD ] && [ -n "$(git for-each-ref --count=1)" ]; }}; then
@@ -250,22 +262,15 @@ unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
 if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
-mkdir -p -- "$state"
-if [ -e "$state/cancelled" ]; then
-    rm -rf -- "$state"
-    printf 'The caller cancelled the guest run.\\n' >&2
-    exit 1
-fi
-bootstrap="$checkout/.git/mac-linux"
+bootstrap="$PWD/.git/mac-linux"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
-trap 'rm -rf -- "$bootstrap"; touch "$state/finished" 2>/dev/null || :' EXIT
+trap 'rm -rf -- "$bootstrap"' EXIT
 export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
 head -c {bootstrap_bytes} | tar -xf - -C "$bootstrap"
 if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
     cat "$bootstrap/bundle-error" >&2
     if grep -Fq {shlex.quote(MISSING_PREREQUISITE_MESSAGE)} "$bootstrap/bundle-error"; then
-        rm -rf -- "$state"
         exit {MISSING_PREREQUISITE_STATUS}
     fi
     exit 1
@@ -284,68 +289,115 @@ git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
 umask 022
-./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json" "$state"
-rm -rf -- "$state"'''
-
-
-def cleanup_shell(settings: GuestSettings, attempt: str) -> str:
-    return guest_attempt_shell(settings, attempt) + f'''
+./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+    locked_run = f'''set -euo pipefail
+exec {RUN_LOCK_FD}<> {RUN_LOCK_PATH}
+flock -x -n {RUN_LOCK_FD} || {{ printf 'The guest run lock is held.\\n' >&2; exit 1; }}
+now=${{EPOCHREALTIME/./}}
+remaining=$(({deadline.utc_microseconds} - now))
+if (( remaining <= 0 )); then
+    printf 'The guest run deadline passed before launch.\\n' >&2
+    exit 124
+fi
+limit={settings.run_time_limit_seconds * 1_000_000}
+if (( remaining > limit )); then
+    remaining=$limit
+fi
+printf '%s %s\\n' "$BASHPID" {shlex.quote(attempt)} > {RUN_LOCK_PATH}
+printf -v duration '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
+exec timeout --signal=KILL "$duration" bash -c {shlex.quote(checkout)}'''
+    return guest_shell(settings) + f'''
 umask 077
-mkdir -p -- "$state"
-exec 8< "$state"
-flock -x -w {GUEST_CLEANUP_LOCK_SECONDS} 8
-touch -- "$state/cancelled"
-if [ ! -f "$state/copy" ]; then
-    printf 'no numbered copy was registered\\n'
-    if [ -e "$state/finished" ]; then
-        rm -rf -- "$state"
+mkdir -p -- "$checkout/.git"
+cd "$checkout"
+status=0
+setsid --wait bash -c {shlex.quote(locked_run)} || status=$?
+if (( status != 0 && status != {MISSING_PREREQUISITE_STATUS} )); then
+    exit "$status"
+fi
+exec 8< {RUN_LOCK_PATH}
+flock -x -n 8 || {{ printf 'The guest run lock is still held.\\n' >&2; exit 1; }}
+exit "$status"'''
+
+
+def cleanup_shell(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline) -> str:
+    return guest_shell(settings) + f'''
+umask 077
+mkdir -p -- "$checkout/.git"
+cd "$checkout"
+exec 8<> {RUN_LOCK_PATH}
+prove_end() {{
+    flock -x -n 8 || return 1
+    read -r group owner < {RUN_LOCK_PATH} || :
+    now=${{EPOCHREALTIME/./}}
+    if [[ "$owner" != {shlex.quote(attempt)} ]] && (( now < {deadline.utc_microseconds} )); then
+        printf 'The guest run has no lock record.\\n' >&2
+        exit {GUEST_END_PENDING_STATUS}
     fi
+    printf 'ended\\n'
     exit 0
-fi
-mapfile -d '' -t paths < "$state/copy"
-group_file="${{paths[0]}}"
-lock_file="${{paths[1]}}"
-stopped=''
-if [ -f "$group_file" ] && read -r group started < "$group_file"; then
-    if [[ ! "$group" =~ ^[1-9][0-9]*$ || "$group" -le 1 || ! "$started" =~ ^[0-9]+$ ]]; then
-        printf 'The guest process group record is invalid.\\n' >&2
-        exit 1
-    fi
-    if stat=$(cat "/proc/$group/stat" 2>/dev/null); then
-        read -r -a fields <<< "${{stat##*) }}"
-        if [[ "${{fields[2]}}" = "$group" && "${{fields[3]}}" = "$group" &&
-              "${{fields[19]}}" = "$started" && "${{fields[0]}}" != Z ]]; then
-            if kill -KILL -- "-$group" 2>/dev/null; then
-                stopped="stopped guest process group $group; "
-            fi
+}}
+prove_end || :
+read -r group owner < {RUN_LOCK_PATH} || :
+if [[ "$owner" == {shlex.quote(attempt)} ]]; then
+    if [[ "$group" =~ ^[1-9][0-9]{{0,9}}$ ]] && (( group > 1 && group <= 2147483647 )); then
+        if [[ /proc/$group/fd/{RUN_LOCK_FD} -ef {RUN_LOCK_PATH} ]]; then
+            kill -KILL -- "-$group" 2>/dev/null || :
         fi
+    else
+        printf 'The guest process group ID is invalid.\\n' >&2
     fi
 fi
-flock -u 8
-exec 7< "$lock_file"
-if ! flock -x -w {GUEST_CLEANUP_LOCK_SECONDS} 7; then
-    printf '%snumbered copy lock is still held\\n' "$stopped" >&2
-    exit 1
-fi
-if [ -L "$lock_file" ] || ! [ "$lock_file" -ef "/proc/$$/fd/7" ]; then
-    printf '%snumbered copy lock changed\\n' "$stopped" >&2
-    exit 1
-fi
-printf '%snumbered copy lock is free\\n' "$stopped"
-rm -rf -- "$state"'''
+for ((retry = 0; retry < {GUEST_KILL_GRACE_SECONDS * 10}; retry++)); do
+    prove_end || sleep 0.1
+done
+prove_end || :
+printf 'The guest run lock is still held.\\n' >&2
+exit {GUEST_END_PENDING_STATUS}'''
 
 
-def failed_guest_run(settings: GuestSettings, attempt: str, detail: str) -> GuestUnavailable:
+class GuestEndStatus(StrEnum):
+    ENDED = 'ended'
+    PENDING = 'pending'
+    UNREACHABLE = 'unreachable'
+
+
+@dataclass(frozen=True)
+class GuestEndProof:
+    status: GuestEndStatus
+    detail: str = ''
+
+
+def prove_guest_end(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline) -> GuestEndProof:
     try:
-        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt)), stdin=subprocess.DEVNULL,
+        reply = subprocess.run(settings.command(cleanup_shell(settings, attempt, deadline)), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, errors='replace',
                                timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return GuestUnavailable(f'{detail}. Guest cleanup unconfirmed: {error}')
-    if reply.returncode:
-        reason = reply.stderr.strip() or f'SSH exited {reply.returncode}'
-        return GuestUnavailable(f'{detail}. Guest cleanup unconfirmed: {reason}')
-    return GuestUnavailable(f'{detail}. Guest cleanup: {reply.stdout.strip()}')
+        return GuestEndProof(GuestEndStatus.UNREACHABLE, str(error))
+    if reply.returncode == 0 and reply.stdout.strip() == 'ended':
+        return GuestEndProof(GuestEndStatus.ENDED)
+    status = GuestEndStatus.PENDING if reply.returncode == GUEST_END_PENDING_STATUS else GuestEndStatus.UNREACHABLE
+    reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
+    return GuestEndProof(status, reason)
+
+
+def failed_guest_run(settings: GuestSettings, attempt: str, deadline: GuestRunDeadline,
+                     detail: str) -> GuestUnavailable:
+    proof = prove_guest_end(settings, attempt, deadline)
+    if proof.status is GuestEndStatus.ENDED:
+        return GuestUnavailable(f'{detail}. Guest cleanup: ended')
+    first_failure = proof.detail
+    bound = deadline.wait_past_kill_grace()
+    proof = prove_guest_end(settings, attempt, deadline)
+    # A reachable guest with a held lock still needs proof.
+    while proof.status is GuestEndStatus.PENDING:
+        time.sleep(0.1)
+        proof = prove_guest_end(settings, attempt, deadline)
+    if proof.status is GuestEndStatus.ENDED:
+        return GuestUnavailable(f'{detail}. Guest cleanup: {first_failure}. Guest cleanup after the deadline: ended')
+    return GuestUnavailable(f'{detail}. Guest cleanup: {proof.detail}. '
+                            + f'guest unreachable; its own timeout bound passed at {bound}')
 
 
 class BundleForm(StrEnum):
@@ -446,7 +498,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         form, reason = BundleForm.FIRST, bundle.reason
     timeout = settings.transfer_timeout_seconds
     transport = uuid4().hex
-    command = settings.command(run_shell(settings, source, len(bootstrap), transport))
+    deadline = GuestRunDeadline.from_now(settings.run_time_limit_seconds)
+    command = settings.command(run_shell(settings, source, len(bootstrap), transport, deadline))
     try:
         with subprocess.Popen(['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, base, header,
                                *command], cwd=repo, stdin=subprocess.PIPE,
@@ -460,13 +513,14 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                     pass
                 raise
     except subprocess.TimeoutExpired as error:
-        raise failed_guest_run(settings, transport, f'SSH or guest run exceeded {timeout} seconds') from error
+        raise failed_guest_run(settings, transport, deadline, f'SSH or guest run exceeded {timeout} seconds') from error
     if stream.returncode:
         diagnostics = errors.decode(errors='replace')
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
         detail = ' '.join(diagnostics.split())[-1200:]
-        raise failed_guest_run(settings, transport, f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
+        raise failed_guest_run(settings, transport, deadline,
+                               f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}')
     result, _, count = output.rstrip().rpartition(b'\n')
     return GuestReply(result.decode('utf-8'), int(count) - len(bootstrap), form, reason)
 
@@ -554,14 +608,15 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return f'{TARGET}: {error}'
 
 
-def run_guest(request_path: Path, state: Path) -> int:
+def run_guest(request_path: Path) -> int:
     """Take a numbered copy before starting the guest gate."""
     from scripts.lib import build_slots
 
     request = guest_request(request_path)
     main = Path.cwd()
-    with build_slots.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
-                               work=request['mode'], purpose=TARGET) as copy:
+    with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+          build_slots.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
+                                work=request['mode'], purpose=TARGET) as copy):
         with build_folders.tool_folder(TARGET, copy.cargo_dir) as runtime:
             home = runtime / 'home'
             (home / '.claude').mkdir(parents=True)
@@ -586,39 +641,8 @@ def run_guest(request_path: Path, state: Path) -> int:
                        str(Path(__file__).resolve()), str(request_path), '--run-copy']
             if shutil.which('dbus-run-session'):
                 command[:0] = ['dbus-run-session', '--']
-            command[:0] = ['timeout', f'--kill-after={GUEST_KILL_AFTER_SECONDS}', str(request['run_time_limit_seconds'])]
-            return run_guest_group(command, state, runtime, copy.path, environment)
-
-
-def run_guest_group(command: list[str], state: Path, runtime: Path, copy: Path, environment: dict[str, str]) -> int:
-    from scripts.lib.process_start import Started, Zombie, proc_table_start
-
-    guard = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        if (state / 'cancelled').exists():
-            raise GuestUnavailable('The caller cancelled the guest run.')
-        group_file = runtime / f'{state.name}.group'
-        lock_file = copy.with_name(copy.name + '.lock')
-        _ = (state / 'copy').write_bytes(os.fsencode(group_file) + b'\0' + os.fsencode(lock_file) + b'\0')
-        with subprocess.Popen(command, cwd=copy, env=environment, start_new_session=True,
-                              pass_fds=build_folders.held_build_folder_descriptors(), stdin=subprocess.DEVNULL) as child:
-            try:
-                start = proc_table_start(child.pid, Path('/proc'))
-                if not isinstance(start, (Started, Zombie)):
-                    raise GuestUnavailable('The guest process group identity is unavailable.')
-                _ = group_file.write_text(f'{child.pid} {start.start}\n', encoding='ascii')
-            except BaseException:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                raise
-            finally:
-                fcntl.flock(guard, fcntl.LOCK_UN)
-            return child.wait()
-    finally:
-        os.close(guard)
+            return subprocess.run(command, cwd=copy.path, env=environment, stdin=subprocess.DEVNULL, check=False,
+                                  pass_fds=build_folders.held_build_folder_descriptors()).returncode
 
 
 def guest_request(path: Path) -> GuestRequest:
@@ -637,18 +661,19 @@ def run_copy(request_path: Path) -> None:
     request = guest_request(request_path)
     if os.cpu_count() != request['jobs']:
         raise GuestUnavailable(f'The guest Python did not set the CPU count to {request["jobs"]}.')
-    commit = gate.checked_git(repo, 'rev-parse', 'HEAD')
-    origin_main = gate.checked_git(repo, 'rev-parse', ORIGIN_MAIN)
+    descriptors = (int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV]), RUN_LOCK_FD)
+    refs = subprocess.check_output(['git', 'rev-parse', 'HEAD', ORIGIN_MAIN, 'HEAD^{tree}'], cwd=repo,
+                                   text=True, pass_fds=descriptors).splitlines()
+    commit, origin_main, tree = refs
     if commit != request['commit'] or origin_main != request['origin_main']:
         raise GuestUnavailable('The guest checkout refs differ from the request.')
-    tree = gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}')
     if tree != request['tree']:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
     machine = gate.WholeMachine(gate_parent=build_folders.ExplicitBuildParent(Path(os.environ['TMPDIR'])))
-    token = copies.COMMAND_LOCKS.set((int(os.environ[build_folders.NUMBERED_COPY_LOCK_ENV]),))
+    token = copies.COMMAND_LOCKS.set(descriptors)
     try:
-        with redirect_stdout(sys.stderr):
+        with build_folders.inherit_build_lock(RUN_LOCK_FD), redirect_stdout(sys.stderr):
             run = gate.run_suites(repo, full=request['full'], mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
@@ -663,4 +688,4 @@ if __name__ == '__main__':
     if sys.argv[2:] == ['--run-copy']:
         run_copy(Path(sys.argv[1]))
     else:
-        raise SystemExit(run_guest(Path(sys.argv[1]), Path(sys.argv[2])))
+        raise SystemExit(run_guest(Path(sys.argv[1])))

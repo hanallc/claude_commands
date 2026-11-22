@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -573,6 +574,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
     settings = _settings() if settings is None else settings
@@ -595,8 +597,18 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all maker leases in source and command subprocesses."""
-    return tuple(_locks)
+    """Retain all build locks in source and command subprocesses."""
+    return (*_inherited_build_locks.get(), *_locks)
+
+
+@contextmanager
+def inherit_build_lock(descriptor: int) -> Generator[None]:
+    """Pass an inherited build lock to child processes."""
+    token = _inherited_build_locks.set((*_inherited_build_locks.get(), descriptor))
+    try:
+        yield
+    finally:
+        _inherited_build_locks.reset(token)
 
 
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
