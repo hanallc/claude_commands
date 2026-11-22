@@ -52,6 +52,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
     "uses_cloud": "Uses the AWS places",
     "memory": "Memory for builds",
     "gpu": "GPU tests",
+    "gpu_limit": "The GPU limit applies to tests for this repository on natedev.",
     "disk": "Free disk",
     "cloud": "Places",
     "money": "Money today",
@@ -159,7 +160,8 @@ class Cell:
     waits: WaitGroups = field(default_factory=dict[str, WaitGroup])
     note: str = ""
     show_marks: bool = True
-    count_note: str = ""
+    verify_used: int = 0
+    gpu: Metric | None = None
 
 
 @dataclass
@@ -301,12 +303,12 @@ def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse | Wait
                     item.get("reservation_id", item["admitted_at"]))
         for item in inputs.reservations if item["worktree"]
     }
-    for step in reading.view.waiting:
-        reason = waiting_cause(step)
-        if isinstance(reason, records.RunLimitWait) and reason.machine == inputs.local_machine and step.folder:
-            checkouts.add(WaitingCheckout(step.folder, step.pid, step.since))
+    checkouts.update(WaitingCheckout(step.folder, step.pid, step.since)
+                     for step in reading.view.waiting if step.folder)
     if isinstance(reading, wire.CloudQueueRead):
         checkouts.update(CheckoutUse(row.identity.folder, row.owner) for row in reading.cloud if row.identity.folder)
+        checkouts.update(WaitingCheckout(row.identity.folder, row.owner.pid, row.since)
+                         for row in reading.repository_slots if row.identity.folder)
     return frozenset(checkouts)
 
 
@@ -774,13 +776,17 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
     scope_use: Counter[claim_state.ClaimScope] = Counter()
     unattributed = 0
     show_free = mac.claims_readable
+    missing_scope = False
     for claim in mac.claims:
         scope_use[claim.scope] += 1
         if isinstance(claim.scope, claim_state.RepositoryScope):
-            name = short_name(claim.origin)
+            # The Mac uses the recorded scope name when the claim has no origin.
+            name = short_name(claim.origin) or clean_label(claim.scope.name)
             if not name:
-                return len(mac.claims), ("A Mac claim has no verified repository origin. "
-                                         "All Mac claim counts appear in this heading.")
+                unattributed += 1
+                show_free = False
+                missing_scope = True
+                continue
             by_row.setdefault(name, []).append(claim)
         else:
             unattributed += 1
@@ -811,7 +817,7 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
             if scope_rows[scope] == 1 and not scope_use[claim_state.RepositoryScope(scope)]:
                 cell = rows[name].mac
                 cell.used, cell.limit, cell.policy = 0, limit, CellPolicy.CONFIGURED
-    return unattributed, ""
+    return unattributed, "A Mac claim has no repository name that this page can show." if missing_scope else ""
 
 
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
@@ -836,6 +842,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     keys_by_row: dict[str, set[str]] = {}
     unresolved_policy = False
     run_labels: dict[tuple[str, str], tuple[str, str]] = {}
+    gpu = explanation.policy.gpu_tests
+    gpu_used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations)
     mac_targets = (frozenset(snapshot.target.name for snapshot in snapshots if snapshot.target.platform == "macos")
                    if isinstance(snapshots, tuple) else frozenset[str]())
 
@@ -865,6 +873,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         name = short_name(origin) if origin else policy_label(key)
         if name:
             keys_by_row.setdefault(name, set()).add(key)
+            if inputs.verify_run_counts.get(key):
+                _ = row(name)
 
     for origin in history:
         _ = observe_local(origin)
@@ -903,14 +913,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if label := clean_label(recorded_unit, names.get(session, ""), session_name, name):
             cell.other.append(label)
 
-    repository_wait_counts: dict[str, set[tuple[int, int]]] = {}
     policy_wait_indices: dict[str, int] = {}
     local_policy_waits: list[LocalPolicyWait] = []
-    gpu_wait_counts: set[tuple[int, int]] = set()
     waiting_origins = {(waiter["pid"], waiter["since"]): origin for _, waiter in reading.ordered
                        if (origin := recorded_origin(waiter.get("repo_identity", "")))}
 
-    def record_wait(destination: WaitGroups, reason: records.WaitReason, name: str) -> None:
+    def record_wait(destination: WaitGroups, reason: records.WaitReason | wire.CloudSlotWait, name: str) -> None:
         # Keep each policy group separate without publishing private keys.
         policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
                         if isinstance(reason, records.RunLimitWait) else 0)
@@ -920,34 +928,51 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
             if isinstance(entry.wait, wire.CloudSlotWait):
-                add_wait(metric_waits.setdefault("cloud", {}), wait_words(entry.wait), visible.name)
+                name = short_name(origins.resolve("", entry.identity.folder))
+                destination = row(name).aws.waits if name else metric_waits.setdefault("cloud", {})
+                record_wait(destination, entry.wait, visible.name)
             continue
         if isinstance(entry, wire.RepositorySlotRow):
-            destination = (mac_waits if entry.machine in mac_targets
-                           else local_waits if entry.machine == local else remote_wait(entry.machine))
-            add_wait(destination, WAIT_WORDS["wait"], visible.name)
+            name = (short_name(origins.resolve("", entry.identity.folder))
+                    or short_name(recorded_origin(entry.wait.repository)) or policy_label(entry.wait.repository))
+            if entry.machine in mac_targets:
+                destination = row(name).mac.waits if name else mac_waits
+            elif entry.machine == local:
+                destination = row(name).natedev.waits if name else local_waits
+            else:
+                destination = row(name).aws.waits if name and entry.machine in saved.aws_targets else remote_wait(entry.machine)
+            add_wait(destination, WAIT_WORDS["run_limit_full"], visible.name)
             continue
         step = entry.step
         pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else local
         reason = waiting_cause(step)
+        recorded = waiting_origins.get((step.pid, step.since), "")
+        checkout = origins.resolve("", step.folder)
+        origin = "" if recorded and checkout and recorded != checkout else recorded or checkout
+        name = short_name(origin or recorded_origin(step.project)) or policy_label(step.project)
         if isinstance(step.route, target_config.MacOnly) or pinned in mac_targets:
-            record_wait(mac_waits, reason, visible.name)
+            record_wait(row(name).mac.waits if name else mac_waits, reason, visible.name)
             continue
         if pinned != local:
-            destination = remote_wait(pinned)
+            destination = row(name).aws.waits if name and pinned in saved.aws_targets else remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
-            repository_wait_counts.setdefault(reason.repository, set()).add((reason.used, reason.limit))
-            recorded = waiting_origins.get((step.pid, step.since), "")
-            checkout = origins.resolve("", step.folder)
-            origin = "" if recorded and checkout and recorded != checkout else recorded or checkout
-            name = observe_local(origin, reason.repository)
+            if not origin and not (recorded and checkout) and name and step.project == reason.repository:
+                _ = row(name)
+            else:
+                name = observe_local(origin, reason.repository)
             local_policy_waits.append(LocalPolicyWait(reason, name, visible.name))
             continue
+        elif isinstance(reason, records.GpuSlotWait):
+            if name:
+                destination = row(name).natedev.waits
+            elif len(gpu.repositories) == 1 and (gpu_name := policy_label(next(iter(gpu.repositories)))):
+                destination = row(gpu_name).natedev.waits
+            else:
+                destination = local_waits
+        elif name:
+            destination = row(name).natedev.waits
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
-        elif isinstance(reason, records.GpuSlotWait):
-            gpu_wait_counts.add((reason.used, reason.slots))
-            destination = metric_waits.setdefault("gpu", {})
         elif isinstance(reason, (records.NeedsMemory, records.MemoryPressure, records.PressureUnavailable)):
             destination = metric_waits.setdefault("memory", {})
         else:
@@ -957,8 +982,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     bindings = Counter(key for keys in keys_by_row.values() for key in keys)
     bound_rows = {key: name for name, keys in keys_by_row.items() for key in keys if bindings[key] == 1}
     for waiting in local_policy_waits:
-        destination = (row(waiting.repository).natedev.waits
-                       if waiting.repository and not unresolved_policy else local_waits)
+        name = waiting.repository or bound_rows.get(waiting.reason.repository, "")
+        destination = row(name).natedev.waits if name and not unresolved_policy else local_waits
         record_wait(destination, waiting.reason, waiting.name)
 
     cloud_slots = saved.cloud_slots
@@ -1003,25 +1028,18 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.note = PAGE_WORDS["not_available"]
 
     shared: list[Metric] = []
-    count_notes: dict[str, str] = {}
     for repository_key, limit in local_limits.items():
         owners = occupancy.get(repository_key, set[str]())
-        used = len(owners)
-        wait_counts = repository_wait_counts.get(repository_key)
-        if wait_counts and wait_counts != {(used, limit)}:
-            count_notes[repository_key] = "The queue waits and the reservations disagree on the run count or limit."
-            continue
+        verify_used = inputs.verify_run_counts.get(repository_key, 0)
+        used = len(owners) + verify_used
         runs: list[str] = []
         merge_above: list[str] = []
         for owner in sorted(owners):
             label, recorded_unit = run_labels.get((repository_key, owner), ("", ""))
-            if used > limit and recorded_unit and recorded_unit == policy.exempt_unit:
+            if used - limit > len(merge_above) and recorded_unit and recorded_unit == policy.exempt_unit:
                 merge_above.append(label)
             elif label:
                 runs.append(label)
-        if used - limit > len(merge_above):
-            count_notes[repository_key] = "The run count exceeds the limit without enough exempt runs."
-            continue
         name = bound_rows.get(repository_key, "")
         if unresolved_policy or name not in rows or len(keys_by_row[name]) > 1:
             key_label = policy_label(repository_key)
@@ -1030,13 +1048,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             continue
         cell = rows[name].natedev
         cell.limit, cell.used = limit, used
+        cell.verify_used = verify_used
         cell.runs, cell.merge_above = runs, merge_above
 
-    for waiting in local_policy_waits:
-        if waiting.repository and not unresolved_policy:
-            cell = rows[waiting.repository].natedev
-            if cell.used is None and not cell.count_note:
-                cell.count_note = count_notes.get(waiting.reason.repository, "")
+    for key in sorted(gpu.repositories):
+        if name := bound_rows.get(key) or short_name(recorded_origin(key)) or policy_label(key):
+            row(name).natedev.gpu = Metric("gpu", gpu_used, gpu.slots)
 
     for name, item in rows.items():
         if name in keys_by_row and not unresolved_policy:
@@ -1045,13 +1062,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             unattributed += item.natedev.other_used
             item.natedev.other_used = 0
             item.natedev.other.clear()
-        for cell in (item.natedev, item.aws):
+        for cell in (item.natedev, item.mac, item.aws):
             if cell.policy is CellPolicy.NO_LIMIT:
                 cell.runs.extend(cell.other)
                 cell.used = cell.other_used
                 cell.other.clear()
                 cell.other_used = 0
-            if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
+            if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used or cell.gpu:
                 item.quiet = False
         if unattributed and item.natedev.policy is CellPolicy.NO_LIMIT:
             item.natedev.used = None
@@ -1069,13 +1086,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     memory_cap = room.cap / records.GIB if isinstance(room, records.MemoryRoom) and isinstance(room.cap, int) else None
     limits = [Metric("memory", memory_used, memory_cap, "GiB", waits=metric_waits.get("memory", {}),
                      unreadable=isinstance(room, records.ReadingUnavailable))]
-    gpu = explanation.policy.gpu_tests
-    if gpu.repositories or "gpu" in metric_waits:
-        gpu_used = sum(gpu_test_reservation(item, gpu) for item in inputs.reservations)
-        counts_agree = not gpu_wait_counts or gpu_wait_counts == {(gpu_used, gpu.slots)}
-        gpu_readable = bool(gpu.repositories) and counts_agree
-        limits.append(Metric("gpu", gpu_used if gpu_readable else None, gpu.slots if gpu_readable else None,
-                             waits=metric_waits.get("gpu", {})))
     disk = inputs.build_space
     disk_waits = metric_waits.get("disk", {})
     if isinstance(disk, records.BuildSpaceLow):

@@ -458,6 +458,7 @@ class MemoryFeedTests(unittest.TestCase):
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
         return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons()))
                 .replace('</head>', staff_names.script({}) + '</head>', 1))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:

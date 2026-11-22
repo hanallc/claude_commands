@@ -116,8 +116,9 @@ class BuildLimitsTests(unittest.TestCase):
             records.WaitingStep(2, "", "", "check", "", now, 0, records.BuildSpaceLow(20, 31)),
             records.WaitingStep(3, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(4, "", "", "check", "", now, 0, records.ReadingUnavailable(),
-                                route=target_config.PinnedTarget("fixture-aws")),
-            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadyForAdmission(), route=target_config.MAC_ONLY),
+                                project="hana", route=target_config.PinnedTarget("fixture-aws")),
+            records.WaitingStep(5, "", "", "check", "", now, 0, records.ReadyForAdmission(),
+                                project="project", route=target_config.MAC_ONLY),
             records.WaitingStep(8, "", "", "test", "", now, 0, records.NeedsMemory()),
             records.WaitingStep(10, "", "", "check", "", now, 0, records.ReadyForAdmission(),
                                 route=target_config.PinnedTarget("other-target")),
@@ -167,7 +168,8 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(quiet.natedev, limits_view.Cell(policy=limits_view.CellPolicy.NO_LIMIT))
         self.assertEqual(shown.natedev.unattributed, 1)
         self.assertEqual(shown.natedev.waits, {})
-        self.assertEqual(wait_names(shown.mac.waits), {"1 run can start at the queue's next check.": ["Mac wait"]})
+        self.assertEqual(shown.mac.waits, {})
+        self.assertEqual(wait_names(project_row.mac.waits), {"1 run can start at the queue's next check.": ["Mac wait"]})
         with self.subTest(origin="unresolved natedev run"):
             check_quiet: records.Reservation = {
                 **fixture_reservation(106, 0, step="check"), "repo": "quiet",
@@ -182,7 +184,7 @@ class BuildLimitsTests(unittest.TestCase):
                 decided_from=replace(explanation.decided_from, reservations=(*reservations, unbound_reservation)))))
         meters = {metric.label: (metric.used, metric.limit) for metric in unbound.natedev.shared}
         self.assertEqual(meters["Repository run limit"], (1, 2))
-        self.assertNotIn("unmatched run limit", meters)
+        self.assertEqual(meters["unmatched run limit"], (0, 1))
         self.assertEqual(wait_names(unbound.natedev.waits), {
             "1 run waits because the repository run limit is full.": ["Run limit"],
             "1 run waits because the run limit for unmatched on natedev is full.": ["Disk wait"],
@@ -194,7 +196,8 @@ class BuildLimitsTests(unittest.TestCase):
                          {"1 run waits because the build disk has less free space than the queue requires.": ["Disk wait"]})
         self.assertEqual(wait_names(shown.natedev.shared[0].waits),
                          {"1 run needs more free memory to start.": ["Memory wait", ""]})
-        self.assertEqual(wait_names(shown.aws.waits),
+        self.assertEqual(shown.aws.waits, {})
+        self.assertEqual(wait_names(hana_row.aws.waits),
                          {"1 run waits because the queue cannot check whether it can start.": ["AWS target wait"]})
         self.assertEqual(wait_names(shown.unplaced), {"1 run can start at the queue's next check.": ["Unplaced wait"]})
         self.assertEqual((shown.aws.shared[0].used, shown.aws.shared[0].limit,
@@ -230,26 +233,34 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
         self.assertEqual((merge_cell.used, merge_cell.other_used), (2, 1))
-        gpu = records.GpuTestSlots(1, frozenset({"gpu-project"}))
-        conflicting_wait = replace(within_limit,
+        gpu = records.GpuTestSlots(2, frozenset({"hana"}))
+        verify_wait = records.RunLimitWait(2, 2, "hana", "natedev")
+        gpu_runs: tuple[records.Reservation, ...] = tuple(
+            {**fixture_reservation(pid, 0, step="test"), "repo": "hana", "repo_identity": hana}
+            for pid in (107, 108))
+        with_verify = replace(within_limit,
             view=replace(queue.view, waiting=(
-                replace(waiting[0], reason=replace(matching, used=3)),
+                replace(waiting[0], folder="", reason=verify_wait, project="hana"),
                 waiting[1],
-                replace(waiting[2], reason=records.GpuSlotWait(1, 1)),
+                replace(waiting[2], reason=records.GpuSlotWait(2, 2)),
                 *waiting[3:],
             )),
-            explanation=replace(within_limit.explanation, policy=replace(within_limit.explanation.policy, gpu_tests=gpu)))
-        wait_limits = show(conflicting_wait)
-        wait_cell = next(row.natedev for row in wait_limits.repositories if row.name == "project")
-        self.assertEqual(wait_cell.waits, cell.waits)
-        self.assertIsNone(wait_cell.limit)
-        self.assertIsNone(wait_cell.used)
+            ordered=[],
+            explanation=replace(within_limit.explanation,
+                policy=replace(within_limit.explanation.policy, gpu_tests=gpu,
+                    repository_runs=records.RepositoryRunLimits({"natedev.hana": 2})),
+                decided_from=replace(within_limit.explanation.decided_from, reservations=gpu_runs,
+                    verify_run_counts={"hana": 2})))
+        wait_limits = show(with_verify)
+        wait_cell = next(row.natedev for row in wait_limits.repositories if row.name == "hana")
+        self.assertEqual((wait_cell.used, wait_cell.limit, wait_cell.verify_used), (2, 2, 2))
         self.assertEqual(wait_cell.runs, [])
-        self.assertEqual((wait_cell.other_used, wait_cell.other), (1, ["check-owner"]))
-        self.assertEqual(wait_cell.count_note, "The queue waits and the reservations disagree on the run count or limit.")
-        gpu_meter = next(metric for metric in wait_limits.natedev.shared if metric.label == "gpu")
-        self.assertEqual((gpu_meter.used, gpu_meter.limit, wait_names(gpu_meter.waits)),
-                         (None, None, {"1 run waits because all GPU test places are in use.": ["Memory wait"]}))
+        self.assertEqual(wait_names(wait_cell.waits), {
+            "1 run waits because the run limit for hana on natedev is full.": ["Run limit"],
+            "1 run waits because all GPU test places are in use.": ["Memory wait"],
+        })
+        self.assertEqual(wait_cell.gpu, limits_view.Metric("gpu", 2, 2))
+        self.assertTrue(all(metric.label != "gpu" for metric in wait_limits.natedev.shared))
         behind = records.BehindHead("fixture", now, "")
         self.check_page(show(replace(queue, view=replace(queue.view, waiting=(
             replace(waiting[2], reason=behind), replace(waiting[5], reason=behind), replace(waiting[4], reason=behind),
@@ -335,19 +346,20 @@ class BuildLimitsTests(unittest.TestCase):
                              (1, 1, ["Build name"]))
             self.assertEqual((mac_cells["cleanup"].used, mac_cells["cleanup"].runs), (1, []))
             self.assertEqual((mac_cells["quiet"].used, mac_cells["quiet"].limit), (0, 1))
-        for shown, total in ((keyless, 2), (unresolved, 3)):
-            with self.subTest(mac_claims=total):
-                self.assertEqual(shown.mac.unattributed, total)
-                self.assertIn("no verified repository origin", shown.mac.unattributed_note)
+        for shown, project_count in ((keyless, 1), (unresolved, 2)):
+            with self.subTest(mac_claims=project_count):
+                self.assertEqual(shown.mac.unattributed, 0)
                 self.assertEqual(shown.mac.waits, normal.mac.waits)
-                self.assertTrue(all(row.mac == limits_view.Cell() for row in shown.repositories))
-                self.assertNotIn("other", {row.name for row in shown.repositories})
+                mac_cells = {row.name: row.mac for row in shown.repositories}
+                self.assertEqual(mac_cells["project"].used, project_count)
+                self.assertEqual(mac_cells["cleanup"].used, 1)
+                self.assertNotIn("other", mac_cells)
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
         self.assertEqual(full_mac.mac.unattributed_note, "")
         self.assertTrue(all(row.mac.limit is None and row.mac.used != 0 for row in full_mac.repositories))
         self.assertEqual(sum(row.mac.used or 0 for row in full_mac.repositories), 2)
-        self.assertTrue(all(row.mac == limits_view.Cell() for row in bad_claims.repositories))
+        self.assertTrue(all(row.mac == limits_view.Cell(waits=row.mac.waits) for row in bad_claims.repositories))
         self.assertEqual(full_mac.mac.waits, bad_claims.mac.waits)
 
     def check_policy_evidence(self, queue: records.QueueRead, saved: limits_view.Background,
@@ -480,7 +492,8 @@ class BuildLimitsTests(unittest.TestCase):
                 third: records.Reservation = {**fixture_reservation(504, 0, step="gate"), "repo": "project",
                                               "repo_identity": primary}
                 without_exempt = show(first, conflicting, third)
-                self.assertNotIn("project run limit", [metric.label for metric in without_exempt.natedev.shared])
+                meter = next(metric for metric in without_exempt.natedev.shared if metric.label == "project run limit")
+                self.assertEqual((meter.used, meter.limit, meter.exempt_runs), (3, 2, 0))
                 with_exempt = show(first, conflicting, {**third, "unit": "merge-owner"})
                 meter = next(metric for metric in with_exempt.natedev.shared if metric.label == "project run limit")
                 self.assertEqual((meter.used, meter.limit, meter.exempt_runs), (3, 2, 1))
@@ -511,12 +524,15 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertEqual(row.findtext("th"), old_row.findtext("th"))
             self.assertEqual(["".join(cell.itertext()) for cell in old_row.findall("td")],
                              ["".join(row.findall("td")[index].itertext()) for index in (0, 2)])
-        for index, machine, count in ((1, "natedev", 2), (2, "mac", 1), (3, "aws", 1)):
-            badge = headings[index].find(f"div[@data-tip='limit:machine:{machine}']")
+        for selector, count in (
+            ("th/div[@data-tip='limit:machine:natedev']", 2),
+            ("td[@data-tip='limit:cell:mac:project']/span", 1),
+            ("td[@data-tip='limit:cell:aws:hana']/span", 1),
+        ):
+            badge = table.find(f".//{selector}/span[@data-wait-count='{count}']")
             assert badge is not None
-            self.assertEqual(badge.get("data-wait-count"), str(count))
-            self.assertEqual(badge.findtext("span[2]"), f"{count} waiting")
-            self.assertEqual(len(badge.findall("span/span[@class='build-limit-mark wait']")), count)
+            self.assertEqual(badge.findtext("span"), str(count))
+            self.assertIsNotNone(badge.find("{http://www.w3.org/2000/svg}svg[@class='lucide lucide-hourglass']"))
         self.assertNotIn("wait behind an earlier step", current)
         self.assertNotIn("Regular step", current)
         self.assertIsNone(table.find(".//tbody/tr/th/small"))
@@ -525,7 +541,7 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertNotIn("regular", current)
         quiet = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "quiet")
         cells = quiet.findall("td")
-        self.assertEqual(cells[0].findtext("span/span[@class='build-limit-note']"), "—")
+        self.assertIsNotNone(cells[0].find(".//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-infinity']"))
         self.assertEqual("".join(cells[1].itertext()), "")
         self.assertEqual("".join(cells[2].itertext()), "")
         self.assertIn("No limit", current)
@@ -642,8 +658,9 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertEqual(hidden.aws.shared[0].used, 2)
                 self.assertEqual(cell.limit, 1 if known_routes is routes else None)
                 rendered = test_memory_hover.MemoryHoverTests().page_expression(
-                    "limitCell(data.cell, data.words)",
+                    "limitCell(data.cell, data.words, 'aws')",
                     {"cell": snapshot_codec.snapshot_value(cell), "words": limits_view.PAGE_WORDS}, limits=True)
                 assert isinstance(rendered, str)
-                self.assertNotIn("build-limit-mark", rendered)
+                self.assertNotIn('class="build-limit-mark ', rendered)
+                self.assertNotIn("lucide-loader-circle", rendered)
                 self.assertNotIn("running", rendered)

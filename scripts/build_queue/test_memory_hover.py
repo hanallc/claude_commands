@@ -47,33 +47,39 @@ class MemoryHoverTests(unittest.TestCase):
         disk = limits_view.Metric("disk", 20, 31, "GiB", "minimum", waits)
         machine = limits_view.MachineLimits("In use", (disk,), waits)
         empty = limits_view.MachineLimits("", (), {})
-        mac = limits_view.MachineLimits("On", (), waits, 1, "A Mac claim has no verified repository origin.")
-        unknown = limits_view.Cell(waits=waits, count_note="The queue waits and the reservations disagree.")
+        mac = limits_view.MachineLimits("On", (), {}, 1, "A Mac claim has no repository name that this page can show.")
+        hana = limits_view.Cell(limit=2, used=2, gpu=limits_view.Metric("gpu", 0, 2), verify_used=2)
         section = limits_view.BuildLimits(machine, mac, empty,
             (limits_view.RepositoryRow("repo:example", natedev=cell),
-             limits_view.RepositoryRow("hana", natedev=unknown)), False, {})
+             limits_view.RepositoryRow("hana", natedev=hana, mac=limits_view.Cell(waits=waits))), False, {})
         keys = ("limit:cell:natedev:repo:example", "limit:machine:natedev", "limit:metric:natedev:disk",
-                "limit:cell:natedev:hana", "limit:machine:mac")
-        rendered, tooltip, heading, metric, unknown_tip, mac_tip = cast(list[str], self.page_expression("""(() => {
+                "limit:cell:natedev:hana", "limit:machine:mac", "limit:cell:mac:hana")
+        rendered, tooltip, heading, metric, hana_tip, mac_tip, mac_wait_tip = cast(list[str], self.page_expression("""(() => {
             renderBuildLimits(data.build_limits);
             return [$('build-limits-content').innerHTML, ...data.keys.map(key => pageTooltipHtml(key, data))];
         })()""", {"build_limits": snapshot_codec.snapshot_value(section), "keys": keys}, limits=True))
         table = ElementTree.fromstring(f"<root>{rendered}</root>")
         detail = table.find(f".//td[@data-tip='{keys[0]}']/span")
         assert detail is not None
-        self.assertEqual(detail.get("data-wait-count"), "2")
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-loader-circle", "lucide lucide-hourglass"])
         self.assertEqual([mark.get("class") for mark in detail.findall("span/span")],
-            [f"build-limit-mark {kind}" for kind in ("run", "free", "line", "wait", "wait")])
+                         ["build-limit-mark free", "build-limit-mark line", None])
         self.assertEqual(detail.findtext("span[2]"), "1 of 2")
         self.assertNotIn("Test two", rendered)
         self.assertNotIn("wait for space", rendered)
-        pending = table.find(f".//td[@data-tip='{keys[3]}']/span")
+        pending = table.find(f".//td[@data-tip='{keys[5]}']/span/span[@data-wait-count='2']")
         assert pending is not None
-        self.assertEqual(pending.findtext("span[2]"), "?")
-        self.assertEqual([mark.get("class") for mark in pending.findall("span/span")], ["build-limit-mark wait"] * 2)
-        self.assertIn("Count not known", rendered)
+        self.assertEqual(pending.findtext("span"), "2")
+        self.assertEqual([icon.get("class") for icon in pending.findall("{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-hourglass"])
+        gpu = table.find(f".//td[@data-tip='{keys[3]}']/span/span[@class='build-limit-chip build-limit-gpu']")
+        assert gpu is not None
+        self.assertEqual(gpu.findtext("span"), "0 of 2")
+        self.assertEqual(len(table.findall(".//tbody//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']")), 1)
+        self.assertIsNone(table.find(".//thead//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']"))
         self.assertIsNotNone(table.find(".//th[@data-tip='limit:machine:mac']"))
-        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, unknown_tip, mac_tip)]
+        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, mac_wait_tip)]
         for column in columns:
             assert column is not None
             self.assertIn("Waiting", [row.text for row in column.findall("dt")])
@@ -82,8 +88,9 @@ class MemoryHoverTests(unittest.TestCase):
             self.assertIn("2 runs wait for space.", [row.text for row in column.findall("dd")])
         self.assertIn("Build &lt;one&gt;", tooltip)
         self.assertNotIn("Build &lt;one&gt;", rendered)
-        self.assertIn("The queue waits and the reservations disagree.", unknown_tip)
-        self.assertIn("A Mac claim has no verified repository origin.", mac_tip)
+        self.assertIn("Verify runs", hana_tip)
+        self.assertIn("The GPU limit applies to tests for this repository on natedev.", hana_tip)
+        self.assertIn("A Mac claim has no repository name that this page can show.", mac_tip)
 
     def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
@@ -1012,6 +1019,7 @@ process.stdout.write(JSON.stringify(steps));
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
         if limits:
             functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
+            constants += f"const buildLimitIcons = {json.dumps(memory_feed.build_limit_icons())};\n"
         if walk or limits:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """

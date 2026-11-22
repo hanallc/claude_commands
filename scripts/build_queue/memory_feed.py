@@ -87,6 +87,8 @@ FUNCTION_IMPORT_MODULES = (
     "scripts.production.change_routing", "scripts.mac_test.offload",
     "scripts.build_hold.build_hold", "scripts.mac_test.mac_test",
 )
+BUILD_LIMIT_ICONS = {"run": "loader-circle", "wait": "hourglass", "merge": "git-merge",
+                     "unlimited": "infinity", "gpu": "microchip"}
 
 
 def feed_code_paths() -> tuple[str, ...]:
@@ -99,6 +101,7 @@ def feed_code_paths() -> tuple[str, ...]:
 
     paths.update((*STARTUP_FILES, "scripts/build_queue/memory_live.html", "scripts/direct/verify.sh",
                   "config/memory_feed.conf"))
+    paths.update(f"scripts/review_links/lucide/{icon}.svg" for icon in BUILD_LIMIT_ICONS.values())
     for module in tuple(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if isinstance(source, str) and source.endswith(".py"):
@@ -256,11 +259,16 @@ def page_link() -> int:
     return 0
 
 
+def build_limit_icons() -> dict[str, str]:
+    return {kind: page_frame.icon_svg(icon) for kind, icon in BUILD_LIMIT_ICONS.items()}
+
+
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
     source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
     page = page_frame.template(source, "Builds", "builds").replace(
         "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+    page = page.replace("__BUILD_LIMIT_ICONS__", json.dumps(build_limit_icons()))
     page = page.replace('</head>', staff_names.script({}) + '</head>', 1)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
