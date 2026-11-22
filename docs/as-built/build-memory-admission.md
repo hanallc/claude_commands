@@ -528,11 +528,11 @@ The Mac claim count uses `build_slots.configured_maximum` to read the repository
 The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
 Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
 The Mac resolves the repository before it takes the claim lock.
-The key follows local clone origins to the upstream repository.
+The key follows local clone origins to the upstream repository. Git alternates supply objects only.
 Each claim saves its key, claim file, mirror name, and start fence directory.
 The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
-The runner, release, and cleanup use the saved identity. Handoff retains the reservation file and its start fence.
-A legacy Mac claim with no key blocks all repositories. Recovery can take the exact claim for cleanup.
+The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
+A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
 If a legacy claim has no saved mirror, cleanup checks for remaining mirror work without stopping any processes.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.

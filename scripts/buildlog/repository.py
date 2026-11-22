@@ -95,11 +95,6 @@ def mac_source_repository(common: str) -> tuple[str, str]:
     """Read the source Git folder and its origin through local clone links."""
     seen = {common}
     while True:
-        borrowed = borrowed_git_dir(common)
-        if borrowed is not None and borrowed not in seen:
-            common = borrowed
-            seen.add(common)
-            continue
         result = subprocess.run(["git", "-C", os.path.dirname(common), f"--git-dir={common}", "remote", "get-url", "origin"],
                                 capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
         if result.returncode == 2:

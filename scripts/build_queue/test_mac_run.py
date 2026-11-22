@@ -13,6 +13,7 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import execution_identity, mac_run, placement
+from scripts.build_queue import admission_wire as wire
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.buildlog import repository
 from scripts.build_targets import build_targets, target_config
@@ -276,6 +277,20 @@ class MacRunTests(unittest.TestCase):
                 self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
             self.fail("The clone exceeded the repository limit")
 
+    def test_mac_origin_takes_precedence_over_borrowed_objects(self) -> None:
+        other = self.root / "other"
+        _ = subprocess.run(["git", "clone", "-q", "--reference", str(self.repo),
+                            str(self.repo), str(other)], check=True)
+        self.assertEqual(repository.borrowed_git_dir(str(other / ".git")), str(self.repo / ".git"))
+        origin = "https://example.invalid/team/other.git"
+        _ = subprocess.run(["git", "-C", str(other), "remote", "set-url", "origin", origin], check=True)
+        _ = subprocess.run(["git", "-C", str(self.checkout), "remote", "set-url", "origin", "../other"], check=True)
+        for checkout in (other, self.checkout):
+            with self.subTest(checkout=checkout):
+                saved = claim_state.mac_repository_identity(str(checkout))
+                assert isinstance(saved, claim_state.MacRepositoryIdentity)
+                self.assertEqual((saved.key, saved.mirror_name), (origin.removesuffix(".git"), "other"))
+
     def test_separate_origins_with_one_base_name_get_separate_claim_files(self) -> None:
         for team in ("team-a", "team-b"):
             repo = self.repository(team)
@@ -295,28 +310,57 @@ class MacRunTests(unittest.TestCase):
         assert isinstance(start, process_identity.Started)
         path = self.paths.claims / "checkout.json"
         path.parent.mkdir(parents=True)
-        mac_test.write_json(path, {"pid": os.getpid(), "proc_start": "ended", "what": "old check",
-            "worktree": str(self.checkout), "since": "2026-11-21T10:00:00+00:00",
-            "claim_id": "old", "episode": "old-episode", "attempt": "old-attempt", "submitting_session": "",
-            "remote_host": "fixture-mac", "repo_name": "checkout"})
-        other = self.native_claim(self.repo)
-        other.remote = "fixture-mac"
-        self.assertEqual(mac_test.command_claim(other, self.paths, watch_claim=False), 11)
-        self.assertEqual(phase_wait_holder.mac_owner("mac", str(self.repo)),
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            checkout = Path(folder)
+            _ = subprocess.run(["git", "init", "-q", folder], check=True)
+            mac_test.write_json(path, {"pid": os.getpid(), "proc_start": "ended", "what": "old check",
+                "worktree": folder, "since": "2026-11-21T10:00:00+00:00",
+                "claim_id": "old", "episode": "old-episode", "attempt": "old-attempt", "submitting_session": "",
+                "remote_host": "fixture-mac", "repo_name": "checkout"})
+        self.assertFalse(checkout.exists())
+        other = self.repository("unrelated")
+        waiting = self.native_claim(other)
+        with mock.patch.object(process_identity, "process_start", return_value=process_identity.Unreadable("fixture")):
+            self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 11)
+        self.assertEqual(phase_wait_holder.mac_owner("mac", str(other)),
                          ("--holder-unit", "old check (kept for cleanup)"))
-        waiting = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 13)
         saved, = claim_state.read_claims(self.paths)
         self.assertEqual(saved.path, path)
         self.assertEqual(saved.scope, claim_state.WHOLE_MAC)
         self.assertEqual(saved.record["proc_start"], start.start)
         self.assertEqual(saved.record["claim_id"], "old")
-        runner = self.native_claim(self.checkout)
+        self.assertEqual(build_targets.wait_claim_identity(self.paths, str(other), waiting.pid, session=NoOwningSession()),
+                         claim_state.claim_identity(saved.record))
+        assignments = self.root / "assignment.json"
+        assignment = placement.PlacementAssignment("new-episode", "new-attempt",
+            placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.target_claim_scope(self.paths, str(other))),
+            execution_identity.SourceKeyUnavailable("The fixture has no source key"),
+            placement.SubmittingOwner("fixture-host", waiting.pid, start.start), NoOwningSession(), 0)
+        _ = assignments.write_text(wire.encode_reply(wire.Assignment(assignment)))
+        reservation = build_targets.CliArguments()
+        reservation.pid, reservation.repo_root = waiting.pid, str(other)
+        reservation.assignment_file = str(assignments)
+        reservation.reservation_file = str(self.root / "reservation")
+        identity_file = self.root / "reservation.identity"
+        reservation.claim_identity_file = str(identity_file)
+        reservation.recover_only = True
+        self.assertEqual(build_targets.reserve_assigned(reservation), 13)
+        self.assertEqual(identity_file.read_text(), "old\told-episode\told-attempt\t\n")
+        runner = self.native_claim(other)
         runner.remote, runner.from_pid = "fixture-mac", waiting.pid
         runner.claim_id, runner.episode, runner.attempt = "old", "old-episode", "old-attempt"
         with mock.patch.object(repository, "mac_source_repository", side_effect=AssertionError("No Git on handoff")):
             self.assertEqual(mac_test.command_claim(runner, self.paths, watch_claim=False), 13)
-        self.assertEqual(mac_test.command_release(runner, self.paths), 0)
+        args = build_targets.CliArguments()
+        args.pid, args.repo_root = runner.pid, str(other)
+        target = target_config.SshTarget("mac", "macos", self.root / "mac_test.conf")
+        connection = eligibility.SshConnectionSettings("fixture-mac", 1, 1)
+        with mock.patch.object(eligibility, "read_connection_settings", return_value=connection), \
+                mock.patch.object(offload, "check_leftovers", return_value=offload.LeftoversEnded()) as check:
+            build_targets.cleanup_refused_claims(target, args, session=NoOwningSession())
+        check.assert_called_once_with(connection, "fixture-mac", offload.ALL_MIRRORS, "mac", 1)
+        self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_offload_adoption_uses_the_reservation_file_for_its_fence(self) -> None:
         saved = claim_state.mac_repository_identity(str(self.checkout))

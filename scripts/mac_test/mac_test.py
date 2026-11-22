@@ -673,6 +673,14 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
 
 
+def recoverable_kept_claim(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
+    """Require proof that the saved owner of the remote claim ended."""
+    if "remote_host" not in run:
+        return False
+    owner = process_identity.process_start(run["pid"])
+    return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(run["proc_start"])
+
+
 def run_holds_work(run: RunRecord) -> bool:
     """Report running work without counting claims kept for cleanup."""
     return run_is_live(run) and not run_is_kept(run)
@@ -728,7 +736,15 @@ def claim_scope_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) 
     return isinstance(scope, WholeMacScope) and claim.path == paths.run and claim.scope == scope
 
 
-def cleanup_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, worktree: Path) -> bool:
+def cleanup_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
+    """Match a cleanup scope, including a keyless Mac claim from any repository."""
+    return claim_scope_matches(paths, claim, scope) or (paths.platform == "macos" and not claim.record.get("repo_key"))
+
+
+def wait_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, worktree: Path) -> bool:
+    """Match a reservation before verifying its exact owner."""
+    if paths.platform == "macos" and claim.record.get("cleanup_pending") and cleanup_claim_matches(paths, claim, scope):
+        return True
     if claim_scope_matches(paths, claim, scope):
         return True
     if paths.platform != "macos" or not isinstance(claim.scope, WholeMacScope):
@@ -740,11 +756,6 @@ def cleanup_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope
     return ("remote_host" in claim.record and isinstance(scope, RepositoryScope)
             and claim.path.name == f"{quote(scope.name, safe='')}.json"
             and claim.record.get("repo_name", scope.name) == scope.name)
-
-
-def wait_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, worktree: Path) -> bool:
-    """Match a reservation before verifying its exact owner."""
-    return cleanup_claim_matches(paths, claim, scope, worktree)
 
 
 def claim_blocks_scope(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
@@ -2014,7 +2025,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
-            if cleanup_claim_matches(paths, claim, scope, Path(args.worktree)) and run_is_kept(record):
+            if cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(record):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -2113,7 +2124,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         (WaitClaimCheck.OWNER_START, lambda claim:
             process_identity.process_start(args.from_pid) == process_identity.Started(claim.record["proc_start"])),
         (WaitClaimCheck.WORKTREE, lambda claim: (claim.record.get("cleanup_pending") is True
-            and cleanup_claim_matches(paths, claim, scope, worktree))
+            and wait_claim_matches(paths, claim, scope, worktree))
             or recorded_worktree_matches(claim.record["worktree"], worktree)),
     )
     for check, matches in checks:
@@ -2431,8 +2442,8 @@ def free_now(
         except (OSError, ConfigError):
             return "state"
         active = tuple(claim for claim in claims if run_is_live(claim.record)
-                       and (guest or not ((run_is_kept(claim.record)
-                                          and cleanup_claim_matches(paths, claim, scope, repo_root.resolve()))
+                       and (guest or not ((cleanup_claim_matches(paths, claim, scope)
+                                          and recoverable_kept_claim(claim.record))
                                          or (not copy and claim_scope_matches(paths, claim, scope)
                                              and copy_gives_way(claim.record)))))
         held = isinstance(mac_claim_slot(paths, scope, active, capacity, kind=mac_kind,
@@ -2444,7 +2455,7 @@ def free_now(
         ) for candidate in scopes)
     else:
         held = any(run_is_live(claim.record)
-                   and not (run_is_kept(claim.record) and cleanup_claim_matches(paths, claim, scope, repo_root.resolve()))
+                   and not (cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(claim.record))
                    for claim in claims)
     if held:
         return "busy"

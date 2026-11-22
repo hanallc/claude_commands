@@ -947,12 +947,11 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     start = process_identity.process_start(args.pid)
     if not isinstance(start, process_identity.Started):
         return
-    worktree = Path(args.repo_root).resolve()
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
-                       if mac_test.cleanup_claim_matches(paths, claim, scope, worktree)
+                       if mac_test.cleanup_claim_matches(paths, claim, scope)
                        and "remote_host" in claim.record
-                       and (mac_test.run_is_kept(claim.record)
+                       and (mac_test.recoverable_kept_claim(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
     if not claims:
@@ -1050,7 +1049,9 @@ def reserve_assigned(args: CliArguments) -> int:
                     return 78
                 scope = assignment.destination.scope
                 matches = [held for held in mac_test.read_claims(paths)
-                    if (held.matches_mac_assignment_scope(scope) if paths.platform == "macos" else held.scope == scope)
+                    if ((held.matches_mac_assignment_scope(scope) or (held.record.get("cleanup_pending")
+                            and mac_test.cleanup_claim_matches(paths, held, scope)))
+                        if paths.platform == "macos" else held.scope == scope)
                     and held.record["pid"] == args.pid
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
@@ -1141,10 +1142,9 @@ def command_reserve(args: CliArguments) -> int:
             return 0
         if args.recover_only:
             scope = mac_test.target_claim_scope(paths, args.repo_root)
-            worktree = Path(args.repo_root).resolve()
             with mac_test.locked(paths.lock):
-                retained = any(mac_test.cleanup_claim_matches(paths, claim, scope, worktree)
-                               and mac_test.run_is_kept(claim.record)
+                retained = any(mac_test.cleanup_claim_matches(paths, claim, scope)
+                               and mac_test.recoverable_kept_claim(claim.record)
                                for claim in mac_test.read_claims(paths))
             if not retained:
                 busy_mac = busy_mac or target.platform == "macos"
