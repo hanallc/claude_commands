@@ -8,6 +8,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
+from scripts.lib import conf
 
 
 class VerifyLintScopeTests(VerifyLintJudgmentFixture):
@@ -29,7 +30,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
             self.assertEqual(len(requests), 1)
             repository = requests.pop().repository
             config = self.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.{repository}=0\n")
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.{repository}=0\n")
 
             result = self.verify("lint", "sample")
             self.assertIn("PASS (recorded)", result.stdout)

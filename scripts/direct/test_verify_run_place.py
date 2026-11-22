@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.production import staff
@@ -123,7 +124,7 @@ fi
         """Write a run limit of one with the exempt unit the reader requires."""
         config = fixture.root / "build_admission.conf"
         _ = config.write_text(config.read_text()
-            + f"\nmax_runs.{fixture.server.host}.repository=1\nmax_runs.exempt_unit=natemerge\n")
+            + f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.repository=1\nmax_runs.exempt_unit=natemerge\n")
 
     def test_verify_requests_a_slot_with_its_own_process_identity(self) -> None:
         with AdmissionFixture() as fixture:
