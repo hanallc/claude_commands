@@ -891,6 +891,9 @@ def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             if command_release(release, paths, provider_lock_held=True) != 0:
                 live.append(claim)
         else:
+            if "wait_released" in claim.record:
+                proof = claim_state.retired_mac_reservation_path(paths, claim_state.claim_identity(claim.record))
+                proof.unlink(missing_ok=True)
             claim.path.unlink(missing_ok=True)
     return tuple(live)
 

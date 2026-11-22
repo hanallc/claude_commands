@@ -1252,6 +1252,7 @@ def command_release_wait(pid: int, *,
             continue
         paths = claim_state.state_paths(target.name)
         fenced: list[claim_state.ProcessBoundClaim] = []
+        removable: list[Path] = []
         with claim_state.locked(paths.lock):
             release_start = start.start if isinstance(start, process_identity.Started) else None
             permission: claim_state.RetiredMacReservation | claim_state.NoSavedRetryPermission
@@ -1267,18 +1268,25 @@ def command_release_wait(pid: int, *,
                         release_start = retired.proc_start
                         reservation = retired.reservation
                 if release_start is not None or (paths.platform == "macos" and isinstance(start, process_identity.Unreadable)):
-                    for path, record in claim_state.read_wait_reservations(paths, identity, reservation):
+                    for path, record, values in claim_state.read_wait_reservations(paths, identity, reservation):
                         if record["pid"] != pid or record["submitting_session"] != session_id:
                             continue
+                        if release_start is not None and record["proc_start"] != release_start:
+                            continue
+                        # A sweep must not restore permission after release removes it.
+                        if ((release_start is None or isinstance(permission, claim_state.RetiredMacReservation))
+                                and "wait_released" not in record):
+                            claim_state.mark_wait_released(path, values)
                         if release_start is None:
-                            claim_state.mark_wait_released(path)
-                        elif record["proc_start"] == release_start:
-                            if claim_state.claim_pending_start(paths, path, record).exists():
-                                fenced.append(record)
-                            else:
-                                path.unlink(missing_ok=True)
+                            continue
+                        if claim_state.claim_pending_start(paths, path, record).exists():
+                            fenced.append(record)
+                        else:
+                            removable.append(path)
                 if isinstance(permission, claim_state.RetiredMacReservation):
                     permission.path.unlink(missing_ok=True)
+                for path in removable:
+                    path.unlink(missing_ok=True)
             except (claim_state.StateReadError, OSError) as error:
                 print(str(error), file=sys.stderr)
                 return 1

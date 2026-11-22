@@ -593,7 +593,9 @@ def retire_replaced_reservation(paths: StatePaths, replacement: Path, record: Ru
             or replaced_reservation(old, path, paths) != replaced):
         return ()
     try:
-        if allow_retry and "wait_released" not in old:
+        if "wait_released" in old:
+            retired_mac_reservation_path(paths, claim_identity(old)).unlink(missing_ok=True)
+        elif allow_retry:
             proof = retired_mac_reservation_path(paths, claim_identity(old))
             proof.parent.mkdir(parents=True, exist_ok=True)
             # Keep the reservation identity if the writer stops before the replacement commits.
@@ -900,29 +902,40 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
 
 def read_wait_reservations(
     paths: StatePaths, identity: ClaimIdentity, reservation: Path | UnrecordedReservationPath,
-) -> Generator[tuple[Path, ProcessBoundClaim], None, None]:
+) -> Generator[tuple[Path, ProcessBoundClaim, dict[str, object]], None, None]:
     """Read the exact local reservation for release."""
+    expected = (identity.claim_id, identity.episode, identity.attempt)
+    unreadable: StateReadError | None = None
+    found = False
     for path in (reservation,) if isinstance(reservation, Path) else claim_files(paths):
         try:
             values = read_json_object(path)
-        except StateReadError:
+            if values is None or "remote_host" in values:
+                continue
+            fields = (values.get("claim_id"), values.get("episode"), values.get("attempt"))
+            if fields != expected:
+                if paths.platform == "macos" and not any(
+                    isinstance(value, str) and value and value != name for value, name in zip(fields, expected)
+                ):
+                    raise StateReadError(f"{path} has an incomplete reservation identity")
+                continue
+        except StateReadError as error:
             if isinstance(reservation, Path):
                 raise
-            continue
-        if (values is None or "remote_host" in values
-                or (values.get("claim_id"), values.get("episode"), values.get("attempt"))
-                != (identity.claim_id, identity.episode, identity.attempt)):
+            if unreadable is None:
+                unreadable = error
             continue
         record = decode_run(values, path)
         assert "remote_host" not in record
-        yield path, record
+        found = True
+        yield path, record, values
+    if paths.platform == "macos" and not found and unreadable is not None:
+        raise unreadable
 
 
-def mark_wait_released(path: Path) -> None:
+def mark_wait_released(path: Path, values: dict[str, object]) -> None:
     """Record release of the exact local reservation under the provider lock."""
-    values = read_json_object(path)
-    if values is not None:
-        write_text_atomic(path, json.dumps({**values, "wait_released": True}) + "\n")
+    write_text_atomic(path, json.dumps({**values, "wait_released": True}) + "\n")
 
 
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:

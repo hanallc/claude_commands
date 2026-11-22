@@ -798,6 +798,12 @@ sys.exit(71)
     def test_release_wait_prevents_retry_after_a_stop_before_permission(self) -> None:
         self.exercise_interrupted_replacement(("release-before-permission",))
 
+    def test_interrupted_release_wait_cannot_restore_retry_permission(self) -> None:
+        self.exercise_interrupted_replacement(("release-before-proof-removal", "release-before-claim-removal"))
+
+    def test_release_wait_reports_its_damaged_reservation_without_a_proof(self) -> None:
+        self.exercise_interrupted_replacement(("release-damaged-before-permission",))
+
     def test_release_wait_revokes_a_retry_with_an_unrelated_damaged_claim(self) -> None:
         self.exercise_interrupted_replacement(("release-with-damaged-claim",))
 
@@ -828,6 +834,8 @@ from pathlib import Path
 import sys
 from unittest.mock import patch
 
+from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_targets import build_targets
 from scripts.mac_test import claim_state, mac_test
 
 checkpoint = sys.argv[1]
@@ -842,6 +850,10 @@ write_json = mac_test.write_json
 def interrupt_unlink(self, *args, **kwargs):
     if checkpoint in ("retire", "legacy-launched") and self == old:
         os._exit(71)
+    if checkpoint == "release-before-claim-removal" and self == old:
+        os._exit(75)
+    if checkpoint == "release-before-proof-removal" and self.parent == paths.retired_reservations:
+        os._exit(75)
     return unlink(self, *args, **kwargs)
 
 def interrupt_write(path, record):
@@ -855,6 +867,9 @@ def interrupt_write(path, record):
         os._exit(73)
 
 with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "write_json", interrupt_write):
+    if checkpoint in ("release-before-proof-removal", "release-before-claim-removal"):
+        identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
+        sys.exit(build_targets.command_release_wait(args.from_pid, identity=identity, session=NoOwningSession()))
     if checkpoint == "lost-reply":
         with redirect_stdout(StringIO()):
             sys.exit(mac_test.command_claim(args, paths, watch_claim=False, session=args.session))
@@ -897,8 +912,9 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     "verify", "", target="mac", placement=route,
                     admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
                 command = offload.claim_arguments(request, config, retire_wait=True, mac_repository=saved)
-                checkpoint = (recovery if recovery in ("committed", "legacy-launched", "release-before-permission")
-                              else "retire")
+                before_permission = recovery in ("release-before-permission", "release-damaged-before-permission")
+                checkpoint = ("release-before-permission" if before_permission
+                              else recovery if recovery in ("committed", "legacy-launched") else "retire")
                 child = subprocess.run([sys.executable, "-c", script, checkpoint, str(old_path), *command[2:]],
                                        capture_output=True, text=True, timeout=5)
                 if recovery == "committed":
@@ -911,17 +927,27 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                     self.assertTrue(mac_test.recoverable_kept_claim(completed.record))
                     self.check_committed_replacement_retry(request, assignment, config, completed, script)
                     continue
-                expected_exit = 74 if recovery == "release-before-permission" else 71
+                expected_exit = 74 if before_permission else 71
                 self.assertEqual(child.returncode, expected_exit, child.stdout + child.stderr)
                 self.assertTrue(old_path.exists())
                 abandoned, = (claim for claim in claim_state.read_claims(self.paths) if claim.path != old_path)
                 self.assertIn("replaced_reservation", abandoned.record)
-                if recovery == "release-before-permission":
+                if before_permission:
                     proof = claim_state.retired_mac_reservation_path(self.paths, identity)
                     self.assertFalse(proof.exists())
                     self.assertFalse(claim_state.claim_pending_start(self.paths, abandoned.path, abandoned.record).exists())
                     unreadable = process_identity.Unreadable("fixture")
                     with mock.patch.object(process_identity, "process_start", return_value=unreadable):
+                        if recovery == "release-damaged-before-permission":
+                            original = old_path.read_bytes()
+                            for damage in (b"{", b"{}"):
+                                with self.subTest(damage=damage), redirect_stderr(StringIO()) as diagnostic:
+                                    _ = old_path.write_bytes(damage)
+                                    self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 1)
+                                    self.assertIn(str(old_path), diagnostic.getvalue())
+                                    self.assertEqual(old_path.read_bytes(), damage)
+                                    self.assertFalse(proof.exists())
+                            _ = old_path.write_bytes(original)
                         with mock.patch.object(claim_state, "submitting_session", return_value=OwningSession("other")):
                             self.assertEqual(build_targets.command_release_wait(waiting.pid, identity=identity), 0)
                         self.assertEqual(claim_state.read_run(old_path), reserved.record)
@@ -935,6 +961,21 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(mac_test, "wri
                                            capture_output=True, text=True, timeout=5)
                     self.assertEqual(child.returncode, 12, child.stdout + child.stderr)
                     self.assertIn("no reservation", child.stderr)
+                    self.assertEqual(claim_state.read_claims(self.paths), ())
+                    continue
+                if recovery in ("release-before-proof-removal", "release-before-claim-removal"):
+                    proof = claim_state.retired_mac_reservation_path(self.paths, identity)
+                    self.assertTrue(proof.exists())
+                    child = subprocess.run([sys.executable, "-c", script, recovery, str(old_path), *command[2:]],
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(child.returncode, 75, child.stdout + child.stderr)
+                    self.assertTrue(old_path.exists())
+                    self.assertEqual(proof.exists(), recovery == "release-before-proof-removal")
+                    child = subprocess.run([sys.executable, "-c", script, "none", str(old_path), *command[2:]],
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(child.returncode, 12, child.stdout + child.stderr)
+                    self.assertIn("no reservation", child.stderr)
+                    self.assertFalse(proof.exists())
                     self.assertEqual(claim_state.read_claims(self.paths), ())
                     continue
                 if recovery == "unlink-error":
