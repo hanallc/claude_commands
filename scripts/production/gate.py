@@ -1440,10 +1440,11 @@ class PassedTreeLedger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
                 if os.write(ledger.fileno(), line) != len(line):
                     raise OSError("incomplete test pass write")
-            if isinstance(passed.required, FullSuite):
-                (gate_state_dir() / "full-required").unlink(missing_ok=True)
         except (OSError, ValueError) as error:
             self.report_error(error)
+        else:
+            if isinstance(passed.required, FullSuite):
+                (gate_state_dir() / "full-required").unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
