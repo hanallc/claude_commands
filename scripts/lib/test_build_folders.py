@@ -2525,6 +2525,19 @@ os._exit(0)
             self.assertEqual(path, leftover)
             self.assertEqual(list(path.iterdir()), [])
 
+    def test_reclaim_keeps_folders_with_gate_recovery_records(self) -> None:
+        ended = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True)
+        for tool, record in ((folders.GATE_RECOVERY_TOOL, "run.json"), ("gate-module", folders.RECOVERY_MARKER)):
+            with self.subTest(tool=tool):
+                spec = folders.BuildFolderSpec(kind="tool", parent=self.root, purpose=tool, suffix_length=0,
+                                               owner_pid=int(ended.stdout))
+                with folders.leased_build_folder(spec) as leftover:
+                    _ = (leftover / record).write_text("pending recovery")
+                with folders.tool_folder(tool) as path:
+                    self.assertNotEqual(path, leftover)
+                folders.sweep_temporary_build_folders(self.root, wait=False)
+                self.assertEqual((leftover / record).read_text(), "pending recovery")
+
     def test_a_free_folder_whose_owner_runs_is_passed_over(self) -> None:
         made = self.command("tool", "--tool", "verify", "--owner-pid", str(os.getpid()))
         self.assertEqual(made.returncode, 0, made.stderr)

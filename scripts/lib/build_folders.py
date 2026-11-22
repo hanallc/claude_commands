@@ -42,6 +42,10 @@ MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
 BUSY = ".claude-busy"
+RECOVERY_MARKER = ".build-folder-recovery"
+QUEUE_PROGRAM_SIDECAR = "program.cgroup"
+GATE_RECOVERY_TOOL = "gate-recovery"
+_GATE_RECOVERY_FOLDER = re.compile(re.escape(GATE_RECOVERY_TOOL) + r"(?:-(?:[0-9]+|[a-z0-9_]{8}))?")
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
 
@@ -51,19 +55,24 @@ def removal_mark(path: Path) -> Path:
     return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
 
 
-def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
-    """Return a descriptor for a regular busy mark. The caller closes it."""
+def _open_regular_file(path: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Open a regular file without following links or blocking on a FIFO."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if create:
         flags |= os.O_CREAT | (os.O_EXCL if exclusive else 0)
-    descriptor = os.open(mark, flags, 0o600)
+    descriptor = os.open(path, flags, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise OSError(errno.EINVAL, "busy mark must be a regular file", str(mark))
+            raise OSError(errno.EINVAL, "expected a regular file", str(path))
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Return a descriptor for a regular busy mark. The caller closes it."""
+    return _open_regular_file(mark, create=create, exclusive=exclusive)
 
 
 def require_no_removal_mark(path: Path) -> None:
@@ -199,9 +208,14 @@ def inherited_temporary_parent() -> Path:
     return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
 
 
+def tmpfs_gate_root() -> Path:
+    """Get the configured root for gate folders."""
+    return Path(_settings().text("roots.gate"))
+
+
 def tmpfs_temporary_parent() -> Path:
     """Keep nested work under the caller's tmpfs folder."""
-    root = Path(_settings().text("roots.gate"))
+    root = tmpfs_gate_root()
     inherited = inherited_temporary_parent().resolve()
     return inherited if inherited.is_relative_to(root) else root
 
@@ -1295,6 +1309,7 @@ class _TemporaryFolderRequest:
     """The temporary folder request retains its cleanup stack."""
     request: UniqueBuildFolder | BuildFolderSpec
     cleanup: ExitStack
+    keep: Callable[[], bool] | None
 
 
 def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> BuildFolderSpec:
@@ -1503,7 +1518,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
-                                                     descriptor=descriptor, temporary=not stable)
+                                                     descriptor=descriptor, temporary=not stable, keep=request.keep)
                     return path
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
@@ -1712,6 +1727,76 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
+def gate_recovery_folder(name: str) -> bool:
+    return _GATE_RECOVERY_FOLDER.fullmatch(name) is not None
+
+
+def program_starts() -> Path:
+    """Locate program recovery records under the build log root."""
+    override = os.environ.get("BUILDLOG_DIR")
+    root = Path(override) if override else Path.home() / ".local/state/buildlog"
+    return root / "program-starts"
+
+
+def read_program_record(path: Path) -> str:
+    """Read a regular program recovery record."""
+    with os.fdopen(_open_regular_file(path, create=False), encoding="utf-8") as record:
+        return record.read()
+
+
+def _legacy_program_recovery_pending() -> bool:
+    """Keep queue sidecars when a scoped record cannot identify its sidecar."""
+    records = program_starts()
+    try:
+        entries = os.listdir(records)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        try:
+            record = cast(object, json.loads(read_program_record(records / name)))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, RecursionError):
+            return True
+        if not isinstance(record, dict):
+            return True
+        fields = cast(dict[str, object], record)
+        scope, sidecar = fields.get("scope"), fields.get("sidecar", "")
+        if not isinstance(scope, str) or not isinstance(sidecar, str) or (scope and not sidecar):
+            return True
+    return False
+
+
+def _recovery_marker_present(directory: int) -> bool:
+    """A linked marker keeps the folder while its recovery record exists."""
+    try:
+        _ = os.stat(RECOVERY_MARKER, dir_fd=directory)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _folder_needs_recovery(folder: str, directory: int) -> bool:
+    return (_recovery_marker_present(directory)
+            or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), directory))
+            or (_folder_exists(Path(QUEUE_PROGRAM_SIDECAR), directory) and _legacy_program_recovery_pending()))
+
+
+def _recovery_record_present(folder: str, directory: int) -> bool:
+    try:
+        descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    try:
+        return _folder_needs_recovery(folder, descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
                        probe_fds: list[int] | None = None) -> RefusedRemovalLease | None:
     """Hold every lease lock below the path. Return a refusal if a lock prevents removal."""
@@ -1720,6 +1805,11 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
+        folder = Path(top).name
+        has_record = (RECOVERY_MARKER in files or QUEUE_PROGRAM_SIDECAR in files
+                      or ("run.json" in files and gate_recovery_folder(folder)))
+        if has_record and _folder_needs_recovery(folder, directory):
+            return RefusedRemovalLease()
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
@@ -1747,7 +1837,9 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                 if isinstance(lease, HeldFolderRemovalLease):
                     probe_fds.append(lease.descriptor)
             if not isinstance(lease, RefusedRemovalLease):
-                if metadata is not None:
+                if _recovery_record_present(folder.name, directory):
+                    lease = RefusedRemovalLease()
+                elif metadata is not None:
                     lease = UnreservedRemovalFolder()
                 elif children:
                     with suppress(FileNotFoundError):
@@ -1916,10 +2008,12 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
-                      descriptor: int, temporary: bool) -> None:
+                      descriptor: int, temporary: bool, keep: Callable[[], bool] | None) -> None:
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
+    if keep is not None and keep():
+        return
     _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
                             temporary=temporary, dir_fd=directory)
 
@@ -1932,9 +2026,9 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
         except FileNotFoundError:
             return True
         with ExitStack() as children:
-            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
             try:
-                if _hold_child_leases(path, children, wait=wait) is not None:
+                if (_recovery_record_present(path.name, directory)
+                        or _hold_child_leases(path, children, wait=wait) is not None):
                     return False
             except OSError:
                 return False
@@ -1942,6 +2036,15 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+
+
+def reclaim_build_folder(path: Path, *, wait: bool) -> bool:
+    """Remove a free folder when no recovery record protects it."""
+    try:
+        with build_folder_lock.folder_parent(path, path.parent, create=False) as directory:
+            return _remove_free(path, directory, wait=wait)
+    except FileNotFoundError:
+        return True
 
 
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
@@ -1961,10 +2064,11 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 
 
 @contextmanager
-def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
+def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, *,
+                           keep: Callable[[], bool] | None = None) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
     with ExitStack() as cleanup:
-        yield create_build_folder(_TemporaryFolderRequest(request, cleanup))
+        yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep))
 
 
 def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[BuildFolderSpec], Path], *,

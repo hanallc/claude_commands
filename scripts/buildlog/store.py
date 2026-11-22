@@ -28,6 +28,8 @@ from enum import Enum
 from pathlib import Path
 from typing import BinaryIO, TypedDict, cast
 
+from scripts.lib import scratch
+
 
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
@@ -245,13 +247,20 @@ def read_last_whole_row_end(path: Path) -> int:
         return 0
 
 
+class AppendLockTimeout(TimeoutError):
+    """The log lock stayed busy until the deadline."""
+
+
 @contextmanager
-def locked_append(path: Path) -> Generator[BinaryIO]:
+def locked_append(path: Path, *, deadline: float | None = None) -> Generator[BinaryIO]:
     """Keep tail repair, any recovery scan and publication under one file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+b", buffering=0) as handle:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            scratch.lock_copy_descriptor(fd, fcntl.LOCK_EX, deadline=deadline)
+        except scratch.CopyLockTimeout as error:
+            raise AppendLockTimeout(f"the append lock deadline passed for {path}") from error
         end = last_whole_row_end(handle)
         if end != os.fstat(fd).st_size:
             os.ftruncate(fd, end)

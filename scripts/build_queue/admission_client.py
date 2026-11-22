@@ -76,6 +76,10 @@ class CheckerFailure(ValueError):
     pass
 
 
+class ReleaseDeadlineExceeded(RuntimeError):
+    """The service did not confirm release before the deadline."""
+
+
 class _QueueUnreachable(Exception):
     pass
 
@@ -789,7 +793,7 @@ class AdmissionRefusalHandler(Protocol):
 
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
-          *, attempt: Callable[[], None] = _no_attempt_hook, report_refusal: bool = True,
+          *, attempt: Callable[[], None] = _no_attempt_hook, deadline: float = math.inf, report_refusal: bool = True,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     def refuse(reason: str, *, checker: bool = False) -> wire.Refused:
@@ -806,9 +810,10 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     if retry is None:
         limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
         launch = isinstance(request, wire.LaunchRequest)
-        deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
-                    if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
+        if isinstance(request, wire.RepositorySlotRequest):
+            deadline = CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
+        elif launch and limit > 0:
+            deadline = CLOCK.monotonic() + limit
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
@@ -898,10 +903,13 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
         if expired is AcquisitionDeadline.UNREACHABLE:
             assert not isinstance(configuration, wire.CleanupTiming)
             raise _unreachable(configuration)
+        if isinstance(request, wire.ReleaseRequest):
+            raise ReleaseDeadlineExceeded(f"the service did not confirm release of reservation {request.reservation}")
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
+    bounded_release = isinstance(request, wire.ReleaseRequest) and math.isfinite(retry.deadline)
     last_valid = last_notice = CLOCK.monotonic()
     restarted = False
     showed_slot = False
@@ -945,7 +953,8 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                         last_notice = CLOCK.monotonic()
                         continue
                     reply = _parse_acquisition_reply(line, request)
-                    if CLOCK.monotonic() > retry.deadline:
+                    replied_at = CLOCK.monotonic()
+                    if replied_at > retry.deadline or (bounded_release and replied_at == retry.deadline):
                         return deadline_reply()
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
@@ -1000,7 +1009,8 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                 if not restarted:
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
-                continue
+                if not bounded_release:
+                    continue
             CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
 
 
@@ -1438,8 +1448,9 @@ def _silence_notice(last_valid: float) -> None:
 
 
 def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.PrioritySetRequest | wire.PriorityClearRequest | wire.TokenWaitRequest,
-              configuration: records.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Ok | wire.Refused:
-    return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration))
+              configuration: records.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE,
+              *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
+    return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration, deadline=deadline))
 
 
 def request_id() -> str:
@@ -1464,8 +1475,9 @@ def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.
     return wire.Refused("invalid service estimate answer")
 
 
-def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
+def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+            *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
+    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration, deadline=deadline)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:

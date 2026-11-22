@@ -282,24 +282,26 @@ def busy_cpu_seconds():
     ticks = list(map(int, pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
     return (sum(ticks) - ticks[3] - ticks[4] - ticks[7]) / os.sysconf('SC_CLK_TCK')
 def sample_memory():
+    global memory_peak
     try:
         fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
         used = (int(fields['MemTotal'].split()[0]) - int(fields['MemAvailable'].split()[0])) * 1024
-        result['memory_peak_bytes'] = max(result['memory_peak_bytes'] or 0, used)
+        memory_peak = max(memory_peak or 0, used)
     except (OSError, ValueError, KeyError):
         pass
 def monitor_memory(stop):
     while True:
         sample_memory()
         if stop.wait(2):
+            sample_memory()
             return
+memory_peak = None
 memory_stop = threading.Event()
 memory_thread = None
 cpu_started = None
 try:
     repo = root / 'repo'
     from scripts.production import merge_gate
-    from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
         get('module_seconds', root / 'module_seconds.json')
@@ -310,7 +312,7 @@ try:
     result['vcpus'] = result['max_running_jobs']
     sample_memory()
     memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-    cancellation.start_masked_thread(memory_thread)
+    memory_thread.start()
     stage('tests start')
     with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         cpu_started = busy_cpu_seconds()
@@ -366,8 +368,8 @@ finally:
         result['cpu_use_percent'] = 100 * result['busy_cpu_s'] / max(0.001, result['vcpus'] * result['gate_s'])
     if memory_thread is not None:
         memory_stop.set()
-        memory_thread.join()
-        sample_memory()
+        memory_thread.join(timeout=float(links.get('program_stop_seconds', 0)))
+    result['memory_peak_bytes'] = memory_peak
 '''
 
 

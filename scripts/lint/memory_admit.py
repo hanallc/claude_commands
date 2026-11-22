@@ -37,7 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, MacOnly, PinnedTarget
 from scripts.build_hold.override_guard import require_shared_state_write
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.lib.proc_text import read_proc_text as _read_proc_text
 
 from scripts.lib.test_phase import (
@@ -931,6 +931,30 @@ def scope_members(directory: Path) -> set[int]:
     return members
 
 
+def scope_populated(scope: Path, *, require_events: bool = False) -> bool:
+    """Check for live processes in the scope and its descendants."""
+    events = scope / "cgroup.events"
+    check_memory_reading(events)
+    try:
+        lines = build_folders.read_program_record(events).splitlines()
+    except FileNotFoundError:
+        if require_events:
+            raise
+        return bool(scope_members(scope))
+    except OSError as error:
+        if error.errno in (errno.EINVAL, errno.ELOOP):
+            raise codec.SnapshotParseError(str(error)) from error
+        if require_events or error.errno != errno.ENODEV:
+            raise
+        return False
+    populated = [line for line in lines if line.startswith("populated ")]
+    if populated == ["populated 1"]:
+        return True
+    if populated == ["populated 0"]:
+        return False
+    raise codec.SnapshotParseError(f"{events} has no valid populated value")
+
+
 def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
     """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
     if isinstance(source, PopulatedStepScope):
@@ -1029,16 +1053,8 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
             scope_name = ""
         if scope_name:
             scope = Path(scope_name)
-            members = scope / "cgroup.procs"
-            check_memory_reading(members)
-            try:
-                if members.read_text().split():
-                    return PopulatedStepScope(scope)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                if error.errno != errno.ENODEV:
-                    raise
+            if scope_populated(scope):
+                return PopulatedStepScope(scope)
     return LiveOwnerProcess() if owner_live else EndedStep()
 
 

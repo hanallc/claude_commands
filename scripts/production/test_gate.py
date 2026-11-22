@@ -11,14 +11,21 @@ import unittest
 import fcntl
 
 import io
+import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
+import subprocess
+import sys
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -87,6 +94,76 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(excludes.count("/.scratch.json"), 1)
         with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_rollback_copy_wait_stops_at_its_deadline_or_on_term(self) -> None:
+        program = """
+import sys
+import time
+from pathlib import Path
+from unittest import mock
+from scripts.lib import scratch
+from scripts.production import gate
+
+repo = Path(sys.argv[1])
+sleep = time.sleep
+announced = False
+
+def announce_wait(seconds):
+    global announced
+    if not announced:
+        announced = True
+        print("waiting", flush=True)
+    sleep(seconds)
+
+with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
+    gate.recover_gate_directory(gate.gate_run_directory(repo))
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        copies = self.root / "copies"
+        repo = copies / "show-maker" / "21-gate"
+        repo.parent.mkdir(parents=True)
+        _ = self.git(self.checkout, "clone", str(self.checkout), str(repo))
+        _ = self.git(repo, "merge", "--no-edit", self.checkpoint)
+        merged = self.git(repo, "rev-parse", "HEAD")
+        self.assertNotEqual(merged, self.base)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "scratch.conf")
+        self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        busy = scratch.busy_path(repo)
+        busy.touch()
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            directory = gate.gate_run_directory(repo)
+            directory.mkdir(parents=True)
+            record = directory / "dead-owner.json"
+            gate.GateRecovery(record, str(repo), os.getpid(), "ended-owner",
+                                    rollback=self.base, rollback_head=merged).save()
+        for lock_path in (busy, repo):
+            for terminate in (False, True):
+                with self.subTest(lock=lock_path.name, terminate=terminate):
+                    self.configure_gate(f"program_stop_seconds={60 if terminate else 1}\n")
+                    descriptor = os.open(lock_path, os.O_RDONLY)
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with subprocess.Popen([sys.executable, "-c", program, str(repo)], cwd=checkout,
+                                              env=self.environment, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, text=True) as child:
+                            try:
+                                assert child.stdout is not None
+                                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                                self.assertEqual(child.stdout.readline(), "waiting\n")
+                                if terminate:
+                                    child.terminate()
+                                output, errors = child.communicate(timeout=5)
+                                self.assertEqual(child.returncode, -signal.SIGTERM if terminate else 0, output + errors)
+                                if not terminate:
+                                    self.assertIn("UNRESOLVED: the scratch copy lock is still held", output)
+                            finally:
+                                if child.poll() is None:
+                                    child.kill()
+                                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    finally:
+                        os.close(descriptor)
+                    self.assertEqual(self.git(repo, "rev-parse", "HEAD"), merged)
+                    self.assertEqual(json.loads(record.read_text())["rollback"], self.base)
 
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
         observed: list[str] = []
