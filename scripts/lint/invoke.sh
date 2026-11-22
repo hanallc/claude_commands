@@ -141,6 +141,22 @@ build_step_output_parent() {
     printf '%s\n' "$parent"
 }
 
+buildlog_capture_command() {
+    "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" "$@"
+}
+
+buildlog_remove_capture() {
+    if [[ -n "$1" ]]; then
+        buildlog_capture_command remove "$1" >/dev/null 2>&1 || true
+    fi
+}
+
+buildlog_can_scope() {
+    [[ "${BUILDLOG_OFF:-0}" != 1 && -f "$BUILDLOG_RECORD" && "${BUILDLOG_SCOPE:-1}" != 0 \
+       && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" && -r /proc/self/cgroup ]] \
+        && command -v systemd-run >/dev/null 2>&1
+}
+
 # buildlog_begin ARGV...
 buildlog_begin() {
     BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE="" BUILDLOG_TARGET_FOLDER=""
@@ -149,12 +165,9 @@ buildlog_begin() {
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
-    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
-          && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
-        local parent
-        if parent="$(build_step_output_parent)"; then
-            BUILDLOG_PEAK="$parent/buildlog.$$.$RANDOM.peak"
-        fi
+    local parent="${BUILDLOG_CAPTURE_DIR:-${HOLD_WAIT_DIR:-}}"
+    if [[ -n "$parent" ]] && buildlog_can_scope; then
+        BUILDLOG_PEAK="$parent/buildlog.$$.$RANDOM.peak"
     fi
 }
 
@@ -200,22 +213,56 @@ buildlog_write_step() {
         "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
+buildlog_record_capture() {
+    local folder=$1 owner=$2
+    shift 2
+    trap '' HUP
+    if [[ -n "$owner" ]]; then
+        buildlog_capture_command transfer-tool "$folder" --tool lint-capture \
+            --owner-pid "$owner" --recipient-pid "$BASHPID" >/dev/null 2>&1 || return 1
+        printf 'owned\n'
+        exec >/dev/null 2>&1
+    fi
+    trap 'buildlog_remove_capture "$folder"' EXIT
+    buildlog_write_step "$@"
+}
+
 # buildlog_end STATUS LOG TTY ARGV...
 buildlog_end() {
     [[ -n "${BUILDLOG_START:-}" ]] || return 0
-    local status=$1 log=$2 tty=$3 held="" parent
+    local status=$1 log=$2 tty=$3 folder="${BUILDLOG_CAPTURE_DIR:-}" peak="${BUILDLOG_PEAK:-}"
     shift 3
     BUILDLOG_NOW=""
     buildlog_now
-    if [[ -n "$log" && -f "$log" ]] && parent="$(build_step_output_parent)"; then
-        held="$parent/buildlog.$$.$RANDOM$RANDOM.log"
-        mv -f "$log" "$held" 2>/dev/null || held=""
+    if [[ -n "$folder" && -n "$peak" && "${peak%/*}" != "$folder" ]]; then
+        # Placement can reserve a path in the verify folder before the step starts.
+        local suffix
+        for suffix in '' .cpu.stat .io.stat .test-phase.json; do
+            if [[ -f "$peak$suffix" ]]; then
+                mv -f -- "$peak$suffix" "$folder/peak$suffix" || true
+            fi
+        done
+        if [[ "${BUILDLOG_TEST_PHASE_FILE:-}" == "$peak.test-phase.json" ]]; then
+            BUILDLOG_TEST_PHASE_FILE="$folder/peak.test-phase.json"
+        fi
+        peak="$folder/peak"
     fi
-    if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
-        buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
+    local record=("$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$log" "$peak" "$@")
+    if [[ -n "$folder" ]]; then
+        local handoff="" owner=$BASHPID
+        if [[ "${BUILDLOG_SYNC:-0}" != 1 ]]; then
+            # The recorder closes this pipe after it takes the lease.
+            handoff="$(buildlog_record_capture "$folder" "$owner" "${record[@]}" &)"
+        fi
+        if [[ "$handoff" != owned ]]; then
+            ( buildlog_record_capture "$folder" "" "${record[@]}" )
+        fi
+        BUILDLOG_CAPTURE_DIR=""
+    elif [[ "${BUILDLOG_SYNC:-0}" == 1 || -n "$peak" ]]; then
+        buildlog_write_step "${record[@]}"
     else
         ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+          buildlog_write_step "${record[@]}" & )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
@@ -374,9 +421,18 @@ run_step_attempt() {
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
     fi
-    local output_parent=""
-    if [[ ! -t 1 ]]; then
-        output_parent="$(build_step_output_parent)" || return $?
+    local BUILDLOG_CAPTURE_DIR="" previous_return capture_owner=$BASHPID
+    if [[ ! -t 1 ]] || buildlog_can_scope; then
+        BUILDLOG_CAPTURE_DIR="$(buildlog_capture_command tool --tool lint-capture --owner-pid "$capture_owner" --sweep-stopped 2>/dev/null)" \
+            || BUILDLOG_CAPTURE_DIR=""
+    fi
+    if [[ -n "$BUILDLOG_CAPTURE_DIR" ]]; then
+        previous_return="$(trap -p RETURN)"
+        trap 'if [[ "${FUNCNAME[0]}" == run_step_attempt ]]; then
+            buildlog_remove_capture "$BUILDLOG_CAPTURE_DIR"
+            trap - RETURN
+            eval "$previous_return"
+        fi' RETURN
     fi
     # The dev shell's programs reach this step only; the next step starts from the caller's PATH.
     local PATH=$PATH
@@ -482,15 +538,22 @@ run_step_attempt() {
             ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
-        # $RANDOM too: a background sweep's run() shares this shell's $$.
-        log="$output_parent/lint_invoke.$$.$RANDOM.log"
-        if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
-            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
+        if [[ -n "$BUILDLOG_CAPTURE_DIR" ]]; then
+            log="$BUILDLOG_CAPTURE_DIR/output.log"
+            { : > "$log"; } 2>/dev/null || log=""
         fi
-        # Keep output streaming for heartbeat_watch.sh and the watching worker.
+        if [[ -n "$log" && -n "${BUILDLOG_PEAK:-}" ]]; then
+            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log" || true
+        fi
+        # Stream the output even if capture is unavailable.
         set +e
-        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
+        if [[ -n "$log" ]]; then
+            buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+                ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
+        else
+            buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+                ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | without_progress_frames
+        fi
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -514,7 +577,7 @@ run_step_attempt() {
     fi
     if [[ -n "$log" && $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
         buildlog_end "$status" "$log" 0 "$@" || true
-        rm -f "$log"
+        buildlog_remove_capture "$BUILDLOG_CAPTURE_DIR"
         cat >&2 <<'EOF'
 
 THIS IS A SANDBOX FAILURE, NOT A TEST FAILURE.
@@ -533,7 +596,6 @@ EOF
         exit 3
     fi
     buildlog_end "$status" "$log" "$tty" "$@" || true
-    [[ -z "$log" ]] || rm -f "$log"
     sweep_after_step "$@" || true
     return $status
 }

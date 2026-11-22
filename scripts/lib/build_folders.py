@@ -732,7 +732,7 @@ def lease_path(path: Path) -> Path:
     return path.with_name(path.name + ".lease.json")
 
 
-def _read_copy_lease(path: Path, directory: int) -> dict[str, object]:
+def _read_folder_lease(path: Path, directory: int) -> dict[str, object]:
     sidecar = lease_path(path)
     descriptor = os.open(sidecar.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(descriptor, encoding="utf-8") as record:
@@ -748,7 +748,7 @@ def _read_copy_lease(path: Path, directory: int) -> dict[str, object]:
 def folder_lease_fields(path: Path) -> dict[str, object]:
     """Read lease fields for a status display."""
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
-        return _read_copy_lease(path, directory)
+        return _read_folder_lease(path, directory)
 
 
 @dataclass(frozen=True)
@@ -860,7 +860,7 @@ def _copy_identity_fields(fields: dict[str, object], copy: NumberedCopySource) -
 
 def _numbered_copy_record(path: Path, form: BuildCopy, directory: int) -> NumberedCopyRecord:
     try:
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
     except FileNotFoundError:
         return NoNumberedCopySource()
     return _validate_numbered_copy_record(path, form, directory, fields)
@@ -936,7 +936,7 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
         return True
     except git_files.NotACheckout as error:
         try:
-            lease = _read_copy_lease(path, directory)
+            lease = _read_folder_lease(path, directory)
             repository = git_files.at(spec.slot_checkout.source)
             if (lease.get("ready") is False and "git_directory" not in lease
                     and _recorded_path(lease, "source_path") == spec.slot_checkout.source
@@ -972,7 +972,7 @@ def record_numbered_copy_source(path: Path, source: Path, commit: str) -> None:
         head = git_files.head(git_files.at(path))
         if not _COMMIT_ID.fullmatch(commit) or not isinstance(head, git_files.DetachedHead) or head.commit != commit:
             raise ValueError(f"{path}: the prepared checkout does not match the requested commit")
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
         _copy_identity_fields(fields, record)
         fields.update(commit=commit, ready=True)
         _publish_lease(path, directory, fields)
@@ -985,7 +985,7 @@ def mark_numbered_copy_removal(copy: NumberedCopySource) -> None:
         _current_copy_lock(path, directory)
         if _numbered_copy_record(path, form, directory) != copy:
             raise ValueError(f"{path}: the numbered copy source changed")
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
         _copy_identity_fields(fields, copy)
         fields["removing"] = True
         _publish_lease(path, directory, fields)
@@ -1033,7 +1033,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
                 raise BlockingIOError(f"{path}: numbered copy is busy")
             record = _numbered_copy_record(path, form, directory)
             if (not isinstance(record, NumberedCopySource)
-                    or _read_copy_lease(path, directory).get("ready") is not True):
+                    or _read_folder_lease(path, directory).get("ready") is not True):
                 raise ValueError(f"{path}: no available numbered copy source")
             result = NumberedCopyUseLease(record, (descriptor,))
         except (OSError, ValueError, RuntimeError) as error:
@@ -1126,7 +1126,7 @@ def _copy_leases_in_unit(unit: Path, root: Path, timing: build_folder_lock.Probe
                         raise ValueError("lock changed during the read")
                     if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                         raise ValueError("copy is not a directory")
-                    fields = _read_copy_lease(path, directory)
+                    fields = _read_folder_lease(path, directory)
                     owner = _copy_owner_record(path, form, fields, held=not free)
                     if free and (fields.get("ready") is not True or not isinstance(
                             _validate_numbered_copy_record(path, form, directory, fields), NumberedCopySource)):
@@ -1224,7 +1224,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
               "start_time": now}
     if spec.kind in ("copy", "slot") and isinstance(spec.slot_checkout, SlotCheckout):
         if released:
-            record = _read_copy_lease(path, directory)
+            record = _read_folder_lease(path, directory)
         elif spec.kind == "copy":
             started = process_start.process_start(spec.owner_pid or os.getpid())
             if isinstance(started, (process_start.Started, process_start.Zombie)):
@@ -1387,7 +1387,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
                             else:
                                 try:
-                                    lease = _read_copy_lease(path, directory)
+                                    lease = _read_folder_lease(path, directory)
                                 except FileNotFoundError:
                                     lease = {}
                                 except (OSError, ValueError) as error:
@@ -1396,7 +1396,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                     raise FileExistsError(f"{path}: a recorded copy checkout is missing")
                         else:
                             try:
-                                lease = _read_copy_lease(path, directory)
+                                lease = _read_folder_lease(path, directory)
                             except (OSError, ValueError):
                                 lease = {}
                             checkout_ready = lease.get("ready") is True
@@ -1466,7 +1466,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             record = _numbered_copy_record(path, form, directory)
                             if not isinstance(record, NumberedCopySource):
                                 raise ValueError(f"{path}: copy registration has no source record")
-                            fields = _read_copy_lease(path, directory)
+                            fields = _read_folder_lease(path, directory)
                             _copy_identity_fields(fields, record)
                             _publish_lease(path, directory, fields)
                         else:
@@ -1819,7 +1819,7 @@ def _folder_has_expired(path: Path, directory: int, cutoff: float, form: FolderF
             if not isinstance(form, BuildCopy):
                 return False
             try:
-                fields = _read_copy_lease(path, directory)
+                fields = _read_folder_lease(path, directory)
                 return (fields.get("ready") is False
                         and _lease_time(fields.get("last_use")).timestamp() <= cutoff
                         and isinstance(_numbered_copy_record(path, form, directory), NumberedCopySource))
@@ -1880,9 +1880,11 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                             temporary=temporary, dir_fd=directory)
 
 
-def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
+def _remove_free(path: Path, directory: int, *, wait: bool, stopped_tool: str = "") -> bool:
     """Remove a folder and its records when no process holds its lock or a lease below it."""
     def cleanup() -> bool:
+        if stopped_tool and not _lease_owner_ended(path, directory, stopped_tool):
+            return False
         try:
             allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
@@ -1900,18 +1902,18 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
 
 
-def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
-    """Remove free allocations in a parent reserved for temporary maker folders.
-    With wait False, a held folder costs one lock try, not the probe wait."""
+def sweep_temporary_build_folders(parent: Path, *, wait: bool = True, stopped_tool: str = "") -> None:
+    """Remove free maker folders or folders of one tool whose owners ended."""
+    tool_name = re.compile(re.escape(stopped_tool) + r"(?:-[1-9][0-9]*)?")
     try:
         with build_folder_lock.folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
             for entry in os.listdir(directory):
                 match = _METADATA.fullmatch(entry)
-                if match is not None:
+                if match is not None and (not stopped_tool or tool_name.fullmatch(match[1])):
                     names.add(match[1])
             for name in sorted(names):
-                _ = _remove_free(parent / name, directory, wait=wait)
+                _ = _remove_free(parent / name, directory, wait=wait, stopped_tool=stopped_tool)
     except FileNotFoundError:
         pass
 
@@ -1942,23 +1944,21 @@ def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[Build
         except FileExistsError:
             path = build_folder_path(spec)
             with build_folder_lock.folder_parent(path, root, create=False) as directory:
-                leftover = _lease_owner_ended(path, directory) and _remove_free(path, directory, wait=False)
+                leftover = (_lease_owner_ended(path, directory, tool)
+                            and _remove_free(path, directory, wait=False, stopped_tool=tool))
             if not leftover:
                 number += 1
 
 
-def _lease_owner_ended(path: Path, directory: int) -> bool:
-    """True when the lease names a process that no longer runs. An unreadable lease is not proof."""
+def _lease_owner_ended(path: Path, directory: int, tool: str) -> bool:
+    """Check whether a tool folder lease names an ended process."""
     try:
-        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-    except OSError:
+        fields = _read_folder_lease(path, directory)
+    except (OSError, ValueError):
         return False
-    with os.fdopen(descriptor) as lease:
-        try:
-            record = cast(object, json.load(lease))
-        except ValueError:
-            return False
-    pid = cast(dict[str, object], record).get("pid") if isinstance(record, dict) else None
+    if fields.get("purpose") != tool:
+        return False
+    pid = fields.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
     try:
@@ -1968,6 +1968,28 @@ def _lease_owner_ended(path: Path, directory: int) -> bool:
     except PermissionError:
         return False
     return False
+
+
+def transfer_tool_folder(path: Path, tool: str, owner_pid: int, recipient_pid: int) -> None:
+    """Transfer a tool folder lease while its current owner is live."""
+    if owner_pid <= 0 or recipient_pid <= 0:
+        raise ValueError("tool folder owners must have positive process IDs")
+    with build_folder_lock.folder_parent(path, path.parent, create=False) as directory:
+        descriptor = build_folder_lock.open_lock(path, directory, create=False)
+        try:
+            if not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
+                raise BlockingIOError(errno.EWOULDBLOCK, "the tool folder is held", str(path))
+            if not build_folder_lock.lock_current(path, directory, descriptor) or not _folder_exists(path, directory):
+                raise FileNotFoundError(f"{path}: the tool folder changed")
+            fields = _read_folder_lease(path, directory)
+            if fields.get("pid") != owner_pid or fields.get("purpose") != tool:
+                raise PermissionError(f"{path}: the tool folder lease has a different owner")
+            os.kill(owner_pid, 0)
+            os.kill(recipient_pid, 0)
+            fields["pid"] = recipient_pid
+            _publish_lease(path, directory, fields)
+        finally:
+            os.close(descriptor)
 
 
 @contextmanager
@@ -2095,6 +2117,12 @@ def main(argv: Sequence[str]) -> int:
     _ = tool.add_argument("--tool", required=True)
     _ = tool.add_argument("--parent", type=Path)
     _ = tool.add_argument("--owner-pid", type=int, required=True)
+    _ = tool.add_argument("--sweep-stopped", action="store_true")
+    transfer = commands.add_parser("transfer-tool")
+    _ = transfer.add_argument("path", type=Path)
+    _ = transfer.add_argument("--tool", required=True)
+    _ = transfer.add_argument("--owner-pid", type=int, required=True)
+    _ = transfer.add_argument("--recipient-pid", type=int, required=True)
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
     run_temp = commands.add_parser("run-temp-path")
@@ -2145,8 +2173,16 @@ def main(argv: Sequence[str]) -> int:
             return run_build(owner, cast(str, args.name), arguments[1:] if arguments[:1] == ["--"] else arguments,
                              showrunner=cast(str, args.showrunner), unit=cast(str, args.unit), work=cast(str, args.work))
         if command == "tool":
-            print(_claim_tool_folder(cast(str, args.tool), cast(Path | None, args.parent), create_build_folder,
-                                     owner_pid=cast(int, args.owner_pid)))
+            tool_name = cast(str, args.tool)
+            tool_parent = cast(Path | None, args.parent)
+            if cast(bool, args.sweep_stopped):
+                sweep_temporary_build_folders(tool_parent or inherited_temporary_parent(), wait=False,
+                                              stopped_tool=tool_name)
+            print(_claim_tool_folder(tool_name, tool_parent, create_build_folder, owner_pid=cast(int, args.owner_pid)))
+            return 0
+        if command == "transfer-tool":
+            transfer_tool_folder(cast(Path, args.path), cast(str, args.tool), cast(int, args.owner_pid),
+                                 cast(int, args.recipient_pid))
             return 0
         if command == "remove":
             path = cast(Path, args.path)
