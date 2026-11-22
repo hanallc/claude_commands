@@ -302,8 +302,12 @@ Without `--target`, `--settings` selects the configuration.
 
 `write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
 A busy result adds `holder`: its known job, `leftovers`, or `unreadable`.
-Missing or contradictory results are unusable.
-Declined, lost, and invalid results return the step to its waiting state.
+Verify checks the exact launch permission when a routed Mac test runner gives no usable result.
+The check uses the admission query timeout.
+Verify exits with status 2 if the queue consumed launch permission or cannot confirm it.
+Verify also exits with status 2 if the runner reports an unconfirmed Mac cleanup.
+The local Verify place becomes free when Verify exits.
+The remote claim stays available for recovery until the runner confirms cleanup.
 
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests. An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
@@ -359,6 +363,8 @@ Declined, lost, and invalid results return the step to its waiting state.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
   Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  The routed test stream uses that limit from the time it receives the verdict.
+  A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
   A failed check or a remaining process keeps the remote claim.
 
@@ -376,10 +382,10 @@ Its saved-result key includes `--run-ignored only`.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A retry backoff does not refuse at once. `build_targets.py probe-backoff --target mac` probes the Mac one time.
-A pass clears the backoff and the failed probe mark, and the call waits for placement.
+A successful probe clears failures that predate the probe.
 A failed probe refuses the call as unreachable.
-For queued steps, the queue probes the Mac during an active backoff.
-A successful probe clears the backoff before the queue checks eligibility.
+For queued steps, the queue uses the normal Mac probe to check recovery during an active backoff.
+Each target gets at most one recovery probe per waiting pass interval.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 
@@ -611,7 +617,7 @@ The token boundary, local repair rule, and step records remain in verify.sh.
 
 A failed reach writes `failed_probe` in the target state folder.
 The record has no expiry time.
-A successful `probe_mac` or a passed Mac-only backoff probe removes it and the retry backoff.
+A successful probe removes the mark and retry backoff if both records predate the probe.
 An unresolved startup or an interrupted target keeps the record unchanged.
 
 A tool version mismatch writes `version-decline-<repository>` in the same folder.

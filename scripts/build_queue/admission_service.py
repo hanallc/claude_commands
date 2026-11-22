@@ -1542,6 +1542,8 @@ class AdmissionServer:
             host_probe if host_probe is not None else self._read_host_evidence)
         self.host_readers: dict[placement.HostEvidenceKey, HostEvidenceReader] = {}
         self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
+        self.mac_recovery_lock: threading.Lock = threading.Lock()
+        self.mac_recovery_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
@@ -3291,6 +3293,18 @@ class AdmissionServer:
             except conf.Unusable as error:
                 return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
 
+    def _begin_mac_backoff_probe(self, target: str) -> bool:
+        """Allow one recovery probe per target in each waiting pass interval."""
+        from scripts.mac_test import eligibility
+
+        if not isinstance(eligibility.read_backoff(time.time(), target), eligibility.ActiveBackoff):
+            return False
+        with self.mac_recovery_lock:
+            if self.clock.monotonic() < self.mac_recovery_retry_at.get(target, 0):
+                return False
+            self.mac_recovery_retry_at[target] = float("inf")
+            return True
+
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets
@@ -3345,17 +3359,15 @@ class AdmissionServer:
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         else:
             if isinstance(target, target_config.SshTarget):
-                if target.platform == "macos":
-                    from scripts.mac_test import eligibility as ssh_eligibility, offload
-
-                    if isinstance(ssh_eligibility.read_backoff(time.time(), target.name), ssh_eligibility.ActiveBackoff):
-                        probe = offload.probe_reachability(offload.ProcessController(),
-                                                          ssh_eligibility.SshProbeSettings(configuration))
-                        if isinstance(probe, offload.ReachableHost):
-                            offload.record_reachable(target.name)
-                answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session, configuration=configuration)
+                recover = target.platform == "macos" and self._begin_mac_backoff_probe(target.name)
+                try:
+                    answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
+                        request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, new_step=True,
+                        session=key.session, configuration=configuration, recover_mac_backoff=recover)
+                finally:
+                    if recover:
+                        with self.mac_recovery_lock:
+                            self.mac_recovery_retry_at[target.name] = self.clock.monotonic() + self._waiting_pass_interval()
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
@@ -4691,8 +4703,11 @@ done
             return [wire.Refused(refusal)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
-            status = (saved if isinstance(saved, status_wire.UnknownPlacementStatus) else
-                status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
+            if isinstance(saved, status_wire.UnknownPlacementStatus):
+                return [status_wire.PlacementStatusReply(saved)]
+            permission = saved.permission if request.include_permission else status_wire.LAUNCH_PERMISSION_NOT_REPORTED
+            status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider,
+                                                      permission)
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
             return [wire.Refused("Repository copy capacity no longer requires admission")]

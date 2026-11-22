@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -215,6 +216,11 @@ class LostMacRun:
 
     seconds: float
     detail: str = 'runner sent no final status'
+
+
+@dataclass(frozen=True)
+class MacCleanupUnconfirmed(LostMacRun):
+    """The runner cannot confirm that the Mac claim can end."""
 
 
 @dataclass(frozen=True)
@@ -902,8 +908,29 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
+@dataclass(frozen=True)
+class CleanupStreamTimedOut:
+    """The SSH stream remained open past the cleanup deadline."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CleanupAfterVerdict:
+    """Start the cleanup deadline when the test sends its verdict."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CleanupOnly:
+    """Start the cleanup deadline before starting SSH."""
+
+    seconds: float
+
+
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
-                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal)
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal | CleanupStreamTimedOut)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -969,6 +996,32 @@ class CliArguments(argparse.Namespace):
         self.assignment_file: str = ""
         self.environment: list[str] = []
         self.fetch: str | None = None
+
+
+def bounded_output_lines(output: BinaryIO | TextIO, remaining: Callable[[], float | None]) -> Generator[bytes]:
+    """Read complete lines without letting a partial line block the cleanup deadline."""
+    descriptor = output.fileno()
+    partial_line = bytearray()
+    with selectors.DefaultSelector() as reader:
+        _ = reader.register(descriptor, selectors.EVENT_READ)
+        while True:
+            timeout = remaining()
+            if (timeout is not None and timeout <= 0) or not reader.select(timeout):
+                raise TimeoutError
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                if partial_line:
+                    yield bytes(partial_line)
+                return
+            *lines, tail = chunk.split(b"\n")
+            if not lines:
+                partial_line.extend(tail)
+                continue
+            partial_line.extend(lines[0])
+            yield bytes(partial_line) + b"\n"
+            for line in lines[1:]:
+                yield line + b"\n"
+            partial_line = bytearray(tail)
 
 
 class ProcessController:
@@ -1105,10 +1158,14 @@ class ProcessController:
                     else None
                 )
                 stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as error:
                 process.kill()
-                stdout, stderr = process.communicate()
-                self.observe_command(arguments, stdout, stderr)
+                # A descendant may still hold a pipe open after the command ends.
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                _ = process.wait()
+                self.observe_command(arguments, error.output or b"", error.stderr or b"")
                 if arguments[0] in ("ssh", "rsync"):
                     self.attempt_evidence.traffic.transfers[-1]["complete"] = False
                 return COMMAND_TIMED_OUT
@@ -1146,7 +1203,15 @@ class ProcessController:
             self.copy_failure_detail = f"copy: {arguments[0]}: {error}"
         return result
 
-    def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
+    def stream_mac_run(
+        self, arguments: Sequence[str],
+        cleanup_limit: CleanupAfterVerdict | CleanupOnly | NoCommandTimeLimit = NO_COMMAND_TIME_LIMIT,
+    ) -> RemoteRunStatus:
+        deadline = time.monotonic() + cleanup_limit.seconds if isinstance(cleanup_limit, CleanupOnly) else math.inf
+
+        def remaining() -> float | None:
+            return None if deadline == math.inf else max(0.0, deadline - time.monotonic())
+
         self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
@@ -1174,8 +1239,11 @@ class ProcessController:
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
+        exit_status = 0
         try:
-            for raw_line in output:
+            lines = (output if isinstance(cleanup_limit, NoCommandTimeLimit)
+                     else bounded_output_lines(output, remaining))
+            for raw_line in lines:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
                     line = raw_line.decode("utf-8", errors="replace")
@@ -1224,6 +1292,8 @@ class ProcessController:
                     if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
                         held_status_line = line
+                        if isinstance(cleanup_limit, CleanupAfterVerdict) and deadline == math.inf:
+                            deadline = time.monotonic() + cleanup_limit.seconds
                     else:
                         held_status_line = ""
                         print(line, end="", flush=True)
@@ -1241,8 +1311,16 @@ class ProcessController:
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
+            timeout = remaining()
+            exit_status = process.wait() if timeout is None else process.wait(timeout=timeout)
             finished_output = True
-            exit_status = process.wait()
+        except (TimeoutError, subprocess.TimeoutExpired):
+            if isinstance(cleanup_limit, NoCommandTimeLimit):
+                raise
+            with suppress(ProcessLookupError):
+                process.kill()
+            _ = process.wait()
+            status = CleanupStreamTimedOut(cleanup_limit.seconds)
         finally:
             if process.poll() is None:
                 self.stop()
@@ -1258,6 +1336,8 @@ class ProcessController:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
+        if isinstance(status, CleanupStreamTimedOut):
+            return status
         if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
@@ -1377,7 +1457,8 @@ def write_result(
         reason = result.detail if target else ""
         status = 75
         if (isinstance(destination, ResultFile) and not linux and verb == "nextest"
-                and evidence is not None and evidence.launch_authorized and evidence.cleanup == "unconfirmed"):
+                and (isinstance(result, MacCleanupUnconfirmed)
+                     or evidence is not None and evidence.launch_authorized and evidence.cleanup == "unconfirmed")):
             reason = "cleanup_unconfirmed"
             print(f"mac_test: the {label} {result.detail}. Cleanup remains unconfirmed.")
         elif (not isinstance(result, HanaGuestEndedRun) or not isinstance(destination, ResultFile)
@@ -1441,24 +1522,14 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
     return MirrorBusyRefusal(holder)
 
 
-def write_backoff(until: float, target: str = "mac") -> None:
+PROBE_RESULT_LOCK_NAME = "probe-result.lock"
+
+
+def write_backoff(until: float, target: str = "mac", *, wait: bool = True) -> None:
     path = eligibility.backoff_path(target)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as output:
-            temporary_path = Path(output.name)
-            try:
-                _ = output.write(f"{until:.6f}\n")
-                output.flush()
-                os.replace(temporary_path, path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+        with claim_state.locked(path.parent / PROBE_RESULT_LOCK_NAME, wait=wait):
+            write_text_atomic(path, f"{until:.6f}\n", new_file_mode=0o600)
     except OSError:
         return
 
@@ -1577,7 +1648,9 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     ]
 
 
-def release_claim(controller: ProcessController, target: str = "") -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
+def release_claim(
+    controller: ProcessController, target: str = "", *, deadline: CommandDeadline = NO_COMMAND_TIME_LIMIT,
+) -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
     if not isinstance(controller.pending, SettledDispatchOperations):
         return ClaimReleaseUnconfirmed("a claim or start operation remains pending")
     identity = controller.claim_identity
@@ -1595,7 +1668,8 @@ def release_claim(controller: ProcessController, target: str = "") -> ClaimRelea
             "--attempt", identity.attempt,
             *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
             *(["--target", target] if target else []),
-        ]
+        ],
+        deadline,
     )
     if isinstance(result, CommandOutput):
         if result.status == 0:
@@ -1807,16 +1881,26 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     return isinstance(stamp, CommandOutput) and stamp.status == 0
 
 
-def record_reachable(target: str = "mac") -> None:
-    """Clear the failed probe mark and the retry backoff after the target answered."""
-    mark = eligibility.state_directory(target) / "failed_probe"
-    with claim_state.locked(mark.parent / "probe-result.lock"):
-        changed = mark.exists()
-        mark.unlink(missing_ok=True)
-        eligibility.backoff_path(target).unlink(missing_ok=True)
-        if changed:
-            label = "Mac" if target in ("", "mac") else target
-            print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
+def record_reachable(target: str, *, probe_started_ns: int) -> None:
+    """Clear a failure only if it predates the successful probe."""
+    backoff = eligibility.backoff_path(target)
+    mark = backoff.parent / "failed_probe"
+    try:
+        with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+            for path in (mark, backoff):
+                try:
+                    if path.stat().st_mtime_ns >= probe_started_ns:
+                        return
+                except FileNotFoundError:
+                    continue
+            changed = mark.exists()
+            mark.unlink(missing_ok=True)
+            backoff.unlink(missing_ok=True)
+    except BlockingIOError:
+        return
+    if changed:
+        label = "Mac" if target in ("", "mac") else target
+        print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
 
 
 def probe_mac(
@@ -1830,19 +1914,23 @@ def probe_mac(
     mark = eligibility.state_directory(target) / "failed_probe"
 
     def failed(reason: str) -> UnavailableProbe:
-        with claim_state.locked(mark.parent / "probe-result.lock"):
-            changed = not mark.exists()
-            write_text_atomic(mark, "failed\n")
-            if changed:
-                label = "Mac" if target in ("", "mac") else target
-                print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
+        try:
+            with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+                changed = not mark.exists()
+                write_text_atomic(mark, "failed\n")
+        except BlockingIOError:
+            return UNAVAILABLE_PROBE
+        if changed:
+            label = "Mac" if target in ("", "mac") else target
+            print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
         return UNAVAILABLE_PROBE
 
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
-        record_reachable(target)
+        record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
 
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
+    probe_started_ns = time.time_ns()
     if linux:
         if not isinstance(config, OffloadConfig):
             raise ValueError("The Linux shell probe requires execution settings")
@@ -2734,6 +2822,7 @@ def claimed_run(
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
+        routed_mac_test = not linux and request.verb == "nextest" and isinstance(request.placement, AssignedOffloadRequest)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
@@ -2756,9 +2845,14 @@ def claimed_run(
                     permission = admission_client.consume_permission(wire.ConsumePermission(
                         uuid.uuid4().hex, assignment, reference, holder))
                 except wire.AdmissionUnavailable:
+                    if routed_mac_test:
+                        break
                     evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
                     return declined("state", started)
                 if isinstance(permission, wire.FirstAuthorization):
+                    evidence.launch_authorized = True
+                    break
+                if routed_mac_test and isinstance(permission.permission, placement.PermissionConsumed):
                     break
                 if (not isinstance(permission.state, placement.CurrentAssignment)
                         or not isinstance(permission.permission, placement.PermissionAvailable)):
@@ -2766,18 +2860,25 @@ def claimed_run(
                 from scripts.build_queue import admission_records as records
 
                 time.sleep(records.read_memory_config().waiting_pass_seconds)
-            evidence.launch_authorized = True
+            if not evidence.launch_authorized:
+                evidence.execution = execution_identity.ExecutionNotStarted()
+                released = release_claim(controller, request.target,
+                                         deadline=CommandTimeLimit(config.leftover_timeout_s))
+                release_allowed = isinstance(released, ClaimReleaseConfirmed)
+                if release_allowed:
+                    return declined("state", started)
+                return MacCleanupUnconfirmed(elapsed_seconds(started), "launch authorization has no confirmed reply")
         release_allowed = False
         identity = controller.claim_identity
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
-        remote_status = controller.stream_mac_run(
-            [
-                *ssh_prefix(config),
-                command,
-            ]
-        )
+        arguments = [*ssh_prefix(config), command]
+        remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
+                         if routed_mac_test else controller.stream_mac_run(arguments))
+        if isinstance(remote_status, CleanupStreamTimedOut):
+            return MacCleanupUnconfirmed(elapsed_seconds(started),
+                                         f"cleanup timed out after {remote_status.seconds:g} s")
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
@@ -2812,11 +2913,13 @@ def claimed_run(
         fetched = (fetch_folder(controller, config, request, repository)
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
         if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
-            cleanup = controller.stream_mac_run([
-                *ssh_prefix(config),
+            arguments = [*ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
-                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
-            ])
+                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
+            cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
+                       if routed_mac_test else controller.stream_mac_run(arguments))
+            if isinstance(cleanup, CleanupStreamTimedOut):
+                return MacCleanupUnconfirmed(elapsed_seconds(started), f"cleanup timed out after {cleanup.seconds:g} s")
             remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
                                                           else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
@@ -2857,7 +2960,8 @@ def claimed_run(
         if release_allowed:
             evidence.unresolved_count = 0
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            _ = release_claim(controller, request.target)
+            if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+                _ = release_claim(controller, request.target)
             if sync_after_release:
                 from scripts.buildlog import sync as buildlog_sync
 

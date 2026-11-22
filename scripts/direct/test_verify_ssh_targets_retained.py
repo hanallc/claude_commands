@@ -32,38 +32,55 @@ mac_test = eligibility_support.mac_test
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
     def test_lost_mac_releases_the_verify_place_and_keeps_the_claim(self) -> None:
+        self.check_lost_mac("lost-cleanup-timeout")
+
+    def test_mac_runner_exit_without_result_releases_the_verify_place(self) -> None:
+        self.check_lost_mac("missing-result-after-authorization")
+
+    def test_lost_mac_authorization_reply_releases_the_verify_place(self) -> None:
+        self.check_lost_mac("lost-authorization-reply")
+
+    def test_mac_cleanup_stream_timeout_releases_the_verify_place(self) -> None:
+        self.check_lost_mac("cleanup-stream-timeout")
+
+    def check_lost_mac(self, mode: str) -> None:
         self.configure("natedev,mac")
         self.enable_mac()
         settings = self.root / "mac_test.conf"
         _ = write_config_fixture(settings, "leftover_timeout_s=1\n")
         _ = self.hold_memory()
-        slots_during_report: list[int] = []
+        slots_during_authorization: list[int] = []
         previous = self.admission.server.handle_request
 
         def observe(request: wire.Request,
                     connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.ExecutionReport):
-                slots_during_report.extend(slot.owner.pid for slot in self.admission.server.verify_run_slots.values())
-            return previous(request, connection)
+            replies = previous(request, connection)
+            if any(isinstance(reply, wire.FirstAuthorization) for reply in replies):
+                slots_during_authorization.extend(
+                    slot.owner.pid for slot in self.admission.server.verify_run_slots.values())
+            return replies
 
         with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):
             process = self.start_verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": '{"mac":"lost-cleanup-timeout"}'})
+                "TEST_SSH_MODES": json.dumps({"mac": mode})})
             try:
-                self.wait_for_path(self.runner_state / "provider-outcome-mac.json", (process,))
+                self.wait_for_path(self.runner_state / "mac-loss-ready", (process,))
                 output, errors = process.communicate(timeout=8)
             except subprocess.TimeoutExpired:
-                self.fail("Verify stayed in the queue after the Mac cleanup timeout.")
+                self.fail("Verify did not exit after the Mac lost its result or cleanup.")
             finally:
                 if process.poll() is None:
                     self.stop_verify(process)
 
         self.assertEqual(process.returncode, 2, output + errors)
         self.assertIn("the Mac does not answer; stop and submit again", errors)
-        self.assertEqual(slots_during_report, [process.pid])
+        self.assertEqual(slots_during_authorization, [process.pid])
         self.assertEqual(self.local_runs(), [])
-        attempt, = self.attempts()
-        self.assertEqual((attempt["outcome"], attempt["cleanup"]), ("lost", "unconfirmed"))
+        if mode == "missing-result-after-authorization":
+            self.assertEqual(self.attempts(), [])
+        else:
+            attempt, = self.attempts()
+            self.assertEqual((attempt["outcome"], attempt["cleanup"]), ("lost", "unconfirmed"))
         controls = caller_provider_controls(self, self.admission)
         claim, = controls.claims("mac")
         identity = claim_state.claim_identity(claim.record)

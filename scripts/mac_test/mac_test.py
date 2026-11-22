@@ -2237,6 +2237,7 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    recover_mac_backoff: bool = False,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2258,9 +2259,8 @@ def free_now(
         capacity_settings = conf.read(path)
     if not capacity_settings.value("offload", conf.on_off):
         return "off"
-    backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
-               else eligibility.read_backoff(time.time(), paths.target))
-    if isinstance(backoff, eligibility.ActiveBackoff):
+    if not recover_mac_backoff and isinstance(eligibility.read_backoff(time.time(), paths.target),
+                                               eligibility.ActiveBackoff):
         return "backoff"
     session = claim_state.submitting_session(session)
     scope = target_claim_scope(paths, str(repo_root))

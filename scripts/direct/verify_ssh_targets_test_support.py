@@ -115,6 +115,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from contextlib import redirect_stdout
 from unittest import mock
@@ -122,7 +123,7 @@ from unittest import mock
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
-from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_protocol as queue_wire, execution_identity, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -205,9 +206,19 @@ def copy_source(*arguments):
                                   else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
-def stream(arguments):
+def stream(arguments, *limits):
     global remote_output, remote_status
     actions.append("run")
+    if mode == "missing-result-after-authorization":
+        (root / "mac-loss-ready").touch()
+        os._exit(75)
+    if mode == "cleanup-stream-timeout":
+        (root / "mac-loss-ready").touch()
+        program = "import sys; print('mac_exit=0', flush=True); sys.stdin.buffer.read()"
+        def start(*_args, **options):
+            return real_popen([sys.executable, "-c", program], stdin=subprocess.PIPE, **options)
+        with mock.patch.object(subprocess, "Popen", side_effect=start):
+            return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
@@ -231,6 +242,12 @@ def stream(arguments):
 
     remote_output, remote_status = wire, status
 
+    if limits:
+        def start(*_args, **options):
+            return real_popen([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", wire], **options)
+        with mock.patch.object(subprocess, "Popen", side_effect=start):
+            return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
+
     class Remote:
         stdout = io.StringIO(wire)
         def wait(self):
@@ -242,10 +259,12 @@ def stream(arguments):
         return offload.ProcessController.stream_mac_run(controller, arguments)
 
 real_run = subprocess.run
+real_popen = subprocess.Popen
 def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
-        if mode == "lost-cleanup-timeout":
+        if mode in ("lost-cleanup-timeout", "lost-authorization-reply", "cleanup-stream-timeout"):
+            (root / "mac-loss-ready").touch()
             assert options["timeout"] == 1, options
             raise subprocess.TimeoutExpired(arguments, options["timeout"])
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
@@ -257,8 +276,17 @@ def commands(arguments, **options):
             "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
 
+real_consume = admission_client.consume_permission
+def consume(request):
+    result = real_consume(request)
+    if mode == "lost-authorization-reply" and isinstance(result, queue_wire.FirstAuthorization):
+        (root / "mac-loss-ready").touch()
+        raise queue_wire.AdmissionUnavailable("the authorization reply was lost")
+    return result
+
 started = time.monotonic()
-with mock.patch.object(controller, "complete_claim", side_effect=complete), \
+with mock.patch.object(admission_client, "consume_permission", side_effect=consume), \
+     mock.patch.object(controller, "complete_claim", side_effect=complete), \
      mock.patch.object(controller, "capture", side_effect=capture), \
      mock.patch.object(controller, "stream_mac_run", side_effect=stream), \
      mock.patch.object(offload, "copy_tracked_scripts", side_effect=copy_scripts), \

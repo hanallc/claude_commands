@@ -2490,6 +2490,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
+    if [[ "$CMD" == test && "$selected_is_mac" == 1 && "$result_usable" == 0 ]]; then
+        local launch
+        launch=$(verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" placement-status --launch-only \
+            --episode "$PLACEMENT_EPISODE" --attempt "$PLACEMENT_ATTEMPT") || launch=unknown
+        if [[ "$launch" != available ]]; then
+            result_word=lost result_reason=cleanup_unconfirmed result_usable=1
+        fi
+    fi
     if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner

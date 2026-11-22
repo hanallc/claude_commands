@@ -13,7 +13,7 @@ from scripts.lint.memory_test_support import admission_configuration_fixture, ad
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import io
 import json
@@ -917,6 +917,19 @@ class StateCheckTests(unittest.TestCase):
                 self.assertEqual(service.read_state(fixture.state_dir), old)
 
 
+@dataclass(frozen=True)
+class MacBackoffTestFixture:
+    admission: AdmissionFixture
+    backoff: Path
+    key: placement.HostEvidenceKey
+    probe: mock.Mock
+
+    def eligibility(self) -> placement.HostEligibility:
+        evidence = self.admission.server.read_provider_evidence(self.key)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        return evidence.eligibility
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
@@ -1222,7 +1235,8 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
-    def test_good_mac_probe_ends_active_backoff(self) -> None:
+    @contextmanager
+    def mac_backoff_fixture(self) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
         from scripts.mac_test import eligibility, offload
@@ -1233,27 +1247,75 @@ class LocalHoldPlacementTests(unittest.TestCase):
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
-            with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
-                 mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
-                 mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"), \
-                 mock.patch.object(offload.ProcessController, "capture") as probe:
+            with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
+                  mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")),
+                  mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
+                  mock.patch.object(offload.ProcessController, "capture") as probe):
                 offload.write_backoff(time.time() + 300, target.name)
-                path = eligibility.backoff_path(target.name)
-                deadline = path.read_text()
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
+                yield MacBackoffTestFixture(fixture, eligibility.backoff_path(target.name), key, probe)
 
-                probe.return_value = offload.CommandOutput(255, "", "unreachable")
-                unavailable = fixture.server.read_provider_evidence(key)
-                assert isinstance(unavailable, placement.FreshHostEvidence)
-                self.assertEqual(unavailable.eligibility, placement.TemporaryExclusion("backoff"))
-                self.assertEqual(path.read_text(), deadline)
+    def test_good_mac_probe_ends_active_backoff(self) -> None:
+        from scripts.mac_test import offload
 
-                probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
-                available = fixture.server.read_provider_evidence(key)
-                assert isinstance(available, placement.FreshHostEvidence)
-                self.assertEqual(available.eligibility, placement.AllowedHost())
-                self.assertFalse(path.exists())
+        with self.mac_backoff_fixture() as fixture:
+            deadline = fixture.backoff.read_text()
+            fixture.probe.return_value = offload.CommandOutput(255, "", "unreachable")
+            self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
+            self.assertEqual(fixture.backoff.read_text(), deadline)
+
+            fixture.admission.clock.advance(60)
+            fixture.probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+            self.assertEqual(fixture.eligibility(), placement.AllowedHost())
+            self.assertFalse(fixture.backoff.exists())
+
+    def test_good_mac_probe_preserves_a_backoff_written_during_the_probe(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_backoff_fixture() as fixture:
+            newer_deadline = time.time() + 600
+
+            def answer(*_arguments: object) -> offload.CommandOutput:
+                offload.write_backoff(newer_deadline)
+                return offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+
+            fixture.probe.side_effect = answer
+            self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
+            self.assertEqual(fixture.backoff.read_text().strip(), f"{newer_deadline:.6f}")
+
+    def test_mac_backoff_probes_each_target_once_across_policy_keys(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_backoff_fixture() as fixture:
+            server = fixture.admission.server
+            other = replace(fixture.key, package="another-package")
+            request = server.host_requests[fixture.key]
+            server.host_requests[other] = replace(request, constraints=replace(request.constraints, package=other.package))
+
+            def answer(arguments: tuple[str, ...], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+                if arguments[-1] == "true":
+                    return offload.CommandOutput(0, "", "")
+                return offload.CommandOutput(255, "", "the full probe failed")
+
+            fixture.probe.side_effect = answer
+            _ = fixture.eligibility()
+            _ = server.read_provider_evidence(other)
+            self.assertEqual(fixture.probe.call_count, 1)
+            self.assertTrue(fixture.backoff.exists())
+            fixture.admission.clock.advance(60)
+            _ = server.read_provider_evidence(other)
+            self.assertEqual(fixture.probe.call_count, 2)
+
+    def test_mac_recovery_returns_when_the_probe_result_lock_is_busy(self) -> None:
+        from scripts.mac_test import claim_state, offload
+
+        with self.mac_backoff_fixture() as fixture:
+            fixture.probe.return_value = offload.CommandOutput(0, "free_gib=1000\nhost=fixture-mac\nrc=0\n", "")
+            deadline = fixture.backoff.read_text()
+            with claim_state.locked(fixture.backoff.parent / "probe-result.lock"):
+                self.assertEqual(fixture.eligibility(), placement.TemporaryExclusion("backoff"))
+            self.assertEqual(fixture.backoff.read_text(), deadline)
 
     def test_busy_diagnostic_skips_an_older_kept_claim_and_names_the_live_holder(self) -> None:
         from scripts.build_queue.test_placement import placement_request
