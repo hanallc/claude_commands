@@ -2414,16 +2414,17 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     raise SystemExit("delivery interrupted after pane input")
             return server_run(*arguments, deadline=deadline)
 
-        def holder_notice(options: send.Options, *, membership: staff.StaffSnapshot | None = None) -> send.Result:
-            del membership
-            self.notices.append((options.to, options.text or ""))
-            return send.Result("sent", "holder received the result")
-
         _ = self.enterContext(patch.object(self.fixture.world, "run", input_line))
         self.holder_sender = self.enterContext(contextlib.ExitStack())
-        _ = self.holder_sender.enter_context(patch.object(send, "_send", holder_notice))
+        _ = self.holder_sender.enter_context(patch.object(send, "_send", self.holder_notice))
         _ = self.enterContext(patch.object(detached_runs, "deliver_in_fresh_process",
                                           side_effect=deliver_in_fixture))
+
+    def holder_notice(self, options: send.Options, *,
+                      membership: staff.StaffSnapshot | None = None) -> send.Result:
+        del membership
+        self.notices.append((options.to, options.text or ""))
+        return send.Result("sent", "holder received the result")
 
     @property
     def run_dir(self) -> Path:
@@ -3254,6 +3255,93 @@ class PaneRunDeliveryTests(unittest.TestCase):
         progress_history.save_dispatch_delivery(self.run_dir, dispatch, stage)
         self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
                          f"sent: worker {row.name} at {pane}")
+
+    def test_holder_delivery_waits_for_the_worker_stage(self) -> None:
+        for state in ("stopped", "closed"):
+            for drops_during_selection in (False, True):
+                with self.subTest(state=state, drops_during_selection=drops_during_selection):
+                    case = PaneRunDeliveryTests("runTest")
+                    case.setUp()
+                    try:
+                        case.check_holder_delivery_stage(state, drops_during_selection=drops_during_selection)
+                    finally:
+                        _ = case.doCleanups()
+
+    def prepare_holder_pass(self, state: str) -> tuple[staff.StaffRow, pass_recorder.DispatchDelivery,
+                                                       detached_runs.RunRecord, Path]:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("holder-stage", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        agent.append(pane, "user", stage.line)
+        if state == "stopped":
+            _ = self.fixture.world.stop(row, self.fixture.world)
+        else:
+            self.fixture.world.remove_pane(pane)
+        record = self.record(row, "holder-stage")
+        record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch,
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        return row, stage, record, path
+
+    def check_holder_delivery_stage(self, state: str, *, drops_during_selection: bool) -> None:
+        _row, stage, record, path = self.prepare_holder_pass(state)
+        dispatch = stage.completion_id
+        observe = worker_panes.observe
+
+        def drop_stage() -> None:
+            progress_history.save_dispatch_delivery(self.run_dir, dispatch, replace(stage, completion_id=""))
+
+        def observe_and_drop(parent: staff.StaffId, membership: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            drop_stage()
+            return observe(parent, membership)
+
+        result = detached_runs.CompletedCommand(0)
+        if drops_during_selection:
+            with patch.object(worker_panes, "observe", new=observe_and_drop):
+                status = detached_runs.deliver(record, result)
+            expected = "the worker stage changed"
+        else:
+            drop_stage()
+            status = detached_runs.deliver(record, result)
+            expected = "the worker stage is unknown"
+        self.assertEqual(status, detached_runs.DEFERRED_WORKER_RESULT + expected)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), status)
+        self.assertNotIn("worker_result_receipt", saved)
+        self.assertNotIn("delivered_at", saved)
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch, stage)
+        self.assert_holder_result(record, "worker is stopped" if state == "stopped" else "worker pane is closed")
+
+    def test_holder_delivery_keeps_the_worker_lock_through_the_state_write(self) -> None:
+        row, _stage, record, path = self.prepare_holder_pass("closed")
+        checks: list[str] = []
+
+        def check_lock(label: str) -> None:
+            with self.assertRaises(BlockingIOError), worker_panes.worker_id_lock(row.id):
+                pass
+            checks.append(label)
+
+        def during_transport(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
+            check_lock("transport")
+            return self.holder_notice(options, membership=membership)
+
+        def during_save(target: Path, text: str) -> None:
+            if target == path and "sent: holder received the result" in text:
+                check_lock("delivery save")
+            write_text_atomic(target, text)
+
+        with (patch.object(send, "_send", new=during_transport),
+              patch.object(detached_runs, "write_text_atomic", new=during_save)):
+            self.assert_holder_result(record, "worker pane is closed")
+        self.assertEqual(checks, ["transport", "delivery save"])
+        with worker_panes.worker_id_lock(row.id):
+            pass
 
     def test_fixed_ordinary_worker_message_propagates_herdr_construction_error(self) -> None:
         row = self.fixture.worker("fixed-message", family="codex")

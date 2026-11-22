@@ -17,7 +17,6 @@ import json
 import shlex
 import os
 import re
-import secrets
 from pathlib import Path
 import subprocess
 import sys
@@ -34,7 +33,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
-from scripts.lib import atomic_file, conf, models_registry, nix_env, unit_runs
+from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
@@ -1157,64 +1156,6 @@ def checked_role_policy(role: WorkerRole | WorkerRoleUnavailable,
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, f"{role}: {error}")
 
 
-RESULT_RESTORE_TOKEN = "HERDR_WORKER_RESULT_RESTORE_TOKEN"
-
-
-class UseNormalWorkerLaunch(Enum):
-    CURRENT = "launch without a result restore authorization"
-
-
-@dataclass(frozen=True)
-class AuthorizedResultLaunch:
-    token: str
-
-
-def _result_launch_record(row: staff.StaffRow, pass_stage: ParkWaitingPass) -> Path:
-    key = hashlib.sha256(json.dumps((row.id, pass_stage.instance, pass_stage.stage)).encode()).hexdigest()
-    return pass_stage.run / f".result-restore-{key}.json"
-
-
-def authorize_result_launch(row: staff.StaffRow, pass_stage: ParkWaitingPass) -> AuthorizedResultLaunch:
-    """Record a launch token before Herdr can create a replacement pane."""
-    token = secrets.token_hex(32)
-    path = _result_launch_record(row, pass_stage)
-    atomic_file.write_text_atomic(path, json.dumps({"session": row.current_session, "token": token}))
-    return AuthorizedResultLaunch(token)
-
-
-def authorized_result_pane(pane: OpenWorker | StoppedWorker, pass_stage: ParkWaitingPass) -> bool:
-    """Check the replacement terminal or prove its launch token in the native process."""
-    path = _result_launch_record(pane.row, pass_stage)
-    saved = worker_lifecycle.read_json_object(path)
-    token = saved.get("token")
-    if saved.get("session") != pane.row.current_session or not isinstance(token, str) or not token:
-        return False
-    if "pane" in saved:
-        return saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal
-    if not isinstance(pane, OpenWorker) or not pane.terminal:
-        return False
-    backend = staff.backend(pane.row)
-    if isinstance(backend, staff.BackendUnavailable):
-        return False
-    client = _client()
-    current = client.pane_row(pane.pane)
-    if isinstance(current, herdr.NoPane) or current.get("terminal_id") != pane.terminal:
-        return False
-    native = client.native_pane_process(pane.pane, backend.family, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=current)
-    if native.current_identity != pane.row.current_session or native.environment.get(RESULT_RESTORE_TOKEN) != token:
-        return False
-    atomic_file.write_text_atomic(path, json.dumps({**saved, "pane": pane.pane, "terminal": pane.terminal}))
-    return True
-
-def result_restore_generation(pane: OpenWorker, pass_stage: ParkWaitingPass) -> str:
-    """Identify the authorized launch when it owns the observed pane."""
-    if not authorized_result_pane(pane, pass_stage):
-        return ""
-    saved = worker_lifecycle.read_json_object(_result_launch_record(pane.row, pass_stage))
-    return pass_recorder.string(saved.get("token"))
-
-
-
 def parked_launch_policy(row: staff.StaffRow, passed: dict[str, object]
                          ) -> LaunchPolicy | progress_history.ParkedLaunchUnavailable:
     """Use the saved policy only for the same native conversation."""
@@ -1471,7 +1412,6 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
                     codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
                     selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
-                    restore_launch: AuthorizedResultLaunch | UseNormalWorkerLaunch = UseNormalWorkerLaunch.CURRENT,
                     ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
@@ -1510,7 +1450,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
                 result = _start_locked(owner, name, role, policy, account, allowed, held, codex,
-                                       keep_model=keep_model, selection=target, restore_launch=restore_launch)
+                                       keep_model=keep_model, selection=target)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1559,8 +1499,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool,
-                  selection: SelectedWorkers | SelectedWorkerRows,
-                  restore_launch: AuthorizedResultLaunch | UseNormalWorkerLaunch) -> WorkerStart:
+                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1692,11 +1631,6 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
-    if isinstance(restore_launch, AuthorizedResultLaunch):
-        if row is None or switching or isinstance(current, OpenWorker):
-            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the result restore launch changed")
-        prepared = replace(prepared, env={**prepared.env, RESULT_RESTORE_TOKEN: restore_launch.token},
-                           unset_environment=prepared.unset_environment - {RESULT_RESTORE_TOKEN})
     if isinstance(current, OpenWorker) and not switching:
         herdr.forget_pane_evidence(client.session, current.pane)
         if not _stop_row(current.row, client, deadline=deadline):

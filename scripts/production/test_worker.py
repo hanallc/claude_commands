@@ -584,9 +584,12 @@ class WorkerCommandTests(unittest.TestCase):
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
         opened = self.opened()
-        _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+        instance = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
             prompt=self.prompt, kind="impl", lens="")
+        line = f"Review the files. End your final reply with DONE {instance}."
+        progress_history.save_dispatch_delivery(self.run_dir, instance,
+            pass_recorder.DispatchDelivery(line, instance, str(self.reply)))
         folder = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         folder.mkdir()
         path = folder / "orphan.json"
@@ -678,11 +681,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertNotIn("delivered_at", saved)
 
             passed = worker_panes.worker_pass(opened.row, self.run_dir)
-            instance = str(passed["instance_id"])
-            line = f"Review the files. End your final reply with DONE {instance}."
-            progress_history.save_dispatch_delivery(self.run_dir, instance,
-                pass_recorder.DispatchDelivery(line, instance, str(self.reply)))
-            self.agent.append(opened.pane, "user", line)
+            self.agent.append(opened.pane, "user", pass_recorder.dispatch_delivery(passed).line)
             pane["agent_status"] = "idle"
             code, _, errors = self.command("restore")
             self.assertEqual((code, errors), (0, ""), errors)
@@ -919,13 +918,29 @@ class WorkerCommandTests(unittest.TestCase):
                 finally:
                     _ = case.doCleanups()
 
-    def check_unaccepted_result(self, state: str) -> None:
+    def test_restore_filters_metadata_from_assignment_evidence(self) -> None:
+        self.check_unaccepted_result("working", assignment="metadata only")
+
+    def test_restore_accepts_a_real_assignment_after_metadata(self) -> None:
+        self.check_unaccepted_result("working", assignment="real after metadata")
+
+    def check_unaccepted_result(self, state: str, *, assignment: str = "absent") -> None:
         opened = self.opened()
         row, pane = opened.row, opened.pane
         instance = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
             worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt, kind="impl", lens="")
+        line = f"Review the files. End your final reply with DONE {instance}."
         progress_history.save_dispatch_delivery(self.run_dir, instance, pass_recorder.DispatchDelivery(
-            f"Review the files. End your final reply with DONE {instance}.", instance, str(self.reply)))
+            line, instance, str(self.reply)))
+        if assignment != "absent":
+            backend = staff.backend(row)
+            assert isinstance(backend, staff.CodexBackend)
+            source = worker_admission.transcript_source(row, backend)
+            with source.open("a", encoding="utf-8") as stream:
+                _ = stream.write(json.dumps({"type": "user", "isMeta": True,
+                                             "message": {"role": "user", "content": line}}) + "\n")
+            if assignment == "real after metadata":
+                self.agent.append(pane, "user", line)
         path, record = self.detached_record(row, "never-accepted")
         record.update(pane_dispatch_id=instance, exit_code=0, delivery="deferred: the worker was busy",
                       finished_at=datetime.now(timezone.utc).isoformat())
@@ -949,15 +964,25 @@ class WorkerCommandTests(unittest.TestCase):
             self.fixture.world.locations[pane]["agent_status"] = state
         report = worker.RestoreReport()
         launches = len(self.fixture.world.launches)
+        accepted = assignment == "real after metadata"
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
-            self.assertIs(worker.restore(self.fixture.parent.id, only=frozenset({row.id}), report=report),
-                          worker.ExitCode.UNCERTAIN)
-        self.assertIn("does not prove assignment acceptance", report.failures[row.id][1])
-        self.assertEqual(report.restored, set())
+            result = worker.restore(self.fixture.parent.id, only=frozenset({row.id}), report=report)
+        if accepted:
+            self.assertIs(result, worker.ExitCode.OK)
+            self.assertEqual(report.restored, {row.id})
+            self.assertEqual(report.failures, {})
+        else:
+            self.assertIs(result, worker.ExitCode.UNCERTAIN)
+            self.assertIn("does not prove assignment acceptance", report.failures[row.id][1])
+            self.assertEqual(report.restored, set())
+        dispatch = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(dispatch, progress_history.ActiveDispatch)
+        self.assertIsInstance(worker.resume_receipt(row, dispatch),
+                              worker.DispatchAwaitingReply if accepted else worker.DispatchNotSubmitted)
         self.assertEqual(len(self.fixture.world.launches), launches)
         resume.assert_not_called()
 
-    def test_restore_continues_an_accepted_result_across_park_and_pane_changes(self) -> None:
+    def test_restore_keeps_an_accepted_result_for_director_review(self) -> None:
         cases = ("retained working", "retained idle", "retained stopped", "retained closed",
                  "cleared idle", "cleared stopped", "cleared closed", "creation crash",
                  "continuation crash", "clearance crash", "changed during clearance", "waiting for runs")
@@ -966,58 +991,52 @@ class WorkerCommandTests(unittest.TestCase):
                 case = WorkerCommandTests("runTest")
                 case.setUp()
                 try:
-                    case.check_restore_parked_account("legacy result without the prompt", retry="continuation " + evidence)
+                    case.check_restore_parked_account("legacy result without the prompt", retry="review " + evidence)
                 finally:
                     _ = case.doCleanups()
 
-    def check_result_continuation(self, row: staff.StaffRow, pane: str, prior_park: dict[str, object],
-                                  evidence: str) -> None:
-        original_start = worker_panes.start_or_resume
+    def check_result_review(self, row: staff.StaffRow, pane: str, prior_park: dict[str, object],
+                            evidence: str) -> None:
+        from scripts.agents import restart, shutdown_record
+
         original_park = progress_history.record_worker_park
         deliver = pass_recorder.dispatch_delivery(prior_park)
         instance = str(prior_park["instance_id"])
         saved_launch = progress_history.parked_worker_launch(prior_park)
         assert isinstance(saved_launch, progress_history.ParkedWorkerLaunch)
         saved_launch = replace(saved_launch, model="retained-result-model")
-        if not evidence.startswith("cleared") and evidence != "creation crash":
+        parked = not evidence.startswith("cleared") and evidence not in ("creation crash", "clearance crash")
+        if parked:
             self.assertTrue(original_park(self.run_dir, row.id, instance, deliver.completion_id, launch=saved_launch))
+        expects_working = evidence in ("retained working", "changed during clearance")
         if evidence.endswith("closed") or evidence == "creation crash":
             self.fixture.world.remove_pane(pane)
         elif evidence.endswith("stopped"):
             _ = self.fixture.world.stop(row, self.fixture.world)
         else:
-            self.fixture.world.locations[pane]["agent_status"] = "working" if evidence.endswith("working") else "idle"
+            self.fixture.world.locations[pane]["agent_status"] = "working" if expects_working else "idle"
 
         sent: list[tuple[str, str]] = []
         before = len(self.fixture.world.launches)
         run_command = self.fixture.world.run
+        restart_entry = [str(row.id)]
+        shutdown_record.save(restart_entry)
 
-        def send_continuation(*args: str, deadline: float = math.inf) -> str:
-            if args[:2] == ("agent", "prompt") and f"Continue pass {instance}" in args[3]:
+        def record_input(*args: str, deadline: float = math.inf) -> str:
+            if args[:2] == ("agent", "prompt"):
                 sent.append((args[2], args[3]))
-                self.agent.append(args[2], "user", args[3])
             return run_command(*args, deadline=deadline)
 
-        def crash_after_creation(*args: object, **kwargs: object) -> worker_panes.WorkerStart:
-            start = cast(Callable[..., worker_panes.WorkerStart], original_start)
-            result = start(*args, **kwargs)
-            assert isinstance(result, worker_panes.OpenWorker)
-            self.assertNotEqual(result.pane, pane)
-            raise SystemExit("after pane creation")
-
-        def interrupt_clear(run: Path, identity: staff.StaffId, pass_id: str, stage: str, *,
-                            launch: progress_history.ParkedWorkerLaunch | progress_history.ClearWorkerPark) -> bool:
-            if evidence == "clearance crash":
-                self.assertTrue(original_park(run, identity, pass_id, stage, launch=launch))
-            elif evidence == "changed during clearance":
-                progress_history.save_dispatch_delivery(run, pass_id, replace(deliver, completion_id="changed-stage"))
-                return False
-            raise SystemExit("after continuation")
+        def change_stage(run: Path, _identity: staff.StaffId, pass_id: str, _stage: str, *,
+                         launch: progress_history.ParkedWorkerLaunch | progress_history.ClearWorkerPark) -> bool:
+            self.assertIs(launch, progress_history.ClearWorkerPark.MARKER)
+            progress_history.save_dispatch_delivery(run, pass_id, replace(deliver, completion_id="changed-stage"))
+            return False
 
         def restore(report: worker.RestoreReport) -> worker.ExitCode:
             return worker.restore(self.fixture.parent.id, only=frozenset({row.id}), report=report)
 
-        with (patch.object(self.fixture.world, "run", new=send_continuation),
+        with (patch.object(self.fixture.world, "run", new=record_input),
               patch.object(turn_end, "recover_completion", return_value=worker.CompletionRecovery.WAITING_ON_REPLY)
               as recovery):
             if evidence == "waiting for runs":
@@ -1028,41 +1047,36 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(sent, [])
                 self.assertTrue(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)))
                 recovery.return_value = worker.CompletionRecovery.WAITING_ON_REPLY
-            if evidence == "creation crash":
-                recovery.return_value = worker.CompletionRecovery.NO_PENDING_NOTICE
-                with (patch.object(worker_panes, "start_or_resume", new=crash_after_creation),
-                      self.assertRaisesRegex(SystemExit, "after pane creation")):
-                    _ = restore(worker.RestoreReport())
-                self.assertEqual(sent, [])
-            elif evidence in ("continuation crash", "clearance crash"):
-                with (patch.object(progress_history, "record_worker_park", new=interrupt_clear),
-                      self.assertRaisesRegex(SystemExit, "after continuation")):
-                    _ = restore(worker.RestoreReport())
-                self.assertEqual(len(sent), 1)
-                self.assertEqual(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)),
-                                 evidence == "continuation crash")
-            elif evidence == "changed during clearance":
+            if evidence == "changed during clearance":
                 failure = worker.RestoreReport()
-                with patch.object(progress_history, "record_worker_park", new=interrupt_clear):
+                with patch.object(progress_history, "record_worker_park", new=change_stage):
                     self.assertIs(restore(failure), worker.ExitCode.UNCERTAIN)
                 self.assertEqual(failure.restored, set())
                 self.assertIn("changed before park clearance", failure.failures[row.id][1])
+                self.assertEqual(sent, [])
+                self.assertEqual(self.fixture.world.launches[before:], [])
                 return
             for _attempt in range(2):
                 report = worker.RestoreReport()
-                self.assertIs(restore(report), worker.ExitCode.OK, report.failures)
-                self.assertEqual(report.restored, {row.id})
-                self.assertFalse(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)))
-        self.assertEqual(len(sent), 0 if evidence == "retained working" else 1)
-        launches = self.fixture.world.launches[before:]
-        if evidence.endswith(("stopped", "closed")) or evidence == "creation crash":
-            self.assertEqual(len(launches), 1)
-            self.assertEqual(self.agent.row(sent[0][0]).current_session, row.current_session)
-            if not evidence.startswith("cleared") and evidence != "creation crash":
-                args = self.fixture.world.requests[-1][1]
-                self.assertEqual(args[args.index("--model") + 1], saved_launch.model)
-        else:
-            self.assertEqual(launches, [])
+                result = restore(report)
+                current = worker_panes.worker_pass(row, self.run_dir)
+                if expects_working:
+                    self.assertIs(result, worker.ExitCode.OK, report.failures)
+                    self.assertEqual(report.restored, {row.id})
+                    self.assertFalse(progress_history.parked_worker_pass(current))
+                else:
+                    self.assertIs(result, worker.ExitCode.UNCERTAIN, report.failures)
+                    self.assertEqual(report.restored, set())
+                    self.assertIn("The director must inspect the worker", report.failures[row.id][1])
+                    self.assertEqual(progress_history.parked_worker_pass(current), parked)
+                    if parked:
+                        self.assertEqual(progress_history.parked_worker_launch(current), saved_launch)
+                    owner = self.fixture.parent
+                    results = restart.WorkerRestoreReports({owner.id: (owner, report)})
+                    self.assertNotIn(row.id, results.resolved(owner.id))
+                    self.assertEqual(shutdown_record.read(), restart_entry)
+        self.assertEqual(sent, [])
+        self.assertEqual(self.fixture.world.launches[before:], [])
 
     def check_restore_parked_account(self, cause: str, *, retry: str = "") -> None:
         from scripts.whoami import agent_accounts
@@ -1222,19 +1236,21 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.agent.row(started_panes[row.id]).current_session, row.current_session)
         if cause == "legacy result without the prompt":
             self.assertEqual(report.restored, {row.id})
-            self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+            saved_record = worker_lifecycle.read_json_object(path)
+            self.assertIn("worker_result_receipt", saved_record)
+            evidence = detached_runs.read_worker_result_receipt(saved_record)
+            assert isinstance(evidence, detached_runs.WorkerResultReceipt)
+            self.assertIs(evidence.park_acceptance, detached_runs.ParkedAssignmentAcceptance.VERIFIED)
             if retry:
                 reopened = started_panes[row.id]
-                if retry.startswith("continuation "):
-                    self.check_result_continuation(self.agent.row(reopened), reopened, parked_before,
-                                                   retry.removeprefix("continuation "))
+                if retry.startswith("review "):
+                    self.check_result_review(self.agent.row(reopened), reopened, parked_before,
+                                             retry.removeprefix("review "))
                 else:
                     self.check_saved_result_restore(self.agent.row(reopened), reopened, active, path, retry)
 
     def check_saved_result_restore(self, row: staff.StaffRow, pane: str, active: progress_history.ActiveDispatch,
                                    path: Path, evidence: str) -> None:
-        from scripts.lib.resume_message import BusyPass
-
         passed = worker_panes.worker_pass(row, self.run_dir)
         self.assertFalse(progress_history.parked_worker_pass(passed))
         original = pass_recorder.dispatch_delivery(passed)
@@ -1341,9 +1357,11 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(report.restored, {row.id})
             self.assertEqual([step.step for step in steps], [worker.UnsubmittedAssignment(expected_pass, expected_command)])
         elif evidence in ("idle", "closed"):
-            self.assertIs(result, worker.ExitCode.OK, report.failures)
-            self.assertEqual(report.restored, {row.id})
-            self.assertEqual([step.step for step in steps], [BusyPass(active.instance_id)])
+            self.assertIs(result, worker.ExitCode.UNCERTAIN, report.failures)
+            self.assertEqual(report.restored, set())
+            self.assertEqual(steps, [])
+            self.assertEqual(len(self.fixture.world.launches), launches)
+            self.assertIn("The director must inspect the worker", report.failures[row.id][1])
         else:
             self.assertIs(result, worker.ExitCode.UNCERTAIN, report.failures)
             self.assertIn("result delivery is uncertain", report.failures[row.id][1])
