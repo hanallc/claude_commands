@@ -1329,7 +1329,8 @@ function renderBuildLimits(limits) {
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="Build limits by repository and machine">
     <thead><tr><th scope="col">Repository</th>${headings}</tr></thead><tbody>${rows}</tbody></table></div>
     ${limitWaits(limits.unplaced)}
-    ${limits.history_unavailable ? '<p class="build-limit-note">Build history unavailable.</p>' : ""}
+    ${limits.history_stale ? '<p class="build-limit-note">Build history is stale.</p>'
+      : limits.history_unavailable ? '<p class="build-limit-note">Build history unavailable.</p>' : ""}
     <div class="build-limit-legend">${legend.map(([kind, label]) => `<span>${limitMarks(kind)}${label}</span>`).join("")}</div>`;
   if (lastBuildLimitsHtml === html) return;
   const scrollLeft = container.querySelector(".build-limits-scroll")?.scrollLeft ?? 0;

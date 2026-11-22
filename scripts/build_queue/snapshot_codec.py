@@ -94,8 +94,10 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         del record["verify"]
     if writing and "placement_block" in record and record["placement_block"] is None:
         del record["placement_block"]
-    if writing and record.get("placement_pending") is False:
-        del record["placement_pending"]
+    if writing and schema.__name__ == "WaitingStep":
+        for key in ("placement_pending", "placement_episode", "caller_start"):
+            if key in record and not record[key]:
+                del record[key]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.

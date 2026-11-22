@@ -3204,11 +3204,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if limit_background is not None:
         limit_names = limits_view.QueueNames(visible_waits,
             limit_cloud_names, {session: identity.owner_text for session, identity in labels.items()})
+        mac_disk_bytes = queue_view.current_mac_disk_bytes(mac_reading, mac_status)
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, limit_names,
             limits_view.Metric("Memory for builds", gib(captured.cap_use),
                                gib(captured.cap) if isinstance(captured.cap, int) else None, "GiB"),
             folder_settings, limit_background, zone, mac_runs,
-            gib(mac_reading.disk_free_bytes) if mac_reading.disk_free_bytes is not None else None)
+            gib(mac_disk_bytes) if mac_disk_bytes is not None else None)
     page["render_seconds"] = time.perf_counter() - started
     return page
 
@@ -3252,9 +3253,19 @@ class LimitsRefresh:
     def current(self, now: float, interval: float) -> limits_view.Background | None:
         if self.pending is not None and self.pending.done():
             try:
-                self.saved = self.pending.result()
+                current = self.pending.result()
+                previous = self.saved
+                if (isinstance(current.history, charts.IndexUnavailable) and previous is not None
+                        and isinstance(previous.history, limits_view.RecentRepositories)):
+                    current.origins.aliases.update(previous.history.origins.aliases)
+                    current.origins.folders = {**previous.history.origins.folders, **current.origins.folders}
+                    current = replace(current, history=previous.history, cloud_routes=previous.cloud_routes,
+                                      history_stale=True)
+                self.saved = current
             except (OSError, ValueError, KeyError, RuntimeError) as error:
                 print(f"Build limits refresh failed: {error}", file=sys.stderr)
+                if self.saved is not None and isinstance(self.saved.history, limits_view.RecentRepositories):
+                    self.saved = replace(self.saved, history_stale=True)
             self.pending = None
         if self.pending is None and now >= self.next_at:
             self.pending = Future()

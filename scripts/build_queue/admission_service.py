@@ -1434,6 +1434,12 @@ def wait_line_name(waiting: WaitingAdmission) -> str:
                                       row.get("folder", ""), row.get("step", ""))
 
 
+def placement_order_reason(request: wire.PlacementRequest) -> str:
+    identity = request.identity
+    name = codec.wait_line_name(identity.unit, identity.name, identity.folder, identity.step)
+    return records.behind_queue_text(name)
+
+
 @cache
 def loaded_git_revision(source_root: Path) -> str:
     """Read the source revision once per process."""
@@ -1504,7 +1510,7 @@ class AdmissionServer:
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
         self.active_placement_waits: set[str] = set()
-        self.placement_capacity_waits: dict[str, placement.PlacementDestination] = {}
+        self.placement_resource_waits: dict[str, records.PlacementBlock] = {}
         self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
         self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
             host_probe if host_probe is not None else self._read_host_evidence)
@@ -2703,28 +2709,31 @@ class AdmissionServer:
     def _placement_wait_reading(self, reading: records.QueueRead) -> records.QueueRead:
         if not self.placement_requests:
             return reading
-        requests = {records.run_owner(request.owner.pid, request.owner.start_time): request
-                    for request in self.placement_requests.values()}
         waiting: list[records.WaitingStep] = []
+        ordered: list[tuple[Path, records.RankedWaiter]] = []
         shown: set[str] = set()
-        for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True):
-            request = requests.get(records.run_owner(row["pid"], row["start_time"]))
+        for step, (path, row) in zip(reading.view.waiting, reading.ordered, strict=True):
+            episode = row.get("placement_episode", "")
+            request = self.placement_requests.get(episode)
             if request is not None:
-                shown.add(request.episode)
-                decision = self._placement_wait_decision(request, step.reason)
-                saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
+                shown.add(episode)
+                saved = self.assignments.get(self.current_assignments.get(episode, ""))
+                if saved is None and self._placement_refusal(request) is not None:
+                    continue
                 if saved is not None and saved.assignment.destination.provider != "local":
                     destination = saved.assignment.destination
-                    decision = records.PlacementBlock(destination.provider, destination.target, "starting", request.episode)
+                    decision = records.PlacementBlock(destination.provider, destination.target, "starting", episode)
+                else:
+                    decision = self._placement_wait_decision(request, step.reason)
                 step = replace(step, placement_block=decision if isinstance(decision, records.PlacementBlock) else None,
-                               placement_pending=isinstance(decision, wire.PlacementEvidenceWait))
+                               placement_pending=isinstance(decision, wire.PlacementEvidenceWait),
+                               placement_episode=episode)
             waiting.append(step)
-        ordered = list(reading.ordered)
+            ordered.append((path, row))
         remote = (request for episode in self.active_placement_waits - shown - self.current_assignments.keys()
                   if (request := self.placement_requests.get(episode)) is not None)
         for request in sorted(remote, key=lambda item: item.since):
-            candidates = self.placement_eligibility.get(request.episode, ())
-            if candidates and all(isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in candidates):
+            if self._placement_refusal(request) is not None:
                 continue
             decision = self._placement_wait_decision(request, None)
             row = self._placement_row(request)
@@ -2736,9 +2745,33 @@ class AdmissionServer:
                 row["since"], row["need"], records.ReadyForAdmission(), identity.unit,
                 project=gate.step_project(request.profile.repo), route=request.route, verify=identity.verify,
                 job=identity.job, placement_block=decision if isinstance(decision, records.PlacementBlock) else None,
-                placement_pending=isinstance(decision, wire.PlacementEvidenceWait)))
+                placement_pending=isinstance(decision, wire.PlacementEvidenceWait),
+                placement_episode=request.episode, caller_start=row["start_time"]))
             ordered.append((self.state_dir / records.waiter_owner(row), gate.rank_waiter(row, records.NormalOrder())))
         return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered)
+
+    def _placement_refusal(self, request: wire.PlacementRequest) -> str | None:
+        """Return the terminal refusal for a request without a current assignment."""
+        candidates = self.placement_eligibility.get(request.episode, ())
+        selection = request.constraints.selection
+        if isinstance(selection, placement.MacOnlyHost):
+            refusal = next((candidate.eligibility.reason for candidate in candidates
+                if candidate.destination.target == "mac"
+                and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
+                and candidate.eligibility.reason != "busy"), None)
+            if refusal is not None:
+                return refusal
+        if isinstance(selection, placement.PinnedHost):
+            selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
+            if selected and all(isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
+                    and isinstance(placement.retry_decision(candidate.destination, candidate.eligibility.reason, self.clock.now()),
+                                 placement.DoNotRetry) for candidate in selected):
+                return "; ".join(candidate.eligibility.reason for candidate in selected
+                    if isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion)))
+        if candidates and all(isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in candidates):
+            return "; ".join(candidate.eligibility.reason for candidate in candidates
+                            if isinstance(candidate.eligibility, placement.FixedExclusion))
+        return None
 
     def _placement_wait_decision(self, request: wire.PlacementRequest, reason: records.WaitReason | None
                                  ) -> records.WaitReason | records.PlacementBlock | wire.PlacementEvidenceWait:
@@ -2750,16 +2783,15 @@ class AdmissionServer:
                 or any(candidate.destination.provider == "local"
                        and isinstance(candidate.eligibility, placement.AllowedHost) for candidate in candidates)):
             return reason
-        if (destination := self.placement_capacity_waits.get(request.episode)) is not None:
-            return records.PlacementBlock(destination.provider, destination.target, "busy", request.episode)
+        if (block := self.placement_resource_waits.get(request.episode)) is not None:
+            return block
         possible = [candidate for candidate in candidates if not isinstance(candidate.eligibility, placement.FixedExclusion)]
-        if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in possible):
-            return wire.PlacementEvidenceWait()
-        # A local hold or a single remaining destination can set a resource wait.
+        # Prefer the local hold. Otherwise use the first blocked route when all routes have a known blocker.
         candidate = next((item for item in possible if item.destination.provider == "local"
                           and isinstance(item.eligibility, placement.TemporaryExclusion)
                           and item.eligibility.reason in ("blocked", "busy", "starting")), None)
-        if candidate is None and len(possible) == 1:
+        if candidate is None and possible and all(
+                isinstance(item.eligibility, placement.TemporaryExclusion) for item in possible):
             candidate = possible[0]
         if candidate is not None and isinstance(candidate.eligibility, placement.TemporaryExclusion):
             destination = candidate.destination
@@ -2815,7 +2847,7 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
-        waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
+        waiting = tuple(replace(step, verify=row.get("verify", step.verify), caller_start=row["start_time"])
                         for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
         reading = replace(reading, view=replace(reading.view, waiting=waiting))
         ci_holds = self._ci_hold_reasons()
@@ -2823,7 +2855,8 @@ class AdmissionServer:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
                 row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
-                ci_runner=row.get("ci_runner", ""), verify=row.get("verify", records.NotVerifyCall()))
+                ci_runner=row.get("ci_runner", ""), verify=row.get("verify", records.NotVerifyCall()),
+                caller_start=row["start_time"])
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -3581,6 +3614,7 @@ done
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
+        row["placement_episode"] = request.episode
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)
@@ -3884,30 +3918,10 @@ done
         if terminal:
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
-        selection = request.constraints.selection
-        if isinstance(selection, placement.MacOnlyHost):
-            refusal = next((candidate.eligibility.reason for candidate in candidates
-                if candidate.destination.target == "mac"
-                and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                and candidate.eligibility.reason != "busy"), "")
-            if refusal:
-                return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
-                    placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
-                    refusal, placement.DoNotRetry(refusal))
-        if isinstance(selection, placement.PinnedHost):
-            selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
-            if selected and all(isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                    and isinstance(placement.retry_decision(candidate.destination, candidate.eligibility.reason, self.clock.now()),
-                        placement.DoNotRetry) for candidate in selected):
-                reason = "; ".join(candidate.eligibility.reason for candidate in selected
-                    if isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion)))
-                return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""), placement.ClosedAssignment(reason),
-                    placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
-        if candidates and all(isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in candidates):
-            reason = "; ".join(candidate.eligibility.reason for candidate in candidates
-                if isinstance(candidate.eligibility, placement.FixedExclusion))
-            return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""), placement.ClosedAssignment(reason),
-                placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
+        if (refusal := self._placement_refusal(request)) is not None:
+            return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
+                placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
+                refusal, placement.DoNotRetry(refusal))
         ordered, _priority = self._queue_order()
         owner = records.waiter_owner(self._placement_row(request))
         position = next((index for index, (_, row) in enumerate(ordered, 1)
@@ -3947,7 +3961,7 @@ done
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
-        self.placement_capacity_waits.clear()
+        self.placement_resource_waits.clear()
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
             self.placement_hold_answers = {}
@@ -4009,7 +4023,7 @@ done
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
-                        _ = self.placement_capacity_waits.setdefault(request.episode, destination)
+                        self._record_placement_block(request, destination, "busy")
                         continue
                     competing = [copy for copy in copies if any(
                         choice.destination == candidate.destination and isinstance(choice.eligibility, placement.AllowedHost)
@@ -4017,7 +4031,7 @@ done
                     newest = max(competing, key=lambda copy: placement.copy_order(
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
                     if newest.episode != request.episode:
-                        _ = self.placement_capacity_waits.setdefault(request.episode, destination)
+                        self._record_placement_block(request, destination, placement_order_reason(newest))
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
@@ -4025,9 +4039,12 @@ done
                     continue
                 if destination.provider == "scaler":
                     continue
-                if (any(same_remote_resource(other, destination) for other in taken)
-                        or self._held_for_older(request, destination, held, holds)):
-                    _ = self.placement_capacity_waits.setdefault(request.episode, destination)
+                if any(same_remote_resource(other, destination) for other in taken):
+                    self._record_placement_block(request, destination, "busy")
+                    continue
+                older = self._held_for_older(request, destination, held, holds)
+                if older is not None:
+                    self._record_placement_block(request, destination, placement_order_reason(older))
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
@@ -4059,6 +4076,11 @@ done
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
             pending_remote_starts=frozenset(pending_remote_starts))
+
+    def _record_placement_block(self, request: wire.PlacementRequest,
+                                destination: placement.PlacementDestination, reason: str) -> None:
+        _ = self.placement_resource_waits.setdefault(request.episode,
+            records.PlacementBlock(destination.provider, destination.target, reason, request.episode))
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -4093,7 +4115,8 @@ done
         return PlacementHold(request.episode, destination, key, observed_at)
 
     def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                        held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
+                        held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]
+                        ) -> wire.PlacementRequest | None:
         """Keep a destination for an older request whose last reading predates this request's reading.
 
         The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
@@ -4107,14 +4130,17 @@ done
             reader = self.host_readers.get(hold.key)
             if reader is None:
                 continue
+            older = self.placement_requests.get(hold.episode)
+            if older is None:
+                continue
             start = holds.get((hold.episode, hold.destination))
             if start is None:
                 start = now
                 holds[(hold.episode, hold.destination)] = start
                 reader.worker.expedite(hold.key)
             if now - start <= self._waiting_pass_interval() + reader.timeout:
-                return True
-        return False
+                return older
+        return None
 
     def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
         assignment = request.assignment

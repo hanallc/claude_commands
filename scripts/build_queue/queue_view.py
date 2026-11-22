@@ -259,6 +259,11 @@ def mac_reading_status(reading: MacBuildReading, now: float) -> str:
     return f"Mac reading is old · age {age_text}"
 
 
+def current_mac_disk_bytes(reading: MacBuildReading, status: str) -> int | None:
+    """Use the same freshness decision for disk and build activity."""
+    return reading.disk_free_bytes if not status else None
+
+
 def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''

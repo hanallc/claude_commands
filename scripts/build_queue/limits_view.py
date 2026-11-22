@@ -85,6 +85,7 @@ class BuildLimits:
     repositories: tuple[RepositoryRow, ...]
     history_unavailable: bool
     unplaced: dict[str, list[str]]
+    history_stale: bool = False
 
 
 def recorded_origin(identity: str) -> str:
@@ -173,6 +174,7 @@ class Background:
     hana_money: Metric
     cloud_routes: dict[str, bool] = field(default_factory=dict[str, bool])
     origins: Origins = field(default_factory=Origins)
+    history_stale: bool = False
 
 
 def recent_steps(connection: sqlite3.Connection, now: float,
@@ -421,8 +423,7 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
     for entry in queue_view.waiting_builds(model):
         if isinstance(entry, queue_view.WaitingBuild):
             step = entry.step
-            block = step.placement_block
-            key = block.episode if block is not None and block.episode else (step.pid, step.since)
+            key = step.episode or (step.pid, step.since)
             name = local_names.get(entry.position)
         elif isinstance(entry, wire.CloudRow):
             key = entry.owner
@@ -524,8 +525,10 @@ def queue_wait(step: records.WaitingStep, cause: records.WaitReason, local_targe
         return "mac", "Placement pending"
     if isinstance(route, target_config.PinnedTarget) and route.target != local_target:
         return machine_for_target(route.target, local_target, mac_target, aws_targets), "Placement pending"
-    if isinstance(cause, records.BehindHead) and cause.head_name == "remote startup":
-        return None, "Waiting for remote startup"
+    if isinstance(cause, records.BehindHead):
+        if cause.head_name == "remote startup":
+            return None, "Waiting for remote startup"
+        return "natedev", records.behind_queue_text(public_queue_text(cause.head_name) or "the first step")
     if isinstance(cause, (records.NeedsMemory, records.MemoryPressure)):
         return "natedev", "Memory"
     if isinstance(cause, records.TokenWaitingWaiter):
@@ -537,9 +540,9 @@ def with_mac_claim_waits(reading: records.QueueRead, snapshots: target_availabil
     """Show claim waits once, including calls that did not ask for placement."""
     waiting = list(reading.view.waiting)
     found = snapshots if isinstance(snapshots, tuple) else ()
-    matched = {step.placement_block.episode: index for index, step in enumerate(waiting)
-               if step.placement_block is not None and step.placement_block.episode}
-    callers = {(step.pid, step.folder): index for index, step in enumerate(waiting)}
+    matched = {step.episode: index for index, step in enumerate(waiting) if step.episode}
+    callers = {(step.pid, step.caller_start, step.folder): index for index, step in enumerate(waiting)
+               if not step.episode and step.caller_start}
     for snapshot in found:
         target = snapshot.target
         if not isinstance(target, target_config.SshTarget) or target.platform != "macos":
@@ -547,15 +550,18 @@ def with_mac_claim_waits(reading: records.QueueRead, snapshots: target_availabil
         directory = target_config.ssh_target_state_directory(target.name)
         for wait in claim_state.read_claim_waits(claim_state.StatePaths(directory, target.name)):
             block = records.PlacementBlock("mac", target.name, wait.reason, wait.episode)
-            index = matched.get(wait.episode, callers.get((wait.caller, wait.folder)))
+            caller = (wait.caller, wait.caller_start, wait.folder)
+            index = matched.get(wait.episode) if wait.episode else callers.get(caller)
             if index is not None:
                 waiting[index] = replace(waiting[index], placement_block=block, placement_pending=False)
                 continue
-            callers[(wait.caller, wait.folder)] = len(waiting)
             if wait.episode:
                 matched[wait.episode] = len(waiting)
+            else:
+                callers[caller] = len(waiting)
             waiting.append(records.WaitingStep(wait.caller, wait.session, wait.name, wait.name,
-                wait.folder, wait.since, 0, records.ReadyForAdmission(), placement_block=block))
+                wait.folder, wait.since, 0, records.ReadyForAdmission(), placement_block=block,
+                placement_episode=wait.episode, caller_start=wait.caller_start))
     return replace(reading, view=replace(reading.view, waiting=tuple(waiting)))
 
 
@@ -680,11 +686,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 if project:
                     row(project).aws.runs.append(label)
 
-    by_pid = {step.pid: step for step in reading.view.waiting}
-    causes = {pid: wait_cause(step) for pid, step in by_pid.items()}
-    ahead = {entry.waiter.pid: hold.waiter["pid"] for entry in explanation.line.steps
-             if isinstance(hold := entry.decision.order_hold, records.HeldBehindHead)}
-    order = {item["pid"]: item for _, item in reading.ordered}
+    order = reading.ordered
     for visible in names.waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
@@ -694,17 +696,10 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 record_wait("", "aws", reason, visible.name)
             continue
         step = entry.step
-        item = order.get(step.pid)
+        item = order[entry.position - 1][1] if entry.position <= len(order) else None
         key = item.get("repo_identity", "") if item is not None and item.get("folder") == step.folder else ""
         project = origins.resolve(key, step.folder)
-        cause = causes[step.pid]
-        if isinstance(cause, records.BehindHead) and step.pid in ahead:
-            head = ahead[step.pid]
-            cause = causes.get(head, cause)
-            causes[step.pid] = cause
-            if step.placement_block is None and not step.placement_pending and head in by_pid:
-                step = replace(step, placement_block=by_pid[head].placement_block,
-                               placement_pending=by_pid[head].placement_pending)
+        cause = wait_cause(step)
         machine, reason = queue_wait(step, cause, inputs.local_machine, mac_name, aws_targets)
         if isinstance(cause, records.RunLimitWait) and reason == "Run limit full":
             if cause.repository != origin_name(project):
@@ -775,4 +770,4 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                        MachineLimits(target_state(mac, zone), mac_shared, shared["mac"]),
                        MachineLimits(aws_state, (Metric("Cloud gates", cloud_used, cloud_limit), saved.aws_money),
                                      shared["aws"]),
-                       ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced)
+                       ordered, isinstance(saved.history, charts.IndexUnavailable), unplaced, saved.history_stale)

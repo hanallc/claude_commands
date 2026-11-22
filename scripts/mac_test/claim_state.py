@@ -478,6 +478,7 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
 @dataclass(frozen=True)
 class ClaimWait:
     caller: int
+    caller_start: str
     folder: str
     name: str
     session: str
@@ -541,7 +542,7 @@ def read_claim_waits(paths: StatePaths) -> tuple[ClaimWait, ...]:
             if (isinstance(since, (int, float))
                     and isinstance(folder, str) and isinstance(name, str) and isinstance(session, str)
                     and isinstance(episode, str) and row.get("reason") == "busy"):
-                waits.append(ClaimWait(caller, folder, name, session, episode, "busy", since))
+                waits.append(ClaimWait(caller, caller_start, folder, name, session, episode, "busy", since))
         except (StateReadError, OSError):
             continue
     return tuple(sorted(waits, key=lambda wait: wait.since))

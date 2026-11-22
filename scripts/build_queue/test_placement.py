@@ -1937,8 +1937,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             evidence = publish_candidate(fixture, younger)
             server.placement_host_keys[(younger.episode, destination)] = evidence.key
             held_for_older = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, list[service.PlacementHold],
-                dict[tuple[str, placement.PlacementDestination], float]], bool], getattr(server, "_held_for_older"))
-            self.assertFalse(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
+                dict[tuple[str, placement.PlacementDestination], float]], wire.PlacementRequest | None],
+                getattr(server, "_held_for_older"))
+            self.assertIsNone(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
             self.assertIsNone(hold)
 
     def client_constraints(self, request: wire.PlacementRequest) -> placement.PlacementConstraints:

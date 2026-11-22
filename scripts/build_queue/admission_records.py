@@ -685,6 +685,7 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    placement_episode: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1013,10 @@ class BehindHead:
     head_session_id: str
 
 
+def behind_queue_text(name: str) -> str:
+    return f"Behind {name} in the queue"
+
+
 @dataclass(frozen=True)
 class ReadyForAdmission:
     """The step is ready for the next admission check."""
@@ -1131,6 +1136,12 @@ class WaitingStep:
     ci_runner: str = field(default="", kw_only=True)
     placement_block: PlacementBlock | None = field(default=None, kw_only=True)
     placement_pending: bool = field(default=False, kw_only=True)
+    placement_episode: str = field(default="", kw_only=True)
+    caller_start: str = field(default="", kw_only=True)
+
+    @property
+    def episode(self) -> str:
+        return self.placement_episode or (self.placement_block.episode if self.placement_block is not None else "")
 
 
 @dataclass(frozen=True)
