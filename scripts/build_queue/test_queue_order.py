@@ -30,6 +30,100 @@ def ids(line: records.QueueMoveLine) -> list[str]:
 
 
 class QueueMoveTests(unittest.TestCase):
+    def test_absent_continuation_keeps_its_run_order_after_restart(self) -> None:
+        with PlacementFixture() as fixture:
+            now = fixture.clock.now()
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, since=now - 30, need=GIB))
+            fixture.free(0)
+            fixture.hold_starts()
+            continuation = fixture.request(run=run, since=now - 5)
+            pinned = fixture.request(since=now - 4)
+            departing = placement_request(fixture, since=now - 10)
+            departing = replace(departing, constraints=replace(departing.constraints,
+                candidates=(*departing.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, departing, placement.TemporaryExclusion("busy"))
+            for request in (departing, continuation, pinned):
+                _ = fixture.server.handle_request(request)
+            line = move_line(fixture)
+            self.assertEqual(fixture.queue_pids(), [continuation.owner.pid, departing.owner.pid, pinned.owner.pid])
+            continuing_id, departing_id, pinned_id = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "pin-before-departure", pinned_id, line.revision, wire.QueueDrop(departing_id, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [continuing_id, pinned_id, departing_id])
+
+            fixture.restart()
+            _ = publish_candidate(fixture, departing, placement.TemporaryExclusion("busy"))
+            self.assertIsInstance(fixture.server.handle_request(departing)[0], wire.PlacementWait)
+            self.assertEqual(ids(move_line(fixture)), [departing_id])
+            self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                "cancel", departing.episode, departing.owner, "fixture")), [wire.Ok()])
+            self.assertEqual(fixture.server.queue_pins, ((pinned_id, 1),))
+            for request in (pinned, continuation):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(ids(move_line(fixture)), [continuing_id, pinned_id])
+
+    def test_undo_after_a_departure_keeps_the_other_pin_at_its_current_place(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            leaving = placement_request(fixture, since=fixture.clock.now() - 10)
+            leaving = replace(leaving, constraints=replace(leaving.constraints,
+                candidates=(*leaving.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, leaving, placement.TemporaryExclusion("busy"))
+            self.assertIsInstance(fixture.server.handle_request(leaving)[0], wire.PlacementWait)
+            for index in range(6):
+                request = fixture.request(since=fixture.clock.now() + index)
+                _ = fixture.server.handle_request(request)
+            line = move_line(fixture)
+            departing, first, third, pinned, fourth, fifth, last = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "pin-third", pinned, line.revision, wire.QueueDrop(third, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [departing, first, pinned, third, fourth, fifth, last])
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "drag-last", last, moved.line.revision, wire.QueueDrop(fifth, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                "cancel-first", leaving.episode, leaving.owner, "fixture")), [wire.Ok()])
+            _ = fixture.run_pass()
+            current = move_line(fixture)
+            self.assertEqual(ids(current), [first, pinned, third, fourth, last, fifth])
+            self.assertEqual(fixture.server.queue_pins, ((pinned, 1), (last, 4)))
+            undone, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "undo-last", last, current.revision, wire.QueueUndo("drag-last")))
+            assert isinstance(undone, wire.QueueMoved)
+            self.assertEqual(ids(undone.line), [first, pinned, third, fourth, fifth, last])
+            self.assertEqual(fixture.server.queue_pins, ((pinned, 1), (last, 5)))
+
+    def test_tail_drag_keeps_main_continuation_claim_order(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            running = fixture.request(run=run, need=4 * GIB)
+            fixture.allow_next_start()
+            grant, = fixture.server.handle_request(running)
+            assert isinstance(grant, wire.Admitted)
+            fixture.free(0)
+            fixture.hold_starts()
+            earlier = fixture.request(run=run, since=running.since + 1, owner=fixture.fixture_owner(700002, "4000"))
+            later = fixture.request(run=run, since=running.since + 2, owner=fixture.fixture_owner(700001, "4000"))
+            tail = [fixture.request(since=running.since + index) for index in (3, 4)]
+            for request in (earlier, later, *tail):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            first, second, third, fourth = ids(line)
+            self.assertEqual(fixture.queue_pids()[:2], [later.owner.pid, earlier.owner.pid])
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "drag-tail", fourth, line.revision, wire.QueueDrop(third, "before")))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(ids(moved.line), [first, second, fourth, third])
+            _ = fixture.run_pass()
+            fixture.release(grant)
+            claim = fixture.server.slots[grant.reservation]
+            assert isinstance(claim, records.ContinuationSlot)
+            self.assertEqual(claim.owner, records.run_owner(earlier.owner.pid, earlier.owner.start_time))
+
     def test_second_move_sets_all_pins_to_the_confirmed_places(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -56,7 +150,7 @@ class QueueMoveTests(unittest.TestCase):
                 "undo-second", first, move.line.revision, wire.QueueUndo("pin-after")))
             assert isinstance(undo, wire.QueueMoved)
             self.assertEqual(ids(undo.line), [first, second, third, pinned, fourth])
-            self.assertEqual(fixture.server.queue_pins, ((pinned, 3),))
+            self.assertEqual(fixture.server.queue_pins, ((first, 0), (pinned, 3)))
 
     def test_departure_behind_an_absent_pin_keeps_its_place_after_restart(self) -> None:
         with PlacementFixture() as fixture:
@@ -224,7 +318,7 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual((undone.old_place, undone.new_place), (2, 5))
             self.assertEqual(ids(undone.line), ids(line))
-            self.assertEqual(fixture.server.queue_pins, ())
+            self.assertEqual(fixture.server.queue_pins, ((third, 4),))
 
             request = wire.QueueMoveRequest("move", third, undone.line.revision, wire.QueueDrop(merge, "before"))
             moved, = fixture.server.handle_request(request)
@@ -266,8 +360,8 @@ class QueueMoveTests(unittest.TestCase):
             undone, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "undo-after-bump", third, current.revision, wire.QueueUndo("move")))
             assert isinstance(undone, wire.QueueMoved)
-            self.assertEqual(ids(undone.line), [merge, urgent, first, third, new_id, second])
-            self.assertEqual(fixture.server.queue_pins, ())
+            self.assertEqual(ids(undone.line), [merge, urgent, first, new_id, second, third])
+            self.assertEqual(fixture.server.queue_pins, ((third, 5),))
             restored, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "move-after-undo", third, undone.line.revision, wire.QueueDrop(merge, "before")))
             assert isinstance(restored, wire.QueueMoved)
@@ -332,13 +426,13 @@ class QueueMoveTests(unittest.TestCase):
                 "move-again", second, reply.line.revision, wire.QueueDrop(last, "after")))
             fixture.proc.kill(requests[2].owner)
             fixture.restart()
-            self.assertEqual(fixture.server.queue_pins, ((second, 2),))
+            self.assertEqual(fixture.server.queue_pins, ((first, 0), (second, 2)))
             for waiting in (requests[0], requests[1], requests[3]):
                 _ = fixture.server.handle_request(waiting)
             current = move_line(fixture)
             reply, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "missing-neighbor", second, current.revision, wire.QueueUndo("move-again")))
-            self.assertEqual(reply, wire.QueueMoveConflict(current, "Undo not available"))
+            self.assertEqual(reply, wire.QueueMoveConflict(current, "The old neighbor left the queue."))
 
     def test_mac_only_join_refuses_a_confirm_with_an_old_revision(self) -> None:
         with PlacementFixture() as fixture:

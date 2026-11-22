@@ -2366,10 +2366,12 @@ The service saves pins in `state.json` when a move completes.
 A pin records the request ID and the number of rows ahead.
 Each confirmed move sets the place of every visible pin to its confirmed position.
 If an absent pin occupies a confirmed place, the service moves it to the next free place.
-The service sorts unpinned waits in priority group order.
+The service applies pins after it sorts the waits.
 It inserts present pinned waits in place order and clamps each insertion to the end.
+Continuation claims use the step order before the service applies pins.
 A request that starts or ends removes one place from pins behind it in the full order.
 The full order includes absent requests and applies their pins.
+An absent step keeps its run identity to recover the run's saved queue time.
 The service keeps a pin while a request is temporarily absent.
 A request that starts or ends loses its own pin.
 Both hosts use the visible order for normal steps.
@@ -2382,8 +2384,10 @@ A refusal before launch keeps the pin and any active local startup claim.
 
 The service checks the order revision for all rows, including rows without handles.
 Its replay ledger records the reply with the new order.
-Undo restores the previous pins for requests that still have a place if the move still applies.
-Without a pin, the wait returns to its current priority group.
+Undo moves the step before its former next neighbor.
+If the step was last, Undo moves it after its former previous neighbor.
+If that neighbor left the queue, the service refuses Undo.
+Undo uses the current queue order and saves pins as a new move.
 A conflict supplies the current order.
 The page requires a complete move list before it enables another move.
 The page shows an unnamed wait as “Build step.”

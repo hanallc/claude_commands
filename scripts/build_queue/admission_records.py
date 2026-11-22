@@ -641,7 +641,6 @@ class Waiter(TypedDict):
     since: float
     order_since: NotRequired[float]
     move_id: NotRequired[str]
-    queue_position: NotRequired[int]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
@@ -685,6 +684,16 @@ class NormalOrder:
 
 class RankedWaiter(Waiter):
     order: PriorityUnit | NormalOrder
+
+
+def order_moved_waiters[T](rows: list[T], move_order: tuple[str, ...], row_id: Callable[[T], str]) -> list[T]:
+    """Apply the confirmed order to the rows in this queue."""
+    if not move_order:
+        return rows
+    members = set(move_order)
+    tracked = {key: row for row in rows if (key := row_id(row)) in members}
+    moved = iter(tracked[key] for key in move_order if key in tracked)
+    return [next(moved) if row_id(row) in tracked else row for row in rows]
 
 
 def waiter_priority(row: Waiter) -> PriorityUnit | NormalOrder:
@@ -1317,6 +1326,7 @@ class QueueInputs:
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
+    move_order: tuple[str, ...] = field(default=(), kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)

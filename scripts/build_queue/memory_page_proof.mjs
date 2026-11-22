@@ -155,6 +155,7 @@ try {
   let servedReading = base;
   let currentFixture = base;
   let queueFixture = null;
+  const undoDrops = new Map();
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
@@ -173,14 +174,19 @@ try {
       const line = () => ({revision:queueFixture.move_revision, members:ordered.map(row => row.move)});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
       const index = ordered.findIndex(row => row.move.row_id === row_id);
+      const after = ordered[index + 1]?.move.row_id;
+      const before = ordered[index - 1]?.move.row_id;
+      const drop = destination.kind === 'QueueUndo' ? undoDrops.get(destination.move_request_id) : destination;
+      if (!drop || !ordered.some(item => item.move.row_id === drop.neighbor)) {
+        return json(409, {reason:'The old neighbor left the queue.', line:line()});
+      }
       const [row] = ordered.splice(index, 1);
-      const neighbor = ordered.findIndex(item => item.move.row_id === destination.neighbor);
-      const undo = destination.kind === 'QueueUndo';
-      const next = undo ? queueFixture.undoPlace : neighbor + (destination.side === 'after' ? 1 : 0);
+      const neighbor = ordered.findIndex(item => item.move.row_id === drop.neighbor);
+      const next = neighbor + (drop.side === 'after' ? 1 : 0);
       ordered.splice(next, 0, row);
       let place = 0;
       queueFixture.waiters = rows.map(item => item.move ? ordered[place++] : item);
-      queueFixture.undoPlace = index;
+      undoDrops.set(request.request_id, after ? {neighbor:after, side:'before'} : {neighbor:before, side:'after'});
       queueFixture.move_revision += '1';
       return json(200, {line:line(), old_place:index + 1, new_place:next + 1});
     }

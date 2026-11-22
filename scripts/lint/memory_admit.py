@@ -462,9 +462,10 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
 
 def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
     """Resolve order metadata without adding it to captured waiter rows."""
-    return sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
+    ordered = sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
                    for path, row in inputs.ordered),
                   key=lambda item: waiter_order(item[1]))
+    return records.order_moved_waiters(ordered, inputs.move_order, lambda item: item[1].get("move_id", ""))
 
 
 
@@ -1401,9 +1402,7 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
-def waiter_order(row: Waiter, *, use_pin: bool = True) -> tuple[int, float, int]:
-    if use_pin and "queue_position" in row:
-        return -1, float(row["queue_position"]), row["pid"]
+def waiter_order(row: Waiter) -> tuple[int, float, int]:
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
     return rank, row.get("order_since", row["since"]), row["pid"]
@@ -2095,6 +2094,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     first_held: Waiter | NoWaiter = NoWaiter()
     first_held_other_than_gpu: Waiter | NoWaiter = NoWaiter()
     parallel_holds: list[tuple[RankedWaiter, frozenset[str]]] = []
+    positions = ({records.waiter_owner(row): index for index, (_, row) in enumerate(ordered)}
+                 if inputs.parallel_remote_starts else {})
     for _, row in ordered:
         owner = records.waiter_owner(row)
         claim = claims.get(owner)
@@ -2133,7 +2134,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
         for hold, allowed in parallel_holds:
-            if not isinstance(ahead, NoWaiter) and waiter_order(ahead) < waiter_order(hold):
+            if (not isinstance(ahead, NoWaiter)
+                    and positions[records.waiter_owner(ahead)] < positions[records.waiter_owner(hold)]):
                 break
             if owner not in allowed:
                 ahead = hold

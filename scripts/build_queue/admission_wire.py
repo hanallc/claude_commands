@@ -325,9 +325,6 @@ class QueueMoved:
     new_place: int
     old_before: str
     old_after: str
-    new_before: str
-    new_after: str
-    previous_pins: tuple[tuple[str, int], ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
