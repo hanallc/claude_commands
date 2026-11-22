@@ -1804,6 +1804,27 @@ After all violations, the call exits 2 with no Cargo call except `metadata`.
 `verify.sh example-test` exits 2 before any work.
 It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
+### Stop a Builds run
+
+The Running table offers **Kill this run** beside a verified natedev Cargo or Verify PID.
+The confirmation shows the row, process tree, progress, and recorded caller.
+The server determines the caller from the reservation's session ID and the current staff record.
+
+1. The feed publishes an opaque reference for each eligible reservation.
+2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
+3. The server reads the reservation and process evidence again when the operator confirms.
+4. The server stops a dedicated program scope through the user manager or requests a stop through the detached run record.
+5. The holder or supervisor completes its normal cleanup.
+6. The server sends the caller the stop notice after it confirms the stop.
+
+The server supplies the first line of the notice.
+The operator can add words in the confirmation.
+The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.
+**Message sent**, **Message queued**, and **Message failed** describe the delivery result.
+The console keeps the result visible for `kill_result_seconds` after the row leaves the table.
+Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
+The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
+
 ## Invariants
 
 - Every compiling step and every BRP launch passes the memory gate before it starts. Sweep, `cargo fmt` and `taplo` steps never wait on it, so the disk floor is never held by memory.

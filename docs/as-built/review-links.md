@@ -1807,6 +1807,14 @@ If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
 A Go change (`POST /console/tune`) must supply `Origin` and the token.
 The server returns 403 when the host or origin check fails.
 
+The Builds Kill action uses `GET /console/build-kill` for current handles and recent results.
+`POST /console/build-kill` requires the matching Origin and request token.
+The server limits the form to `kill_request_bytes`.
+Both requests require the Tailscale login in `kill_operator_login`.
+The default admits the user ID that owns the untagged local Tailscale node.
+The server checks the socket peer with Tailscale WhoIs.
+The Builds queue verifies the scope or detached command before it stops a run.
+
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
   The server uses the monotonic clock. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.

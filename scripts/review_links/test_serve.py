@@ -42,7 +42,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
-from scripts.build_queue import memory_feed
+from scripts.build_queue import kill_action, memory_feed
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
 from scripts.production import (
@@ -4199,6 +4199,40 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, content = self.post(accounts_page.PAGE_PATH, body)
             self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
             tune.assert_called_once()
+
+    def test_build_kill_requires_origin_operator_token_and_bounded_body(self) -> None:
+        settings = self.root.parent / "kill-config"
+        settings.mkdir()
+        _ = write_config_fixture(settings / "review_links.conf", "# whole: 1024..65536\nkill_request_bytes=4096")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
+        origin = f"http://127.0.0.1:{self.port}"
+        token = self.server.new_item_token
+        reference, handle = "a" * 64, "b" * 64
+        form = {"token": token, "reference": reference, "handle": handle, "words": "Use the next slot."}
+        result: kill_action.KillResult = {"reference": reference, "step": "check", "pid": 17,
+            "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.QUEUED}
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "kill_operator", return_value=False) as operator,
+              patch.object(self.server.kill_actions, "options", return_value=({}, [])) as options,
+              patch.object(self.server.kill_actions, "stop", return_value=result) as stop):
+            self.assertEqual(self.request(kill_action.PATH).status, 403)
+            options.assert_not_called()
+            self.assertEqual(self.post(kill_action.PATH, urlencode(form), origin=origin)[0], 403)
+            operator.return_value = True
+            self.assertEqual(self.request(kill_action.PATH).status, 200)
+            options.assert_called_once_with()
+            for sent_origin, values, expected in (
+                ("", form, 403),
+                ("http://wrong.invalid", form, 403),
+                (origin, {**form, "token": "wrong"}, 403),
+                (origin, {**form, "words": "x" * 4097}, 400),
+            ):
+                with self.subTest(origin=sent_origin, status=expected):
+                    self.assertEqual(self.post(kill_action.PATH, urlencode(values), origin=sent_origin)[0], expected)
+            stop.assert_not_called()
+            status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
+            self.assertEqual((status, json.loads(body)), (200, {"result": result}))
+            stop.assert_called_once_with(reference, handle, form["words"])
 
     def test_console_tune_requires_the_origin_and_token(self) -> None:
         key = "faster_box_max_cost_ratio"
