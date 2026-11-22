@@ -23,6 +23,7 @@ from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -135,6 +136,7 @@ class RunRecord(StopFields):
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     delivered_at: NotRequired[float]
+    worker_result_digest: NotRequired[str]
     blocked_notice_accepted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
     push_alert_attempted: NotRequired[Literal[True]]
@@ -302,7 +304,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                             for key in ("command_pid", "command_group", "exit_code", "push_retries"))
                     and all(key not in raw or isinstance(raw[key], str)
                             for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
-                                        "delivery", "ended", "stop_reason"))
+                                        "delivery", "ended", "stop_reason", "worker_result_digest"))
                     and ("hold_stop_requests" not in raw or _is_hold_stop_requests(raw["hold_stop_requests"]))
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
@@ -1765,6 +1767,37 @@ def result_message(record: RunRecord, result: CommandResult) -> str:
     return result_text(record, result)
 
 
+def _worker_result_message(record: RunRecord, result: CommandResult) -> str:
+    return f"Detached run: {record['run_id']}\n" + result_message(record, result)
+
+
+def _worker_result_digest(text: str) -> str:
+    return hashlib.sha256(text.strip().encode()).hexdigest()
+
+
+def confirmed_worker_results(runs: Path, worker: staff.StaffRow, ids: Collection[str]) -> Generator[RunRecord]:
+    """Read finished results with recorded delivery to the worker."""
+    for run_id in ids:
+        if not run_id or Path(run_id).name != run_id:
+            continue
+        record = worker_lifecycle.read_json_object(runs / f"{run_id}.json")
+        if (not _is_run_record(record) or record["run_id"] != run_id or record["staff_id"] != worker.id
+                or record["status"] != "finished" or Path(record["session_dir"]).resolve() != runs.parent.resolve()):
+            continue
+        delivery = record.get("delivery", "")
+        if (delivery == f"already delivered: {run_id}"
+                or any(delivery.startswith(f"sent: worker {name} at ") and delivery.rsplit(" at ", 1)[1]
+                       for name in (worker.name, record["worker"]))):
+            yield record
+
+
+def matches_worker_result_message(record: RunRecord, text: str) -> bool:
+    """Require the full delivered message. Old records retain the result source."""
+    if digest := record.get("worker_result_digest"):
+        return _worker_result_digest(text) == digest
+    return text.strip() == _worker_result_message(record, command_result(record)).strip()
+
+
 def deliver(record: RunRecord, result: CommandResult, *,
             worker_input: WorkerResultInput = WorkerResultInput.TYPE,
             resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
@@ -1781,7 +1814,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
 
     marker = f"Detached run: {record['run_id']}"
 
-    def save_push(sent: send.Result, *, interrupted: bool = False) -> str:
+    def save_push(sent: send.Result, *, interrupted: bool = False, worker_result: str = "") -> str:
         detail = f"{sent.outcome}: {sent.detail}"
         if isinstance(sent, (send.UncertainRelayDelivery, send.WorkerMessageUnconfirmed)):
             detail = UNCONFIRMED_RESULT_PUSH + detail
@@ -1791,7 +1824,9 @@ def deliver(record: RunRecord, result: CommandResult, *,
             detail = UNCONFIRMED_RESULT_PUSH + detail
         elif interrupted:
             detail = INTERRUPTED_PASS_DELIVERY + detail
-        return _save_delivery(path, detail)
+        digest = (_worker_result_digest(worker_result)
+                  if worker_result and isinstance(sent, send.PaneTextDelivered) and not interrupted else "")
+        return _save_delivery(path, detail, worker_result_digest=digest)
 
     def save_deferral(detail: str) -> str:
         return _save_delivery(path, saved if saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION)) else detail)
@@ -1830,7 +1865,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
                     return save_deferral(DEFERRED_WORKER_RESULT + f"director unavailable: {error}")
             options = send.parse(["--to", str(member.id), "--from", "detached-runs",
                                   "--timeout", str(send_budget.seconds()), "--text",
-                                  marker + "\n" + result_message(record, result)])
+                                  _worker_result_message(record, result)])
             _ = _save_delivery(path, checkpoint)
             with _keep_send_error(path), staff.supplied_snapshot(membership):
                 sent = send.send(options)
@@ -1934,7 +1969,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
                     return save_deferral(DEFERRED_WORKER_RESULT + "the resumed worker is unavailable")
                 worker = resumed
                 receipt = replace(receipt, worker_only=True)
-            text = marker + "\n" + result_message(record, result)
+            text = _worker_result_message(record, result)
             timeout = send_budget.seconds()
             with _keep_send_error(path):
                 delivery = send.deliver_worker_text(worker, membership, text,
@@ -1959,7 +1994,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
             return _save_delivery(path, prefix + delivery.detail)
         if delivery.outcome == "retry":
             return save_deferral(DEFERRED_WORKER_RESULT + delivery.detail)
-        return save_push(delivery, interrupted=target is WorkerResultTarget.DIRECTOR)
+        return save_push(delivery, interrupted=target is WorkerResultTarget.DIRECTOR, worker_result=text)
 
 
 def _defer_blocked_worker_result(path: Path, delivery: send.BlockedWorkerResult) -> str:
@@ -1989,13 +2024,15 @@ def _defer_blocked_worker_result(path: Path, delivery: send.BlockedWorkerResult)
     return saved
 
 
-def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None) -> str:
+def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None, worker_result_digest: str = "") -> str:
     with record_lock(path):
         record = _read_record(path)
         current = record.get("delivery", "")
         if if_current is not None and if_current != current:
             return current
         record["delivery"] = delivery
+        if worker_result_digest:
+            record["worker_result_digest"] = worker_result_digest
         if (delivery not in (COVERED_BY_DONE, OTHER_PASS_DELIVERY)
                 and not _worker_result_pending(delivery) and "delivered_at" not in record):
             record["delivered_at"] = time.time()
@@ -2009,11 +2046,25 @@ class WorkerResultReplay(Enum):
     RETRY = "the worker has not accepted the result"
 
 
+@dataclass(frozen=True)
+class ConfirmedPaneResult:
+    """The pane accepted this detached result."""
+
+    run_id: str
+    pane: str
+
+
+class ObserveResultSubmission(Enum):
+    DISCARD = "no caller tracks the pane result"
+
+
 def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                                   worker_input: WorkerResultInput,
                                   resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
                                   pane_dispatch_id: str = "",
                                   input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+                                  on_submission: Callable[[ConfirmedPaneResult], None]
+                                      | ObserveResultSubmission = ObserveResultSubmission.DISCARD,
                                   ) -> WorkerResultReplay:
     """Submit one waiting result. The next turn can receive the next result."""
     runs = run / DETACHED_RUNS_DIR
@@ -2031,8 +2082,13 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             continue
         if _worker_result_pending(delivery):
             return WorkerResultReplay.RETRY
-        if (delivery.startswith(f"sent: worker {worker.name} at ") or
-                not isinstance(resume_parked, ParkedWorkerDelivery) and delivery.startswith("already delivered: ")):
+        prefix = f"sent: worker {worker.name} at "
+        if delivery.startswith(prefix):
+            if (not isinstance(on_submission, ObserveResultSubmission) and pane_dispatch_id
+                    and record.get("pane_dispatch_id") == pane_dispatch_id and (pane := delivery.removeprefix(prefix))):
+                on_submission(ConfirmedPaneResult(record["run_id"], pane))
+            return WorkerResultReplay.SUBMITTED
+        if not isinstance(resume_parked, ParkedWorkerDelivery) and delivery.startswith("already delivered: "):
             return WorkerResultReplay.SUBMITTED
     return WorkerResultReplay.NONE
 

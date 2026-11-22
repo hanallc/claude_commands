@@ -3119,6 +3119,22 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
 
     def test_hook_recovers_done_after_a_result_from_an_earlier_pass(self) -> None:
+        for delivery in ("confirmed", "running marker", "quoted in another dispatch", "later ordinary reply"):
+            with self.subTest(delivery=delivery):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_earlier_result_reply(delivery)
+                finally:
+                    _ = case.doCleanups()
+
+        for family in ("claude", "codex"):
+            for pending in (True, False, None):
+                for order in ("earlier_unconfirmed_then_later_done", "earlier_unconfirmed_then_later_result"):
+                    with self.subTest(family=family, pending=pending, order=order):
+                        self.check_earlier_uncertainty_during_native_stop(family, pending, order)
+
+    def check_earlier_result_reply(self, result_case: str) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
         row = self.fixture.worker("impl", family="codex")
         pane = "w1:p1"
@@ -3126,28 +3142,41 @@ class PaneRunDeliveryTests(unittest.TestCase):
         dispatch, reply = self.begin_pane_pass(row)
         delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         record = self.record(row, "earlier-result")
-        record.update(status="finished", pane_dispatch_id="earlier-pass",
-                      delivery=f"sent: worker {row.name} at {pane}")
+        record.update(pane_dispatch_id="earlier-pass", started_at=0)
+        if result_case != "running marker":
+            record.update(status="finished", exit_code=0, finished_at=datetime.now(timezone.utc).isoformat(),
+                          delivery=f"sent: worker {row.name} at {pane}")
         write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
         done = f"DONE {dispatch}"
         later = "The earlier check passed."
-        agent.append(pane, "user", delivery.line)
+        prompt = (f"End your final reply with DONE {dispatch}."
+                  if result_case == "quoted in another dispatch" else delivery.line)
+        agent.append(pane, "user", prompt)
         agent.append(pane, "assistant", done)
-        agent.append(pane, "user", "Detached run: earlier-result")
+        message = "Detached run: earlier-result"
+        if result_case != "running marker":
+            message += "\n" + detached_runs.result_message(record, detached_runs.CompletedCommand(0))
+        if result_case == "quoted in another dispatch":
+            message = "Read the unchanged prompt file \"other.txt\". End your final reply with DONE other.\n" + message
+        agent.append(pane, "user", message)
         agent.append(pane, "assistant", later)
+        if result_case == "later ordinary reply":
+            agent.append(pane, "user", "Check another file.")
+            later = "I checked the file."
+            agent.append(pane, "assistant", later)
         self.fixture.world.locations[pane]["agent_status"] = "done"
 
+        if result_case in ("running marker", "quoted in another dispatch"):
+            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=later)),
+                             turn_end.TurnOutcome.IGNORED)
+            self.assertFalse(reply.exists())
+            self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+            return
         self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=later)),
                          turn_end.TurnOutcome.DONE)
         self.assertEqual(reply.read_text().rstrip(), done)
         self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
         self.assertEqual(self.inputs, [])
-
-        for family in ("claude", "codex"):
-            for pending in (True, False, None):
-                for order in ("earlier_unconfirmed_then_later_done", "earlier_unconfirmed_then_later_result"):
-                    with self.subTest(family=family, pending=pending, order=order):
-                        self.check_earlier_uncertainty_during_native_stop(family, pending, order)
 
     def check_earlier_uncertainty_during_native_stop(
             self, family: Literal["claude", "codex"], pending: bool | None, order: str) -> None:

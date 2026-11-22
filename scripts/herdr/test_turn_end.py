@@ -2552,7 +2552,8 @@ class TurnEndTests(unittest.TestCase):
         done = self.case.agent.replies[-1]
         deferred = order.startswith("result still deferred") or order == "legacy record"
         if not deferred:
-            self.case.agent.append(pane, "user", f"Detached run: {name}\nRun finished: private verification")
+            message = detached_runs.result_message(record, detached_runs.command_result(record))
+            self.case.agent.append(pane, "user", f"Detached run: {name}\n{message}")
             self.case.agent.append(pane, "assistant", "I already recorded that check.")
             record.update(delivery=f"sent: worker {name} at {pane}", delivered_at=datetime.now().timestamp())
             with detached_runs.record_lock(path):
@@ -3021,10 +3022,12 @@ class TurnEndTests(unittest.TestCase):
             "started_at": 0, "pid": 0, "command": ["true"], "label": "private verification",
             "log": str(log), "session_dir": str(run), "director_dir": str(run), "done_message_file": "",
             "pane_dispatch_id": "earlier-pass", "delivery": f"sent: worker {row.name} at {pane}",
+            "exit_code": 0, "finished_at": datetime.now(timezone.utc).isoformat(),
         }
+        message = detached_runs.result_message(record, detached_runs.CompletedCommand(0))
         atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
         self.case.agent.complete(pane)
-        self.case.agent.append(pane, "user", f"Detached run: {log.stem}")
+        self.case.agent.append(pane, "user", f"Detached run: {log.stem}\n{message}")
         self.case.agent.append(pane, "assistant", "The earlier check passed.")
         atomic_file.write_text_atomic(ready, "ready\n")
 

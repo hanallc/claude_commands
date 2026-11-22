@@ -1096,11 +1096,12 @@ def _save_late_done(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: 
     return saved
 
 
-def _is_covered_result_reply(event: WorkerEvent, receipt: worker.DispatchReceipt) -> bool:
-    """Match the event to a result reply after the verified DONE."""
-    return (isinstance(receipt, worker.DispatchComplete)
-            and isinstance(receipt.covered_result_turn, worker.DetachedResultTurn)
-            and receipt.covered_result_turn.reply == event.reply)
+def _result_proves_done(event: WorkerEvent, receipt: worker.DispatchReceipt) -> bool:
+    """Recover the DONE after a confirmed result delivery in this transcript."""
+    if not isinstance(receipt, worker.DispatchComplete) or not isinstance(receipt.result_delivery, worker.ResultDeliveryProof):
+        return False
+    proof = receipt.result_delivery
+    return proof.assignment is worker.ResultAssignment.EARLIER or proof.delivery.reply.reply == event.reply
 
 
 def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: dict[str, object],
@@ -1150,7 +1151,7 @@ def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: di
                                       require_transcript=require_transcript, verify=verify)
     if (not isinstance(receipt, worker.DispatchComplete) or stage_one
             or (event.kind == EventKind.TURN_END and not isinstance(event.native_stop, dict)
-                and receipt.reply != event.reply and not _is_covered_result_reply(event, receipt))):
+                and receipt.reply != event.reply and not _result_proves_done(event, receipt))):
         return receipt
     path = Path(delivery.reply_file)
     worker.save_reply(path, receipt.reply)
@@ -1316,8 +1317,12 @@ def _handle_locked(event: WorkerEvent,
                             else detached_runs.WorkerResultInput.TYPE)
             parked = progress_history.parked_worker_pass(passed)
             resume = (lambda: worker.restore_parked_worker(row, parent.id, hold)) if parked else detached_runs.ParkedWorkerDelivery.DEFER
+            def record_submission(result: detached_runs.ConfirmedPaneResult) -> None:
+                worker.record_reaped_result(row, run, instance, stage, result)
+
             replay = detached_runs.submit_finished_worker_result(
-                run, row, worker_input=worker_input, resume_parked=resume, pane_dispatch_id=instance, input_lock=hold)
+                run, row, worker_input=worker_input, resume_parked=resume, pane_dispatch_id=instance, input_lock=hold,
+                on_submission=record_submission)
             if replay == detached_runs.WorkerResultReplay.SUBMITTED:
                 if parked:
                     _ = progress_history.record_worker_park(run, row.id, instance, delivery.completion_id,
@@ -1416,7 +1421,7 @@ def _handle_locked(event: WorkerEvent,
         if (event.kind == EventKind.TURN_END and (not reply or reply != event.reply)
                 and not isinstance(event.native_stop, dict)
                 and not isinstance(turn_cursor, worker.TranscriptCursor)
-                and not _is_covered_result_reply(event, receipt)
+                and not _result_proves_done(event, receipt)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and
                          isinstance(receipt.reply, (worker.DispatchComplete, worker.DispatchAwaitingReply)))
                 and not (needs_verification and isinstance(receipt, worker.DispatchAwaitingReply))

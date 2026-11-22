@@ -832,7 +832,8 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
-        for cause in ("saved deferral", "orphan", "unidentified at reap", "unidentified at startup"):
+        for cause in ("saved deferral", "orphan", "unidentified at reap", "unidentified at startup",
+                      "assignment changes after reap", "pane closes during recovery"):
             with self.subTest(parked_result=cause):
                 case = WorkerCommandTests("runTest")
                 case.setUp()
@@ -906,6 +907,32 @@ class WorkerCommandTests(unittest.TestCase):
             add_unidentified_pane()
             return launch_policy(member, passed)
 
+        replacement = ""
+
+        def replace_after_reap(run: str, name: str = "") -> list[str]:
+            nonlocal replacement
+            reaped = reap(run, name)
+            if received and not replacement:
+                progress_history.complete_dispatch(self.run_dir, "impl", active.instance_id)
+                replacement = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                    worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                    kind="impl", lens="")
+            return reaped
+
+        def close_during_recovery(*_args: object, **_kwargs: object) -> worker.CompletionRecovery:
+            self.assertIn(pane, self.fixture.world.locations)
+            self.fixture.world.remove_pane(pane)
+            return worker.CompletionRecovery.NO_PENDING_NOTICE
+
+        parked_before = worker_panes.worker_pass(row, self.run_dir)
+        resumed: list[worker.WorkerResume] = []
+
+        def capture_resume(_member: staff.StaffRow, plan: worker.WorkerResume) -> worker.ExitCode:
+            self.assertEqual(plan.step, worker.UnsubmittedAssignment(replacement, ("assign.sh",)))
+            resumed.append(plan)
+            return worker.ExitCode.OK
+
+        report = worker.RestoreReport()
         with (ExitStack() as context, patch.object(self.fixture.world, "run", side_effect=accept_result),
               patch.object(agent_accounts, "codex_account_home",
                            return_value=agent_accounts.CodexHomeHoldingLogin("codex2", target_home, "fixture"))):
@@ -913,9 +940,28 @@ class WorkerCommandTests(unittest.TestCase):
                 _ = context.enter_context(patch.object(detached_runs, "reap_orphans", new=add_before_reap))
             if cause == "unidentified at startup":
                 _ = context.enter_context(patch.object(worker_panes, "parked_launch_policy", new=add_before_startup))
+            if cause == "assignment changes after reap":
+                _ = context.enter_context(patch.object(detached_runs, "reap_orphans", new=replace_after_reap))
+                _ = context.enter_context(patch.object(worker, "_resume_launcher", new=capture_resume))
+            if cause == "pane closes during recovery":
+                self.fixture.world.add(row, pane, family="codex")
+                self.fixture.world.locations[pane]["agent_status"] = "working"
+                _ = context.enter_context(patch.object(detached_runs, "reap_orphans", return_value=[]))
+                _ = context.enter_context(patch.object(turn_end, "recover_completion", side_effect=close_during_recovery))
             outcome = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({row.id}),
-                                     started_panes=started_panes)
+                                     started_panes=started_panes, report=report)
         self.assertEqual(self.agent.submitted, [(pane, line)])
+        if cause == "assignment changes after reap":
+            self.assertTrue(replacement)
+            self.assertEqual(len(resumed), 1, report.failures)
+        if cause == "pane closes during recovery":
+            self.assertIs(outcome, worker.ExitCode.OK)
+            current = worker_panes.worker_pass(row, self.run_dir)
+            self.assertTrue(progress_history.parked_worker_pass(current))
+            self.assertEqual(progress_history.parked_worker_launch(current),
+                             progress_history.parked_worker_launch(parked_before))
+            self.assertNotIn(pane, self.fixture.world.locations)
+            return
         if cause.startswith("unidentified"):
             self.assertIs(outcome, worker.ExitCode.UNCERTAIN)
             self.assertEqual(len(self.fixture.world.launches), launches)
@@ -4006,6 +4052,44 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.stops, [])
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(self.fixture.world.locations[opened.pane]["agent_status"], "working")
+
+        with self.subTest(change="director session changes during resume"):
+            self.check_restore_notice_after_director_session_change()
+
+    def check_restore_notice_after_director_session_change(self) -> None:
+        opened = self.opened("notice-worker")
+        row = opened.row
+        parent = self.fixture.parent
+        moved = staff.StaffId(fixture_runtime_id("restore-new-director"))
+        fixture_session(moved, staff.ClaudeBackend())
+        dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
+            worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        line = f"Check the file. End your final reply with DONE {dispatch}."
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+            pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
+        self.agent.append(opened.pane, "user", line)
+
+        def resume_and_move(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
+            _ = staff.update_current_session(parent.current_session, moved)
+            return worker.ExitCode.OK
+
+        def send_notice(member: staff.StaffRow, director: staff.StaffRow, run: Path,
+                        _hold: worker_panes.WorkerLockHold, *, record: staff.StaffSnapshot,
+                        pane: worker.KeepCompletedPane) -> worker.CompletionRecovery:
+            self.assertIs(pane, worker.KeepCompletedPane.KEEP)
+            passed = worker_panes.worker_pass(member, run, record=record)
+            turn_end.repeat_completion_notice(member.name, director, run, passed)()
+            return worker.CompletionRecovery.NO_PENDING_NOTICE
+
+        atomic_file.write_text_atomic(self.reply, f"DONE {dispatch}\n")
+        with (patch.object(worker, "_resume_launcher", side_effect=resume_and_move) as resume,
+              patch.object(turn_end, "recover_completion", side_effect=send_notice),
+              patch.object(send, "send", return_value=send.Result("sent", "notice received")) as notice):
+            self.assertIs(worker.restore(parent.id, only=frozenset({row.id})), worker.ExitCode.OK)
+        resume.assert_called_once()
+        notice.assert_called_once()
+        self.assertEqual(cast(send.Options, notice.call_args.args[0]).to, f"session:{moved}")
 
     def test_busy_worker_receives_no_prompt(self) -> None:
         opened = self.opened()
