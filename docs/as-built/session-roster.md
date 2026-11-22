@@ -282,10 +282,14 @@ The relay checks the current registry, connected peer PID, and process start bef
 
 The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMessage` tool.
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
+The PreToolUse hook approves the first `SendMessage` call and sets its `to`, `message`, and `summary` to the approved values.
+The hook refuses later calls and calls without a tool ID.
 The proxy checks the request and writes it to the recipient's verified socket.
 The relay requires a completed proxy write of the approved text and one explicit success result for the forwarded tool ID.
-The relay logs changed calls locally in `STATE/relay_mismatches.jsonl`, with a bounded target and short excerpts at the first text difference.
-The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+The relay logs differences in model input in `STATE/relay_mismatches.jsonl`.
+The log limits the target length, shows short excerpts at the first text difference, and marks summary changes.
+The `SENT` line reports when the guard set the approved input for a changed call.
+If the model makes several calls, the `SENT` line gives the call count and reports one proxy forward.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.
 If `~/.config/claude/oauth-token.gpg` exists, the relay decrypts it for authentication.
