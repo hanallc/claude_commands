@@ -37,6 +37,7 @@ from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
+from scripts.test_times import recent_gate_times
 
 # Each AWS gate host name starts with this prefix; `top --host aws` selects every such host.
 AWS_HOST_PREFIX = "ip-"
@@ -550,7 +551,7 @@ def positive(value: str) -> int:
     return number
 
 
-ReportCommand = Literal["top", "suites", "suite", "module", "test", "trend"]
+ReportCommand = Literal["top", "suites", "suite", "module", "test", "trend", "seed-gate-times"]
 
 
 @dataclass(init=False)
@@ -584,6 +585,7 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     test_parser = subcommands.add_parser("test", help="find kept test names by substring")
     _ = test_parser.add_argument("subject", metavar="text")
     _ = test_parser.add_argument("--runs", type=positive, default=20)
+    _ = subcommands.add_parser("seed-gate-times", help="seed recent gate times from the committed buildlog index")
     if not argv or argv[0].startswith("--") and argv[0] != "--help":
         argv = ["top", *argv]
     request = parser.parse_args(argv, namespace=ReportRequestArguments())
@@ -592,14 +594,18 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     return request
 
 
+def open_read_only_index(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(index.read_only_path_uri(path), uri=True,
+                           timeout=index.BUSY_TIMEOUT_MS / 1000)
+
+
 def open_report_index() -> sqlite3.Connection:
     """Read a complete index and build one only when none qualifies."""
     path = index.complete_gate_index_in(store.root())
     if isinstance(path, index.NoCompleteGateIndex):
         _ = index.update()
         path = index.index_path()
-    connection = sqlite3.connect(index.read_only_path_uri(path), uri=True,
-                                 timeout=index.BUSY_TIMEOUT_MS / 1000)
+    connection = open_read_only_index(path)
     _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
@@ -643,6 +649,23 @@ def refresh_after_report() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     request = arguments(sys.argv[1:] if argv is None else argv)
+    if request.command == "seed-gate-times":
+        try:
+            path = index.complete_gate_index_in(store.root())
+            if isinstance(path, index.NoCompleteGateIndex):
+                print("recent gate times not seeded: no complete index has compatible gate tables", file=sys.stderr)
+                return 1
+            with closing(open_read_only_index(path)) as connection:
+                connection.execute("BEGIN").close()
+                if not index.has_numeric_update_time(connection):
+                    print("recent gate times not seeded: the opened index has no completed refresh", file=sys.stderr)
+                    return 1
+                keys = recent_gate_times.seed(connection)
+        except (OSError, sqlite3.Error, conf.Unusable) as error:
+            print(f"recent gate times not seeded: {error}", file=sys.stderr)
+            return 1
+        print(f"Recent gate time keys: {keys}")
+        return 0
     if request.command == "trend":
         store.root().mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):

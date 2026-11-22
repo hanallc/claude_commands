@@ -45,7 +45,7 @@ from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import gate
-from scripts.test_times import gate_record
+from scripts.test_times import gate_record, recent_gate_times
 
 
 @dataclass(frozen=True)
@@ -1101,14 +1101,25 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
         raise ValueError('The buildlog record differs from the result')
 
 
-def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, record_id: str) -> bool:
-    """Search the bytes that another import could have appended for this record."""
+@dataclass(frozen=True)
+class AppendedRecord:
+    row: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AppendRequired:
+    """The destination still needs this record."""
+
+
+def _appended_record(marker: Path, handle: BinaryIO, destination: Path,
+                     record_id: str) -> AppendedRecord | AppendRequired:
+    """Read the row that an earlier import appended for this record."""
     try:
         saved = read(marker)
     except FileNotFoundError:
-        return False
+        return AppendRequired()
     if saved.get('id') != record_id or saved.get('destination') != str(destination):
-        return False
+        return AppendRequired()
     offset = saved.get('offset')
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError('The gate import marker has an invalid file offset')
@@ -1120,8 +1131,8 @@ def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, 
             except ValueError:
                 continue
             if isinstance(previous, dict) and cast(dict[str, object], previous).get('id') == record_id:
-                return True
-    return False
+                return AppendedRecord(cast(dict[str, object], previous))
+    return AppendRequired()
 
 
 def import_record(folder: Path, row: dict[str, object]) -> None:
@@ -1137,7 +1148,8 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     with store.locked_append(destination) as handle:
         # The lock repairs a partial row before it gives us the offset.
         offset = handle.tell()
-        if not _import_already_appended(marker, handle, destination, record_id):
+        appended = _appended_record(marker, handle, destination, record_id)
+        if isinstance(appended, AppendRequired):
             save(marker, {'id': record_id, 'destination': str(destination), 'offset': offset})
             # An older box names the step merge-gate or targeted-test.
             record = {**record, 'step': gate.SuiteMode.step(ledger.text(record, 'step'))}
@@ -1145,6 +1157,9 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
+        else:
+            record = appended.row
+    recent_gate_times.update_recent_times(record)
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:
