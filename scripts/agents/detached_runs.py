@@ -2240,10 +2240,31 @@ def _wait_for_leader(command: CommandGroup, deadline: float) -> None:
         time.sleep(min(0.05, remaining))
 
 
+def _stop_watched_group(path: Path, watched: CommandGroup) -> None:
+    """Send TERM to the group that the watcher just left."""
+    def verify_group() -> CommandGroup | CommandGroupUnverified:
+        record = worker_lifecycle.read_json_object(path)
+        if (record.get("status") != "running" or _has_saved_cgroup(record) or _recorded_group(record) != watched
+                or isinstance(_saved_process(watched.group, watched.started),
+                              (SavedProcessIdReused, process_start.Unreadable))):
+            return CommandGroupUnverified()
+        return watched
+
+    with contextlib.suppress(ProcessLookupError):
+        _ = stop_with_reason(path, SUPERVISOR_GONE_REASON, verify_group=verify_group,
+                             signal_group=process_group.send_process_group)
+
+
 def command_supervisor_gone(args: argparse.Namespace) -> int:
     """Stop the saved scope or command group after the supervisor pipe closes."""
     path = Path(str(getattr(args, "record", "")))
-    # Leave the command group, so its TERM spares this watcher.
+    use_pidfd = process_stop.supported()
+    watched_group = None
+    # The watcher inherits the group when the command starts.
+    # Its membership proves the group even if the leader has exited.
+    if not use_pidfd and (command := command_group(path)) is not None and os.getpgrp() == command.group:
+        watched_group = command
+    # Leave the group before TERM.
     os.setsid()
 
     def supervisor_is_gone() -> bool:
@@ -2251,13 +2272,16 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
         return not _has_saved_cgroup(record) or not detached_run_process.supervises(record["pid"], path)
 
     try:
-        _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone,
-                         stop_pass=False, retry_slice_read=True)
+        if use_pidfd:
+            _ = stop_command(path, SUPERVISOR_GONE_REASON, check=supervisor_is_gone,
+                             stop_pass=False, retry_slice_read=True)
+        elif watched_group is not None:
+            _stop_watched_group(path, watched_group)
     except OSError as error:
         print(f"detached_runs: {path.stem}: stop failed: {error}", file=sys.stderr)
         return 1
     record = _read_record(path)
-    group_stop = not process_stop.supported() and bool(record.get("stop_reason"))
+    group_stop = not use_pidfd and bool(record.get("stop_reason"))
     if not _has_saved_cgroup(record) and (group_stop or record.get("scope_error")):
         grace, _ = _scope_stop_graces()
         deadline = time.monotonic() + grace

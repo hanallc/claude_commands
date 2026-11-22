@@ -766,7 +766,9 @@ A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
 On Linux with pidfds, a run without a saved slice can receive TERM and reports an unconfirmed stop.
 On systems without pidfds, the stop checks the saved leader identity and sends TERM to the group.
-The watcher waits for the saved leader to exit before it reaps the run.
+The watcher confirms the command group from its own membership before it leaves the group.
+It can send TERM to surviving members after the leader exits.
+The watcher waits for the saved leader and the group to end before it reaps the run.
 The stop grace limits this wait.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.
 It stops any processes that remain and reports them as a cleanup in the result.

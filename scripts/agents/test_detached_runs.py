@@ -1978,6 +1978,7 @@ sys.exit(status)
               patch.object(process_start, "process_start", return_value=start) as read_start,
               patch.object(detached_run_process, "supervisor_match", return_value=False),
               patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 2.0)),
+              patch.object(os, "getpgrp", side_effect=[leader, os.getpgrp()]),
               patch.object(os, "setsid"),
               patch.object(os, "killpg") as send,
               patch.object(time, "sleep", side_effect=save_status) as sleep,
@@ -1990,6 +1991,73 @@ sys.exit(status)
         self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
         self.assertEqual(saved.get("exit_code"), 143)
         self.assertEqual(saved.get("status"), "finished")
+
+    def test_mac_watcher_stops_surviving_group_after_the_leader_exits(self) -> None:
+        leader = DEAD_PID
+        original = process_start.Started("original")
+        gone = process_start.Gone()
+        replacement = process_start.Started("replacement")
+        cases = (
+            ("leader already gone", gone, gone, leader, True, "finished"),
+            ("leader exits as watcher leaves", original, gone, leader, True, "finished"),
+            ("group ID reused after watcher leaves", original, replacement, leader, False, "finished"),
+            ("watcher belongs to another group", gone, gone, leader + 1, False, "running"),
+        )
+        for index, (case, before, after, group, expect_term, status) in enumerate(cases):
+            with self.subTest(case=case):
+                path = self.record(["fixture command"], run_id=f"watcher-{index}")
+                self.update_record(path, command_pid=leader, command_group=leader, command_started=original.start)
+                events: list[str] = []
+                left_group = False
+                descendants_live = True
+
+                def read_group() -> int:
+                    if left_group:
+                        return leader + 2
+                    events.append("read membership")
+                    return group
+
+                def leave_group() -> None:
+                    nonlocal left_group
+                    events.append("leave group")
+                    left_group = True
+
+                def read_start(_pid: int) -> process_start.ProcessStart:
+                    return after if left_group else before
+
+                def send_term(pid: int, number: int) -> None:
+                    nonlocal descendants_live
+                    self.assertTrue(descendants_live)
+                    self.assertEqual((pid, number), (leader, signal.SIGTERM))
+                    events.append("send TERM")
+                    descendants_live = False
+
+                def group_is_live(group_id: int) -> bool:
+                    self.assertEqual(group_id, leader)
+                    return descendants_live
+
+                with (self.darwin_without_pidfds(),
+                      patch.object(process_start, "process_start", side_effect=read_start),
+                      patch.object(detached_run_process, "supervisor_match", return_value=False),
+                      patch.object(detached_runs, "_scope_stop_graces", return_value=(2.0, 2.0)),
+                      patch.object(os, "getpgrp", side_effect=read_group),
+                      patch.object(os, "setsid", side_effect=leave_group),
+                      patch.object(os, "killpg", side_effect=send_term),
+                      patch.object(detached_runs, "_group_is_live", side_effect=group_is_live),
+                      patch.object(detached_runs, "_replay_completion",
+                                   return_value=detached_runs.CompletionReplay.HANDLED)):
+                    self.assertEqual(detached_runs.main(["supervisor-gone", str(path)]), 0)
+
+                expected = ["read membership", "leave group"]
+                if expect_term:
+                    expected.append("send TERM")
+                self.assertEqual(events, expected)
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved.get("status"), status)
+                if expect_term:
+                    self.assertEqual(saved.get("stop_reason"), detached_runs.SUPERVISOR_GONE_REASON)
+                else:
+                    self.assertNotIn("stop_reason", saved)
 
     def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])
