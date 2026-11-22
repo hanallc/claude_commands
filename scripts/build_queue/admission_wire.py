@@ -17,11 +17,11 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)
 from scripts.build_targets import target_config
+from scripts.build_targets.execution_transport import ExecutionTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
     from scripts.build_queue import placement
-    from scripts.build_targets.execution_transport import ExecutionTransport
 else:
     class _DeferredAdmissionRecords:
         """Load domain types when an annotation or a default needs them."""
@@ -86,12 +86,99 @@ class UsedVerifySlot:
 
 
 @dataclass(frozen=True)
+class LocalRunProvider:
+    """The local run slot needs no remote provider claim."""
+
+
+@dataclass(frozen=True)
+class RemoteRunProvider:
+    """The saved endpoint and claim identify the provider that must settle the run."""
+    endpoint: str
+    transport: ExecutionTransport
+    claim: placement.ProviderClaimReference
+    holder: placement.ClaimHolderIdentity
+    start_fence_id: str
+
+
+@dataclass(frozen=True)
+class LegacyRunProviderUnrecorded:
+    """The saved slot predates provider identity records."""
+
+
+RunProviderIdentity = LocalRunProvider | RemoteRunProvider | LegacyRunProviderUnrecorded
+
+
+@dataclass(frozen=True)
+class RunCommandAttempt:
+    """The episode and attempt identify one command of the run."""
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class RunClaimAcquisitionPending:
+    """The provider has yet to confirm whether this exact claim was acquired."""
+    claim: placement.ProviderClaimReference
+
+
+@dataclass(frozen=True)
+class RunCommandSettlementPending:
+    """The service still needs settlement proof for this command attempt."""
+    command: RunCommandAttempt
+
+
+@dataclass(frozen=True)
+class RunClaimReleasePending:
+    """The provider has yet to confirm release of this exact claim."""
+    claim: placement.ProviderClaimReference
+
+
+@dataclass(frozen=True)
+class RunOpen:
+    """The run can still request a command grant."""
+
+
+@dataclass(frozen=True)
+class SettlementPending:
+    """The run is closing and holds its place until this operation settles."""
+    reason: str
+    operation: RunClaimAcquisitionPending | RunCommandSettlementPending | RunClaimReleasePending
+
+
+@dataclass(frozen=True)
+class RunNeverLaunched:
+    """The service has proof that no command of the run has started."""
+
+
+@dataclass(frozen=True)
+class RunLaunchUnresolved:
+    """The service has yet to prove whether the first possible command launch occurred."""
+    command: RunCommandAttempt
+
+
+@dataclass(frozen=True)
+class RunLaunched:
+    """At least one command of the run has started."""
+
+
+@dataclass(frozen=True)
+class RunLaunchUnrecorded:
+    """The saved slot predates run launch records."""
+
+
+RunLaunchState = RunNeverLaunched | RunLaunchUnresolved | RunLaunched | RunLaunchUnrecorded
+
+
+@dataclass(frozen=True)
 class VerifyRunSlot:
     """The Verify run holds one place on its chosen machine."""
     repository: str
     owner: Owner
     use: PendingVerifyGrants | UsedVerifySlot = UsedVerifySlot()
     destination: placement.PlacementDestination = field(default_factory=_natedev_run_destination, kw_only=True)
+    provider: RunProviderIdentity = field(default=LegacyRunProviderUnrecorded(), kw_only=True)
+    settlement: RunOpen | SettlementPending = field(default=RunOpen(), kw_only=True)
+    launch: RunLaunchState = field(default=RunLaunchUnrecorded(), kw_only=True)
 
     @property
     def run_key(self) -> str:
@@ -552,7 +639,13 @@ class RunGrantRefused:
     reason: Literal["missing_run", "stale_run", "not_built"]
 
 
-RunGrantReply = RunGrant | RunGrantRefused
+@dataclass(frozen=True)
+class RunGrantSettlementPending:
+    """The closing run gives no command grant while settlement remains pending."""
+    reason: str
+
+
+RunGrantReply = RunGrant | RunGrantRefused | RunGrantSettlementPending
 
 
 @dataclass(frozen=True)

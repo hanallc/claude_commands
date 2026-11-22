@@ -43,9 +43,10 @@ class ProtocolTests(unittest.TestCase):
         scope = RepositoryScope("fixture", "fixture-key", 1)
         grant = grant_wire.RunGrant(placement.PlacementDestination("mac", "mac", "mac-host", scope, 1))
         for reply in (grant, grant_wire.RunGrantRefused("missing_run"),
-                      grant_wire.RunGrantRefused("stale_run"), grant_wire.RunGrantRefused("not_built")):
+                      grant_wire.RunGrantRefused("stale_run"), grant_wire.RunGrantRefused("not_built"),
+                      grant_wire.RunGrantSettlementPending("waiting for exact claim release")):
             with self.subTest(reply=reply):
-                self.assertEqual(grant_wire.parse_record(grant_wire.encode_record(reply), type(reply)), reply)
+                self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(reply), grant_wire.RunGrantReply), reply)
 
     def test_placement_status_round_trips_without_launch_permission(self) -> None:
         from scripts.build_queue import admission_wire as status_wire

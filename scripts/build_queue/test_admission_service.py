@@ -8083,6 +8083,9 @@ class VerifyRunSlotTests(unittest.TestCase):
             for slot in cast(dict[str, dict[str, object]], raw_state["verify_run_slots"]).values():
                 del slot["destination"]
                 del slot["use"]
+                del slot["provider"]
+                del slot["settlement"]
+                del slot["launch"]
             _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(raw_state))
             fixture.restart()
             self.assertEqual(list(fixture.server.verify_run_slots.values()), [granted])

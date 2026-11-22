@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_wire as wire, placement
+from scripts.build_targets.execution_transport import SshCommandTransport
 from scripts.mac_test.claim_state import RepositoryScope, WHOLE_MAC
 
 
@@ -20,6 +21,9 @@ class RunRecordCodecTests(unittest.TestCase):
 
         self.assertEqual(slot.destination, placement.PlacementDestination("local", "natedev", "natedev", WHOLE_MAC))
         self.assertEqual(slot.use, wire.UsedVerifySlot())
+        self.assertEqual(slot.provider, wire.LegacyRunProviderUnrecorded())
+        self.assertEqual(slot.settlement, wire.RunOpen())
+        self.assertEqual(slot.launch, wire.RunLaunchUnrecorded())
         self.assertEqual(slot.key, "123-4200:fixture")
         self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
@@ -36,6 +40,32 @@ class RunRecordCodecTests(unittest.TestCase):
         del old["destination"]
         local = wire.parse_record(wire.encode_record(old), wire.VerifyRunSlot)
         self.assertEqual(local, replace(slot, destination=wire.VerifyRunSlot("fixture", slot.owner).destination))
+
+    def test_run_launch_states_survive_the_slot_codec(self) -> None:
+        command = wire.RunCommandAttempt("first-step", "first-attempt")
+        for launch in (wire.RunNeverLaunched(), wire.RunLaunchUnresolved(command), wire.RunLaunched()):
+            with self.subTest(launch=launch):
+                slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"),
+                    provider=wire.LocalRunProvider(), launch=launch)
+                self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
+
+    def test_remote_settlement_retains_the_provider_and_the_exact_operation(self) -> None:
+        scope = RepositoryScope("fixture", "fixture-key", 2)
+        destination = placement.PlacementDestination("mac", "mac", "mac-host", scope, 2)
+        claim = placement.ProviderClaimReference("mac", "mac", scope, "run-claim", "run-a", "placement-a")
+        provider = wire.RemoteRunProvider("original-mac",
+            SshCommandTransport(Path("/fixture/mac.conf")), claim,
+            placement.ClaimHolderIdentity("natedev", 123, "4200"), "outer-start-fence")
+        command = wire.RunCommandAttempt("nextest-step", "nextest-attempt")
+        for operation, launch in (
+            (wire.RunClaimAcquisitionPending(claim), wire.RunNeverLaunched()),
+            (wire.RunCommandSettlementPending(command), wire.RunLaunched()),
+            (wire.RunClaimReleasePending(claim), wire.RunLaunched()),
+        ):
+            with self.subTest(operation=operation):
+                slot = wire.VerifyRunSlot("fixture", wire.Owner(123, "4200"), destination=destination,
+                    provider=provider, settlement=wire.SettlementPending("cancelled", operation), launch=launch)
+                self.assertEqual(wire.parse_record(wire.encode_record(slot), wire.VerifyRunSlot), slot)
 
     def test_the_run_request_preserves_the_set_of_named_machines(self) -> None:
         owner = placement.SubmittingOwner("natedev", 123, "4200")
