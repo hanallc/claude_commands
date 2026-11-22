@@ -1640,6 +1640,9 @@ class ImagePairTests(ImagesFixture):
         page = images.render(self.status).decode()
         self.assertEqual(page.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(page.count(page_frame.ZOOM_SCRIPT), 1)
+        # Hover or keyboard focus shows an arrow button's tip; a turned-off button shows none.
+        shown_tip = "[data-image-zoom-step]:not([disabled]):is(:hover,:focus-visible) [data-image-zoom-tip]{visibility:visible}"
+        self.assertIn(shown_tip, page_frame.ZOOM_STYLE)
         self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
         # A narrow card stacks the pair, before on top.
         self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
@@ -1654,7 +1657,7 @@ class ImagePairTests(ImagesFixture):
         self.assertIn("The counts now match.", page)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_the_arrow_keys_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
+    def test_the_arrow_keys_and_buttons_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
         _ = self.register_pair()
         _ = self.register()
         probe = """<script>
@@ -1669,8 +1672,23 @@ class ImagePairTests(ImagesFixture):
   check(!label.hidden && label.textContent === text, step + ' badges the picture ' + text);
   check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, step + ' names the zoom ' + text);
  };
+ const [left, right] = zoom.querySelectorAll('[data-image-zoom-step]');
+ const tip = button => button.querySelector('[data-image-zoom-tip]');
+ const tipShown = button => getComputedStyle(tip(button)).visibility === 'visible';
  after.click();
  shows(after, 'After', 'A click on After');
+ check(!left.hidden && !left.disabled && left.getAttribute('aria-label') === 'Show Before', 'The left button shows Before');
+ check(!right.hidden && right.disabled, 'The right button is off on the last picture');
+ check(tip(left).textContent === 'Press ← to show Before' && tip(left).querySelector('kbd').textContent === '←',
+       'The left tip names the key and the picture');
+ check(!tipShown(left), 'The tip is hidden until hover or focus');
+ left.click();
+ shows(before, 'Before', 'A click on the left button');
+ check(left.disabled && !right.disabled && tip(right).textContent === 'Press → to show After',
+       'On the first picture the left button is off and the right tip names After');
+ check(document.activeElement === zoom, 'A button that turns off returns focus to the large view');
+ right.click();
+ shows(after, 'After', 'A click on the right button');
  press('ArrowRight');
  shows(after, 'After', 'The right arrow on the last picture');
  press('ArrowLeft');
@@ -1691,6 +1709,7 @@ class ImagePairTests(ImagesFixture):
  const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
  single.click();
  check(zoom.open && label.hidden && label.textContent === '', 'A single image has no badge');
+ check(left.hidden && right.hidden, 'A single image has no arrow buttons');
  press('ArrowLeft');
  check(zoom.querySelector('img').src === single.href, 'The arrows keep a single image');
  press('Escape');

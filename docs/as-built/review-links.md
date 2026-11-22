@@ -1508,7 +1508,9 @@ It fits the view with a 16px margin and never exceeds the image's natural size.
 Escape or a click on the backdrop or image closes it.
 In a pair zoom, a badge above the image says Before or After.
 The left arrow key shows the before image and the right arrow key shows the after image.
-A single image has no badge and ignores the arrow keys. An arrow key with a modifier keeps the browser action.
+A left and a right arrow button at the sides of the view do the same. A button is dim and off at the end of the pair.
+A hover or keyboard focus on a button shows a tip, such as "Press ← to show Before". On a Mac the tip names ◀ or ▶.
+A single image has no badge, no arrow buttons, and ignores the arrow keys. An arrow key with a modifier keeps the browser action.
 The page keeps its scroll position and returns focus to the image link that opened the zoom.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
 Middle clicks and the right-click menu retain the browser's link action.

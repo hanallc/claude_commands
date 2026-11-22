@@ -515,8 +515,9 @@ document.addEventListener('click',async event=>{
 
 # A plain click on a data-image-zoom link shows its image over the page; Escape returns focus to that link.
 # A click with a modifier key, or any other button, keeps the browser's link action.
-# In a data-image-zoom-group, the left and right arrow keys show the previous and next image,
-# and a badge names the shown image (Before or After for a pair).
+# In a data-image-zoom-group, the left and right arrow keys and the arrow buttons show the previous
+# and next image, and a badge names the shown image (Before or After for a pair).
+# A button's hover tip names its key (the ◀ and ▶ keys on a Mac) and the image it shows.
 # The zoom keeps hrefs, not link nodes, so a page refresh while it is open changes nothing.
 ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
@@ -528,6 +529,22 @@ max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;o
 font:600 14px/20px system-ui,sans-serif}
 [data-image-zoom-dialog]:has([data-image-zoom-badge]:not([hidden])) img{max-height:calc(100dvh - 68px)}
 [data-image-zoom-dialog]::backdrop{background:transparent}
+[data-image-zoom-step]{position:fixed;top:50%;transform:translateY(-50%);width:48px;height:48px;padding:0;
+display:grid;place-items:center;border:1px solid #fff4;border-radius:24px;background:#000c;color:#fff;cursor:pointer}
+[data-image-zoom-step]:not([disabled]):is(:hover,:focus-visible){background:#222;border-color:#fff8}
+[data-image-zoom-step][disabled]{opacity:.3;cursor:default}
+[data-image-zoom-step][hidden]{display:none}
+[data-image-zoom-step] svg{width:24px;height:24px}
+[data-image-zoom-step="-1"]{left:24px}
+[data-image-zoom-step="1"]{right:24px}
+[data-image-zoom-tip]{position:absolute;top:calc(100% + 10px);padding:7px 11px;border-radius:6px;background:#e8e8e8;
+color:#111;font:500 13px/18px system-ui,sans-serif;white-space:nowrap;box-shadow:0 3px 12px #0006;pointer-events:none;
+visibility:hidden}
+[data-image-zoom-step="-1"] [data-image-zoom-tip]{left:0}
+[data-image-zoom-step="1"] [data-image-zoom-tip]{right:0}
+[data-image-zoom-step]:not([disabled]):is(:hover,:focus-visible) [data-image-zoom-tip]{visibility:visible}
+[data-image-zoom-tip] kbd{display:inline-block;min-width:18px;margin:0 2px;padding:0 4px;border:1px solid #999;
+border-bottom-width:2px;border-radius:4px;background:#fff;font:700 16px/18px system-ui,sans-serif;text-align:center}
 [data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100dvh - 32px);
 border:0;border-radius:0;cursor:zoom-out}
 '''
@@ -537,14 +554,39 @@ const dialog=document.createElement('dialog'), image=document.createElement('img
 dialog.dataset.imageZoomDialog='';dialog.setAttribute('role','dialog');
 dialog.setAttribute('aria-modal','true');dialog.tabIndex=-1;
 badge.dataset.imageZoomBadge='';badge.setAttribute('aria-live','polite');badge.hidden=true;
-dialog.append(badge,image);document.body.append(dialog);
+const mac=/Mac/.test(navigator.userAgentData?.platform || navigator.platform);
+const arrow=path=>'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+ +'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+path+'</svg>';
+const steps=[[-1,mac ? '◀' : '←','m12 19-7-7 7-7"/><path d="M19 12H5','previous'],
+ [1,mac ? '▶' : '→','M5 12h14"/><path d="m12 5 7 7-7 7','next']].map(([step,key,path,place])=>{
+ const button=document.createElement('button'), tip=document.createElement('span');
+ button.type='button';button.dataset.imageZoomStep=String(step);button.hidden=true;
+ button.innerHTML=arrow('<path d="'+path+'"/>');tip.dataset.imageZoomTip='';tip.setAttribute('aria-hidden','true');
+ button.append(tip);return {step,key,place,button,tip};
+});
+dialog.append(badge,image,...steps.map(item=>item.button));document.body.append(dialog);
 let opener='', shown='', position=[0,0];
 const live=href=>[...document.querySelectorAll('a[data-image-zoom]')].find(link=>link.getAttribute('href')===href);
+function neighbor(step){
+ const current=live(shown), group=current?.closest('[data-image-zoom-group]');
+ const links=group ? [...group.querySelectorAll('a[data-image-zoom]')].filter(item=>item.querySelector('img')) : [];
+ return {grouped:links.length>1, next:links[links.indexOf(current)+step]};
+}
 function show(link){
  const thumbnail=link.querySelector('img');
  shown=link.getAttribute('href');image.alt=thumbnail.alt;image.src=link.href;
  badge.textContent=link.dataset.imageZoomLabel || '';badge.hidden=!badge.textContent;
  dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
+ for(const {step,key,place,button,tip} of steps){
+  const {grouped,next}=neighbor(step), name=next?.dataset.imageZoomLabel || 'the '+place+' image';
+  button.hidden=!grouped;button.disabled=!next;button.setAttribute('aria-label','Show '+name);
+  tip.innerHTML='Press <kbd></kbd> to show ';tip.querySelector('kbd').textContent=key;tip.append(name);
+ }
+}
+function move(step){
+ const {next}=neighbor(step);
+ if(next) show(next);
+ return Boolean(next);
 }
 function close(){
  if(!dialog.open) return;
@@ -557,10 +599,11 @@ dialog.addEventListener('keydown',event=>{
  if(event.key==='Escape'){event.preventDefault();close();return;}
  const step={ArrowLeft:-1,ArrowRight:1}[event.key];
  if(!step || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
- const current=live(shown), group=current?.closest('[data-image-zoom-group]');
- const links=group ? [...group.querySelectorAll('a[data-image-zoom]')].filter(item=>item.querySelector('img')) : [];
- const next=links[links.indexOf(current)+step];
- if(next){event.preventDefault();show(next);}
+ if(move(step)) event.preventDefault();
+});
+// A button that turns off at the end of the group hands focus back to the large view, so the keys keep working.
+for(const {step,button} of steps) button.addEventListener('click',()=>{
+ if(move(step) && button.disabled) dialog.focus({preventScroll:true});
 });
 document.addEventListener('click',event=>{
  if(dialog.open && (event.target===dialog || event.target===image)){close();return;}
