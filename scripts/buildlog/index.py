@@ -543,7 +543,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
         "",
         "one row per verify.sh call (its steps carry call_id), and per port-lint call that ran nothing",
     ),
-    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of natepiano/hana"),
+    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of the hana repository"),
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
