@@ -184,14 +184,19 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(copy_cell.waits, cell.waits)
         self.assertEqual(copy_limits.natedev.waits, shown.natedev.waits)
         matching = replace(full, limit=2)
+        check: records.Reservation = {**fixture_reservation(105, 0, step="check"), "repo": "project",
+                                      "repo_identity": primary, "unit": "check-owner"}
         within_limit = replace(queue,
             view=replace(queue.view, waiting=(replace(waiting[0], reason=matching), *waiting[1:])),
-            explanation=replace(explanation, policy=replace(explanation.policy,
-                repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
+            explanation=replace(explanation,
+                decided_from=replace(explanation.decided_from, reservations=(*reservations, check)),
+                policy=replace(explanation.policy,
+                    repository_runs=records.RepositoryRunLimits({"natedev.project": 2}, "merge-owner"))))
         within = show(within_limit)
         merge_cell = next(row.natedev for row in within.repositories if row.owner == "team · example.invalid")
         self.assertEqual(merge_cell.merge_above, [])
         self.assertEqual(merge_cell.runs, ["regular", "merge-owner"])
+        self.assertEqual((merge_cell.used, merge_cell.other_used), (2, 1))
         gpu = records.GpuTestSlots(1, frozenset({"gpu-project"}))
         conflicting_wait = replace(within_limit,
             view=replace(queue.view, waiting=(
@@ -205,8 +210,9 @@ class BuildLimitsTests(unittest.TestCase):
         wait_cell = next(row.natedev for row in wait_limits.repositories if row.owner == "team · example.invalid")
         self.assertEqual(wait_cell.waits, cell.waits)
         self.assertIsNone(wait_cell.limit)
-        self.assertEqual(wait_cell.used, 0)
+        self.assertIsNone(wait_cell.used)
         self.assertEqual(wait_cell.runs, [])
+        self.assertEqual((wait_cell.other_used, wait_cell.other), (1, ["check-owner"]))
         gpu_meter = next(metric for metric in wait_limits.natedev.shared if metric.label == "gpu")
         self.assertEqual((gpu_meter.used, gpu_meter.limit, gpu_meter.waits),
                          (None, None, {"All GPU test places are in use.": ["Memory wait"]}))

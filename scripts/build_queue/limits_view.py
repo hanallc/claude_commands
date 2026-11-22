@@ -745,8 +745,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             item.owner = owner
         if owners_count[name, owner] > 1:
             item.owner = " · ".join(filter(None, (owner, urlsplit(origin).netloc)))
-        for cell in (item.natedev, item.aws):
-            if cell.limit is None:
+        for cell, has_limited_runs in ((item.natedev, origin in bindings), (item.aws, False)):
+            if cell.limit is None and not has_limited_runs:
                 cell.runs.extend(cell.other)
                 cell.used = (cell.used or 0) + cell.other_used
                 cell.other.clear()
