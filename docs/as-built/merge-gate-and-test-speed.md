@@ -390,6 +390,7 @@ The six merge flags are required unless `--tests-only`, `--promote-only`, or `--
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
 Use the module names that the gate prints.
 A standalone named run waits for the build hold to clear and takes one local admission reservation.
+The named run of the unit in `max_runs.exempt_unit` does not wait for the build hold.
 A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
 It reads the reservation from the state folder in the grant and checks that release has not started.
 The child runs one module at a time and takes no additional CPU slot.
