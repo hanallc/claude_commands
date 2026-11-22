@@ -1119,7 +1119,7 @@ def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str
     tools = root / "build-tool-tripwires"
     tools.mkdir()
     marker = root / "build-tool-calls.jsonl"
-    script = f"""#!{Path(__file__).resolve().parents[1] / "lib/py"}
+    script = f"""#!/usr/bin/env {Path(__file__).resolve().parents[1] / "lib/py"}
 import fcntl, json, sys
 with open({str(marker)!r}, "a") as output:
     fcntl.flock(output, fcntl.LOCK_EX)
