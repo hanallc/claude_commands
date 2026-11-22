@@ -105,6 +105,26 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
+def refused_claim(saved: SavedPlacementAssignment) -> placement.RetainedCleanupClaim | None:
+    """Read the claim that a refused attempt retains for cleanup."""
+    report = saved.terminal_report
+    if (isinstance(saved.provider, placement.ProviderClaimReference)
+            and isinstance(report, placement.TerminalAttemptReport)
+            and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))):
+        return placement.RetainedCleanupClaim(saved.provider, report.outcome.reason)
+    return None
+
+
+def assignment_pending_start(saved: SavedPlacementAssignment,
+                             evidence: execution_identity.ExecutionEvidence | None = None,
+                             *, has_claim: bool = False) -> bool:
+    """Read the start state from the assignment, its claim, and execution evidence."""
+    return (isinstance(saved.state, placement.CurrentAssignment)
+            and isinstance(saved.terminal_report, placement.NoTerminalReport)
+            and isinstance(saved.provider, placement.NoProviderClaim)
+            and not has_claim and not isinstance(evidence, execution_identity.ObservedExecution))
+
+
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
 
@@ -1200,6 +1220,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    mac_retained_claims: tuple[placement.ProviderClaimReference, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)

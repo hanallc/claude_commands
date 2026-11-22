@@ -2703,21 +2703,8 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
-def mac_activity_host(reading: queue_view.MacBuildReading, snapshots: target_availability.Snapshots) -> str:
-    if reading.host:
-        return reading.host
-    found = snapshots if isinstance(snapshots, tuple) else ()
-    target = next((snapshot.target for snapshot in found
-                   if isinstance(snapshot.target, target_config.SshTarget)
-                   and snapshot.target.platform == "macos" and snapshot.target.name == reading.target), None)
-    if not reading.target:
-        target = queue_view.selected_mac_target(snapshot.target for snapshot in found)
-    if target is not None:
-        try:
-            return conf.read(target.settings).text("host")
-        except conf.Unusable:
-            pass
-    return reading.target or "mac"
+def mac_activity_host(reading: queue_view.MacBuildReading) -> str:
+    return reading.hostname or conf.read_or_repository("machines").words("mac.hosts")[0]
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -2741,7 +2728,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     folder_settings = conf.read_or_repository("build_folders")
     slot_roots = folder_settings.values()
     mac_reading = queue_view.read_mac_builds()
-    mac_machine = mac_activity_host(mac_reading, snapshots)
+    mac_machine = mac_activity_host(mac_reading)
     machine = host_name()
     slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     with staff.supplied_snapshot(staff_display.members):
@@ -2750,7 +2737,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
              *target_availability.holder_sessions(snapshots)], os.environ)
     members = FeedStaff(staff_display.members)
     zone = user_zone()
-    routes = target_availability.MacRoutes(snapshots, labels, zone)
+    route_snapshots = snapshots
+    if isinstance(snapshots, tuple):
+        selected_mac = queue_view.selected_mac_snapshot(snapshots)
+        route_snapshots = () if selected_mac is None else (selected_mac,)
+    routes = target_availability.MacRoutes(route_snapshots, labels, zone)
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
         memory = entry.step.measured

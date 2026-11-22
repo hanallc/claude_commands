@@ -96,6 +96,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         for key in ("placement_block", "mac_decision", "mac_startup"):
             if key in record and record[key] is None:
                 del record[key]
+    if writing and schema.__name__ == "QueueView" and not record.get("mac_retained_claims"):
+        _ = record.pop("mac_retained_claims", None)
     if writing and schema.__name__ == "WaitingStep":
         for key in ("placement_pending", "placement_episode", "caller_start"):
             if key in record and not record[key]:

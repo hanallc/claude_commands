@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +12,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+from queue import SimpleQueue
+from threading import Thread
 import time
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 from uuid import uuid4
@@ -480,7 +482,7 @@ def claim_files(paths: StatePaths) -> tuple[Path, ...]:
 
 
 MacBlocker = Literal["limit-full", "whole-mac-full", "mirror-backoff", "starting", "ineligible",
-                     "machine-held", "disk-floor", "cleanup", "whole-mac-cleanup", "copy-yield", "older-request"]
+                     "machine-held", "disk-floor", "cleanup", "whole-mac-cleanup", "copy-yield", "copy-running", "older-request"]
 
 
 @dataclass(frozen=True)
@@ -534,6 +536,34 @@ def record_claim_wait(paths: StatePaths, caller: int, folder: str, name: str,
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+@contextmanager
+def publish_claim_waits(paths: StatePaths, caller: int, folder: str, name: str,
+                        session: SubmittingSession, episode: str) -> Generator[Callable[[MacDecision], None] | None, None, None]:
+    """Publish wait records without delaying the next claim attempt."""
+    pending: SimpleQueue[MacDecision | None] = SimpleQueue()
+
+    def write_waits() -> None:
+        with ExitStack() as record:
+            last: MacDecision | None = None
+            while (decision := pending.get()) is not None:
+                if decision != last:
+                    record.close()
+                    _ = record.enter_context(record_claim_wait(paths, caller, folder, name, session, episode,
+                                                               decision=decision))
+                    last = decision
+
+    writer = Thread(target=write_waits, name="claim-wait-record", daemon=True)
+    try:
+        writer.start()
+    except RuntimeError:
+        yield None
+        return
+    try:
+        yield pending.put
+    finally:
+        pending.put(None)
 
 
 def claim_wait_decision(row: dict[str, object], target: str) -> MacDecision | None:

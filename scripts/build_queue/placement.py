@@ -471,7 +471,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
-    mac_blocker: MacBlocker | None = None
+    mac_decision: MacDecision | None = None
 
 
 @dataclass(frozen=True)
