@@ -2577,13 +2577,25 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                                 and state.pane == reaped_panes.get(state.row.id)
                                 and state.status == herdr.AgentStatus.WORKING):
                             continue
+                        if isinstance(state, worker_panes.ClosedWorker):
+                            fresh = worker_panes.observe_worker(parent, state.row, staff.snapshot())
+                            if not isinstance(fresh, (worker_panes.OpenWorker, worker_panes.StoppedWorker,
+                                                      worker_panes.ClosedWorker)):
+                                outcome = ExitCode.UNCERTAIN
+                                continue
+                            state = fresh
+                            if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
+                                changed = True
+                                continue
                         if passed.get("status") == "canceled":
                             if isinstance(state, worker_panes.ClosedWorker):
                                 continue
-                            closed = worker_panes.close(parent, WorkerName.parse(state.row.name), lock=hold)
-                            if isinstance(closed, worker_panes.Closed):
-                                changed = True
-                                continue
+                            allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
+                            if isinstance(allowed, worker_panes.CloseAllowed):
+                                closed = worker_panes.close(parent, WorkerName.parse(state.row.name), lock=hold)
+                                if isinstance(closed, worker_panes.Closed):
+                                    changed = True
+                                    continue
                     if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
                                     CompletionRecovery.WAITING_ON_REPLY):
                         print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
