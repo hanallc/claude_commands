@@ -56,6 +56,16 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-c
 
 A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
+## Mac Linux guest folders
+
+The Mac Linux route runs the suite in a numbered copy.
+It makes a per-run tool folder under the copy's `target` directory.
+Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
+The guest removes the tool folder when the suite returns.
+The suite uses a private PID namespace and mounts its own `/proc`.
+At the guest deadline, the namespace ends all suite processes, including processes that change groups.
+If `bwrap` is missing, the route declines before it sends the source.
+
 ## How it works
 
 ### State, lock and block — `scripts/mac_test/mac_test.py`

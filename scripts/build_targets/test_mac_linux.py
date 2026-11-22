@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,8 @@ if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
     print('fixture SSH refused the connection', file=sys.stderr)
     sys.exit(255)
 environment = dict(os.environ, HOME=str(home))
+if 'FIXTURE_GUEST_PATH' in os.environ:
+    environment['PATH'] = os.environ['FIXTURE_GUEST_PATH']
 scenario = os.environ['FIXTURE_GUEST_RESULT']
 if arm:
     reply = subprocess.check_output(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment)
@@ -115,6 +118,20 @@ sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment,
 '''
 
 
+BWRAP_FIXTURE = '''import os
+from pathlib import Path
+import sys
+
+flags = ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
+         '--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '/dev/shm', '--']
+assert sys.argv[1:1 + len(flags)] == flags, sys.argv[1:]
+assert Path(os.environ['TMPDIR']).is_dir()
+os.environ['FIXTURE_SANDBOX'] = 'bwrap'
+command = sys.argv[1 + len(flags):]
+os.execvp(command[0], command)
+'''
+
+
 GATE_FIXTURE = '''import fcntl
 import os
 from pathlib import Path
@@ -136,6 +153,7 @@ def WholeMachine(*, gate_parent):
 
 
 def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time_limit):
+    assert os.environ['FIXTURE_SANDBOX'] == 'bwrap'
     guest = Path(os.environ['FIXTURE_GUEST_HOME'])
     assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
@@ -238,6 +256,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         binaries = self.root / 'bin'
         binaries.mkdir()
         self.executable(binaries / 'ssh', f'#!{sys.executable} -B\n' + SSH_FIXTURE)
+        self.executable(binaries / 'bwrap', f'#!{sys.executable} -B\n' + BWRAP_FIXTURE)
         (binaries / 'chromium').symlink_to(sys.executable)
         config = self.root / 'config'
         config.mkdir()
@@ -349,6 +368,20 @@ fi
         self.assertIsInstance(result, str)
         self.assertIn('fixture SSH refused the connection', str(result))
         self.assert_guest_clean('probe')
+
+    def test_missing_bwrap_refuses_before_upload(self) -> None:
+        binaries = self.root / 'without-bwrap'
+        binaries.mkdir()
+        for name in ('bash', 'id'):
+            executable = shutil.which(name)
+            assert executable is not None
+            (binaries / name).symlink_to(executable)
+        with patch.dict(os.environ, {'FIXTURE_GUEST_PATH': str(binaries)}):
+            result = self.route()
+        self.assertIsInstance(result, str)
+        self.assertIn('bwrap is absent from the guest PATH', str(result))
+        self.assert_guest_clean('probe')
+        self.assertFalse((self.guest_home / '.claude').exists())
 
     def test_other_repository_is_refused_before_ssh(self) -> None:
         _ = self.git('remote', 'set-url', 'origin', 'https://example.test/other-repo.git')
@@ -755,7 +788,7 @@ fi
         self.assertEqual([job.returncode for job in result.jobs], [124, 124])
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def test_guest_returns_module_metrics(self) -> None:
+    def test_sandboxed_guest_returns_module_metrics(self) -> None:
         result = self.route()
         assert isinstance(result, mac_linux.MacLinuxGateRun), result
         self.assertTrue(result.passed)
