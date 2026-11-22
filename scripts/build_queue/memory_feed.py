@@ -2500,6 +2500,7 @@ class OutsideQueueScan:
         self.processes = processes
         self.staff_members = staff_members
         self.builds = builds
+        self.commands_read: set[int] = set()
         self.groups: dict[int, Path | None] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
@@ -2527,19 +2528,28 @@ class OutsideQueueScan:
             OUTSIDE_PROCESS_METADATA[key] = OutsideProcessMetadata(process.name)
         return OUTSIDE_PROCESS_METADATA[key]
 
-    def command(self, pid: int) -> tuple[str, ...]:
+    def command(self, pid: int, *, refresh: bool = False) -> tuple[str, ...]:
         process = self.processes[pid]
         if process.zombie:
             return ()
         evidence = self.metadata(pid)
-        if evidence.command is None or evidence.name != process.name:
-            evidence.name = process.name
+        if evidence.command is None or evidence.name != process.name or (refresh and pid not in self.commands_read):
             try:
-                command = read_proc_text(PROC / str(pid) / "cmdline").removesuffix("\0")
-                evidence.command = tuple(command.split("\0")) if command else ()
+                line = read_proc_text(PROC / str(pid) / "cmdline").removesuffix("\0")
+                command = tuple(line.split("\0")) if line else ()
             except OSError:
-                evidence.command = ()
+                command = ()
+            if evidence.command != command or evidence.name != process.name:
+                evidence.owners = None
+            evidence.command = command
+            evidence.name = process.name
+            self.commands_read.add(pid)
         return evidence.command
+
+    def refresh_tree_commands(self, pids: Iterable[int]) -> None:
+        """Refresh command lines once for the live processes in a marked tree."""
+        for pid in pids:
+            _ = self.command(pid, refresh=True)
 
     def owner(self, pids: Iterable[int], *, detached: bool = False) -> unit_labels.UnitLabels | None:
         keys = (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS) if detached else SESSION_OWNER_KEYS
@@ -2617,6 +2627,13 @@ def outside_queue_row(pid: int, command: tuple[str, ...], owner: unit_labels.Uni
             "command": label[:80], "cpu_seconds": seconds}
 
 
+def is_outside_tree_wrapper(command: tuple[str, ...]) -> bool:
+    return not command or is_agent_command(command) or (
+        Path(command[0]).name.lstrip("-") in SHELLS and all(
+            word.startswith("-") and word.split("=", 1)[0] != "--command"
+            and not re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word) for word in command[1:]))
+
+
 def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_per_second: int,
                        seen: set[int]) -> list[OutsideQueueProcess]:
     """Measure outside command trees in an agent scope."""
@@ -2629,11 +2646,7 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_
         pid = pending.pop()
         if pid in seen:
             continue
-        command = scan.command(pid)
-        idle_shell = bool(command) and Path(command[0]).name.lstrip("-") in SHELLS and all(
-            word.startswith("-") and word.split("=", 1)[0] != "--command"
-            and not re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word) for word in command[1:])
-        if not command or is_agent_command(command) or idle_shell:
+        if is_outside_tree_wrapper(scan.command(pid)):
             seen.add(pid)
             pending.extend(child for child in scan.children.get(pid, ()) if child in pids)
             continue
@@ -2643,6 +2656,13 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float, ticks_
         # Read parents first so a child reaped during this scan cannot count twice.
         seconds = sum(process_cpu_ticks(child, scan.processes[child].start) for child in tree) / ticks_per_second
         if seconds > limit:
+            scan.refresh_tree_commands(tree)
+            command = scan.command(pid)
+            if is_outside_tree_wrapper(command):
+                seen.difference_update(tree)
+                seen.add(pid)
+                pending.extend(child for child in scan.children.get(pid, ()) if child in pids)
+                continue
             if owner is None:
                 owner = scan.owner(scope_owners)
             rows.append(outside_queue_row(pid, command, owner or scan.owner(scan.ancestors(pid)), seconds))
@@ -2664,6 +2684,7 @@ def detached_cpu_seconds(scope: Path) -> float:
 
 
 def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> OutsideQueueProcess | None:
+    # Only CPU charged to the detached scope counts, even when a child has its own build scope.
     seconds = detached_cpu_seconds(scope)
     if seconds <= limit:
         return None
@@ -2673,6 +2694,7 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     nested = {admitted for admitted in scan.admitted_scopes if admitted.is_relative_to(scope)}
     if scan.has_admission(pids, nested):
         return None
+    scan.refresh_tree_commands(pids)
     for pid in sorted(pids, key=lambda item: (scan.processes[item].parent in pids, item)):
         if command := scan.command(pid):
             owner = scan.scope_owner(pids) or scan.owner(scan.ancestors(pid), detached=True)

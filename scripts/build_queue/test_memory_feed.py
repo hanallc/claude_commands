@@ -185,6 +185,13 @@ class MemoryFeedTests(unittest.TestCase):
         ])
         inputs = reading.explanation.decided_from
         owners = memory_feed.FeedStaff(staff_members)
+        cmdline = self.root / "proc/8102/cmdline"
+        original_command = cmdline.read_text()
+        _ = cmdline.write_text("/bin/python3\0/fixture/agent_exec.py\0")
+        self.assertEqual([(row["command"], row["owner"]) for row in memory_feed.outside_queue_processes(inputs, owners)],
+                         [("agent_exec.py", "test")])
+        _ = cmdline.write_text(original_command)
+
         user = self.root / "cgroup/user"
         scope = user / "builds.slice/build-fixture.scope"
         write_scope(scope)
@@ -227,7 +234,9 @@ class MemoryFeedTests(unittest.TestCase):
             self.assertEqual(text_reads[cpu_stat], 2)
         self.assertEqual([(row["pid"], row["owner"], row["cpu_seconds"]) for row in outside], [(8102, "builds", 151.5)])
         self.assertEqual(byte_reads[self.root / "proc/8102/environ"], 1)
-        self.assertEqual(byte_reads[self.root / "proc/8102/cmdline"], 0)
+        self.assertEqual(byte_reads[cmdline], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8105/cmdline"], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 0)
         self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 2)
 
         reservation = fixture_reservation(8105, admission_records.GIB)
@@ -261,6 +270,18 @@ class MemoryFeedTests(unittest.TestCase):
             self.assertIn("direct_test.time_limit_seconds missing", errors.getvalue())
         _ = config.write_text("# whole: 1..\ndirect_test.time_limit_seconds=130\n")
         self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
+
+        environ = self.root / "proc/8102/environ"
+        _ = cmdline.write_text("/bin/python3\0/fixture/detached_exec.py\0")
+        _ = environ.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
+        byte_reads.clear()
+        with mock.patch.object(Path, "read_bytes", new=count_bytes):
+            rows = memory_feed.outside_queue_processes(inputs, owners)
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), rows)
+        self.assertEqual([(row["pid"], row["command"], row["owner"]) for row in rows],
+                         [(8102, "detached_exec.py", "test")])
+        self.assertEqual(byte_reads[cmdline], 2)
+        self.assertEqual(byte_reads[environ], 1)
 
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
