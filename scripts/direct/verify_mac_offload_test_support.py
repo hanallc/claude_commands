@@ -18,6 +18,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
+import math
 import os
 import errno
 import select
@@ -35,6 +36,7 @@ from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import cached_property
 from pathlib import Path
 from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
@@ -42,6 +44,7 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
+from scripts.lib.process_start import Started, Unreadable, Zombie, open_linux_process_exit, proc_table_start
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -134,8 +137,12 @@ def processes_carrying(marker: str) -> set[int]:
 
 def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
     """Wait for marked processes to exit. Return survivors without a signal."""
+    return wait_for_verify_exit(lambda: processes_carrying(marker), timeout)
+
+
+def wait_for_verify_exit(scan: Callable[[], set[int]], timeout: float) -> set[int]:
     deadline = time.monotonic() + timeout
-    while children := processes_carrying(marker):
+    while children := scan():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -144,7 +151,7 @@ def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
         try:
             for pid in children:
                 try:
-                    descriptors.append(os.pidfd_open(pid))
+                    descriptors.append(open_linux_process_exit(pid))
                 except ProcessLookupError:
                     pass
                 except AttributeError:
@@ -153,48 +160,203 @@ def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
                     if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EPERM):
                         raise
                     poll_exits = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             if descriptors:
-                _ = select.select(descriptors, [], [], min(0.01, remaining) if poll_exits else remaining)
+                watcher = select.poll()
+                for descriptor in descriptors:
+                    watcher.register(descriptor, select.POLLIN)
+                seconds = min(0.01, remaining) if poll_exits else remaining
+                _ = watcher.poll(math.ceil(1000 * seconds))
             elif poll_exits:
                 time.sleep(min(0.01, remaining))
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
-    return processes_carrying(marker)
+    return scan()
 
 
-def reap(marker: str) -> dict[int, str]:
-    """Kill every process carrying `marker` and wait until none is left.
+PROC = Path("/proc")
 
-    verify.sh runs each step in its own process group and its step owner in
-    its own session, so a kill of verify's group leaves the step's tree
-    running under init. A stopped process cannot fork or exit, so stopping
-    each one found until a scan finds no new one catches the whole tree.
-    """
-    stopped: dict[int, str] = {}
-    while fresh := processes_carrying(marker) - stopped.keys():
-        for pid in fresh:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGSTOP)
+
+@dataclass(frozen=True)
+class VerifyProcessFamily:
+    parent: int
+    group: int
+    identity: Started | Zombie
+
+
+def verify_process_family(entry: Path) -> VerifyProcessFamily:
+    _, separator, rest = (entry / "stat").read_bytes().rpartition(b")")
+    fields = rest.split()
+    if not separator or len(fields) <= 19 or not fields[19].isdigit():
+        raise ValueError("invalid process stat fields")
+    start = fields[19].decode("ascii")
+    identity = Zombie(start) if fields[0] in (b"Z", b"X") else Started(start)
+    return VerifyProcessFamily(int(fields[1]), int(fields[2]), identity)
+
+
+class VerifyProcessScan:
+    """Find fixture processes and keep their identities between scans."""
+
+    def __init__(self, root: Path, marker: str) -> None:
+        self.root: Path = root.resolve()
+        self.marker: bytes = os.fsencode(marker)
+        self.known: dict[int, str] = {}
+
+    def remember(self, pid: int) -> None:
+        identity = proc_table_start(pid, PROC)
+        if isinstance(identity, (Started, Zombie)):
+            self.known[pid] = identity.start
+
+    def has_fixture_evidence(self, entry: Path) -> bool:
+        with contextlib.suppress(OSError):
+            if self.marker in (entry / "environ").read_bytes().split(b"\0"):
+                return True
+        with contextlib.suppress(OSError):
+            if (entry / "cwd").readlink().is_relative_to(self.root):
+                return True
+        return False
+
+    def scan(self) -> dict[int, Started | Unreadable]:
+        families: dict[int, VerifyProcessFamily] = {}
+        unreadable: dict[int, Unreadable] = {}
+        related: set[int] = set()
+        own_pid, own_group, uid = os.getpid(), os.getpgrp(), os.getuid()
+        for entry in PROC.iterdir() if PROC.is_dir() else ():
+            if not entry.name.isdecimal() or (pid := int(entry.name)) in (0, 1, own_pid):
+                continue
             try:
-                arguments = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
-                stopped[pid] = shlex.join(os.fsdecode(word) for word in arguments if word)
+                family = verify_process_family(entry)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, ValueError) as error:
+                unreadable[pid] = Unreadable(str(error))
+            else:
+                families[pid] = family
+                if self.known.get(pid) == family.identity.start:
+                    related.add(pid)
+                    continue
+                if isinstance(family.identity, Zombie):
+                    continue
+            with contextlib.suppress(OSError):
+                if entry.stat().st_uid == uid and self.has_fixture_evidence(entry):
+                    related.add(pid)
+
+        while True:
+            groups = {families[pid].group for pid in related & families.keys()} - {0, own_group}
+            linked = {pid for pid, family in families.items()
+                      if family.parent in related or family.group in groups}
+            if linked <= related:
+                break
+            related.update(linked)
+        for pid in unreadable.keys() - related:
+            if pid in self.known:
+                related.add(pid)
+                continue
+            with contextlib.suppress(OSError):
+                if os.getpgid(pid) in groups:
+                    related.add(pid)
+
+        self.known = {pid: families[pid].identity.start for pid in related & families.keys()} | {
+            pid: self.known[pid] for pid in unreadable.keys() & self.known.keys()}
+        live: dict[int, Started | Unreadable] = {
+            pid: identity for pid in related & families.keys()
+            if isinstance(identity := families[pid].identity, Started)}
+        live.update({pid: unreadable[pid] for pid in related & unreadable.keys()})
+        return live
+
+
+@dataclass(frozen=True)
+class StoppedVerifyProcess:
+    pid: int
+    identity: Started
+    resume_descriptor: int
+
+
+def reap(scan: VerifyProcessScan | str) -> dict[int, str]:
+    """Stop and kill fixture processes. Report any process that remains."""
+    # An expired leak check still needs time to stop the processes it found.
+    deadline = time.monotonic() + max(5, TEST_HANG_GUARD_SECS)
+    attempted: dict[int, Started] = {}
+    stopped: list[StoppedVerifyProcess] = []
+    resumed: set[int] = set()
+    commands: dict[int, str] = {}
+    errors: list[str] = []
+
+    def collect() -> dict[int, Started | Unreadable]:
+        if isinstance(scan, VerifyProcessScan):
+            return scan.scan()
+        return {pid: identity for pid in processes_carrying(scan)
+                if isinstance(identity := proc_table_start(pid, PROC), (Started, Unreadable))}
+
+    try:
+        while time.monotonic() < deadline:
+            fresh = {pid: identity for pid, identity in collect().items()
+                     if isinstance(identity, Started) and identity != attempted.get(pid)}
+            if not fresh:
+                break
+            for pid, identity in fresh.items():
+                attempted[pid] = identity
+                try:
+                    descriptor = open_linux_process_exit(pid)
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    errors.append(f"{pid}: {error}")
+                    continue
+                try:
+                    if proc_table_start(pid, PROC) == identity:
+                        os.kill(pid, signal.SIGSTOP)
+                        stopped.append(StoppedVerifyProcess(pid, identity, descriptor))
+                        descriptor = -1
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    errors.append(f"{pid}: {error}")
+                    continue
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                try:
+                    arguments = (PROC / str(pid) / "cmdline").read_bytes().split(b"\0")
+                    commands[pid] = shlex.join(os.fsdecode(word) for word in arguments if word)
+                except OSError as error:
+                    commands[pid] = f"command unavailable: {error}"
+    finally:
+        for process in stopped:
+            pid = process.pid
+            try:
+                current = proc_table_start(pid, PROC)
+                if isinstance(current, Unreadable):
+                    raise OSError(current.reason)
+                if current == process.identity:
+                    os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
             except OSError as error:
-                stopped[pid] = f"command unavailable: {error}"
-    for pid in stopped:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-    for pid in stopped:
-        try:
-            descriptor = os.pidfd_open(pid)
-        except ProcessLookupError:
-            continue
-        try:
-            _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
-        finally:
-            os.close(descriptor)
-    return stopped
+                errors.append(f"{pid}: {error}")
+                # Release the stop even when cleanup cannot verify or kill the process.
+                try:
+                    send_resume = cast(Callable[[int, int], None], getattr(signal, "pidfd_send_signal"))
+                    send_resume(process.resume_descriptor, signal.SIGCONT)
+                    resumed.add(pid)
+                except ProcessLookupError:
+                    pass
+                except OSError as resume_error:
+                    errors.append(f"{pid}: {resume_error}")
+            finally:
+                os.close(process.resume_descriptor)
+    remaining = wait_for_verify_exit(lambda: collect().keys() - resumed, max(0, deadline - time.monotonic()))
+    if remaining or errors:
+        reasons = collect()
+        for pid in sorted(remaining):
+            identity = reasons.get(pid)
+            detail = identity.reason if isinstance(identity, Unreadable) else commands.get(pid, "still running")
+            errors.append(f"{pid}: {detail}")
+        raise OSError("processes remain after verify cleanup:\n" + "\n".join(errors))
+    return commands
 
 
 @dataclass(frozen=True)
@@ -1465,7 +1627,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         self.placement_policy = {**self.environment, **(extra or {})}
 
         install_fixed_cargo(self.bin_directory / "cargo")
-        return subprocess.Popen(
+        process = subprocess.Popen(
             ["bash", str(self.verify_script), *arguments],
             cwd=self.root,
             env={**self.environment, **(extra or {})},
@@ -1475,6 +1637,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             start_new_session=True,
             preexec_fn=restore_sigint,
         )
+        self.fixture_processes.remember(process.pid)
+        return process
 
     def cargo_events(self) -> list[CargoEvent]:
         if not self.cargo_events_path.exists():
@@ -1604,9 +1768,16 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         """The environment entry every process this test starts inherits."""
         return f"TEST_RUNNER_STATE={self.runner_state}"
 
+    @cached_property
+    def fixture_processes(self) -> VerifyProcessScan:
+        return VerifyProcessScan(self.root, self.child_marker())
+
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        """Kill the call and every process under it, its steps' own groups and sessions too."""
-        _ = reap(self.child_marker())
+        """Stop the verify call and its fixture processes."""
+        scan = self.fixture_processes
+        if process.returncode is None and process.pid not in scan.known:
+            scan.remember(process.pid)
+        _ = reap(scan)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def assert_nothing_outlives(self) -> None:
@@ -1615,9 +1786,10 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        remaining = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
+        scan = self.fixture_processes
+        remaining = wait_for_verify_exit(lambda: set(scan.scan()), TEST_HANG_GUARD_SECS)
         if remaining:
-            survivors = reap(self.child_marker())
+            survivors = reap(scan)
             for pid in remaining:
                 _ = survivors.setdefault(pid, "exited before reap")
             commands = "\n".join(f"{pid}: {command}" for pid, command in sorted(survivors.items()))
@@ -1659,9 +1831,12 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         try:
             for process in processes:
                 try:
-                    descriptors.append(os.pidfd_open(process.pid))
+                    descriptors.append(open_linux_process_exit(process.pid))
                 except ProcessLookupError:
                     pass
+                except OSError as error:
+                    if error.errno != errno.ENOTSUP:
+                        raise
             with local_release_waiter(directory or self.root, self.root / "tmp",
                                       RELEASE_CHANGES | inotify.IN_MODIFY) as events:
                 while True:
@@ -1679,8 +1854,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                     if remaining <= 0:
                         self.fail(f"timed out waiting for {what}")
                     if isinstance(events, LocalReleaseEvents):
-                        readable, _, _ = select.select([events.descriptor, *descriptors], [], [], remaining)
-                        if events.descriptor in readable:
+                        watcher = select.poll()
+                        for descriptor in (events.descriptor, *descriptors):
+                            watcher.register(descriptor, select.POLLIN)
+                        readable = watcher.poll(math.ceil(1000 * remaining))
+                        if any(descriptor == events.descriptor for descriptor, mask in readable if mask & select.POLLIN):
                             # Fixture markers are arbitrary names, including open logs;
                             # consume every directory event, not just hold-state names.
                             _ = os.read(events.descriptor, 65536)

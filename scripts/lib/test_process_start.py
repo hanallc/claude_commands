@@ -20,7 +20,7 @@ class ProcessStartTests(unittest.TestCase):
             process = Path(directory) / "42"
             process.mkdir()
             stat = process / "stat"
-            for state, expected in (("S", identity.Started), ("Z", identity.Zombie)):
+            for state, expected in (("S", identity.Started), ("Z", identity.Zombie), ("X", identity.Zombie)):
                 _ = stat.write_text(f"42 (nested (name)) {state} " + "0 " * 18 + "123 0\n")
                 result = identity.process_start(42)
                 self.assertIs(type(result), expected)

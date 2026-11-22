@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Callable
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from dataclasses import replace
 import io
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import socket
 import shutil
@@ -17,7 +20,7 @@ import tempfile
 from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
-from scripts.lib import build_folders
+from scripts.lib import build_folders, process_group
 from scripts.lib.process_start import Zombie
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
@@ -252,32 +255,127 @@ gate.run_suites(Path.cwd(), full=True)
         self.assertEqual(list(parent.iterdir()), [])
 
     def test_cancellation_sends_term_to_all_jobs_before_reaping(self) -> None:
-        jobs: list[gate.RunningGateJob] = []
-        for name in ("first", "second"):
-            job = gate.start_gate_job(
-                "hooks", Path(f"test_{name}.py"),
-                [sys.executable, "-c", "import signal; signal.pause()"],
-                self.checkout, self.environment, self.state / f"{name}.log")
-            self.addCleanup(job.output.close)
-            self.addCleanup(gate.kill_job_group, job)
-            jobs.append(job)
-        sent: list[int] = []
-        reap = gate.reap_gate_job
+        for fault in ("none", "TERM", "configuration", "KILL retry"):
+            with self.subTest(fault=fault), ExitStack() as cleanup:
+                jobs: list[gate.RunningGateJob] = []
+                for name in ("first", "second"):
+                    job = gate.start_gate_job(
+                        "hooks", Path(f"test_{name}.py"),
+                        [sys.executable, "-c", "import signal; signal.pause()"],
+                        self.checkout, self.environment, self.state / f"{name}.log")
+                    _ = cleanup.callback(job.output.close)
+                    _ = cleanup.callback(gate.kill_job_group, job)
+                    jobs.append(job)
+                sent: list[int] = []
+                wait_for_child = os.wait4
+                denial = PermissionError("first TERM denied")
+                if fault == "KILL retry":
+                    jobs[0].cleanup_timing = replace(jobs[0].cleanup_timing, stop_seconds=0.2)
+                refused = False
 
-        def send_record(pid: int, number: int) -> None:
-            if number == signal.SIGTERM:
-                sent.append(pid)
-            send_process_group(pid, number)
+                def send_record(pid: int, number: int) -> None:
+                    nonlocal refused
+                    if number == signal.SIGTERM:
+                        sent.append(pid)
+                        if fault == "TERM" and pid == jobs[0].process.pid:
+                            raise denial
+                        if fault == "KILL retry" and pid == jobs[0].process.pid:
+                            return
+                    if (fault == "KILL retry" and pid == jobs[0].process.pid
+                            and number == signal.SIGKILL and not refused):
+                        refused = True
+                        raise PermissionError("first KILL denied")
+                    send_process_group(pid, number)
 
-        def reap_after_all_terms(job: gate.RunningGateJob, *, block: bool = False) -> None:
-            self.assertEqual(sent, [item.process.pid for item in jobs])
-            reap(job, block=block)
+                def reap_after_all_terms(pid: int, options: int) -> tuple[int, int, resource.struct_rusage]:
+                    self.assertEqual(sent, [item.process.pid for item in jobs])
+                    return wait_for_child(pid, options)
 
-        with mock.patch("scripts.production.gate.process_group.send_process_group", side_effect=send_record), \
-                mock.patch.object(gate, "reap_gate_job", side_effect=reap_after_all_terms):
-            gate.stop_gate_jobs(jobs)
-        for job in jobs:
-            self.assertIsNotNone(job.process.returncode)
+                with (ExitStack() as faults,
+                      mock.patch("scripts.production.gate.process_group.send_process_group", side_effect=send_record),
+                      mock.patch.object(os, "wait4", side_effect=reap_after_all_terms)):
+                    if fault == "configuration":
+                        reader = mock.Mock(side_effect=PermissionError("configuration denied after launch"))
+                        _ = faults.enter_context(mock.patch.object(gate, "admission_records",
+                            mock.Mock(spec=admission_records, read_memory_config=reader)))
+                    if fault == "TERM":
+                        with self.assertRaises(PermissionError) as raised:
+                            gate.stop_gate_jobs(jobs)
+                        self.assertIs(raised.exception, denial)
+                    elif fault == "KILL retry":
+                        with self.assertRaisesRegex(PermissionError, "first KILL denied"):
+                            gate.stop_gate_jobs(jobs)
+                        self.assertIsNone(jobs[0].process.returncode)
+                        gate.kill_job_group(jobs[0])
+                    else:
+                        gate.stop_gate_jobs(jobs)
+                for job in jobs:
+                    self.assertIsNotNone(job.process.returncode)
+
+    def test_whole_machine_recovers_a_denied_group_before_launch(self) -> None:
+        parent = self.root / "private-recovery"
+        parent.mkdir()
+        first_runner = self.state / "recovery-runner.py"
+        child_pid = self.state / "child-pid"
+        # The first runner leaves its child for the gate to recover.
+        self.write(first_runner, """import os
+from pathlib import Path
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+(Path(os.environ["GATE_TEST_STATE"]) / "child-pid").write_text(str(child.pid))
+""")
+        selected = gate.SelectedModules(("scripts/hooks/test_first.py",))
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=parent)):
+            def deny_cleanup(group: int, number: int) -> None:
+                if number in (signal.SIGTERM, signal.SIGKILL):
+                    raise PermissionError("fixture group cleanup denied")
+                send_process_group(group, number)
+
+            try:
+                with (mock.patch.object(gate, "module_runner", return_value=first_runner),
+                      mock.patch.object(process_group, "send_process_group", side_effect=deny_cleanup),
+                      self.assertRaisesRegex(PermissionError, "fixture group cleanup denied")):
+                    _ = gate.run_suites(self.checkout, machine=gate.WholeMachine(), selected=selected)
+                child = int(child_pid.read_text())
+                record, = parent.glob("gate-recovery-*/run.json")
+                saved = cast(dict[str, object], json.loads(record.read_text()))
+                self.assertIn(str(os.getpgid(child)), cast(dict[str, str], saved["groups"]))
+                start = gate.start_gate_job
+
+                def start_after_recovery(*args: object, **options: object) -> gate.RunningGateJob:
+                    launch = cast(Callable[..., gate.RunningGateJob], start)
+                    self.assertFalse(record.exists())
+                    self.assert_process_stopped(child)
+                    child_pid.unlink()
+                    return launch(*args, **options)
+
+                with mock.patch.object(gate, "start_gate_job", side_effect=start_after_recovery):
+                    rerun = gate.run_suites(self.checkout, machine=gate.WholeMachine(), selected=selected)
+                self.assertTrue(rerun.passed)
+                self.assertEqual([job.module for job in rerun.jobs], ["test_first.py"])
+            finally:
+                if child_pid.exists():
+                    try:
+                        os.kill(int(child_pid.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_finish_keeps_cleanup_error_when_output_close_fails(self) -> None:
+        job = gate.start_gate_job(
+            "hooks", Path("test_first.py"), [sys.executable, "-c", "pass"],
+            self.checkout, self.environment, self.state / "close-error.log")
+        self.addCleanup(job.output.close)
+        self.addCleanup(gate.kill_job_group, job)
+        with (mock.patch.object(process_group, "send_process_group",
+                                side_effect=PermissionError("group KILL denied")),
+              mock.patch.object(job.output, "close", side_effect=OSError("output close denied")),
+              self.assertRaisesRegex(PermissionError, "group KILL denied") as raised):
+            _ = gate.finish_gate_job(job, 0)
+        self.assertIn("output close denied", cast(list[str], getattr(raised.exception, "__notes__", [])))
 
     def test_gate_removes_its_folder_on_normal_exit(self) -> None:
         parent = self.root / "gate-temporary"
@@ -426,8 +524,12 @@ gate.start_gate_job = stop_after_start
                     pass
 
     def test_finished_module_leaves_no_running_child(self) -> None:
+        with self.subTest(group="gone"), mock.patch.object(gate, "gate_group_has_live_members",
+                side_effect=AssertionError("an absent group needs no scan")):
+            result = self.run_gate("--tests-only", "--full")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.write(self.state / "leak-child", "leak")
-        result = self.run_gate("--tests-only")
+        result = self.run_gate("--tests-only", "--full")
         child = int((self.state / "child-pid").read_text())
         try:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

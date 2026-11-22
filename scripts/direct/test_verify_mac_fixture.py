@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import ExitStack, suppress
+import fcntl
 import json
 import os
+import resource
 import select
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -15,9 +20,11 @@ from typing import cast, final
 from unittest import mock
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
+from scripts.direct import verify_mac_offload_test_support as verify_support
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
+from scripts.lib.process_start import open_linux_process_exit
 
 
 @final
@@ -93,45 +100,93 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
 
     def test_fixture_waits_for_a_detached_child_to_finish_before_checking_for_leaks(self) -> None:
         release = self.runner_state / "recorder-release"
-        child = subprocess.Popen(
-            [sys.executable, self.environment["TEST_WAIT_HELPER"], str(release)],
-            env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        observe_exits = select.select
-        observed: list[int] = []
+        platform = sys.platform
+        for high_descriptor in ((False, True) if platform == "linux" else (False,)):
+            with self.subTest(high_descriptor=high_descriptor), ExitStack() as faults:
+                release.unlink(missing_ok=True)
+                child = subprocess.Popen(
+                    [sys.executable, self.environment["TEST_WAIT_HELPER"], str(release)],
+                    env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True,
+                )
+                real_poll = select.poll
+                observed: list[int] = []
 
-        def release_on_exit_wait(readers: list[int], writers: list[int], errors: list[int],
-                                 timeout: float) -> tuple[list[int], list[int], list[int]]:
-            observed.extend(readers)
-            release.touch()
-            return observe_exits(readers, writers, errors, timeout)
+                @final
+                class ReleaseOnPoll:
+                    def __init__(self) -> None:
+                        self.watcher = real_poll()
+                        self.descriptors: list[int] = []
 
-        try:
-            with mock.patch.object(select, "select", side_effect=release_on_exit_wait):
-                self.assert_nothing_outlives()
-            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertTrue(observed, "cleanup did not observe the live child's exit")
-            self.assertEqual(child.returncode, 0, output + errors)
-        finally:
-            if child.poll() is None:
-                child.kill()
-            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    def register(self, descriptor: int, events: int) -> None:
+                        self.descriptors.append(descriptor)
+                        self.watcher.register(descriptor, events)
+
+                    def poll(self, timeout: int) -> list[tuple[int, int]]:
+                        observed.extend(self.descriptors)
+                        release.touch()
+                        return self.watcher.poll(timeout)
+
+                try:
+                    if high_descriptor:
+                        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                        if hard != resource.RLIM_INFINITY and hard <= 1024:
+                            self.skipTest(f"hard RLIMIT_NOFILE is {hard}. The row needs descriptor 1024.")
+                        if soft != resource.RLIM_INFINITY and soft <= 1024:
+                            resource.setrlimit(resource.RLIMIT_NOFILE, (1025, hard))
+                            _ = faults.callback(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+                        open_pidfd = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+
+                        def open_high_pidfd(pid: int) -> int:
+                            descriptor = open_pidfd(pid)
+                            if pid != child.pid:
+                                return descriptor
+                            try:
+                                return fcntl.fcntl(descriptor, fcntl.F_DUPFD, 1024)
+                            finally:
+                                os.close(descriptor)
+
+                        _ = faults.enter_context(mock.patch.object(os, "pidfd_open", new=open_high_pidfd))
+                    with mock.patch.object(select, "poll", side_effect=ReleaseOnPoll):
+                        self.assert_nothing_outlives()
+                    output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertTrue(observed, "cleanup did not observe the live child's exit")
+                    if high_descriptor:
+                        self.assertGreaterEqual(max(observed), 1024)
+                    self.assertEqual(child.returncode, 0, output + errors)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_exceptional_verify_exit_stops_its_processes_before_the_next_case(self) -> None:
-        for failure in (subprocess.TimeoutExpired("verify", 0), FixtureHang("the fixture stopped")):
-            with self.subTest(failure=type(failure).__name__):
+        cases = [(subprocess.TimeoutExpired("verify", 0), "marked"),
+                 (FixtureHang("the fixture stopped"), "marked")]
+        platform = sys.platform
+        if platform == "linux":
+            cases.extend((FixtureHang("the fixture stopped"), case) for case in ("unmarked", "unreadable"))
+        sleep = shutil.which("sleep", path=self.environment["PATH"])
+        assert sleep is not None
+        for failure, case in cases:
+            with self.subTest(failure=type(failure).__name__, case=case), ExitStack() as cleanup:
+                unmarked = case != "marked"
+                escaped_pid = self.runner_state / "unmarked-pid"
                 process = subprocess.Popen([sys.executable, "-c", """
 import subprocess
 from pathlib import Path
 import os
+import sys
 from scripts.direct.wait_for_test_state import wait_for_file
-child = subprocess.Popen(["sleep", "300"])
+child = subprocess.Popen([sys.argv[3], "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if sys.argv[1] == "1":
+    path = Path(sys.argv[2])
+    detached = subprocess.Popen([sys.argv[3], "300"], cwd=path.parent, env={}, start_new_session=True,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    path.write_text(str(detached.pid))
 print("ready", flush=True)
 wait_for_file(Path(os.environ["TEST_RUNNER_STATE"]) / "exception-release")
-"""], cwd=VERIFY.parents[2], env=self.environment, stdout=subprocess.PIPE,
+""", str(int(unmarked)), str(escaped_pid), sleep], cwd=VERIFY.parents[2], env=self.environment, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, start_new_session=True)
-                assert process.stdout is not None
-                self.assertEqual(process.stdout.readline(), "ready\n")
                 communicate = process.communicate
                 first = True
 
@@ -143,12 +198,71 @@ wait_for_file(Path(os.environ["TEST_RUNNER_STATE"]) / "exception-release")
                     return communicate(timeout=timeout)
 
                 try:
-                    with mock.patch.object(self, "start_verify", return_value=process), \
-                         mock.patch.object(process, "communicate", side_effect=interrupt), \
-                         self.assertRaises(type(failure)):
-                        _ = self.verify("test", "sample")
+                    assert process.stdout is not None
+                    ready = select.poll()
+                    ready.register(process.stdout, select.POLLIN)
+                    self.assertTrue(ready.poll(5000), "the verify fixture did not report readiness")
+                    self.assertEqual(process.stdout.readline(), "ready\n")
+                    detached_exit = select.poll()
+                    observed: list[int] = []
+                    with ExitStack() as faults:
+                        def deny_stat_after_stop(pid: int) -> None:
+                            target = Path("/proc") / str(pid) / "stat"
+                            read_bytes = Path.read_bytes
+                            send_signal = os.kill
+                            send_pidfd = cast(Callable[[int, int], None], getattr(signal, "pidfd_send_signal"))
+
+                            def observe_signal(process_id: int, number: int) -> None:
+                                send_signal(process_id, number)
+                                if process_id == pid:
+                                    observed.append(number)
+
+                            def read_stat(path: Path) -> bytes:
+                                if path == target and signal.SIGSTOP in observed:
+                                    raise PermissionError("detached child stat denied")
+                                return read_bytes(path)
+
+                            def observe_resume(descriptor: int, number: int) -> None:
+                                send_pidfd(descriptor, number)
+                                observed.append(number)
+
+                            _ = faults.enter_context(mock.patch.object(os, "kill", new=observe_signal))
+                            _ = faults.enter_context(mock.patch.object(signal, "pidfd_send_signal", new=observe_resume))
+                            _ = faults.enter_context(mock.patch.object(Path, "read_bytes", new=read_stat))
+                            _ = faults.enter_context(mock.patch.object(verify_support, "TEST_HANG_GUARD_SECS", 1))
+
+                        if unmarked:
+                            pid = int(escaped_pid.read_text())
+                            descriptor = open_linux_process_exit(pid)
+                            _ = cleanup.callback(os.close, descriptor)
+                            detached_exit.register(descriptor, select.POLLIN)
+
+                            def stop_detached() -> None:
+                                if not detached_exit.poll(0):
+                                    with suppress(ProcessLookupError):
+                                        os.kill(pid, signal.SIGKILL)
+                                    _ = detached_exit.poll(TEST_HANG_GUARD_SECS * 1000)
+
+                            _ = cleanup.callback(stop_detached)
+                            self.assertFalse(detached_exit.poll(0))
+                            if case == "unreadable":
+                                deny_stat_after_stop(pid)
+                        with mock.patch.object(self, "start_verify", return_value=process), \
+                             mock.patch.object(process, "communicate", side_effect=interrupt):
+                            if case == "unreadable":
+                                with self.assertRaisesRegex(OSError, "detached child stat denied"):
+                                    _ = self.verify("test", "sample")
+                            else:
+                                with self.assertRaises(type(failure)):
+                                    _ = self.verify("test", "sample")
+                    if case == "unreadable":
+                        self.assertEqual(observed, [signal.SIGSTOP, signal.SIGCONT])
+                        self.assertFalse(detached_exit.poll(0))
+                        continue
                     self.assertIsNotNone(process.poll())
                     self.assertEqual(processes_carrying(self.child_marker()), set())
+                    if unmarked:
+                        self.assertTrue(detached_exit.poll(0), "the unmarked child still runs")
                 finally:
                     self.stop_verify(process)
 

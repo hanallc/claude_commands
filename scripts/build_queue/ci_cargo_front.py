@@ -13,12 +13,15 @@ from dataclasses import dataclass
 from functools import partial
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+from typing import BinaryIO
 
 
 from scripts.build_queue import admission_client as client
@@ -79,16 +82,25 @@ def cargo_path(explicit: str, front: Path) -> tuple[str, str]:
     raise FileNotFoundError("cargo: no cargo executable after the admission front")
 
 
-def capture_progress(stream: int, sidecar: Path) -> None:
+def capture_progress(stream: BinaryIO, sidecar: Path, stopped: threading.Event) -> None:
     parser = progress.CounterParser()
-    while data := os.read(stream, 65536):
-        _ = os.write(sys.stderr.fileno(), data)
-        counter = parser.consume(data.decode(errors="replace"), complete=False)
-        if isinstance(counter, progress.ProgressCounter):
-            progress.publish_counter(sidecar, counter)
-            progress.progress_path(sidecar, "json").chmod(0o644)
-        else:
-            progress.progress_path(sidecar, "json").unlink(missing_ok=True)
+    with stream:
+        descriptor = stream.fileno()
+        pending = select.poll()
+        pending.register(descriptor, select.POLLIN)
+        while not stopped.is_set():
+            if not pending.poll(50):
+                continue
+            data = os.read(descriptor, 65536)
+            if not data:
+                return
+            _ = os.write(sys.stderr.fileno(), data)
+            counter = parser.consume(data.decode(errors="replace"), complete=False)
+            if isinstance(counter, progress.ProgressCounter):
+                progress.publish_counter(sidecar, counter)
+                progress.progress_path(sidecar, "json").chmod(0o644)
+            else:
+                progress.progress_path(sidecar, "json").unlink(missing_ok=True)
 
 
 def cancel(number: int, frame: object) -> None:
@@ -162,37 +174,63 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
             environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
             status = 1
             cleanup = ExitStack()
+            cleanup_deadline: float
             try:
                 _ = adopt_descendants()
-                # The main thread forks because the death signal follows the thread that forks.
-                process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
-                                      preexec_fn=partial(end_with_front, pid))
-                stream = process.stderr
-                if stream is None:
-                    raise RuntimeError("cargo progress pipe is unavailable")
-                reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
-                reader.start()
-                _ = cleanup.callback(stream.close)
-                _ = cleanup.callback(reader.join)
+                # Defer cancellation until the reader has a cleanup callback.
+                with cancellation.defer_cleanup_signals():
+                    # The death signal follows the thread that forks.
+                    process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
+                                          preexec_fn=partial(end_with_front, pid))
+                    stream = process.stderr
+                    if stream is None:
+                        raise RuntimeError("cargo progress pipe is unavailable")
+                    stopped = threading.Event()
+                    reader = threading.Thread(target=capture_progress, args=(stream, sidecar, stopped), daemon=True)
+                    try:
+                        reader.start()
+                    except BaseException:
+                        stream.close()
+                        raise
+
+                    def join_reader() -> None:
+                        reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+                        if reader.is_alive():
+                            stopped.set()
+                            raise TimeoutError("cargo progress pipe stayed open past the cleanup deadline")
+
+                    _ = cleanup.callback(join_reader)
                 status = process.wait()
             except SystemExit as error:
                 status = error.code if isinstance(error.code, int) else 1
                 raise
             finally:
                 with cancellation.defer_cleanup_signals():
+                    cleanup_deadline = time.monotonic() + 2 * grant.execution.program_stop_seconds
                     try:
-                        place.finish(failed=status != 0)
-                    finally:
                         try:
-                            cleanup.close()
+                            try:
+                                place.finish(failed=status != 0, cleanup_deadline=cleanup_deadline)
+                            except BaseException as error:
+                                try:
+                                    cleanup.close()
+                                except BaseException as reader_error:
+                                    error.add_note(str(reader_error))
+                                raise
+                            else:
+                                cleanup.close()
                         finally:
                             try:
                                 while os.waitpid(-1, os.WNOHANG)[0]:
                                     pass
                             except ChildProcessError:
                                 pass
-                            finally:
-                                held.status = status
+                    except BaseException:
+                        if status == 0:
+                            status = 1
+                        raise
+                    finally:
+                        held.status = status
         return status if status >= 0 else 128 - status
 
 

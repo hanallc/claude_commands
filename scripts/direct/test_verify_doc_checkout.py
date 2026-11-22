@@ -21,7 +21,7 @@ from scripts.agents.remote import local_machine
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
+from scripts.direct.verify_mac_offload_test_support import VerifyProcessScan, processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -43,7 +43,9 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
                 env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)}, start_new_session=True,
             )
         self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
-        self.addCleanup(reap, marker)
+        scan = VerifyProcessScan(self.root, marker)
+        scan.remember(process.pid)
+        self.addCleanup(reap, scan)
         return process, log, marker
 
     @contextmanager

@@ -6,7 +6,9 @@ from scripts.lib import atomic_file, cancellation
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
+import errno
 import functools
 import io
 import json
@@ -28,6 +30,7 @@ from scripts.build_queue import queue_place as queue, admission_client as client
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_start import Started, open_linux_process_exit, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue import admission_records as records, program_start, step_estimator
 from scripts.lint import memory_admit as gate
@@ -161,7 +164,7 @@ class HelperLifelineTests(unittest.TestCase):
             assert owner.stdout is not None
             self.assertTrue(select.select([owner.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "helper owner did not become ready")
             pids = cast(list[int], json.loads(cast(bytes, owner.stdout.readline())))
-            descriptors = [os.pidfd_open(pid) for pid in pids]
+            descriptors = [open_linux_process_exit(pid) for pid in pids]
             owner.kill()
             self.assertEqual(owner.wait(timeout=3), -signal.SIGKILL)
             pending = set(descriptors)
@@ -436,8 +439,13 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         class SingleScopeSample(queue.QueuePlace):
             def sample_once(self) -> None:
                 stopped = threading.Event()
-                stopped.set()
-                self._sample(queue.ScopedProgram(), stopped)
+
+                def stop_after_sample(_seconds: float) -> bool:
+                    stopped.set()
+                    return True
+
+                with mock.patch.object(stopped, "wait", side_effect=stop_after_sample):
+                    self._sample(queue.ScopedProgram(), stopped)
 
         with tempfile.TemporaryDirectory(prefix="scope-sample-test-") as directory:
             root = Path(directory)
@@ -724,7 +732,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 _ = os.write(fork_write, b"F")
                 self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                 descendant = int(cast(bytes, child.stdout.readline()))
-                descendant_descriptor = os.pidfd_open(descendant)
+                descendant_descriptor = open_linux_process_exit(descendant)
                 self.assertEqual(os.getsid(descendant), descendant)
                 self.assertNotEqual(os.getpgid(descendant), leader)
                 _ = os.write(exit_write, b"E")
@@ -757,7 +765,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         assert child.stdout is not None
                         self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                         leader = int(cast(bytes, child.stdout.readline()))
-                        leader_descriptor = os.pidfd_open(leader)
+                        leader_descriptor = open_linux_process_exit(leader)
                         _, row = fixture.reservation()
                         scope_name = Path(row["sidecar"]).read_text().strip()
                         directory = Path(scope_name)
@@ -799,26 +807,44 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def test_normal_exit_records_the_exit_code_and_one_peak(self) -> None:
         with QueuePlaceFixture() as fixture:
-            for status, wrapper in ((0, "program_start.py"), (7, "program_start.py"), (0, "queue_place.py")):
-                with self.subTest(status=status, wrapper=wrapper):
-                    with queue.queue_place("rust-analyzer", fixture.root) as place:
-                        spawn = subprocess.Popen
+            for status, wrapper, deny_cleanup in (
+                    (0, "program_start.py", False), (7, "program_start.py", False),
+                    (0, "queue_place.py", False), (0, "program_start.py", True),
+                    (7, "program_start.py", True)):
+                with self.subTest(status=status, wrapper=wrapper, deny_cleanup=deny_cleanup):
+                    with ExitStack() as faults:
+                        if deny_cleanup:
+                            _ = faults.enter_context(self.assertRaisesRegex(PermissionError, "program record removal"))
+                        with queue.queue_place("rust-analyzer", fixture.root) as place:
+                            spawn = subprocess.Popen
 
-                        def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
-                            if argv[2:3] == ["--program-start"]:
-                                argv = [argv[0], str(Path(queue.__file__).with_name(wrapper)), *argv[2:]]
-                            return spawn(argv, **kwargs)
+                            def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
+                                if argv[2:3] == ["--program-start"]:
+                                    argv = [argv[0], str(Path(queue.__file__).with_name(wrapper)), *argv[2:]]
+                                return spawn(argv, **kwargs)
 
-                        with mock.patch.object(subprocess, "Popen", side_effect=start):
-                            child = place.popen([sys.executable, "-c", CHILD, str(status)],
-                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        output, _ = child.communicate(b"queued protocol\x00\xff", timeout=3)
-                        self.assertEqual(output, b"queued protocol\x00\xff")
-                        _, row = fixture.reservation()
-                        place.observe(GIB, GIB)
-                        reservation_id = str(row.get("reservation_id", ""))
-                    self.assertEqual(place.status, status)
-                    fixture.assert_released(self, reservation_id, status=status)
+                            with mock.patch.object(subprocess, "Popen", side_effect=start):
+                                child = place.popen([sys.executable, "-c", CHILD, str(status)],
+                                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                            output, _ = child.communicate(b"queued protocol\x00\xff", timeout=3)
+                            self.assertEqual(output, b"queued protocol\x00\xff")
+                            _, row = fixture.reservation()
+                            place.observe(GIB, GIB)
+                            reservation_id = str(row.get("reservation_id", ""))
+                            if deny_cleanup:
+                                assert isinstance(place.program, queue.StartedProgram)
+                                record_path = place.program.record
+                                unlink = Path.unlink
+
+                                def deny_program_record(path: Path, *, missing_ok: bool = False) -> None:
+                                    if path == record_path:
+                                        raise PermissionError(errno.EACCES, "program record removal", str(path))
+                                    unlink(path, missing_ok=missing_ok)
+
+                                _ = faults.enter_context(mock.patch.object(Path, "unlink", new=deny_program_record))
+                    expected = 1 if deny_cleanup and status == 0 else status
+                    self.assertEqual(place.status, expected)
+                    fixture.assert_released(self, reservation_id, status=expected)
 
     def test_exception_after_a_successful_program_still_releases_with_failure(self) -> None:
         with QueuePlaceFixture() as fixture:
@@ -857,6 +883,42 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertIsInstance(place.program, queue.StartedProgram)
             self.assertEqual(place.status, 1)
             fixture.assert_cleaned(self)
+
+    def test_sampler_gets_join_time_after_process_cleanup_uses_its_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="queue-sampler-join-") as directory:
+            sidecar = Path(directory) / "program.cgroup"
+            scope = sidecar.with_suffix(".scope")
+            _ = sidecar.write_text(str(scope))
+            record = sidecar.with_suffix(".json")
+            record.touch()
+            timing = wire.RunnerExecutionTiming(program_sample_seconds=0.1, program_stop_seconds=1.0,
+                                                peak_wave_seconds=1.0)
+            place = queue.QueuePlace(sidecar, sidecar, configuration=timing)
+            process = mock.Mock(spec=subprocess.Popen, poll=mock.Mock(return_value=0))
+            stopped = threading.Event()
+            is_alive = mock.Mock(return_value=True)
+            clock = mock.Mock(return_value=10.0)
+            cleanup_deadline = 11.0
+
+            def stop_at_deadline(_scope: Path, deadline: float, _sample_seconds: float) -> None:
+                self.assertTrue(stopped.is_set(), "process cleanup started before the sampler stop")
+                self.assertEqual(deadline, cleanup_deadline)
+                clock.return_value = deadline
+
+            def join_sampler(*, timeout: float) -> None:
+                self.assertEqual(clock(), cleanup_deadline)
+                self.assertGreater(timeout, 0)
+                is_alive.return_value = False
+
+            join = mock.Mock(side_effect=join_sampler)
+            sampler = mock.Mock(spec=threading.Thread, ident=1, is_alive=is_alive, join=join)
+            place.program = queue.StartedProgram(process, stopped, sampler, queue.ScopedProgram(), record)
+            with (mock.patch.object(queue, "time", mock.Mock(monotonic=clock)),
+                  mock.patch.object(queue, "stop_scope", side_effect=stop_at_deadline)):
+                place.finish(cleanup_deadline=cleanup_deadline)
+            join.assert_called_once()
+            self.assertEqual(place.status, 0)
+            self.assertFalse(record.exists())
 
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
@@ -921,7 +983,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         assert leader.stdout is not None
                         self.assertTrue(select.select([leader.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "descendant never became ready")
                         descendant = int(cast(bytes, leader.stdout.readline()))
-                        descriptor = os.pidfd_open(descendant)
+                        descriptor = open_linux_process_exit(descendant)
                         if descendant_detaches:
                             self.assertEqual(os.getsid(descendant), descendant)
                             self.assertEqual(os.getpgid(descendant), descendant)
@@ -1143,7 +1205,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(os.read(read_fd, 5), b"ready")
                     _, row = fixture.reservation()
                     os.kill(holder, number)
-                    descriptor = os.pidfd_open(holder)
+                    descriptor = open_linux_process_exit(holder)
                     try:
                         self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
                                         "the holder did not exit after the signal")
@@ -1175,9 +1237,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     @unittest.skipUnless(hasattr(os, "fork"), "start interruption needs fork")
     def test_start_window_interrupts_leave_atomic_records_for_the_next_start(self) -> None:
-        for checkpoint in ("popen-return", "on-started"):
-            for number in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
-                with self.subTest(checkpoint=checkpoint, signal=number), QueuePlaceFixture() as fixture:
+        for checkpoint, holder_case in (("popen-return", "native"), ("on-started", "native"),
+                                        ("on-started", "unreadable"), ("on-started", "darwin")):
+            numbers = (signal.SIGKILL,) if holder_case != "native" else (signal.SIGTERM, signal.SIGINT, signal.SIGKILL)
+            for number in numbers:
+                with self.subTest(checkpoint=checkpoint, signal=number, holder_case=holder_case), QueuePlaceFixture() as fixture:
                     ready_read, ready_write = os.pipe()
                     resume_read, resume_write = os.pipe()
                     caught_read, caught_write = os.pipe()
@@ -1236,7 +1300,33 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         record = wire.parse_record(saved[0].read_text(), program_start.ProgramStart)
                         self.assertEqual(record.holder.pid, holder)
                         self.assertEqual(record.program.pid, program_pid)
-                        descriptor = os.pidfd_open(holder)
+                        if holder_case == "unreadable":
+                            holder_stat = Path("/proc") / str(holder) / "stat"
+                            read = Path.read_bytes
+
+                            def deny_holder_stat(path: Path) -> bytes:
+                                if path == holder_stat:
+                                    raise PermissionError(errno.EACCES, "holder stat", str(path))
+                                return read(path)
+
+                            with (mock.patch.object(Path, "read_bytes", new=deny_holder_stat),
+                                  mock.patch.dict(os.environ, {"VERIFY_PROC_ROOT": "/proc"})):
+                                queue.cleanup_program_starts(records.read_memory_config())
+                            self.assertEqual(wire.parse_record(saved[0].read_text(), program_start.ProgramStart), record)
+                            self.assertEqual(records.process_start_time(program_pid), record.program.start_time)
+                        elif holder_case == "darwin":
+                            configuration = records.read_memory_config()
+                            with mock.patch.object(sys, "platform", "darwin"):
+                                identity = process_start(holder)
+                                assert isinstance(identity, Started), identity
+                                darwin_record = replace(record, holder=wire.Owner(holder, identity.start))
+                                atomic_file.write_text_atomic(saved[0], wire.encode_record(darwin_record))
+                                queue.cleanup_program_starts(configuration)
+                                self.assertEqual(wire.parse_record(saved[0].read_text(), program_start.ProgramStart),
+                                                 darwin_record)
+                                self.assertEqual(records.process_start_time(program_pid), record.program.start_time)
+                            atomic_file.write_text_atomic(saved[0], wire.encode_record(record))
+                        descriptor = open_linux_process_exit(holder)
                         try:
                             os.kill(holder, number)
                             if number != signal.SIGKILL:
@@ -1519,7 +1609,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     program_pid = int(os.read(spawned_read, 64))
                     self.assertTrue(select.select([ready_read], [], [], TEST_HANG_GUARD_SECS)[0], "scope startup never reached its barrier")
                     wrapper_pid = int(os.read(ready_read, 64))
-                    descriptor = os.pidfd_open(wrapper_pid)
+                    descriptor = open_linux_process_exit(wrapper_pid)
                     cgroup = Path(f"/proc/{wrapper_pid}/cgroup").read_text()
                     scope_name = next(line[3:] for line in cgroup.splitlines() if line.startswith("0::"))
                     self.assertIn(fixture.private_slice, Path(scope_name).parts)

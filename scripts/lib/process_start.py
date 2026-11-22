@@ -1,12 +1,13 @@
 """Read a process start without losing the reason for an absent identity."""
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Callable, TypeVar, cast
 
 if TYPE_CHECKING:
     from typing import override
@@ -72,7 +73,8 @@ def process_start_format() -> str:
 
 def process_start(pid: int) -> ProcessStart:
     """Read the process start from the host."""
-    if sys.platform == "darwin":
+    platform = sys.platform
+    if platform == "darwin":
         if pid <= 0:
             return Unreadable("invalid process id")
         try:
@@ -95,6 +97,15 @@ def process_start(pid: int) -> ProcessStart:
     return proc_table_start(pid, Path(os.environ.get("VERIFY_PROC_ROOT", "/proc")))
 
 
+def open_linux_process_exit(pid: int) -> int:
+    """Open a descriptor for observing process exit on Linux."""
+    platform = sys.platform
+    if platform != "linux":
+        raise OSError(errno.ENOTSUP, "process exit descriptors require Linux")
+    open_pidfd = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+    return open_pidfd(pid)
+
+
 def proc_table_start(pid: int, proc_root: Path) -> ProcessStart:
     """Read the process start from the specified Linux process table."""
     if pid <= 0:
@@ -106,7 +117,7 @@ def proc_table_start(pid: int, proc_root: Path) -> ProcessStart:
         if not separator or len(fields) <= 19 or not fields[19].isdigit() or fields[0] not in (b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I"):
             return Unreadable("invalid process stat fields")
         start = fields[19].decode("ascii")
-        return Zombie(start) if fields[0] == b"Z" else Started(start)
+        return Zombie(start) if fields[0] in (b"Z", b"X") else Started(start)
     except (FileNotFoundError, ProcessLookupError):
         return Gone()
     except (OSError, UnicodeError) as error:

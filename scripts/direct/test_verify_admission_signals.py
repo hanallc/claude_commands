@@ -9,7 +9,7 @@ import unittest
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_doc_test_support import VERIFY, VerifyDocFixture
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
+from scripts.direct.verify_mac_offload_test_support import VerifyProcessScan, processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_until
 
 
@@ -70,7 +70,9 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                                            env=environment, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, text=True, start_new_session=True)
                 self.addCleanup(process.wait, timeout=5)
-                self.addCleanup(reap, marker)
+                scan = VerifyProcessScan(self.root, marker)
+                scan.remember(process.pid)
+                self.addCleanup(reap, scan)
                 wait_until(ready.exists, self.root, processes=(process,))
                 process.terminate()
                 output, errors = process.communicate(timeout=5)

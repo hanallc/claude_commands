@@ -12,13 +12,17 @@ import subprocess
 import sys
 from typing import TextIO, cast
 import unittest
+from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
+from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.lib.process_start import open_linux_process_exit
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -73,24 +77,49 @@ print(json.dumps({'pid': os.getpid(), 'argv': sys.argv[1:],
     'descendant': descendant,
     'progress': os.environ.get('CARGO_TERM_PROGRESS_WHEN'),
     'width': os.environ.get('CARGO_TERM_PROGRESS_WIDTH')}), flush=True)
+if os.environ.get('TEST_CARGO_CLEANUP_FAULT') in ('signal', 'startup signal'):
+    print('Building [=>] 1/4: fixture', file=sys.stderr, flush=True)
 if '--version' not in sys.argv:
     finished.wait(20)
 raise SystemExit(int(os.environ.get('FAKE_CARGO_STATUS', '0')))
 """
 
 DENIED_HOME_FRONT = """
+import errno
 import faulthandler
+import os
+from pathlib import Path
 import runpy
 import signal
 from unittest import mock
-from scripts.build_queue import admission_records as records, step_estimator
+from scripts.build_queue import admission_records as records, queue_place, step_estimator
 from scripts.buildlog import store
+from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.lib import conf
 faulthandler.register(signal.SIGUSR2)
+fault = os.environ.get('TEST_CARGO_CLEANUP_FAULT')
+unlink = Path.unlink
+send_signal = os.kill
+popen = queue_place.QueuePlace.popen
+def unlink_when_allowed(path, *, missing_ok=False):
+    if fault == 'record' and path.parent == store.root() / 'program-starts':
+        raise PermissionError(errno.EACCES, 'program record removal', str(path))
+    unlink(path, missing_ok=missing_ok)
+def signal_when_allowed(pid, number):
+    if fault in ('signal', 'startup signal') and number == signal.SIGTERM:
+        raise PermissionError(errno.EPERM, 'program signal denied')
+    send_signal(pid, number)
+def popen_with_start_barrier(place, *args, **kwargs):
+    if fault == 'startup signal':
+        place.on_started = lambda: wait_for_file(Path('start-release'))
+    return popen(place, *args, **kwargs)
 with mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
      mock.patch.object(step_estimator, 'step_estimate', side_effect=PermissionError('runner history')), \\
      mock.patch.object(conf, 'read', side_effect=PermissionError('runner config path')), \\
-     mock.patch.object(store, 'locked_rows', side_effect=PermissionError('runner history path')):
+     mock.patch.object(store, 'locked_rows', side_effect=PermissionError('runner history path')), \\
+     mock.patch.object(Path, 'unlink', new=unlink_when_allowed), \\
+     mock.patch.object(os, 'kill', new=signal_when_allowed), \\
+     mock.patch.object(queue_place.QueuePlace, 'popen', new=popen_with_start_barrier):
     runpy.run_module('scripts.build_queue.ci_cargo_front', run_name='__main__')
 """
 
@@ -192,7 +221,7 @@ class CargoLifetimeTests(unittest.TestCase):
             child = self.start_front(fixture, "build")
             data = self.started(child)
             cargo = int(str(data["pid"]))
-            descriptor = os.pidfd_open(cargo)
+            descriptor = open_linux_process_exit(cargo)
             try:
                 self.assertFalse(select.select([descriptor], [], [], 0)[0])
                 child.kill()
@@ -307,17 +336,44 @@ class CargoLifetimeTests(unittest.TestCase):
                     self.assertFalse(fixture.server.waiters)
 
     def test_cancelled_cargo_releases_and_records_a_failed_peak(self) -> None:
-        with AdmissionFixture() as fixture, fixture.serving():
-            child = self.start_front(fixture, "build")
-            _ = self.started(child)
-            self.supply_front_memory(fixture, child)
-            child.terminate()
-            output, errors = child.communicate(timeout=8)
-            self.assertEqual(child.returncode, 143, output + errors)
-            with fixture.loop_turn():
-                self.assertFalse(fixture.server.reservations)
-            row, = fixture.history()
-            self.assertEqual((row["status"], row["outcome"]), (143, "killed"))
+        for fault, release_status in (("none", 143), ("record", 1), ("signal", 143), ("startup signal", 143)):
+            with (self.subTest(fault=fault),
+                  AdmissionFixture() as fixture, fixture.serving()):
+                signal_denied = fault in ("signal", "startup signal")
+                if signal_denied:
+                    fixture.configure(program_stop_seconds=0.2)
+                with mock.patch.dict(os.environ, {
+                        "TEST_CARGO_CLEANUP_FAULT": fault, "FAKE_CARGO_STATUS": "0"}):
+                    child = self.start_front(fixture, "build")
+                data = self.started(child)
+                self.supply_front_memory(fixture, child)
+                if fault == "signal":
+                    with fixture.loop_turn():
+                        record, = fixture.server.reservations.values()
+                    wait_for_file(progress.progress_path(Path(record.sidecar), "json"))
+                if fault == "record":
+                    os.kill(int(str(data["pid"])), signal.SIGUSR1)
+                else:
+                    child.terminate()
+                    if fault == "startup signal":
+                        (fixture.root / "start-release").touch()
+                output, errors = child.communicate(timeout=8)
+                if fault == "record":
+                    self.assertIn("program record removal", errors)
+                    self.assertEqual(child.returncode, 1, output + errors)
+                elif signal_denied:
+                    self.assertIn("program signal denied", errors)
+                    self.assertIn("cargo progress pipe stayed open past the cleanup deadline", errors)
+                    self.assertIn("Building [=>] 1/4: fixture", errors)
+                    self.assertEqual(child.returncode, 1, output + errors)
+                else:
+                    self.assertEqual(child.returncode, 143, output + errors)
+                with fixture.loop_turn():
+                    self.assertFalse(fixture.server.reservations)
+                row, = fixture.history()
+                self.assertEqual(row["status"], release_status)
+                if fault != "record":
+                    self.assertEqual(row["outcome"], "killed")
 
     def test_cargo_release_waits_until_a_surviving_descendant_stops(self) -> None:
         with AdmissionFixture() as fixture:
@@ -327,7 +383,7 @@ class CargoLifetimeTests(unittest.TestCase):
                 data = self.started(child)
                 self.supply_front_memory(fixture, child)
                 descendant = int(str(data["descendant"]))
-                descriptor = os.pidfd_open(descendant)
+                descriptor = open_linux_process_exit(descendant)
                 try:
                     self.assertFalse(select.select([descriptor], [], [], 0)[0])
                     with fixture.loop_turn():

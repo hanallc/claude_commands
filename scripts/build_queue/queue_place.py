@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
+import math
 import os
 from pathlib import Path
 import signal
@@ -23,6 +24,7 @@ import time
 from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, cancellation, conf
+from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import program_start as startup
@@ -38,6 +40,7 @@ class ConfiguredFirstPeak:
 
 
 CONFIGURED_FIRST_PEAK = ConfiguredFirstPeak()
+SAMPLER_JOIN_SECONDS = 1.0
 
 
 class ProgramPurpose(Enum):
@@ -226,7 +229,8 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             record = wire.parse_record(path.read_text(), startup.ProgramStart)
         except FileNotFoundError:
             continue
-        if admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
+        holder = process_start(record.holder.pid)
+        if isinstance(holder, Unreadable) or isinstance(holder, Started) and holder.start == record.holder.start_time:
             continue
         deadline = time.monotonic() + configuration.program_stop_seconds
         if record.scope:
@@ -364,7 +368,7 @@ class QueuePlace:
         return process
 
     def _sample(self, tracking: ScopedProgram | ProgramTree, stopped: threading.Event) -> None:
-        while True:
+        while not stopped.is_set():
             try:
                 scope = self.sidecar.read_text().strip()
                 if scope:
@@ -387,18 +391,21 @@ class QueuePlace:
                         self.observe(reading.bytes, reading.bytes)
             except (OSError, ValueError, StopIteration):
                 pass  # A process or scope can disappear between sampling reads.
-            if stopped.wait(self.configuration.program_sample_seconds):
-                return
+            _ = stopped.wait(self.configuration.program_sample_seconds)
 
-    def finish(self, *, failed: bool = False) -> None:
+    def finish(self, *, failed: bool = False, cleanup_deadline: float = math.inf) -> None:
         if not isinstance(self.program, StartedProgram):
             return
         program = self.program
         process = program.process
+        config = self.configuration
+        deadline = min(time.monotonic() + config.program_stop_seconds, cleanup_deadline)
+        finalized = False
+        program.stopped.set()
         try:
             completed = process.poll()
-            config = self.configuration
-            deadline = time.monotonic() + config.program_stop_seconds
+            if completed is not None and not failed:
+                self.status = completed
             if isinstance(program.tracking, ScopedProgram):
                 stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
             else:
@@ -417,13 +424,23 @@ class QueuePlace:
                                else config.program_sample_seconds)
                     members = program_members(program.tracking, self.sidecar)
             _ = process.wait()
-            if completed is not None and not failed:
-                self.status = completed
             program.record.unlink(missing_ok=True)
+            finalized = True
         finally:
-            program.stopped.set()
-            if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
-                program.sampler.join()
+            first_error = sys.exc_info()[1]
+            try:
+                if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
+                    program.sampler.join(timeout=SAMPLER_JOIN_SECONDS)
+                    if program.sampler.is_alive():
+                        raise TimeoutError("the program sampler did not stop before the cleanup deadline")
+            except BaseException as error:
+                finalized = False
+                if first_error is None:
+                    raise
+                first_error.add_note(str(error))
+            finally:
+                if not finalized and self.status == 0:
+                    self.status = 1
 
 
 @dataclass(frozen=True)
@@ -549,9 +566,11 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             raise
         finally:
             with cancellation.defer_cleanup_signals():
-                place.finish(failed=failed)
-                if isinstance(grant, HeldReservation):
-                    grant.status = place.status
+                try:
+                    place.finish(failed=failed)
+                finally:
+                    if isinstance(grant, HeldReservation):
+                        grant.status = place.status
 
 
 class ShellArguments(argparse.Namespace):
