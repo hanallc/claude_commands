@@ -8229,13 +8229,9 @@ with patch.object(fcntl, "flock", admission):
         return source
 
     def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
-        self.working_dir = self.model_phase_source()
-        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(self.working_dir)],
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(source)],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
-        self.start_numbered_phase(session_dir, "57c", 40_010)
-        directory = phase_reservation.phase_directory(session_dir, "57c")
-        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
 
         def git(root: Path, *arguments: str) -> str:
             return subprocess.run(
@@ -8244,6 +8240,12 @@ with patch.object(fcntl, "flock", admission):
                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             ).stdout.strip()
 
+        _ = git(source, "commit", "--allow-empty", "-qm", "base")
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
+        self.start_numbered_phase(session_dir, "57c", 40_010)
+        directory = phase_reservation.phase_directory(session_dir, "57c")
+        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
         _ = git(self.working_dir, "add", ".")
         _ = git(self.working_dir, "commit", "-qm", "home baseline")
         with redirect_stdout(io.StringIO()):

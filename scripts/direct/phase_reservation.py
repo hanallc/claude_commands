@@ -395,7 +395,15 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     return KnownPhaseWorktree(root)
 
 
-def _require_model_worktree(root: Path, owner_unit: str) -> None:
+def claimed_launch_directory(directory: Path, requested: Path) -> Path:
+    """Use the claimed checkout and keep a start directory inside it."""
+    if not ((directory / BASELINE_FILE).is_file() or (directory / WORKTREE_FILE).is_file()):
+        return requested
+    root = phase_worktree(directory).root.resolve()
+    return requested if requested.resolve().is_relative_to(root) else root
+
+
+def _require_model_worktree(root: Path, home: _PhaseRunHome) -> None:
     from scripts.worktree import worktrees
 
     try:
@@ -403,8 +411,8 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
         model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
         if root != model_path.resolve():
             raise ValueError("the checkout is outside the worktree model")
-        if unit != owner_unit:
-            raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
+        if unit != home.unit:
+            raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {home.unit!r}")
         record = worktrees.checkout_record(model_path)
         if (record is None or record.stage is not worktrees.MakeStage.DONE
                 or not isinstance(record.layout, worktrees.RecordedWorktreeOutput)
@@ -415,18 +423,19 @@ def _require_model_worktree(root: Path, owner_unit: str) -> None:
             raise ValueError(
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
     except (OSError, ValueError, worktrees.Refused) as error:
-        fix = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>."
+        if root == home.root.resolve():
+            fix = "Move the unit home into the worktree model by the showrunner's order."
+        else:
+            fix = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>."
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
 def _record_worktree(directory: Path, root: Path) -> None:
-    """Record a separate checkout after verifying its worktree record."""
+    """Verify the checkout before recording a separate checkout."""
     home = _phase_run_home(directory)
-    is_home = root == home.root.resolve()
-    if not is_home:
-        _require_model_worktree(root, home.unit)
+    _require_model_worktree(root, home)
     directory.mkdir(parents=True, exist_ok=True)
-    if is_home:
+    if root == home.root.resolve():
         (directory / WORKTREE_FILE).unlink(missing_ok=True)
     else:
         write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
