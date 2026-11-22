@@ -869,28 +869,33 @@ def _allow_copied_envrc(source: Path, checkout: Path) -> None:
     """Allow the new checkout's .envrc when the source has the same allowed bytes."""
     new_rc = checkout / ".envrc"
     try:
-        if not new_rc.is_file() or (direnv := shutil.which("direnv")) is None:
+        if not (new_rc.is_symlink() or new_rc.is_file()) or (direnv := shutil.which("direnv")) is None:
             return
-        direnv = os.path.abspath(direnv)
+        direnv = os.path.realpath(direnv)
         source_rc = source / ".envrc"
-        contents = new_rc.read_bytes()
-        if source_rc.is_file() and source_rc.read_bytes() == contents:
+        if (
+            not new_rc.is_symlink() and not source_rc.is_symlink() and source_rc.is_file()
+            and (contents := new_rc.read_bytes()) == source_rc.read_bytes()
+        ):
             status = subprocess.run([direnv, "status", "--json"], cwd=source,
                                     capture_output=True, check=True, timeout=5)
             match cast(object, json.loads(status.stdout)):
                 case {"state": {"foundRC": {"path": str(found), "allowed": int(allowed)}}} if (
                     found == str(source_rc) and type(allowed) is int and allowed == 0
+                    and not source_rc.is_symlink() and not new_rc.is_symlink()
                     and source_rc.read_bytes() == contents == new_rc.read_bytes()
                 ):
                     _ = subprocess.run([direnv, "allow", str(checkout)],
                                        capture_output=True, check=True, timeout=5)
                     try:
-                        if new_rc.read_bytes() == contents:
+                        if not new_rc.is_symlink() and new_rc.read_bytes() == contents:
                             return
                     except OSError:
                         pass
-                    _ = subprocess.run([direnv, "deny", str(new_rc)],
-                                       capture_output=True, check=True, timeout=5)
+                    # A missing .envrc makes direnv search parent folders.
+                    if new_rc.is_file():
+                        _ = subprocess.run([direnv, "deny", str(checkout)],
+                                           capture_output=True, check=True, timeout=5)
                 case _:
                     pass
     except (OSError, ValueError, subprocess.SubprocessError):

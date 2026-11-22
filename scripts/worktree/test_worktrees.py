@@ -2375,11 +2375,18 @@ class WorktreeLifecycleTests(unittest.TestCase):
         source_rc = source / ".envrc"
         original = b"export FIXTURE=tracked\n"
         _ = source_rc.write_bytes(original)
-        _ = self.git(source, "add", ".envrc")
+        target_rc = source / "fixture.envrc"
+        _ = target_rc.write_bytes(original)
+        _ = self.git(source, "add", source_rc.name, target_rc.name)
         _ = self.git(source, "commit", "-m", "Add the fixture environment")
 
         log = self.root / "direnv.log"
-        direnv = self.root / "direnv"
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        direnv = bin_dir / "direnv"
+        link_target = self.root / "nested"
+        link_target.mkdir()
+        (self.repository / "bin-link").symlink_to(link_target, target_is_directory=True)
         _ = direnv.write_text(rf"""#!{sys.executable}
 import json
 import os
@@ -2408,15 +2415,24 @@ raise SystemExit(2)
         for name, expected_commands, warning in (
             ("equal", ["status", "allow"], False),
             ("relative-path", ["status", "allow"], False),
+            ("symlink-path", ["status", "allow"], False),
             ("different", [], True),
             ("unallowed", ["status"], True),
             ("other-file", ["status"], True),
             ("allow-failed", ["status", "allow"], True),
             ("changed-during-allow", ["status", "allow", "deny"], True),
+            ("source-symlink", [], True),
+            ("checkout-symlink", [], True),
             ("absent", [], False),
         ):
             with self.subTest(name=name):
-                fake_path = os.path.relpath(direnv.parent, self.repository) if name == "relative-path" else str(direnv.parent)
+                match name:
+                    case "relative-path":
+                        fake_path = os.path.relpath(bin_dir, self.repository)
+                    case "symlink-path":
+                        fake_path = "bin-link/../bin"
+                    case _:
+                        fake_path = str(bin_dir)
                 self.environment["PATH"] = fake_path + os.pathsep + original_path
                 self.environment["DIRENV_TEST_STATUS"] = "1" if name == "unallowed" else "0"
                 self.environment["DIRENV_TEST_ALLOW_EXIT"] = "1" if name == "allow-failed" else "0"
@@ -2425,11 +2441,20 @@ raise SystemExit(2)
                 self.environment["DIRENV_TEST_PATH"] = str(found)
                 if name == "absent":
                     _ = self.git(source, "checkout", "--detach", self.base)
+                elif name in {"source-symlink", "checkout-symlink"}:
+                    source_rc.unlink()
+                    source_rc.symlink_to(target_rc.name)
+                    if name == "checkout-symlink":
+                        _ = self.git(source, "commit", "-am", "Link the fixture environment")
+                        source_rc.unlink()
+                        _ = source_rc.write_bytes(original)
                 else:
                     _ = source_rc.write_bytes(b"export FIXTURE=modified\n" if name == "different" else original)
                 _ = log.write_text("")
                 command = [sys.executable, "-B", str(WORKTREES), "make", "origin", "demo", name]
                 result = self.command(self.repository, command)
+                if name in {"source-symlink", "checkout-symlink"}:
+                    _ = self.git(source, "restore", source_rc.name)
                 tree = self.trees / "origin/demo" / name
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), str(tree))
@@ -2438,7 +2463,7 @@ raise SystemExit(2)
                 self.assertEqual(notices, [notice] if warning else [])
                 calls = {"status": [str(source), "status", "--json"],
                          "allow": [str(self.repository), "allow", str(tree)],
-                         "deny": [str(self.repository), "deny", str(tree / ".envrc")]}
+                         "deny": [str(self.repository), "deny", str(tree)]}
                 self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
                                  [calls[command] for command in expected_commands])
                 if name == "equal":
