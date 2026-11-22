@@ -226,6 +226,7 @@ def record_lock(path: Path) -> Generator[None]:
 
 
 PENDING_STOP_SUFFIX = ".stop-pending"
+_RUN_INDEX_SUFFIXES = (PENDING_STOP_SUFFIX, process_stop.RUN_SLICE_RECORD_SUFFIX)
 
 
 def _write_record(path: Path, record: RunRecord) -> RunRecord:
@@ -1034,14 +1035,26 @@ def _run_record_paths(runs: Path) -> list[Path]:
         return []
 
 
-def _indexed_run_paths(runs: Path) -> set[Path]:
-    """Find records for runs that can stay active after the supervisor exits."""
-    suffixes = (PENDING_STOP_SUFFIX, process_stop.RUN_SLICE_RECORD_SUFFIX)
+def _user_run_slice_directory() -> Path:
+    uid = os.getuid()
+    return (process_stop.CGROUP_ROOT / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
+            / "builds.slice" / "builds-detached.slice")
+
+
+def _run_candidates(runs: Path, *, scan_records: bool, slice_units: Collection[str] = ()) -> set[Path]:
+    """Find records that the reader must check."""
+    paths: set[Path] = set()
     try:
         with os.scandir(runs) as entries:
-            return {Path(entry.path).with_suffix(".json") for entry in entries if entry.name.endswith(suffixes)}
+            for entry in entries:
+                if entry.name.endswith(_RUN_INDEX_SUFFIXES):
+                    paths.add(Path(entry.path).with_suffix(".json"))
+                elif entry.name.endswith(".json") and (scan_records or
+                        (slice_units and _command_slice_unit(entry.name.removesuffix(".json")) in slice_units)):
+                    paths.add(Path(entry.path))
     except FileNotFoundError:
-        return set()
+        pass
+    return paths
 
 
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
@@ -1206,19 +1219,29 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
         return LiveRunEvidence((), ())
     supervisors = detached_run_process.supervisor_records()
     named: dict[Path, set[Path]] = {}
+    found: list[RunRecord] = []
+    errors: list[LiveRunReadError] = []
+    slice_units: set[str] = set()
     if not isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
         for path in supervisors:
             if path.parent.name == DETACHED_RUNS_DIR and path.parent.parent in folders:
                 named.setdefault(path.parent.parent, set()).add(path)
-    found: list[RunRecord] = []
-    errors: list[LiveRunReadError] = []
+        # Older launchers saved the slice identity before they wrote an index.
+        directory = _user_run_slice_directory()
+        try:
+            with os.scandir(directory) as entries:
+                slice_units = {entry.name for entry in entries if entry.name.endswith(".slice")}
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            affected = frozenset(member for identities in folders.values() for member in identities)
+            errors.append(LiveRunReadError(directory, error, affected))
     for folder, identities in folders.items():
         directory = folder / DETACHED_RUNS_DIR
         try:
-            if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
-                paths = set(_run_record_paths(directory))
-            else:
-                paths = named.get(folder, set()) | _indexed_run_paths(directory)
+            paths = named.get(folder, set()) | _run_candidates(
+                directory, scan_records=isinstance(supervisors, detached_run_process.ProcessTableUnavailable),
+                slice_units=slice_units)
             evidence = _read_live_runs(
                 sorted(paths), lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities,
                 detached_run_process.supervises if isinstance(supervisors, detached_run_process.ProcessTableUnavailable)
@@ -1256,10 +1279,10 @@ def _run_is_pending(path: Path, raw: dict[str, object], supervisor_owns: Callabl
 def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool],
                identities: frozenset[staff.StaffId]) -> LiveRunEvidence:
     try:
-        paths = _run_record_paths(runs)
+        paths = _run_candidates(runs, scan_records=True)
     except OSError as error:
         return LiveRunEvidence((), (LiveRunReadError(runs, error, identities),))
-    return _read_live_runs(paths, owns, detached_run_process.supervises, identities)
+    return _read_live_runs(sorted(paths), owns, detached_run_process.supervises, identities)
 
 
 def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], bool],
@@ -1276,6 +1299,8 @@ def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], b
         try:
             raw = worker_lifecycle.read_json_object(path)
             if not raw and not path.exists():
+                if any(path.with_suffix(suffix).exists() for suffix in _RUN_INDEX_SUFFIXES):
+                    raise worker_lifecycle.WorkerStateUnreadable(path, "the indexed run record is missing")
                 if staff_names is not None and path in supervised_paths:
                     raise worker_lifecycle.WorkerStateUnreadable(path, "the live supervisor record is missing")
                 continue
@@ -1922,10 +1947,14 @@ def deliver_in_fresh_process(record_path: Path) -> int:
     return completed.returncode
 
 
+def _command_slice_unit(run_id: str) -> str:
+    slice_id = run_id.partition("@")[0].replace("-", "")
+    return f"builds-detached-{slice_id}.slice"
+
+
 def _command_scope_unit(kind: str, run_id: str) -> process_stop.ScopeUnit:
     scope_id = run_id.partition("@")[0]
-    slice_id = scope_id.replace("-", "")
-    return process_stop.ScopeUnit(f"builds-detached-{slice_id}.slice", f"detached-{kind}-{scope_id}.scope")
+    return process_stop.ScopeUnit(_command_slice_unit(run_id), f"detached-{kind}-{scope_id}.scope")
 
 
 def scope_prefix(log: Path, environment: dict[str, str], *,

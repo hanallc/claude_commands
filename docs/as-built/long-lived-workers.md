@@ -719,6 +719,8 @@ The launcher indexes the run record and saves the slice identity before it start
 It exports `DETACHED_RUN_SLICE` to the command.
 The index lets the live-run reader find the slice after its supervisor exits.
 The reader also checks records named by live supervisors and legacy stop markers.
+It matches older records without an index to their slice names.
+An index without its record gives a read error.
 The supervisor or reaper removes the slice index after it saves the finished record.
 The scope launchers use the run slice when the variable is set.
 Transient services keep their usual placement.

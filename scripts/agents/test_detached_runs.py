@@ -162,17 +162,17 @@ class DetachedRunsTests(unittest.TestCase):
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         return cast(dict[str, object], json.loads(text)) if text.strip() else {}
 
-    def record(self, command: list[str], **extra: str) -> Path:
+    def record(self, command: list[str], *, run_id: str = "r1", **extra: str) -> Path:
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
         record: detached_runs.RunRecord = {
-            "run_id": "r1", "status": "running", "session_dir": str(self.session), "worker": WORKER,
+            "run_id": run_id, "status": "running", "session_dir": str(self.session), "worker": WORKER,
             "staff_id": self.worker_id,
             "label": "verify.sh check", "command": command,
-            "log": str(runs / "r1.log"), "started_at": time.time(), "pid": os.getpid(),
+            "log": str(runs / f"{run_id}.log"), "started_at": time.time(), "pid": os.getpid(),
             "director_dir": str(self.session), "done_message_file": extra.get("done", ""),
         }
-        path = runs / "r1.json"
+        path = runs / f"{run_id}.json"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
         return path
 
@@ -1507,6 +1507,53 @@ sys.exit(1)
             self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
             self.assertFalse(index.exists())
             self.assertEqual(detached_runs.live_runs_in_folders(identities), [])
+
+    def test_live_run_reader_finds_a_legacy_slice_without_an_index(self) -> None:
+        run_id = f"20261122T050535-2458258-a09b@{self.worker_id}"
+        path = self.record(["fixture command"], run_id=run_id)
+        cgroups = self.root / "cgroups"
+        uid = os.getuid()
+        scope = (cgroups / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
+                 / "builds.slice" / "builds-detached.slice" / "builds-detached-20261122T0505352458258a09b.slice")
+        scope.mkdir(parents=True)
+        saved_slice: process_stop.RunSliceIdentity = {
+            "unit": scope.name, "path": "/" + str(scope.relative_to(cgroups)),
+            "device": scope.stat().st_dev, "inode": scope.stat().st_ino,
+        }
+        self.update_record(path, command_slice=saved_slice)
+        self.assertFalse(path.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX).exists())
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        identities = {self.session: frozenset({self.worker_id})}
+
+        with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+              patch.object(detached_run_process, "supervisor_records", return_value={})):
+            run, = detached_runs.live_runs_in_folders(identities)
+            self.assertEqual(run["run_id"], path.stem)
+            self.assertEqual(run.get("command_slice"), saved_slice)
+            _ = events.write_text("populated 0\n")
+            self.assertEqual(detached_runs.live_runs_in_folders(identities), [])
+
+    def test_live_run_reader_reports_an_index_with_a_missing_record(self) -> None:
+        identities = frozenset({self.worker_id, staff.StaffId("another-worker")})
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir(exist_ok=True)
+        missing = runs / f"missing@{self.worker_id}.json"
+        missing.with_suffix(process_stop.RUN_SLICE_RECORD_SUFFIX).touch()
+        cgroups = self.root / "cgroups"
+        empty: dict[Path, frozenset[int]] = {}
+        for supervisors in (empty, detached_run_process.ProcessTableUnavailable()):
+            with (self.subTest(supervisors=supervisors),
+                  patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                  patch.object(detached_run_process, "supervisor_records", return_value=supervisors)):
+                evidence = detached_runs.live_run_evidence_in_folders({self.session: identities})
+                self.assertEqual(evidence.runs, ())
+                error, = evidence.read_errors
+                self.assertEqual(error.path, missing)
+                self.assertEqual(error.staff_ids, frozenset({self.worker_id}))
+                with self.assertRaisesRegex(worker_lifecycle.WorkerStateUnreadable, "indexed run record is missing"):
+                    _ = evidence.require_readable()
+        self.assertEqual(detached_runs.live_run_evidence_for_staff(runs, identities).read_errors[0].path, missing)
 
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_empty_stop_reason_refuses_before_configuration_or_lock(self) -> None:
