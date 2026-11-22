@@ -1730,8 +1730,7 @@ class AdmissionServer:
                    and isinstance(request.constraints.cargo_folder, placement.CargoFolder)}
         if occupied:
             for key, slot in list(self.slots.items()):
-                if (isinstance(slot, records.ContinuationSlot) and slot.owner not in inputs.pending_remote_starts
-                        and folders.get(slot.owner) in occupied):
+                if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
                     del self.slots[key]
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
                        occupied_cargo_folders=occupied)
@@ -1997,31 +1996,21 @@ class AdmissionServer:
                 else:
                     del self.slots[key]
 
-    def _return_waiting_claims(self) -> None:
-        for episode, waiting in self.waiters.items():
-            if episode in self.current_assignments or episode in self.reservations:
-                continue
-            claim = waiting.continuation_claim
-            if isinstance(claim, records.ContinuationSlot) and self.slots.get(claim.slot.reservation) is claim:
-                self.slots[claim.slot.reservation] = claim.slot
-                waiting.continuation_claim = NoContinuationClaim()
-
     def _claim_slots(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
         waiters = {records.waiter_owner(item.row): item for item in self.waiters.values()}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             waiting = waiters.get(owner)
-            if waiting is None:
+            if waiting is None or not gate.can_use_natedev(row):
                 continue
             request = waiting.request
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
             if saved is not None and isinstance(saved.remote_start_hold, records.RemoteStartHold):
                 continue
             placement_request = self.placement_requests.get(request.episode)
-            if placement_request is not None and isinstance(placement_request.purpose, placement.SpeculativeCopy):
-                continue
-            if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace):
+            if placement_request is not None and not isinstance(self._local_placement_eligibility(placement_request),
+                                                                (placement.AllowedHost, placement.EvidenceNeeded)):
                 continue
             if not isinstance(request, wire.AdmitRequest) or not isinstance(request.run, wire.RunIdentity):
                 continue
@@ -2602,8 +2591,7 @@ class AdmissionServer:
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
                 if isinstance(cargo_folder, placement.CargoFolder):
                     for slot_key, slot in list(self.slots.items()):
-                        if (isinstance(slot, records.ContinuationSlot) and slot.owner not in inputs.pending_remote_starts
-                                and inputs.cargo_folders.get(slot.owner) == cargo_folder):
+                        if isinstance(slot, records.ContinuationSlot) and inputs.cargo_folders.get(slot.owner) == cargo_folder:
                             del self.slots[slot_key]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
@@ -4907,7 +4895,6 @@ done
                 undo = saved.reply
         result = self._move_destination(request, line, undo)
         if isinstance(result, wire.QueueMoved):
-            self._return_waiting_claims()
             self.pass_stale = True
             self.next_pass = self.clock.monotonic()
         return self._mutation_reply(key, result)

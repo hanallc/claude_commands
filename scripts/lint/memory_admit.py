@@ -2016,6 +2016,7 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
+    natural_order = {records.waiter_owner(row): waiter_order(row) for _, row in ordered} if inputs.slots else {}
     returned_claims: set[str] = set()
     while True:
         room = inputs_room(inputs, policy)
@@ -2023,9 +2024,11 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
         admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
         if not inputs.slots:
             break
-        held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
-                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
-        held_owners.difference_update(inputs.pending_remote_starts)
+        # Return a claim only when the blocker was ahead before moves.
+        held_owners = {owner for entry in admissions if entry.decision.reused_slot
+                       and isinstance(hold := entry.decision.order_hold, HeldBehindHead)
+                       and natural_order[records.waiter_owner(hold.waiter)]
+                       <= natural_order[owner := records.waiter_owner(entry.waiter)]}
         if not held_owners:
             break
         # Return the claim before checking the earlier row's room again.
@@ -2117,7 +2120,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     folder_slot_bytes: dict[placement.CargoFolder, int] = {}
     for owner, claim in claims.items():
         folder = inputs.cargo_folders.get(owner)
-        if folder is not None and owner not in inputs.pending_remote_starts:
+        if folder is not None:
             folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: RankedWaiter | NoWaiter = NoWaiter()
@@ -2154,10 +2157,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             earlier_limit = run_limit_waiters.get(records.waiter_owner(earlier))
             if earlier_limit is not None and (not follows_run_limit or earlier_limit != repository):
                 earlier = NoWaiter()
-        # A grant returns the other claims for this folder, except during remote startup.
+        # A grant returns the other continuation claims for this folder.
         released = (folder_slot_bytes.get(folder, 0) - held
-                    if folder is not None and not folder_busy and not remote_start_pending
-                    and isinstance(earlier, NoWaiter) else 0)
+                    if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
         checked_room = remaining + released
         alone = head_owner == owner and head_can_start_alone
         fits = extra <= checked_room
@@ -2190,7 +2192,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             if owner not in allowed:
                 ahead = hold
                 break
-        may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
+        fits_behind_moved_blocker = within and not isinstance(ahead, NoWaiter) and waiter_order(row) < waiter_order(ahead)
+        may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within) or fits_behind_moved_blocker
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(records.stored_waiter(ahead))
         elif local and not isinstance(first_folder_wait, NoWaiter):
