@@ -579,7 +579,7 @@ def stop_command(
 
 
 def acknowledge_stop_notice(path: Path, notice_id: str) -> None:
-    """Release a finished record after the caller saves its pending notice."""
+    """Release a finished record after the caller saves the delivery result."""
     if not notice_id or worker_lifecycle.read_json_object(path).get("stop_notice_id") != notice_id:
         return
     with record_lock(path):
@@ -1017,7 +1017,7 @@ def _prune_finished_locked(runs: Path) -> list[str]:
                 continue
             if current.get("stop_notice_id"):
                 if notice_cutoff is None:
-                    retention = conf.read_or_repository("review_links").number("snapshot_retention_seconds")
+                    retention = conf.read_or_repository("review_links").number("kill_result_seconds")
                     notice_cutoff = now - retention
                 if _finished_time(current) > notice_cutoff:
                     continue

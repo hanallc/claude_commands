@@ -751,8 +751,8 @@ The stop commit saves the notice ID in the run record.
 Builds saves the pending notice before it sends it.
 Builds saves the delivery result before it acknowledges the notice ID.
 An acknowledgment error does not change the delivery result.
-Pruning keeps a finished run with an unacknowledged notice ID for `review_links.snapshot_retention_seconds`.
-The default is seven days from `finished_at`.
+Pruning keeps a finished run with an unacknowledged notice ID for `review_links.kill_result_seconds` after `finished_at`.
+The setting allows 5 to 300 seconds. The default is 30 seconds.
 After that time, the usual pruning rules apply.
 A run that ends by itself just after the stop commit reports as stopped.
 Recovery finishes committed stops and the pending cleanup of runs without a supervisor.

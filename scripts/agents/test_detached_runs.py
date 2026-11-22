@@ -767,12 +767,12 @@ class DetachedRunsTests(unittest.TestCase):
     def test_prune_expires_an_unacknowledged_stop_notice(self) -> None:
         now = datetime(2026, 11, 22, tzinfo=timezone.utc).timestamp()
         _ = write_config_fixture(self.root / "config/review_links.conf",
-                                 "# range: 0..\nsnapshot_retention_seconds=60\n")
+                                 "# range: 5..300\nkill_result_seconds=5\n")
         recent = self.finished_run("recent-notice", staff_id="retired-worker", started_at=now - 600,
-                                   finished_at=datetime.fromtimestamp(now - 59, timezone.utc).isoformat(),
+                                   finished_at=datetime.fromtimestamp(now - 4, timezone.utc).isoformat(),
                                    stop_notice_id="recent", stop_pass_requested=True)
         expired = self.finished_run("expired-notice", staff_id="retired-worker", started_at=now - 600,
-                                    finished_at=datetime.fromtimestamp(now - 61, timezone.utc).isoformat(),
+                                    finished_at=datetime.fromtimestamp(now - 6, timezone.utc).isoformat(),
                                     stop_notice_id="expired", stop_pass_requested=True)
 
         with patch.object(time, "time", return_value=now) as clock:
