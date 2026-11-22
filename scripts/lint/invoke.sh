@@ -133,6 +133,14 @@ buildlog_read_context() {
     BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
 }
 
+build_step_output_parent() {
+    local parent="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}"
+    if [[ ! -d "$parent" ]]; then
+        "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$parent" >/dev/null || return
+    fi
+    printf '%s\n' "$parent"
+}
+
 # buildlog_begin ARGV...
 buildlog_begin() {
     BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_NOW="" BUILDLOG_TREE="" BUILDLOG_MEM_WAIT_S=0 BUILDLOG_TEST_PHASE_FILE="" BUILDLOG_TARGET_FOLDER=""
@@ -143,7 +151,10 @@ buildlog_begin() {
     BUILDLOG_START="${BUILDLOG_NOW:-}"
     if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
-        BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
+        local parent
+        if parent="$(build_step_output_parent)"; then
+            BUILDLOG_PEAK="$parent/buildlog.$$.$RANDOM.peak"
+        fi
     fi
 }
 
@@ -192,12 +203,12 @@ buildlog_write_step() {
 # buildlog_end STATUS LOG TTY ARGV...
 buildlog_end() {
     [[ -n "${BUILDLOG_START:-}" ]] || return 0
-    local status=$1 log=$2 tty=$3 held=""
+    local status=$1 log=$2 tty=$3 held="" parent
     shift 3
     BUILDLOG_NOW=""
     buildlog_now
-    if [[ -n "$log" && -f "$log" ]]; then
-        held="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM$RANDOM.log"
+    if [[ -n "$log" && -f "$log" ]] && parent="$(build_step_output_parent)"; then
+        held="$parent/buildlog.$$.$RANDOM$RANDOM.log"
         mv -f "$log" "$held" 2>/dev/null || held=""
     fi
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
@@ -363,6 +374,10 @@ run_step_attempt() {
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
     fi
+    local output_parent=""
+    if [[ ! -t 1 ]]; then
+        output_parent="$(build_step_output_parent)" || return $?
+    fi
     # The dev shell's programs reach this step only; the next step starts from the caller's PATH.
     local PATH=$PATH
     if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
@@ -468,7 +483,7 @@ run_step_attempt() {
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
-        log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        log="$output_parent/lint_invoke.$$.$RANDOM.log"
         if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
             ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
         fi

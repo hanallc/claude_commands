@@ -948,7 +948,9 @@ run_step() {
         (( admission == 0 )) || return "$admission"
     fi
     RUN_LAST_ATTEMPT_KILLED=0
-    step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
+    local step_log_parent
+    step_log_parent="${HOLD_WAIT_DIR:-$(build_step_output_parent)}" || return $?
+    step_log="$(mktemp "$step_log_parent/step-output.XXXXXX")" || return $?
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
             VERIFY_SLOT_SOURCE=$DOC_REPO_TOP
@@ -4485,7 +4487,9 @@ run_lint_judgment() {
         start_tree_watch
         # Store diagnostics in the watch directory for cancellation cleanup.
         # Keep admission and the step record in run().
-        CLIPPY_LOG="$(mktemp "${TREE_WATCH_DIR:-${TMPDIR:-/tmp}}/clippy.XXXXXX")"
+        local clippy_parent
+        clippy_parent="${TREE_WATCH_DIR:-${HOLD_WAIT_DIR:-$(build_step_output_parent)}}" || return $?
+        CLIPPY_LOG="$(mktemp "$clippy_parent/clippy.XXXXXX")" || return $?
         clippy_status=0
         # Use the existing tee to record diagnostics.
         # Keep wait and cancellation messages visible.
