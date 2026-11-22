@@ -546,7 +546,7 @@ def _begin_direct_test() -> None:
 
     try:
         with without_recording():
-            if linux and _user_test_manager_available():
+            if linux:
                 settings = conf.read("test_times")
                 limit = settings.origin(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
                 if isinstance(limit, conf.UnavailableValue):
@@ -555,7 +555,10 @@ def _begin_direct_test() -> None:
                     seconds = conf.read(template).value(_DIRECT_TEST_LIMIT_KEY, conf.positive_whole)
                 else:
                     seconds = limit.value
-                _adopt_direct_test_scope(seconds)
+                if _user_test_manager_available():
+                    _adopt_direct_test_scope(seconds)
+                else:
+                    _start_direct_test_watchdog(seconds)
             if has_test_folder:
                 from scripts.lib.testing_folders import start_test_run
 
@@ -578,17 +581,69 @@ def _direct_test_unit(cgroup: str) -> str:
 
 
 def _user_test_manager_available() -> bool:
-    """Check for a user systemd manager without starting one."""
+    """Check for a user systemd manager without starting one.
+
+    Only a proven absence returns False: no user bus, or a bus where no process owns
+    the systemd name. Any other failed check raises ValueError.
+    """
+    import re
     import subprocess
 
-    try:
-        result = subprocess.run(
-            ["busctl", "--user", "--timeout=5s", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
-             "org.freedesktop.DBus", "NameHasOwner", "s", _SYSTEMD_SERVICE],
-            capture_output=True, text=True, check=False)
-    except FileNotFoundError:
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if address is None and not runtime:
         return False
-    return result.returncode == 0 and result.stdout.strip() == "b true"
+    if address is None:
+        socket = os.path.join(runtime, "bus")
+    else:
+        local = re.fullmatch(r"unix:path=([^,;]+)", address)
+        socket = local[1] if local else ""
+    if socket and not os.path.exists(socket):
+        return False
+    result = subprocess.run(
+        ["busctl", "--user", "--timeout=5s", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+         "org.freedesktop.DBus", "NameHasOwner", "s", _SYSTEMD_SERVICE],
+        capture_output=True, text=True, check=False)
+    answer = result.stdout.strip()
+    if result.returncode or answer not in ("b true", "b false"):
+        raise ValueError("could not check the user systemd manager: "
+                         + (result.stderr.strip() or f"busctl exited {result.returncode}"))
+    return answer == "b true"
+
+
+def _direct_test_limit_line(seconds: int) -> str:
+    return f"stopped at the {seconds}-second direct test limit; run longer tests with targeted_test.py --module"
+
+
+def _start_direct_test_watchdog(seconds: int) -> None:
+    """Bound a direct test with a watchdog process when no user systemd manager runs.
+
+    Known limit: the watchdog stops only this process. Its children outlive the deadline.
+    """
+    pid = os.getpid()
+    descriptor = os.pidfd_open(pid)
+    try:
+        _ = os.posix_spawn(
+            sys.executable, [sys.executable, "-IS", os.path.realpath(__file__), "watchdog", str(seconds)],
+            os.environ,
+            file_actions=[(os.POSIX_SPAWN_DUP2, descriptor, 0),
+                          (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0)],
+            setsid=True)
+    finally:
+        os.close(descriptor)
+
+
+def _watch_direct_test(seconds: int) -> None:
+    """Stop the test at its deadline. Standard input is the test's pidfd."""
+    import select
+    import signal
+    from contextlib import suppress
+
+    readable, _, _ = select.select([0], [], [], seconds)
+    if not readable:
+        print(_direct_test_limit_line(seconds), file=sys.stderr, flush=True)
+        with suppress(ProcessLookupError):
+            signal.pidfd_send_signal(0, signal.SIGKILL)
 
 
 def _direct_test_scope_enforces_deadline(unit: str) -> bool:
@@ -691,8 +746,7 @@ def _observe_direct_test(pid: int, seconds: int) -> None:
         print(unit, flush=True)
         _ = select.select([descriptor], [], [])
         if _settle_direct_test_scope(unit):
-            print(f"stopped at the {seconds}-second direct test limit; run longer tests with targeted_test.py --module",
-                  file=sys.stderr, flush=True)
+            print(_direct_test_limit_line(seconds), file=sys.stderr, flush=True)
     finally:
         os.close(descriptor)
 
@@ -764,4 +818,7 @@ if __name__ == "sitecustomize":
 
 
 if __name__ == "__main__":
-    _observe_direct_test(int(sys.argv[1]), int(sys.argv[2]))
+    if sys.argv[1] == "watchdog":
+        _watch_direct_test(int(sys.argv[2]))
+    else:
+        _observe_direct_test(int(sys.argv[1]), int(sys.argv[2]))

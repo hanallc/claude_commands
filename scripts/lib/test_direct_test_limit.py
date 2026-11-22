@@ -45,6 +45,12 @@ class Example(unittest.TestCase):
     def test_long(self):
         print('fixture started', flush=True)
         print('fixture finished', flush=True)
+
+    def test_hang(self):
+        import time
+        print('fixture started', flush=True)
+        time.sleep(60)
+        print('fixture finished', flush=True)
 """
 GATE_CASE = """
 from direct_case import Example
@@ -147,6 +153,37 @@ print("folder=" + os.environ["TMPDIR"])
         self.assertIn("fixture stdout\n", result.stdout)
         self.assertEqual(folder.parent, self.root / "test-runs")
         self.assertFalse(folder.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
+    def test_no_user_manager_stops_a_long_test_at_the_direct_limit(self) -> None:
+        self.environment = without_user_test_manager(self.root, self.environment)
+        self.environment["PYTHONPATH"] = startup.startup_pythonpath("")
+        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+import unittest
+case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_hang")
+unittest.TextTestRunner().run(case)
+""")
+        self.assertEqual(result.returncode, -signal.SIGKILL.value, result.stdout + result.stderr)
+        self.assertIn("fixture started\n", result.stdout)
+        self.assertNotIn("fixture finished", result.stdout)
+        self.assertIn(LIMIT_LINE, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
+    def test_failed_manager_check_stops_before_the_test(self) -> None:
+        bus = self.root / "bus"
+        bus.touch()
+        write_stdlib_tool(self.root / "busctl", "import sys\nprint('fixture bus refused', file=sys.stderr)\nsys.exit(1)\n")
+        self.environment.update(DBUS_SESSION_BUS_ADDRESS=f"unix:path={bus}",
+                                PATH=os.pathsep.join((str(self.root), self.environment["PATH"])),
+                                PYTHONPATH=startup.startup_pythonpath(""))
+        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+import unittest
+case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_long")
+unittest.TextTestRunner().run(case)
+""")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("direct test: could not check the user systemd manager: fixture bus refused", result.stderr)
+        self.assertNotIn("fixture started", result.stdout)
 
     @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
     def test_scope_name_without_enforcement_cannot_bypass_the_direct_limit(self) -> None:
