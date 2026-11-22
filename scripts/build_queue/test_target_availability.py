@@ -145,7 +145,7 @@ class MacRouteTests(unittest.TestCase):
     def test_a_busy_mac_holds_a_repository_only_with_its_own_claims(self) -> None:
         self.use_target_config()
         cargo_liner = claim_state.RepositoryScope("cargo-liner", "github.com/natepiano/cargo-liner")
-        hana = claim_state.RepositoryScope("hana", "github.com/natepiano/hana")
+        hana = claim_state.RepositoryScope("hana", "github.com/hanallc/hana")
         organon = claim_state.RepositoryScope("organon", "github.com/natepiano/organon")
         claims = (claim(hana, "nextest hana"), claim(cargo_liner, "check cargo-handler"))
         scopes = {"/fixture/cargo-liner-tile": cargo_liner, "/fixture/organon": organon}

@@ -406,7 +406,7 @@ class MacQueueViewTests(unittest.TestCase):
                     "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
                 if index == 0:
                     _ = (folder / "Cargo.toml").write_text(
-                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                        '[workspace.package]\nrepository = "https://github.com/hanallc/hana"\n')
                 generation = f"fixture-{pid}"
                 log = f"run-{generation}-{pid}.log"
                 arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]
