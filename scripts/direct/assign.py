@@ -38,6 +38,7 @@ from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
 from scripts.production import worker as staff_worker
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 from scripts.lint import style_review
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 from scripts.whoami import quota_state
@@ -552,8 +553,9 @@ def post_launch_board(artifacts: staff_worker.CompletionArtifacts, slot: str, ki
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", slot) or slot in (".", ".."):
         raise ValueError(f"invalid board slot: {slot}")
     override = env.get("UNIT_NOW_EPOCH")
-    stamp = (datetime.fromtimestamp(int(override.split(".")[0])).astimezone()
-             if override else datetime.now().astimezone()).strftime("%Y-%m-%dT%H:%M:%S%z")
+    zone = user_zone()
+    stamp = (datetime.fromtimestamp(int(override.split(".")[0]), zone)
+             if override else datetime.now(zone)).strftime("%Y-%m-%dT%H:%M:%S%z")
     flattened = message.translate(str.maketrans("\n\r\t", "   "))
     body = "".join(character for character in flattened if character.isprintable())[:900]
     with artifacts.append(artifacts.run / "board.log") as stream:
@@ -622,7 +624,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                 "--new-pass-instance-id", str(instance)]
     post_launch_board(artifacts, slot, "register", f"role={role}; status in {status}", env)
     if enrolled:
-        stamp = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        stamp = datetime.now(user_zone()).strftime("%Y-%m-%dT%H:%M:%S%z")
         with artifacts.append(run / "heartbeat.log") as stream:
             _ = stream.write(f"---- {stamp} [{slot}] ----\n{role}\n")
     else:
