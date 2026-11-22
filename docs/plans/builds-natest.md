@@ -1190,3 +1190,18 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Acceptance gate:**
   1. Table rows on a fixture history: lists removed from every record; the latest-reads file holds the newest lists; `latest_module_reads` returns the same result before and after; the index reads no file again after the step.
   2. A dry run on natedev states the bytes before and after.
+
+### Phase 424 — a test run folder leaves room for a 108-byte socket path  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** every test module that a gate or a targeted run starts gets a folder path short enough that its Unix sockets fit the 108-byte AF_UNIX limit. builds 20:12 (from sdlc): admin-console's targeted run (repofix, 18:47-20:03) exited 1 with about 340 errors: "OSError: AF_UNIX path too long" (test_add_unit*, test_crate_run, test_unit_move, test_disk) and Chrome "Socket path too long" (test_list_page, 88 errors in each part). The Mac part fell back to natedev and met the same errors.
+- **Spec:**
+  1. Find the cause first. The gate folder is `<tmpfs>/<tool>-N` (`gate_temporary`, `scripts/production/gate.py:888`; tool `targeted-test` or `merge-gate`, `gate.py:1576`). Each module gets `build_folders.tool_folder(f"{suite}-{path.stem}", temporary)` (`gate.py:1734`). `testing_folders.test_run_folder` (`scripts/lib/testing_folders.py:20`) adds `test-runs/test-run-<id>`. Tests then add tempfile folders and socket names. Print the real deepest socket path of each failing module and its byte count. Say why the targeted form fails and the merge gate does not (if it does not), and whether a recent change (for example `7cd713d141` build folders track A) made a name longer.
+  2. Repair where the path is made, not in each test, and the same for the gate and targeted forms. Prefer a short module folder name (for example a short index or hash in place of `<suite>-<stem>`) and a short test-run name. Keep each folder unique and keep the owner and lease files the sweepers read.
+  3. If a folder name changes, change every reader of that name in the same commit: sweepers, recovery, retained-folder reports, docs. grep for each old prefix.
+  4. One test asserts the budget: the deepest folder that the gate and `test_run_folder` make, plus a fixed socket-name budget, fits in 108 bytes. Take the budget from the longest socket name in the failing tests.
+  5. No config key changes; no check goes away.
+- **Files:** `scripts/production/gate.py`; `scripts/lib/testing_folders.py`; `scripts/lib/build_folders.py` (only if the name is made there); their tests; the as-built doc that names the folder layout.
+- **Workers:** 1 writer.
+- **Acceptance gate:** the failing modules named above pass in one tests-only gate; the budget test passes; basedpyright zero errors and warnings on changed files; one blind review.
