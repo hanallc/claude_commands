@@ -259,6 +259,78 @@ class AccountsPageTests(unittest.TestCase):
             _ = accounts_page.page()
         cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
 
+    def test_page_shows_token_states_and_renewal_steps_below_models(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=335)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\naccount: claude9\nmade: {made.isoformat()}\nchecked_at: {AT.isoformat()}\n"
+            + f"last_good_use: {(AT - timedelta(minutes=1)).isoformat()}\n"
+            + f"last_login_failure: {AT.isoformat()}\n---\n", encoding="utf-8")
+        config = Path(os.environ["CONF_DIR"]) / "showrunners.conf"
+        dates = ("token_expiry.lead_days=30 7\n"
+                 + "token_expiry.hana_linux_runners.ends=2026-11-22\n"
+                 + "token_expiry.hana_macos_runner_query.ends=2026-11-14\n")
+        _ = config.write_text("mac_token.account=\n" + dates, encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+            mac_section = page.split(b'<section class="token-steps">', 1)[1].split(b"</section>", 1)[0]
+            self.assertIn(b"<p>Set <code>mac_token.account</code> first.</p>", mac_section)
+            self.assertNotIn(b"<ol>", mac_section)
+            _ = config.write_text("mac_token.account=claude2\n" + dates, encoding="utf-8")
+            page = accounts_page.page()
+        self.assertLess(page.index(b'aria-label="Models"'), page.index(b'aria-label="Tokens"'))
+        table = page.split(b'aria-label="Tokens"', 1)[1].split(b"</table>", 1)[0]
+        rows = [match[1] for match in re.finditer(rb"<tr>(<td.*?)</tr>", table)]
+        self.assertEqual(len(rows), 3)
+        for row, expected in zip(rows, (
+            (b"Mac fallback token", b"for claude2.", b">2026-12-15</time>", b">30</td>",
+             b'<span class="error">Login failed</span><br><span class="warning">Renew soon</span>'),
+            (b"hana-linux-runners", b"Registers the Hana Linux CI runners.", b">2026-11-22</time>", b">7</td>",
+             b'<span class="warning">Renew soon</span>'),
+            (b"hana-macos-runner-query", b"Checks runner availability", b">2026-11-14</time>", b">0</td>",
+             b'<span class="error">Expired</span>'),
+        )):
+            for value in expected:
+                self.assertIn(value, row)
+        renewal, linux, macos = (section.split(b"</section>", 1)[0].decode()
+                             for section in page.split(b'<section class="token-steps">')[1:])
+        steps = [match[1] for match in re.finditer(r"<li>(.*?)</li>", renewal)]
+        self.assertEqual(steps, [
+            "In a plain Terminal or iTerm window, not in a herdr pane, run <code>mac-token-renew</code>.",
+            "Approve access in the browser while signed in to claude2.",
+            "Copy the token that setup-token shows, then paste it at the hidden prompt and press Enter.",
+        ])
+        self.assertNotIn("<pre>", renewal)
+        self.assertNotIn('class="token-command"', renewal)
+        self.assertEqual(linux.count("<li>"), 5)
+        self.assertIn("Keep Administration read and write. Set 366 days.", linux)
+        self.assertIn(
+            'Run this command in a plain natedev terminal.<code class="token-command" tabindex="0">'
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/whoami/hana_runner_token.py reseal</code>", linux)
+        self.assertNotIn("systemd-creds", linux)
+        self.assertIn("/tune showrunners token_expiry.hana_linux_runners.ends &lt;YYYY-MM-DD&gt;</code>", linux)
+        self.assertEqual(macos.count("<li>"), 3)
+        self.assertIn("Keep Administration read only.", macos)
+        self.assertIn('class="token-command" tabindex="0">gh secret set MACOS_RUNNER_QUERY_TOKEN --repo hanallc/hana</code>', macos)
+        self.assertIn("/tune showrunners token_expiry.hana_macos_runner_query.ends &lt;YYYY-MM-DD&gt;</code>", macos)
+        self.assertIn(b".token-command{display:block;white-space:pre;overflow-x:auto;", page)
+        self.assertIn(b"tbody tr td{border-top:1px solid var(--line)}", page)
+        self.assertIn(b".roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}", page)
+        self.assertNotIn(b"tbody tr:last-child td{border-top:", page)
+
+    def test_page_marks_old_mac_token_metadata_stale(self) -> None:
+        notes = self.review_root.parent / "agents"
+        notes.mkdir()
+        made = AT - timedelta(days=2)
+        _ = (notes / "Mac fallback token.md").write_text(
+            f"---\nmade: {made.isoformat()}\nchecked_at: {made.isoformat()}\n---\n", encoding="utf-8")
+        with (patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}),
+              patch.object(accounts, "read_status", return_value=sort_reading())):
+            page = accounts_page.page()
+        self.assertIn(b">Stale token data</td>", page)
+
     def test_next_accounts_response_shows_nav_quota_from_the_same_store(self) -> None:
         home = self.review_root.parent / "home"
         home.mkdir()

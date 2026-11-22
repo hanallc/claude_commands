@@ -18,7 +18,7 @@ from typing import TypedDict, cast
 from scripts.accounts import accounts, next_moves
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
-from scripts.whoami import quota_alert, run_out
+from scripts.whoami import mac_fallback_token, quota_alert, run_out, token_expiry
 
 PAGE_NAME = "accounts.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -573,6 +573,68 @@ def models_board(reading: accounts.StatusReading) -> str:
             + f'<tbody>{rows}</tbody></table></div></section>')
 
 
+def _step_markup(step: token_expiry.RenewalStep) -> str:
+    prose = step.instruction if isinstance(step, token_expiry.CommandStep) else step
+    markup = "".join(f"<code>{html.escape(part)}</code>" if index % 2 else html.escape(part)
+                     for index, part in enumerate(prose.split("`")))
+    if isinstance(step, token_expiry.CommandStep):
+        markup += f'<code class="token-command" tabindex="0">{html.escape(step.command)}</code>'
+    return markup
+
+
+def _token_steps(token: token_expiry.TokenExpiry) -> str:
+    heading = "Replace the token on the Mac" if token.key == token_expiry.MAC_TOKEN else f"Renew {token.name}"
+    content = ("<ol>" + "".join(f"<li>{_step_markup(step)}</li>" for step in token.renewal_steps) + "</ol>"
+               if token.renewal_steps else "<p>Set <code>mac_token.account</code> first.</p>")
+    return f'<section class="token-steps"><h3>{html.escape(heading)}</h3>{content}</section>'
+
+
+def tokens_board(reading: accounts.StatusReading) -> str:
+    mac = mac_fallback_token.read()
+    now, zone = reading.checked_at, reading.zone
+    settings = conf.read("showrunners")
+    try:
+        account = mac_fallback_token.configured_account(settings.values("mac_token.account").get("mac_token.account", ""))
+    except (OSError, ValueError):
+        account = mac_fallback_token.Unknown.VALUE
+
+    try:
+        leads = token_expiry.expiry_days(settings.values("token_expiry.lead_days").get("token_expiry.lead_days", ""))
+    except (OSError, ValueError):
+        leads = ()
+
+    keys = settings.settings if isinstance(settings.settings, dict) else ()
+    tokens = (token_expiry.mac_token(mac, account), *token_expiry.configured_tokens(keys, settings.values))
+    rows: list[str] = []
+    for token in tokens:
+        alerts: list[str] = []
+        if token.key == token_expiry.MAC_TOKEN and isinstance(mac, mac_fallback_token.MacFallbackToken):
+            if isinstance(mac.active_login_failure(now), datetime):
+                alerts.append('<span class="error">Login failed</span>')
+            if not mac.recently_checked(now):
+                alerts.append("Stale token data")
+        end_date, days = token.end_date(zone), token.days_left(now, zone)
+        end = f'<time datetime="{end_date}">{end_date}</time>' if end_date is not None else "Unknown"
+        if token.expired(now, zone):
+            alerts.append('<span class="error">Expired</span>')
+        elif end_date is None:
+            alerts.append("End date unavailable")
+        elif not leads:
+            alerts.append("Expiry schedule unavailable")
+        elif token.expiry_lead(now, zone, leads) is not None:
+            alerts.append('<span class="warning">Renew soon</span>')
+        cells = (_cell(html.escape(token.name)), _cell(html.escape(token.purpose)), _cell(end),
+                 _cell("Unknown" if days is None else str(max(days, 0)), "right"),
+                 _cell("<br>".join(alerts) if alerts else "No active alert"))
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    head = "".join(f'<th class="{align}" scope="col">{heading}</th>' for heading, align in (
+        ("token", "left"), ("purpose", "left"), ("ends", "left"), ("days left", "right"), ("state", "left")))
+    steps = "".join(_token_steps(token) for token in tokens)
+    return ('<section class="card tokens-card"><h2>Tokens</h2><div class="scroll">'
+            f'<table aria-label="Tokens"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>{steps}</section>')
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
@@ -582,7 +644,7 @@ def page() -> bytes:
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
-    body = board(reading, alerts) + models_board(reading)
+    body = board(reading, alerts) + models_board(reading) + tokens_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
@@ -622,7 +684,16 @@ STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
-.models-card{margin-top:24px}
+.models-card,.tokens-card{margin-top:24px}
+.token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
+.token-steps h3{font-size:.93rem;margin:0 0 7px}
+.token-steps ol{margin:0;padding-left:1.5rem}
+.token-steps li + li{margin-top:5px}
+.token-steps li::marker,.token-steps p{color:var(--ink-2)}
+.token-steps code{overflow-wrap:anywhere}
+.token-steps .token-command{display:block;white-space:pre;overflow-x:auto;overflow-wrap:normal;
+scrollbar-color:var(--ink-2) var(--line);scrollbar-width:thin}
+.token-steps p{margin:0}
 .roles-table td{vertical-align:top}
 .role-line{min-height:1.5em}
 .model-tooltip{position:fixed;width:max-content;padding:7px 11px;background:var(--model-tooltip-bg);
@@ -646,7 +717,8 @@ left:calc(100% + var(--sort-arrow-gap));transform:translateY(-50%);width:var(--t
 th.right .sort-arrow{left:auto;right:calc(100% + var(--sort-arrow-gap))}
 th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
-tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
+tbody tr td{border-top:1px solid var(--line)}
+.roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
