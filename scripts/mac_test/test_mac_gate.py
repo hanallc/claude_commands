@@ -53,7 +53,7 @@ assert Path(args[args.index('--lifecycle-script') + 1]).is_file()
 folder = Path(args[-2])
 if '--gate-preparation-fd' in args:
     sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
-    from scripts.mac_test.mac_gate import assigned_gate_paths
+    from scripts.mac_test.mac_gate import MacGateResultLines, assigned_gate_paths
 
     paths = assigned_gate_paths(folder.name.removeprefix('mac-gate-'))
     paths.journal.parent.mkdir(parents=True, exist_ok=True)
@@ -81,15 +81,18 @@ if '--assignment-file' in args:
     if case == 'assigned-refusal':
         (folder / os.environ['MAC_GATE_REFUSAL_FILE']).write_text(os.environ['MAC_GATE_REFUSAL'])
         sys.exit(2)
-    if case != 'unsettled':
+    if case not in ('unsettled', 'settlement-failed', 'settlement-timeout'):
         (folder / os.environ['MAC_GATE_COMPLETION_FILE']).write_text(assignment.attempt)
 if case != 'cleanup-refused':
     assert '--no-wait' not in args
-if case == 'timeout':
+def wait_for_caller_exit():
     caller = int(args[args.index('--caller-fd') + 1])
     ready, _, _ = select.select([caller], [], [], float(os.environ['MAC_GATE_HANG_GUARD']))
     assert ready and os.read(caller, 1) == b''
     Path(os.environ['MAC_GATE_RESULT']).with_name('timeout-cleaned').touch()
+
+if case == 'timeout':
+    wait_for_caller_exit()
     sys.exit(2)
 if case == 'lost':
     sys.exit(0)
@@ -112,8 +115,21 @@ if case in ('attempt', 'commit', 'tree'):
     row[case] = 'wrong'
 if case == 'modules':
     row['gate']['jobs'][0]['module'] = 'test_wrong.py'
-print('mac_gate_result=' + json.dumps(row))
-print('mac_exit=0')
+line = 'mac_gate_result=' + json.dumps(row)
+print(line, flush=True)
+print('mac_exit=0', flush=True)
+if case in ('settlement-failed', 'settlement-timeout'):
+    result_lines = MacGateResultLines()
+    result_lines.record(line)
+    job, = result_lines.decode(request).run.jobs
+    assert job.returncode == 1
+    (folder / 'placement-test-failures').write_text(
+        '--- fixture/test_one.py exit=1 ---\\n' + job.output)
+    if case == 'settlement-timeout':
+        wait_for_caller_exit()
+    else:
+        print('mac queue: the exact Mac claim has not settled', file=sys.stderr)
+    sys.exit(2)
 """
 
 
@@ -344,7 +360,7 @@ class MacGateTests(unittest.TestCase):
         _ = command.write_text(FAKE_QUEUE)
         payload = self.root / 'gate.json'
         _ = payload.write_text(json.dumps(gate_box.encode_run(gate.GateRun((job,), 1, 0))))
-        timeout = 0.2 if case == 'timeout' else 15.0
+        timeout = 0.2 if case in ('timeout', 'settlement-timeout') else 15.0
         with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload),
                                            'MAC_GATE_HANG_GUARD': str(TEST_HANG_GUARD_SECS),
                                            'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}),
@@ -365,9 +381,11 @@ class MacGateTests(unittest.TestCase):
             NoOwningSession(), 1)
         refusal = wire.DispatchStatus(assignment, placement.ClosedAssignment('blocked'), placement.PermissionAvailable(),
                                      retry=placement.DoNotRetry('blocked'))
-        for case in ('completed', 'assigned-refusal', 'unsettled', 'lost', 'tree'):
+        job = replace(module_job('one', status=1), output='The Mac test failed\nFixture traceback\n')
+        for case in ('completed', 'assigned-refusal', 'unsettled', 'settlement-failed', 'settlement-timeout',
+                     'lost', 'tree'):
             with (self.subTest(case=case),
-                  self.queue_case(case, module_job('one', status=1)) as selection,
+                  self.queue_case(case, job) as selection,
                   mock.patch.dict(os.environ, {
                       'MAC_GATE_REFUSAL': wire.encode_reply(refusal),
                       'MAC_GATE_REFUSAL_FILE': mac_gate.ASSIGNED_REFUSAL,
@@ -378,6 +396,15 @@ class MacGateTests(unittest.TestCase):
                 if case == 'completed':
                     assert isinstance(result, MacGateCompleted), result
                     self.assertFalse(result.run.passed)
+                elif case in ('settlement-failed', 'settlement-timeout'):
+                    assert isinstance(result, MacGateUnresolved), result
+                    if case == 'settlement-timeout':
+                        self.assertIn('The Mac queue call exceeded', result.reason)
+                        self.assertTrue((self.root / 'timeout-cleaned').exists())
+                    else:
+                        self.assertIn('the exact Mac claim has not settled', result.reason)
+                    self.assertIn('fixture/test_one.py exit=1', result.reason)
+                    self.assertIn(job.output, result.reason)
                 else:
                     expected = MacGatePrelaunchRefused if case == 'assigned-refusal' else MacGateUnresolved
                     self.assertIsInstance(result, expected)

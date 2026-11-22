@@ -1066,6 +1066,10 @@ def run_assigned(args: Arguments, encoded: str) -> int:
                                                                   on_close, owned_close=True), remote, ssh, emit, caller=args.caller)
                             if remote.state == RemoteState.EXITED and status == 0:
                                 result = result_lines.decode(cloud_gate.read(folder / "request.json"))
+                                failures = "\n".join(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}"
+                                                     for job in result.run.jobs if job.returncode)
+                                if failures:
+                                    _ = (folder / mac_gate.ASSIGNED_TEST_FAILURES).write_text(failures, encoding="utf-8")
                                 _ = save_assigned_outcome(saved, path, assignment,
                                     placement.AttemptCompleted(int(not result.run.passed)),
                                     execution_identity.ExecutionEvidenceUnavailable(

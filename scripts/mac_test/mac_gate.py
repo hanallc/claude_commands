@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, TextIO, cast, override
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -77,6 +77,7 @@ RESULT_PREFIX = 'mac_gate_result='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 ASSIGNED_REFUSAL = 'placement-refusal.json'
 ASSIGNED_COMPLETION = 'placement-completed'
+ASSIGNED_TEST_FAILURES = 'placement-test-failures'
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
 MAC_TIME_LIMIT_S = 3600
 
@@ -125,6 +126,11 @@ class RequestMacPlacement:
 
 
 REQUEST_MAC_PLACEMENT = RequestMacPlacement()
+
+
+@dataclass(frozen=True)
+class MacGateTestFailureReceiptNotOpened:
+    """The gate has not opened the test failure receipt."""
 
 
 @contextmanager
@@ -670,9 +676,10 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
     from scripts.build_queue import admission_wire as wire, execution_identity, placement
     from scripts.production.gate_routes import MacGateCancellation
 
-    try:
-        repo = repo.resolve()
-        with ExitStack() as cleanup:
+    with ExitStack() as cleanup:
+        test_failures: TextIO | MacGateTestFailureReceiptNotOpened = MacGateTestFailureReceiptNotOpened()
+        try:
+            repo = repo.resolve()
             caller, lifetime = os.pipe()
             _ = cleanup.callback(os.close, caller)
             caller_lifetime = cleanup.enter_context(ExitStack())
@@ -735,6 +742,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                     # Keep the receipts open after the queue removes the request.
                     refusal_receipt = cleanup.enter_context((folder / ASSIGNED_REFUSAL).open('w+'))
                     completion_receipt = cleanup.enter_context((folder / ASSIGNED_COMPLETION).open('w+'))
+                    test_failures = cleanup.enter_context(
+                        (folder / ASSIGNED_TEST_FAILURES).open('w+', encoding='utf-8', errors='replace'))
                     if cancelled.poll(0):
                         return 'The Mac gate was cancelled'
                 preparation.sendall(b'1')
@@ -752,20 +761,25 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                         and refusal.retry == placement.DoNotRetry(refusal.state.reason)):
                     raise SettledMacRefusal(refusal.state.reason)
             if status or was_cancelled:
-                return queue_failure(lines, folder, status, cancelled=was_cancelled)
-            result_lines = MacGateResultLines()
-            for line in lines:
-                result_lines.record(line)
-            result = result_lines.decode(request)
-            if isinstance(assignment, placement.PlacementAssignment):
-                if completion_receipt.read() != assignment.attempt:
-                    return 'The service did not confirm Mac gate settlement'
-            return result
-    except subprocess.TimeoutExpired:
-        return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError,
-            copies.CopyError, scratch.ScratchError, wire.AdmissionUnavailable) as error:
-        return f'The Mac gate could not finish: {error}'
+                reason = queue_failure(lines, folder, status, cancelled=was_cancelled)
+            elif isinstance(assignment, placement.PlacementAssignment) and completion_receipt.read() != assignment.attempt:
+                reason = 'The service did not confirm Mac gate settlement'
+            else:
+                result_lines = MacGateResultLines()
+                for line in lines:
+                    result_lines.record(line)
+                return result_lines.decode(request)
+        except subprocess.TimeoutExpired:
+            reason = f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError,
+                copies.CopyError, scratch.ScratchError, wire.AdmissionUnavailable) as error:
+            reason = f'The Mac gate could not finish: {error}'
+        if not isinstance(test_failures, MacGateTestFailureReceiptNotOpened):
+            with suppress(OSError):
+                failures = test_failures.read()
+                if failures:
+                    return f'{reason}\n{failures}'
+        return reason
 
 
 def run_assigned(repo: Path, *, assignment: PlacementAssignment, mode: gate.SuiteMode, full: bool,

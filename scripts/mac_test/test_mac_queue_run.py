@@ -660,7 +660,8 @@ def run_pass(target):
                                  placement.PrelaunchRefused(reason))
 
     def test_assigned_gate_launches_only_after_authorization_and_keeps_unsettled_claims(self) -> None:
-        for case in ("completed", "failed tests", "malformed", "blocked", "unknown", "cleanup failed"):
+        for case in ("completed", "failed tests", "malformed", "blocked", "unknown", "cleanup failed",
+                     "failed tests and cleanup"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 args, assignment, environment = self.assigned_gate(root)
@@ -668,10 +669,12 @@ def run_pass(target):
                 identity = claim_state.ClaimIdentity(reference.claim_id, reference.episode, reference.attempt)
                 events: list[str] = []
                 completed = case in ("completed", "failed tests")
-                runs_remote = completed or case in ("malformed", "cleanup failed")
+                cleanup_failed = case in ("cleanup failed", "failed tests and cleanup")
+                runs_remote = completed or cleanup_failed or case == "malformed"
                 result_identity = {"attempt": f"mac-gate-{assignment.attempt}", "commit": "commit", "tree": "tree"}
                 cloud_gate.save(root / "request.json", {**result_identity, "modules": ["scripts/fixture/test_unit.py"]})
-                test_status = int(case == "failed tests")
+                test_status = int(case in ("failed tests", "failed tests and cleanup"))
+                test_output = "The Mac test failed\nFixture traceback\n"
 
                 def lifecycle(_script: str, phase: str, argv: Path, _arguments: list[str],
                               env: dict[str, str], **_options: object) -> int:
@@ -683,7 +686,7 @@ def run_pass(target):
                         self.assertEqual(claim.record["pid"], os.getpid())
                         _ = argv.write_text(json.dumps(["/bin/zsh", "-c", "fixture"]))
                         _ = argv.with_suffix(".json.close").write_text("fixture-cleanup")
-                    return int(phase == "cleanup" and case == "cleanup failed")
+                    return int(phase == "cleanup" and cleanup_failed)
 
                 def authorize(request: wire.ConsumePermission) -> wire.DispatchStatus | wire.FirstAuthorization:
                     events.append("authorize")
@@ -702,7 +705,7 @@ def run_pass(target):
                     self.assertIn(assignment.destination.host, command)
                     self.assertIn("episode/attempt", command[-1])
                     self.assertIn("dispatch_status", command[-1])
-                    job = gate.GateJobResult("fixture", "test_unit.py", test_status, 1, "")
+                    job = gate.GateJobResult("fixture", "test_unit.py", test_status, 1, test_output)
                     row = {**result_identity, "gate": gate_box.encode_run(gate.GateRun((job,), 1, 0))}
                     emit(mac_gate.RESULT_PREFIX + ("{" if case == "malformed" else json.dumps(row)) + "\n")
                     remote.state = mac_queue_run.RemoteState.EXITED
@@ -742,18 +745,26 @@ def run_pass(target):
                     self.assertEqual("stream" in events, runs_remote)
                     self.assertEqual((root / mac_gate.ASSIGNED_COMPLETION).exists(), completed)
                     self.assertEqual((root / mac_gate.ASSIGNED_REFUSAL).exists(), case == "blocked")
-                    self.assertEqual(offload.pending_start_path(reference.target, identity).exists(), case == "cleanup failed")
+                    self.assertEqual(offload.pending_start_path(reference.target, identity).exists(), cleanup_failed)
                     claim = offload.read_assigned_mac_claim(assignment)
-                    self.assertIsInstance(claim, offload.AssignedMacClaim if case == "cleanup failed" else offload.MacClaimSettled)
+                    self.assertIsInstance(claim, offload.AssignedMacClaim if cleanup_failed else offload.MacClaimSettled)
                     expected = ["prepare", "authorize"]
                     if runs_remote:
                         expected.append("stream")
                     expected.append("cleanup")
-                    if case != "cleanup failed":
+                    if not cleanup_failed:
                         expected.append("release")
                     if completed or case == "blocked":
                         expected.append("report")
                     self.assertEqual(events, expected)
+                    failures = root / "placement-test-failures"
+                    if case == "failed tests and cleanup":
+                        self.assertTrue(failures.exists(), "Settlement failure lost the validated test output")
+                        report = failures.read_text()
+                        self.assertIn("fixture/test_unit.py exit=1", report)
+                        self.assertIn(test_output, report)
+                    elif not test_status:
+                        self.assertFalse(failures.exists())
 
     def test_every_run_returns_the_placement_and_keeps_the_mac_status(self) -> None:
         cases = ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True))
