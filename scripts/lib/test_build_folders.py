@@ -453,6 +453,16 @@ class FolderFormTests(unittest.TestCase):
             self.assertEqual(path, self.root / "build/hana/demo/mac")
             self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
 
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
+
     def test_paths_refuse_invalid_components_and_numbers(self) -> None:
         for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
             with self.subTest(name=name):

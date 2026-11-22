@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf, copy_record
+from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.lib.user_zone import user_zone
 
@@ -85,17 +85,17 @@ FOLDERS: list[tuple[str, str]] = [
     ("~/rust", "~/rust"),
     ("~/.local/state", "~/.local/state"),
     ("/tmp", "/tmp"),
-    ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
-    ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
 ]
 
 
 def scanned_folders() -> list[tuple[str, str]]:
-    """FOLDERS plus the scratch root when no folder holds it; task checkouts build there."""
+    """List fixed folders, Hana CI runners, and the scratch root if separate."""
+    folders = list(FOLDERS)
+    folders.extend((f"CI runner {number}", str(path)) for number, path in build_folders.ci_folders("hana"))
     scratch = copy_record.root()
-    if any(scratch.is_relative_to(Path(path).expanduser()) for _, path in FOLDERS):
-        return list(FOLDERS)
-    return [*FOLDERS, ("scratch", str(scratch))]
+    if not any(scratch.is_relative_to(Path(path).expanduser()) for _, path in folders):
+        folders.append(("scratch", str(scratch)))
+    return folders
 
 
 @dataclass(frozen=True)

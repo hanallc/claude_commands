@@ -425,9 +425,23 @@ def main_output_path(repo: str) -> Path:
     return build_root() / _form_name(repo) / "main"
 
 
+def _ci_folder(repo: str) -> Path:
+    return build_root() / _form_name(repo) / "ci"
+
+
 def ci_path(repo: str, number: int) -> Path:
     """Return the path for a numbered CI runner."""
-    return build_root() / _form_name(repo) / "ci" / _folder_number(number)
+    return _ci_folder(repo) / _folder_number(number)
+
+
+def ci_folders(repo: str) -> list[tuple[int, Path]]:
+    """List existing CI runner folders in runner number order."""
+    parent = _ci_folder(repo)
+    try:
+        numbers = copy_numbers(parent)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [(number, parent / _folder_number(number)) for number in sorted(numbers) if numbers[number]]
 
 
 def copy_path(repo: str, unit: str, number: int) -> Path:
