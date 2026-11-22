@@ -1575,34 +1575,6 @@ if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     fi
 fi
 
-VERIFY_RUN_SLOT_HELD=0
-admit_verify_run() {
-    [[ "${OSTYPE:-}" != darwin* && "$VERIFY_RUN_SLOT_HELD" == 0 ]] || return 0
-    local status=0 monitor=0 placement_previous_job_pid=${!:-}
-    local -a request=("$BUILDLOG_MEM_ADMIT_SCRIPT" verify-run-slot --pid "$$" --episode "${1:-}")
-    PLACEMENT_CLIENT_ACTIVE=1
-    [[ $- != *m* ]] || monitor=1
-    set -m
-    (
-        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
-        if [[ -p "/proc/$$/fd/2" || -c "/proc/$$/fd/2" ]]; then
-            verify_helper --require-helper "${request[@]}" </dev/null
-        else
-            # Relay diagnostics through a pipe to keep the caller's file offset.
-            verify_helper --require-helper "${request[@]}" </dev/null 2>&1 >/dev/null | cat >&2
-        fi
-    ) &
-    HOLD_WAITER_PID=$!
-    if [[ "$monitor" == 0 ]]; then set +m; fi
-    wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
-    if (( status != 0 )); then
-        PLACEMENT_FAILED=1
-        return "$status"
-    fi
-    VERIFY_RUN_SLOT_HELD=1
-}
-
 shift
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
@@ -3181,7 +3153,6 @@ route_test() {
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
-        if [[ "$MAC_ONLY" == 0 ]]; then admit_verify_run || exit $?; fi
         placement_once "$refresh_source" || placement_status=$?
         refresh_source=0
         if (( placement_status == 78 )); then
@@ -3216,11 +3187,7 @@ route_test() {
             require_nextest
         fi
         collect_routing_wait
-        if [[ "$MAC_ONLY" == 1 ]]; then
-            if cache_lookup; then exit "$LOOKUP_STATUS"; fi
-            # The Mac assignment has no claim until Verify reserves it.
-            admit_verify_run "$PLACEMENT_EPISODE" || exit $?
-        fi
+        if [[ "$MAC_ONLY" == 1 ]] && cache_lookup; then exit "$LOOKUP_STATUS"; fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
@@ -4097,8 +4064,12 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
     os.replace(record, lock / "owned")
+    # The admission service uses the sidecar to tell that the guard allowed the step.
+    if sidecar := os.environ.pop("BUILDLOG_SCOPE_SIDECAR", ""):
+        Path(sidecar).write_text(os.environ["BUILDLOG_STEP_SCOPE"] + "\n")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
+os.environ.pop("BUILDLOG_DEFER_SCOPE_SIDECAR", None)
 sys.exit(shell_status(subprocess.call(command)))
 '
 
@@ -4182,8 +4153,8 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
-            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env \
-                VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+            BUILDLOG_DEFER_SCOPE_SIDECAR=1 \
+            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
         return "$step_status"
