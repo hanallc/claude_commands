@@ -1433,3 +1433,16 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/targeted_test.py` (or the request builder it calls); its tests.
 - **Workers:** 1 writer.
 - **Acceptance gate:** the test; basedpyright zero on changed files; one blind review; affected run green (joined with other waiting tips where they join).
+
+### Phase 441 — claude_commands tests write temp files only under the run's TMPDIR or their fixture folder  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds and bob 10:16 EST: guest run 1 left test files in the guest's `/tmp` and `/dev/shm` (`/tmp/gc-*`, `/tmp/claude/worktree_delete`, `/tmp/hanadocs-prioritize/writer.lock`, `/dev/shm/g-*`). The cause is in the tests and gate code that use a fixed path. A private `/tmp` in the guest runner only contains it.
+- **Spec:**
+  1. Survey first: list each claude_commands test and each gate code path that writes to `/tmp` or `/dev/shm` by a fixed path (`file:line`, the path, test or production code). Include `tempfile` calls with `dir="/tmp"` or `dir="/dev/shm"` and literal `/tmp/...` paths.
+  2. Fix plan: each one moves under the run's `TMPDIR` (tempfile default) or its fixture folder. Production code that must use `/dev/shm` for speed keeps it only through one named root that a test can point at its fixture folder.
+  3. Fix the survey's rows in worker-sized parts; prove each part with its own modules.
+- **Files:** from the survey.
+- **Workers:** 1 writer for the survey; the fix parts split by folder.
+- **Acceptance gate:** a guest run leaves nothing in `/tmp` or `/dev/shm` without the private-`/tmp` runner; each part's modules green; one blind review per part.
