@@ -1634,6 +1634,7 @@ function bindFeedbackForm(form){
     if(item.listRequest!==request) return;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     if(stale){
+     if(tableView.dialogItem?.dataset.key===key) return;
      applySavedState(result,{metadataOnly:true});
      if(action==='unpark') showUnparkResult(result);
      else tableView.applyAction();
@@ -1677,7 +1678,7 @@ function bindFeedbackForm(form){
      const focus=document.activeElement;
      const inside=recordDetails(item).closest('dialog')?.contains(focus);
      focusParkedAfterClose=focusUnpark && (inside || focus===document.body);
-     tableView.closeCard(key);tableView.apply(false);
+     tableView.closeCard(key);tableView.applyAction();
      if(hadFocus && listOwnsFocus() && (inside || focus===document.body)) focusAfterQuestion(item);
     }
    }catch(error){
@@ -1768,7 +1769,7 @@ function bindFeedbackForm(form){
      if(!stale && listOwnsFocus()){
       if(item.hidden && (!focusChoice || recordDetails(item).contains(focusChoice))) focusAfterQuestion(item);
       else if(!focusChoice?.isConnected && !item.hidden && document.activeElement===document.body){
-       const close=form.closest('dialog[open]')?.querySelector('[data-close]');
+       const close=recordDetails(item).closest('dialog[open]')?.querySelector('[data-close]');
        const target=!saved && submitter?.matches(':enabled') ? submitter : close ?? item.querySelector('.list-toggle');
        target.focus({preventScroll:true});
       }

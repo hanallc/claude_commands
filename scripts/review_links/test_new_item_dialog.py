@@ -568,7 +568,11 @@ async function sendSaved() {
     if (url === '/console/review/new-item?page=list') {
      const morty = {id:'fixture-list-producer',name:'morty'};
      const owner = listToken === 'list-token-before-restart' ? morty : {id:'builds-staff',name:'builds'};
-     return json({token:listToken,page_owner:owner.id,recipients:owner === morty ? [morty] : [owner, morty]});
+     return originalFetch(url, options).then(async response => {
+      const fresh = await response.json();
+      return json({...fresh, token:owner === morty ? listToken : fresh.token,
+                   page_owner:owner.id, recipients:owner === morty ? [morty] : [owner, morty]});
+     });
     }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      const payload = JSON.parse(options.body);

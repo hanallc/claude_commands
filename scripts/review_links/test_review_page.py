@@ -1606,11 +1606,15 @@ window.fetch=(url,options)=>{
         validating = replace(change, state=review_items.ReviewState.VALIDATING, actions=('question',))
         with patch.object(review_items, 'read', return_value=[validating]):
             markup = browser_markup(self.root, show='Validating')
+        rows = [replace(change, key=f'page-owner/C{number}', id=f'C{number}') for number in range(1, 61)]
+        with patch.object(review_items, 'read', return_value=rows):
+            open_markup = browser_markup(self.root)
         probe = r'''<script>
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog'),row=()=>content.querySelector('[data-list-item]');
+ const dialog=document.querySelector('#record-item-dialog');
+ const row=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
  const toggle=()=>row().querySelector('.list-toggle');
  const close=dialog.querySelector('[data-close]'),error=dialog.querySelector('[data-record-error]');
  let finishPost;
@@ -1622,43 +1626,69 @@ window.fetch=(url,options)=>{
  };
  const edit=(field,words)=>{field.value=words;field.dispatchEvent(new Event('input'));};
  const ask=form=>form.requestSubmit(form.querySelector('[value="question"]'));
- const settled=async form=>{
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+ const until=async(test,message)=>{
   const end=performance.now()+8000;
-  while(form.dataset.sending){
-   if(performance.now()>end) throw new Error('The save did not settle.');
-   await new Promise(resolve=>requestAnimationFrame(resolve));
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await frame();
   }
  };
+ const settled=form=>until(()=>!form.dataset.sending,'The save did not settle.');
  try{
-  content.querySelector('#review-show-validating').click();
+  if(VALIDATING) content.querySelector('#review-show-validating').click();
   toggle().click();const first=await readyReviewCard(row()),words=first.elements.feedback;
-  edit(words,'Which check passed?');ask(first);
-  edit(words,'Which check ran?');edit(words,'Which check passed?');
-  words.focus();words.setSelectionRange(3,7);
-  finishPost(Response.json({answer:'question saved'}));await settled(first);
-  check(words.value==='Which check passed?' && document.activeElement===words &&
-   words.selectionStart===3 && words.selectionEnd===7,
-   'A saved Ask preserves words edited during the save and keeps their selection.');
-  ask(first);close.click();toggle().click();
+  edit(words,'Which check passed?');
+  if(VALIDATING){
+   ask(first);
+   edit(words,'Which check ran?');edit(words,'Which check passed?');
+   words.focus();words.setSelectionRange(3,7);
+   finishPost(Response.json({answer:'question saved'}));await settled(first);
+   check(words.value==='Which check passed?' && document.activeElement===words &&
+    words.selectionStart===3 && words.selectionEnd===7,
+    'A saved Ask preserves words edited during the save and keeps their selection.');
+   ask(first);close.click();toggle().click();
+   const reopened=await readyReviewCard(row());
+   finishPost(Response.json({reason:'An earlier refusal.'},{status:400}));await settled(first);
+   check(dialog.open && !reopened.querySelector('[data-send-status]').textContent.includes('Not saved:'),
+    'A refusal from before Close stays out of the reopened item.');
+  }
+  const sent=await readyReviewCard(row());
+  ask(sent);close.click();
+  if(!VALIDATING){
+   scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});
+   const departure=content.querySelector('[data-record-motion-key="page-owner/C1"]');
+   await frame();
+   check(scrollY>=innerHeight,'The page scrolls one viewport during the save.');
+   await until(()=>!departure?.isConnected,'The row did not finish leaving.');
+   scrollTo({top:0,behavior:'instant'});
+   await until(row,'The pending row did not return.');
+  }
+  toggle().click();
   const reopened=await readyReviewCard(row());
   edit(reopened.elements.feedback,'Keep these later words.');
-  finishPost(Response.json({answer:'question saved'}));await settled(first);
+  finishPost(Response.json({answer:'question saved'}));await settled(sent);
   check(dialog.open && reopened.elements.feedback.value==='Keep these later words.' &&
    !reopened.querySelector('[data-send-status]').textContent.includes('Saved:'),
    'A response from before Close leaves the reopened item and its draft in place.');
-  ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
-  finishPost(new Response('Unreadable result'));await settled(reopened);
-  check(!error.hidden && error.textContent==='Saved; the item could not refresh.' &&
-   reopened.elements.feedback.value==='Keep the words after Ask.',
-   'An unreadable successful response reports a display error and keeps the draft.');
-  ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);
-  check(error.hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
-   reopened.elements.feedback.value==='Keep the words after Ask.',
-   'A failed save reports a save error and keeps the draft.');
+  if(VALIDATING){
+   ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
+   finishPost(new Response('Unreadable result'));await settled(reopened);
+   check(!error.hidden && error.textContent==='Saved; the item could not refresh.' &&
+    reopened.elements.feedback.value==='Keep the words after Ask.',
+    'An unreadable successful response reports a display error and keeps the draft.');
+   ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);
+   check(error.hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
+    reopened.elements.feedback.value==='Keep the words after Ask.',
+    'A failed save reports a save error and keeps the draft.');
+  }
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe + '</body>').encode()), [[]])
+        for is_validating, source in ((True, markup), (False, open_markup)):
+            with self.subTest(validating=is_validating):
+                script = probe.replace('VALIDATING', json.dumps(is_validating))
+                self.assertEqual(firefox_probe_results(source.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_retries_an_unavailable_body_with_the_same_version(self) -> None:
@@ -2139,7 +2169,9 @@ window.fetch=(url,options)=>{
   check(await ready('page-owner/C4'),'The newer card body loads.');
   check(document.querySelector('[data-review]').dataset.version!==previousVersion &&
    row('page-owner/C4').dataset.title==='a newer summary','F004: the body version refreshes the summary.');
+  const openAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({show:'open',item:'page-owner/C4'});
+  await openAddress;
   await until(()=>document.querySelector('[data-review]').dataset.show==='open' && form('page-owner/C4'),'the Open form');
   conflict='/resolve-conflict';
   const stale=form('page-owner/C4');
@@ -5510,6 +5542,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const form=await readyReviewCard(row);
  const detail=recordDetails(row),scroll=detail.closest('.console-dialog-body');
  detail.style.height='1600px';
+ await frame();
  scroll.scrollTop=220;
  await frame();
  check(scroll.scrollTop===220 && near(top(row),before) && near(top(next),following),
@@ -6192,7 +6225,7 @@ window.fetch=(url,options={})=>{
   jump.dataset.recordJump='';
   review.append(jump);
   jump.href='#item=page-owner%2FC99';jump.click();
-  const missing=review.querySelector('[data-missing-item]'),missingHash=location.hash;
+  const missing=document.querySelector('[data-record-link-notice]'),missingHash=location.hash;
   jump.href='#item=page-owner%2FC2';jump.click();
   jump.remove();
   check(expanded(change('page-owner/C2'),'Open') && missing.hidden,'A valid review link clears the notice.');
@@ -6298,10 +6331,12 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 window.refreshMarkup=original;
-window.transformFixtureBody=(text,key)=>{
+let heldBody;
+window.transformFixtureBody=async(text,key)=>{
+ if(heldBody?.key===key) await heldBody.ready;
  const panel=document.createElement('div');panel.innerHTML=text;
  if(key.startsWith('question/')){
-  const form=panel.querySelector('form');form.elements.token.value+='-refreshed';form.elements.row.value+='-refreshed';
+  const form=panel.querySelector('form');form.elements.token.value+='-refreshed';
  }
  return panel.innerHTML;
 };
@@ -6370,22 +6405,44 @@ window.fetch=async(_url,options={})=>{
     refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
   check(recordDetails(fresh).querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
   check(recordDetails(fresh).querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
-  check(recordDetails(fresh).querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
+  check(recordDetails(fresh).querySelector('form').elements.row.value===fresh.dataset.key &&
     recordDetails(fresh).querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
   const [initialTarget,other]=rows().filter(row=>row.dataset.type==='change');
-  const afterRefresh=()=>new Promise(resolve=>
-   document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
+  const afterRefresh=()=>new Promise((resolve,reject)=>{
+   const review=document.querySelector('[data-review]');
+   const refreshed=()=>{clearTimeout(timeout);resolve();};
+   const timeout=nativeTimeout(()=>{
+    review.removeEventListener('review-refreshed',refreshed);
+    reject(new Error('Review did not refresh after the refusal.'));
+   },8000);
+   review.addEventListener('review-refreshed',refreshed,{once:true});
+  });
   const liveRow=key=>rows().find(row=>row.dataset.key===key);
   other.querySelector('.list-toggle').click();
   let otherForm=await readyReviewCard(other);
   let rejected=holdPost();
   otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
   check(leavingNow(other),'The row starts to leave before the response.');
+  let releaseBody;
+  heldBody={key:other.dataset.key,ready:new Promise(resolve=>{releaseBody=resolve;})};
   let refreshed=afterRefresh();rejected.refuse('Fixture older refusal');await refreshed;
   const returnedOther=liveRow(other.dataset.key);
   otherForm=await readyReviewCard(returnedOther);
+  const retainedWorks=otherForm.querySelector('[value="works"]');
+  check(retainedWorks.disabled && !otherForm.elements.feedback.disabled,
+   'During refresh the retained form disables actions and keeps the draft editable.');
+  const postCount=posts.length;
+  retainedWorks.click();
+  check(posts.length===postCount,'Clicking the disabled action sends no request.');
+  releaseBody();heldBody=null;
+  const works=()=>recordDetails(returnedOther).querySelector('[value="works"]:enabled:not([aria-disabled="true"])');
+  const bodyDeadline=performance.now()+8000;
+  while(!works()){
+   if(performance.now()>bodyDeadline) throw new Error('The returned card did not enable its actions.');
+   await flush();
+  }
   check(visibleStatus('Not saved: Fixture older refusal'),'A refused row shows the reason.');
-  rejected=holdPost();otherForm.requestSubmit(otherForm.querySelector('[value="works"]'));
+  rejected=holdPost();works().click();
   refreshed=afterRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
   check(!visibleStatus('Not saved: Fixture older refusal'),'A later refusal replaces the previous reason.');
   const target=liveRow(initialTarget.dataset.key);target.querySelector('.list-toggle').click();await readyReviewCard(target);
@@ -6530,7 +6587,7 @@ window.fetch=async(_url,options={})=>{
   document.querySelector('[data-type-chip=""]').click();
   const pending=rows().find(row=>row.dataset.number==='page-owner/c3'),pendingKey=pending.dataset.key;
   pending.querySelector('.list-toggle').click();await readyReviewCard(pending);
-  const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
+  const pendingForm=recordDetails(pending).querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
   const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
   const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));

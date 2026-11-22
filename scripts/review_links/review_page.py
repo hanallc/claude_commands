@@ -1869,6 +1869,7 @@ const view=createRecordTable({content:()=>content,
   if(show) params.set('show',['response','for-you'].includes(params.get('type')) && show==='Validating' ? 'open' : show);
  },
  persistLinkedTarget:true,
+ keepItemOnMissingLink:true,
  missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
   const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
@@ -1986,13 +1987,12 @@ function loadBodies(){
    const apply=(row,detail)=>applyReviewDetail(key,row,detail,text);
    view.itemError('');
    current.dataset.bodyLoaded='true';
-   view.presentItemRevision(current,text,apply,{
-    initial:Boolean(detail.querySelector('[data-record-loading]')),
-    force:Boolean(detail.querySelector('form button:disabled') && !detail.querySelector('form button:enabled'))
-   });
+   view.presentItemRevision(current,text,apply,{initial:Boolean(detail.querySelector('[data-record-loading]'))});
+   drawSaveControls(detail.querySelector('[data-review-form]'));
   };
   if(bodies.has(key)){install(bodies.get(key));return;}
   if(bodyRequests.has(key)) return;
+  drawSaveControls(recordDetails(row).querySelector('[data-review-form]'));
   const version=content.dataset.version;
   const prefetched=firstRequest?.key===key && firstRequest.version===version;
   const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
@@ -2033,12 +2033,19 @@ function rememberItem(row){
 function recoveringForm(key,form){
  return recovering.has(key) && recovering.get(key).revision===form.elements.revision?.value;
 }
+function drawSaveControls(form){
+ if(!form) return;
+ const row=recordFromDetail(form),key=row.dataset.key;
+ const pending=pendingSaves.has(key);
+ setCardSubmitting(form,pending);
+ if(pending) return;
+ const disabled=row.dataset.bodyLoaded!=='true' || !index.has(key) || recoveringForm(key,form);
+ form.querySelectorAll('button').forEach(button=>button.disabled=disabled);
+}
 function drawSaveState(key,form=recordDetails(reviewRow(key))?.querySelector('[data-review-form]')){
  if(!form) return;
- const pending=pendingSaves.get(key);
- setCardSubmitting(form,Boolean(pending));
- if(!pending && recoveringForm(key,form)) form.querySelectorAll('button').forEach(button=>button.disabled=true);
- form.querySelector('[data-send-status]').textContent=pending?.notice || view.actionNotice(recordFromDetail(form));
+ drawSaveControls(form);
+ form.querySelector('[data-send-status]').textContent=pendingSaves.get(key)?.notice || view.actionNotice(recordFromDetail(form));
 }
 function bindForm(row){
  const form=recordDetails(row).querySelector('[data-review-form]');if(!form || form.dataset.bound) return;
@@ -2062,6 +2069,12 @@ function bindForm(row){
    const request=view.startItemRequest(key);
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);
    const submission=view.startAction(row);
+   const reopened=()=>view.dialogItem?.dataset.key===key && view.opened.has(key) &&
+    !view.currentItemRequest(request);
+   const showResult=result=>{
+    if(reopened()) view.applyAction();
+    else view.showActionResult(row,submission,key,result);
+   };
    const settle=async()=>{
     pendingSaves.delete(key);setCardSubmitting(form,false);drawSaveState(key);
     if(isDeferredLink(key)){
@@ -2077,7 +2090,7 @@ function bindForm(row){
    };
    const fail=reason=>{
     pendingSaves.delete(key);
-    view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+reason});
+    showResult({kind:'failure',message:'Not saved: '+reason});
    };
    await saveReviewAction(data,{
    confirmedSave:()=>{
@@ -2104,8 +2117,8 @@ function bindForm(row){
       view.installOwnItemResult(request,text,(item,detail)=>applyReviewDetail(key,item,detail,text));
     }
     if(validationQuestion){
-     if(result.detail_closed) view.closeCard(key);
-     view.showActionResult(row,submission,key,savedMessage);
+     if(result.detail_closed && !reopened()) view.closeCard(key);
+     showResult(savedMessage);
      return;
     }
     const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
@@ -2117,12 +2130,12 @@ function bindForm(row){
      question:outcome==='question',
      closes:result.detail_closed ?? (!handed && !['question','later'].includes(outcome)),awaitingSnapshot:true};
     const applySaved=()=>{
-     if(!showOwnDetail && (outcome==='later' || !isDeferredLink(key))) view.closeCard(key);
+     if(!reopened() && !showOwnDetail && (outcome==='later' || !isDeferredLink(key))) view.closeCard(key);
      saved.set(key,marker);savedEntry(key,marker);
      if(marker.closes) storeSavedVerdicts();
      pendingSaves.delete(key);
      if(outcome==='done' && mountedRow(key)) bind();
-     view.showActionResult(row,submission,key,{
+     showResult({
       ...savedMessage,hiddenMessage:outcome==='done' && savedMessage.kind==='success' ? savedMessage.message : undefined});
      if((handed || outcome==='done') && parent!==window) parent.postMessage('for-you-completed',location.origin);
     };
@@ -2134,7 +2147,7 @@ function bindForm(row){
     if(!view.currentItemRequest(request)) return;
     if(closes){
      view.closeCard(key);
-     view.showActionResult(row,submission,key,{kind:'failure',message:'Saved; the item could not refresh.'});
+     showResult({kind:'failure',message:'Saved; the item could not refresh.'});
     }else view.savedItemError(request);
    },
    recover:async reason=>{
@@ -2166,7 +2179,7 @@ function bindForm(row){
       recovering.delete(key);
       const fresh=recordDetails(reviewRow(key))?.querySelector('[data-review-form]');
       rememberForm(fresh);
-      fresh?.querySelectorAll('button').forEach(button=>button.disabled=false);
+      drawSaveControls(fresh);
      }
     }
    },

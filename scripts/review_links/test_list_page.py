@@ -1127,13 +1127,15 @@ async function inspect(){
   await readingCounts;
   check(draft.querySelector('[name=feedback]').value==='Keep this draft when I switch tabs.',
    'The draft is still available on the List.');
+  const retainedLink=link('sdlc/C1');
   close.click();
-  check(!dialog.open && !link('sdlc/C1') && doc.activeElement===row().querySelector('.list-toggle'),
-   'Close focuses the row while the List loads its links.');
+  check(!dialog.open && retainedLink && doc.activeElement===retainedLink &&
+   row().hasAttribute('data-list-review-version'),
+   'Close focuses the retained link while the List loads its links.');
   releaseCounts();
-  await changed(doc.body,()=>link('sdlc/C1'),'the pending link appears');
+  await changed(doc.body,()=>!row().hasAttribute('data-list-review-version'),'the List finishes loading links');
   await animationFrames(win);
-  check(doc.activeElement===link('sdlc/C1'),'The loaded link receives focus.');
+  check(doc.activeElement===link('sdlc/C1'),'Focus stays on the link after loading.');
   win.fetch=fetchBeforeReturn;
   readyLink=link('sdlc/C1');
  }
@@ -2454,7 +2456,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("const edit=()=>{draftStamp++;retain();};", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',edit)", list_page.SCRIPT)
-        self.assertIn("setCardSubmitting(form,false,item);syncTell()", list_page.SCRIPT)
+        self.assertIn("setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell()", list_page.SCRIPT)
         self.assertIn('rows="4"', words)
 
     def test_record_fields_share_the_markdown_formatter(self) -> None:
@@ -3160,8 +3162,8 @@ window.fetch=async(_path,options={})=>{
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
   check(row('106').dataset.unread==='false' && !row('106').querySelector('.list-dot') &&
-   !recordDetails(removed).querySelector('[value="read"]'),'Remove clears the unread controls before the response');
-  check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
+   !removed.querySelector('[value="read"]'),'Remove clears the unread controls before the response');
+  check([...removed.querySelectorAll('button')].every(button=>button.disabled),'Remove disables the form buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
   check(row('106').hidden,'Remove stays outside Working after success');
@@ -7029,7 +7031,9 @@ try{
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await flush();
+ const updates=document.querySelector('[data-show-record-updates]');
+ await until(()=>!updates.hidden,'the updated card after the lost response');
+ updates.click();
  retryForm=recordDetails(rows().find(row=>row.dataset.number==='105')).querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
