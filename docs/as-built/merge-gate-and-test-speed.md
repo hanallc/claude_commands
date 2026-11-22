@@ -250,6 +250,7 @@ The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 Gate startup checks recovery records for dead gate processes across checkouts.
 If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
+Each gate process reports a refused record once.
 The gate keeps that record and checks the remaining records.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.

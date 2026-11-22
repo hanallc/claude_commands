@@ -765,6 +765,7 @@ class NoGateRecovery:
 
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
     "merge_gate_recovery", default=NoGateRecovery())
+_reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
 def gate_run_directory(repo: Path) -> Path:
@@ -796,8 +797,11 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
             except GateRefused as error:
                 if directory == own_directory:
                     raise
-                reason = " ".join(str(error).splitlines())
-                print(f"Gate recovery kept {str(path)!r}: {reason}", file=sys.stderr)
+                report_key = (os.getpid(), path)
+                if report_key not in _reported_foreign_gate_refusals:
+                    reason = " ".join(str(error).splitlines())
+                    print(f"Gate recovery kept {str(path)!r}: {reason}", file=sys.stderr)
+                    _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
 

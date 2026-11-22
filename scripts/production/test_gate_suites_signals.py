@@ -79,12 +79,14 @@ class GateProcessStateTests(unittest.TestCase):
             recoverable.pid: Gone(),
             os.getpid(): Started("caller"),
         }
-        with (mock.patch.object(gate, "process_start", side_effect=identities.__getitem__),
+        with (mock.patch.object(gate, "process_start", side_effect=identities.__getitem__) as read_start,
               mock.patch.object(admission_records, "read_memory_config",
                                 return_value=mock.Mock(program_stop_seconds=0)),
-              redirect_stderr(io.StringIO()) as report,
-              gate.gate_recovery(checkout) as current):
-            self.assertTrue(current.path.is_file())
+              redirect_stderr(io.StringIO()) as report):
+            gate.recover_gate_runs(checkout)
+            with gate.gate_recovery(checkout) as current:
+                self.assertTrue(current.path.is_file())
+        self.assertEqual(read_start.call_args_list.count(mock.call(unreadable_owner.pid)), 2)
         self.assertEqual(report.getvalue().splitlines(), [
             f"Gate recovery kept {str(unreadable_owner.path)!r}: cannot recover gate 5000001: owner status cannot be read",
             f"Gate recovery kept {str(unreadable_group.path)!r}: cannot recover gate group 5000003: group status cannot be read",
