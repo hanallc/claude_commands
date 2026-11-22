@@ -18,7 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_view, queue_evidence
-from scripts.build_queue.slot_wait import QueueKind, QueueRowName
+from scripts.build_queue.slot_wait import QueueKind, QueueRowName, recorded_step
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_wire import CloudGroup
@@ -48,11 +48,12 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
 
 
 class RecordedOwnerQueueTests(unittest.TestCase):
-    def test_fixed_gate_uses_the_configured_queue_name(self) -> None:
+    def test_gate_uses_the_configured_queue_name(self) -> None:
         for label, expected in (("  fixture   gate  ", "fixture gate"), ("$private", "gate")):
             with self.subTest(label=label):
                 names = StepNames({"names.gate": label})
                 self.assertEqual(QueueRowName.fixed(QueueKind.MERGE_GATE, names), expected)
+                self.assertEqual(recorded_step("gate", names), expected)
 
     def test_repository_slot_wait_is_shown_without_a_memory_need(self) -> None:
         with QueueFixture() as fixture:
