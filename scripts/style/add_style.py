@@ -20,7 +20,7 @@ from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.production import showrunners, staff
+from scripts.production import session_staff, showrunners, staff
 from scripts.lib import build_folders, git_files
 from scripts.worktree import worktrees
 from scripts.lib.git_exclude import ensure_excluded, require_untracked_ignored
@@ -203,6 +203,25 @@ class UnfinishedStyleCheckout:
     branch: str
 
 
+def _enrolled_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout:
+    from scripts.production.production_admission import require_guard_ready
+
+    _require_bootstrap_destination(standing.doc, standing.repository)
+    try:
+        document = read_new_production(standing.doc, standing.name)
+    except Refusal as error:
+        raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap. {error}") from error
+    if document.merge_checkout != standing.repository:
+        raise Refusal(f"{standing.doc}: Merge checkout must name {standing.repository}")
+    try:
+        _ = session_staff.production_session_directory(document.doc, document.checkout)
+    except ValueError as error:
+        raise Refusal(f"{standing.doc}: {error}") from error
+    _require_bootstrap_destination(document.log, standing.repository)
+    require_guard_ready()
+    return UnfinishedStyleCheckout(document.checkout, document.doc, document.merge_branch)
+
+
 def _unfinished_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout | None:
     repository, name = standing.repository, standing.name
     checkout = build_folders.worktree_path(build_folders.repo_word(repository), name, worktrees.UNIT_WORKTREE_NAME)
@@ -235,7 +254,8 @@ def _request(name: str) -> StyleProduction:
         checkout, doc = standing.checkout, standing.doc
         branch = read_production(standing.name).merge_branch
     else:
-        route = _unfinished_style_checkout(standing)
+        route = (_enrolled_style_checkout(standing) if standing.doc.exists() or standing.doc.is_symlink()
+                 else _unfinished_style_checkout(standing))
         if route is not None:
             checkout, doc, branch = route.checkout, route.doc, route.branch
         else:
@@ -364,19 +384,6 @@ def _enroll_legacy_bootstrap(style: StyleProduction, standing: NoStyleProduction
     for path in (standing.doc, live_log):
         _require_bootstrap_destination(path, style.repository)
 
-    if standing.doc.is_file():
-        try:
-            enrolled = read_new_production(standing.doc, style.name)
-        except Refusal as error:
-            raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap. {error}") from error
-        saved = standing.doc.read_text(encoding="utf-8").splitlines()
-        if (enrolled.merge_checkout != style.repository or enrolled.checkout != style.checkout
-                or enrolled.merge_branch != style.merge_branch or enrolled.log != live_log
-                or optional_field(saved, "Kind") != FieldPresent("style")):
-            raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap")
-        _require_branch_point(style, production_field(saved, "Branch point").removeprefix("refs/heads/"))
-        return replace(style, doc=standing.doc)
-
     files: list[tuple[Path, str]] = []
     if log.exists():
         if not log.is_file():
@@ -387,10 +394,19 @@ def _enroll_legacy_bootstrap(style: StyleProduction, standing: NoStyleProduction
                 raise Refusal(f"{live_log}: conflicts with the legacy style log")
         else:
             files.append((live_log, log_text))
+    elif live_log.exists():
+        raise Refusal(f"{live_log}: conflicts with the missing legacy style log")
 
     index = next(index for index, line in enumerate(lines) if line.startswith("- **Showrunner checkout:**"))
     newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
     lines.insert(index, f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}{newline}")
+    repository_line = f"- **Repository:** {style.repository}{newline}"
+    for repository_index, line in enumerate(lines):
+        if line.startswith("- **Repository:**"):
+            lines[repository_index] = repository_line
+            break
+    else:
+        lines.insert(index, repository_line)
     files.append((standing.doc, "".join(lines)))
     return replace(style, doc=standing.doc, enrollment=LegacyStyleEnrollment(relative_log, tuple(files)))
 

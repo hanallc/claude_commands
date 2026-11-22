@@ -32,6 +32,7 @@ from scripts.production import change_review, production_doc, staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.production.production_names import GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
+from scripts.lib.atomic_file import create_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, recorded_showrunner
 
@@ -991,6 +992,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertFalse(self.checkout.exists())
 
     def legacy_bootstrap(self) -> tuple[Path, Path, Path]:
+        self.env["TEST_REQUIRE_ADMISSION"] = "1"
         _ = self.git("worktree", "remove", str(self.checkout))
         checkout = self.checkout.parent.with_name("sample-style") / "production"
         _ = self.git("worktree", "add", "-qb", "style/main", str(checkout), self.initial_tip)
@@ -1018,7 +1020,6 @@ class AddStyleTests(unittest.TestCase):
         live_log = self.repo / log.relative_to(checkout)
         before = {path: path.read_bytes() for path in (legacy, log, plan)}
         registered = self.git("worktree", "list", "--porcelain")
-        self.env["TEST_REQUIRE_ADMISSION"] = "1"
         self.env["TEST_FAIL_LAUNCH"] = "1"
 
         failed = self.run_bootstrap(success=False)
@@ -1078,6 +1079,135 @@ class AddStyleTests(unittest.TestCase):
                     self.assertEqual(self.calls(), [])
                 finally:
                     conflict.unlink()
+
+    def check_legacy_repository_conversion(self, replacement: str) -> None:
+        legacy, _, _ = self.legacy_bootstrap()
+        text = legacy.read_text().replace(f"- **Repository:** {self.repo}\n", replacement)
+        _ = legacy.write_text(text)
+
+        _ = self.run_bootstrap()
+
+        enrolled = read_production("sample-style")
+        self.assertEqual(enrolled.doc, self.doc)
+        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Repository"), str(self.repo))
+        self.assertEqual(legacy.read_text(), text)
+
+    def test_legacy_bootstrap_adds_an_absolute_repository_when_absent(self) -> None:
+        self.check_legacy_repository_conversion("")
+
+    def test_legacy_bootstrap_expands_the_repository_for_admission(self) -> None:
+        relative = os.path.relpath(self.repo, self.env["HOME"])
+        self.check_legacy_repository_conversion(f"- **Repository:** ~/{relative}\n")
+
+    def test_legacy_bootstrap_refuses_a_destination_log_when_the_legacy_log_is_missing(self) -> None:
+        legacy, log, plan = self.legacy_bootstrap()
+        log.unlink()
+        live_log = self.repo / log.relative_to(legacy.parent.parent)
+        _ = live_log.write_text("Keep this unrelated log.\n")
+        tracked = (legacy, live_log, plan, self.repo / ".git/info/exclude", self.repo / ".git/config")
+        before = {path: path.read_bytes() for path in tracked}
+        refs = self.git("show-ref")
+
+        refused = self.run_bootstrap(success=False)
+
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn(f"{live_log}: conflicts with the missing legacy style log", refused.stderr)
+        self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+        self.assertEqual(self.git("show-ref"), refs)
+        self.assertFalse(log.exists())
+        self.assertFalse(self.doc.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_legacy_bootstrap_without_a_log_retries_after_interrupted_publication(self) -> None:
+        legacy, log, plan = self.legacy_bootstrap()
+        log.unlink()
+        live_log = self.repo / log.relative_to(legacy.parent.parent)
+        tracked = (legacy, plan)
+        before = {path: path.read_bytes() for path in tracked}
+
+        def interrupted_create(path: Path, text: str) -> bool:
+            if path == self.doc:
+                raise OSError("stopped before document publication")
+            return create_text_atomic(path, text)
+
+        with mock.patch.object(add_style, "create_text_atomic", interrupted_create):
+            stopped = self.run_bootstrap(success=False)
+
+        self.assertEqual(stopped.returncode, 2, stopped.stderr)
+        self.assertIn("stopped before document publication", stopped.stderr)
+        self.assertFalse(self.doc.exists())
+        self.assertFalse(live_log.exists())
+        self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+        self.assertEqual(self.calls(), [])
+
+        _ = self.run_bootstrap()
+
+        enrolled = read_production("sample-style")
+        self.assertEqual((enrolled.doc, enrolled.log), (self.doc, live_log))
+        self.assertFalse(live_log.exists())
+        self.assertFalse(log.exists())
+        self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+
+    def publish_legacy_bootstrap_before_launch_failure(self) -> tuple[Path, Path, Path]:
+        legacy, log, plan = self.legacy_bootstrap()
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+        stopped = self.run_bootstrap(success=False)
+        del self.env["TEST_FAIL_LAUNCH"]
+        self.assertEqual(stopped.returncode, 2, stopped.stderr)
+        self.assertIn("launch.py exited 2", stopped.stderr)
+        self.assertEqual(len(Path(self.env["TEST_LAUNCH_DESTINATIONS"]).read_text().splitlines()), 1)
+        return legacy, self.repo / log.relative_to(legacy.parent.parent), plan
+
+    def check_enrolled_retry_after_legacy_document_change(self, field: str) -> None:
+        legacy, live_log, plan = self.publish_legacy_bootstrap_before_launch_failure()
+        if field:
+            _ = legacy.write_text("".join(line for line in legacy.read_text().splitlines(keepends=True)
+                                          if not line.startswith(f"- **{field}:**")))
+        else:
+            legacy.unlink()
+        tracked = (self.doc, live_log, plan)
+        before = {path: path.read_bytes() for path in tracked}
+
+        _ = self.run_bootstrap()
+
+        enrolled = read_production("sample-style")
+        self.assertEqual((enrolled.doc, enrolled.checkout, enrolled.merge_branch),
+                         (self.doc, legacy.parent.parent, "style/main"))
+        self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+        self.assertEqual(legacy.exists(), bool(field))
+        self.assertEqual(len(Path(self.env["TEST_LAUNCH_DESTINATIONS"]).read_text().splitlines()), 2)
+
+    def test_enrolled_bootstrap_retries_after_the_legacy_log_field_is_removed(self) -> None:
+        self.check_enrolled_retry_after_legacy_document_change("Log")
+
+    def test_enrolled_bootstrap_retries_after_the_legacy_merge_branch_is_removed(self) -> None:
+        self.check_enrolled_retry_after_legacy_document_change("Merge branch")
+
+    def test_enrolled_bootstrap_retries_after_the_legacy_document_is_deleted(self) -> None:
+        self.check_enrolled_retry_after_legacy_document_change("")
+
+    def check_enrolled_repository_refusal(self, replacement: str, diagnostic: str) -> None:
+        legacy, live_log, plan = self.publish_legacy_bootstrap_before_launch_failure()
+        _ = legacy.write_text(legacy.read_text().replace("- **Merge branch:** style/main\n", ""))
+        _ = self.doc.write_text(self.doc.read_text().replace(f"- **Repository:** {self.repo}\n", replacement))
+        tracked = (legacy, self.doc, live_log, plan, self.repo / ".git/info/exclude", self.repo / ".git/config")
+        before = {path: path.read_bytes() for path in tracked}
+        calls = self.calls()
+
+        refused = self.run_bootstrap(success=False)
+
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn(f"{self.doc}: {diagnostic}", refused.stderr)
+        self.assertEqual({path: path.read_bytes() for path in tracked}, before)
+        self.assertEqual(self.calls(), calls)
+
+    def test_enrolled_bootstrap_refuses_a_missing_repository_before_writes(self) -> None:
+        self.check_enrolled_repository_refusal("", "production doc lacks Repository")
+
+    def test_enrolled_bootstrap_refuses_an_abbreviated_repository_before_writes(self) -> None:
+        relative = os.path.relpath(self.repo, self.env["HOME"])
+        self.check_enrolled_repository_refusal(f"- **Repository:** ~/{relative}\n",
+                                               "Repository must match the absolute main checkout path")
 
     def test_registered_legacy_bootstrap_keeps_its_document_without_a_timer(self) -> None:
         legacy, log, _ = self.legacy_bootstrap()
