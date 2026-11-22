@@ -1,7 +1,6 @@
 """Read a process start without losing the reason for an absent identity."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
@@ -72,11 +71,41 @@ def process_start_format() -> str:
     return "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1"
 
 
-@dataclass(frozen=True)
 class ProcessReadDeadline:
-    """Check this monotonic deadline before a read and use it to limit the ps timeout."""
+    """A monotonic deadline for reading a process start."""
 
-    at: float
+    __slots__: tuple[str, ...] = ("_at",)
+
+    def __init__(self, at: float) -> None:
+        self._at: float = at
+
+    @property
+    def at(self) -> float:
+        return self._at
+
+    @override
+    def __setattr__(self, name: str, value: object) -> None:
+        if name != "_at" or hasattr(self, "_at"):
+            raise AttributeError(f"cannot assign to {name!r}")
+        object.__setattr__(self, name, value)
+
+    @override
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"cannot delete {name!r}")
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        return (self.at,) == (other.at,)
+
+    @override
+    def __hash__(self) -> int:
+        return hash((self.at,))
+
+    @override
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(at={self.at!r})"
 
 
 class StandardProcessReadBudget:
