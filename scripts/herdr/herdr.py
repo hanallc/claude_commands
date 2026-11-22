@@ -864,46 +864,11 @@ class PaneShellAncestry(Enum):
 
 
 @dataclass(frozen=True)
-class _PlacementScanUnread:
-    """Inventory has no process scan yet."""
-
-
-@dataclass(frozen=True)
-class _PlacementScanFailed:
-    reason: str
-
-
-@dataclass(frozen=True)
-class _ShellHandoff:
-    shell_pid: int
-
-
-@dataclass(frozen=True)
-class _CgroupHandoff:
-    group: tuple[str, Path]
-    witness_pid: int
-
-
-type _HandoffAnchor = _ShellHandoff | _CgroupHandoff
-
-
-@dataclass(frozen=True)
-class _PlacementScanCompleted:
-    servers: dict[int, str]
-    sessions: dict[int, str]
-    parents: Mapping[int, int]
-    starts: Mapping[int, str]
-    handoffs: dict[int, _HandoffAnchor]
-
-
-@dataclass(frozen=True)
 class ProcessAncestry:
     """Use parent PIDs and terminals from the scan that supplied the placement."""
 
     parents: Mapping[int, int] = field(default_factory=dict[int, int])
     terminals: Mapping[int, int | str] = field(default_factory=dict[int, int | str])
-    placement: _PlacementScanCompleted | _PlacementScanUnread = field(
-        default_factory=_PlacementScanUnread, compare=False, repr=False)
 
     def is_detached_from_shell(self, pid: int, shell_pid: int) -> bool:
         terminal = self.terminals.get(pid)
@@ -5812,12 +5777,11 @@ class _BoundUnixSocket:
     path: Path
 
 
-def _darwin_bound_sockets(*, timeout: float = 10.0, pids: Sequence[int] = ()) -> list[_BoundUnixSocket]:
+def _darwin_bound_sockets(*, timeout: float = 10.0) -> list[_BoundUnixSocket]:
     # Darwin lsof reports a bound Unix sun_path; unbound client endpoints have
     # arrow names. TCP state fields are not emitted for these Unix sockets.
-    selector = ["-p", ",".join(map(str, pids))] if pids else []
     result = run_program([os.environ.get("HERDR_LSOF", "lsof"), "-n", "-P", "-a", "-U",
-                          "-u", str(os.getuid()), *selector, "-F", "pfn"], timeout=timeout)
+                          "-u", str(os.getuid()), "-F", "pfn"], timeout=timeout)
     # lsof exits 1 with no output when no files match.
     if result.returncode == 1 and not result.stdout and not result.stderr:
         return []
@@ -6092,14 +6056,12 @@ def herdr_places() -> HerdrProcessPlacements:
 
 
 def _placement_in_session(pid: int, environment: Mapping[str, str], session: str,
-                          parent: Callable[[int], int], *,
-                          panes: Callable[[str], _LivePanePlaces] | None = None) -> ProcessPlacement:
+                          parent: Callable[[int], int]) -> ProcessPlacement:
     if environment.get("TMUX_PANE"):
         return NotInHerdr()
     pane = environment.get("HERDR_PANE_ID", "")
     if pane:
-        read_panes = _live_pane_reader.get() if panes is None else panes
-        return read_panes(session).placement(pid, pane, parent)
+        return _live_pane_reader.get()(session).placement(pid, pane, parent)
     if any(environment.get(key) for key in ("HERDR_ENV", "HERDR_SESSION", "HERDR_SOCKET_PATH")):
         return UnprovedHerdrPlacement(f"process {pid} has herdr markers but no pane id")
     return NotInHerdr()
@@ -6178,12 +6140,12 @@ def pane_scopes(groups: list[tuple[str, Path]], slice_name: str) -> list[tuple[s
             for scope in (path, *path.parents) if scope.parent.name == slice_name]
 
 
-def _add_scope_owners(owners: dict[tuple[str, Path], dict[str, int]], pids: Sequence[int],
+def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int],
                       sessions: dict[int, str], slice_name: str) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
         for scope in pane_scopes(_systemd_cgroups(proc_root() / str(pid)), slice_name):
-            _ = owners.setdefault(scope, {}).setdefault(sessions[pid], pid)
+            owners.setdefault(scope, set()).add(sessions[pid])
 
 
 @dataclass
@@ -6215,13 +6177,12 @@ class _LinuxProcessScan:
 
 
 def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
-                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None,
-                      handoffs: dict[int, _HandoffAnchor] | None = None) -> dict[int, str]:
+                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
     read_slice = cache(agents_slice)
-    unit_groups: dict[tuple[str, Path], int] = {}
+    unit_groups: dict[tuple[str, Path], str] = {}
     shared_groups: dict[tuple[str, Path], set[str]] = {}
     for pid, session in servers.items():
         try:
@@ -6231,7 +6192,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
         for hierarchy, path in _systemd_cgroups(proc_root() / str(pid)):
             if unit in path.parts:
                 root = Path(*path.parts[:path.parts.index(unit) + 1])
-                unit_groups[hierarchy, root] = pid
+                unit_groups[hierarchy, root] = session
             else:
                 shared_groups.setdefault((hierarchy, path), set()).add(session)
     children: dict[int, list[Path]] = {}
@@ -6275,12 +6236,9 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             for hierarchy, path in groups:
                 shared_sessions.update(shared_groups.get((hierarchy, path), set()))
                 for ancestor in (path, *path.parents):
-                    group = (hierarchy, ancestor)
-                    if group in unit_groups:
-                        server = unit_groups[group]
-                        sessions[pid] = servers[server]
-                        if handoffs is not None:
-                            handoffs[pid] = _CgroupHandoff(group, server)
+                    session = unit_groups.get((hierarchy, ancestor), "")
+                    if session:
+                        sessions[pid] = session
                         break
                 if pid in sessions:
                     break
@@ -6289,11 +6247,11 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
-        owners: dict[tuple[str, Path], dict[str, int]] = {}
+        owners: dict[tuple[str, Path], set[str]] = {}
         if loose:
             _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions, read_slice())
             if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
-                shared_sessions.update(servers[pid] for pid in unit_groups.values())
+                shared_sessions.update(unit_groups.values())
         walked = set(sessions)
         # Handoff retains child_pid in each imported PTY runtime. Unlike a
         # shared cgroup or HERDR_SESSION, this identifies the actual pane shell.
@@ -6306,20 +6264,14 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
                     if pid in sessions:
                         continue
                     sessions[pid] = owner
-                    if handoffs is not None:
-                        handoffs[pid] = _ShellHandoff(shell)
                     descendants.extend((child, owner) for child in children.get(pid, []))
         if loose:
             _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions, read_slice())
             for pid, scopes in loose.items():
-                found = {session: _CgroupHandoff(scope, witness) for scope in scopes
-                         for session, witness in owners.get(scope, {}).items()}
+                found = {session for scope in scopes for session in owners.get(scope, set())}
                 # A scope with two owners holds a server started inside a pane; it names neither.
                 if pid not in sessions and len(found) == 1:
-                    session, anchor = found.popitem()
-                    sessions[pid] = session
-                    if handoffs is not None:
-                        handoffs[pid] = anchor
+                    sessions[pid] = found.pop()
     return {pid: session for pid, session in sessions.items() if pid not in servers}
 
 
@@ -6478,8 +6430,8 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
     return working_directories
 
 
-def _darwin_socket_servers(listeners: list[_BoundUnixSocket], *,
-                          failures: list[str] | None = None) -> dict[int, str]:
+def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
+                             failures: list[str] | None = None) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
     for listener in listeners:
@@ -6493,32 +6445,21 @@ def _darwin_socket_servers(listeners: list[_BoundUnixSocket], *,
     if failures is not None:
         failures.extend(f"cannot establish a socket owner for herdr session {session}"
                         for session, pids in holders.items() if len(pids) > 1)
-    return {pid: session for session, pids in holders.items() if len(pids) == 1 for pid in pids}
-
-
-def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
-                             failures: list[str] | None = None, scan_servers: dict[int, str] | None = None,
-                             handoffs: dict[int, _HandoffAnchor] | None = None) -> dict[int, str]:
-    servers = {pid: session for pid, session in _darwin_socket_servers(listeners, failures=failures).items()
-               if pid in by_pid}
-    if scan_servers is not None:
-        scan_servers.update(servers)
+    servers = {pid: session for session, pids in holders.items() if len(pids) == 1
+               for pid in pids if pid in by_pid}
     children: dict[int, list[int]] = {}
     for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
     sessions: dict[int, str] = {}
     for server, session in servers.items():
         # A live handoff preserves pane shell PIDs even after reparenting.
-        pending = [(pid, server) for pid in children.get(server, [])]
-        pending.extend((shell, shell) for shell in _pane_shell_pids(session))
+        pending = [*children.get(server, []), *_pane_shell_pids(session)]
         while pending:
-            pid, anchor = pending.pop()
+            pid = pending.pop()
             if pid in sessions or pid not in by_pid or pid in servers:
                 continue
             sessions[pid] = session
-            if handoffs is not None and anchor != server:
-                handoffs[pid] = _ShellHandoff(anchor)
-            pending.extend((child, anchor) for child in children.get(pid, []))
+            pending.extend(children.get(pid, []))
     return sessions
 
 
@@ -6528,14 +6469,10 @@ def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[Herdr
         listeners = _darwin_bound_sockets()
     except (HerdrFailure, subprocess.TimeoutExpired):
         return []
-    servers: dict[int, str] = {}
-    handoffs: dict[int, _HandoffAnchor] = {}
-    sessions = _darwin_process_sessions(by_pid, listeners, scan_servers=servers, handoffs=handoffs)
-    parents = {pid: process.parent for pid, process in by_pid.items()}
-    ancestry = ProcessAncestry(parents,
+    sessions = _darwin_process_sessions(by_pid, listeners)
+    ancestry = ProcessAncestry({pid: process.parent for pid, process in by_pid.items()},
                               {pid: process.terminal for pid, process in by_pid.items()
-                               if process.terminal is not None},
-                              _PlacementScanCompleted(servers, sessions, parents, {}, handoffs))
+                               if process.terminal is not None})
     processes: list[HerdrProcess] = []
     working_directories = _darwin_process_cwds(sorted(sessions))
     for pid, session in sessions.items():
@@ -6619,11 +6556,8 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
     except OSError:
         return processes
     scan = _LinuxProcessScan()
-    servers = _live_server_processes(candidates)
-    handoffs: dict[int, _HandoffAnchor] = {}
-    sessions = _process_sessions(candidates, servers, scan=scan, handoffs=handoffs)
-    ancestry = ProcessAncestry(scan.parents, scan.terminals,
-                              _PlacementScanCompleted(servers, sessions, scan.parents, scan.starts, handoffs))
+    sessions = _process_sessions(candidates, _live_server_processes(candidates), scan=scan)
+    ancestry = ProcessAncestry(scan.parents, scan.terminals)
     for pid, session in sessions.items():
         process = proc_root() / str(pid)
         try:
@@ -6746,206 +6680,6 @@ def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRe
         return processes
     labels = RecordedLabels(membership)
     return [replace(row, marks=labels.resolve(row.pid, row.marks)) for row in processes]
-
-
-@dataclass(frozen=True)
-class _ProvedAncestry:
-    session: str
-    server_pid: int
-
-
-@dataclass(frozen=True)
-class _ProvedHandoffMembership:
-    session: str
-    server_pid: int
-    anchor: _HandoffAnchor
-
-
-@dataclass(frozen=True)
-class _UnprovedMembership:
-    """No current ancestry or handoff evidence establishes a server."""
-
-
-class _PlacementIdentity(NamedTuple):
-    parent: int
-    started: str
-
-
-def _placement_identity(pid: int) -> _PlacementIdentity:
-    if _platform() == "darwin":
-        info = _darwin_process_bsd_info(pid)
-        return _PlacementIdentity(info.pbi_ppid, str(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
-    fields = _linux_process_stat(pid)
-    if not fields[19].isdecimal():
-        raise ValueError(f"process {pid}: start time is unreadable")
-    return _PlacementIdentity(int(fields[1]), fields[19])
-
-
-def _placement_lineage(pid: int) -> dict[int, _PlacementIdentity]:
-    lineage: dict[int, _PlacementIdentity] = {}
-    while pid > 1 and pid not in lineage:
-        try:
-            lineage[pid] = identity = _placement_identity(pid)
-        except (HerdrFailure, OSError, AttributeError, ValueError, LookupError):
-            break
-        pid = identity.parent
-    return lineage
-
-
-def _placement_listeners(pids: Sequence[int]) -> dict[int, str]:
-    if not pids:
-        return {}
-    if _platform() == "darwin":
-        return _darwin_socket_servers(_darwin_bound_sockets(pids=pids))
-    return _live_server_processes([proc_root() / str(pid) for pid in pids])
-
-
-def _same_placement_identity(scan: _PlacementScanCompleted, pid: int, identity: _PlacementIdentity) -> bool:
-    return scan.starts.get(pid) == identity.started and scan.parents.get(pid) == identity.parent
-
-
-def _same_placement_path(scan: _PlacementScanCompleted, lineage: Mapping[int, _PlacementIdentity], anchor: int) -> bool:
-    for pid, identity in lineage.items():
-        if not _same_placement_identity(scan, pid, identity):
-            return False
-        if pid == anchor:
-            return True
-    return False
-
-
-def _in_handoff_group(pid: int, group: tuple[str, Path]) -> bool:
-    hierarchy, root = group
-    return any(key == hierarchy and path.is_relative_to(root)
-               for key, path in _systemd_cgroups(proc_root() / str(pid)))
-
-
-def _pane_keeps_shell(place: HerdrPlace, pid: int) -> bool:
-    reply = Herdr(place.session).result("pane", "process-info", "--pane", place.pane)
-    info = reply.get("process_info")
-    if isinstance(info, _PaneProcessInfo):
-        info = info.read_again()
-    return json_object(info, "handoff pane process info").get("shell_pid") == pid
-
-
-class InventoryPlacementReader:
-    """Read the process and pane evidence for one inventory host loop."""
-
-    def __init__(self) -> None:
-        self._scan: _PlacementScanUnread | _PlacementScanCompleted | _PlacementScanFailed = _PlacementScanUnread()
-        self._panes: dict[str, _LivePanePlaces] = {}
-        self._clients: dict[str, ClientsAttached | NoClientAttached | ClientsUnreadable] = {}
-
-    def _read_scan(self) -> _PlacementScanCompleted | _PlacementScanFailed:
-        if isinstance(self._scan, _PlacementScanUnread):
-            try:
-                rows = herdr_processes(inherited_marks_only=True)
-                saved = rows[0].ancestry.placement if rows else _PlacementScanUnread()
-                scan = saved if isinstance(saved, _PlacementScanCompleted) else _PlacementScanCompleted({}, {}, {}, {}, {})
-                if _platform() == "darwin":
-                    starts: dict[int, str] = {}
-                    for pid in scan.sessions.keys() | scan.servers.keys():
-                        try:
-                            identity = _placement_identity(pid)
-                        except (HerdrFailure, OSError, AttributeError, ValueError):
-                            continue
-                        if identity.parent == scan.parents.get(pid):
-                            starts[pid] = identity.started
-                    scan = replace(scan, starts=starts)
-                self._scan = scan
-            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                self._scan = _PlacementScanFailed(str(error))
-        return self._scan
-
-    def _read_panes(self, session: str) -> _LivePanePlaces:
-        if session not in self._panes:
-            self._panes[session] = _LivePanePlaces(session)
-        return self._panes[session]
-
-    def _saved_membership(self, scan: _PlacementScanCompleted, pid: int, lineage: dict[int, _PlacementIdentity],
-                          session: str) -> _ProvedAncestry | _ProvedHandoffMembership | _UnprovedMembership:
-        servers = [server for server, name in scan.servers.items() if name == session]
-        if len(servers) != 1:
-            return _UnprovedMembership()
-        server, = servers
-        if server in lineage:
-            if _same_placement_path(scan, lineage, server):
-                return _ProvedAncestry(session, server)
-            return _UnprovedMembership()
-        anchor = scan.handoffs.get(pid)
-        if isinstance(anchor, _ShellHandoff):
-            pane = self._read_panes(session).shells().get(anchor.shell_pid)
-            if (pane is not None
-                    and _same_placement_path(scan, lineage, anchor.shell_pid)
-                    and _same_placement_identity(scan, server, _placement_identity(server))
-                    and _pane_keeps_shell(pane, anchor.shell_pid)):
-                return _ProvedHandoffMembership(session, server, anchor)
-        elif isinstance(anchor, _CgroupHandoff):
-            witness = anchor.witness_pid
-            if (pid in lineage and _same_placement_identity(scan, pid, lineage[pid])
-                    and _in_handoff_group(pid, anchor.group) and _in_handoff_group(witness, anchor.group)):
-                if witness == server:
-                    confirmed = _same_placement_identity(scan, server, _placement_identity(server))
-                else:
-                    proof = self._saved_membership(scan, witness, _placement_lineage(witness), session)
-                    confirmed = not isinstance(proof, _UnprovedMembership)
-                if confirmed:
-                    return _ProvedHandoffMembership(session, server, anchor)
-        return _UnprovedMembership()
-
-    def place(self, pid: int) -> ProcessPlacement:
-        if _process_action.get():
-            return herdr_place_of(pid)
-        try:
-            environment = process_environment(pid)
-            if not environment.get("HERDR_PANE_ID") or environment.get("TMUX_PANE"):
-                return _placement_in_session(pid, environment, "", linux_process_parent)
-            scan = self._read_scan()
-            if isinstance(scan, _PlacementScanFailed):
-                return UnprovedHerdrPlacement(f"cannot read the placement of process {pid}: {scan.reason}")
-            lineage = _placement_lineage(pid)
-            session = scan.sessions.get(pid)
-            membership: _ProvedAncestry | _ProvedHandoffMembership | _UnprovedMembership = _UnprovedMembership()
-            if session is None:
-                ancestors = tuple(lineage)[1:]
-                listeners = _placement_listeners(ancestors)
-                for ancestor in ancestors:
-                    if ancestor in listeners:
-                        membership = _ProvedAncestry(listeners[ancestor], ancestor)
-                        break
-            else:
-                membership = self._saved_membership(scan, pid, lineage, session)
-                if (not isinstance(membership, _UnprovedMembership)
-                        and _placement_listeners((membership.server_pid,)).get(membership.server_pid) != session):
-                    membership = _UnprovedMembership()
-            if not isinstance(membership, _UnprovedMembership):
-                return _placement_in_session(pid, environment, membership.session,
-                                             lambda item: lineage[item].parent, panes=self._read_panes)
-        except (HerdrFailure, OSError, AttributeError, ValueError, LookupError, subprocess.SubprocessError):
-            return UnprovedHerdrPlacement(f"cannot read the placement of process {pid}")
-        return UnprovedHerdrPlacement(f"cannot establish the herdr session of process {pid}")
-
-    def clients(self, session: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
-        if _process_action.get():
-            return attached_clients(session)
-        if session not in self._clients:
-            self._clients[session] = attached_clients(session)
-        return self._clients[session]
-
-
-@contextmanager
-def inventory_placement_reader() -> Generator[InventoryPlacementReader]:
-    """Share inventory reads through the ordinary report scope."""
-    reader = InventoryPlacementReader()
-    if _process_action.get():
-        yield reader
-        return
-    owns_replies = _pane_observations.get() is None
-    with observation_snapshot():
-        try:
-            yield reader
-        finally:
-            if owns_replies and (observed := _pane_observations.get()) is not None:
-                observed.clear()
 
 
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:

@@ -2627,25 +2627,6 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertTrue(self.prompt_state().exists())
         self.assertFalse(any(item["key"].endswith(":bump") for item in self.sent()))
 
-    def test_tick_reuses_the_pane_list_from_nested_discovery(self) -> None:
-        self.panes["unit-one"].update(session="agents", label="build-unit")
-        read_panes = herdr.Herdr.panes
-        pane_lists = 0
-
-        def panes(client: herdr.Herdr) -> list[herdr.PaneIdentity]:
-            nonlocal pane_lists
-            if client.session == "agents":
-                pane_lists += 1
-                if pane_lists > 1:
-                    raise HerdrFailure("second pane list denied")
-            return read_panes(client)
-
-        with mock.patch.object(herdr.Herdr, "panes", panes):
-            result = self.tick(START)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("pane labels unavailable", result.stderr)
-        self.assertEqual(pane_lists, 1)
-
     def test_a_multiword_own_label_does_not_hold_the_unit(self) -> None:
         self.panes["unit-one"].update(session="agents", label="build-unit director",
                                       pane="holding: build-unit director must dispatch its order\n")
