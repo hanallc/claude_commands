@@ -166,6 +166,16 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual(self.claim("2", other), (0, ""))
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
 
+    def test_claim_keeps_the_recorded_model_worktree_when_the_requested_folder_is_gone(self) -> None:
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        removed = self.session.parent / "removed"
+        removed.mkdir()
+        removed.rmdir()
+        directory = phase_reservation.phase_directory(self.session, "2")
+
+        self.assertEqual(self.claim("2", removed), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+
     def test_claim_refuses_a_recorded_clone_without_a_valid_model_worktree(self) -> None:
         clone = self.session.parent / "phase-2-clone"
         self.record_clone("2", clone)
@@ -237,6 +247,21 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
         self.assertIn("phase_reservation.py clear " + shlex.join(["--session-dir", str(self.session), "--phase", "2"]),
                       errors)
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
+
+    def test_claim_tells_a_phase_with_legacy_state_to_check_its_state(self) -> None:
+        clone = self.session.parent / "phase-2-clone"
+        self.record_clone("2", clone)
+        directory = phase_reservation.phase_directory(self.session, "2")
+        _ = (self.session / phase_reservation.STATE_FILE).write_text(json.dumps({
+            "kind": phase_reservation.NOT_ENROLLED, "phase": "2"}))
+
+        code, errors = self.claim("2", self.second)
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"state {phase_reservation.NOT_ENROLLED!r}", errors)
+        self.assertIn("Check the phase reservation state, then claim again.", errors)
+        self.assertNotIn("phase_reservation.py clear", errors)
         self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(clone) + "\n")
 
     def test_claim_uses_the_unit_word_from_completed_records(self) -> None:

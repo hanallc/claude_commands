@@ -477,7 +477,8 @@ def _has_recorded_checkout(directory: Path) -> bool:
 def _require_checkout_move(directory: Path) -> None:
     """Check the reservation state while the caller holds the phase lock."""
     state = read_state(directory)
-    if not state and not (directory / STATE_FILE).exists():
+    state_in_phase = bool(state) or (directory / STATE_FILE).exists()
+    if not state_in_phase:
         state = read_state(directory.parent.parent)
         if phase_directory_name(_state_phase(state)) != directory.name:
             return
@@ -486,7 +487,7 @@ def _require_checkout_move(directory: Path) -> None:
         return
     if kind in HOLDS_RESERVATION:
         action = "Release the phase reservation, then claim again."
-    elif kind in BOARD_STATES.values():
+    elif state_in_phase and kind in BOARD_STATES.values():
         command = shlex.join(["python3", str(Path(__file__).resolve()), "clear",
                               "--session-dir", str(directory.parent.parent), "--phase", directory.name])
         action = f"Run {command}, then claim again."
@@ -500,17 +501,18 @@ def _record_claim_checkout(directory: Path, requested: Path | None, *, repo_argu
     root = requested
     if _has_recorded_checkout(directory):
         recorded = phase_worktree(directory).root.resolve()
-        if requested is None and repo_argument is not None and Path(repo_argument).resolve() != recorded:
-            raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout")
         recorded_exists = recorded.is_dir()
-        if requested is not None and requested != recorded:
+        if requested != recorded and (requested is not None or repo_argument is not None):
             if isinstance(_model_worktree_path(recorded), ValueError):
-                _require_model_worktree(requested, _phase_run_home(directory).unit)
-                _require_checkout_move(directory)
-                _record_baselines(directory, requested)
-                _record_worktree(directory, requested)
-                return requested
-            if not recorded_exists:
+                if requested is not None:
+                    _require_model_worktree(requested, _phase_run_home(directory).unit)
+                    _require_checkout_move(directory)
+                    _record_baselines(directory, requested)
+                    _record_worktree(directory, requested)
+                    return requested
+                if repo_argument is not None and Path(repo_argument).resolve() != recorded:
+                    raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout")
+            elif requested is not None and not recorded_exists:
                 _require_checkout_move(directory)
         if recorded_exists:
             root = repository_root(recorded)
