@@ -787,6 +787,7 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
         installed = Path.home() / ".claude"
         config = installed / "config"
         _ = shutil.copytree(self.candidate / "config", config)
+        _ = shutil.copyfile(REPOSITORY / "config/build_steps.conf", config / "build_steps.conf")
         _ = (config / "aws_page.conf").write_text(f"output_folder={folder}\n")
         settings = config / "aws_target.conf"
         defaults = (REPOSITORY / "config/aws_target.conf").read_text()
@@ -808,19 +809,29 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
                 + "    assert configuration.whole('spend_pace_days') == 13\n"
                 + "    assert conf.read('aws_target').whole('spend_pace_days') == 7"))
         rendered: list[bytes] = []
+        statuses: list[int] = []
 
         def visit(browser: Browser, _path: str, _viewport: Viewport, _limit: float,
                   key: str, _direct: str) -> PageResult:
             if key == "second":
-                rendered.append(self.fetch(browser, f"/aws/{aws_page.PAGE_NAME}"))
+                destination = f"/aws/{aws_page.PAGE_NAME}"
+                status, _, content = self.request(browser, destination)
+                statuses.append(status)
+                if status != 200:
+                    kind = FaultKind.HTTP_SERVER if status >= 500 else FaultKind.HTTP_DOCUMENT
+                    return PageResult(0, (PageFault(kind, f"HTTP {status} {destination}", destination),))
+                rendered.append(content)
             return PageResult(0, ())
 
-        with (patch.dict(os.environ, {"REVIEW_LINKS_HOST": "127.0.0.1"}), self.http_visits(visit),
+        with (patch.dict(os.environ, {"REVIEW_LINKS_HOST": "127.0.0.1",
+                                      "BUILD_TARGETS_STATE_DIR": str(self.candidate.parent / "aws-state")}),
+              self.http_visits(visit),
               patch.object(console_settings, "installed_checkout", return_value=repository),
               redirect_stdout(StringIO()) as output):
             _ = os.environ.pop("CONF_DIR")
             self.assertEqual(conf.read(settings).whole("spend_pace_days"), 13)
             self.assertEqual(console_check.run_check(self.candidate, base=base), "", output.getvalue())
+        self.assertEqual(statuses, [200, 200], output.getvalue())
         self.assertEqual(len(rendered), 2)
         for page in rendered:
             self.assertIn(b"AWS spend unavailable", page)

@@ -82,7 +82,7 @@ from scripts.lib.build_steps import gate_job_for_command, read_step_names
 from scripts.lint import sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, console_check, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
+    affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
@@ -1924,10 +1924,12 @@ def live_state_tree_refusal(tree: Path, target: str) -> str:
 
 def live_state_refusal(repo: Path, target: str) -> str:
     """Run the target tree's live state checks before its code is installed."""
+    from scripts.production.console_check import export_tree
+
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
         tree = Path(temporary)
         try:
-            console_check.export_tree(repo, target, tree)
+            export_tree(repo, target, tree)
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
         return live_state_tree_refusal(tree, target)
@@ -1939,6 +1941,8 @@ class ConsolePromotionRefused(GateRefused):
 
 def check_promotion(repo: Path, target: str) -> None:
     """Check the exported target before main moves."""
+    from scripts.production import console_check
+
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
         tree = Path(temporary)
         try:
