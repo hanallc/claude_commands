@@ -1334,7 +1334,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         with patch.dict(os.environ, self.environment, clear=True):
             journal = replace(worktrees._open_move(move), copy_tag=uuid4().hex)  # pyright: ignore[reportPrivateUsage]
             _ = shutil.copytree(old, journal.staging, symlinks=True)
-            worktrees.write_move(replace(journal, destination=worktrees.FolderIdentity.read(journal.staging)))
+            worktrees.write_move(replace(journal, destination=worktrees.FolderIdentity.read(journal.staging),
+                                         git_entry=self.root / "missing-git-entry"))
             record = worktrees.move_file(old)
         before = record.read_bytes()
         command = self.migration_command("--list", list_file)
@@ -1353,6 +1354,40 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertTrue(journal.staging.is_dir())
         self.assertEqual(old.readlink(), new)
         self.assertFalse(stale.exists())
+
+    def test_migration_resume_reports_when_git_stops_tracking_target(self) -> None:
+        self.layout_fixture()
+        old = self.trees / "legacy"
+        self.make(old, "legacy")
+        new = self.trees / "origin/fixture-unit/demo"
+        target = old / "target"
+        target.mkdir()
+        _ = (target / "keep").write_text("tracked\n")
+        _ = self.git(old, "add", "-f", "target/keep")
+        list_file = self.root / "list"
+        _ = list_file.write_text(f"{old} fixture-unit demo\n")
+        relocate = worktrees._relocate_worktree_records  # pyright: ignore[reportPrivateUsage]
+
+        def remove_tracked_target(journal: worktrees.MoveJournal) -> worktrees.WorktreeRecord:
+            _ = self.git(new, "rm", "-f", "target/keep")
+            return relocate(journal)
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(sys, "argv", ["worktrees.py", "migrate", "--list", str(list_file)]),
+              redirect_stdout(StringIO())):
+            with patch.object(worktrees, "_move_output_deferred", return_value=True):
+                self.assertEqual(worktrees.move_worktree(old, "origin", "fixture-unit", "demo"), new)
+            journal_file = worktrees.move_file(old)
+            with (patch.object(worktrees, "_relocate_worktree_records", remove_tracked_target),
+                  redirect_stderr(errors := StringIO())):
+                self.assertEqual(worktrees.main(), 1)
+            self.assertEqual(errors.getvalue().splitlines(),
+                             ["Git stopped tracking target during the move. Retry the move."])
+            self.assertEqual(worktrees.read_move(journal_file).stage, worktrees.MoveStage.LINKED)
+            output = self.root / "build/origin/fixture-unit/demo"
+            self.assertFalse(output.exists())
+            self.assertEqual(worktrees.main(), 0)
+            self.assertEqual((new / "target").readlink(), output)
 
     def test_migration_keeps_unverified_moves_and_previously_published_copies(self) -> None:
         self.layout_fixture()

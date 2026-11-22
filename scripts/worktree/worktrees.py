@@ -1699,8 +1699,8 @@ def _move_output_layout(journal: MoveJournal, *, defer_output: bool) -> Recorded
         checkout = journal.staging
     else:
         raise ValueError(f"{move.new}: cannot verify the checkout for output placement")
-    # The saved Git directory works before Git repairs a relative pointer in the copy.
-    git_dir = journal.git_entry if journal.git_entry.is_absolute() else None
+    # A planned copy can still have a relative pointer that Git must repair.
+    git_dir = journal.git_entry if journal.stage is MoveStage.PLANNED and journal.git_entry.is_absolute() else None
     if _tracked_target_paths(checkout, git_dir=git_dir):
         return UnassignedOutput()
     return output_record(move.repo, move.unit, move.short_name)
@@ -2941,8 +2941,7 @@ def _migration_journals(selection: MigrationSelection, folders: MigrationFolders
                     relocated.append(journal)
             case MigrationJournalState.UNMOVED:
                 if not dry_run and selection.includes(move.old):
-                    layout = _move_output_layout(journal, defer_output=_move_output_deferred(move))
-                    _ = _check_saved_move_reservations(journal, layout)
+                    _ = _check_saved_move_reservations(journal, UnassignedOutput())
                     if journal.copy_tag and os.path.lexists(journal.staging):
                         report_retained_folder(journal.staging, "a discarded move left a staged copy")
                     path.unlink()
@@ -3225,7 +3224,7 @@ def main() -> int:
     except Refused as error:
         print(str(error), file=sys.stderr)
         return error.code
-    except (OSError, ValueError, KeyError, staff.StaffRefused, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, MigrationPlanChanged, staff.StaffRefused, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)
         return 1
     return 0
