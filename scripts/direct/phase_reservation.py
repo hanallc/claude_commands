@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import NamedTuple, cast, overload
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import build_folders, copy_record, unit_runs
+from scripts.lib import build_folders, copy_record, git_files, unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
@@ -365,8 +365,12 @@ def _adopt_session_level_files(session_dir: Path) -> None:
             os.replace(session_dir / name, target / name)
 
 
-def home_worktree(directory: Path) -> Path:
-    """Read the unit folder from its staff row."""
+class _PhaseRunHome(NamedTuple):
+    unit: str
+    root: Path
+
+
+def _phase_run_home(directory: Path) -> _PhaseRunHome:
     run = directory.parent.parent
     owner = unit_runs.director(run)
     if not owner:
@@ -376,7 +380,12 @@ def home_worktree(directory: Path) -> Path:
         raise StateRefused(f"run owner {owner!r}: unit staff row is unavailable")
     if isinstance(row.worktree, staff.WorktreeUnfilled):
         raise StateRefused(f"run owner {owner!r}: unit staff row has no home folder")
-    return row.worktree.path
+    return _PhaseRunHome(row.name, row.worktree.path)
+
+
+def home_worktree(directory: Path) -> Path:
+    """Read the unit folder from its staff row."""
+    return _phase_run_home(directory).root
 
 
 def phase_worktree(directory: Path) -> KnownPhaseWorktree:
@@ -386,18 +395,34 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     return KnownPhaseWorktree(root)
 
 
+def _require_model_worktree(root: Path, owner_unit: str) -> None:
+    from scripts.worktree import worktrees
+
+    try:
+        repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
+        model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
+        if root != model_path.resolve():
+            raise ValueError("the checkout is outside the worktree model")
+        if unit != owner_unit:
+            raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
+        record = worktrees.checkout_record(model_path)
+        if (record is None or record.stage is not worktrees.MakeStage.DONE
+                or not isinstance(record.layout, worktrees.RecordedWorktreeOutput)
+                or (record.layout.unit, record.layout.short_name) != (unit, short_name)):
+            raise ValueError("no completed worktree record matches the checkout")
+        main = worktrees.main_checkout_for_word(repo)
+        if Path(record.repo).resolve() != main or git_files.at(root).common_dir != git_files.at(main).common_dir:
+            raise ValueError(f"the checkout does not belong to the main checkout for {repo!r}")
+    except (OSError, ValueError, worktrees.Refused) as error:
+        raise StateRefused(f"{root}: {error}. Run worktrees.py make <repo word> <unit> p<phase id>.") from error
+
+
 def _record_worktree(directory: Path, root: Path) -> None:
-    """Record a separate checkout only when it matches the worktree model."""
-    is_home = root == home_worktree(directory).resolve()
+    """Record a separate checkout after verifying its worktree record."""
+    home = _phase_run_home(directory)
+    is_home = root == home.root.resolve()
     if not is_home:
-        refusal = f"{root}: phase checkout is outside the worktree model. Run worktrees.py make <repo word> <unit> p<phase id>."
-        try:
-            repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
-            expected = build_folders.worktree_path(repo, unit, short_name).resolve()
-        except ValueError as error:
-            raise StateRefused(refusal) from error
-        if root != expected:
-            raise StateRefused(refusal)
+        _require_model_worktree(root, home.unit)
     directory.mkdir(parents=True, exist_ok=True)
     if is_home:
         (directory / WORKTREE_FILE).unlink(missing_ok=True)

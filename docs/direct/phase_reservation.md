@@ -60,6 +60,8 @@ The reset writes the new state only after the log append and board post succeed.
 If either fails, the record stays unchanged and repair prints no `claim` command.
 Repair prints the phase's `claim` command and returns 0 when the board post succeeds.
 Run that command with `--repo` set to the unit's home worktree or a model worktree.
+A separate checkout must have a completed worktree record and share the Git common directory of the main checkout.
+Its model path must name the unit that owns the run.
 Pending release, a release marker, or any other board status prevents this reset.
 An unreadable board for either the recorded reservation or a mapped reservation also prevents this reset.
 Never supply reservation or run ids by hand.

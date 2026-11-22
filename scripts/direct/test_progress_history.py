@@ -45,6 +45,7 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
+from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -8216,15 +8217,18 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([phase.phase for phase in owners.by_phase], ["6"])
         self.assertEqual(owners.refused, [])
 
-    def model_phase_path(self, phase: str) -> Path:
-        workspace = (self.root / "worktrees").resolve()
-        _ = (self.config_file.parent / "build_folders.conf").write_text(f"roots.workspace={workspace}\n")
-        self.enterContext(patch.dict(os.environ, CONF_DIR=str(self.config_file.parent)))
-        checkout = workspace / "fixture" / "reservation" / f"p{phase}"
-        checkout.parent.mkdir(parents=True)
-        return checkout
+    def model_phase_source(self) -> Path:
+        root = self.root.resolve()
+        config = model_worktree_environment(root, self.config_file.parent)
+        self.enterContext(patch.dict(os.environ, config))
+        source = root / "rust" / "fixture"
+        source.parent.mkdir()
+        return source
 
     def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
+        self.working_dir = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(self.working_dir)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
         self.start_numbered_phase(session_dir, "57c", 40_010)
         directory = phase_reservation.phase_directory(session_dir, "57c")
@@ -8247,8 +8251,7 @@ with patch.object(fcntl, "flock", admission):
         old_head = git(self.working_dir, "rev-parse", "HEAD")
         self.finish_numbered_phase(session_dir, 40_020)
 
-        checkout = self.model_phase_path("57c")
-        _ = git(self.working_dir, "worktree", "add", "-qb", "scratch", str(checkout))
+        checkout = make_fixture_worktree(self.working_dir, "reservation", "p57c")
         _ = (checkout / "new.txt").write_text("new start\n", encoding="utf-8")
         _ = git(checkout, "add", "new.txt")
         _ = git(checkout, "commit", "-qm", "phase baseline")
@@ -8282,11 +8285,12 @@ with patch.object(fcntl, "flock", admission):
         self.start_numbered_phase(run, "4a", 40_010)
         row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
         assert isinstance(row, staff.StaffRow)
-        checkout = self.model_phase_path("4a")
-        _ = subprocess.run(["git", "init", "-q", str(checkout)], capture_output=True, check=True)
-        _ = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], capture_output=True, check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
                            capture_output=True, check=True)
+        checkout = make_fixture_worktree(source, "reservation", "p4a")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
                 "claim", "--session-dir", str(run), "--phase", "4a", "--repo", str(checkout),
@@ -8333,14 +8337,15 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_an_open_phase_retry_keeps_its_claim_from_any_cwd(self) -> None:
-        checkout = self.model_phase_path("57c")
-        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True,
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         _ = subprocess.run(
-            ["git", "-C", str(checkout), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            ["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
              "commit", "--allow-empty", "-qm", "phase baseline"],
             check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+        checkout = make_fixture_worktree(source, "reservation", "p57c")
         for name, extra in (("retry-57c", ()),
                             ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):
             with self.subTest(name=name):

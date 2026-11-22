@@ -19,6 +19,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import phase_reservation  # noqa: E402
+from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402
@@ -70,7 +71,7 @@ class BerthHookTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.repo = self.root / "repo"
+        self.repo = self.root / "rust" / "fixture"
         (self.repo / "src").mkdir(parents=True)
         for command in (["init", "-q", "-b", "main"], ["config", "user.name", "t"], ["config", "user.email", "t@example.invalid"],
                         ["config", "gc.auto", "0"], ["config", "maintenance.auto", "false"]):
@@ -131,16 +132,9 @@ class BerthHookTests(unittest.TestCase):
             "./src/panels/\ndocs/panels.md\n")
 
     def make_phase_worktree(self, phase: str) -> Path:
-        workspace = self.root / "worktrees"
-        configuration = self.root / "config"
-        configuration.mkdir()
-        _ = (configuration / "build_folders.conf").write_text(f"roots.workspace={workspace}\n")
-        self.environment["CONF_DIR"] = str(configuration)
-        checkout = workspace / "fixture" / "design-unit" / f"p{phase}"
-        checkout.parent.mkdir(parents=True)
-        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(checkout)],
-                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        return checkout
+        self.environment.update(model_worktree_environment(self.root, self.root / "config"))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            return make_fixture_worktree(self.repo, "design-unit", f"p{phase}")
 
     def claim_phase_worktree(self, phase: str, root: Path) -> None:
         directory = phase_reservation.phase_directory(self.session_dir, phase)
