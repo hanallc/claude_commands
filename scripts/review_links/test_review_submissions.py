@@ -675,6 +675,8 @@ class ReviewSubmissionTests(unittest.TestCase):
             set_doc.assert_called_once_with(identity, wrapped_row.doc, expected=row.doc)
         self.assertFalse(active_doc.exists())
         self.assertTrue(wrapped_row.doc.path.is_file())
+        text = wrapped_row.doc.path.read_text().replace("- **Proposals:** `issues`", "- **Proposals:** `new-issues`")
+        _ = wrapped_row.doc.path.write_text(text)
         self.assertNotEqual(proposals_folder.issues_folder(wrapped_row.doc.path), native_folder)
         self.assertEqual(submissions.submit(payload, members=staff.StaffSnapshot((wrapped_row,))), saved)
         self.assertEqual(saved.path.parent, native_folder.resolve())
