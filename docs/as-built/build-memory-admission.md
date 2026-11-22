@@ -1309,6 +1309,17 @@ Only an unreadable hold state gives `ReadingUnavailable`, which the client refus
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.
+Repository run limits use `max_runs.<machine>.<repository>` in `build_admission.conf`.
+The admission service reads the limits each pass.
+`max_runs.natedev.claude_commands` permits two concurrent local `gate` or `test-affected` runs.
+The admission service uses the Git repository name when a gate profile supplies an absolute path.
+Each run uses one slot while it holds an admission reservation for either step.
+Module jobs and remote placements use no slots.
+The unit in `max_runs_exempt_unit` can start above the limit, and its runs use slots.
+A run that waits only for its limit holds later steps subject to the same limit.
+Other steps can pass that run when the other admission checks permit a start.
+The Builds page shows the count, limit, repository, and machine.
+The snapshot codec writes the wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
