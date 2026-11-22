@@ -461,7 +461,7 @@ sys.stdin.read(1)
             self.assertEqual(gate.read_gate_recovery(first.path), first)
             self.assertFalse(second.path.exists())
 
-    def test_held_nested_lease_keeps_folders_and_slot_and_allows_other_recovery(self) -> None:
+    def test_held_nested_lease_keeps_the_record_unfinished_and_allows_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True):
             directory = gate.gate_run_directory(self.checkout)
@@ -485,9 +485,13 @@ sys.stdin.read(1)
                 with redirect_stdout(output), gate.gate_recovery(self.checkout):
                     self.assertIn("UNRESOLVED", output.getvalue())
                     self.assertTrue(holder.is_dir())
-                    self.assertTrue(first.path.is_file())
+                    saved = gate.read_gate_recovery(first.path)
+                    assert saved is not None
+                    self.assertFalse(saved.finished)
+                    self.assertEqual(saved.folders, [str(parent)])
+                    self.assertEqual(marker.readlink(), first.path)
                     self.assertFalse(second.path.exists())
-                    self.assertEqual(self.jobserver_tokens(), b"")
+                    self.assertEqual(self.jobserver_tokens(), b"Q")
             self.assertFalse(build_folders.reclaim_build_folder(parent, wait=False))
             with gate.gate_recovery(self.checkout):
                 self.assertTrue(parent.is_dir())
@@ -619,6 +623,7 @@ gate.run_suites(Path.cwd(), full=True)
                     self.assertTrue(folder.is_dir())
                     self.assertEqual(recovery.folders, [str(folder)])
                     self.assertEqual(build_folders.build_folder_state(folder), "held")
+                    self.write(folder / "assets.lock" / "output", "ordinary content")
                 self.assertFalse(folder.exists())
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [])
@@ -645,14 +650,7 @@ gate.run_suites(Path.cwd(), full=True)
             [folder] = held
             self.assertEqual((folder / "held-output").read_text(), "the holder owns this file")
             self.assertEqual(build_folders.build_folder_state(folder), "held")
-            self.assertEqual(self.jobserver_tokens(), b"")
-            [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
-            recovery = gate.read_gate_recovery(record_path)
-            assert recovery is not None
-            self.assertFalse(recovery.finished)
-            self.assertEqual(recovery.folders, [str(folder.parent), str(folder)])
-            self.assertEqual([(token.value, token.operation) for token in recovery.tokens], [(b"Q".hex(), "held")])
-            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), record_path)
+            _ = self.assert_unresolved_folder_cleanup([folder.parent, folder])
 
     @gate_suites("hooks")
     def test_module_cleanup_retains_a_folder_with_a_held_nested_lease(self) -> None:
@@ -675,14 +673,7 @@ gate.run_suites(Path.cwd(), full=True)
             folder = nested.parent
             self.assertEqual((nested / "output").read_text(), "the holder owns this file")
             self.assertEqual(build_folders.build_folder_state(nested), "held")
-            self.assertEqual(self.jobserver_tokens(), b"")
-            [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
-            recovery = gate.read_gate_recovery(record_path)
-            assert recovery is not None
-            self.assertFalse(recovery.finished)
-            self.assertEqual(recovery.folders, [str(folder.parent), str(folder)])
-            self.assertEqual([(token.value, token.operation) for token in recovery.tokens], [(b"Q".hex(), "held")])
-            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), record_path)
+            _ = self.assert_unresolved_folder_cleanup([folder.parent, folder])
 
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
         parent = self.root / "kept-gate"
@@ -705,16 +696,13 @@ gate.run_suites(Path.cwd(), full=True)
                     self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), recovery.path)
 
     def assert_unresolved_folder_cleanup(self, folders: list[Path]) -> gate.GateRecovery:
-        self.assertEqual(self.jobserver_tokens(), b"")
-        [reservation] = self.admission.server.reservations.values()
-        self.assertTrue(Path(reservation.sidecar).is_file())
         [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
         recovery = gate.read_gate_recovery(record_path)
         assert recovery is not None
         self.assertFalse(recovery.finished)
         self.assertEqual(recovery.folders, list(map(str, folders)))
-        self.assertEqual([(token.value, token.operation) for token in recovery.tokens], [(b"Q".hex(), "held")])
         for folder in folders:
+            self.assertTrue(folder.is_dir())
             self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), record_path)
         return recovery
 
@@ -743,7 +731,7 @@ gate.run_suites(Path.cwd(), full=True)
                 gate.check_gate_folder_leases(recovery)
 
     @gate_suites("hooks", "lib")
-    def test_top_level_lease_keeps_capacity_after_modules_finish(self) -> None:
+    def test_top_level_lease_keeps_folder_and_record_after_modules_finish(self) -> None:
         self.supply_jobserver(b"Q")
         finish = gate.finish_gate_job
         folders: list[Path] = []
@@ -763,9 +751,11 @@ gate.run_suites(Path.cwd(), full=True)
             [folder] = folders
             self.assertEqual(build_folders.build_folder_state(folder), "held")
             _ = self.assert_unresolved_folder_cleanup([folder])
+            self.assertEqual(self.jobserver_tokens(), b"Q")
+            self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_module_cleanup_keeps_capacity_when_lock_open_fails(self) -> None:
+    def test_module_cleanup_keeps_folder_and_record_when_lock_open_fails(self) -> None:
         self.supply_jobserver(b"Q")
         finish = gate.finish_gate_job
         open_lock = build_folder_lock.open_lock
@@ -896,7 +886,7 @@ gate.start_gate_job = interrupt_after_start
         self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_unresolved_module_cleanup_keeps_capacity_and_folders(self) -> None:
+    def test_unresolved_module_cleanup_keeps_scope_and_folders(self) -> None:
         self.supply_jobserver(b"Q")
         self.configure_gate("program_stop_seconds=1\nprogram_sample_seconds=0.05")
         self.environment["BUILDLOG_SCOPE"] = "1"
@@ -920,6 +910,7 @@ Path({str(descendant)!r}).write_text(str(child.pid))
         began = 0.0
         signals: list[int] = []
         leaders: list[int] = []
+        scopes: list[Path] = []
 
         def record_scope(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             nonlocal escaped, began
@@ -931,6 +922,7 @@ Path({str(descendant)!r}).write_text(str(child.pid))
             self.write(job.scope.parent / "cgroup.procs", "")
             self.write(job.scope / "cgroup.procs", f"{escaped}\n")
             leaders.append(job.process.pid)
+            scopes.append(job.scope.parent)
             began = time.monotonic()
             return finish(job, status)
 
@@ -950,15 +942,15 @@ Path({str(descendant)!r}).write_text(str(child.pid))
             self.assertLessEqual(time.monotonic() - began, stop_seconds + 1)
         self.assertTrue(signals)
         self.assertEqual(os.getsid(escaped), escaped)
-        self.assertEqual(self.jobserver_tokens(), b"")
-        [reservation] = self.admission.server.reservations.values()
+        self.assertEqual(self.jobserver_tokens(), b"Q")
+        self.assert_gate_released()
         [path] = (self.state / "runner" / "active-runs").glob("*/*.json")
         record = cast(dict[str, object], json.loads(path.read_text()))
-        self.assertEqual(Path(reservation.sidecar).read_text().strip(), record["scope"])
+        [scope] = scopes
+        self.assertEqual(record["scope"], str(scope))
+        self.assertIs(record["finished"], False)
         [leader] = leaders
         self.assertIn(str(leader), cast(dict[str, str], record["groups"]))
-        tokens = cast(list[dict[str, object]], record["tokens"])
-        self.assertEqual([token["operation"] for token in tokens], ["held"])
         folders = cast(list[str], record["folders"])
         self.assertTrue(folders)
         self.assertTrue(all(Path(folder).is_dir() for folder in folders))

@@ -1814,9 +1814,12 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
                       or ("run.json" in files and gate_recovery_folder(folder)))
         if current != path and has_record and _folder_needs_recovery(folder, directory):
             return RefusedRemovalLease()
-        for name in (*files, *folders):
+        for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and current / stem not in separately_checked:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
                 lease = _hold_free_lease(current / stem, directory, stack, wait=wait)
                 if isinstance(lease, RefusedRemovalLease):
                     return lease
