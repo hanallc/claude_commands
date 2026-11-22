@@ -3835,7 +3835,7 @@ process.stdout.write(JSON.stringify({
         base = with_wait_reason(captured_reading(), admission_records.NeedsMemory())
         step, = base.view.waiting
         step = replace(step, run=LiveBuildRun(900, "run-start", 1))
-        member = admission_records.QueueMoveMember("fixture-wait", "")
+        member = admission_records.QueueMoveMember("fixture-wait")
         line = admission_records.QueueMoveLine("fixture-revision", (member,))
         row = gate.rank_waiter({"pid": step.pid, "since": step.since, "start_time": "wait-start",
                                "need": step.need, "move_id": member.row_id}, admission_records.NormalOrder())
@@ -3849,7 +3849,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(rows[0]["pid"], 900)
 
         unnamed = replace(step, pid=201, step="", folder="", project="", run=NoLiveBuildRun())
-        unnamed_member = admission_records.QueueMoveMember("unnamed-wait", "")
+        unnamed_member = admission_records.QueueMoveMember("unnamed-wait")
         unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
             "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
         complete = replace(line, members=(*line.members, unnamed_member))
@@ -3860,7 +3860,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(named.get("move_revision"), line.revision)
         self.assertEqual([wait["name"] for wait in named["waiters"]], [rows[0]["name"], "Build step"])
 
-        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait", "")))
+        incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
         with mock.patch.object(admission_client, "view",
                                return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
             stale = memory_feed.reading()

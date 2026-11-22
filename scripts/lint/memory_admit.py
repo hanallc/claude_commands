@@ -1406,9 +1406,7 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
         return -1, float(row["queue_position"]), row["pid"]
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
-    natural_place = (row.get("order_since", row["since"]), row["pid"])
-    since, pid = row.get("move_rank", natural_place)
-    return rank, since, pid
+    return rank, row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)

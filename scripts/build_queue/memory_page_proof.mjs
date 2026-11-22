@@ -459,7 +459,7 @@ try {
             showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],
             since:fixtureTime - (14 - index * 3) * 60, pid:500 + index,
             need:1.2 + index / 10, machine:'natedev', place:index + 1,
-            move:{row_id:unit, group:index === 0 ? unit : ''}}))};
+            move:{row_id:unit}}))};
         if (!queueDragProof) {
           const cloud = readings.cloud.waiters.find(row => row.kind === 'cloud');
           queueFixture.waiters.push({...cloud, kind:'cloud', name:'cloud fixture', pid:600});
@@ -552,19 +552,21 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
-        queueFixture.waiters.splice(1, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
-          name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
-          move:{row_id:'new-unit', group:''}});
         queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
           name:'remote startup', machine:'mac', reason:'remote startup',
-          move:{row_id:'remote-start', group:'', movable:false}});
+          move:{row_id:'remote-start', movable:false}});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
         assert.deepEqual((await snapshot()).handles, []);
         assert.ok(await evaluate('queueReading(latest).move_revision !== ' + JSON.stringify(queueFixture.move_revision)));
         servedReading = queueFixture;
         await evaluate('pageRefresh.refresh(true)');
-        assert.deepEqual((await snapshot()).handles, ['natemerge', 'new-unit', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        queueFixture.move_revision += 'new-unit';
+        queueFixture.waiters.splice(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+          name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
+          move:{row_id:'new-unit'}});
+        await evaluate('pageRefresh.refresh(true)');
         const retryStart = await grip('typesafe');
         const retryTarget = await cell('new-unit', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
@@ -578,26 +580,28 @@ try {
         const nextTarget = await cell('postmaster', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
-        queueFixture = {...queueFixture, waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
+        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left',
+          waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
         servedReading = queueFixture;
         await evaluate('pageRefresh.refresh(true)');
         assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
         assert.ok(await evaluate(`Boolean(document.querySelector('tr[data-tip="wait:remote-start"]'))`));
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...nextTarget, button:'left', buttons:0, clickCount:1});
-        await waitForLine('typesafe · test affected moved from 2 to 6');
-        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '6');
+        await waitForLine('The queue changed.');
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
 
-        queueFixture.waiters.splice(2, 0, {...template, key:'mac-only', pid:652,
+        queueFixture.move_revision += 'mac-only';
+        queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
           name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
-          move:{row_id:'mac-only', group:'', movable:false}});
+          move:{row_id:'mac-only', movable:false}});
         await evaluate('pageRefresh.refresh(true)');
         const macStart = await grip('typesafe');
         const macTarget = await cell('natemerge', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...macStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...macTarget, button:'left', buttons:1});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...macTarget, button:'left', buttons:0, clickCount:1});
-        await waitForLine('typesafe · test affected moved from 7 to 1');
+        await waitForLine('typesafe · test affected moved from 2 to 1');
         assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');

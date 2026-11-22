@@ -2362,20 +2362,20 @@ Cloud waits have their own order.
 The admission service gives each wait an ID.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
-The service saves each moved episode's rank in `state.json`.
-The rank lasts until the command starts or the request ends.
-A remote startup timeout or an expired local claim keeps the rank while the assignment settles.
-Rows follow priority group order, with each dragged row in its saved place.
-When the queue has a dragged row, new waits join the end of their group.
+The first confirmed move saves the full order in `state.json`.
+The service skips an absent wait but keeps its entry until the request starts or ends.
+A returning wait uses its saved entry.
+A new wait joins after the last saved entry in its priority group, even if that entry is absent.
+The first wait in a group joins before the first lower-priority entry, if there is one.
+A priority change applies to new entries in the saved order.
 Both hosts use the visible order for normal steps.
 Only starts that the local preview selects can pass a new remote startup hold.
-The table includes remote-only waits at their rank positions.
+The table includes remote-only waits in the saved order.
 The table identifies waits that a build hold blocks.
 Speculative Mac copy rows show the newest-first rule.
-A refusal before launch keeps the rank and any active local startup claim.
-Use `/build:bump` to change the order of the groups.
+A refusal before launch keeps the saved entry and any active local startup claim.
 
-The service checks the current order revision before it commits a move.
+The service checks the order revision for all rows, including rows without handles.
 Its replay ledger records the reply with the new order.
 Undo restores the row between its old neighbors if they still define the destination.
 A conflict supplies the current order.

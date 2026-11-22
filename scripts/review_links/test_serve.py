@@ -4210,7 +4210,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(configuration / "review_links.conf", "kill_operator_login=local-node-owner\n")
         origin = f"http://127.0.0.1:{self.port}"
         request = admission.QueueMoveRequest("1" * 32, "2" * 32, "3" * 32, admission.QueueDrop("4" * 32, "before"))
-        line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id, ""),))
+        line = records.QueueMoveLine("5" * 32, (records.QueueMoveMember(request.row_id),))
         content = cast(dict[str, object], json.loads(admission.encode_record(request)))
         del content["kind"], content["code_version"]
         headers = {"Content-Type": "application/json"}

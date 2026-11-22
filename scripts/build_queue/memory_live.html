@@ -1405,8 +1405,7 @@ function queueReading(d) {
   }
   const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
   const members = new Map(queueReply.line.members.map(member => [member.row_id, member]));
-  if (queueReply.line.members.some(member => member.movable !== false && !rows.has(member.row_id)) ||
-      [...rows.values()].some(row => row.move.movable !== false && !members.has(row.move.row_id)))
+  if (rows.size !== members.size || [...rows.keys()].some(id => !members.has(id)))
     return {...d, queueReady:false};
   const ordered = queueReply.line.members.flatMap(member => {
     const row = rows.get(member.row_id);

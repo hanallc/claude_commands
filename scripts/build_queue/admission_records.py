@@ -633,14 +633,6 @@ Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 NO_PRESSURE_HOLD = NoPressureHold()
 
 
-WaitRank = tuple[float, int]
-
-
-@dataclass(frozen=True)
-class SubmissionRank:
-    """The waiter uses its submission order."""
-
-
 class Waiter(TypedDict):
     pid: int
     start_time: str
@@ -649,8 +641,6 @@ class Waiter(TypedDict):
     since: float
     order_since: NotRequired[float]
     move_id: NotRequired[str]
-    move_rank: NotRequired[WaitRank]
-    move_place: NotRequired[int]
     queue_position: NotRequired[int]
     label: NotRequired[str]
     session_id: NotRequired[str]
@@ -1077,9 +1067,8 @@ class PackageNotRecorded:
 
 @dataclass(frozen=True)
 class QueueMoveMember:
-    """Identify a queue row, its priority group, and whether it can move."""
+    """Identify a queue row and show if it can move."""
     row_id: str
-    group: str
     movable: bool = field(default=True, kw_only=True)
 
 
