@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.nightly_review import candidates
 from scripts.lib import file_lock
 from scripts.production import investigation, proposal_issue, staff, update_registration, waiting_why
@@ -33,9 +34,7 @@ class WaitingWhyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = test_change_page.ChangePageTests('runTest')
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, test_change_page.ChangePageTests('runTest'))
         self.root = self.fixture.root
         _ = self.enterContext(patch.object(candidates, 'state_root', return_value=self.fixture.temporary / 'candidates'))
         folder = self.fixture.temporary / 'proposals'
