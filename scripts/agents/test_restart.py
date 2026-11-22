@@ -4471,11 +4471,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             ["missing: restart anomaly: no staff row; removed from the restart record"])
         self.assertEqual(self.stops, [])
 
-    def test_restart_keeps_a_deleted_id_when_its_record_lock_times_out(self) -> None:
-        missing = "missing-row"
-        rows = self.rows[:2]
-        shutdown_record.save([missing, *(str(row.id) for row in rows)])
-        self.running.clear()
+    @contextmanager
+    def hold_restart_record_until_timeout(self) -> Generator[None]:
         path = shutdown_record.record_path().with_suffix(".lock")
         acquire_flock = worker_lifecycle.acquire_flock
         with path.open("a") as held:
@@ -4491,9 +4488,16 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                     raise
 
             with (patch.object(worker_lifecycle, "acquire_flock", side_effect=release_after_timeout),
-                  patch.object(shutdown_record, "record_lock_seconds", return_value=0.05),
-                  redirect_stdout(io.StringIO()) as output):
-                self.assertEqual(shutdown.main(["restart"]), 0)
+                  patch.object(shutdown_record, "record_lock_seconds", return_value=0.05)):
+                yield
+
+    def test_restart_keeps_a_deleted_id_when_its_record_lock_times_out(self) -> None:
+        missing = "missing-row"
+        rows = self.rows[:2]
+        shutdown_record.save([missing, *(str(row.id) for row in rows)])
+        self.running.clear()
+        with self.hold_restart_record_until_timeout(), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["restart"]), 0)
 
         self.assertCountEqual([name for name, _ in self.launches], [row.name for row in rows])
         self.assertEqual(shutdown_record.read(), [missing])
@@ -4504,6 +4508,34 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertIn("Nate waits for the command that holds the restart record lock to finish.", report)
         self.assertIn("Nate runs agents restart there.", report)
         self.assertNotIn("Restart removed the entry.", report)
+
+    def test_restart_busy_record_retry_keeps_the_account(self) -> None:
+        missing = "missing-row"
+        first, other = self.rows[:2]
+        shutdown_record.save([missing, str(first.id), str(other.id)])
+        self.running.clear()
+        self.account_processes()
+
+        def saved(identity: str, name: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
+            label = ".claude3" if identity == first.current_session else ".claude4"
+            return "claude", {"CLAUDE_CONFIG_DIR": str(self.root / label)}, ["--resume", identity, "--name", name]
+
+        with (patch.object(restart, "session_launch", side_effect=saved),
+              patch.object(restart, "start_row", return_value="w1:p0") as start):
+            with self.hold_restart_record_until_timeout(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["restart", "claude3"]), 0)
+            self.assertEqual([item.args[0] for item in start.call_args_list], [first])
+            self.assertEqual(shutdown_record.read(), [missing, str(other.id)])
+
+            issue = next(line for line in output.getvalue().splitlines() if line.startswith(f"{missing}:"))
+            self.assertIn(f"could not remove {missing} from the restart record: the record is busy.", issue)
+            retry = shlex.split(issue.partition("Nate runs ")[2].removesuffix(" there."))
+            self.assertEqual(retry, ["agents", "restart", "claude3"])
+            start.reset_mock()
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(shutdown.main(retry[1:]), 0)
+            start.assert_not_called()
+            self.assertEqual(shutdown_record.read(), [str(other.id)])
 
     def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
         reference = str(self.rows[0].current_session)

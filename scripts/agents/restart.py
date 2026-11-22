@@ -65,6 +65,39 @@ NO_RESTART_MESSAGE = herdr.NoOpeningPrompt()
 DEFAULT_RESTART_CAUSE = "agents restart ran"
 
 
+@dataclass(frozen=True)
+class BulkCommand:
+    verb: Literal["restart", "stop", "held-sessions"] = "restart"
+    account: str | None = None
+    all_rows: bool = False
+    only: tuple[str, ...] = ()
+    why: str = DEFAULT_RESTART_CAUSE
+    dry_run: bool = False
+    here: bool = False
+
+    def arguments(self) -> list[str]:
+        arguments: list[str] = [self.verb]
+        if self.all_rows:
+            arguments.append("--all")
+        if self.only:
+            only = ",".join(self.only)
+            arguments.extend([f"--only={only}"] if only.startswith("-") else ["--only", only])
+        if self.verb == "restart" and self.why != DEFAULT_RESTART_CAUSE:
+            arguments.extend([f"--why={self.why}"] if self.why.startswith("-") else ["--why", self.why])
+        if self.dry_run:
+            arguments.append("--dry-run")
+        if self.here:
+            arguments.append("--here")
+        if self.account:
+            if self.verb == "stop":
+                arguments.append("--account")
+            arguments.append(self.account)
+        return arguments
+
+    def retry(self) -> str:
+        return shlex.join(["agents", *self.arguments()])
+
+
 def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str],
                     account: accounts.AccountSelection) -> bool:
     if isinstance(account, accounts.NamedAccount):
@@ -376,7 +409,6 @@ class BulkReport:
         return json.dumps(data)
 
     def receive(self, data: DetachedReport) -> None:
-        self.retry = data["retry"]
         self.targets.update(data["targets"])
         self.fixed_targets = frozenset(data["targets"])
         self.units.update(data["units"])
@@ -446,17 +478,6 @@ class BulkReport:
 
 _BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
 _DETACHED_CHILD: ContextVar[bool] = ContextVar("_DETACHED_CHILD", default=False)
-
-
-def _retry_command(arguments: list[str]) -> str:
-    retry = ["agents"]
-    options = iter(arguments)
-    for option in options:
-        if option == "--why":
-            _ = next(options, "")
-        elif not option.startswith("--why="):
-            retry.append(option)
-    return shlex.join(retry)
 
 
 def _create_log(files: ExitStack, path: Path) -> io.FileIO:
@@ -545,12 +566,12 @@ def _report_record_busy(key: str, name: str, error: shutdown_record.RecordBusy, 
         report.issues[key] = FollowUp(report.targets.get(key, name), _error_reason(error), step, operator=True)
 
 
-def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool = False, dry_run: bool = False) -> int:
+def run_command(action: Callable[[], int], command: BulkCommand) -> int:
     """Write the command output to the terminal and the same log."""
     if _DETACHED_CHILD.get():
         return action()
-    path = shutdown_state_root() / "logs" / f"{'stop' if stop else 'restart'}-{uuid4().hex}.log"
-    report = BulkReport(path, "agents stop --all" if stop else "agents restart", _retry_command(arguments))
+    path = shutdown_state_root() / "logs" / f"{command.verb}-{uuid4().hex}.log"
+    report = BulkReport(path, "agents stop --all" if command.verb == "stop" else "agents restart", command.retry())
     with ExitStack() as files:
         try:
             report.log_stream = _create_log(files, path)
@@ -582,7 +603,7 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
             print(flush=True)
         if code and not report.issues:
             report.failure("", report.command, "Could not complete the command")
-        result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
+        result = "\n".join(report.lines(dry_run=command.dry_run)) + "\n"
         if log is not None and report.writer is LogWriter.LOCAL:
             try:
                 _write_log(log, result)
@@ -596,6 +617,7 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
 @dataclass
 class WorkerRestoreReports:
     attempts: dict[staff.StaffId, tuple[staff.StaffRow, RestoreReport]] = field(default_factory=dict)
+    command: BulkCommand = BulkCommand()
 
     def resolved(self, scope: staff.StaffId) -> set[staff.StaffId]:
         attempt = self.attempts.get(scope)
@@ -629,7 +651,8 @@ class WorkerRestoreReports:
                 for identity, (name, reason) in failures.items():
                     bulk.targets[identity] = name
                     bulk.issues[identity] = (
-                        FollowUp(f"{owner.name} / {name}", reason, _record_retry_step("agents restart"), operator=True)
+                        FollowUp(f"{owner.name} / {name}", reason,
+                            _record_retry_step(replace(self.command, only=(identity,)).retry()), operator=True)
                         if identity in record_busy else FollowUp(f"{owner.name} / {name}", reason,
                             f"The director runs worker.py restore in {owner.name}.", owner.name))
                 for identity, reason in skipped.items():
@@ -645,7 +668,8 @@ class WorkerRestoreReports:
             next_step = f"run worker.py restore in {owner.name}"
             for identity, (name, reason) in sorted(failures.items(), key=lambda item: item[1]):
                 status = "restored" if identity in restored else "not restored"
-                step = _record_retry_step("agents restart") if identity in record_busy else next_step
+                step = (_record_retry_step(replace(self.command, only=(identity,)).retry())
+                        if identity in record_busy else next_step)
                 print(f"restart anomaly: {owner.name}: worker {name} {status}: "
                       + f"{' '.join(reason.splitlines())}; {step}", file=sys.stderr)
             for run, reason in sorted(run_failures.items()):
@@ -794,11 +818,11 @@ def _launch_failure_reason(error: Exception) -> str:
     return _error_reason(error)
 
 
-def _anomaly(row: staff.StaffRow, error: object) -> None:
+def _anomaly(row: staff.StaffRow, error: object, *, retry: str = "") -> None:
     if (report := _BULK_REPORT.get()) is not None:
         report.failure(row.id, row.name, _error_reason(error))
     else:
-        step = ". Run agents restart again." if isinstance(error, staff.UpkeepRowBusy) else ""
+        step = f". Run {retry} again." if retry and isinstance(error, staff.UpkeepRowBusy) else ""
         print(f"{row.name}: restart anomaly: {_error_reason(error)}{step}", file=sys.stderr)
 
 
@@ -980,7 +1004,8 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                 _ = report.failures.setdefault(member.id, (member.name, _error_reason(error)))
         result = worker.ExitCode.UNCERTAIN
     if reports is None:
-        WorkerRestoreReports({row.id: (parent, report)}).report()
+        account = target_account if isinstance(target_account, str) else target_account.label
+        WorkerRestoreReports({row.id: (parent, report)}, BulkCommand(account=account)).report()
     else:
         reports.attempts[row.id] = parent, report
     if result != worker.ExitCode.OK:
@@ -1465,7 +1490,8 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     return CompleteLiveRows(selected) if complete else PartialLiveRows(selected)
 
 
-def prune_live_rows(reading: CompleteLiveRows | PartialLiveRows) -> None:
+def prune_live_rows(reading: CompleteLiveRows | PartialLiveRows, *,
+                    command: BulkCommand | None = None) -> None:
     """Prune recorded live rows after a complete read and a locked liveness check."""
     if isinstance(reading, PartialLiveRows):
         print("restart: partial liveness read; existing restart rows retained", file=sys.stderr)
@@ -1485,7 +1511,7 @@ def prune_live_rows(reading: CompleteLiveRows | PartialLiveRows) -> None:
                 elif isinstance(observed, herdr.UnknownConversation):
                     _anomaly(row, observed.reason)
         except shutdown_record.RecordBusy as error:
-            _report_record_busy(row.id, row.name, error, "agents held-sessions")
+            _report_record_busy(row.id, row.name, error, (command or BulkCommand("held-sessions")).retry())
         except (OSError, ValueError, staff.StaffRefused) as error:
             _anomaly(row, error)
 
@@ -1542,10 +1568,10 @@ class AfterStop(Enum):
     KEEP_STOPPED = "keep the selected rows for the next restart"
 
 
-def _detach_stop(arguments: list[str], selected: list[staff.StaffRow], record: staff.StaffSnapshot) -> int:
+def _detach_stop(command: BulkCommand, selected: list[staff.StaffRow], record: staff.StaffSnapshot) -> int:
     report = _BULK_REPORT.get()
     if report is None:
-        return run_command(lambda: _detach_stop(arguments, selected, record), arguments, stop=arguments[0] == "stop")
+        return run_command(lambda: _detach_stop(command, selected, record), command)
     for row in selected:
         report.track(row, record)
 
@@ -1560,6 +1586,7 @@ def _detach_stop(arguments: list[str], selected: list[staff.StaffRow], record: s
     else:
         launch_error: Exception | None = None
         try:
+            arguments = replace(command, only=tuple(str(row.id) for row in selected)).arguments()
             _ = stop_resume.detach([*arguments, "--parent-report", report.detach_data()], "restart",
                                    program=Path(__file__).resolve(), log=report.log, log_fd=stream.fileno())
         except Exception as error:
@@ -1613,6 +1640,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
 def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
              account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     report = _BULK_REPORT.get()
+    command = BulkCommand("stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
+                          account=None if isinstance(account, AllRestartAccounts) else account.label,
+                          all_rows=stop_all, only=only, why=why, dry_run=dry_run)
+    retry = report.retry if report is not None else command.retry()
 
     def stop_requested() -> bool:
         return report is not None and report.stop_signal is not None
@@ -1661,7 +1692,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     row = record.by_id(identity) or before
                     if report is not None:
                         report.track(row, record)
-                    _anomaly(row, error)
+                    _anomaly(row, error, retry=retry)
         select_only = bool(only) and not stop_all
         pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
                        list(only) if select_only else
@@ -1677,18 +1708,24 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             for row in shown.rows:
                 if str(row.id) not in pending_ids:
                     preview(f"{row.name}: live, not in the restart record")
+        saved_ids: set[str] | None = None
         for reference in pending_ids:
-            row = record.by_member_reference(reference) if select_only else record.by_id(staff.StaffId(reference))
+            row = record.by_id(staff.StaffId(reference))
             if select_only and row is None:
-                matches = [item for item in record.rows if item.name == reference]
-                row = matches[0] if len(matches) == 1 else None
-            if row is None and select_only:
-                if report is not None:
-                    report.issues[reference] = FollowUp(reference, "The staff row is unknown or ambiguous",
-                        "Nate selects a staff row ID.", operator=True)
-                print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
-                continue
-            # A retry cannot start these ids, so they leave the record.
+                if saved_ids is None:
+                    saved_ids = set(shutdown_record.read())
+                # A saved ID takes precedence over a name or conversation reference.
+                if reference not in saved_ids:
+                    row = record.by_current_session(reference)
+                    if row is None:
+                        matches = [item for item in record.rows if item.name == reference]
+                        row = matches[0] if len(matches) == 1 else None
+                    if row is None:
+                        if report is not None:
+                            report.issues[reference] = FollowUp(reference, "The staff row is unknown or ambiguous",
+                                "Nate selects a staff row ID.", operator=True)
+                        print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
+                        continue
             reason = "no staff row" if row is None else None if select_only else leaves_record(row, record, runs=observed.runs)
             if row is None or reason is not None:
                 name = reference if row is None else row.name
@@ -1696,7 +1733,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     try:
                         shutdown_record.forget([reference])
                     except shutdown_record.RecordBusy as error:
-                        _report_record_busy(reference, name, error, "agents restart")
+                        _report_record_busy(reference, name, error, retry)
                         continue
                 if report is not None:
                     report.issues[reference] = FollowUp(name, reason or "No staff row",
@@ -1758,17 +1795,10 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
 
-    def resume_retry(members: list[str], *, stop_first: bool = False) -> str:
-        retry = ["agents", "restart", "--only", ",".join(members)]
-        if stop_first:
-            if after_stop is AfterStop.KEEP_STOPPED:
-                retry[1] = "stop"
-            retry.append("--all")
-        if not isinstance(account, AllRestartAccounts):
-            if retry[1] == "stop":
-                retry.append("--account")
-            retry.append(account.label)
-        return shlex.join(retry)
+    resume_command = replace(command, verb="restart", all_rows=False)
+
+    def resume_retry(members: Iterable[str]) -> str:
+        return replace(resume_command, only=tuple(members)).retry()
 
     def defer_resume(identity: staff.StaffId) -> None:
         if report is not None:
@@ -1777,8 +1807,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
     def record_busy(holder: staff.StaffRow, error: shutdown_record.RecordBusy, *, resuming: bool = False) -> None:
         for member in members_by_holder[holder.id]:
-            retry = report.retry if report is not None and not resuming else resume_retry([member], stop_first=not resuming)
-            _report_record_busy(member, record.rows_by_id[staff.StaffId(member)].name, error, retry)
+            step_command = resume_retry([member]) if resuming else retry
+            _report_record_busy(member, record.rows_by_id[staff.StaffId(member)].name, error, step_command)
 
     # The record saves only members that a restart starts; the stop still reaches every member.
     leaving = {str(row.id) for row in selected if stop_all and leaves_record(row, record, runs=observed.runs) is not None}
@@ -1786,15 +1816,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                        for holder, members in members_by_holder.items()}
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
-        arguments = ["stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
-                     "--all", "--only", ",".join(str(row.id) for row in selected)]
-        if after_stop is AfterStop.RESTART:
-            arguments.extend(("--why", why))
-        if not isinstance(account, AllRestartAccounts):
-            if after_stop is AfterStop.KEEP_STOPPED:
-                arguments.append("--account")
-            arguments.append(account.label)
-        return _detach_stop(arguments, selected, record)
+        return _detach_stop(command, selected, record)
     lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
@@ -1825,7 +1847,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     if report is not None and _DETACHED_CHILD.get() and stop_all:
         _record_stop_plan(report, (row for row in selected if row.id not in refused_workers))
     if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
-        prune_live_rows(reading)
+        prune_live_rows(reading, command=replace(command, verb="held-sessions", all_rows=False))
 
     pre_stop_codex = observed.codex
     keep_running = (frozenset(row.id for row in record.rows if row.kind == "worker" and row.id not in worker_policies)
@@ -1922,7 +1944,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 record_busy(holder, error)
             except staff.StaffRefused as error:
                 _ = holders.pop(identity, None)
-                _anomaly(holder, error)
+                _anomaly(holder, error, retry=retry)
                 if report is not None:
                     for member in members_by_holder[identity]:
                         if member != identity:
@@ -1981,7 +2003,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             # A stop read can still show a worker that has exited. Read pane evidence again for restore.
             pane_evidence.close()
             _ = pane_evidence.enter_context(herdr.pane_evidence_run())
-    resume_checks = DirectorResumeChecks()
+    resume_checks = DirectorResumeChecks(worker_restores=WorkerRestoreReports(command=resume_command))
     resume_policies = {record.rows_by_id[identity].current_session: policy
                        for identity, policy in worker_policies.items() if identity not in blocked_workers}
     record_save_failures: dict[str, OSError | ValueError] = {}
@@ -2035,11 +2057,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             current_record = staff.initial_snapshot()
             current = current_record.by_id(holder.id)
             if current is None:
+                gone = [member for member in members_by_holder[holder.id]
+                        if current_record.by_id(staff.StaffId(member)) is None]
                 try:
-                    shutdown_record.forget([member for member in members_by_holder[holder.id]
-                                            if current_record.by_id(staff.StaffId(member)) is None])
+                    shutdown_record.forget(gone)
                 except shutdown_record.RecordBusy as error:
-                    _report_record_busy(holder.id, holder.name, error, "agents restart")
+                    _report_record_busy(holder.id, holder.name, error, resume_retry(gone))
                     return RestartDisposition.REMOVED
                 if report is not None:
                     report.issues[holder.id] = FollowUp(holder.name, "The staff row is gone", "Restart removed the entry.")
@@ -2312,6 +2335,15 @@ def _run_detached_child(action: Callable[[], int], report: BulkReport, log_fd: i
         handlers.close()
 
 
+class DetachedCommandOptions(argparse.Namespace):
+    account: str | None = None
+    all: bool = False
+    only: str = ""
+    why: str = DEFAULT_RESTART_CAUSE
+    dry_run: bool = False
+    here: bool = False
+
+
 def main() -> int:
     """Run detached restart work and save its output."""
     if __name__ == "__main__":
@@ -2327,14 +2359,27 @@ def main() -> int:
     log = cast(Path, options.log)
     data = cast(DetachedReport | None, options.parent_report)
     stop = arguments[:1] == ["stop"]
-    report = BulkReport(log, "agents stop --all" if stop else "agents restart", _retry_command(arguments))
+    title = "agents stop --all" if stop else "agents restart"
     if data is not None:
+        report = BulkReport(log, title, data["retry"])
         report.receive(data)
     else:
         selection = argparse.ArgumentParser(add_help=False)
+        _ = selection.add_argument("--all", action="store_true")
         _ = selection.add_argument("--only", required=True)
-        scope, _ = selection.parse_known_args(arguments)
-        report.targets.update((identity, identity) for identity in cast(str, scope.only).split(",") if identity)
+        _ = selection.add_argument("--dry-run", action="store_true")
+        if stop:
+            _ = selection.add_argument("--account")
+        else:
+            _ = selection.add_argument("account", nargs="?")
+            _ = selection.add_argument("--why", default=DEFAULT_RESTART_CAUSE)
+            _ = selection.add_argument("--here", action="store_true")
+        scope, _ = selection.parse_known_args(arguments[1:], namespace=DetachedCommandOptions())
+        command = BulkCommand("stop" if stop else "restart", account=scope.account, all_rows=scope.all,
+            only=tuple(identity for identity in scope.only.split(",") if identity),
+            why=scope.why, dry_run=scope.dry_run, here=scope.here)
+        report = BulkReport(log, title, command.retry())
+        report.targets.update((identity, identity) for identity in command.only)
         report.fixed_targets = frozenset(report.targets)
 
     def action() -> int:
