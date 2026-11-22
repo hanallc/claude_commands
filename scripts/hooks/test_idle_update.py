@@ -114,6 +114,19 @@ class IdleUpdateRoleTests(StaffTestCase):
             self.assertIn("what you last had on deck", helper("fixture", False, 1300, snapshot))
             self.assertEqual(helper("fixture", False, 1300, staff.StaffSnapshot(())), "")
 
+    def test_the_prompt_hook_gives_a_held_director_no_idle_text(self) -> None:
+        owner = fixture_member("showrunner", name="TEST-production")
+        unit = fixture_member("unit", name="TEST-director", parent=owner.id)
+        _ = staff.pause(str(unit.id), "review")
+        session = str(unit.current_session)
+        held = staff.local_by_current_session(session)
+        assert held is not None
+        hook = import_module("scripts.hooks.user-prompt-submit-conversation-pause")
+        helper = cast(Callable[[str, bool, int, staff.StaffSnapshot], str], getattr(hook, "_idle_update_context"))
+        with mock.patch.object(idle_update, "limits", return_value=LIMITS):
+            self.assertEqual(helper(session, True, 1000, staff.StaffSnapshot((held,))), "")
+            self.assertEqual(helper(session, False, 1300, staff.StaffSnapshot((held,))), "")
+
 
 if __name__ == "__main__":
     _ = unittest.main()
