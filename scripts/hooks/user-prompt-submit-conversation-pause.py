@@ -63,18 +63,18 @@ def _record_activity(session_id: str, source: str, prompt: str, record: staff.St
 
 def _idle_update_context(session_id: str, typed: bool, now: int, record: staff.StaffSnapshot) -> str:
     """Record nate's typed time, or return the idle update context for any other prompt."""
-    from scripts.lib import conf
-
     try:
-        from scripts.hooks import idle_update
+        from scripts.hooks import conversation_pause, idle_update
 
         if not idle_update.has_role(record):
             return ""
         if typed:
             idle_update.typed(session_id, now)
             return ""
+        if conversation_pause.director_turn(session_id, record=record) is conversation_pause.DirectorTurn.HOLD:
+            return ""
         return idle_update.context(session_id, now, idle_update.limits())
-    except (OSError, ValueError, conf.Unusable) as error:
+    except Exception as error:
         lines = str(error).splitlines()
         detail = lines[0] if lines else ""
         print(f"conversation-pause: idle update: {type(error).__name__}: {detail}", file=sys.stderr)

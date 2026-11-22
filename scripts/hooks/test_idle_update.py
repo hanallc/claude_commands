@@ -5,7 +5,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Callable
 from contextlib import AbstractContextManager
+from importlib import import_module
 from typing import cast, final, override
 from unittest import mock
 
@@ -42,15 +44,17 @@ class IdleUpdateContextTests(unittest.TestCase):
         idle_update.typed("fixture", 1000)
         _ = idle_update.context("fixture", 1300, LIMITS)
         text = idle_update.context("fixture", 1500, LIMITS)
-        self.assertIn('End this turn with "—" alone', text)
+        self.assertIn('This turn has no text for nate: end the turn with "—" alone', text)
+        self.assertIn("its one status line only", text)
         self.assertIn("due in 7 min", text)
+        self.assertIn("due in 9 min", idle_update.context("fixture", 1360, LIMITS))
 
     def test_the_first_turn_after_the_renewal_time_asks_only_for_news(self) -> None:
         idle_update.typed("fixture", 1000)
         _ = idle_update.context("fixture", 1300, LIMITS)
         text = idle_update.context("fixture", 1950, LIMITS)
         self.assertIn("only the news since your last update", text)
-        self.assertIn('End this turn with "—" alone', idle_update.context("fixture", 1960, LIMITS))
+        self.assertIn("This turn has no text for nate", idle_update.context("fixture", 1960, LIMITS))
 
     def test_a_typed_prompt_ends_the_mode(self) -> None:
         idle_update.typed("fixture", 1000)
@@ -92,12 +96,23 @@ class IdleUpdateLimitsTests(unittest.TestCase):
 
 @final
 class IdleUpdateRoleTests(StaffTestCase):
-    def test_producer_showrunner_and_unit_rows_have_the_mode(self) -> None:
+    def test_showrunner_and_unit_rows_have_the_mode_and_no_row_does_not(self) -> None:
         owner = fixture_member("showrunner", name="TEST-production")
         unit = fixture_member("unit", name="TEST-director", parent=owner.id)
         self.assertTrue(idle_update.has_role(staff.StaffSnapshot((owner,))))
         self.assertTrue(idle_update.has_role(staff.StaffSnapshot((unit,))))
         self.assertFalse(idle_update.has_role(staff.StaffSnapshot(())))
+
+    def test_the_prompt_hook_records_typed_time_and_returns_the_context(self) -> None:
+        owner = fixture_member("showrunner", name="TEST-production")
+        snapshot = staff.StaffSnapshot((owner,))
+        hook = import_module("scripts.hooks.user-prompt-submit-conversation-pause")
+        helper = cast(Callable[[str, bool, int, staff.StaffSnapshot], str], getattr(hook, "_idle_update_context"))
+        with mock.patch.object(idle_update, "limits", return_value=LIMITS):
+            self.assertEqual(helper("fixture", True, 1000, snapshot), "")
+            self.assertEqual(helper("fixture", False, 1200, snapshot), "")
+            self.assertIn("what you last had on deck", helper("fixture", False, 1300, snapshot))
+            self.assertEqual(helper("fixture", False, 1300, staff.StaffSnapshot(())), "")
 
 
 if __name__ == "__main__":

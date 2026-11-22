@@ -234,6 +234,8 @@ turn's final line names which one**:
 `— holding: waiting on <what is running>` · `gate: <name>` · `decision: <question>` ·
 `blocked: <cause>` · `done: run summary emitted`
 
+In idle update mode (<IdleUpdate/>), a turn with no text for nate carries this line only.
+
 The closed list:
 
 - **waiting** — a background dispatch, verification, smoke run, or style pass is

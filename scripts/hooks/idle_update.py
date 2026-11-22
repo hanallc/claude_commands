@@ -11,9 +11,13 @@ try:
 except FileNotFoundError:
     pass
 
+import fcntl
 import json
+import math
 import os
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
@@ -24,6 +28,7 @@ from scripts.production import staff
 
 ROLES: frozenset[staff.Kind] = frozenset({"producer", "showrunner", "unit"})
 RULE = "~/.claude/docs/idle_update.md"
+NO_TEXT = 'end the turn with "—" alone (a unit director ends it with its one status line only)'
 
 
 class IdleRecord(TypedDict):
@@ -55,6 +60,16 @@ def _record_path(session_id: str) -> Path:
     return state_dir() / f"{session_id}.json"
 
 
+@contextmanager
+def _locked(session_id: str) -> Generator[None]:
+    """Serialize each read and write of one session's record."""
+    folder = state_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / f".{session_id}.lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def _read(session_id: str) -> IdleRecord | None:
     try:
         value = cast(object, json.loads(_record_path(session_id).read_text(encoding="utf-8")))
@@ -84,15 +99,21 @@ def _write(session_id: str, record: IdleRecord) -> None:
 
 def typed(session_id: str, now: float) -> None:
     """Record that nate typed in the session; idle update mode ends."""
-    _write(session_id, {"typed_at": now, "updated_at": None})
+    with _locked(session_id):
+        _write(session_id, {"typed_at": now, "updated_at": None})
 
 
 def context(session_id: str, now: float, limit: Limits) -> str:
     """Return the hook context for a prompt nate did not type, or an empty text outside the mode."""
+    with _locked(session_id):
+        return _context(session_id, now, limit)
+
+
+def _context(session_id: str, now: float, limit: Limits) -> str:
     record = _read(session_id)
     if record is None:
         # No typed time yet: start the count at this prompt.
-        typed(session_id, now)
+        _write(session_id, {"typed_at": now, "updated_at": None})
         return ""
     idle = now - record["typed_at"]
     if idle < limit.after_seconds:
@@ -101,13 +122,13 @@ def context(session_id: str, now: float, limit: Limits) -> str:
             "Keep doing all your work. ")
     updated = record["updated_at"]
     if updated is not None and now - updated < limit.renew_seconds:
-        due = int((updated + limit.renew_seconds - now) // 60) + 1
-        return head + f'End this turn with "—" alone. The next update is due in {due} min. Rule: {RULE}.'
+        due = math.ceil((updated + limit.renew_seconds - now) / 60)
+        return head + f"This turn has no text for nate: {NO_TEXT}. The next update is due in {due} min. Rule: {RULE}."
     _write(session_id, {**record, "updated_at": now})
     if updated is None:
         return head + ("Your text to nate this turn is one short update: what you last had on deck with him, "
                        "in a few words, and the question whether he is willing to look at it. "
-                       f'Show it in full only after he says yes. With nothing on deck, end with "—" alone. Rule: {RULE}.')
+                       f"Show it in full only after he says yes. With nothing on deck, {NO_TEXT}. Rule: {RULE}.")
     return head + ("Your text to nate this turn is one short update with only the news since your last update, "
                    "and the question whether he is willing to look at what you have on deck. "
-                   f'With no news, end with "—" alone. Rule: {RULE}.')
+                   f"With no news, {NO_TEXT}. Rule: {RULE}.")
