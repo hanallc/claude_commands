@@ -25,6 +25,11 @@ A short name is one nonempty path component. It must contain a character other t
 - `worktrees.py make <repo word> <unit> <short-name>` creates the source, the output link, and the worktree record.
   It uses the main checkout for the repo word and checks its origin.
   It creates the branch `<unit>-<short-name>` from the main checkout's HEAD.
+- A phase that runs beside the current phase uses a model worktree.
+  The director creates it with `worktrees.py make <repo word> <unit> p<phase id>`.
+  The director removes it with `worktrees.py remove <path>` after the checkpoint reaches origin.
+  `phase_reservation.py claim` accepts the unit's home worktree or a model worktree.
+  The command records the path only for a separate model worktree.
 - `move_worktree(old, repo, unit, short_name)` moves a linked checkout and keeps its Git worktree entry and branch.
   It updates the worktree and staff records, adds a link at the old path, and links the Claude transcript folders.
   A retry resumes from the move record.
@@ -57,6 +62,10 @@ A full `cargo clean` for an assigned worktree or linked main checkout empties it
 The Cargo seed is absent. The first test build of a new Hana worktree takes about 3.5 minutes more without it. The shared `sccache` stays warm.
 
 ## Numbered copies and removal
+
+Tests and proofs that need a source copy use `scripts/lib/build_slots.py run --source <worktree> --commit <hash> ...`.
+The director creates a model worktree for a trial project.
+Workers use `scratch.py new --worker` only for downloads and other files unrelated to builds, tests, gates, or source copies.
 
 `build_slots.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
 

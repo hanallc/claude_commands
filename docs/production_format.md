@@ -324,9 +324,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
    At plan start and at each <PhaseEnd/>, map which phases depend on which.
-   Run each independent phase beside the current one under berth, with its own
-   checkpoint (`/showrunner:produce` → Rules, parallel by default). A phase
-   better run as its own unit goes to the showrunner as a proposed split
+   Give each independent phase its own berth reservation and checkpoint
+   (`/showrunner:produce` → Rules, parallel by default).
+   Use `worktrees.py make <repo word> <unit> p<phase id>` for a phase that runs beside the current phase.
+   Remove that worktree with `worktrees.py remove <path>` after its checkpoint reaches origin.
+   A phase better run as its own unit goes to the showrunner as a proposed split
    (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch except <FastTrack/> (`commands/unit/fast_track.md`);
@@ -435,12 +437,12 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 13. **Waiting on another unit** (user, 2026-09-29). Only code you need that
     exists only in another unit's unmerged work blocks you. Reservations, shared
     files and "to avoid conflicts" do not; the showrunner clears those and names
-    the cargo-berth commands you run. Before reporting a code block, test it: in
-    a scratch worktree, merge the merge branch without that work and run your
-    tests. Green means you are not blocked; continue. A real block ends the turn
-    with item 10's line. While it lasts, take the work the showrunner names, or:
-    parts of your next phase in files nobody holds, your fix built in a scratch
-    copy, tests, docs or research.
+    the cargo-berth commands you run. Merge the merge branch into a model
+    worktree and test without the other unit's change.
+    Continue if the tests pass. If the code blocks you, use item 10's line.
+    While you wait, take the work the showrunner names.
+    You can also start independent phase work, tests, docs, or research.
+    Build a fix in a numbered copy with `build_slots.py run --source <worktree> --commit <hash> ...`.
 15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix

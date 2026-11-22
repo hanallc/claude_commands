@@ -213,7 +213,11 @@ A cleanup failure prints its step and returns nonzero.
 The failure does not prevent pointer cleanup.
 A busy repository copy can remain through the separate `copies.py remove` step.
 
-Workers create private work folders with `scratch.py new --worker [--name <word>]`.
+The director creates a model worktree for a parallel phase or trial project.
+The director removes the phase worktree after its checkpoint reaches origin.
+Workers use numbered copies for tests and proofs that need source copies.
+`scripts/lib/build_slots.py run` selects a numbered copy for the source commit.
+Workers use `scratch.py new --worker [--name <word>]` only for downloads and files unrelated to builds, tests, gates, or source copies.
 Names have the form `<showrunner>-<unit>-<worker>-<suffix>[-<word>]` under `TMPDIR`.
 `scratch.worker_task(staff_id) -> str` names their shared task.
 `scratch.end(task)` removes folders for that exact task and permits retries.

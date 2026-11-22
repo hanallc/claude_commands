@@ -53,7 +53,14 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.session = root / "run"
         self.session.mkdir()
         self.first = root / "worktree-x"
-        self.second = root / "worktree-y"
+        workspace = root / "worktrees"
+        self.second = workspace / "fixture" / "reservation" / "p2"
+        self.second.parent.mkdir(parents=True)
+        configuration = root / "config"
+        configuration.mkdir()
+        _ = (configuration / "build_folders.conf").write_text(f"roots.workspace={workspace}\n")
+        _ = self.enterContext(cast(contextlib.AbstractContextManager[object],
+                                   mock.patch.dict(os.environ, CONF_DIR=str(configuration))))
         self.first.mkdir()
         record_unit(self, self.session, self.first, "1")
         for command in (
@@ -85,6 +92,30 @@ class WorktreeAttributionTests(unittest.TestCase):
             code = phase_reservation.main(["claim", "--session-dir", str(self.session),
                                            "--phase", phase, "--repo", str(root)])
         return code, errors.getvalue()
+
+    def test_claim_records_the_model_worktree(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "2")
+        self.assertEqual(self.claim("2", self.second), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.second) + "\n")
+
+    def test_claim_refuses_a_clone_outside_the_model(self) -> None:
+        clone = self.first.parent / "scratch" / "fixture" / "reservation" / "p3"
+        clone.parent.mkdir(parents=True)
+        _ = subprocess.run(["git", "clone", "-q", str(self.first), str(clone)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        directory = phase_reservation.phase_directory(self.session, "3")
+        code, errors = self.claim("3", clone)
+        self.assertEqual(code, 2)
+        self.assertIn(str(clone), errors)
+        self.assertIn("worktrees.py make <repo word> <unit> p<phase id>", errors)
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
+        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+
+    def test_claim_uses_the_legacy_home_without_a_worktree_record(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertFalse((directory / phase_reservation.WORKTREE_FILE).exists())
+        self.assertEqual(phase_reservation.phase_worktree(directory).root, self.first)
 
     def test_claim_records_the_first_commit_and_dirty_status(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
@@ -266,7 +297,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? first.txt\n")
 
     def test_claim_uses_the_phase_copy_when_the_launch_folder_lacks_its_baseline(self) -> None:
-        phase_copy = self.first.parent / "phase-copy"
+        phase_copy = self.second.with_name("phase-copy")
         for command in (
             ["git", "clone", "-q", str(self.first), str(phase_copy)],
             ["git", "-C", str(phase_copy), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
@@ -306,7 +337,7 @@ class WorktreeAttributionTests(unittest.TestCase):
                             "-m", "replacement"], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         # The old root is gone. The new root contains only the unrelated replacement branch.
-        replacement = self.first.parent / "replacement"
+        replacement = self.second.with_name("replacement")
         _ = subprocess.run(["git", "clone", "-q", "--single-branch", "--no-local", str(self.first),
                             str(replacement)], check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         with self.assertRaises(phase_reservation.StateRefused):

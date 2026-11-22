@@ -36,7 +36,7 @@ With one
 open phase in the edit's worktree every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
 The staff row supplies the home folder.
-`claim --repo` writes a `worktree` file only when the phase uses another checkout.
+`claim --repo` writes a `worktree` file only when the phase uses a separate model worktree.
 
 `enrolled_awaiting_first_touch` turns `Active`, and an `Active` record follows a new
 reservation of its own phase: once cargo-berth releases the recorded one, as a shrink's
@@ -64,7 +64,7 @@ from pathlib import Path
 from typing import NamedTuple, cast, overload
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import unit_runs
+from scripts.lib import build_folders, copy_record, unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
 
@@ -387,9 +387,19 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
 
 
 def _record_worktree(directory: Path, root: Path) -> None:
-    """Store only a checkout that differs from the unit folder."""
+    """Record a separate checkout only when it matches the worktree model."""
+    is_home = root == home_worktree(directory).resolve()
+    if not is_home:
+        refusal = f"{root}: phase checkout is outside the worktree model. Run worktrees.py make <repo word> <unit> p<phase id>."
+        try:
+            repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
+            expected = build_folders.worktree_path(repo, unit, short_name).resolve()
+        except ValueError as error:
+            raise StateRefused(refusal) from error
+        if root != expected:
+            raise StateRefused(refusal)
     directory.mkdir(parents=True, exist_ok=True)
-    if root == home_worktree(directory).resolve():
+    if is_home:
         (directory / WORKTREE_FILE).unlink(missing_ok=True)
     else:
         write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
