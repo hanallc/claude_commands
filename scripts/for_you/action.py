@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
-from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 from scripts.lib import atomic_file, file_lock
@@ -195,15 +194,6 @@ class ActionStore:
             return self._write(replace(record, status="done", updated_at=now, completed_at=now, evidence=evidence))
 
 
-def card_url(key: str) -> str:
-    """Use the existing Review origin and path without creating a console page."""
-    from scripts.review_links import review_link, review_page
-
-    root = review_link.review_root()
-    url = review_link.snapshot_url(root, root / review_page.PAGE_PATH.lstrip("/"))
-    return url + "?" + urlencode({"type": "for-you", "show": "open", "item": key})
-
-
 class Arguments(argparse.Namespace):
     """The fields accepted by the action filer."""
 
@@ -241,7 +231,6 @@ def main(argv: list[str]) -> int:
                                requested_by=args.requested_by, reason=args.reason, waits=args.waits,
                                concerns=args.concerns, dedupe_key=args.dedupe_key)
             print(record.key)
-            print(card_url(record.key))
         elif args.operation == "withdraw":
             print(store.withdraw(args.id, requested_by=args.requested_by, reason=args.reason).key)
         else:

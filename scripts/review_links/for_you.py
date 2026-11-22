@@ -63,14 +63,14 @@ class UnavailableSource:
 
 @dataclass(frozen=True)
 class KnownOpenCount:
-    """The complete number of open machine cards and agent actions."""
+    """The complete number of open rebuild rows and agent actions."""
 
     value: int
 
 
 @dataclass(frozen=True)
 class UnavailableOpenCount:
-    """The complete count is unavailable; known_open counts only confirmed open cards."""
+    """The complete count is unavailable; known_open counts only confirmed open rows."""
 
     known_open: int
 
@@ -195,8 +195,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
         unavailable.append(UnavailableSource("completed rebuild needs", str(error)))
 
     compared: tuple[str, ...] = ()
-    comparison_current = False
-    probes = rebuild_row.RunningSystemProbes()
+    current_comparisons: set[str] = set()
     working_directories: dict[str, str] = {}
     try:
         values = rebuild_row.config_values(config)
@@ -207,15 +206,16 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
             working_directories[machine] = directory
         _ = rebuild_row.RebuildSettings.read(config)
         compared = answer.compared
-        probes = answer.probes
-        comparison_current = (not answer.refresh_due and isinstance(answer.expected, rebuild_row.ExpectedSystems)
-                              and isinstance(answer.failure, rebuild_row.NoEvaluationFailure))
-        if not comparison_current:
+        if answer.refresh_due:
             unavailable.append(UnavailableSource("rebuild comparison", "The comparison is stale or unavailable."))
         else:
             for machine in ("natedev", "mac"):
-                if not probes.succeeded(machine):
+                if not answer.evaluation_current(machine):
+                    unavailable.append(UnavailableSource("rebuild comparison", f"{machine}: the expected system is unavailable."))
+                elif not answer.probes.succeeded(machine):
                     unavailable.append(UnavailableSource("rebuild comparison", f"{machine}: the running system is unavailable."))
+                else:
+                    current_comparisons.add(machine)
     except (OSError, ValueError, KeyError, TypeError) as error:
         unavailable.append(UnavailableSource("rebuild comparison", str(error)))
 
@@ -226,7 +226,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
         requests = tuple(sorted((*active, *completed), key=lambda request: datetime.fromisoformat(request.created_at)))
         status: Literal["open", "done", "unknown"] = (
             "open" if active or machine in compared else "done"
-            if comparison_current and probes.succeeded(machine) and needs_available else "unknown")
+            if machine in current_comparisons and needs_available else "unknown")
         current = active if active else completed
         reason = "\n".join(f"{request.reason} Requester: {request.requested_by or 'Not recorded'}. "
                            + f"Concerns: {request.concerns or 'Not recorded'}." for request in current)

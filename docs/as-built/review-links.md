@@ -317,10 +317,10 @@ An unavailable live value is `null`.
 The bottom-left `For you` button shows the global action count.
 The collapsed rail keeps an icon and badge.
 The phone header keeps a compact button.
-The nonmodal panel shows two action entries with machine names, copy buttons, and card links.
-The panel footer opens Review with the reserved parameters `type=for-you` and `show=open`.
-The foryou-page phase adds the For you filter and card expansion.
-Notifier links preserve the console query entries for other pages.
+The nonmodal panel shows every open action in source order.
+Each action shows its machine, command, and a Copy button.
+The machine line adds the requester after a dot when a requester exists.
+When the panel reaches its height limit, the entries scroll below the header and note.
 Escape closes the panel and focuses the visible For you button.
 
 `/console/for-you.json` reads the shared action reader and uses `Cache-Control: no-store`.

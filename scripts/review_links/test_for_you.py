@@ -5,7 +5,6 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
@@ -33,7 +32,8 @@ class ForYouTests(unittest.TestCase):
         self.cache = self.root / "comparison"
         self.config = self.root / "statusline.conf"
         _ = self.config.write_text("\n".join((
-            f"rebuild.repo={self.root / 'nixos'}", "rebuild.ref=main", "rebuild.natedev=natedev", "rebuild.mac=MacBook-Pro",
+            f"rebuild.repo={self.root / 'nixos'}", "rebuild.ref=main", "rebuild.ref.mac=origin/main",
+            "rebuild.natedev=natedev", "rebuild.mac=MacBook-Pro",
             f"rebuild.cwd.natedev={self.root / 'nixos'}", "rebuild.cwd.mac=/fixture/mac/nixos",
             "rebuild.ssh=mac", "rebuild.interval=60", "rebuild.eval_timeout=120", "rebuild.eval_retry_seconds=600",
             f"rebuild.cache={self.cache}")), encoding="utf-8")
@@ -47,8 +47,11 @@ class ForYouTests(unittest.TestCase):
         _ = self.enterContext(patch("subprocess.run", side_effect=AssertionError("The reader executed a command.")))
 
     def write_comparison(self, machines: str = "", due: str = "9999999999") -> None:
-        details = {"commit": "a" * 40, "source": [str(self.root / "nixos"), "main", "natedev", "MacBook-Pro"],
-                   "natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac",
+        commit = "a" * 40
+        details = {"commits": {"natedev": commit, "mac": commit},
+                   "source": [str(self.root / "nixos"), "main", "origin/main", "natedev", "MacBook-Pro"],
+                   "paths": {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"},
+                   "failures": {},
                    "running_system_probes": {"natedev": True, "mac": True}}
         _ = self.cache.write_text(f"{machines}\n{due}\n\n{json.dumps(details)}\n", encoding="utf-8")
 
@@ -201,12 +204,30 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(self.read().open_count, for_you.KnownOpenCount(4))
 
     def test_failed_comparison_evaluation_cannot_prove_completion(self) -> None:
-        self.complete_need()
-        answer = rebuild_row.read(self.config)
-        failed = replace(answer, failure=rebuild_row.EvaluationFailure("a" * 40, (), 1.0))
-        with patch.object(rebuild_row, "read", return_value=failed):
-            snapshot = self.read()
-        self.assertEqual(snapshot.rows[0].status, "unknown")
+        self.complete_need("natedev")
+        self.complete_need("mac")
+        local_commit, mac_commit = "b" * 40, "a" * 40
+        paths = {"natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac"}
+        for failed in ("natedev", "mac"):
+            with self.subTest(failed=failed):
+                self.cache.unlink()
+
+                def run(command: list[str], *, timeout: int = 30) -> str:
+                    _ = timeout
+                    if command[0] == "git":
+                        return local_commit if command[-1] == "main^{commit}" else mac_commit
+                    if command[0] == "nix":
+                        machine = "natedev" if f"?rev={local_commit}" in command[-1] else "mac"
+                        return "" if machine == failed else json.dumps({machine: paths[machine]})
+                    return paths["natedev" if command[0] == "realpath" else "mac"]
+
+                rebuild_row.write(self.config, run, clock=lambda: 9_999_999_900)
+                snapshot = self.read()
+                rows = {row.key: row for row in snapshot.rows}
+                for machine in paths:
+                    self.assertEqual(rows[f"rebuild/{machine}"].status, "unknown" if machine == failed else "done")
+                self.assertEqual(snapshot.unavailable, (for_you.UnavailableSource(
+                    "rebuild comparison", f"{failed}: the expected system is unavailable."),))
 
     def test_failed_ssh_comparison_cannot_prove_mac_completion(self) -> None:
         self.complete_need("mac")

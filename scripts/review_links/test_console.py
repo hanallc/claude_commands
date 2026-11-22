@@ -293,18 +293,20 @@ class ForYouNotifierTests(unittest.TestCase):
                                  "/fixture", "sdlc", "Login needs your browser.", "Release check", "",
                                  status, "manual", "")
 
-    def test_notifier_counts_each_open_row_and_limits_the_panel_to_two_entries(self) -> None:
-        rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac"),
-                self.action("action/third"), replace(self.action("action/done"), status="done"))
+    def test_notifier_counts_and_returns_every_open_row_in_order(self) -> None:
+        rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac", requested_by=""),
+                replace(self.action("action/done"), status="done"), self.action("action/third"))
         with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, ())):
             result = console.for_you_payload()
         self.assertTrue(result["available"])
         assert result["available"] is True
         self.assertEqual(result["count"], 3)
-        self.assertEqual(len(result["entries"]), 2)
+        self.assertEqual([entry["key"] for entry in result["entries"]],
+                         ["action/fixture", "rebuild/mac", "action/third"])
         self.assertEqual(result["entries"][1]["machine"], "mac")
-        self.assertEqual(result["entries"][0]["href"],
-                         "?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Ffixture")
+        self.assertEqual(result["entries"][1]["requested_by"], "")
+        for entry in result["entries"]:
+            self.assertNotIn("href", entry)
 
     def test_zero_and_unavailable_counts_have_distinct_answers(self) -> None:
         for failures, available in (((), True), ((for_you.UnavailableSource("fixture", "Read failed."),), False)):
@@ -336,8 +338,8 @@ Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
 const entries=[{key:'rebuild/natedev',kind:'rebuild',title:'Apply the new console settings',command:'rebuild',
- machine:'natedev',requested_by:'watcher',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Drebuild%252Fnatedev'},
- {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Fdemo'}];
+ machine:'natedev',requested_by:'watcher'},
+ {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc'}];
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied=text;}}});
 window.fetch=async(url,options)=>{
  if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
@@ -366,7 +368,8 @@ try{
  mode='good';trigger.click();await flush();
  check(!panel.hidden && trigger.getAttribute('aria-expanded')==='true','the button opens the panel');
  check(trigger.textContent.includes('2') && panel.querySelectorAll('article').length===2,'the count and two entries appear');
- check(panel.textContent.includes('natedev') && panel.textContent.includes('mac'),'the entries name each machine');
+ const machineLines=()=>[...panel.querySelectorAll('[data-entry-machine]')].map(line=>line.textContent);
+ check(machineLines().join('|')==='natedev · watcher|mac · sdlc','rebuild and action entries name their requesters');
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
@@ -469,21 +472,13 @@ try{
  check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
   'an unavailable count replaces a known zero');
  mode='good';dispatchEvent(new Event('focus'));await flush();
- const link=panel.querySelector('[data-for-you-card]');
- check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');
- link.click();await flush();
- const url=new URL(location.href),place=new URL(url.searchParams.get('at.review'),location.origin);
- check(url.searchParams.get('page')==='review' && place.searchParams.get('type')==='for-you' &&
- place.searchParams.get('item')==='rebuild/natedev','a card opens Review with the reserved parameters and key');
- check(panel.hidden,'a card closes the panel');
- check(url.searchParams.get('at.list')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
-  'opening a card preserves unrelated console parameters');
- trigger.click();await flush();
- panel.querySelector('footer a').click();await flush();
- const footerURL=new URL(location.href),footerPlace=new URL(footerURL.searchParams.get('at.review'),location.origin);
- check(footerURL.searchParams.get('at.list')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
-  footerPlace.searchParams.get('type')==='for-you' && !footerPlace.searchParams.has('item'),
-  'opening the footer preserves unrelated parameters and clears the card key');
+ entries[0].requested_by='';dispatchEvent(new Event('focus'));await flush();
+ check(machineLines().join('|')==='natedev|mac · sdlc','a rebuild without a requester shows the machine alone');
+ check(!panel.querySelector('a,footer'),'the panel has no card or footer links');
+ const url=new URL(location.href);
+ check(url.searchParams.get('page')==='list' && url.searchParams.get('at.list')==='/page?filter=mine' &&
+  url.searchParams.get('extra')==='kept','using the panel preserves the List location and other console parameters');
+ panel.querySelector('#close-actions').click();
  if(innerWidth>680){document.getElementById('nav-toggle').click();await flush();
   check(trigger.getBoundingClientRect().width>0 && trigger.querySelector('b').getBoundingClientRect().width>0,'collapsed navigation keeps the icon and badge');
   trigger.click();await flush();

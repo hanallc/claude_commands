@@ -20,8 +20,8 @@ scripts/lib/py -m scripts.for_you.action add \
   --concerns admin-console --dedupe-key github-access
 ```
 
-The filer prints the action key and its Review URL.
-The URL selects `type=for-you`, `show=open`, and `item=<key>`.
+The filer prints only the action key.
+The console For you panel shows the open action.
 The filer never executes the stored command.
 A repeated requester and dedupe key returns the existing open action.
 
@@ -62,16 +62,14 @@ Historical rows use `unknown` when the reader cannot confirm their current state
 
 
 The shell reads `/console/for-you.json` through the shared reader.
-The response contains the complete count and at most two open action entries.
+The response contains the complete count and every open action entry in source order.
 The desktop button uses the approved amber style.
 The collapsed rail keeps the icon and badge.
 The phone header keeps the button visible.
 
-The button opens a nonmodal panel with machine names, copy buttons, and card links.
-Each card link selects Review with `type=for-you`, `show=open`, and the action key.
-The footer opens Review with the reserved parameters and no action key.
-Both links keep other pages’ saved locations.
-The foryou-page phase adds the For you filter and card expansion.
+The button opens a nonmodal panel with machine names, commands, and copy buttons.
+When the panel reaches its height limit, the entries scroll below the header and note.
+The machine line adds the requester after a dot when a requester exists.
 Escape closes the panel and focuses the visible For you button.
 Copy writes the command to the clipboard.
 Copy does not complete the action.

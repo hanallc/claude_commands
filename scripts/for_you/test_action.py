@@ -170,21 +170,17 @@ class ActionTests(unittest.TestCase):
             _ = self.store.mark_done("../other", evidence="Confirmed.")
 
     def test_cli_add_list_and_withdraw_never_execute_command(self) -> None:
-        def card_url(key: str) -> str:
-            return "http://fixture/review?item=" + key
-
-        with patch.object(action, "card_url", side_effect=card_url), \
-                patch("subprocess.run", side_effect=AssertionError("The filer executed a command.")):
+        with patch("subprocess.run", side_effect=AssertionError("The filer executed a command.")):
             result, output = self.cli("add", "--title", "Restore access", "--command", "never-run-this",
                                       "--machine", "mac", "--cwd", "/fixture/repo", "--requested-by", "staff-a",
                                       "--reason", "User access", "--waits", "Release", "--concerns", "console",
                                       "--dedupe-key", "access")
             self.assertEqual(result, 0)
-            key, url = output.splitlines()
-            self.assertIn(key, url)
+            key, = output.splitlines()
             result, output = self.cli("list", "--json")
             self.assertEqual(result, 0)
             records = cast(list[dict[str, object]], json.loads(output))
+            self.assertEqual(records[0]["key"], key)
             self.assertEqual(records[0]["command"], "never-run-this")
             self.assertEqual(self.cli("withdraw", "--id", key, "--requested-by", "staff-a", "--reason", "Cancel."),
                              (0, key + "\n"))
@@ -193,16 +189,6 @@ class ActionTests(unittest.TestCase):
             result, _ = self.cli("withdraw", "--id", key, "--requested-by", "staff-b", "--reason", "Cancel.")
         self.assertEqual(result, 2)
         self.assertIn("Another requester", errors.getvalue())
-
-    def test_card_url_uses_existing_review_path_and_encoded_key(self) -> None:
-        from scripts.review_links import review_link
-
-        key = "action/00000000-0000-0000-0000-000000000001"
-        with patch.object(review_link, "review_root", return_value=self.folder), \
-                patch.dict(os.environ, {"REVIEW_LINKS_HOST": "fixture.invalid"}):
-            url = action.card_url(key)
-        self.assertIn("/console/review.html?type=for-you&show=open&item=action%2F", url)
-        self.assertFalse(self.folder.exists())
 
 
 if __name__ == "__main__":

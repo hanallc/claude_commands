@@ -1,4 +1,4 @@
-"""Compare running systems with main and cache the last rebuild result."""
+"""Compare running systems with their rebuild refs and cache the results."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -13,8 +13,8 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable, Collection, Iterator, Mapping
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import quote
@@ -23,6 +23,8 @@ from scripts.lib import atomic_file, conf_reads
 from scripts.rebuild import need
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+_MACHINES: tuple[need.Machine, ...] = ("natedev", "mac")
+_COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class RebuildSettings:
 
     repo: Path
     ref: str
+    ref_mac: str
     natedev: str
     mac: str
     ssh: str
@@ -41,14 +44,14 @@ class RebuildSettings:
     @classmethod
     def read(cls, path: Path) -> RebuildSettings:
         values = config_values(path)
-        settings = cls(Path(values["rebuild.repo"]), values["rebuild.ref"],
+        settings = cls(Path(values["rebuild.repo"]), values["rebuild.ref"], values["rebuild.ref.mac"],
                        values["rebuild.natedev"], values["rebuild.mac"],
                        values["rebuild.ssh"], int(values["rebuild.interval"]), int(values["rebuild.eval_timeout"]),
                        int(values["rebuild.eval_retry_seconds"]))
         if (not settings.repo.is_absolute() or settings.interval <= 0
                 or settings.eval_timeout <= 0 or settings.eval_retry_seconds <= 0):
             raise ValueError("Invalid rebuild settings")
-        if not all((settings.ref, settings.natedev, settings.mac, settings.ssh)):
+        if not all((settings.ref, settings.ref_mac, settings.natedev, settings.mac, settings.ssh)):
             raise ValueError("Empty rebuild settings")
         return settings
 
@@ -74,13 +77,8 @@ def system_path(value: str) -> bool:
 
 
 @dataclass(frozen=True)
-class NoExpectedSystems:
-    """No evaluation result exists for reuse."""
-
-
-@dataclass(frozen=True)
 class ExpectedSystems:
-    """The expected system paths from one commit and evaluation source."""
+    """The expected paths when both machines use one commit."""
 
     commit: str
     source: tuple[str, ...]
@@ -88,52 +86,35 @@ class ExpectedSystems:
     mac: str
 
     def details(self) -> str:
-        return json.dumps({"commit": self.commit, "source": self.source,
-                           "natedev": self.natedev, "mac": self.mac})
+        return _CachedEvaluations(self.source, dict.fromkeys(_MACHINES, self.commit),
+                                  {"natedev": self.natedev, "mac": self.mac}).details(RunningSystemProbes())
 
 
-@dataclass(frozen=True)
-class NoEvaluationFailure:
-    """No failed evaluation requires a retry delay."""
-
-
-@dataclass(frozen=True)
-class EvaluationFailure:
-    """The commit, source, and completion time of a failed evaluation."""
-
-    commit: str
-    source: tuple[str, ...]
-    failed_at: float
-
-    def details(self) -> str:
-        return json.dumps({"commit": self.commit, "source": self.source, "failed_at": self.failed_at})
-
-
-def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoExpectedSystems,
-                     run: CommandRunner, commit: str) -> ExpectedSystems | NoExpectedSystems:
-    """Reuse a complete evaluation for the resolved commit or evaluate it."""
-    source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
-    if (isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source
-            and system_path(previous.natedev) and system_path(previous.mac)):
-        return previous
+def _evaluate(settings: RebuildSettings, run: CommandRunner, commit: str,
+              machines: Collection[need.Machine]) -> dict[need.Machine, str]:
+    """Evaluate the requested systems from one commit."""
     flake = f"git+file://{quote(str(settings.repo))}?rev={commit}"
+    systems = {
+        "natedev": f"nixosConfigurations.{json.dumps(settings.natedev)}.config.system.build.toplevel.outPath",
+        "mac": f"darwinConfigurations.{json.dumps(settings.mac)}.system.outPath",
+    }
     expression = (
         f"let flake = builtins.getFlake {json.dumps(flake)}; "
         + "pathOrEmpty = value: let result = builtins.tryEval value; "
         + "in if result.success then result.value else \"\"; in { "
-        + f"natedev = pathOrEmpty flake.nixosConfigurations.{json.dumps(settings.natedev)}.config.system.build.toplevel.outPath; "
-        + f"mac = pathOrEmpty flake.darwinConfigurations.{json.dumps(settings.mac)}.system.outPath; }}"
+        + " ".join(f"{machine} = pathOrEmpty flake.{systems[machine]};" for machine in machines)
+        + " }"
     )
     output = run(["nix", "eval", "--json", "--no-write-lock-file", "--expr", expression], timeout=settings.eval_timeout)
     try:
-        paths = cast(dict[str, object], json.loads(output))
-        local, mac = paths["natedev"], paths["mac"]
-        return ExpectedSystems(commit, source,
-                               local if isinstance(local, str) and system_path(local) else "",
-                               mac if isinstance(mac, str) and system_path(mac) else "")
-    except (ValueError, KeyError, TypeError):
-        pass
-    return NoExpectedSystems()
+        value = cast(object, json.loads(output))
+    except ValueError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    paths = cast(dict[str, object], value)
+    return {machine: path for machine in machines
+            if isinstance(path := paths.get(machine), str) and system_path(path)}
 
 
 @dataclass(frozen=True)
@@ -155,35 +136,65 @@ class RunningSystemProbes:
 
 
 @dataclass(frozen=True)
-class RebuildComparison:
-    """Keep the existing status text and the availability of each running system."""
+class _CachedEvaluations:
+    """Keep paths by machine and retry times by commit for one evaluation source."""
 
-    row: str
-    probes: RunningSystemProbes
+    source: tuple[str, ...] = ()
+    commits: dict[need.Machine, str] = field(default_factory=dict)
+    paths: dict[need.Machine, str] = field(default_factory=dict)
+    failures: dict[str, float] = field(default_factory=dict)
+
+    def details(self, probes: RunningSystemProbes) -> str:
+        return json.dumps({**asdict(self), "running_system_probes": asdict(probes)})
+
+    @classmethod
+    def decode(cls, value: dict[str, object]) -> _CachedEvaluations:
+        source = value.get("source")
+        if not isinstance(source, list) or not all(isinstance(part, str) for part in cast(list[object], source)):
+            return cls()
+        commits = value.get("commits")
+        paths = value.get("paths")
+        failures = value.get("failures")
+        if not isinstance(commits, dict) or not isinstance(paths, dict) or not isinstance(failures, dict):
+            return cls()
+        refs = cast(dict[str, object], commits)
+        systems = cast(dict[str, object], paths)
+        retry_times = cast(dict[str, object], failures)
+        resolved: dict[need.Machine, str] = {
+            machine: commit for machine in _MACHINES
+            if isinstance(commit := refs.get(machine), str) and _COMMIT.fullmatch(commit)
+        }
+        return cls(
+            tuple(cast(list[str], source)), resolved,
+            {machine: path for machine in resolved
+             if isinstance(path := systems.get(machine), str) and system_path(path)},
+            {commit: failed_at for commit in set(resolved.values())
+             if isinstance(failed_at := retry_times.get(commit), (int, float)) and 0 <= failed_at < float("inf")},
+        )
 
 
-def compare(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
-            run: Callable[[list[str]], str] = command_output) -> RebuildComparison:
-    """Compare running systems and retain failed probes as unavailable."""
-    items: list[str] = []
-    probes: dict[str, bool] = {}
-    for machine, path, command in (
-        ("natedev", expected.natedev if isinstance(expected, ExpectedSystems) else "",
-         ["realpath", "/run/current-system"]),
-        ("mac", expected.mac if isinstance(expected, ExpectedSystems) else "",
-         ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
-    ):
+def _compare(settings: RebuildSettings, expected: Mapping[need.Machine, str],
+             run: Callable[[list[str]], str]
+             ) -> tuple[tuple[str, ...], RunningSystemProbes]:
+    """Probe the running systems and compare the available paths."""
+    compared: list[str] = []
+    probes: dict[need.Machine, bool] = {}
+    for machine in _MACHINES:
+        command = ["realpath", "/run/current-system"] if machine == "natedev" else [
+            "ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]
         running = run(command)
         probes[machine] = system_path(running)
-        if system_path(path) and system_path(running) and running != path:
-            items.append(f"rebuild {machine}")
-    return RebuildComparison(", ".join(items), RunningSystemProbes(probes["natedev"], probes["mac"]))
+        path = expected.get(machine, "")
+        if probes[machine] and system_path(path) and running != path:
+            compared.append(machine)
+    return tuple(compared), RunningSystemProbes(probes["natedev"], probes["mac"])
 
 
-def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
+def row(settings: RebuildSettings, expected: ExpectedSystems,
         run: Callable[[list[str]], str] = command_output) -> str:
     """Return the existing status text for the current system comparison."""
-    return compare(settings, expected, run).row
+    compared, _ = _compare(settings, {"natedev": expected.natedev, "mac": expected.mac}, run)
+    return RebuildAnswer(compared, False).row()
 
 
 type OpenRebuildNeeds = tuple[need.MachineNeeds, ...]
@@ -212,21 +223,24 @@ class RebuildNeedsUnavailable(_NoKnownRebuildNeeds):
 class RebuildAnswer:
     """The known rebuild machines and whether the cache needs a refresh.
 
-    `compared` holds the machines whose running system differs from main;
+    `compared` holds machines whose running system differs from their rebuild ref.
     `needs` holds the open rebuild records or the reason they are unavailable.
     `probes` records whether each machine supplied a running system path.
     """
 
     machines: tuple[str, ...]
     refresh_due: bool
-    expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
-    failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
+    evaluations: _CachedEvaluations = field(default_factory=_CachedEvaluations)
     compared: tuple[str, ...] = ()
     needs: OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable = RebuildNeedsNotRead()
     probes: RunningSystemProbes = RunningSystemProbes()
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
+
+    def evaluation_current(self, machine: str) -> bool:
+        """Check for a current expected path for this machine."""
+        return not self.refresh_due and machine in self.evaluations.paths
 
 
 def config_values(path: Path) -> dict[str, str]:
@@ -296,16 +310,16 @@ def transcript_session(bridge: str, run: CommandRunner) -> str:
     return sessions[0] if sessions else ""
 
 
-def machine_changes(settings: RebuildSettings, command: list[str], known: dict[str, str],
+def machine_changes(settings: RebuildSettings, ref: str, command: list[str], known: dict[str, str],
                     run: CommandRunner) -> tuple[Change, ...] | None:
     """List the commits on the configured ref after the machine's last switch, or None when unknown."""
     lines = run(command).splitlines()
     commit = switched_commit("\n".join(lines[1:]), lines[0]) if lines else ""
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+    if not _COMMIT.fullmatch(commit):
         return None
     listing = run(["git", "-C", str(settings.repo), "log",
                    "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
-                   f"{commit}..{settings.ref}"])
+                   f"{commit}..{ref}"])
     changes: list[Change] = []
     for line in listing.splitlines():
         fields = line.split("\x1f")
@@ -342,9 +356,9 @@ def write_changes(config: Path, run: CommandRunner = command_output) -> None:
         # A machine that does not answer keeps its last list.
         previous = read_changes(config)
         machines: dict[str, list[dict[str, str]]] = {}
-        for machine, command in (("natedev", ["sh", "-c", script]),
-                                 ("mac", ["ssh", "-o", "BatchMode=yes", settings.ssh, script])):
-            changes = machine_changes(settings, command, known, run)
+        for machine, ref, command in (("natedev", settings.ref, ["sh", "-c", script]),
+                                      ("mac", settings.ref_mac, ["ssh", "-o", "BatchMode=yes", settings.ssh, script])):
+            changes = machine_changes(settings, ref, command, known, run)
             if changes is None:
                 changes = previous.get(machine)
             if changes is not None:
@@ -395,8 +409,7 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
-        expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
-        failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
+        evaluations = _CachedEvaluations()
         probes = RunningSystemProbes()
         if len(lines) >= 4:
             try:
@@ -404,21 +417,14 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
                 if not isinstance(value, dict):
                     raise ValueError("The comparison details must be an object.")
                 details = cast(dict[str, object], value)
+                if "commit" in details:
+                    return RebuildAnswer((), True)
                 probes = RunningSystemProbes.decode(details.get("running_system_probes"))
-                commit, source = details["commit"], details["source"]
-                if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
-                        and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))):
-                    failed_at = details.get("failed_at")
-                    if isinstance(failed_at, (float, int)) and 0 <= failed_at < float("inf"):
-                        failure = EvaluationFailure(commit, tuple(cast(list[str], source)), failed_at)
-                    else:
-                        local, mac = details["natedev"], details["mac"]
-                        if isinstance(local, str) and system_path(local) and isinstance(mac, str) and system_path(mac):
-                            expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
+                evaluations = _CachedEvaluations.decode(details)
             except (ValueError, KeyError, TypeError):
                 pass
         compared = tuple(item.removeprefix("rebuild ") for item in items)
-        return RebuildAnswer(compared, refresh_due, expected, failure, compared, probes=probes)
+        return RebuildAnswer(compared, refresh_due, evaluations, compared, probes=probes)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
@@ -440,6 +446,49 @@ def write_status_cache(cache: Path, line: str, due: str, sources: list[Path], be
     _ = scratch.replace(cache)
 
 
+def _refresh_comparison(settings: RebuildSettings, answer: RebuildAnswer, run: CommandRunner,
+                        clock: Callable[[], float]) -> RebuildAnswer:
+    """Compare systems after evaluating or reusing the paths for each commit."""
+    source = (str(settings.repo), settings.ref, settings.ref_mac, settings.natedev, settings.mac)
+    previous = answer.evaluations
+    if previous.source != source:
+        previous = _CachedEvaluations()
+    refs = (settings.ref, settings.ref_mac)
+    resolved_refs = {ref: run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{ref}^{{commit}}"])
+                     for ref in dict.fromkeys(refs)}
+    resolved: dict[need.Machine, str] = {
+        machine: resolved_refs[ref] for machine, ref in zip(_MACHINES, refs, strict=True)
+        if _COMMIT.fullmatch(resolved_refs[ref])
+    }
+    commits: dict[need.Machine, str] = {
+        machine: commit for machine, commit in previous.commits.items() if commit in previous.failures
+    }
+    commits.update(resolved)
+    current = _CachedEvaluations(source, commits)
+    groups: dict[str, list[need.Machine]] = {}
+    for machine in _MACHINES:
+        if machine in commits:
+            groups.setdefault(commits[machine], []).append(machine)
+    for commit, machines in groups.items():
+        for machine in machines:
+            if previous.commits.get(machine) == commit and machine in previous.paths and machine in resolved:
+                current.paths[machine] = previous.paths[machine]
+        missing: list[need.Machine] = [machine for machine in machines if machine not in current.paths]
+        if not missing:
+            continue
+        requested: list[need.Machine] = [machine for machine in missing if machine in resolved]
+        failed_at = previous.failures.get(commit)
+        if failed_at is not None and (not requested or clock() < failed_at + settings.eval_retry_seconds):
+            current.failures[commit] = failed_at
+        elif requested:
+            paths = _evaluate(settings, run, commit, requested)
+            current.paths.update(paths)
+            if len(paths) != len(requested):
+                current.failures[commit] = clock()
+    compared, probes = _compare(settings, current.paths, run)
+    return RebuildAnswer(compared, False, current, compared, probes=probes)
+
+
 def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
     try:
@@ -456,34 +505,15 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
         if not answer.refresh_due:
             return
         began = time.time_ns()
-        line, due, details = "", "", ""
-        probes = answer.probes
-        if isinstance(answer.failure, EvaluationFailure):
-            line, details = answer.row(), answer.failure.details()
+        line = due = details = ""
         try:
             settings = RebuildSettings.read(config)
-            commit = run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{settings.ref}^{{commit}}"])
-            source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
-            failure = answer.failure
-            if (isinstance(failure, EvaluationFailure) and failure.commit == commit and failure.source == source
-                    and clock() < failure.failed_at + settings.eval_retry_seconds):
-                line, details = answer.row(), failure.details()
-            elif re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
-                expected = expected_systems(settings, answer.expected, run, commit)
-                evaluated_at = clock()
-                comparison = compare(settings, expected, run)
-                line, probes = comparison.row, comparison.probes
-                if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
-                    details = expected.details()
-                else:
-                    details = EvaluationFailure(commit, source, evaluated_at).details()
+            current = _refresh_comparison(settings, answer, run, clock)
+            line = current.row()
+            details = current.evaluations.details(current.probes)
             due = str(int(clock()) + settings.interval)
         except (OSError, ValueError, KeyError):
             pass
-        if details:
-            fields = cast(dict[str, object], json.loads(details))
-            fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
-            details = json.dumps(fields)
         write_status_cache(cache, line, due, [config], began, details)
 
 

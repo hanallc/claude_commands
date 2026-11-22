@@ -188,7 +188,7 @@ def icon_svg(name: str) -> str:
 
 
 class ForYouEntry(TypedDict):
-    """One short action entry with a console card link."""
+    """One action entry in the For you panel."""
 
     key: str
     kind: str
@@ -196,7 +196,6 @@ class ForYouEntry(TypedDict):
     command: str
     machine: str
     requested_by: str
-    href: str
 
 
 class CompleteForYouCount(TypedDict):
@@ -207,7 +206,7 @@ class CompleteForYouCount(TypedDict):
 
 
 class CompleteForYouPayload(CompleteForYouCount):
-    """The complete count and at most two short entries."""
+    """The complete count and all open entries."""
 
     entries: list[ForYouEntry]
 
@@ -236,13 +235,11 @@ def for_you_payload() -> ForYouPayload:
     count = for_you_count(snapshot)
     if count["available"] is False:
         return count
-    entries: list[ForYouEntry] = []
-    for row in (row for row in snapshot.rows if row.status == "open"):
-        if len(entries) == 2:
-            break
-        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
-        entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
-                        "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
+    entries: list[ForYouEntry] = [
+        {"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
+         "machine": row.machine, "requested_by": row.requested_by}
+        for row in snapshot.rows if row.status == "open"
+    ]
     return {**count, "entries": entries}
 
 
@@ -311,23 +308,23 @@ border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);
 .collapsed .for-you-button b{position:absolute;top:3px;right:2px;min-width:17px;line-height:17px;font-size:11px;padding:0 3px}
 .collapsed .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
 #action-popover{--popover-left:256px;position:fixed;left:var(--popover-left);bottom:24px;
- width:min(460px,calc(100vw - var(--popover-left) - 12px));max-height:calc(100dvh - 48px);overflow:auto;z-index:10;
+ width:min(460px,calc(100vw - var(--popover-left) - 12px));max-height:calc(100dvh - 48px);z-index:10;
+display:flex;flex-direction:column;overflow:hidden;
 border:1px solid var(--border);border-radius:12px;background:var(--nav);color:var(--text);box-shadow:0 16px 54px #0008}
 .collapsed~#action-popover{--popover-left:84px}
-#action-popover header{display:flex;align-items:center;justify-content:space-between;padding:17px 20px 0;font-size:17px}
+#action-popover header{flex:none;display:flex;align-items:center;justify-content:space-between;padding:17px 20px 0;font-size:17px}
 #action-popover header span{margin-left:5px;color:var(--notice-text)}
 #action-popover header button{background:none;border:0;border-radius:6px;color:var(--muted);font-size:24px;line-height:28px;width:28px;padding:0;cursor:pointer}
-#action-popover .panel-note{margin:5px 20px 14px;font-size:13px;color:var(--muted)}
+#action-popover .panel-note{flex:none;margin:5px 20px 14px;font-size:13px;color:var(--muted)}
+#action-popover [data-for-you-entries]{overflow:auto}
 #action-popover article{padding:18px 20px;border-top:1px solid var(--border)}
 .short-head{display:flex;align-items:center;gap:9px;font-size:14px}.short-head svg{width:17px;height:17px;color:var(--notice-text)}
 .short-head strong{overflow-wrap:anywhere}
 #action-popover article p{margin:5px 0 12px 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
-#action-popover .code-block{margin:0 0 10px}
+#action-popover .code-block{margin:0}
 #action-popover pre{border:1px solid var(--border);background:var(--page);border-radius:6px;margin:0;padding:12px 48px 12px 13px;
 font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 #action-popover [data-copy-code]{opacity:1;color:var(--muted)}
-#action-popover a{color:var(--accent);font-size:13px;text-decoration:none}
-#action-popover footer{padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
 .mobile-header .for-you-button{display:none}
 @media /* Phone query */{.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
 .mobile-header .for-you-button svg{width:16px;height:16px}.mobile-header .for-you-label{display:inline}
@@ -337,7 +334,7 @@ font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 '''
 
 FOR_YOU_SCRIPT = r'''
-function createForYouNotifier(openCard){
+function createForYouNotifier(){
  const triggers=[...document.querySelectorAll('[data-for-you-toggle]')],panel=document.getElementById('action-popover');
  const entries=panel.querySelector('[data-for-you-entries]'),note=panel.querySelector('[data-for-you-note]');
  let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
@@ -349,18 +346,6 @@ function createForYouNotifier(openCard){
   }
   return false;
  }
- function actionURL(href){
-  const url=new URL(location.href);
-  const destination=new URL(href,url);
-  url.searchParams.set('page','review');
-  url.searchParams.set('at.review',destination.searchParams.get('at.review'));
-  return url;
- }
- function syncLinks(){
-  for(const link of panel.querySelectorAll('[data-for-you-card]')){
-   link.href=actionURL(link.href).href;
-  }
- }
  function showEntries(items){
   const value=JSON.stringify(items);
   if(value===displayed || entries.contains(document.activeElement)) return;
@@ -370,9 +355,8 @@ function createForYouNotifier(openCard){
    article.querySelector('strong').textContent=item.title;
    article.querySelector('[data-entry-rebuild]').hidden=item.kind!=='rebuild';
    article.querySelector('[data-entry-action]').hidden=item.kind==='rebuild';
-   article.querySelector('[data-entry-machine]').textContent=item.machine+' · '+item.requested_by;
+   article.querySelector('[data-entry-machine]').textContent=item.requested_by ? item.machine+' · '+item.requested_by : item.machine;
    article.querySelector('code').textContent=item.command;
-   article.querySelector('a').href=actionURL(item.href).href;
    return article;
   });
   entries.replaceChildren(...nodes);displayed=value;
@@ -432,7 +416,7 @@ function createForYouNotifier(openCard){
  }
  triggers.forEach(button=>button.addEventListener('click',()=>{
   if(!panel.hidden){close();return;}
-  opener=button;syncLinks();panel.hidden=false;triggers.forEach(item=>item.setAttribute('aria-expanded','true'));refresh();
+  opener=button;panel.hidden=false;triggers.forEach(item=>item.setAttribute('aria-expanded','true'));refresh();
  }));
  document.getElementById('close-actions').addEventListener('click',close);
  function escape(event){
@@ -441,11 +425,6 @@ function createForYouNotifier(openCard){
   event.preventDefault();event.stopPropagation();close();
  }
  addEventListener('keydown',escape,true);
- panel.addEventListener('click',event=>{
-  const link=event.target.closest?.('[data-for-you-card]');
-  if(!link || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-  event.preventDefault();close();openCard(actionURL(link.href));
- });
  const release=()=>drawPanel(last ? String(last.count) : '?');
  entries.addEventListener('focusout',()=>queueMicrotask(release));
  document.addEventListener('selectionchange',release);
@@ -458,7 +437,7 @@ function createForYouNotifier(openCard){
   }
  });
  draw();
- return {refresh,escape,syncLinks};
+ return {refresh,escape};
 }
 '''
 
@@ -556,12 +535,11 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
 <p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
 <div data-for-you-entries></div>
-<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
 <p data-entry-machine></p><div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
-<a data-for-you-card>Open card →</a></article></template>
+</article></template>
 <script>
 <!-- FOR YOU SCRIPT -->
 (() => {
@@ -622,7 +600,6 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (place === entry.dataset.url) url.searchParams.delete(placeKey(entry.dataset.page));
     else url.searchParams.set(placeKey(entry.dataset.page), place);
     history.replaceState(state, '', url);
-    actions.syncLinks();
   }
   function frameFor(entry) {
     let frame = frames.get(entry.dataset.page);
@@ -704,7 +681,6 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const url = new URL(location.href);
     url.searchParams.set('page', selected.dataset.page);
     history.replaceState(history.state, '', url);
-    actions.syncLinks();
     const path = selected.dataset.url;
     frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });
     document.getElementById('page-unavailable').hidden = Boolean(path);
@@ -764,12 +740,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));
     } catch (_) {}
   }
-  const actions = createForYouNotifier(url => {
-    history.replaceState(null, '', url);
-    const place = url.searchParams.get('at.review');
-    if (frames.has('review') && place) frames.get('review').src = place;
-    select('review', true);
-  });
+  const actions = createForYouNotifier();
   select(new URL(location.href).searchParams.get('page'));
   function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }
   function scheduleRebuilds() {
