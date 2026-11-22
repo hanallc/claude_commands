@@ -47,6 +47,16 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the numbered copy root.
 Its Git children inherit the destination lease and busy lock.
+Before `copies.py clone` creates a checkout, it selects clone folders by the owner's prefix.
+The task record ties each clone path to its owner, repository, and session.
+The guard checks that identity against the local mirror record and any readable registry record for that path.
+A clone without `--owner` uses the caller's owner when available and needs no remote registry write.
+The maker marks its setup lease as released when setup completes.
+The clone record stays for later leases.
+The guard probes the folder lock without delay.
+It refuses only when the folder lease proves that the holder ended or the PID was reused.
+The refusal lists each path and gives one `copies.py mirror-remove` command for it.
+Removal uses the scratch coordinator for clones in both the scratch root and session folders.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.
