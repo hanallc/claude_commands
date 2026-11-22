@@ -29,7 +29,7 @@ from scripts.build_queue.queue_fixture import fixture_reservation, head_reading,
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport
-from scripts.buildlog import repository, store
+from scripts.buildlog import machine_facts, repository, store
 from scripts.lib import conf, process_start
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -897,3 +897,61 @@ class BuildLimitsTests(unittest.TestCase):
                 self.assertNotIn('class="build-limit-mark ', rendered)
                 self.assertNotIn("lucide-loader-circle", rendered)
                 self.assertNotIn("running", rendered)
+
+
+class MachineFactsLineTests(unittest.TestCase):
+    """The facts line under each machine heading, from the saved machine facts."""
+
+    def saved(self, written: float = 1000.0) -> machine_facts.SavedFacts:
+        return {"version": machine_facts.VERSION, "written": written, "machines": {
+            "natedev": machine_facts.facts("read", load=52.71, cpus=32, battery={"percent": 100, "mains": True}),
+            "mac": machine_facts.facts("read", link_ms=3.2, load=19.56, cpus=12, battery={"percent": 85, "mains": False}),
+            "aws": machine_facts.facts("no_box")}}
+
+    def line(self, saved: machine_facts.SavedFacts | None, machine: str, now: float = 1000.0) -> str:
+        return limits_view.facts_line(saved, machine, now, UTC)
+
+    def test_each_machine_shows_its_line(self) -> None:
+        saved = self.saved()
+        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32 · battery 100% (mains)")
+        self.assertEqual(self.line(saved, "mac"), "link 3 ms · load 19.6/12 · battery 85% (on battery)")
+        self.assertEqual(self.line(saved, "aws"), "no box running")
+
+    def test_failures_show_their_words(self) -> None:
+        saved = self.saved()
+        saved["machines"].update(
+            natedev=machine_facts.facts("read", load=52.71, cpus=32),
+            mac=machine_facts.facts("unreachable", detail="timed out"),
+            aws=machine_facts.facts("failed", detail="ledger evidence is unavailable"))
+        self.assertEqual(self.line(saved, "natedev"), "load 52.7/32")
+        self.assertEqual(self.line(saved, "mac"), "link unreachable")
+        self.assertEqual(self.line(saved, "aws"), "facts unreadable")
+        saved["machines"]["mac"] = machine_facts.facts("read", link_ms=0.4, detail="Permission denied (publickey).")
+        self.assertEqual(self.line(saved, "mac"), "link <1 ms · load unreadable")
+
+    def test_stale_and_missing_facts(self) -> None:
+        saved = self.saved(written=datetime(2026, 11, 22, 14, 5, tzinfo=UTC).timestamp())
+        fresh = saved["written"] + machine_facts.STALE_SECONDS
+        self.assertEqual(self.line(saved, "mac", fresh), "link 3 ms · load 19.6/12 · battery 85% (on battery)")
+        self.assertEqual(self.line(saved, "mac", fresh + 1), "facts not sampled since 14:05")
+        self.assertEqual(self.line(None, "natedev"), "facts not sampled")
+        del saved["machines"]["aws"]
+        self.assertEqual(self.line(saved, "aws", saved["written"]), "facts not sampled")
+
+    def test_build_limits_carries_the_lines_to_the_page(self) -> None:
+        reading = head_reading()
+        saved = self.saved(written=reading.explanation.now)
+        background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None))
+        shown = limits_view.build_limits(reading, (), (), {}, {}, background, UTC, facts=saved)
+        self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
+                         ("load 52.7/32 · battery 100% (mains)",
+                          "link 3 ms · load 19.6/12 · battery 85% (on battery)", "no box running"))
+        missing = limits_view.build_limits(reading, (), (), {}, {}, background, UTC)
+        self.assertEqual(missing.aws.facts, "facts not sampled")
+        rendered = test_memory_hover.MemoryHoverTests().page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return $('build-limits-content').innerHTML;
+        })()""", {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True)
+        assert isinstance(rendered, str)
+        self.assertIn('<div class="build-limit-facts">link 3 ms · load 19.6/12 · battery 85% (on battery)</div>', rendered)
+        self.assertIn('<div class="build-limit-facts">no box running</div>', rendered)

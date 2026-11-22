@@ -446,6 +446,16 @@ A failed query raises `AdmissionUnavailable` within the query bound. Commands pr
 The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
+The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
+`limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
+Examples: natedev `load 52.7/32 · battery 100% (mains)`, Mac `link 3 ms · load 19.6/12 · battery 85% (on battery)`, AWS `no box running`.
+natedev has no link part. A machine without a battery has no battery part.
+A failed TCP connect shows `link unreachable`. A failed SSH command after a good connect shows `link 3 ms · load unreadable`.
+A running AWS gate box shows `box running · no link or load reading`, because its security group accepts no inbound connection.
+A probe that cannot start shows `facts unreadable`.
+A missing or invalid file shows `facts not sampled`.
+Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
 `can run on` is one line that names the targets that can take the step now.

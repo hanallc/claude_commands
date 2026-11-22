@@ -16,6 +16,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/health.py` | Recorder health: `calculate_snapshot()`, `write_snapshot()`, `read_snapshots()` and the freshness states (below). |
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, the one filesystem capacity and device reader. It imports `cgroup_capture` only. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command), the parsers `parse_meminfo`, `parse_pressure`, `parse_cpu_ticks` and `parse_boot_id`, the readers `read_pressure` and `read_cpu_ticks`, and `read_power_profile` with its path `POWER_PROFILE_STATE`. The `/proc` paths are module values (`MEMINFO`, `PRESSURE`, `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`, `BOOT_ID`) that tests patch. Also the types `MachineMemoryUse`, `StallTotals`, `PartialStallTotals` (shared by memory, CPU and IO), `CpuTicks`, `PowerProfile` and `Unmeasured`. |
+| `scripts/buildlog/machine_facts.py` | `sample_once(path, at, probes)` saves the machine facts file; `read_facts(path)` reads it for the Builds feed. `Probes` holds the command runner, the TCP connect, `/proc/loadavg`, the CPU count, the Mac link settings and the gate box reader, which tests replace. `STALE_SECONDS` is three timer periods. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. `append_line`, `locked_append`, `last_whole_row_end` and `read_last_whole_row_end` keep each monthly file whole (below). `note_error(context)` writes one timestamped line to `errors.log`. |
 | `scripts/buildlog/index.py` | The schema number is in [build-memory-admission.md](build-memory-admission.md). This module owns the step stall columns, `SAMPLE_COLUMNS`, `samples`, `add_sample`, `samples_host_at`, and `steps_host_started`. |
 | `scripts/buildlog/cli.py` | The `sample` command takes no arguments and exits 2 if given any. `usage-hours [YYYY-MM-DD]` reports the preceding 24 hours. |
@@ -89,6 +90,19 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 3. The `samples` table stores the machine counters, power profile, slices, filesystem, jobserver, and zram.
    The resource objects use JSON `TEXT` columns.
    The index uses `(host, at)`. Older source rows retain NULL for fields that they lack.
+
+### Machine facts: `buildlog sample` → `~/.local/state/machine-facts.json`
+
+On natedev, `buildlog sample` then calls `machine_facts.sample_once(state_path(), at)`.
+`MACHINE_FACTS_FILE` moves the file; the default is beside the `BUILDLOG_DIR` folder.
+The pass probes three machines in parallel threads. Each machine records its own state, so one failed probe keeps the others.
+- natedev: the 1-minute load from `/proc/loadavg`, `os.cpu_count()`, and the UPS from `upsc cyberpower` (`battery.charge`; `ups.status` `OL` is mains, `OB` is battery). Without `upsc` there is no battery.
+- Mac: `ssh -G <host>` resolves the `mac_test.conf` `host` alias. A TCP connect to its SSH port gives `link_ms`, with `connect_timeout_s`. A failed connect records `unreachable`. Then one SSH call, with `probe_timeout_s`, runs `sysctl -n vm.loadavg hw.ncpu; pmset -g batt`. A Mac without `InternalBattery` in `pmset` has no battery.
+- AWS: the newest `GateRunning` reservation in the cost ledger that has not expired. No such box records `no_box`. A running box records `unreachable`: `GateSecurityGroup` has egress rules only, so natedev cannot connect to it.
+The file is `{"version":1,"written":<epoch>,"machines":{"natedev"|"mac"|"aws":{"state","link_ms","load","cpus","battery","detail"}}}`.
+`state` is `read`, `unreachable`, `no_box` or `failed`; `battery` is `{"percent","mains"}` or `null`.
+A failed write prints `buildlog sample: machine facts not saved: <error>` and the sample still exits 0.
+The slowest probe sets the pass time: at most `connect_timeout_s` plus `probe_timeout_s` for the Mac.
 
 ### Hourly Rust cache readings
 
