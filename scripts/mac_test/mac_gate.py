@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 from typing import cast, override
+from uuid import uuid4
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -332,7 +333,17 @@ def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
 
 
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
-    remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
+    source_attempt = attempt_name(folder)
+    attempt_file = argv_file.with_suffix('.json.attempt')
+    if phase == 'prepare':
+        remote_attempt = f'{source_attempt}_{uuid4().hex}'
+        write_text_atomic(attempt_file, remote_attempt)
+    else:
+        try:
+            remote_attempt = attempt_file.read_text()
+        except FileNotFoundError:
+            remote_attempt = source_attempt
+    remote = f'{REMOTE_ROOT}/{attempt_name(Path(remote_attempt))}'
     root = '"$HOME"/' + shlex.quote(remote)
     python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
     runner = f'{python} {root}/mac_gate.py'
@@ -385,7 +396,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     write_text_atomic(checkout_file, checkout)
     _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
     mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
-                                 task=checkout_task(folder))
+                                 task=checkout_task(Path(remote)))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
     copies.register_remote(mirror)
     copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)

@@ -34,7 +34,7 @@ from typing import TextIO, TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
-from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
@@ -311,8 +311,11 @@ def wait_to_retry() -> None:
 
 def run(args: Arguments) -> int:
     since = time.time()
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    owner = OwningSession(session) if session else NoOwningSession()
+    owner = owning_session() if args.kind == "run" else NoOwningSession()
+    if isinstance(owner, NoOwningSession):
+        session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        if session:
+            owner = OwningSession(session)
     announced = False
     reported_block = False
     try:
@@ -326,6 +329,9 @@ def run(args: Arguments) -> int:
                 if isinstance(result, int):
                     return result
                 block = result
+            block = mac_test.lift_expired_claim_block(claim_state.state_paths(), owner, block)
+            if isinstance(block, claim_state.NoMacBlock):
+                continue
             if not reported_block:
                 holder = mac_test.holder_name(block.holder)
                 reason = " ".join(block.reason.splitlines())
@@ -383,8 +389,9 @@ def run_attempt(
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
                 clean_ended_runs(callback_environment)
+                block = blocking_run(args, owner)
                 on_close = ""
-                if args.lifecycle_script:
+                if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
@@ -401,7 +408,7 @@ def run_attempt(
                             fcntl.flock(lease_descriptor, fcntl.LOCK_EX)
                 else:
                     status = 0
-                if status == 0:
+                if status == 0 and isinstance(block, claim_state.NoMacBlock):
                     block = blocking_run(args, owner)
                     if isinstance(block, claim_state.NoMacBlock):
                         # Record failure until the Mac reports an exit status.

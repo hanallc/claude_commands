@@ -26,10 +26,13 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
-`mac_queue_run.py --kind run` checks the Mac block before placement and before it starts remote work.
-The block holder can start a run.
+`mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
+The run uses the holding unit's session for the block check and the placement request.
+Workers of that unit can start a run during its block.
 Other sessions see one wait line with the holder and reason.
 The run returns any placement before it waits for the block to clear.
+The wait can lift an expired block through the Mac block expiry procedure.
+A failed CI restore keeps the block in place.
 `--no-wait` reports the block and exits with status 78.
 
 Doc uses a snapshot of the staged tree.
@@ -434,6 +437,8 @@ An interrupted run stops and reaps both log readers after recording its result. 
 
 An active Mac gate uses the lifecycle script that started the run.
 Its close hook stops the attempt with the script uploaded to the Mac during preparation.
+Each preparation records its own Mac attempt directory.
+A retry uses a fresh directory even if cleanup retains the previous checkout.
 When a later queue run finds an ended gate, it calls the installed natedev lifecycle script.
 The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.

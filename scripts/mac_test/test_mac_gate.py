@@ -377,7 +377,8 @@ class MacGateTests(unittest.TestCase):
         clone = self.exercise_bundle(self.repo, folder, request, expected=False)
 
         home = self.root / 'mac home'
-        remote = home / mac_gate.REMOTE_ROOT / folder.name
+        argv_file = folder / 'argv.json'
+        remote = home / mac_gate.REMOTE_ROOT / argv_file.with_suffix('.json.attempt').read_text()
         entry = remote / 'mac_gate.py'
         remote.mkdir(parents=True)
         entry.with_suffix('.py.new').touch()
@@ -389,7 +390,6 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 """)
         environment = {**os.environ, 'HOME': str(home), 'ZDOTDIR': str(home),
                        'PYTHONPATH': str(self.root / 'local-pythonpath')}
-        argv_file = folder / 'argv.json'
         stage = cast(list[str], json.loads(argv_file.read_text()))
         self.assertEqual(stage[:2], ['/bin/zsh', '-c'])
         stop = argv_file.with_suffix('.json.close').read_text()
@@ -405,8 +405,31 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                 self.assertEqual(json.loads(result.stdout),
                                  [str(home / '.claude'), str(entry), action, str(remote), *arguments])
 
-    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *, expected: bool) -> str:
-        argv_file = folder / 'argv.json'
+    def test_prepare_after_retained_cleanup_uses_a_fresh_remote_attempt(self) -> None:
+        folder = self.root / 'mac-gate-fixture'
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
+        cloud_gate.save(folder / 'request.json', request)
+        _ = self.exercise_bundle(self.repo, folder, request, expected=False)
+        first = folder / 'argv.json'
+        first_attempt = first.with_suffix('.json.attempt').read_text()
+        retained = subprocess.CompletedProcess(['ssh'], 0, mac_gate.CheckoutCleanup.RETAINED + '\n', '')
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(subprocess, 'run', return_value=retained) as ssh):
+            self.assertEqual(mac_gate.lifecycle('cleanup', first, folder, '1'), 0)
+        cleanup_command = cast(list[str], ssh.call_args.args[0])
+        self.assertIn(first_attempt, cleanup_command[-1])
+        retry = folder / 'retry.json'
+        retry_command = self.exercise_bundle(self.repo, folder, request, expected=False, argv_file=retry)
+        retry_attempt = retry.with_suffix('.json.attempt').read_text()
+        self.assertNotEqual(first_attempt, retry_attempt)
+        self.assertIn(retry_attempt, retry_command)
+        self.assertIn(retry_attempt, retry.with_suffix('.json.close').read_text())
+        self.assertEqual(first.with_suffix('.json.attempt').read_text(), first_attempt)
+
+    def exercise_bundle(self, clone: Path, folder: Path, request: dict[str, object], *,
+                        expected: bool, argv_file: Path | None = None) -> str:
+        if argv_file is None:
+            argv_file = folder / 'argv.json'
         _ = (folder / 'local-repo').write_text(str(self.repo))
         captured = subprocess.run
         clone_commands: list[str] = []
@@ -448,9 +471,10 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
               mock.patch.object(subprocess, 'run', side_effect=send)):
             self.assertEqual(mac_gate.lifecycle('prepare', argv_file, folder, '1'), 0)
         self.assertEqual(reconciled_hosts, ['fixture-mac'])
+        attempt = argv_file.with_suffix('.json.attempt').read_text()
         self.assertEqual(registered, [
             copies.RemoteMirror('fixture-owner', copies.SelectedRepository('fixture-project'),
-                                'fixture-mac', str(clone), folder.name, task='gate:' + folder.name),
+                                'fixture-mac', str(clone), folder.name, task='gate:' + attempt),
         ])
         self.assertEqual(argv_file.with_suffix('.json.checkout').read_text(), str(clone))
         self.assertEqual(argv_file.with_suffix('.json.lease').read_text(), str(lease))

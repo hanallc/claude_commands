@@ -541,6 +541,19 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
     return block
 
 
+def lift_expired_claim_block(
+    paths: StatePaths, session: SubmittingSession, block: PendingMacBlock | ActiveMacBlock,
+) -> MacBlockState:
+    if utc_now() < block.expires:
+        return block
+    with locked(paths.control_lock):
+        current = blocking_claim_block(paths, session)
+        if isinstance(current, NoMacBlock) or utc_now() < current.expires:
+            return current
+        target = paths.target if paths.registry_selected else ""
+        return expire_block(paths, read_config(target), (), current).block
+
+
 def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
     print(f"blocked by {holder_name(block.holder)}: {block.reason}")
     return ClaimFinished(10)
