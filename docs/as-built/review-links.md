@@ -1504,7 +1504,7 @@ It fits the view with a 16px margin and never exceeds the image's natural size.
 Escape or a click on the backdrop or image closes it.
 In a pair zoom, a label above the image says Before or After.
 The left arrow key shows the before image and the right arrow key shows the after image.
-The page keeps its scroll position and returns focus to the link of the image shown last.
+The page keeps its scroll position and returns focus to the image link that opened the zoom.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
 Middle clicks and the right-click menu retain the browser's link action.
 `page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.

@@ -135,7 +135,7 @@ def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
              *, before: Path | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
-        raise ValueError("the caption is empty; say the change in a few plain words")
+        raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),

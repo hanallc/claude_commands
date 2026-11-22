@@ -1664,9 +1664,8 @@ class ImagePairTests(ImagesFixture):
 (async () => {
  const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
  const zoom = document.querySelector('[data-image-zoom-dialog]');
- const label = zoom.querySelector('[data-image-zoom-label]');
+ const label = zoom.querySelector('[data-image-zoom-caption]');
  const [before, after] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
- const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
  const press = key => zoom.dispatchEvent(new KeyboardEvent('keydown', {key, bubbles:true, cancelable:true}));
  const shows = (link, text, step) => {
   check(zoom.open && zoom.querySelector('img').src === link.href, step + ' shows the ' + text + ' picture');
@@ -1683,8 +1682,16 @@ class ImagePairTests(ImagesFixture):
  shows(before, 'Before', 'The left arrow on the first picture');
  press('ArrowRight');
  shows(after, 'After', 'The right arrow');
+ zoom.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowLeft', altKey:true, bubbles:true, cancelable:true}));
+ shows(after, 'After', 'Alt and the left arrow');
+ const list = document.querySelector('[data-images]');
+ list.replaceWith(list.cloneNode(true));
+ const [freshBefore, freshAfter] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
+ press('ArrowLeft');
+ shows(freshBefore, 'Before', 'The left arrow after a page refresh');
  press('Escape');
- check(!zoom.open && document.activeElement === after, 'Escape returns focus to the shown picture');
+ check(!zoom.open && document.activeElement === freshAfter, 'Escape returns focus to the link that opened the zoom');
+ const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
  single.click();
  check(zoom.open && label.hidden && label.textContent === '', 'A single image has no label');
  press('ArrowLeft');
