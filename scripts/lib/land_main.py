@@ -124,7 +124,7 @@ def checked_git(checkout: Path, *arguments: str,
 
 def remote_branch_commit(checkout: Path, remote: str, branch: str, *,
                          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
-    """Fetch and return the exact commit that the remote advertises for the branch."""
+    """Return the exact commit that the remote advertises for the branch."""
     return remote_branch_tip(checkout, remote, branch, time_limit=time_limit).commit
 
 
@@ -140,7 +140,7 @@ class AdvertisedBranchTip:
 
 def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBranch, *,
                       time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> AdvertisedBranchTip:
-    """Read and fetch one advertised branch tip without updating local refs."""
+    """Resolve one advertised branch tip without updating local refs."""
     # The snapshot protects against fetches in this checkout.
     # Another clone can still publish a different commit after ls-remote.
     default = isinstance(branch, RemoteDefaultBranch)
@@ -169,12 +169,13 @@ def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBr
             raise LandError(f"{remote}: expected one symbolic HEAD branch")
         branch = targets[0]
     sha = matching_shas[0]
-    _ = checked_git(checkout, "-c", "remote.origin.followRemoteHEAD=never", "fetch",
-                    "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
-                    "--", remote, sha, time_limit=time_limit)
-    resolved = checked_git(checkout, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}",
-                           time_limit=time_limit)
-    if resolved != sha:
+    object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit)
+    if object_type.returncode:
+        _ = checked_git(checkout, "-c", "remote.origin.followRemoteHEAD=never", "fetch",
+                        "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
+                        "--", remote, sha, time_limit=time_limit)
+        object_type = run_git(checkout, "--no-replace-objects", "cat-file", "-t", sha, time_limit=time_limit)
+    if git_output(object_type, "cat-file").strip() != "commit":
         raise LandError(f"{remote}: {sha} for {ref} is not a commit")
     return AdvertisedBranchTip(branch, sha)
 

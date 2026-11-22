@@ -65,6 +65,12 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual(self.git("for-each-ref", *columns).stdout, refs)
         self.assertEqual(fetch_head.read_text(), "saved fetch state\n")
 
+    def test_uses_the_advertised_local_commit_when_fetch_would_fail(self) -> None:
+        local = self.git("rev-parse", "HEAD").stdout.strip()
+        self.fail_git("-C", str(self.repo), "-c", "remote.origin.followRemoteHEAD=never", "fetch")
+
+        self.assertEqual(land_main.remote_branch_commit(self.repo, "origin", "main"), local)
+
     def test_push_runs_the_hook_from_the_checkout_root_with_the_full_commit(self) -> None:
         self.install_hook()
         expected: list[str] = []
