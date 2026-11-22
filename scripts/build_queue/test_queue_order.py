@@ -19,6 +19,7 @@ from scripts.build_queue.test_placement import (
 )
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
+from scripts.lib import conf
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_pressure_reading
 from scripts.production import land_runs
@@ -513,7 +514,7 @@ class QueueMoveTests(unittest.TestCase):
             inputs = replace(inputs, host=records.HostMemory(60 * GIB, 60 * GIB),
                              spacing=records.ReadyToStart())
             policy = replace(admission_policy_fixture(),
-                repository_runs=records.RepositoryRunLimits({f"{inputs.local_machine}.fixture": 1}))
+                repository_runs=records.RepositoryRunLimits({f"{conf.host_key_name(inputs.local_machine)}.fixture": 1}))
             capped_wait, memory_wait, follower_wait = gate.admission_pass(inputs, inputs.now, policy).rows
             self.assertFalse(memory_wait.decision.room.passes)
             self.assertEqual(capped_wait.decision.run_limit,
