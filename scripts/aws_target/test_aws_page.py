@@ -14,6 +14,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
@@ -358,12 +359,12 @@ class AwsCombinedTableTests(PageCostFixture):
 })();
 </script>"""
         _ = page.write_text(page.read_text().replace('</body>', probe + '</body>', 1))
-        result = subprocess.run([
+        result = run_browser([
             'google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
             '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', f'--user-data-dir={self.root / "chrome"}',
             '--window-size=760,1000',
             '--dump-dom', page.as_uri() + query,
-        ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=True)
+        ], timeout=TEST_HANG_GUARD_SECS, check=True)
         marker = re.search(r'<p id="table-checks">(.*?)</p>', result.stdout)
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')

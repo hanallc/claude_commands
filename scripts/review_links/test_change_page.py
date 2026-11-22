@@ -33,6 +33,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1793,9 +1794,9 @@ class ChangePageTests(unittest.TestCase):
             try:
                 profile = self.temporary / 'copy-profile'
                 profile.mkdir()
-                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                result = run_browser(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
-                    capture_output=True, text=True, timeout=30)
+                    timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
             finally:
                 server.shutdown()
@@ -4006,9 +4007,9 @@ class ChangePageTests(unittest.TestCase):
             try:
                 profile = self.temporary / "browser-profile"
                 profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                run = run_browser(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                       "--window-size", "390,1200", "--screenshot", str(self.temporary / "browser.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"], capture_output=True, text=True, timeout=45)
+                                      f"http://127.0.0.1:{server.server_port}/"], timeout=45)
                 for kind, mode in cases:
                     with self.subTest(kind=kind, mode=mode):
                         self.assertEqual(run.returncode, 0, run.stderr)

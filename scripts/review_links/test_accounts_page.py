@@ -21,6 +21,7 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts, next_moves, role_map
 from scripts.accounts.home_test_support import scratch_account_home
@@ -218,9 +219,9 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
         try:
             profile = Path(temporary) / "profile"
             profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+            run = run_browser(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                   "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
+                                 timeout=45)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:

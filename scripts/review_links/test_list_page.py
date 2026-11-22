@@ -9,7 +9,6 @@ import os
 import re
 import select
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
@@ -18,12 +17,11 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import BinaryIO, ClassVar, cast, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -33,10 +31,11 @@ from xml.etree import ElementTree
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.lib import conf, file_lock
-from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
+from scripts.review_links.browser_test_support import BrowserProcess, run_browser, start_browser
+from scripts.review_links.browser_test_support import stop_browser as _stop_browser
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
@@ -69,28 +68,12 @@ def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bo
     return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
-def _stop_browser(process: subprocess.Popen[bytes]) -> None:
-    try:
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGTERM)
-        with suppress(subprocess.TimeoutExpired):
-            _ = process.wait(timeout=10)
-        # The browser can exit before its child processes.
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGKILL)
-        _ = process.wait(timeout=10)
-    finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-
-
 class _Browser:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        self.process: subprocess.Popen[bytes] = process
+    def __init__(self, browser: BrowserProcess[bytes]) -> None:
+        self.process: subprocess.Popen[bytes] = browser.process
         self.closed: bool = False
         self.resources: ExitStack = ExitStack()
-        _ = self.resources.callback(_stop_browser, process)
+        _ = self.resources.callback(_stop_browser, browser)
 
     def close(self) -> None:
         if not self.closed:
@@ -118,14 +101,14 @@ class _Chrome(_Browser):
         self.loaded: set[tuple[str, str]] = set()
         self.sequence: int = 0
         with (root / "chrome.log").open("wb") as log:
-            process = subprocess.Popen(
+            browser = start_browser(
                 ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
                  "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
                  "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
                  f"--user-data-dir={root / 'chrome'}", "about:blank"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
-                start_new_session=True)
-        super().__init__(process)
+                output=bytes, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
+        super().__init__(browser)
+        process = self.process
         with self.stop_on_error():
             writer = process.stdin
             assert writer is not None
@@ -247,11 +230,12 @@ class _Firefox(_Browser):
             'user_pref("marionette.port", 0);\n'
             + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
         with (root / "firefox.log").open("wb") as log:
-            process = subprocess.Popen(
+            browser = start_browser(
                 ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                  "--marionette", "--remote-allow-system-access", "about:blank"],
-                stdout=log, stderr=log, start_new_session=True)
-        super().__init__(process)
+                output=bytes, stdout=log, stderr=log)
+        super().__init__(browser)
+        process = self.process
         with self.stop_on_error():
             port_file = profile / "MarionetteActivePort"
             deadline = time.monotonic() + 30
@@ -410,8 +394,8 @@ class ListPageTests(unittest.TestCase):
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
                 screenshot = path if path is not None else root / "page.png"
-                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
-                                      capture_output=True, text=True, timeout=45, env=environment)
+                return run_browser([*command, "--screenshot", str(screenshot), destination],
+                                      timeout=45, env=environment)
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
@@ -1185,13 +1169,12 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                         elif size == "430,900":
                             command, environment = _private_firefox_command(
                                 self.root / f"overlay-profile-{size}", width, height, dark=True)
-                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
-                                try:
-                                    self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
-                                finally:
-                                    browser.terminate()
-                                    _ = browser.wait(timeout=10)
+                            browser = start_browser([*command, url], output=bytes, stdout=subprocess.DEVNULL,
+                                                    stderr=subprocess.DEVNULL, env=environment)
+                            try:
+                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
+                            finally:
+                                _stop_browser(browser)
                         else:
                             with self.firefox().page(url, width, height, dark=True):
                                 self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
@@ -3701,7 +3684,7 @@ observer.observe(original.parentNode,{childList:true});
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.test_accounts_page.run_browser", side_effect=load):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5793,7 +5776,7 @@ window.fetch=async(_path,options={})=>{
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+        with patch("scripts.review_links.test_page_frame.run_browser", side_effect=screenshot):
             assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")

@@ -44,6 +44,7 @@ from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
 from scripts.message import send_result
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links.test_page_question import question_outcome
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
@@ -1386,6 +1387,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             return result
 
         with (patch.object(self.server, "review_cache", cache),
+              patch.object(serve, "run_screenshot_command", run_browser),
               patch.object(self.server.page_captures, "complete", side_effect=capture_done)):
             _ = self.start_page_capture()
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))

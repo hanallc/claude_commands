@@ -31,6 +31,7 @@ from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from subprocess import run as run_screenshot_command
 from typing import BinaryIO, cast, override
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
@@ -117,9 +118,10 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
             + 'user_pref("layout.css.devPixelsPerPx", "1.0");\n'
             + 'user_pref("ui.prefersReducedMotion", 1);\n'
             + 'user_pref("network.proxy.type", 0);\n', encoding="utf-8")
-        _ = subprocess.run([firefox, "--headless", "--no-remote", "--profile", folder,
-                            "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
+        _ = run_screenshot_command(
+            [firefox, "--headless", "--no-remote", "--profile", folder,
+             "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
         with output.open("rb") as stream:
             image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
     if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > new_item_dialog.MAX_IMAGE_BYTES:

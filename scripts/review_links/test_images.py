@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
@@ -491,10 +492,10 @@ class ImagesTests(ImagesFixture):
             try:
                 profile = self.temporary / "browser-profile"
                 profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                run = run_browser(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                       "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
                                       f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=45)
+                                     timeout=45)
                 self.assertEqual(run.returncode, 0, run.stderr)
             finally:
                 server.shutdown()
@@ -1530,9 +1531,9 @@ async (find, whenPageShows, check, controlRefresh) => {
             try:
                 profile = self.temporary / 'question-browser-profile'
                 profile.mkdir()
-                done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                done = run_browser(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', '1200,900', '--screenshot', str(self.temporary/'question-browser.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=60)
+                    f'http://127.0.0.1:{server.server_port}/'], timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 complete.set()

@@ -19,6 +19,7 @@ from xml.etree import ElementTree
 from typing import cast, override
 from unittest import mock
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
 from scripts.review_links.test_page_frame import assert_status_states
@@ -803,11 +804,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_browser(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:

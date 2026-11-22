@@ -44,6 +44,7 @@ from scripts.review_links import change_browser, change_page, console, page_fram
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
+from scripts.review_links.browser_test_support import run_browser, start_browser, stop_browser
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -1827,10 +1828,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    result=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                    result=run_browser(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size','1440,900','--screenshot',str(self.fixture.temporary/'window.png'),
                         f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399'],
-                        capture_output=True,text=True,timeout=45)
+                        timeout=45)
                 self.assertEqual(result.returncode,0,result.stderr)
             finally:
                 server.shutdown()
@@ -1939,14 +1940,14 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         profile = self.fixture.temporary / 'marionette-profile'
         profile.mkdir()
         _ = (profile/'user.js').write_text('user_pref("marionette.port", 0);\n')
-        with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
-                               'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as browser:
-            try:
-                with self.marionette_commands(browser) as command:
-                    _ = command('WebDriver:Navigate', url=page.as_uri())
-                    yield command
-            finally:
-                browser.kill()
+        browser = start_browser(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
+                                 'about:blank'], output=bytes, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            with self.marionette_commands(browser.process) as command:
+                _ = command('WebDriver:Navigate', url=page.as_uri())
+                yield command
+        finally:
+            stop_browser(browser)
 
     @contextmanager
     def marionette_commands(self, browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
@@ -2834,9 +2835,9 @@ window.fetch=async(url,options)=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_browser(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -2985,9 +2986,9 @@ window.fetch=async(url,options)=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_browser(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -4459,9 +4460,9 @@ window.fetch=async(url)=>{
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                    done = run_browser(['firefox', '--headless', '--no-remote', '--profile', profile,
                         '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
-                        f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 server.shutdown()
@@ -5706,9 +5707,9 @@ window.fetch=async(_url,options={})=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                            done=run_browser(['firefox','--headless','--no-remote','--profile',profile,
                                 '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],capture_output=True,text=True,timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'],timeout=30)
                         self.assertEqual(done.returncode,0,done.stderr)
                     finally:
                         server.shutdown()
@@ -5910,9 +5911,9 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_browser(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()

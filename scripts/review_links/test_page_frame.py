@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 from typing import cast, override
 
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links import console, page_frame, review_submissions, serve
 from scripts.lib import conf
 from scripts.production import staff
@@ -607,11 +608,11 @@ window.fetch=async(url,options={})=>{
         try:
             profile = Path(temporary) / 'profile'
             profile.mkdir()
-            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+            done = run_browser(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                    '--window-size', '1600,900',
                                    '--screenshot', str(Path(temporary) / 'page.png'),
                                    f'http://127.0.0.1:{server.server_port}/?page={identity}'],
-                                  capture_output=True, text=True, timeout=45)
+                                  timeout=45)
             case.assertEqual(done.returncode, 0, done.stderr)
         finally:
             server.shutdown()

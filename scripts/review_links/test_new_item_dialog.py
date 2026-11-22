@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -18,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
+from scripts.review_links.browser_test_support import run_browser
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -691,11 +691,11 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         try:
             profile = output.parent / "profile"
             profile.mkdir()
-            run = subprocess.run(
+            run = run_browser(
                 ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                  "--window-size", "1440,900", "--screenshot", str(output),
                  f"http://127.0.0.1:{server.server_port}/"],
-                capture_output=True, text=True, timeout=75, check=False)
+                timeout=75)
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():
