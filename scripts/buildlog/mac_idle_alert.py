@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
@@ -154,6 +154,7 @@ def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = Blo
 
     A view passes `live_agrees`, and a Mac condition line shows only when the live Mac state agrees with it.
     The watch passes None, because it formats the reading that it just wrote from the live state.
+    A view calls `mac_idle.view_alert_line`, never this function directly.
     """
     saved = read_alert(path)
     if isinstance(saved, NoSavedAlert):

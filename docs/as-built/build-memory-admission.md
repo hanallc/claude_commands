@@ -444,7 +444,7 @@ Queries project the stored `PassResult` through `queue_read_from_pass`. A releas
 A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
 `/build:page` shows the running and waiting steps, memory use, wait reasons, priority, and cloud slot counts.
 The Builds page shows the saved Mac idle alert first, in red.
-The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
+The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.

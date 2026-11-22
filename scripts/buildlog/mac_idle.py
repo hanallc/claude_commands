@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from scripts.mac_test import mac_test
     from scripts.buildlog import mac_idle_alert
     from zoneinfo import ZoneInfo
-
     from scripts.message.unit_labels import UnitLabels
 else:
     from scripts.direct import step_record
