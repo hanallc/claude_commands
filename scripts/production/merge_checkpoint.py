@@ -1913,7 +1913,7 @@ class BatchResumeRecord:
             checkpoint_gate.report("batch", "warning", f"{self.path}: could not remove the batch record ({error})")
 
 
-def reset_batch(rollback: ResetBatchCheckout) -> None:
+def reset_batch(rollback: ResetBatchCheckout, warnings: list[str]) -> None:
     """Undo every unpublished merge from the current batch attempt."""
     production = rollback.production
     checkout = production.checkout
@@ -1926,6 +1926,7 @@ def reset_batch(rollback: ResetBatchCheckout) -> None:
             raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from {rollback.expected_tip}",
                                        "the showrunner will inspect the merge branch")
     open_merge = read_open_merge(merge_head_path(checkout))
+    clear_merge = False
     if isinstance(open_merge, OpenMerge):
         owns_merge = isinstance(state, InFlightBatchMerge) and (
             not open_merge.targets or open_merge.targets == (state.target,))
@@ -1934,18 +1935,24 @@ def reset_batch(rollback: ResetBatchCheckout) -> None:
             raise checkpoint_gate.Stop("merge", "held", f"the batch left the operator merge open: {detail}",
                                        "the showrunner will inspect the merge branch")
         _ = good(git(checkout, "merge", "--abort"), "merge")
-        record.store_merge_state(NO_BATCH_MERGE)
-        if good(git(checkout, "rev-parse", "HEAD"), "merge") == rollback.start_tip:
+        clear_merge = True
+    try:
+        if clear_merge and good(git(checkout, "rev-parse", "HEAD"), "merge") == rollback.start_tip:
             return
-    if head == rollback.start_tip:
-        _ = good(git(checkout, "reset", "--keep", head), "red")
-    else:
-        if not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
+        if head == rollback.start_tip:
+            _ = good(git(checkout, "reset", "--keep", head), "red")
+        elif not push_origin_matches(production, rollback.published_tip, rollback.start_tip):
             raise checkpoint_gate.Stop("push", "failed", "origin moved; cannot reset the batch",
                                        "the showrunner will inspect the merge branch")
-        undo_unpushed_merge(production, head, rollback.start_tip)
-    if isinstance(record.merge_state, InFlightBatchMerge):
-        record.store_merge_state(NO_BATCH_MERGE)
+        else:
+            undo_unpushed_merge(production, head, rollback.start_tip)
+        clear_merge = clear_merge or isinstance(state, InFlightBatchMerge)
+    finally:
+        if clear_merge:
+            try:
+                record.store_merge_state(NO_BATCH_MERGE)
+            except (OSError, ValueError) as error:
+                warnings.append(f"could not clear the in-flight batch merge: {error}")
 
 
 class BatchStopNotice(NamedTuple):
@@ -2011,12 +2018,12 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
                       rollback: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT, *,
                       record_results: bool = True) -> int:
     """Attempt rollback, send all notices, and record the results."""
-    reset_error = ""
+    rollback_warnings: list[str] = []
     if isinstance(rollback, ResetBatchCheckout):
         try:
-            reset_batch(rollback)
+            reset_batch(rollback, rollback_warnings)
         except (checkpoint_gate.Stop, OSError, ValueError) as error:
-            reset_error = str(error)
+            rollback_warnings.insert(0, f"rollback failed: {error}")
 
     rows = tuple(notices)
     checkpoint_gate.report(stop.step, stop.state, stop.detail.replace("\n", "; "))
@@ -2028,8 +2035,8 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
         for request, detail, _ in rows:
             if error := land_result_error(request, landed=False, step=stop.step, state=stop.state, detail=detail):
                 record_errors.append(f"{request.unit.name} phase {request.phase}: {error}")
-    if reset_error:
-        checkpoint_gate.report("batch", "warning", f"rollback failed: {reset_error}")
+    for warning in rollback_warnings:
+        checkpoint_gate.report("batch", "warning", warning)
     for record_error in record_errors:
         print(f"land result: not recorded — {record_error}", flush=True)
     return checkpoint_gate.TREE_CHANGED_STATUS if stop.state == "cancelled" else 1

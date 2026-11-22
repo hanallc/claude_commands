@@ -429,6 +429,37 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                     self.assertIn("beta phase 2", warning)
                     self.assertEqual(results.read_bytes(), b"\xff\n")
 
+    def test_batch_restores_start_when_the_in_flight_clear_fails(self) -> None:
+        start = self.git("rev-parse", "HEAD")
+        alpha = self.checkpoint()
+        beta = self.beta_checkpoint("src/beta.txt", "beta change\n")
+        main = self.push_main_change("src/beta.txt", "main change\n")
+        rows = [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+        record = self.batch_record()
+        clear_tips: list[str] = []
+        error = "fixture cannot clear the in-flight batch merge"
+
+        def reject_clear(path: Path, contents: str) -> None:
+            if (path == record and contents.endswith("in-flight\t-\n") and path.exists()
+                    and path.read_text().endswith(f"in-flight\t{main}\n")):
+                clear_tips.append(self.git("rev-parse", "HEAD"))
+                raise PermissionError(error)
+            atomic_file.write_text_atomic(path, contents)
+
+        with patch.object(merge_checkpoint, "write_text_atomic", reject_clear):
+            result = self.land_batch(rows)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(clear_tips, [start])
+        self.assert_rolled_back(start)
+        self.assertNotIn("rollback failed:", result.stdout)
+        before, warning, _ = result.stdout.partition(f"batch: warning — could not clear the in-flight batch merge: {error}")
+        self.assertTrue(warning, result.stdout)
+        notices = [line for line in before.splitlines() if line.startswith("send ")]
+        self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
+        for notice in notices:
+            self.assertIn("origin/main conflicts: src/beta.txt", notice)
+
     def merge_as_operator_during_gate(self, target: str, path: str, *, advance_main: bool = False) -> Path:
         saved_index = self.state / "operator-index"
         after_merge = (f'''
