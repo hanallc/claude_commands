@@ -1617,17 +1617,21 @@ The guest receives no AWS credentials.
 The bootstrap downloads the payload with curl and verifies its SHA-256.
 The image sets the maximum file size and `source_download_timeout_s` (120 seconds).
 `hana_source.materialize` verifies Git prerequisites, checks the advertised commit, and fetches verified objects.
-The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
-The shared maker allocates mirror metadata and temporary bundle files.
-`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
-The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
-The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+The guest retains its main checkout at `~/rust/hana` on the data disk.
+The bootstrap downloads the payload inside the main checkout.
+The runner stages the verified bundle in the main checkout's Git directory.
+`build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+The maker rescues source edits before reset and retains Cargo output within the configured size limit.
+The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
+The shell cache lives at `~/build/hana/main/shells`.
 
 The guest must use host name `aws-hana`.
-Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
-The image supplies these approved values and includes Git, curl, and Python.
-The per-run runtime supplies the source, maker, slot, rescue, and configuration modules.
-The runner retains inherited slot locks through command execution.
+The image selects `roots.build` for the guest and expands `~/` against the runner's home.
+Admission requires `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes`.
+The image supplies these values and includes Git, curl, and Python.
+The per-run runtime supplies the source, copy maker, rescue, and configuration modules.
+The runner retains the numbered copy lock through command execution.
+Runtime ABI 2 requires an image that probes the numbered copy lock.
 
 ## Hana result transport
 

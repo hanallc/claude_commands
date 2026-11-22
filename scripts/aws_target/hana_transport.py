@@ -240,7 +240,7 @@ class SourceSender:
                        runtime: tuple[hana_render.RenderedGuestFile, ...], abi: int
                        ) -> Generator[tuple[hana_protocol.SourceManifest, Callable[[], None]]]:
         common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
-        with build_folders.tool_folder('hana-source-bundle') as temporary:
+        with build_folders.tool_folder('hana-source-bundle', parent=Path(common)) as temporary:
             # This bare metadata repository isolates bundle refs from the caller's refs.
             _ = hana_source.git(temporary, self.limits, 'init', '--bare', '--quiet',
                                 '--object-format=' + ('sha256' if len(commit) == 64 else 'sha1'))

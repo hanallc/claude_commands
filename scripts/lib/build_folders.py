@@ -222,7 +222,7 @@ def _check_name(name: str) -> None:
         raise ValueError("a build folder name must be one path component")
 
 
-BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
+BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target",
                           "scratch", "legacy-unique", "legacy-stable", "tool", "slot", "copy"]
 
 
@@ -1295,7 +1295,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot", "copy")
+    return spec.kind in ("standing", "editable", "mirror", "target", "legacy-stable", "slot", "copy")
 
 
 FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
@@ -1731,7 +1731,7 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder, *,
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | StableOwnerFolder, *,
                         on_create: FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
     path = create_build_folder(spec, on_create=on_create)

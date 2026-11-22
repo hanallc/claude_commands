@@ -21,8 +21,7 @@ from scripts.aws_target import hana_protocol
 
 IMAGE_SLOT_POLICY = Path('/var/lib/hana-runtime/config/build_folders.conf')
 PAYLOAD_MOUNT = Path('/run/hana-payload')
-DATA_TEMP = Path('/var/lib/hana/tmp')
-SLOT_ROOT_KEY = 'roots.slots.aws-hana'
+BUILD_ROOT_KEY = 'roots.build'
 PROBE_WAIT_KEY = 'locks.probe_wait_seconds'
 PROBE_RETRY_KEY = 'locks.probe_retry_seconds'
 
@@ -35,14 +34,18 @@ class BundleSlice:
 
 @dataclass(frozen=True)
 class ImageSlotPolicy:
-    root: Path
+    build_root: Path
     probe_wait_seconds: float
     probe_retry_seconds: float
     overrides: dict[str, str]
 
+    def copy_path(self, slot: int) -> Path:
+        """Locate the numbered copy for the assigned slot."""
+        return self.build_root / hana_protocol.REPOSITORY / hana_protocol.COPY_UNIT / str(slot)
+
 
 def read_slot_policy(path: Path) -> ImageSlotPolicy:
-    """Read the limits and roots installed by the image."""
+    """Read the capacity, build root, and lock timing from the image."""
     overrides: dict[str, str] = {}
     limits: dict[str, str] = {}
     values: dict[str, str] = {}
@@ -51,15 +54,14 @@ def read_slot_policy(path: Path) -> ImageSlotPolicy:
         for line in path.read_text().splitlines():
             key, separator, value = re.split(r'(?:^|\s)#', line, maxsplit=1)[0].partition('=')
             key = key.strip()
-            if separator and (key in (PROBE_WAIT_KEY, PROBE_RETRY_KEY)
-                    or (key.startswith('roots.') and key.endswith('.aws-hana'))
+            if separator and (key in (PROBE_WAIT_KEY, PROBE_RETRY_KEY, BUILD_ROOT_KEY)
                     or key.startswith('slots.aws-hana.')) and key not in overrides:
                 overrides[key] = line
                 values[key] = value.strip()
                 if previous.startswith(('# whole:', '# range:')):
                     limits[key] = previous
             previous = line.strip()
-        root = Path(values[SLOT_ROOT_KEY])
+        root = Path(values[BUILD_ROOT_KEY])
         wait = float(values[PROBE_WAIT_KEY])
         retry = float(values[PROBE_RETRY_KEY])
         if (not root.is_absolute() or '..' in root.parts or not math.isfinite(wait) or wait < 0
@@ -74,12 +76,12 @@ def read_slot_policy(path: Path) -> ImageSlotPolicy:
 
 
 def apply_slot_policy(path: Path, policy: ImageSlotPolicy) -> None:
-    """Give the runner the slot roots, capacity, and lock timing from the image."""
+    """Give the runner the image's build root, capacity, and lock timing."""
     try:
         lines: list[str] = []
         for line in path.read_text().splitlines():
             key = line.partition('=')[0].strip()
-            if key in policy.overrides or key.removesuffix('.aws-hana') in policy.overrides:
+            if any(key == setting or key.startswith(setting + '.') for setting in policy.overrides):
                 if lines and lines[-1].strip().startswith(('# whole:', '# range:')):
                     _ = lines.pop()
             else:
@@ -162,7 +164,9 @@ def main(max_bytes: int, download_timeout_s: int, command_timeout_s: float) -> i
         action = selected
         request = hana_protocol.decode_request(json.dumps(fields['request']).encode())
         policy = read_slot_policy(IMAGE_SLOT_POLICY)
-        with (tempfile.TemporaryFile(dir=DATA_TEMP) as archive,
+        checkout = hana_protocol.main_checkout(Path.home())
+        checkout.mkdir(parents=True, exist_ok=True)
+        with (tempfile.TemporaryFile(dir=checkout) as archive,
               tempfile.TemporaryDirectory(dir=PAYLOAD_MOUNT) as workspace,
               os.fdopen(os.dup(sys.stdout.fileno()), 'wb') as report_start):
             download_payload(request.manifest.bundle_url, archive, max_bytes, download_timeout_s)

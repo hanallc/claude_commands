@@ -1,4 +1,4 @@
-"""Exercise exact source bundles with private Git repositories and guest slots."""
+"""Exercise exact source bundles with private Git repositories and guest copies."""
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -59,6 +59,10 @@ class HanaSourceTests(unittest.TestCase):
     @property
     def limits(self) -> hana_protocol.SourceLimits:
         return source.read_limits(self.configuration)
+
+    @property
+    def guest_home(self) -> Path:
+        return self.root / 'guest'
 
     @cached_property
     def sender(self) -> transport.SourceSender:
@@ -122,7 +126,7 @@ source_basis_max_commits=8
         _ = (manifest.parent / 'hana_protocol.py').write_text(f'RUNTIME_ABI = {hana_protocol.RUNTIME_ABI}\n')
         _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
         override_fixture_settings(private.settings,
-            f'roots.slots.aws-hana={self.root / "guest-slots"}\n'
+            f'roots.build.aws-hana={self.root / "guest-build"}\n'
             + '# whole: 1..\nslots.aws-hana.hana.max=1\n# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n')
         self.checkout = self.enterContext(build_folders.leased_build_folder(build_folders.BuildFolderSpec(
             kind='mirror', parent=self.root / 'sources', suffix_length=0, repository='hana', owner='fixture', slot=0)))
@@ -158,8 +162,7 @@ source_basis_max_commits=8
     @contextmanager
     def materialize(self, manifest: hana_protocol.SourceManifest) -> Generator[source.LeasedSource | source.MissingBasis]:
         with (self.verified_bundle(manifest) as bundle,
-              source.materialize(manifest, self.limits, bundle, root=self.root / 'guest',
-                  showrunner='builds', unit='aws', work='source-test') as leased):
+              source.materialize(manifest, self.limits, bundle, number=1, work='source-test') as leased):
             yield leased
 
     def member(self, manifest: hana_protocol.SourceManifest, name: str) -> bytes:
@@ -169,8 +172,11 @@ source_basis_max_commits=8
             with member:
                 return member.read()
 
-    def guest(self):
-        return mock.patch('socket.gethostname', return_value='aws-hana')
+    @contextmanager
+    def guest(self) -> Generator[None]:
+        with (mock.patch('socket.gethostname', return_value='aws-hana'),
+              mock.patch.dict(os.environ, {'HOME': str(self.guest_home)})):
+            yield
 
     def test_two_dirty_worktrees_preserve_exact_files_modes_links_index_and_refs(self) -> None:
         with build_slots.take_slot(self.checkout, self.base, showrunner='builds', unit='aws', work='dirty',
@@ -286,25 +292,48 @@ source_basis_max_commits=8
             self.fail('invalid bundle was admitted')
         self.assertIsInstance(refused.exception.__cause__, subprocess.CalledProcessError)
 
-    def test_full_pool_uses_existing_admission_and_never_creates_an_overflow_slot(self) -> None:
+    def test_assigned_copy_uses_the_guest_main_checkout_and_refuses_a_second_holder(self) -> None:
         manifest = self.prepare()
         with self.guest(), self.materialize(manifest) as leased:
             assert isinstance(leased, source.LeasedSource)
-            with self.assertRaises(build_slots.SlotsFull), self.materialize(manifest):
+            main = self.guest_home / 'rust/hana'
+            self.assertEqual((main / 'tracked').read_text(), 'committed\n')
+            self.assertEqual(source.git(main, self.limits, 'rev-parse', '--is-bare-repository'), 'false')
+            self.assertEqual(leased.path, self.root / 'guest-build/hana/aws-hana/1')
+            proof = build_folders.numbered_copy_record(leased.path)
+            assert isinstance(proof, build_folders.NumberedCopySource)
+            self.assertEqual(proof.source, main)
+            self.assertEqual(proof.commit, manifest.commit)
+            self.assertFalse((main / '.git/hana-bundle').exists())
+            with self.assertRaisesRegex(BlockingIOError, 'assigned copy 1'), self.materialize(manifest):
                 self.fail('full pool admitted source')
-            self.assertFalse((self.root / 'guest-slots/hana-slot2').exists())
+            self.assertFalse(leased.path.with_name('2').exists())
+            self.assertFalse((self.guest_home / 'mirrors').exists())
+        self.assertEqual(build_folders.build_folder_state(leased.path), 'free')
+
+    def test_oversize_copy_discards_only_cargo_output(self) -> None:
+        manifest = self.prepare()
+        with self.guest(), self.materialize(manifest) as leased:
+            assert isinstance(leased, source.LeasedSource)
+            artifact = leased.copy.cargo_dir / 'artifact'
+            _ = artifact.write_text('cache')
+        override_fixture_settings(self.pool_settings, '# whole: 1..\nslots.aws-hana.hana.max_bytes=1\n')
+        with self.guest(), self.materialize(manifest) as leased:
+            assert isinstance(leased, source.LeasedSource)
+            self.assertFalse(artifact.exists())
+            self.assertTrue(leased.copy.cargo_dir.is_dir())
+            self.assertEqual((leased.path / 'tracked').read_text(), 'committed\n')
 
     def test_missing_guest_slot_keys_stop_admission(self) -> None:
         manifest = self.prepare()
         original = self.pool_settings.read_text()
-        for key in ('roots.slots.aws-hana', 'slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'):
+        for key in ('slots.aws-hana.hana.max', 'slots.aws-hana.hana.max_bytes'):
             with self.subTest(key=key):
                 _ = self.pool_settings.write_text('\n'.join(line for line in original.splitlines()
                                                             if not line.startswith(key + '=')) + '\n')
-                expected = build_slots.SlotsNotConfigured if key.startswith('roots') else conf.Unusable
-                with self.guest(), self.assertRaises(expected), self.materialize(manifest):
+                with self.guest(), self.assertRaises(conf.Unusable), self.materialize(manifest):
                     self.fail('missing guest keys admitted source')
-                self.assertFalse((self.root / 'guest-slots').exists())
+                self.assertFalse((self.root / 'guest-build').exists())
         _ = self.pool_settings.write_text(original)
 
     def test_ignored_input_outside_the_allowed_list_refuses_before_upload(self) -> None:

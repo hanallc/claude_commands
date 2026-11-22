@@ -19,6 +19,13 @@ An identical nested committed proof can reuse its held copy.
 A run can still wait for normal build admission.
 The AWS gate uses its separate slot path.
 
+The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
+The sender stages the bundle in the source repository's common Git directory.
+The guest stages the payload inside the main checkout and the bundle inside its Git directory.
+The runner takes the assigned copy number under `~/build/hana/aws-hana`.
+The receiver probes that numbered copy's lock before it reports lease release.
+The shell cache lives at `~/build/hana/main/shells`.
+
 The caller holds the copy lease through preparation and execution.
 The lease records the source checkout, commit, Git directory identities, and holder.
 Python callers pass the lock descriptor and its environment setting to build and test children.

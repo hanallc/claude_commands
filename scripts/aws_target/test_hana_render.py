@@ -109,6 +109,7 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..60\nlocks.probe_wait_seconds.fixture-guest=0.4\n'
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
+                + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
                 + 'roots.slots.fixture-guest=/fixture/slots\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
@@ -173,7 +174,8 @@ class HanaRenderTests(unittest.TestCase):
             for path in (*image_entries, 'config/build_folders.conf'):
                 self.assertEqual(stat.S_IMODE((image_runtime / path).stat().st_mode), 0o644)
             self.assertEqual((image_runtime / 'config/build_folders.conf').read_text(),
-                '# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+                'roots.build=/fixture/build\n# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n'
+                + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
             receiver = cast(dict[str, object], json.loads((output / 'receiver.json').read_text()))
             self.assertEqual(receiver['result_transfer_timeout_s'], 83)
             self.assertEqual(receiver['command_timeout_s'], 23)
@@ -221,6 +223,8 @@ class HanaRenderTests(unittest.TestCase):
                 (targets, 'loopback.shell_timeout_s.fixture-guest', False),
                 (folders, 'locks.probe_wait_seconds.fixture-guest', True),
                 (folders, 'locks.probe_wait_seconds', False),
+                (folders, 'roots.build.fixture-guest', True),
+                (folders, 'roots.build', False),
                 (folders, 'patterns.tool', False),
             ):
                 with self.subTest(file=path.name, key=key):
