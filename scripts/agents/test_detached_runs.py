@@ -1232,7 +1232,7 @@ sys.exit(1)
     @unittest.skipUnless(process_stop.supported(), "pidfd stop needs Linux")
     def test_slice_stop_waits_for_nested_step_scopes(self) -> None:
         for outcome in ("TERM", "KILL", "scan error", "resume", "EPERM", "still populated",
-                        "natural", "unreadable", "missing", "replaced"):
+                        "natural", "cleanup interrupted", "unreadable", "missing", "replaced"):
             with self.subTest(outcome=outcome), contextlib.ExitStack() as descriptors:
                 path = self.record(["fixture command"])
                 proc = self.root / f"proc-{outcome}"
@@ -1283,6 +1283,7 @@ sys.exit(1)
                 if outcome == "resume":
                     self.update_record(path, stop_reason="fixture stop", stop_pass_requested=True)
                 now = 0.0
+                interrupted = False
 
                 def open_pidfd(pid: int) -> int:
                     self.assertEqual(pid, 702)
@@ -1291,9 +1292,19 @@ sys.exit(1)
                     return read
 
                 def term(_descriptor: int, number: int) -> None:
+                    nonlocal interrupted
                     self.assertEqual(number, signal.SIGTERM)
-                    reason = None if outcome == "natural" else "fixture stop"
-                    self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), reason)
+                    saved = worker_lifecycle.read_json_object(path)
+                    self.assertNotIn("finished_at", saved)
+                    reason = None if outcome in ("natural", "cleanup interrupted") else "fixture stop"
+                    self.assertEqual(saved.get("stop_reason"), reason)
+                    if outcome in ("natural", "cleanup interrupted"):
+                        self.assertEqual(saved["exit_code"], 0)
+                        self.assertIs(saved["slice_cleanup_pending"], True)
+                        self.assertIs(saved["slice_leftovers"], True)
+                    if outcome == "cleanup interrupted" and not interrupted:
+                        interrupted = True
+                        raise SystemExit("fixture supervisor died during cleanup")
                     self.assertEqual(kill.read_text(), "0\n")
                     if outcome == "EPERM":
                         raise PermissionError("fixture denies TERM")
@@ -1305,7 +1316,8 @@ sys.exit(1)
                     now += seconds
                     with path.with_suffix(".record.lock").open("a") as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    if outcome in ("KILL", "scan error", "resume") and kill.read_text() == "1\n":
+                    if outcome in ("KILL", "scan error", "resume", "cleanup interrupted") and kill.read_text() == "1\n":
+                        self.assertNotIn("finished_at", worker_lifecycle.read_json_object(path))
                         _ = events.write_text("populated 0\n")
 
                 write = os.write
@@ -1343,6 +1355,31 @@ sys.exit(1)
                                 _ = process_stop.slice_has_ended(published)
                         send_term.assert_not_called()
                         continue
+                    if outcome == "cleanup interrupted":
+                        with (patch.object(detached_runs, "_run", return_value=0),
+                              self.assertRaisesRegex(SystemExit, "fixture supervisor died during cleanup")):
+                            _ = detached_runs.main(["supervise", str(path)])
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved["status"], "running")
+                        self.assertEqual(saved["exit_code"], 0)
+                        self.assertIs(saved["slice_cleanup_pending"], True)
+                        self.assertNotIn("scope_error", saved)
+                        self.assertNotIn("finished_at", saved)
+                        self.assertEqual(events.read_text(), "populated 1\n")
+                        with patch.object(detached_run_process, "supervises", return_value=True):
+                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                        self.assertEqual(send_term.call_count, 1)
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+                        self.assertEqual(send_term.call_count, 2)
+                        self.assertEqual(kill.read_text(), "1\n")
+                        self.assertEqual(events.read_text(), "populated 0\n")
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved["status"], "finished")
+                        self.assertEqual(saved["exit_code"], 0)
+                        self.assertTrue(saved["finished_at"])
+                        self.assertNotIn("slice_cleanup_pending", saved)
+                        self.assertIn("Result: PASS (exit 0)", self.sent.pop())
+                        continue
                     if outcome in ("natural", "unreadable"):
                         if outcome == "unreadable":
                             events.unlink()
@@ -1352,11 +1389,14 @@ sys.exit(1)
                         if outcome == "natural":
                             result = self.sent.pop()
                             self.assertIn("Result: PASS (exit 0)", result)
-                            self.assertIn("the supervisor stopped processes that remained in the run slice", result)
+                            self.assertIn("Cleanup stopped the processes that remained in the run slice.", result)
+                            self.assertTrue(worker_lifecycle.read_json_object(path)["finished_at"])
                         else:
                             saved = worker_lifecycle.read_json_object(path)
                             self.assertEqual(saved["status"], "running")
                             self.assertEqual(saved["exit_code"], 0)
+                            self.assertIs(saved["slice_cleanup_pending"], True)
+                            self.assertNotIn("finished_at", saved)
                             self.assertIn("cannot read cgroup.events", str(saved["scope_error"]))
                             self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
                             self.assertEqual(self.sent, [])
@@ -1366,6 +1406,7 @@ sys.exit(1)
                             self.assertTrue(process_stop.slice_has_ended(published))
                             self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
                             self.assertIn("Result: STOPPED (exit 0)", self.sent.pop())
+                            self.assertTrue(worker_lifecycle.read_json_object(path)["finished_at"])
                         continue
                     args = ["stop", "--reason", "fixture stop", str(path)]
                     if outcome in ("TERM", "KILL", "scan error", "resume"):
@@ -1380,6 +1421,7 @@ sys.exit(1)
                         self.assertTrue(process_stop.slice_has_ended(published))
                         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
                         self.assertIn("Result: STOPPED (exit 143)", self.sent.pop())
+                        self.assertTrue(worker_lifecycle.read_json_object(path)["finished_at"])
                     else:
                         self.assertEqual(detached_runs.main(args), 1)
                         detail = "cgroup.kill failed" if outcome == "EPERM" else "populated after KILL"
@@ -1388,6 +1430,7 @@ sys.exit(1)
                         self.assertEqual(saved["stop_reason"], "fixture stop")
                         self.assertIs(saved["stop_pass_requested"], True)
                         self.assertIn(detail, str(saved["scope_error"]))
+                        self.assertNotIn("finished_at", saved)
                 if outcome == "scan error":
                     send_term.assert_not_called()
                 else:

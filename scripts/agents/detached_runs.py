@@ -130,6 +130,7 @@ class RunRecord(StopFields):
     command_group: NotRequired[int]
     command_started: NotRequired[str]
     command_slice: NotRequired[process_stop.RunSliceIdentity]
+    slice_cleanup_pending: NotRequired[Literal[True]]
     slice_leftovers: NotRequired[Literal[True]]
     director_dir: str
     done_message_file: str
@@ -286,6 +287,16 @@ def _write_record(path: Path, record: RunRecord) -> RunRecord:
             fields["self_stop"] = current["self_stop"]
         else:
             _ = fields.pop("self_stop", False)
+        if fields["status"] == "finished":
+            _ = fields.pop("slice_cleanup_pending", None)
+            if fields.get("scope_error"):
+                _ = fields.pop("finished_at", None)
+            elif current["status"] == "running":
+                stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                if _has_saved_cgroup(current):
+                    fields["finished_at"] = stamp
+                else:
+                    _ = fields.setdefault("finished_at", stamp)
         if not _is_run_record(fields):
             raise SystemExit(f"detached_runs: {path} update is not a run record")
         write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
@@ -316,7 +327,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
-                                        "push_alert_attempted", "slice_leftovers"))
+                                        "push_alert_attempted", "slice_cleanup_pending", "slice_leftovers"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
                              and isinstance(cast(dict[str, object], pane_dispatch).get("unavailable"), str))))
@@ -492,7 +503,7 @@ def _stop_slice_command(
                 record = _read_record(path)
                 if record.get("command_slice") != run_slice or record["status"] != "running" or not check():
                     return False
-                pending = record.get("stop_reason") or record.get("scope_error")
+                pending = record.get("stop_reason") or record.get("scope_error") or record.get("slice_cleanup_pending")
                 if resume and not pending:
                     return False
                 ended = process_stop.slice_has_ended(run_slice)
@@ -525,7 +536,9 @@ def _stop_slice_command(
             record = _read_record(path)
             if record.get("command_slice") != run_slice:
                 raise process_stop.SliceStopFailed("the saved run slice changed during the stop")
-            if record.pop("scope_error", ""):
+            error = record.pop("scope_error", "")
+            cleanup = record.pop("slice_cleanup_pending", False)
+            if error or cleanup:
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         return True
 
@@ -774,12 +787,15 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         if raw["status"] != "running":
             continue
-        if (run_slice := raw.get("command_slice")) and (raw.get("stop_reason") or raw.get("scope_error")):
+        supervisor_alive = raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path)
+        if (run_slice := raw.get("command_slice")) and (
+                raw.get("stop_reason") or raw.get("scope_error")
+                or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
             try:
                 _ = _stop_slice_command(path, "", run_slice, check=lambda: True, stop_pass=False, resume=True)
             except process_stop.SliceStopFailed as error:
                 print(f"detached_runs: {path.stem}: stop recovery failed: {error}", file=sys.stderr)
-        if raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path):
+        if supervisor_alive:
             continue
         try:
             with record_lock(path), contextlib.ExitStack() as scope_lock:
@@ -801,7 +817,6 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                     record["delivery"] = (SUPERSEDED_ORPHAN_DELIVERY if newer and not record.get("self_stop")
                                           else ORPHAN_RESULT_PENDING)
             record.update(status="finished", ended="supervisor gone", completion_pending=True)
-            _ = record.setdefault("finished_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             record = _write_record(path, record)
             result.queue_completion(path, record)
             result.run_ids.append(record["run_id"])
@@ -827,7 +842,7 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
                 return CompletionReplay.HANDLED
         if _has_saved_cgroup(current) and not _command_has_ended(current, current["pid"]):
             return CompletionReplay.RETRY
-        record["completion_pending"] = True
+        record.update(status="finished", completion_pending=True)
         record = _write_record(path, record)
         return _replay_completion(path, record)
 
@@ -1504,7 +1519,7 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
     if stop_reason:
         lines.append(f"Stop reason: {stop_reason}")
     if record.get("slice_leftovers"):
-        lines.append("Cleanup: the supervisor stopped processes that remained in the run slice.")
+        lines.append("Cleanup stopped the processes that remained in the run slice.")
     if error := record.get("scope_error"):
         lines.append(f"Cleanup error: {error}")
     if exit_code == SUPERSEDED_STATUS:
@@ -1848,9 +1863,6 @@ def command_deliver(args: argparse.Namespace) -> int:
             print(f"detached_runs: {record['run_id']}: the command group has no confirmed end", file=sys.stderr)
             return 1
     if _cancels_pass(record) and not _result_push_failed(record.get("delivery", "")):
-        if record["status"] != "finished":
-            record["status"] = "finished"
-            _ = record.setdefault("finished_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
         return 0 if _finish_record(record_path, record) == CompletionReplay.HANDLED else 1
     delivery = deliver(record, command_result(record))
     if _result_push_failed(delivery):
@@ -1906,7 +1918,8 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
     """Publish the command identity and group, then run the command in its own session.
 
     A stop leaves the supervisor alive to record and deliver the result.
-    The gate input stays open until the command ends. Then the supervisor writes "done" to the watcher.
+    The gate input stays open until the command ends.
+    The supervisor saves the slice cleanup intent before it releases the watcher.
     """
     script = Path(__file__).resolve()
     try:
@@ -1921,6 +1934,7 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
         return 127
 
     assert child.stdin is not None
+    path = Path(environment["UNIT_DETACHED_RECORD"])
     with child.stdin as gate:
         started = process_start.process_start(child.pid)
         if not isinstance(started, process_start.Started):
@@ -1929,7 +1943,6 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
             # The gate shell reads the end of its input and exits 125.
             gate.close()
         else:
-            path = Path(environment["UNIT_DETACHED_RECORD"])
             with record_lock(path):
                 record = _read_record(path)
                 record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
@@ -1939,10 +1952,27 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
                     record["supervisor_started"] = supervisor.start
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             _send_gate_line(gate, b"start\n")
-        returncode = child.wait()
+        exit_code = _exit_status(child.wait())
         if not gate.closed:
+            _ = _checkpoint_command_exit(path, exit_code, scoped_only=True)
             _send_gate_line(gate, b"done\n")
-    return _exit_status(returncode)
+    return exit_code
+
+
+def _checkpoint_command_exit(path: Path, exit_code: int, *, scoped_only: bool = False) -> RunRecord:
+    """Save the exit status and any cleanup that must finish before delivery."""
+    with record_lock(path):
+        record = _read_record(path)
+        if record["status"] == "finished" or (scoped_only and not _has_saved_cgroup(record)):
+            return record
+        updated = record.copy()
+        updated["exit_code"] = exit_code
+        if _has_saved_cgroup(record):
+            updated["slice_cleanup_pending"] = True
+            _ = updated.pop("finished_at", None)
+        if updated != record:
+            write_text_atomic(path, json.dumps(updated, indent=2, sort_keys=True))
+        return updated
 
 
 def _send_gate_line(gate: IO[bytes], line: bytes) -> None:
@@ -1996,7 +2026,6 @@ def _completion_sources(root: Path) -> Generator[None]:
 
 def _finish_command_slice(path: Path, run_slice: process_stop.RunSliceIdentity) -> RunRecord:
     with contextlib.ExitStack() as lock:
-        leftovers = False
         error = ""
         try:
             grace, kill_grace = _scope_stop_graces()
@@ -2004,19 +2033,21 @@ def _finish_command_slice(path: Path, run_slice: process_stop.RunSliceIdentity) 
             acquired = lock.enter_context(_scope_stop_lock(path, deadline=deadline))
             if not acquired:
                 raise process_stop.SliceStopFailed("a previous slice stop did not finish in time")
-            leftovers = not process_stop.slice_ends_by(run_slice, time.monotonic() + grace)
-            if leftovers:
+            if not process_stop.slice_ends_by(run_slice, time.monotonic() + grace):
+                with record_lock(path):
+                    record = _read_record(path)
+                    record["slice_leftovers"] = True
+                    write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
                 process_stop.stop_slice(run_slice, grace, kill_grace)
         except (OSError, ValueError) as exc:
             error = str(exc)
         with record_lock(path):
             record = _read_record(path)
-            if leftovers:
-                record["slice_leftovers"] = True
             if error:
                 record["scope_error"] = error
             else:
                 _ = record.pop("scope_error", None)
+                _ = record.pop("slice_cleanup_pending", None)
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             return record
 
@@ -2063,9 +2094,7 @@ def command_supervise(args: argparse.Namespace) -> int:
                 record = _recover_staged_pane_stop(record_path, _read_record(record_path))
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
-        finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        record.update(exit_code=exit_code, finished_at=finished_at)
-        record = _write_record(record_path, record)
+        record = _checkpoint_command_exit(record_path, exit_code)
         if run_slice := record.get("command_slice"):
             record = _finish_command_slice(record_path, run_slice)
             if error := record.get("scope_error"):
@@ -2093,7 +2122,6 @@ def command_supervise(args: argparse.Namespace) -> int:
             # The delivery process saves a checkpoint before it starts a send.
             _ = _save_delivery(
                 record_path, FAILED_RESULT_PUSH + f"delivery process exited {delivery_exit}", if_current="")
-        record.update(status="finished", exit_code=exit_code, finished_at=finished_at)
         completion = _finish_record(record_path, record)
         saved = worker_lifecycle.read_json_object(record_path)
         if _is_run_record(saved) and _needs_push_retry(saved):

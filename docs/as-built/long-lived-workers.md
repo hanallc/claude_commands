@@ -734,7 +734,10 @@ The record saves the command's process group as `command_group`.
 
 An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
 The record stays running until the supervisor or recovery can confirm that the slice is empty.
+The supervisor saves the exit code and cleanup intent before it releases the watcher.
+The run record saves `finished_at` when it records the confirmed end of the slice.
 Startup recovery resumes a saved stop even if the supervisor still runs.
+It resumes pending cleanup if the supervisor is gone.
 A run without a saved slice can receive a legacy group TERM, which reports an unconfirmed stop.
 The stop requires Linux pidfd support.
 After a normal command exit, the supervisor gives the slice members the stop grace to exit.

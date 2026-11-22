@@ -174,16 +174,8 @@ buildlog_exec() {
         return
     fi
     local status=0
-    if [[ "${BUILDLOG_SCOPE_SLICE_KEY-unset}" != ":${DETACHED_RUN_SLICE:-}" ]]; then
-        BUILDLOG_SCOPE_SLICE_ARG="$("$BUILD_HELPER_ROOT/lib/py" -c \
-            'from scripts.lib.process_stop import scope_slice_args; print(*scope_slice_args("builds.slice"))')" || {
-            "$@"
-            return
-        }
-        BUILDLOG_SCOPE_SLICE_KEY=":${DETACHED_RUN_SLICE:-}"
-    fi
     systemd-run --user --scope --quiet --collect --expand-environment=no \
-        "$BUILDLOG_SCOPE_SLICE_ARG" -- \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
