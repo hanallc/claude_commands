@@ -1405,7 +1405,7 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
     natural_place = (row.get("order_since", row["since"]), row["pid"])
-    since, pid = row.get("move_order", natural_place)
+    since, pid = row.get("move_rank", natural_place)
     return rank, since, pid
 
 

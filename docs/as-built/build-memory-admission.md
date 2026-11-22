@@ -2363,12 +2363,13 @@ The admission service gives each wait an ID.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
 A grant or cancellation ends the move.
-The service saves the manual order apart from the bump list in `state.json`.
+The service saves the rank on each waiter that a move reorders in `state.json`.
+That rank lasts while the step waits, including during a remote startup hold.
 The bumped units still have priority.
 New natedev waits join the end of a group with manual order.
 Both hosts use the visible order, and only starts selected by the local preview can pass a new remote startup hold.
-Remote-only waits stay behind the older movable waits in their priority group.
-A prelaunch refusal keeps the local wait and its continuation claim.
+The queue table includes remote-only waits at their rank positions.
+A refusal before launch keeps the local wait and its continuation claim.
 Use `/build:bump` to change priority between groups.
 
 The service checks the current order revision before it commits a move.

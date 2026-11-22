@@ -1534,7 +1534,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
 
 
 WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "build space", "the build in the same Cargo folder"]
+                    "AWS slot", "build hold", "Mac", "build space", "the build in the same Cargo folder", "target"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -2988,7 +2988,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = step_page_owner(waiter, labels, ci_runners, members, machine, ci_label=ci_label)
         identity = owner.labels
         cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
-        if isinstance(cause, admission_records.BehindHead):
+        target = waiter.placement_target
+        if target:
+            reason = f"waiting for {target}"
+        elif isinstance(cause, admission_records.BehindHead):
             order = order_holds.get(waiter.pid)
             blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
                        else admission_records.behind_place(cause, waiting))
@@ -3006,19 +3009,20 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(named, NoNamedStep):
             name = QueueRowName.owner_only("Build step")
             named = LocalStepName(name, name, staff_names.text_parts(name))
+        notes: TargetNotes = {"runs_on": target, "targets": target.split(" or "), "mac_text": ""} if target else (
+            NO_TARGET_NOTES if ci_label else target_notes(waiter.route, routes, waiter.step, waiter.folder, waiter.package))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
                         "reason": reason,
-                        "fits": need <= captured.signed_room, "place": place,
+                        "fits": not target and need <= captured.signed_room, "place": place,
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
-                        "why": wait_why(waiter.reason),
+                        "why": "target" if target else wait_why(waiter.reason),
                         **local_call_notes(waiter),
-                        **(NO_TARGET_NOTES if ci_label else target_notes(
-                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
+                        **notes,
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
                         **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
                                      waiter.folder, host_name()),
@@ -3180,7 +3184,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limit": "room and head protection", "ram": ram,
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,
-        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
+        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting
+            if not step.placement_target), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
@@ -3203,7 +3208,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
     shown_move_ids = {row["move"].row_id for row in waiting_rows if "move" in row}
-    if shown_move_ids and shown_move_ids == move_members.keys() and isinstance(move_line, admission_records.QueueMoveLine):
+    if (any(member.movable for member in move_members.values()) and shown_move_ids == move_members.keys()
+            and isinstance(move_line, admission_records.QueueMoveLine)):
         page["move_revision"] = move_line.revision
     page["render_seconds"] = time.perf_counter() - started
     return page

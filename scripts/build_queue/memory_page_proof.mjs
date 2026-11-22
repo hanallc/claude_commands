@@ -169,17 +169,17 @@ try {
       const request = JSON.parse(body);
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
-      const movable = rows.filter(row => row.move);
-      const line = () => ({revision:queueFixture.move_revision, members:movable.map(row => row.move)});
+      const ordered = rows.filter(row => row.move);
+      const line = () => ({revision:queueFixture.move_revision, members:ordered.map(row => row.move)});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
-      const index = movable.findIndex(row => row.move.row_id === row_id);
-      const [row] = movable.splice(index, 1);
-      const neighbor = movable.findIndex(item => item.move.row_id === destination.neighbor);
+      const index = ordered.findIndex(row => row.move.row_id === row_id);
+      const [row] = ordered.splice(index, 1);
+      const neighbor = ordered.findIndex(item => item.move.row_id === destination.neighbor);
       const undo = destination.kind === 'QueueUndo';
       const next = undo ? queueFixture.undoPlace : neighbor + (destination.side === 'after' ? 1 : 0);
-      movable.splice(next, 0, row);
+      ordered.splice(next, 0, row);
       let place = 0;
-      queueFixture.waiters = rows.map(item => item.move ? movable[place++] : item);
+      queueFixture.waiters = rows.map(item => item.move ? ordered[place++] : item);
       queueFixture.undoPlace = index;
       queueFixture.move_revision += '1';
       return json(200, {line:line(), old_place:index + 1, new_place:next + 1});
@@ -519,16 +519,6 @@ try {
           observer.observe(node, {childList:true, characterData:true, subtree:true});
         })`);
         await waitForLine('typesafe · test affected moved from 5 to 2');
-        if (queueDragProof) {
-          const clip = await evaluate(`(() => {
-            const walk = document.querySelector('#walk').getBoundingClientRect();
-            const top = document.querySelector('#walk .queue-title').getBoundingClientRect().top + scrollY - 10;
-            const bottom = document.querySelector('#queue-feedback').getBoundingClientRect().bottom + scrollY + 12;
-            return {x:Math.max(0,walk.left-10),y:top,width:Math.min(innerWidth-walk.left,walk.width+20),height:bottom-top,scale:1};
-          })()`);
-          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-          await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
-        }
         assert.equal((await snapshot()).action,'Undo');
         await evaluate("document.querySelector('#queue-action').click(); true");
         await waitForLine('typesafe · test affected moved from 2 to 5');
@@ -555,9 +545,11 @@ try {
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
         queueFixture.waiters.splice(1, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
-          title:{unit:'new-unit', step:'test affected'}, move:{row_id:'new-unit', group:''}});
+          name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
+          move:{row_id:'new-unit', group:''}});
         queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
-          name:'remote startup', machine:'mac', reason:'remote startup'});
+          name:'remote startup', machine:'mac', reason:'remote startup',
+          move:{row_id:'remote-start', group:'', movable:false}});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
         assert.deepEqual((await snapshot()).handles, []);
@@ -586,6 +578,32 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...nextTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('typesafe · test affected moved from 2 to 6');
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '6');
+
+        queueFixture.waiters.splice(2, 0, {...template, key:'mac-only', pid:652,
+          name:'Mac-only step', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          move:{row_id:'mac-only', group:'', movable:false}});
+        await evaluate('pageRefresh.refresh(true)');
+        const macStart = await grip('typesafe');
+        const macTarget = await cell('new-unit', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...macStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...macTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...macTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 7 to 2');
+        assert.deepEqual(await evaluate(`['typesafe', 'new-unit', 'mac-only'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['2', '3', '4']);
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] .machine').textContent`), 'mac');
+        assert.ok(!(await snapshot()).handles.includes('mac-only'));
+        assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
+        if (queueDragProof) {
+          const clip = await evaluate(`(() => {
+            const walk = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk .queue-title').getBoundingClientRect().top + scrollY - 10;
+            const bottom = document.querySelector('#queue-feedback').getBoundingClientRect().bottom + scrollY + 12;
+            return {x:Math.max(0,walk.left-10),y:top,width:Math.min(innerWidth-walk.left,walk.width+20),height:bottom-top,scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
+        }
         queueFixture = null;
         servedReading = base;
       }

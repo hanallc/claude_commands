@@ -875,7 +875,7 @@ function stepTooltip(key, data) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
     if (row.why === 'build space') rows.push(field('Reason', row.reason));
-    if (row.kind !== 'cloud') {
+    if (row.kind !== 'cloud' && row.why !== 'target') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -1390,7 +1390,7 @@ function queueMessage(text, action = null) {
 }
 
 function queueGrip(row, ready) {
-  if (!ready || !queueAccess?.token || !row.move || row.kind === "cloud") return "";
+  if (!ready || !queueAccess?.token || !row.move || row.move.movable === false) return "";
   const active = row.move.row_id === queueDrag?.row.move.row_id;
   const title = active && queueDrag.blocked ? queueBumpTip : queueGripTip;
   return `<button type="button" class="queue-grip" data-move-id="${esc(row.move.row_id)}"
@@ -1405,15 +1405,17 @@ function queueReading(d) {
     return d;
   }
   const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
+  const members = new Map(queueReply.line.members.map(member => [member.row_id, member]));
+  if (queueReply.line.members.some(member => member.movable !== false && !rows.has(member.row_id)) ||
+      [...rows.values()].some(row => row.move.movable !== false && !members.has(row.move.row_id)))
+    return {...d, queueReady:false};
   const ordered = queueReply.line.members.flatMap(member => {
     const row = rows.get(member.row_id);
     return row ? [{...row, move:member}] : [];
   });
-  if (ordered.length !== rows.size || ordered.length !== queueReply.line.members.length)
-    return {...d, queueReady:false};
   let index = 0;
   return {...d, move_revision:queueReply.line.revision,
-    waiters:d.waiters.flatMap(row => row.move ? ordered.slice(index, ++index) : [row])};
+    waiters:d.waiters.map(row => members.has(row.move?.row_id) ? ordered[index++] : row)};
 }
 
 function showQueue(d) {
@@ -1430,7 +1432,7 @@ function beginQueueDrag(id, pointer) {
   const reading = queueReading(latest);
   if (!reading.move_revision || reading.queueReady === false) return false;
   const row = reading.waiters.find(item => item.move?.row_id === id);
-  if (!row) return false;
+  if (!row || row.move.movable === false) return false;
   queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null, blocked:false};
   queueMessage("");
   tips.hide();
@@ -1475,6 +1477,11 @@ function queueRequestId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function queuePlace(reading, id, revision) {
+  if (reading.queueReady === false || reading.move_revision !== revision) return 0;
+  return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
+}
+
 async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
   const revision = reading.move_revision;
   if (queueSending) return;
@@ -1501,14 +1508,17 @@ async function sendQueueMove(row, reading, destination, id = queueRequestId()) {
       }, queueAccess.highlight_seconds * 1000);
       const {unit, step} = row.title ?? olderStepTitle(row);
       const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
-      const places = current.queueReady !== false && [revision, result.line.revision].includes(current.move_revision)
-        ? current.waiters.filter(item => item.kind !== "cloud").flatMap((item, index) => item.move ? [index + 1] : [])
-        : [];
-      const from = places[result.old_place - 1], to = places[result.new_place - 1];
+      const updated = queueReading(latest);
+      const currentRows = current.waiters.filter(item => item.kind !== "cloud");
+      const confirmed = current.move_revision === result.line.revision && currentRows.length === result.line.members.length &&
+        currentRows.every((item, index) => item.move?.row_id === result.line.members[index].row_id);
+      const from = queuePlace(current, row.move.row_id, revision) || (confirmed ? result.old_place : 0);
+      const to = queuePlace(updated, row.move.row_id, result.line.revision);
       queueMessage(from && to ? `${label} moved from ${from} to ${to}` : `${label} moved`,
         undo ? null : {label:"Undo", run:() => {
           const current = queueReading(latest);
-          if (current.queueReady === false || !current.move_revision || !current.waiters.some(item => item.move?.row_id === row.move.row_id)) {
+          if (current.queueReady === false || !current.move_revision || !current.waiters.some(item =>
+            item.move?.row_id === row.move.row_id && item.move.movable !== false)) {
             queueMessage("Undo not available");
             return;
           }
@@ -1727,7 +1737,8 @@ function fitWalkDetails() {
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
-  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
+  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB],
+    ...latest.waiters.filter(row => row.kind !== "cloud" && row.why !== "target").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
   // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
@@ -1900,7 +1911,7 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = stepRow(row.dataset.tip, d);
-    if (waiter.kind === "cloud") continue;
+    if (waiter.kind === "cloud" || waiter.why === "target") continue;
     // A wait bar stops at the room end or the cap line, whichever is first.
     const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
     const waitWidth = Math.min(waitEnd, waiter.need * unit);
