@@ -1401,8 +1401,8 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
-def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    if "queue_position" in row:
+def waiter_order(row: Waiter, *, use_pin: bool = True) -> tuple[int, float, int]:
+    if use_pin and "queue_position" in row:
         return -1, float(row["queue_position"]), row["pid"]
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
@@ -2094,7 +2094,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: Waiter | NoWaiter = NoWaiter()
     first_held_other_than_gpu: Waiter | NoWaiter = NoWaiter()
-    first_new_remote_start: Waiter | NoWaiter = NoWaiter()
+    parallel_holds: list[tuple[RankedWaiter, frozenset[str]]] = []
     for _, row in ordered:
         owner = records.waiter_owner(row)
         claim = claims.get(owner)
@@ -2106,10 +2106,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
-        parallel_remote_start = owner in inputs.parallel_remote_starts
-        if parallel_remote_start and isinstance(first_new_remote_start, NoWaiter):
-            first_new_remote_start = row
-        local_route = can_use_natedev(row) and not parallel_remote_start
+        can_pass_hold = inputs.parallel_remote_starts.get(owner)
+        if can_pass_hold is not None:
+            parallel_holds.append((row, can_pass_hold))
+        local_route = can_use_natedev(row) and can_pass_hold is None
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = folder in inputs.occupied_cargo_folders
@@ -2132,9 +2132,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         ahead = first_held_other_than_gpu if GPU_WAIT_MAY_PASS and not gpu_step else first_held
-        if (owner not in inputs.preview_local_starts and not isinstance(first_new_remote_start, NoWaiter)
-                and (isinstance(ahead, NoWaiter) or waiter_order(first_new_remote_start) < waiter_order(ahead))):
-            ahead = first_new_remote_start
+        for hold, allowed in parallel_holds:
+            if not isinstance(ahead, NoWaiter) and waiter_order(ahead) < waiter_order(hold):
+                break
+            if owner not in allowed:
+                ahead = hold
+                break
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(ahead)

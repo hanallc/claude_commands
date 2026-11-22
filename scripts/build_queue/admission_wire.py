@@ -327,8 +327,7 @@ class QueueMoved:
     old_after: str
     new_before: str
     new_after: str
-    previous_pin: int | None = field(default=None, kw_only=True)
-    previous_pin_next: str = field(default="", kw_only=True)
+    previous_pins: tuple[tuple[str, int], ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)

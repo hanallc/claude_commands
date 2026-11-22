@@ -585,6 +585,20 @@ def pinned_order(order: list[str], pins: QueuePins) -> list[str]:
     return ordered
 
 
+def confirmed_pins(order: list[str], pins: dict[str, int]) -> QueuePins:
+    places = {row_id: index for index, row_id in enumerate(order) if row_id in pins}
+    occupied = set(places.values())
+    # If a confirmed place is occupied, move the absent pin to the next free place.
+    for row_id, place in sorted(pins.items(), key=lambda pin: pin[1]):
+        if row_id in places:
+            continue
+        while place in occupied:
+            place += 1
+        places[row_id] = place
+        occupied.add(place)
+    return tuple(sorted(places.items(), key=lambda pin: pin[1]))
+
+
 def move_neighbors(order: list[str], index: int) -> tuple[str, str]:
     return (order[index - 1] if index else "", order[index + 1] if index + 1 < len(order) else "")
 
@@ -1850,7 +1864,7 @@ class AdmissionServer:
                 reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
 
-    def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
+    def _ordered_waiters(self, *, include_absent: bool = False) -> list[tuple[Path, records.RankedWaiter]]:
         rows: list[tuple[Path, records.RankedWaiter]] = []
         for waiting in self.waiters.values():
             if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace):
@@ -1867,6 +1881,16 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
             rows.append((self.state_dir / records.waiter_owner(row), row))
+        if include_absent:
+            present = {row.get("move_id") for _, row in rows}
+            for key, place in self.places.items():
+                if not place.move_id or place.move_id in present:
+                    continue
+                row = gate.rank_waiter({**place.queue_identity, "need": 0, "move_id": place.move_id,
+                                        "ci_runner": place.ci_runner}, records.NormalOrder())
+                if isinstance(place.order_since, float):
+                    row["order_since"] = place.order_since
+                rows.append((self.state_dir / key, row))
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     @staticmethod
@@ -1878,12 +1902,16 @@ class AdmissionServer:
         if not self.queue_pins:
             return rows, priority
         tracked = {row_id: (path, row) for path, row in rows if (row_id := row.get("move_id"))}
-        present = iter(tracked[row_id] for row_id in pinned_order(list(tracked), self.queue_pins))
+        projected = pinned_order(list(tracked), self.queue_pins)
+        if projected == list(tracked):
+            return rows, priority
+        present = iter(tracked[row_id] for row_id in projected)
         ordered = (next(present) if row.get("move_id") else (path, row) for path, row in rows)
         return [(path, {**row, "queue_position": index}) for index, (path, row) in enumerate(ordered)], priority
 
-    def _priority_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
-        rows = self._ordered_waiters()
+    def _priority_order(self, *, include_absent: bool = False
+                        ) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+        rows = self._ordered_waiters(include_absent=include_absent)
         if isinstance(self.priority, records.NoQueuePriority):
             return rows, self.priority
         # Match CI priority by runner. Keep the runner out of the published unit field.
@@ -2860,27 +2888,13 @@ class AdmissionServer:
     def _depart_queue_id(self, row_id: str) -> None:
         if not self.queue_pins:
             return
-        rows, _ = self._queue_order()
-        order = [member for _, row in rows if (member := row.get("move_id"))]
-        if row_id not in order:
-            # Use the known requests when the departing request is absent.
-            places = [place for place in self.places.values() if place.move_id]
-            entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
-            units = {entry["unit"]: index for index, entry in enumerate(entries)}
-            labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sorted({
-                place.queue_identity["session_id"] for place in places if place.queue_identity["session_id"]
-                and not (place.ci_runner or place.queue_identity.get("unit"))
-            })) if units else {}
-            places.sort(key=lambda place: (
-                units.get(gate.queue_unit(place.ci_runner or place.queue_identity.get("unit", ""),
-                                          place.queue_identity["session_id"], labels), len(units)),
-                place.order_since if isinstance(place.order_since, float) else place.since, place.owner.pid))
-            order = pinned_order([place.move_id for place in places], self.queue_pins)
-
+        rows, _ = self._priority_order(include_absent=True)
+        natural = [member for _, row in rows if (member := row.get("move_id"))]
+        order = pinned_order(natural, self.queue_pins)
         positions = {member: index for index, member in enumerate(order)}
         departed = positions[row_id]
         self._set_queue_pins(tuple(
-            (member, place - 1 if place > 0 and departed < positions.get(member, place) else place)
+            (member, place - 1 if place > 0 and departed < positions[member] else place)
             for member, place in self.queue_pins if member != row_id))
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
@@ -4112,12 +4126,24 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
-        parallel_starts: set[str] = pending_remote_starts - inputs.pending_remote_starts if local_starts else set()
+        parallel_starts: dict[str, frozenset[str]] = {}
+        new_holds = pending_remote_starts - inputs.pending_remote_starts
+        if new_holds and local_starts and ordered and "queue_position" in ordered[0][1]:
+            start_rows = [row for _, row in ordered if records.waiter_owner(row) in local_starts]
+            for _, row in ordered:
+                owner = records.waiter_owner(row)
+                if owner not in new_holds or not gate.can_use_natedev(row):
+                    continue
+                natural = gate.waiter_order(row, use_pin=False)
+                current = gate.waiter_order(row)
+                starts = frozenset(records.waiter_owner(start) for start in start_rows
+                    if current < gate.waiter_order(start) and gate.waiter_order(start, use_pin=False) < natural)
+                if starts:
+                    parallel_starts[owner] = starts
         return replace(inputs, ordered=[(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
             pending_remote_starts=frozenset(pending_remote_starts),
-            parallel_remote_starts=frozenset(parallel_starts),
-            preview_local_starts=frozenset(local_starts) if parallel_starts else frozenset())
+            parallel_remote_starts=parallel_starts)
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -4841,41 +4867,34 @@ done
         old_index = order.index(row_id)
         old_before, old_after = move_neighbors(order, old_index)
         del order[old_index]
-        pins = dict(self.queue_pins)
-        previous = pins.pop(row_id, None)
-        previous_next = ""
-        if previous is not None:
-            pin_ids = [member for member, place in self.queue_pins if place == previous]
-            _, previous_next = move_neighbors(pin_ids, pin_ids.index(row_id))
+        previous_pins = self.queue_pins
+        pins = dict(previous_pins)
         if isinstance(destination, wire.QueueUndo):
             if (saved is None or saved.row_id != row_id
                     or (old_before, old_after) != (saved.new_before, saved.new_after)
                     or saved.old_before and saved.old_before not in order
                     or saved.old_after and saved.old_after not in order):
                 return unavailable
-            place = saved.previous_pin
-            next_pin = saved.previous_pin_next
+            _ = pins.pop(row_id, None)
+            for member, place in saved.previous_pins:
+                if member == row_id or member in pins:
+                    pins[member] = place
+            ordered = pinned_order(natural, tuple(pins.items()))
         else:
             if destination.neighbor not in order:
                 return changed
             place = order.index(destination.neighbor) + int(destination.side == "after")
-            if place == old_index:
-                return wire.QueueMoved(row_id, line, old_index + 1, old_index + 1,
-                                      old_before, old_after, old_before, old_after,
-                                      previous_pin=previous, previous_pin_next=previous_next)
-            next_pin = next((member for member in order[place:] if pins.get(member) == place), "")
-        updated_pins = list(pins.items())
-        if place is not None:
-            index = next((i for i, (member, _) in enumerate(updated_pins) if member == next_pin), len(updated_pins))
-            updated_pins.insert(index, (row_id, place))
-        self._set_queue_pins(tuple(updated_pins))
-        ordered = pinned_order(natural, self.queue_pins)
+            if place != old_index:
+                pins[row_id] = place
+            order.insert(place, row_id)
+            ordered = order
+        self._set_queue_pins(confirmed_pins(ordered, pins))
         new_index = ordered.index(row_id)
         new_before, new_after = move_neighbors(ordered, new_index)
         updated = self._revise_move_line(tuple(by_id[member] for member in ordered))
         return wire.QueueMoved(row_id, updated, old_index + 1, new_index + 1,
                               old_before, old_after, new_before, new_after,
-                              previous_pin=previous, previous_pin_next=previous_next)
+                              previous_pins=previous_pins)
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:
