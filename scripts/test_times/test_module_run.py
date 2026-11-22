@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
 
 from dataclasses import dataclass
 import json
@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 import unittest
 
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -306,6 +307,187 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
     return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
+
+
+FOLDER_PATHS = """import os, unittest
+from pathlib import Path
+
+class Folders(unittest.TestCase):
+    def test_paths(self):
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+            print(setting + "=" + str(Path(os.environ[setting]).parent.parent))
+"""
+
+
+class ModuleRunnerFolderTests(unittest.TestCase):
+    def test_runner_recovers_an_ended_owners_folder_and_keeps_a_held_folder(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        parent = output / "test-runs"
+        parent.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = checkout / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        shim = str(checkout / "scripts/lib/py")
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        owner_source = """import sys
+from pathlib import Path
+from scripts.lib import build_folders
+
+parent = build_folders.ExplicitBuildParent(Path(sys.argv[1]))
+folder = build_folders.create_build_folder(build_folders.UniqueBuildFolder(sys.argv[2], parent))
+print(folder, flush=True)
+sys.stdin.read(1)
+"""
+        owner = [shim, "-B", "-c", owner_source, str(parent)]
+        ended = subprocess.run([*owner, "config-reads-"], cwd=checkout, env=environment,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True, timeout=30)
+        leftover = Path(ended.stdout.strip())
+        self.assertEqual(leftover.parent, parent)
+        self.assertTrue(leftover.is_dir())
+        live = subprocess.Popen([*owner, "test-run-roots-"], cwd=checkout, env=environment,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(live)
+        assert live.stdout is not None
+        self.assertTrue(select.select([live.stdout], [], [], 30)[0], "The live owner did not report its folder")
+        held = Path(cast(str, live.stdout.readline()).strip())
+        self.assertEqual(held.parent, parent)
+        self.assertTrue(held.is_dir())
+
+        result = subprocess.run(
+            [shim, "-B", str(checkout / "scripts/test_times/module_run.py"), str(checkout), source.name],
+            cwd=checkout, env=environment, capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(leftover.exists(), f"The ended owner left {leftover}")
+        self.assertFalse(leftover.with_name(leftover.name + ".lease.json").exists())
+        self.assertFalse(leftover.with_name(leftover.name + ".lock").exists())
+        self.assertTrue(held.is_dir())
+        self.assertIsNone(live.poll())
+        stdout, stderr = live.communicate(timeout=30)
+        self.assertEqual(live.returncode, 0, stdout + stderr)
+
+    def test_concurrent_runners_do_not_wait_for_held_folder_names(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        ready = root / "ready"
+        source = checkout / "test_folders.py"
+        _ = source.write_text("""import os, sys, unittest
+from pathlib import Path
+
+class Folders(unittest.TestCase):
+    def test_paths(self):
+        paths = [str(Path(os.environ[key]).parent)
+                 for key in ("CONF_READ_LOG", "SCRATCH_ROOT")]
+        if "FIXTURE_READY" in os.environ:
+            ready = Path(os.environ["FIXTURE_READY"])
+            ready.with_suffix(".tmp").write_text("\\n".join(paths))
+            ready.with_suffix(".tmp").rename(ready)
+            sys.stdin.read(1)
+        else:
+            print("\\n".join(paths))
+""")
+        entry = checkout / "run_fixture.py"
+        _ = entry.write_text("""import runpy, sys, time
+from types import SimpleNamespace
+from unittest.mock import patch
+from scripts.lib import build_folder_lock, build_folders
+
+create_folder = build_folders.create_build_folder
+new_suffix = build_folders._new_suffix
+first_suffixes = iter(("a", "b"))
+
+def fixture_suffix(length, settings):
+    initial = next(first_suffixes, "")
+    return initial * length if initial else new_suffix(length, settings)
+
+def refuse_wait(seconds):
+    raise AssertionError("A runner waited for a held folder name")
+
+def create_without_wait(*args, **kwargs):
+    clock = SimpleNamespace(monotonic=time.monotonic, sleep=refuse_wait)
+    with patch.object(build_folder_lock, "time", clock):
+        return create_folder(*args, **kwargs)
+
+build_folders._new_suffix = fixture_suffix
+build_folders.create_build_folder = create_without_wait
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+""")
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        command = [str(checkout / "scripts/lib/py"), "-B", str(entry),
+                   str(checkout / "scripts/test_times/module_run.py"), str(checkout), source.name]
+        first = subprocess.Popen(command, cwd=checkout, env={**environment, "FIXTURE_READY": str(ready)},
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(first)
+        wait_until(lambda: ready.exists() or first.poll() is not None, root, timeout=30, processes=(first,))
+        if not ready.exists():
+            stdout, stderr = first.communicate(timeout=30)
+            self.fail(stdout + stderr)
+        held = tuple(Path(path) for path in ready.read_text().splitlines())
+        second = subprocess.run(command, cwd=checkout, env=environment, capture_output=True, text=True,
+                                check=False, timeout=30)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        allocated = tuple(Path(path) for path in second.stdout.splitlines())
+        self.assertEqual(len(allocated), 2)
+        self.assertTrue(all(path.parent == output / "test-runs" for path in (*held, *allocated)))
+        self.assertTrue(set(held).isdisjoint(allocated))
+        self.assertTrue(all(path.is_dir() for path in held))
+        stdout, stderr = first.communicate(timeout=30)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
+
+    def test_runner_folders_use_the_checkout_output(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = checkout / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        environment = direct_test_fixture_environment(root)
+        result = subprocess.run(
+            [str(checkout / "scripts/lib/py"), "-B", str(checkout / "scripts/test_times/module_run.py"),
+             str(checkout), source.name],
+            cwd=checkout, env=environment, capture_output=True, text=True, check=False,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+            self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
+
+    def test_runner_folders_follow_start_dir_into_another_checkout(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/tested"
+        start_dir = checkout / "tests"
+        start_dir.mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+        output = root / "build/claude/verify/tested"
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = start_dir / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        environment = {**direct_test_fixture_environment(root), "PYTHONPATH": str(start_dir)}
+        result = subprocess.run(
+            [str(RUNNER.parents[1] / "lib/py"), "-B", str(RUNNER), str(start_dir), source.name],
+            cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+            self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
 
 
 class ModuleRunnerTests(unittest.TestCase):
@@ -709,9 +891,9 @@ class FixtureCPU(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
-            env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
-                   "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            env["PYTHONPATH"] = str(root)
+            env = direct_test_fixture_environment(root)
+            env.update(TEST_TIMES_OUT=str(output), HOME=str(root / "home"),
+                       BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
             result = subprocess.run(
                 [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -731,35 +913,50 @@ class ModuleProcessCleanupTests(unittest.TestCase):
                 root = Path(self.enterContext(tempfile.TemporaryDirectory()))
                 processes = OwnedTestProcesses()
                 self.addCleanup(processes.finish)
-                environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-                    "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-                    "PYTHONPATH": str(root)})
-                _ = environment.pop("TEST_TIMES_OUT", None)
-                _ = (root / "test_parent.py").write_text("""import signal, unittest
+                environment = processes.environment(direct_test_fixture_environment(root))
+                environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
+                case = root / "test_parent.py"
+                _ = case.write_text("""import unittest
 class ParentDeath(unittest.TestCase):
     def test_wait(self):
         print('ready', flush=True)
-        signal.pause()
+        import select
+        select.select([], [], [])
 """, encoding="utf-8")
-                parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                repository = RUNNER.parents[2]
+                log = root / "runner.log"
+                shim = repository / "scripts/lib/py"
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
+                source = f"""import os, sys
+from pathlib import Path
+from scripts.production import gate
+job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
+                         Path({str(repository)!r}), dict(os.environ), Path({str(log)!r}))
+print(job.process.pid, flush=True)
+sys.exit(job.process.wait())
+"""
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
                 processes.track(parent)
-                _ = environment.pop("GATE_PARENT_PID", None)
-                _ = environment.pop("MERGE_GATE_PARENT_PID", None)
-                environment[parent_name] = str(parent.pid)
-                runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
-                    env=environment, cwd=root, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-                processes.track(runner)
-                output = runner.stdout
+                output = parent.stdout
                 assert output is not None
                 self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
-                self.assertEqual(cast(str, output.readline()), "ready\n")
-                parent.send_signal(signal.SIGTERM)
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                self.addCleanup(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                parent.terminate()
                 self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
-                stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
-                self.assertNotIn("Traceback", stderr)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -826,12 +1023,9 @@ class InheritedSignal(unittest.TestCase):
         source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
                   .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
         _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
-        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
-            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
-            "PYTHONDONTWRITEBYTECODE": "1"})
-        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
-            _ = environment.pop(name, None)
-        environment["PYTHONPATH"] = str(root)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(root))
         process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)

@@ -37,6 +37,8 @@ from scripts.lib.conf import UseConfiguredValue
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
 
+TEST_RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
+
 # Python's mkdtemp allocator uses this suffix.
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
@@ -539,6 +541,30 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
                 return InvalidFolderComponents("the path has the wrong number of components")
     except ValueError as error:
         return InvalidFolderComponents(str(error))
+
+
+def test_runs_parent(checkout: Path) -> Path:
+    """Use the selected checkout's build output or its temporary parent."""
+    target = checkout / "target"
+    output = None
+    if isinstance(parse_form(checkout), BuildCopy):
+        if not target.is_symlink():
+            output = target
+    elif target.is_symlink():
+        with suppress(OSError, RuntimeError):
+            linked_output = target.resolve(strict=True)
+            if linked_output.is_dir() and isinstance(parse_form(linked_output), (WorktreeOutput, MainOutput)):
+                output = linked_output
+    if output is not None:
+        parent = output / "test-runs"
+        if parent.is_symlink():
+            raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
+        return parent
+
+    inherited = inherited_temporary_parent().resolve()
+    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
+        return inherited.parent
+    return inherited / "test-runs"
 
 
 def repository_git_timeout() -> float:
@@ -1459,7 +1485,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 new_folder = False
                 try:
                     if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind not in ("copy", "slot") and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind not in ("copy", "slot")):
+                                      wait=spec.kind not in ("copy", "slot") and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))

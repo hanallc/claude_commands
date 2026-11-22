@@ -14,11 +14,15 @@ import time
 import subprocess
 import select
 from types import SimpleNamespace
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.build_queue import admission_protocol as wire, admission_records
+from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.direct.local_release_wait import LocalReleaseEvents
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
@@ -801,17 +805,84 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertNotIn("Rerun alone", output.getvalue())
 
     @gate_suites("lib", "hooks")
-    def test_named_modules_run_alone_with_no_hold_ledger_or_record(self) -> None:
-        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
+    def test_named_modules_use_the_build_hold_and_repository_run_limit(self) -> None:
+        checkout = self.root / "named-modules"
+        _ = self.git(self.checkout, "worktree", "add", "--detach", str(checkout))
+        self.write(checkout / "scripts/hooks/test_first.py", SUITE_MODULE
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        repository = "claude_commands"
+        _ = self.git(checkout, "remote", "set-url", "origin", str(self.root / f"{repository}.git"))
+        self.configure_gate(f"# whole: 1..\nmax_runs.natedev.{repository}=2\nmax_runs_exempt_unit=natemerge\n")
+        holder = Path(self.environment["BUILD_HOLD_DIR"]) / "fixture-holder"
+        self.write(holder, "Fixture build hold\n")
+
+        occupied: list[wire.Admitted] = []
+        events: list[str | admission_records.RunLimitWait] = []
+        grants: list[tuple[str, str, int]] = []
+        previous = self.admission.server.reply_filter
+
+        def observe(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Admitted):
+                reservations = self.admission.server.reservations.values()
+                record = next(row for row in reservations if row.reservation_id == reply.reservation)
+                grants.append((record.step, record.queue_waiter.get("repository_name", ""), len(reservations)))
+                events.append("admitted")
+            elif isinstance(reply, wire.Wait):
+                limit = reply.snapshot.decision.run_limit
+                if isinstance(limit, admission_records.RunLimitWait) and limit not in events:
+                    events.append(limit)
+                    self.admission.release(occupied.pop(0))
+            return previous(reply)
+
+        def release_fixture_hold(holders: Path, release: Path) -> LocalReleaseEvents:
+            self.assertEqual(os.environ["BUILDLOG_UNIT"], "fixture-unit")
+            self.assertEqual(self.module_events(), [])
+            self.assertEqual(len(self.admission.caller_reservations()), 2)
+            events.append("hold")
+            holder.unlink()
+            return LocalReleaseEvents(holders, release)
+
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
-              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
-            for name in ("BuildHoldWait", "gate_reservation", "PassedTreeLedger", "record_gate_run", "run_gate_suites"):
-                _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
-            code = gate.main(["--tests-only", "--repo", str(self.checkout),
-                                    "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+              mock.patch.object(self.admission.server, "reply_filter", observe),
+              mock.patch.object(gate, "local_release_waiter", side_effect=release_fixture_hold),
+              mock.patch.object(gate, "run_gate_suites", side_effect=AssertionError("run_gate_suites")),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+            try:
+                for _slot in range(2):
+                    self.admission.allow_next_start()
+                    request = self.admission.request(need=admission_records.GIB, step="gate")
+                    assert isinstance(request.profile, admission_records.StepProfile)
+                    request = replace(request, profile=replace(request.profile, repo=repository))
+                    with self.admission.loop_turn():
+                        occupied.append(only_admitted(self.admission.server.handle_request(request)))
+                self.admission.allow_next_start()
+                os.environ["BUILDLOG_UNIT"] = "natemerge"
+                code = gate.main(["--affected", "--repo", str(checkout),
+                                  "--module", "lib/test_second.py"])
+                self.assertEqual(code, 0, output.getvalue())
+                self.assertTrue(holder.exists())
+                self.assertEqual(events, ["admitted"])
+                self.assertEqual(grants, [("test-affected", repository, 3)])
+                self.clear_gate_events()
+
+                self.admission.allow_next_start()
+                os.environ["BUILDLOG_UNIT"] = "fixture-unit"
+                code = gate.main(["--tests-only", "--repo", str(checkout),
+                                  "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+            finally:
+                for grant in occupied:
+                    self.admission.release(grant)
         self.assertEqual(code, 1, output.getvalue())
+        self.assertEqual(events, ["admitted", "hold", admission_records.RunLimitWait(2, 2, repository, "natedev"),
+                                  "admitted"])
+        self.assertEqual(grants, [("test-affected", repository, 3), ("gate", repository, 2)])
+        self.assert_gate_released()
+        exempt, ordinary = self.gate_run_records()
+        self.assertEqual((exempt["selection"], exempt["hold_wait_s"], exempt["status"]), ("subset", 0.0, 0))
+        self.assertEqual((ordinary["selection"], ordinary["status"]), ("subset", 1))
+        self.assertGreater(ordinary["hold_wait_s"], 0.0)
+        self.assertFalse(Path(self.environment["GATE_PASSED_DIR"], "passed-trees.jsonl").exists())
         starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
         # A red module runs once more alone, as in the gate, so a flake is not a red name.
         self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])

@@ -586,14 +586,23 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
-  A later `package_root.py` run inside an import selects the checkout only and starts no folder.
-  `gate.py --affected` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/r*`.
-  Child processes inherit TMPDIR, and each run holds its folder lock.
+  At the first unittest call, the shared Python hook disables bytecode writes for the test.
+  Python child processes inherit `PYTHONDONTWRITEBYTECODE=1`.
+  Outside verified gate jobs, the hook gives each run a private folder.
+  `targeted_test.py` uses the same test-folder context for its outer run.
+  A modeled checkout keeps each `r*` run folder under `test-runs` in its build output.
+  Worktree and main checkouts use their `target` link to the build output.
+  On natedev, a modeled `~/.claude` uses `/build/claude/main/test-runs`.
+  Numbered copies use their own `target` folder.
+  A checkout without a model output uses `$TMPDIR/test-runs`.
+  A verified gate keeps both timed runner folders in its `TMPDIR`.
+  A direct timed runner selects the output from the checkout that contains `start_dir`.
+  The runner gives `config-reads-*` and `test-run-roots-*` unique names in that checkout's `test-runs` folder.
+  A nested legacy run uses the parent of the current run folder.
+  Child processes inherit `TMPDIR`.
+  Each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
+  Before allocation, direct runs sweep free folders in their test parent, including older `test-run-*` folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.

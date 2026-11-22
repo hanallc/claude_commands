@@ -44,13 +44,14 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 import fcntl
+from functools import cache
 import hashlib
 import inspect
 from importlib import import_module
@@ -71,7 +72,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Literal, TextIO, cast
+from typing import BinaryIO, Literal, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -80,7 +81,7 @@ from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import gate_job_for_command, read_step_names
-from scripts.lint import sweep
+from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
@@ -101,6 +102,7 @@ from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
+from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
 from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
@@ -108,10 +110,10 @@ from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_client import AdmissionHoldCheck, step_identity  # noqa: E402
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
+    QueuePlace, QueuePlaceRefused, no_hold_wait, queue_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -194,6 +196,11 @@ class NightlyRunState(Enum):
 @dataclass(frozen=True)
 class SharedMachine:
     """Share the machine through admission, holds, memory limits, and CPU slots."""
+
+
+@dataclass(frozen=True)
+class HoldExemptNamedModuleMachine:
+    """Share resources and record a named run that the hold exempts."""
 
 
 @dataclass(frozen=True)
@@ -431,16 +438,21 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
         print("Memory stop message could not be sent: " + " ".join(str(error).split()), flush=True)
 
 
+class NoBuildHoldCheck:
+    """Request admission while a build hold can be active."""
+
+
 @contextmanager
-def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
+def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildHoldCheck, *,
                      type_dirs: Sequence[str] = (),
                      mode: SuiteMode = SuiteMode.GATE) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-        with queue_place(program, repo,
-                         before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
+        before_check = (no_hold_wait if isinstance(hold, NoBuildHoldCheck)
+                        else AdmissionHoldCheck(hold.wait_until_free, hold.admits))
+        with queue_place(program, repo, before_check=before_check) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -1109,6 +1121,12 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
                                              -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
 
 
+@cache
+def _gate_program_source() -> BinaryIO:
+    """Keep the gate source open while this process launches test modules."""
+    return Path(__file__).resolve().open("rb")
+
+
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
@@ -1118,10 +1136,16 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
+            job_environment = {**environment, "GATE_PARENT_PID": str(os.getpid())}
+            descriptors = copies.COMMAND_LOCKS.get()
+            if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
+                descriptor = _gate_program_source().fileno()
+                job_environment[GATE_PARENT_SOURCE_FD] = str(descriptor)
+                descriptors = (*descriptors, descriptor)
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                       cwd=repo, env={**environment, "GATE_PARENT_PID": str(os.getpid())},
+                                       cwd=repo, env=job_environment,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+                                       start_new_session=True, pass_fds=descriptors)
             job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
@@ -1589,10 +1613,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
-               machine: SharedMachine | WholeMachine = SHARED_MACHINE,
+               machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
-    shared = isinstance(machine, SharedMachine)
+    shared = not isinstance(machine, WholeMachine)
     if shared:
         recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
@@ -1614,10 +1638,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     report_retained_gate_test_folders(tmpfs)
-    hold = BuildHoldWait() if shared else None
+    hold = BuildHoldWait() if isinstance(machine, SharedMachine) else None
     tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
     if hold is not None:
         hold.wait_until_free()
+    if shared:
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1660,6 +1685,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1675,7 +1701,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     scope_prefix = suite_scope_prefix() if shared else []
     state_directory = gate_state_dir() if shared else tmpfs
     timings_path = state_directory / "module_seconds.json"
-    timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
+    timings = machine.module_seconds.copy() if isinstance(machine, WholeMachine) else read_measures(timings_path)
     cpu_path = state_directory / "module_cpu_seconds.json"
     cpu_measures = read_measures(cpu_path) if shared else {}
     run_cpu: dict[str, float] = {}
@@ -1714,9 +1740,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or hold is None or admission is None:
+        if ledger is None or admission is None:
             return
-        waited = hold.waited_s()
+        waited = hold.waited_s() if hold is not None else 0.0
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
@@ -1734,10 +1760,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
+    hold_check = hold if hold is not None else NoBuildHoldCheck()
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, tmpfs) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
+          (gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if shared else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
@@ -3025,7 +3052,7 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
-                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
+                            help="run this module without waiting for a build hold (suite/module)")
 
 
 def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> GateRun:
@@ -3182,11 +3209,24 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
 
 
 def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Run only the named modules, as a merge red's check on its base.
+    """Reserve resources and apply the hold exemption for the configured unit.
 
-    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
+    The unit identity is not proof against a session that claims to be that unit.
+    It is the same trust that the run limit exemption uses, and builds accepts it.
     """
-    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
+    try:
+        exempt_unit = admission_records.read_memory_config().policy.repository_runs.exempt_unit
+    except conf.Unusable as error:
+        raise GateRefused(str(error)) from error
+    machine: SharedMachine | HoldExemptNamedModuleMachine = SHARED_MACHINE
+    if exempt_unit:
+        caller = step_identity(mode.value, str(repo))
+        labels: Mapping[str, memory_admit.UnitMembership] = {}
+        if caller.session_id and not caller.unit:
+            labels = memory_admit.priority_labels([caller.session_id])
+        if memory_admit.queue_unit(caller.unit, caller.session_id, labels) == exempt_unit:
+            machine = HoldExemptNamedModuleMachine()
+    return run_suites(repo, [], module_time_limit_s, machine=machine, mode=mode,
                       selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
