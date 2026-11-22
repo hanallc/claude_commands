@@ -54,10 +54,10 @@ from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
 from scripts.production import staff
 
-from scripts.buildlog import store
+from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
+from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -438,7 +438,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
     if isinstance(request.identity.job, StepJob):
         return request.identity.job
     step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity):
         job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
         if isinstance(job, StepJob):
             return job
@@ -487,6 +487,29 @@ def reservation_row(record: ReservationRecord) -> records.Reservation:
     if not isinstance(record.charge_use, test_phase.NoTestPhaseChargeUse):
         row["test_phase_charge_use"] = record.charge_use
     return row
+
+
+@cache
+def gate_worktree_repository_name(worktree: str) -> str | records.UnknownRepository:
+    """Read the Git repository name for this gate worktree."""
+    try:
+        key = repository.repository_key(worktree)
+        if key == store.UNKNOWN_IDENTITY or key.startswith(repository.MANIFEST_IDENTITY_PREFIX):
+            return records.UnknownRepository()
+        if key.startswith("git-root:"):
+            return repository.repo_name(worktree) or records.UnknownRepository()
+        return key.rsplit("/", 1)[-1] or records.UnknownRepository()
+    except (OSError, ValueError):
+        return records.UnknownRepository()
+
+
+def gate_repository_name(step: str, repository_name: str, worktree: str) -> str:
+    """Resolve the Git repository for a gate with a legacy program profile."""
+    if step in records.REPOSITORY_RUN_STEPS and Path(repository_name).is_absolute() and Path(worktree).is_absolute():
+        name = gate_worktree_repository_name(worktree)
+        if isinstance(name, str):
+            return name
+    return repository_name
 
 
 @dataclass(frozen=True)
@@ -2007,6 +2030,8 @@ class AdmissionServer:
             row["repo_identity"] = profile.repository.key
             row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
+        elif isinstance(profile, records.ProgramProfile):
+            row["repository_name"] = gate_repository_name(profile.step, profile.repo, profile.worktree)
         if isinstance(request, wire.AdmitRequest):
             row["package"] = step_estimator.test_package(list(request.argv))
             row["filters"] = list(step_estimator.test_filters(list(request.argv)))
@@ -2084,6 +2109,10 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
+            repository_name = record.queue_waiter.get("repository_name", record.repo)
+            resolved_name = gate_repository_name(record.step, repository_name, record.worktree)
+            if resolved_name != repository_name:
+                row["queue_waiter"] = {**record.queue_waiter, "repository_name": resolved_name}
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
@@ -2121,9 +2150,18 @@ class AdmissionServer:
             if (isinstance(eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
                     or owner in pending_remote_starts and eligibility != placement.TemporaryExclusion("blocked")):
                 local_owners.add(owner)
-        inputs = gate.build_queue_inputs([(path, row) for path, row in ordered
-            if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
-        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits)
+        local_rows = [(path, row) for path, row in ordered if records.waiter_owner(row) in local_owners]
+        limits = config.policy.repository_runs
+        sessions = list(dict.fromkeys(session for _, row in local_rows
+            if not row.get("unit") and (session := row.get("session_id", ""))
+            and limits.for_step(self.host, row.get("repository_name", ""), row.get("step", ""))))
+        labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
+        exempt = frozenset(records.waiter_owner(row) for _, row in local_rows
+            if (session := row.get("session_id", "")) in labels
+            and gate.queue_unit(row.get("unit", ""), session, labels) == limits.exempt_unit)
+        inputs = gate.build_queue_inputs(local_rows, memories, readings, now, priority, unowned)
+        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
+                         local_machine=self.host, run_limit_exempt_owners=exempt)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -2241,10 +2279,10 @@ class AdmissionServer:
                 continue
             sidecar = Path(row["sidecar"])
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
-            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
             if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
-                    and row["step"] != "merge-gate" and self.boot_id):
+                    and row["step"] != "gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -2816,7 +2854,7 @@ class AdmissionServer:
             stem = stem.with_name(stem.name + "0")
         if profile.step == "build":
             shape = build_shape(list(request.argv)).key
-        elif profile.step == "merge-gate":
+        elif profile.step in {"gate", "merge-gate"}:
             shape = gate.merge_gate_shape(request.argv)
         else:
             shape = ""
@@ -5204,6 +5242,7 @@ ADMISSION_CALLERS = {
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
     "merge_gate.py": "production/merge_gate.py",
+    "gate.py": "production/gate.py",
     "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
     "queue_place.py": "build_queue/queue_place.py",

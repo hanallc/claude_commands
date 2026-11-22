@@ -150,13 +150,30 @@ class GpuTestSlots:
 
 
 # These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
+REPOSITORY_RUN_STEPS = frozenset({"gate", "test-affected"})
+
+
+@dataclass(frozen=True)
+class RepositoryRunLimits:
+    """Limit concurrent gate and test-affected runs by machine and repository."""
+    by_machine_and_repository: Mapping[str, int] = field(default_factory=dict[str, int])
+    exempt_unit: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_machine_and_repository", MappingProxyType(dict(self.by_machine_and_repository)))
+
+    def for_step(self, machine: str, repository: str, step: str) -> int:
+        """Return the configured limit, or zero for an unrestricted step."""
+        if step in REPOSITORY_RUN_STEPS:
+            return self.by_machine_and_repository.get(f"{machine}.{repository}", 0)
+        return 0
 
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
-    """The policy holds memory, pressure, timing, and GPU limits for admission."""
+    """Set memory, pressure, timing, GPU, and repository run limits."""
     timing: AdmissionTiming
     pressure: PressurePolicy
     peak_hold: PeakHold
@@ -164,6 +181,7 @@ class AdmissionPolicy:
     progress_lookahead_percent: float = field(kw_only=True)
     agent_swap_share_percent: int = field(default=100, kw_only=True)
     gpu_tests: GpuTestSlots = field(default=NO_GPU_TESTS, kw_only=True)
+    repository_runs: RepositoryRunLimits = field(default_factory=RepositoryRunLimits, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -919,6 +937,20 @@ class GpuSlotWait:
 
 
 @dataclass(frozen=True)
+class RunLimitFree:
+    """The repository run limit permits this step."""
+
+
+@dataclass(frozen=True)
+class RunLimitWait:
+    """The step waits for room under its repository run limit."""
+    used: int
+    limit: int
+    repository: str
+    machine: str
+
+
+@dataclass(frozen=True)
 class AdmissionDecision:
     """The decision holds admission state, memory charges, and reasons for a delay."""
     state: Literal["admit", "hold"]
@@ -934,6 +966,7 @@ class AdmissionDecision:
     reused_slot: bool = False
     room: RoomCheck = RoomCheck(0, 0, True, basis=Fits())
     gpu: GpuSlotFree | GpuSlotWait = GpuSlotFree()
+    run_limit: RunLimitFree | RunLimitWait = RunLimitFree()
 
 
 @dataclass(frozen=True)
@@ -1003,7 +1036,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
+             | BehindHead | GpuSlotWait | RunLimitWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -1015,7 +1048,7 @@ class HeadAdmissionStatus:
     cause: HeadCause = field(kw_only=True)
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
-              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
+              | RunLimitWait | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
               | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
 
 
@@ -1031,6 +1064,10 @@ def build_space_text(wait: BuildSpaceHold) -> str:
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
     return f"waiting for the GPU test slot ({wait.used} of {wait.slots} in use)"
+
+
+def run_limit_text(wait: RunLimitWait) -> str:
+    return f"{wait.used} of {wait.limit} {wait.repository} runs on {wait.machine}"
 
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
@@ -1049,6 +1086,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: behind " + select_queue_name(cause.head_name)
     if isinstance(cause, GpuSlotWait):
         return "head: " + gpu_slot_text(cause)
+    if isinstance(cause, RunLimitWait):
+        return "head: " + run_limit_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
     if isinstance(cause, placement.CargoFolderWait):
@@ -1297,6 +1336,8 @@ class QueueInputs:
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
+    local_machine: str = field(default="natedev", kw_only=True)
+    run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1517,6 +1558,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
                            for key in values if key.startswith("program_first_peak_gib.")}
+            run_limits = {key.removeprefix("max_runs."): value(key, conf.positive_whole)
+                          for key in values if key.startswith("max_runs.")}
+            exempt_unit = value("max_runs_exempt_unit", str) if run_limits else ""
             if "cargo" not in first_peaks:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
@@ -1524,7 +1568,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                                        progress_lookahead_percent=number("progress_lookahead_percent"),
                                        agent_swap_share_percent=whole("agent_swap_share_percent"),
                                        gpu_tests=GpuTestSlots(whole("gpu_test_slots"),
-                                                              value("gpu_test_repositories", lambda raw: frozenset(raw.split())))),
+                                                              value("gpu_test_repositories", lambda raw: frozenset(raw.split()))),
+                                       repository_runs=RepositoryRunLimits(run_limits, exempt_unit)),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
@@ -1748,6 +1793,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
+        case RunLimitWait():
+            return run_limit_text(reason)
         case BehindHead():
             place = behind_place(reason, waiting)
             return f"behind #{place}" if place else "behind the first step"

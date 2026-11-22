@@ -45,6 +45,7 @@ from scripts.production import change_routing, change_review, staff
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
+from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -561,8 +562,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
                 with server.staff_read_scope():
-                    payload = (console.for_you_count_view(for_you.read_for_status_line()) if route.query == "view=count"
-                               else console.for_you_payload())
+                    if route.query == "view=count":
+                        try:
+                            snapshot = for_you.read(include_comparison_reason=False)
+                        except RecursionError as error:
+                            rebuild = rebuild_row.read()
+                            snapshot = for_you.ForYouSnapshot(
+                                (), (for_you.UnavailableSource("For you", str(error)),), rebuild.machines)
+                        payload = console.for_you_count_view(snapshot)
+                    else:
+                        payload = console.for_you_payload()
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
                 self.json_response(503, {"available": False, **extra})

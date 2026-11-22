@@ -57,6 +57,7 @@ from scripts.review_links import accounts_page, change_browser, change_page, con
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
 
 
@@ -3117,7 +3118,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
         self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1, "rebuild_machines": ["mac"]})
-        self.assertEqual(read.call_count, 1)
+        read.assert_called_once_with(include_comparison_reason=False)
+
+    def test_for_you_count_view_keeps_rebuilds_when_the_read_exceeds_the_recursion_limit(self) -> None:
+        rebuild = rebuild_row.RebuildAnswer(("natedev", "mac"), False)
+        with (patch.object(for_you, "read", side_effect=RecursionError("Fixture read failed.")),
+              patch.object(rebuild_row, "read", return_value=rebuild)):
+            status, _, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"available": False, "rebuild_machines": ["natedev", "mac"]})
 
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

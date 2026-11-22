@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -32,15 +32,10 @@ from scripts.copies import copies
 from scripts.lib import build_folders, conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.test_times import gate_record
-
-if TYPE_CHECKING:
-    from scripts.production.gate_routes import (
-        MacGateCancellation, MacGateExcludeFileMissing, MacGateExclusions,
-    )
 
 MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
@@ -74,22 +69,20 @@ class UseCallerProcessLifetime:
 USE_CALLER_PROCESS_LIFETIME = UseCallerProcessLifetime()
 
 
-def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
+def read_modules(repo: Path) -> gate.MacGateExclusions | gate.MacGateExcludeFileMissing:
     """Return excluded test paths in the tested checkout."""
-    from scripts.production.gate_routes import MacGateExcludeFileMissing, MacGateExclusions
-
     try:
         entries = {line for row in (repo / MODULE_LIST).read_text().splitlines()
                    if (line := row.partition('#')[0].strip())}
     except FileNotFoundError:
-        return MacGateExcludeFileMissing()
+        return gate.MacGateExcludeFileMissing()
     if not entries:
-        return MacGateExclusions(())
+        return gate.MacGateExclusions(())
     tracked_paths = set(gate.checked_git(repo, 'ls-files', '-z', '--cached', '--others',
                                         '--exclude-standard', '--', 'scripts').split('\0'))
     excluded = entries & tracked_paths
-    return MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
-                                   if (name := path.relative_to(repo).as_posix()) in excluded))
+    return gate.MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
+                                        if (name := path.relative_to(repo).as_posix()) in excluded))
 
 
 def attempt_name(folder: Path) -> str:
@@ -471,15 +464,13 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
 
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
-               cancellation: MacGateCancellation | UseCallerProcessLifetime,
+               cancellation: gate.MacGateCancellation | UseCallerProcessLifetime,
                ) -> MacGateResult | str:
     """Wait for a Mac placement in queue order and run the assigned modules."""
-    from scripts.production.gate_routes import MacGateCancellation
-
     try:
         repo = repo.resolve()
         with ExitStack() as cleanup:
-            if isinstance(cancellation, MacGateCancellation):
+            if isinstance(cancellation, gate.MacGateCancellation):
                 caller = os.dup(cancellation.caller_fd)
             else:
                 caller, lifetime = os.pipe()
@@ -543,7 +534,7 @@ def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: boo
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
           selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
-          cancellation: MacGateCancellation | UseCallerProcessLifetime = USE_CALLER_PROCESS_LIFETIME) -> gate.GateRun | str:
+          cancellation: gate.MacGateCancellation | UseCallerProcessLifetime = USE_CALLER_PROCESS_LIFETIME) -> gate.GateRun | str:
     """Return the observed module results or a reason to run them on natedev."""
     outcome = run_remote(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                          selected=selected, cancellation=cancellation)
@@ -662,7 +653,7 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.MERGE_GATE, full=True,
+            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
                                 module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
