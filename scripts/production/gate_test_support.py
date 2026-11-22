@@ -707,7 +707,7 @@ class MergeGateFixture(unittest.TestCase):
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
-                env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
+                env={**self.environment, "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1"}, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         # Restore the registry's state paths after each call.
         with contextlib.ExitStack() as scope:
