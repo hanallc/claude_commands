@@ -124,8 +124,11 @@ class RepositorySlotTests(unittest.TestCase):
         )
         private = copies_environment(self.root)
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
+        _ = write_config_fixture(self.root / "machines.conf", "mac.hosts=fake-mac\n")
         _ = write_config_fixture(self.root / "build_folders.conf",
-            "names.repository_key_length=8\npatterns.mirror={repository}/{owner}-s{slot}\n")
+            "names.repository_key_length=8\npatterns.mirror={repository}/{owner}-s{slot}\n"
+            + "# whole: 1..\nslots.fake-mac.default_max=1\n"
+            + "# whole: 1..\nslots.fake-mac.hana.max=2\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **private,
@@ -239,8 +242,18 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual([identity.name for identity in known], ["hana", "phase-copy", "hana"])
         self.assertIsInstance(identities[0], eligibility.KnownRepository)
         self.assertEqual(cast(eligibility.KnownRepository, identities[0]).name, "hana")
-        self.assertEqual(self.claim("mac", main, 101)[0], 0)
-        self.assertEqual(self.claim("mac", clone, 102)[0], 0)
+
+        paths = mac_test.state_paths("mac")
+        for worktree, pid in ((main, 101), (clone, 102)):
+            args = self.arguments("mac", worktree, pid)
+            scope = claim_state.target_claim_scope(paths, args.worktree)
+            with claim_state.locked(paths.lock):
+                result = mac_test.claim_once(args, paths, scope, session=NoOwningSession(),
+                                             mac_kind=mac_test.MacClaimKind.GUEST)
+            assert isinstance(result, mac_test.ClaimFinished), result
+            self.assertEqual(result.status, 0)
+
+        self.assertEqual(self.claim("mac", linked, 103)[0], 11)
 
     def test_linux_clones_with_different_names_share_origin_capacity(self) -> None:
         main = self.repository("project", "git@github.com:nate/project.git")
