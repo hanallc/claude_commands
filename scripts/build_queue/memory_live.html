@@ -834,12 +834,17 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
+  const guestFields = row.guest_run ? [field('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
+  const namesGuest = row.targets?.includes('mac-linux');
+  const namedTargets = !waiting && namesGuest
+    ? [field('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
-    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+    : stepTitle(row, unavailable && !row.guest_run ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (unavailable) return [...rows, ...stepFields, ...guestFields, ...namedTargets,
+    ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -884,7 +889,7 @@ function stepTooltip(key, data) {
     }
   } else {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(field('Runs on', machine));
+    rows.push(field('Runs on', machine), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1363,7 +1368,7 @@ function renderWalk(d) {
       (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
-  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.guest_run || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
