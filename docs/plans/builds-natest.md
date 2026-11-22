@@ -606,7 +606,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module and of each importer of changed support pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`, after natemerge's go; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names for the merge passes. After the phase is merged to main, the director writes the AWS median in the next file when AWS has a full gate in the last 2 days.
 
-### Phase 401 — the start cost of one verify.sh test is measured  · status: todo
+### Phase 401 — the start cost of one verify.sh test is measured  · status: done (measure)
+
+**As built:** measurement only, no code change (natedev, main `6401c0f801`, run `20261121T191825-1684979-25d4`). Result: "none does; the verify lane closes". The largest caller pair, `test_verify_mac_only.py` and `test_verify_mac_local.py`, makes 32 full `verify.sh` starts at about 4.9 CPU s per gate. All 54 tests in the ten modules passed. The floor row is in the next file.
 **Depends on:** none
 
 #### Work Order
@@ -637,7 +639,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** each number names its run or its record, with host; the report states one of two results: "one caller pair shows more than 10 CPU s per gate" with the pair, or "none does; the verify lane closes"; `git status` shows no changed file.
 
-### Phase 402 — the verify mac theme reaches the target of Phase 401  · status: todo
+### Phase 402 — the verify mac theme reaches the target of Phase 401  · status: dropped
+
+**As built:** dropped. Phase 401 found no caller pair above 10 CPU s per gate, so the verify lane closes (Floors row in the next file).
 **Depends on:** Phase 401, Phase 386, Phase 390
 
 #### Work Order
