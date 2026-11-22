@@ -1420,3 +1420,16 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 - **Files:** `scripts/production/mac_run.sh` and the scratch and task code it calls; their tests.
 - **Workers:** 1 writer.
 - **Acceptance gate:** the cause is named with evidence; a test proves the clone is removed and the task ends on that path; basedpyright zero on changed files; `bash -n`; one blind review; affected run green.
+
+### Phase 440 — a Python test-affected run shows its true local reason on the Builds page  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** builds 09:37 EST: `targeted_test.py` sends its build queue request with no route, so the Builds page shows "a direct cargo command runs where it starts" for every Python test-affected run. The page must show the true local reason.
+- **Spec:**
+  1. Facts from builds: the default reason comes from `scripts/build_queue/admission_records.py:39` and `:1662-1668`; the page reads it at `scripts/build_queue/memory_feed.py:1572`. The local reason is set through `BUILD_QUEUE_LOCAL_REASON` (`direct_cargo_route`).
+  2. `targeted_test.py` sets that reason for its own request: "no Mac route for a claude_commands test-affected run yet" (builds' words).
+  3. Add a test that the request of a test-affected run carries that reason and the page row shows it. No config key change.
+- **Files:** `scripts/production/targeted_test.py` (or the request builder it calls); its tests.
+- **Workers:** 1 writer.
+- **Acceptance gate:** the test; basedpyright zero on changed files; one blind review; affected run green (joined with other waiting tips where they join).
