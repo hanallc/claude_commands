@@ -243,6 +243,25 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
 .wrow.wait .row-label .name { white-space: normal; }
+.wrow:has(.queue-grip) .row-label { padding-inline-start: 30px; }
+.queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
+  display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
+  color: var(--ink-3); cursor: grab; touch-action: none; }
+.queue-grip:hover, .queue-grip:focus-visible { color: var(--ink); }
+.queue-grip svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.queue-grip[aria-pressed="true"] { cursor: grabbing; color: var(--ink); }
+body:has(.queue-lift) #tip { visibility: hidden; }
+.queue-lift { transform: translateY(-2px); }
+.walk-chart, .walk.beside .walk-table { z-index: 1; }
+.queue-emphasis { position: absolute; inset-inline: 0; border-radius: 6px; pointer-events: none;
+  background: color-mix(in srgb, #4f8ff0 14%, var(--card)); }
+.queue-emphasis.lift { outline: 1px solid #4f8ff0; box-shadow: 0 6px 18px #0005; transform: translateY(-2px); }
+.queue-feedback { display: inline-flex; align-items: baseline; gap: 12px; margin: 8px 0 0; padding: 6px 12px;
+  border-radius: 7px; background: var(--ink); color: var(--card); font-size: 0.88rem; }
+.queue-feedback[hidden] { display: none; }
+.queue-feedback button { color: inherit; font: inherit; font-weight: 650; text-decoration: underline;
+  background: none; border: 0; padding: 0; cursor: pointer; }
+.queue-feedback button[hidden] { display: none; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
 .row-memory { min-width: 0; }
@@ -447,6 +466,9 @@ body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
+    <div class="queue-feedback" id="queue-feedback" hidden>
+      <span id="queue-status" role="status"></span><button type="button" id="queue-action" hidden>Undo</button>
+    </div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
@@ -852,8 +874,9 @@ function stepTooltip(key, data) {
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
-    if (row.why === 'build space') rows.push(field('Reason', row.reason));
-    if (row.kind !== 'cloud') {
+    if (['build space', 'build hold'].includes(row.why)) rows.push(field('Reason', row.reason));
+    if (row.order_note) rows.push(field('Order', row.order_note));
+    if (row.kind !== 'cloud' && row.why !== 'target') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -1094,8 +1117,9 @@ function showQueueError(message) {
 
 function captureReportView() {
   const active = document.activeElement;
-  const focus = active?.closest('[data-tip], [data-owner-key], [id]');
-  const selector = element => element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
+  const focus = active?.closest('[data-move-id], [data-tip], [data-owner-key], [id]');
+  const selector = element => element?.dataset.moveId ? `.queue-grip[data-move-id="${CSS.escape(element.dataset.moveId)}"]`
+    : element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
     : element?.dataset.ownerKey ? `[data-owner-key="${CSS.escape(element.dataset.ownerKey)}"]`
     : element?.id ? `#${CSS.escape(element.id)}` : '';
   // An anchor must be on screen: a row out of view that moves must not move the rows the viewer reads.
@@ -1216,7 +1240,7 @@ function render(d) {
   latest = d;
   setTimeout(fitLabels, 650);
 
-  renderWalk(d);
+  showQueue(d);
   renderSwap(d);
   renderLeftovers(d);
   restoreReportView(view);
@@ -1346,10 +1370,220 @@ function placeLimitLabels() {
 }
 window.addEventListener("resize", placeLimitLabels);
 
+const queueMovePath = "/console/builds/queue-move";
+let queueAccess = null;
+let queueDrag = null;
+let queueSending = false;
+let queueReply = null;
+let queueHighlight = "";
+let queueHighlightTimer;
+let queueAction = null;
+
+function queueMessage(text, action = null) {
+  $("queue-feedback").hidden = !text;
+  $("queue-status").textContent = text;
+  const button = $("queue-action");
+  button.hidden = !action;
+  if (action) button.textContent = action.label;
+  queueAction = action;
+}
+
+function queueReading(d) {
+  if (!queueReply || !d.move_revision) return d;
+  if (!queueReply.previousRevisions.includes(d.move_revision)) {
+    queueReply = null;
+    return d;
+  }
+  if (queueReply.conflict) return {...d, queueReady:false};
+  const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
+  const shown = queueReply.line.members.filter(member => rows.has(member.row_id));
+  if (shown.length !== rows.size) return {...d, queueReady:false};
+  const shownIds = new Set(shown.map(member => member.row_id));
+  const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
+  let index = 0;
+  return {...d, move_revision:queueReply.line.revision,
+    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row)};
+}
+
+function showQueue(d) {
+  if (d.move_revision && queueAccess === null) {
+    queueAccess = {};
+    void fetch(queueMovePath, {cache:"no-store"}).then(response => response.ok ? response.json() : {})
+      .then(access => { queueAccess = access; if (latest) showQueue(latest); }).catch(() => {});
+  }
+  if (!queueDrag && !queueSending) showWalk(queueReading(d));
+}
+
+function showWalk(d) {
+  const focusedMove = document.activeElement?.dataset.moveId;
+  renderWalk({...d, queueControls:{
+    canMove:Boolean(d.move_revision && d.queueReady !== false && queueAccess?.token),
+    lifted:queueDrag?.row.move.row_id,
+    highlighted:queueHighlight
+  }});
+  fitLabels();
+  if (focusedMove) $("walk").querySelector(`.queue-grip[data-move-id="${CSS.escape(focusedMove)}"]`)?.focus({preventScroll:true});
+}
+
+function beginQueueDrag(id, pointer) {
+  if (!latest || queueSending || !queueAccess?.token) return false;
+  const reading = queueReading(latest);
+  if (!reading.move_revision || reading.queueReady === false) return false;
+  const row = reading.waiters.find(item => item.move?.row_id === id);
+  if (!row || row.move.movable === false) return false;
+  queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null};
+  queueMessage("");
+  tips.hide();
+  return true;
+}
+
+function previewQueueMove(neighbor) {
+  const drag = queueDrag;
+  if (!drag || !neighbor || neighbor === drag.row) return;
+  const rows = drag.rows.filter(row => row.move);
+  const from = rows.indexOf(drag.row), to = rows.indexOf(neighbor);
+  rows.splice(from, 1);
+  rows.splice(to, 0, drag.row);
+  let index = 0;
+  drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
+  drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
+    : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
+  const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
+  queueMessage(drag.pointer === null ? `Place ${place}` : "");
+  showWalk({...drag.reading, waiters:drag.rows});
+}
+
+function finishQueueDrag(commit) {
+  const drag = queueDrag;
+  if (!drag) return;
+  queueDrag = null;
+  const walk = $("walk");
+  if (drag.pointer !== null && walk.hasPointerCapture(drag.pointer)) walk.releasePointerCapture(drag.pointer);
+  if (commit && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
+    void sendQueueMove(drag.row, drag.reading, {kind:"QueueMoveRequest", destination:drag.destination});
+  } else {
+    queueMessage("");
+    if (latest) showQueue(latest);
+  }
+}
+
+function queueRequestId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function queuePlace(reading, id, revision) {
+  if (reading.queueReady === false || reading.move_revision !== revision) return 0;
+  return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
+}
+
+async function sendQueueMove(row, reading, request, id = queueRequestId()) {
+  const revision = reading.move_revision;
+  if (queueSending) return;
+  queueSending = true;
+  const undo = request.kind === "QueueUndoRequest";
+  const previousRevisions = queueReply?.line.revision === revision
+    ? [...queueReply.previousRevisions, revision] : [revision];
+  queueMessage(undo ? "Restoring the queue place…" : "Saving the queue place…");
+  try {
+    const response = await fetch(queueMovePath, {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({...request, request_id:id, row_id:row.move.row_id, revision, token:queueAccess.token})});
+    const result = await response.json();
+    if (response.status === 409) {
+      if (result.line.revision !== revision) queueReply = {line:result.line, previousRevisions, conflict:true};
+      queueMessage(result.reason);
+    } else if (response.ok) {
+      queueReply = {line:result.line, previousRevisions};
+      queueHighlight = row.move.row_id;
+      clearTimeout(queueHighlightTimer);
+      queueHighlightTimer = setTimeout(() => {
+        queueHighlight = "";
+        if (latest) showQueue(latest);
+      }, queueAccess.highlight_seconds * 1000);
+      const {unit, step} = row.title ?? olderStepTitle(row);
+      const label = [ownerText(unit), publicText(step)].filter(Boolean).join(" · ");
+      const updated = queueReading(latest);
+      const from = queuePlace(reading, row.move.row_id, revision);
+      const to = queuePlace(updated, row.move.row_id, result.line.revision);
+      queueMessage(from && to ? `${label} moved from ${from} to ${to}` : `${label} moved`,
+        undo ? null : {label:"Undo", run:() => {
+          const current = queueReading(latest);
+          if (current.queueReady === false || !current.move_revision || !current.waiters.some(item =>
+            item.move?.row_id === row.move.row_id && item.move.movable !== false)) {
+            queueMessage("Undo not available");
+            return;
+          }
+          void sendQueueMove(row, current, {kind:"QueueUndoRequest", move_request_id:id});
+        }});
+    } else if (response.status === 503) {
+      queueMessage(result.reason, {label:"Retry", run:() => void sendQueueMove(row, reading, request, id)});
+    } else {
+      queueMessage(result.reason || "The queue move was refused.");
+    }
+  } catch {
+    queueMessage("The queue could not confirm the move.",
+      {label:"Retry", run:() => void sendQueueMove(row, reading, request, id)});
+  } finally {
+    queueSending = false;
+    if (latest) showQueue(latest);
+    void pageRefresh.refresh(true);
+  }
+}
+
+$("queue-action").addEventListener("click", () => queueAction?.run());
+$("walk").addEventListener("pointerdown", event => {
+  const button = event.target.closest(".queue-grip");
+  if (event.button !== 0 || !button || queueDrag || !beginQueueDrag(button.dataset.moveId, event.pointerId)) return;
+  event.preventDefault();
+  button.focus({preventScroll:true});
+  $("walk").setPointerCapture(event.pointerId);
+  showWalk(queueDrag.reading);
+});
+function queueRowAt(event) {
+  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".wait[data-tip]");
+  return queueDrag.rows.find(item => item.move && row?.dataset.tip === `wait:${item.key}`);
+}
+
+$("walk").addEventListener("pointermove", event => {
+  if (queueDrag?.pointer !== event.pointerId) return;
+  previewQueueMove(queueRowAt(event));
+});
+$("walk").addEventListener("pointerup", event => {
+  if (queueDrag?.pointer !== event.pointerId) return;
+  finishQueueDrag(Boolean(queueRowAt(event)));
+});
+$("walk").addEventListener("lostpointercapture", event => {
+  if (queueDrag?.pointer === event.pointerId) finishQueueDrag(false);
+});
+$("walk").addEventListener("keydown", event => {
+  const button = event.target.closest(".queue-grip");
+  if (queueDrag?.pointer === null && event.key === "Tab") finishQueueDrag(false);
+  if (!button || ![" ", "Enter", "Escape", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  if (!queueDrag) {
+    if ((event.key === " " || event.key === "Enter") && beginQueueDrag(button.dataset.moveId, null)) showWalk(queueDrag.reading);
+    return;
+  }
+  if (event.key === "Escape") finishQueueDrag(false);
+  else if (queueDrag.pointer !== null) return;
+  else if (event.key === " " || event.key === "Enter") finishQueueDrag(true);
+  else {
+    const rows = queueDrag.rows.filter(row => row.move);
+    previewQueueMove(rows[rows.indexOf(queueDrag.row) + (event.key === "ArrowUp" ? -1 : 1)]);
+  }
+});
+
 function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
+  const {canMove, lifted, highlighted} = d.queueControls ?? {};
+  const grip = row => {
+    if (!canMove || !row.move || row.move.movable === false) return "";
+    return `<button type="button" class="queue-grip" data-move-id="${esc(row.move.row_id)}"
+      aria-label="Move ${esc(row.name)}" aria-pressed="${row.move.row_id === lifted}"
+      title="Drag to move. Press Space, then an arrow key. Press Enter to drop.">
+      <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
+  };
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
@@ -1385,19 +1619,23 @@ function renderWalk(d) {
   const waitingCount = d.waiters.length;
   if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
-  const title = !units.length ? "Queued, in order of submission"
+  const title = d.move_revision ? "Waiting, in queue order"
+    : !units.length ? "Queued, in order of submission"
     : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
     : `Queued, ${units.join(" followed by ")} and then in submission order`;
-  const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+  const titleHtml = d.move_revision || !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
   rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
-    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = ["build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "";
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
+    const state = w.move && (w.move.row_id === lifted ? " queue-lift"
+      : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
+    const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
+    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, rowClass);
+    const note = w.order_note || (["build hold", "build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "");
+    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
@@ -1421,7 +1659,6 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
-  fitLabels();
 }
 
 function fitAxisLabels() {
@@ -1493,7 +1730,8 @@ function fitWalkDetails() {
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
-  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
+  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB],
+    ...latest.waiters.filter(row => row.kind !== "cloud" && row.why !== "target").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
   // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
@@ -1560,6 +1798,14 @@ function fitWalkDetails() {
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
     row.style.minHeight = `${height}px`;
     metadata.style.height = `${height}px`;
+  }
+  walk.querySelectorAll(".queue-emphasis").forEach(node => node.remove());
+  for (const row of walk.querySelectorAll(".wrow.queue-lift, .wrow.queue-highlight")) {
+    const field = document.createElement("div");
+    field.className = row.classList.contains("queue-lift") ? "queue-emphasis lift" : "queue-emphasis";
+    field.style.top = `${row.offsetTop}px`;
+    field.style.height = `${row.offsetHeight}px`;
+    walk.append(field);
   }
   const queueRow = table.querySelector("tr.queue-head");
   const queueSpacer = walk.querySelector(".walk-chart .queue-head");
@@ -1658,7 +1904,7 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = stepRow(row.dataset.tip, d);
-    if (waiter.kind === "cloud") continue;
+    if (waiter.kind === "cloud" || waiter.why === "target") continue;
     // A wait bar stops at the room end or the cap line, whichever is first.
     const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
     const waitWidth = Math.min(waitEnd, waiter.need * unit);
