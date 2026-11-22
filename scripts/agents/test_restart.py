@@ -4537,6 +4537,21 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             start.assert_not_called()
             self.assertEqual(shutdown_record.read(), [str(other.id)])
 
+    def test_restart_only_removes_a_retired_producer_from_the_record(self) -> None:
+        retired = replace(self.rows[0], id=staff.StaffId("alpha-id"), name="alpha", kind="producer",
+                          unit_type=staff.NotUnit(), retirement=staff.RetiredProducer("claude:sonnet:high"))
+        record = staff.StaffSnapshot((retired, *self.rows[1:]))
+        other = str(self.rows[1].id)
+        shutdown_record.save([retired.id, other])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "start_row") as start, redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["restart", "--only", retired.id]), 0)
+
+        start.assert_not_called()
+        self.assertEqual(shutdown_record.read(), [other])
+        self.assertIn("agents restart: 0 of 0 sessions back.", output.getvalue())
+        self.assertIn(f"{retired.id}: the producer is retired. Restart removed the entry.", output.getvalue())
+
     def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
         reference = str(self.rows[0].current_session)
         shutdown_record.save([reference])

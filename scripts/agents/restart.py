@@ -1710,8 +1710,10 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     preview(f"{row.name}: live, not in the restart record")
         saved_ids: set[str] | None = None
         for reference in pending_ids:
-            row = record.by_id(staff.StaffId(reference))
-            if select_only and row is None:
+            identity = staff.StaffId(reference)
+            row = record.rows_by_id.get(identity)
+            retired = row is None and record.by_id(identity) is not None
+            if select_only and row is None and not retired:
                 if saved_ids is None:
                     saved_ids = set(shutdown_record.read())
                 # A saved ID takes precedence over a name or conversation reference.
@@ -1726,7 +1728,10 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                 "Nate selects a staff row ID.", operator=True)
                         print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
                         continue
-            reason = "no staff row" if row is None else None if select_only else leaves_record(row, record, runs=observed.runs)
+            if row is None:
+                reason = "the producer is retired" if retired else "no staff row"
+            else:
+                reason = None if select_only else leaves_record(row, record, runs=observed.runs)
             if row is None or reason is not None:
                 name = reference if row is None else row.name
                 if not dry_run:
@@ -2055,18 +2060,22 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             if holder.id in blocked_workers:
                 return RestartDisposition.HELD
             current_record = staff.initial_snapshot()
-            current = current_record.by_id(holder.id)
+            current = current_record.rows_by_id.get(holder.id)
             if current is None:
                 gone = [member for member in members_by_holder[holder.id]
-                        if current_record.by_id(staff.StaffId(member)) is None]
+                        if staff.StaffId(member) not in current_record.rows_by_id]
+                retired = current_record.by_id(holder.id) is not None
+                name = str(holder.id) if retired else holder.name
+                reason = "the producer is retired" if retired else "no staff row"
                 try:
                     shutdown_record.forget(gone)
                 except shutdown_record.RecordBusy as error:
-                    _report_record_busy(holder.id, holder.name, error, resume_retry(gone))
+                    _report_record_busy(holder.id, name, error, resume_retry(gone))
                     return RestartDisposition.REMOVED
                 if report is not None:
-                    report.issues[holder.id] = FollowUp(holder.name, "The staff row is gone", "Restart removed the entry.")
-                print(f"{holder.name}: restart anomaly: no staff row; removed from the restart record", file=sys.stderr)
+                    report.issues[holder.id] = FollowUp(name, reason if retired else "The staff row is gone",
+                                                       "Restart removed the entry.")
+                print(f"{name}: restart anomaly: {reason}; removed from the restart record", file=sys.stderr)
                 return RestartDisposition.REMOVED
             current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             if current.kind in ("unit", "showrunner") and (
