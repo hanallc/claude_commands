@@ -1536,6 +1536,18 @@ def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
     return _mutation(wire.WidthRequest(request_id(), reservation, width))
 
 
+def move_queue(request: wire.QueueMoveRequest | wire.QueueUndoRequest, timeout: float
+               ) -> wire.QueueMoved | wire.QueueMoveConflict | wire.Refused:
+    """Submit one console move with a bounded response time."""
+    deadline = CLOCK.monotonic() + timeout
+    with _connect(timeout) as connection:
+        connection.sendall(wire.encode_request(request).encode())
+        reply = wire.parse_reply(_line(connection, bytearray(), deadline), request)
+    if isinstance(reply, (wire.QueueMoved, wire.QueueMoveConflict, wire.Refused)):
+        return reply
+    raise CheckerFailure("invalid queue move answer")
+
+
 def priority_set(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
     return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor))
 

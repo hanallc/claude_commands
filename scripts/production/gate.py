@@ -71,7 +71,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Literal, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast
 
 from scripts.agents import remote
 from scripts.lib import process_group
@@ -91,7 +91,7 @@ from scripts.production.gate_routes import (
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
-    SuiteMode as SuiteMode, TreeSelection as TreeSelection, WholeGateRoute,
+    SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
@@ -2952,35 +2952,61 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
-def mac_linux_gate_placed(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> bool:
-    """Check that the current gate has the Mac Linux assignment."""
+@dataclass(frozen=True)
+class NoGateAssignment:
+    """The caller supplied no placement file."""
+
+
+class GateAssignmentRefused(GateRefused):
+    """The gate could not verify the placement supplied by the caller."""
+
+
+def current_gate_target(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded) -> str | NoGateAssignment:
+    """Return the target from the queue assignment for this gate."""
     path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
+    if path is None:
+        return NoGateAssignment()
     if not path:
-        return False
+        raise GateAssignmentRefused("BUILDLOG_PLACEMENT_FILE is empty")
     try:
         saved = admission_wire.read_assignment(Path(path)).assignment
-        if saved.destination.target != "mac-linux":
-            return False
-        if not conf.read("build_targets").value("enabled.mac-linux", conf.on_off,
-                                               default=False, recover_invalid=False):
-            return False
-        if not isinstance(gate_job, StepJob) or saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
-            return False
-        owner = saved.owner
-        identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
-        pid = os.getpid()
-        if (owner.host != host_name()
-                or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid)):
-            return False
-        if (owner.pid != pid and gate_job != gate_job_from_process(
-                mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
-            return False
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot read the gate placement file {path!r}: {error}") from error
+    if saved.episode != os.environ.get("BUILDLOG_PLACEMENT_EPISODE"):
+        raise GateAssignmentRefused("The placement episode does not match BUILDLOG_PLACEMENT_EPISODE")
+    if not isinstance(gate_job, StepJob):
+        raise GateAssignmentRefused("The placement has no recorded gate job to verify")
+    owner = saved.owner
+    identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+    pid = os.getpid()
+    if owner.host != host_name() or identity not in build_hold.caller_processes(build_hold.PROC_ROOT, pid):
+        raise GateAssignmentRefused("The placement owner is not this process or a live ancestor")
+    if (owner.pid != pid and gate_job != gate_job_from_process(
+            mode.value, build_hold.PROC_ROOT / str(owner.pid), start_time=owner.start_time)):
+        raise GateAssignmentRefused("The placement owner's command does not match this gate job")
+    try:
         status = admission_client.placement_status(saved.episode, saved.attempt, wait_for_service=False).status
-        return (isinstance(status, admission_wire.KnownPlacementStatus)
-                and isinstance(status.state, placement.CurrentAssignment)
-                and status.assignment == saved)
-    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable):
-        return False
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot query the gate placement status: {error}") from error
+    if isinstance(status, admission_wire.UnknownPlacementStatus):
+        raise GateAssignmentRefused("The queue does not know the gate placement attempt")
+    if status.assignment != saved:
+        raise GateAssignmentRefused("The queue assignment does not match the gate placement file")
+    if isinstance(status.state, placement.ClosedAssignment):
+        raise GateAssignmentRefused(f"The gate placement attempt is stale: {status.state.reason}")
+    return saved.destination.target
+
+
+class MacLinuxGateRefused(GateRefused):
+    """The assigned Mac Linux guest could not complete the gate."""
+
+
+class MacLinuxGateRoute(Protocol):
+    """Run the tests and type checks in the Mac Linux guest."""
+
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
+              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str]) -> GateRun | str: ...
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -2992,8 +3018,6 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
-    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
@@ -3004,31 +3028,60 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
-    def attempt(route: WholeGateRoute, selection: AllModules | TreeSelection) -> GateRun | str:
-        return route.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                           selected=selection, gate_job=gate_job)
-
     def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
-        outcome = attempt(cloud, selection)
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job)
         if isinstance(outcome, str):
+            if not isinstance(target, NoGateAssignment):
+                raise GateRefused(f"AWS gate failed: {outcome}")
             print('Cloud gate uses natedev: ' + outcome, flush=True)
             return run_local(type_dirs)
-        return finish_remote(outcome)
+        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
 
-    def run_whole_gate(selection: AllModules | TreeSelection) -> GateRun:
-        if mac_linux_gate_placed(mode, gate_job):
-            guest = cast(WholeGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
-            outcome = attempt(guest, selection)
-            if isinstance(outcome, GateRun):
-                return finish_remote(outcome)
-            print('Mac Linux gate falls back: ' + outcome, flush=True)
-        return run_cloud(selection)
+    def run_guest(selection: AllModules | TreeSelection) -> GateRun:
+        guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
+        outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selection, gate_job=gate_job, type_dirs=type_dirs)
+        if isinstance(outcome, str):
+            raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
+        if not outcome.passed:
+            print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
+            if outcome.time_limit_report:
+                print(outcome.time_limit_report, file=sys.stderr, flush=True)
+            for job in outcome.jobs:
+                if job.returncode:
+                    print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
+                          file=sys.stderr, flush=True)
+        return outcome
 
+    target = current_gate_target(mode, gate_job)
+    match target:
+        case "natedev":
+            return run_local(type_dirs)
+        case "mac-linux":
+            key = "enabled.mac-linux"
+            try:
+                enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
+            except conf.Unusable as error:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
+            if not enabled:
+                raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
+            run_selected = run_guest
+        case "aws":
+            if type_dirs:
+                raise GateRefused("The AWS gate route does not support type checks")
+            run_selected = run_cloud
+        case NoGateAssignment():
+            run_selected = run_cloud
+        case _:
+            raise GateRefused(f"The gate does not support the assigned target {target}")
+
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     if mode is SuiteMode.GATE:
-        return run_whole_gate(ALL_MODULES)
+        return run_selected(ALL_MODULES)
 
     selected: AllModules | TreeSelection = ALL_MODULES
     whole_suite = full
@@ -3041,14 +3094,19 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                        else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
         modules = discover_test_modules(repo)
         selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        if ledger.reuse(report=False):
-            return run_local(type_dirs)
+        unassigned = isinstance(target, NoGateAssignment)
+        if ledger.reuse(report=not unassigned and not type_dirs):
+            if unassigned:
+                return run_local(type_dirs)
+            if type_dirs:
+                return run_selected(TreeSelection((), tree))
+            return GateRun((), 0.0, 0.0, tests_reused=True)
         whole_suite = isinstance(selection, FullSuite)
         paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
         selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
         if isinstance(selection, AffectedSelection) and not selection.modules:
             if type_dirs:
-                return run_local(type_dirs)
+                return run_local(type_dirs) if unassigned else run_selected(selected)
             ledger.record_pass(selection)
             record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
                             hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
@@ -3056,7 +3114,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
     # Nate ordered the Mac split off on 2026-11-21.
-    return run_whole_gate(selected)
+    return run_selected(selected)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE  # pyright: ignore[reportUnreachable]
     try:
