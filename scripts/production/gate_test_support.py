@@ -467,6 +467,7 @@ class MergeGateFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "GATE_TEST_STATE": str(self.state),
+            "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1",
             "GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "GATE_PYTHON": str(self.bin / "suite-python"),
@@ -707,7 +708,7 @@ class MergeGateFixture(unittest.TestCase):
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
-                env={**self.environment, "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1"}, stdin=subprocess.DEVNULL, capture_output=True,
+                env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         # Restore the registry's state paths after each call.
         with contextlib.ExitStack() as scope:

@@ -651,8 +651,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         (mac / "scripts/lib/py").chmod(0o755)
         self.write(mac / "scripts/lib/waiting_rows.py", "")
 
-        environment = {**self.environment, "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1"}
-        with mock.patch.dict(os.environ, environment), redirect_stdout(io.StringIO()):
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
             gate.promote(args)
 
         self.assertFalse(receipt.exists())
