@@ -897,7 +897,7 @@ raise SystemExit(1)
                 # The request can name a commit before the branch tip.
                 later = self.checkpoint("outside.txt", "later work\n", push=False)
                 _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
-                if outcome not in ("live-owner", "equal-patch", "unlanded"):
+                if outcome not in ("equal-patch", "unlanded"):
                     _ = self.git("update-ref", "refs/heads/alpha-phase", sha, cwd=self.origin)
                 if outcome != "live-owner":
                     _ = self.git("checkout", "alpha-branch", cwd=self.unit)
@@ -974,7 +974,7 @@ raise SystemExit(1)
                     rerun = self.run_checkpoint(sha)
                     self.assertEqual(rerun.process.returncode, 0, rerun.process.stdout + rerun.process.stderr)
                 else:
-                    expected = later if outcome in ("live-owner", "moved", "unlanded") else sha
+                    expected = later if outcome in ("moved", "unlanded") else sha
                     self.assertEqual(remote.split()[0], expected)
                     reasons = {"live-owner": "present worktree", "merge-branch": "production merge branch",
                                "enrolled-merge-branch": "other uses this production merge branch",
