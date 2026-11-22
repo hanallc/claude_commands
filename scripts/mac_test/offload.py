@@ -31,7 +31,7 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, assert_never, cast, final
 from urllib.parse import quote
 
 
@@ -252,11 +252,29 @@ class KnownMacJob:
     what: str
 
 
+class MirrorBusyCheck(Enum):
+    """The mirror check that reported a busy refusal."""
+
+    LEASE = "mirror lease"
+    PROCESS = "mirror process check"
+    UNREPORTED = ""
+
+    @property
+    def suffix(self) -> str:
+        return f" ({self.value})" if self.value else ""
+
+
+@dataclass(frozen=True)
+class MacJobFromCommand:
+    """Use the command and package as the claim label."""
+
+
 @dataclass(frozen=True)
 class RecordedMirrorSession:
     """The last session recorded in the mirror."""
 
     session: str
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
 
 @dataclass(frozen=True)
@@ -268,16 +286,10 @@ class LostRunLeftovers:
 class UnreadableMacHolder:
     """The Mac holder cannot be read."""
 
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
+
 
 MacHolder = KnownMacJob | RecordedMirrorSession | LostRunLeftovers | UnreadableMacHolder
-
-
-class MirrorBusyCheck(Enum):
-    """The mirror check that reported a busy refusal."""
-
-    UNREPORTED = ""
-    LEASE = "mirror lease"
-    PROCESS = "mirror process check"
 
 
 @dataclass(frozen=True)
@@ -286,7 +298,6 @@ class BusyMacDecline:
 
     holder: MacHolder
     seconds: float
-    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
     @property
     def reason(self) -> Literal["busy"]:
@@ -298,12 +309,38 @@ def claim_holder(stdout: str) -> MacHolder:
     return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
 
 
+_MIRROR_SESSION_PREFIX = "last recorded mirror session "
+_LEFTOVERS_HOLDER_VALUE = "leftovers"
+_UNREADABLE_HOLDER_VALUE = "unreadable"
+
+
 def holder_value(holder: MacHolder) -> str:
-    if isinstance(holder, KnownMacJob):
-        return holder.what
-    if isinstance(holder, RecordedMirrorSession):
-        return f"last recorded mirror session {holder.session}"
-    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+    match holder:
+        case KnownMacJob(what=what):
+            return what
+        case RecordedMirrorSession(session=session, mirror_check=check):
+            return f"{_MIRROR_SESSION_PREFIX}{session}{check.suffix}"
+        case LostRunLeftovers():
+            return _LEFTOVERS_HOLDER_VALUE
+        case UnreadableMacHolder(mirror_check=check):
+            return _UNREADABLE_HOLDER_VALUE + check.suffix
+        case _:
+            assert_never(holder)
+
+
+def holder_from_value(value: str) -> MacHolder:
+    if value == _LEFTOVERS_HOLDER_VALUE:
+        return LostRunLeftovers()
+    for check in MirrorBusyCheck:
+        suffix = check.suffix
+        if suffix and not value.endswith(suffix):
+            continue
+        text = value.removesuffix(suffix)
+        if text == _UNREADABLE_HOLDER_VALUE:
+            return UnreadableMacHolder(check)
+        if text.startswith(_MIRROR_SESSION_PREFIX) and (session := text.removeprefix(_MIRROR_SESSION_PREFIX)):
+            return RecordedMirrorSession(session, check)
+    return KnownMacJob(value)
 
 
 @dataclass(frozen=True)
@@ -528,8 +565,6 @@ def fence_settlement_path(relative: Path) -> Path:
 
 def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Create the start identity before the probe acknowledges preparation."""
-    from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
-
     relative = start_fence_relative(identity, target, scope_key=scope_key)
     program = """import pathlib, sys
 base = pathlib.Path.home() / sys.argv[1]
@@ -537,7 +572,8 @@ base.parent.mkdir(parents=True, exist_ok=True)
 base.with_suffix(".lock").touch()
 """
     prepare = shlex.join(["python3", "-c", program, str(relative)])
-    return remote_creation_command(fence_settlement_path(relative), prepare, RemotePreparationAction.PREPARE)
+    return claim_state.remote_creation_command(fence_settlement_path(relative), prepare,
+        claim_state.RemotePreparationAction.PREPARE)
 
 
 
@@ -569,10 +605,9 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
     relative = start_fence_relative(identity, target, scope_key=scope_key)
     encoded = str(relative).encode().hex()
     if settle:
-        from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
-
         command = remove_start_fence_command(relative, key)
-        return remote_creation_command(fence_settlement_path(relative), command, RemotePreparationAction.SETTLE)
+        return claim_state.remote_creation_command(fence_settlement_path(relative), command,
+            claim_state.RemotePreparationAction.SETTLE)
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -595,15 +630,14 @@ if not matches:
 
 def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
     """Remove this fence when the command finishes. The claim can prepare again."""
-    from scripts.mac_test.mac_gate import RemotePreparationAction, remote_creation_command
-
     relative = start_fence_relative(identity, target, scope_key=scope_key)
     finish = remove_start_fence_command(relative, pending_start_key(identity))
     return (start_fence_command(identity, target, scope_key=scope_key)
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
-            + remote_creation_command(fence_settlement_path(relative), finish, RemotePreparationAction.FINISH)
+            + claim_state.remote_creation_command(fence_settlement_path(relative), finish,
+                claim_state.RemotePreparationAction.FINISH)
             + '\nexit "$dispatch_status"')
 
 
@@ -633,6 +667,7 @@ class OffloadRequest:
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
     placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    claim_job: KnownMacJob | MacJobFromCommand = MacJobFromCommand()
 
     @property
     def source_root(self) -> Path:
@@ -859,7 +894,6 @@ class MirrorBusyRefusal:
     """A receiver or runner could not acquire the mirror."""
 
     holder: RecordedMirrorSession | UnreadableMacHolder
-    mirror_check: MirrorBusyCheck
 
 
 @dataclass(frozen=True)
@@ -1373,9 +1407,7 @@ def write_result(
     if isinstance(destination, ResultFile):
         holder_line = ""
         if isinstance(result, BusyMacDecline):
-            check = result.mirror_check.value
-            suffix = f" ({check})" if check else ""
-            holder_line = f"holder={holder_value(result.holder)}{suffix}\n"
+            holder_line = f"holder={holder_value(result.holder)}\n"
         linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
@@ -1411,8 +1443,9 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
     if match is None:
         return NoMirrorBusyRefusal()
     session = (match["session"] or "").strip()
-    holder = RecordedMirrorSession(session) if session and session != "unreadable" else UnreadableMacHolder()
-    return MirrorBusyRefusal(holder, MirrorBusyCheck(match["check"] or ""))
+    check = MirrorBusyCheck(match["check"] or "")
+    holder = RecordedMirrorSession(session, check) if session and session != "unreadable" else UnreadableMacHolder(check)
+    return MirrorBusyRefusal(holder)
 
 
 def write_backoff(until: float, target: str = "mac") -> None:
@@ -1530,6 +1563,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
                if isinstance(request.admission, MacClaimFromWait) else [])
+    job = request.claim_job
+    what = job.what if isinstance(job, KnownMacJob) else f"{request.verb} {request.package or 'workspace'}"
     return [
         str(Path(__file__).resolve().parents[1] / "lib/py"),
         str(Path(__file__).with_name("mac_test.py")),
@@ -1537,7 +1572,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         "--pid",
         str(os.getpid()),
         "--what",
-        f"{request.verb} {request.package or 'workspace'}",
+        what,
         "--worktree",
         str(request.repo_root),
         "--remote",
@@ -2589,7 +2624,7 @@ def claim_for_assigned_mac_run(controller: ProcessController, assignment: placem
         assignment.destination.host)
     request = OffloadRequest(repo, "", assignment.episode, NO_RESULT_FILE, (), owner="",
         holder_session=claim_state.session_id(assignment.session), target=target,
-        placement=AssignedOffloadRequest(assignment))
+        placement=AssignedOffloadRequest(assignment), claim_job=KnownMacJob(claim_state.GATE_JOB_LABEL))
     repository = eligibility.repository_identity(repo)
     if not isinstance(repository, KnownRepository):
         return MacClaimNotConfirmed("repo", "", "The gate repository identity is unavailable")
@@ -2797,7 +2832,7 @@ def claimed_run(
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
-            return BusyMacDecline(remote_status.holder, elapsed_seconds(started), remote_status.mirror_check)
+            return BusyMacDecline(remote_status.holder, elapsed_seconds(started))
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
@@ -3342,7 +3377,7 @@ def run_offload(
                 refusal = mirror_busy_refusal(result.detail)
                 if isinstance(refusal, MirrorBusyRefusal):
                     write_mirror_busy(config, repository.name, request.target)
-                    return BusyMacDecline(refusal.holder, result.seconds, refusal.mirror_check)
+                    return BusyMacDecline(refusal.holder, result.seconds)
             return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))

@@ -28,7 +28,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
-from scripts.mac_test.offload_test_support import mirror_use_payload
+from scripts.mac_test.offload_test_support import mirror_use_payload, patch_cleanup_capture
 from scripts.lint.memory_test_support import write_config_fixture
 
 
@@ -1426,9 +1426,8 @@ class LinuxProcessTests(unittest.TestCase):
         selector_runner = dispatch.fixture.root / ".claude/scripts/lib/py"
         selector_runner.parent.mkdir(parents=True)
 
-        def cleanup(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            if argv[0] != "ssh":
-                return dispatch.command_reply(argv, **options)
+        def cleanup(argv: list[str], budget: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[0], "ssh")
             dispatch.commands.append(argv)
             dispatch.actions.append("cleanup")
             selector = self.selector_output()
@@ -1444,7 +1443,7 @@ class LinuxProcessTests(unittest.TestCase):
             )
             with mock.patch.object(subprocess, "Popen", open_process):
                 result = run_command(["bash", "-c", stubs + argv[-1]], text=True,
-                                     capture_output=True, check=False, timeout=5,
+                                     capture_output=True, check=False, timeout=min(budget, 5),
                                      env={"HOME": str(dispatch.fixture.root), "PATH": "/usr/bin:/bin"})
             cleanups.append(result)
             return result
@@ -1473,7 +1472,7 @@ class LinuxProcessTests(unittest.TestCase):
             with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
                 return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
 
-        with mock.patch.object(subprocess, "run", side_effect=cleanup), \
+        with patch_cleanup_capture(cleanup), \
                 mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream):
             completed, output, errors = dispatch.run_request(dispatch.request())
             self.assertIsInstance(completed, offload.PassedOnTarget)
@@ -1576,13 +1575,15 @@ class LinuxProcessTests(unittest.TestCase):
                 self.process(102, group=102, start=124, cwd=self.root)
                 print(dispatch.probe_wire, end="")
                 return subprocess.CompletedProcess(argv, 0, "", "")
-            if argv[0] == "ssh":
-                dispatch.commands.append(argv)
-                dispatch.actions.append("cleanup")
-                reply = self.selector_output()
-                cleanup_replies.append(reply)
-                return reply
             return dispatch.command_reply(argv, **options)
+
+        def cleanup(argv: list[str], _budget: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[0], "ssh")
+            dispatch.commands.append(argv)
+            dispatch.actions.append("cleanup")
+            reply = self.selector_output()
+            cleanup_replies.append(reply)
+            return reply
 
         def stream(arguments: Sequence[str]) -> offload.RemoteRunStatus:
             dispatch.commands.append(list(arguments))
@@ -1605,6 +1606,7 @@ class LinuxProcessTests(unittest.TestCase):
         with mock.patch.object(dispatch.controller, "capture", side_effect=capture), \
                 mock.patch.object(dispatch.controller, "stream_mac_run", side_effect=stream), \
                 mock.patch.object(subprocess, "run", side_effect=child), \
+                patch_cleanup_capture(cleanup), \
                 mock.patch.object(linux_runner, "prepare_shell", return_value=shell) as evaluate, \
                 mock.patch.object(linux_runner, "execute_slot", side_effect=AssertionError("Work must not start")) as execute:
             result, output, errors = dispatch.run_request(dispatch.request())
@@ -1967,6 +1969,7 @@ class LinuxDispatchTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(self.controller, "stream_mac_run", side_effect=self.stream))
         _ = self.enterContext(mock.patch.object(offload, "read_tree_key", return_value=offload.KnownTreeKey("source-key")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.command_reply))
+        _ = self.enterContext(patch_cleanup_capture(self.cleanup_capture))
 
     def request(self, verb: eligibility.MacVerb = "nextest") -> offload.OffloadRequest:
         return offload.OffloadRequest(self.source, "hana", "call", offload.NO_RESULT_FILE,
@@ -2032,6 +2035,9 @@ class LinuxDispatchTests(unittest.TestCase):
             self.commands.append(argv)
             self.assertEqual(argv, ["direnv", "export", "json"])
             return subprocess.CompletedProcess(argv, 1, "", "environment blocked")
+        self.fail(f"Unexpected external command: {argv}")
+
+    def cleanup_capture(self, argv: list[str], _budget: float) -> subprocess.CompletedProcess[str]:
         self.assertEqual(argv[0], "ssh", f"Unexpected external command: {argv}")
         self.commands.append(argv)
         self.actions.append("cleanup")

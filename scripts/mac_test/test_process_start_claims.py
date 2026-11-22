@@ -29,9 +29,9 @@ from scripts.lint.memory_test_support import write_config_fixture
 class ClaimProcessStartTests(unittest.TestCase):
     def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
         cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int]], ...] = (
-            ("mac", mac_test.RepositoryScope("hana"), mac_test.RepositoryScope("hana"), [0, 11]),
+            ("mac", mac_test.RepositoryScope("claude_commands"), mac_test.RepositoryScope("claude_commands"), [0]),
             ("mac", mac_test.RepositoryScope("hana"), mac_test.RepositoryScope("other"), [0, 0]),
-            ("mac", mac_test.WHOLE_MAC, mac_test.RepositoryScope("hana"), [0, 11]),
+            ("mac", mac_test.WHOLE_MAC, mac_test.RepositoryScope("claude_commands"), [0]),
             ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11]),
         )
         for provider, first_scope, second_scope, expected in cases:
@@ -52,6 +52,19 @@ class ClaimProcessStartTests(unittest.TestCase):
                     request = replace(request, constraints=replace(request.constraints,
                         candidates=(placement.PlacementCandidate(destination),)))
                     _ = publish_candidate(fixture, request)
+                    if expected == [0] and assignments:
+                        first, = requests
+                        waiting, = fixture.connect(request).replies()
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        self.assertEqual(assignment_for(fixture, first), assignments[0])
+                        self.assertEqual(mac_test.read_claims(paths), ())
+                        settled, = fixture.connect(wire.CancelPlacement(
+                            "cancel-first", first.episode, first.owner, "the first caller stopped before claiming")).replies()
+                        self.assertIsInstance(settled, wire.Ok)
+                        self.assertNotIn(first.episode, fixture.server.current_assignments)
+                        assignments.clear()
+                        requests.clear()
                     assignments.append(assignment_for(fixture, request))
                     requests.append(request)
 

@@ -122,6 +122,7 @@ from unittest import mock
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
+from scripts.mac_test.offload_test_support import patch_cleanup_capture
 from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
@@ -242,17 +243,17 @@ def stream(arguments):
         return offload.ProcessController.stream_mac_run(controller, arguments)
 
 real_run = subprocess.run
-def commands(arguments, **options):
-    if arguments[0] == "ssh":
-        actions.append("cleanup")
-        unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
-        count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
-        fence = ""
-        if not unresolved and count == 0 and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            fence = "dispatch_start_settled=" + offload.pending_start_key(controller.claim_identity) + "\n"
-        return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
-            "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
-    return real_run(arguments, **options)
+
+def cleanup(arguments, budget):
+    assert arguments[0] == "ssh", arguments
+    actions.append("cleanup")
+    unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
+    count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
+    fence = ""
+    if not unresolved and count == 0 and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+        fence = "dispatch_start_settled=" + offload.pending_start_key(controller.claim_identity) + "\n"
+    return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
+        "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
 
 started = time.monotonic()
 with mock.patch.object(controller, "complete_claim", side_effect=complete), \
@@ -261,7 +262,7 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
      mock.patch.object(offload, "copy_tracked_scripts", side_effect=copy_scripts), \
      mock.patch.object(offload, "copy_tree_with_key", side_effect=copy_source), \
      mock.patch.object(offload, "trusted_linux_source", return_value=True), \
-     mock.patch.object(subprocess, "run", side_effect=commands):
+     patch_cleanup_capture(cleanup):
     result = offload.run_offload(controller, config, request, started)
 
 configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")

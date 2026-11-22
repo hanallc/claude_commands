@@ -32,13 +32,13 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_gate, mac_queue_run, mac_test, offload
-from scripts.production import mac_gate_process, merge_gate, targeted_test
+from scripts.production import gate, mac_gate_process
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import (
     MacGateCompleted, MacGatePrelaunchRefused, MacGateUnresolved, ModuleCoverage, SuiteMode, TreeSelection,
 )
-from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
-from scripts.production.merge_gate_test_support import gate_suites
+from scripts.production.gate_suites_test_support import GateSuitesFixture
+from scripts.production.gate_test_support import gate_suites
 
 
 HOOKS = "scripts/hooks/test_first.py"
@@ -56,6 +56,7 @@ class MacTransportCase(Enum):
     STALLED_CLEANUP = "stalled-cleanup"
     CLAIM_PUBLICATION = "claim-publication"
     MANUAL_BEFORE_PLACEMENT = "manual-before-placement"
+    HOLD_MANUAL_TESTS = "hold-manual-tests"
 
 
 class ClaimWriteBarrier(Enum):
@@ -65,7 +66,7 @@ class ClaimWriteBarrier(Enum):
 
 def run_claim_at_write_barrier() -> int:
     """Pause the real claim subprocess at its record write."""
-    state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+    state = Path(os.environ["GATE_TEST_STATE"])
     barrier = ClaimWriteBarrier(os.environ["MAC_GATE_CLAIM_BARRIER"])
     claim_id = sys.argv[sys.argv.index("--claim-id") + 1]
     attempt = sys.argv[sys.argv.index("--attempt") + 1]
@@ -92,7 +93,7 @@ def run_claim_at_write_barrier() -> int:
 
 def run_queue_with_fixture_transport() -> int:
     """Run the assigned queue with local substitutes for remote operations."""
-    state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+    state = Path(os.environ["GATE_TEST_STATE"])
     write_text_atomic(state / "assigned-queue-pid", str(os.getpid()))
     run = mac_queue_run.run_assigned
 
@@ -105,7 +106,7 @@ def run_queue_with_fixture_transport() -> int:
         if MacTransportCase(os.environ["MAC_GATE_TRANSPORT_CASE"]) is MacTransportCase.UNAVAILABLE_OWNER:
             args = sys.argv[1:]
             assignment = mac_queue_run.read_assignment(args[args.index("--gate-assignment") + 1])
-            paths = mac_gate.assigned_gate_paths(assignment)
+            paths = mac_gate.assigned_gate_paths(assignment.attempt)
             assert paths.journal.is_file() and not paths.request_root.exists() and not paths.directory.exists()
             write_text_atomic(state / "owner-unavailable", attempt)
             raise wire.AdmissionUnavailable("the fixture admission service is unavailable")
@@ -161,9 +162,12 @@ def run_assignment_with_fixture_transport(run: Callable[[mac_queue_run.Arguments
     def stream(_command: list[str], remote: mac_queue_run.RemoteRun, _ssh: ExitStack,
                emit: Callable[[str], None] = print, *, caller: mac_queue_run.QueueCaller) -> int:
         remote.state = mac_queue_run.RemoteState.LIVE
-        if case is MacTransportCase.HELD:
+        if case in (MacTransportCase.HELD, MacTransportCase.HOLD_MANUAL_TESTS):
             write_text_atomic(state / "assigned-ready", str(folder))
-            caller.ready(timeout=-1)
+            if case is MacTransportCase.HELD:
+                caller.ready(timeout=-1)
+            else:
+                wait_until((state / "allow-manual-finish").is_file, state)
         write_text_atomic(state / "assigned-streamed", assignment.attempt)
         if case is MacTransportCase.MALFORMED:
             emit(mac_gate.RESULT_PREFIX + "{\n")
@@ -171,9 +175,9 @@ def run_assignment_with_fixture_transport(run: Callable[[mac_queue_run.Arguments
             request = cloud_gate.read(folder / "request.json")
             output = (state / "assigned-output").read_text()
             modules = tuple(Path(path) for path in cast(list[str], request["modules"]))
-            jobs = tuple(merge_gate.GateJobResult(path.parent.name, path.name, 0, 1, output) for path in modules)
+            jobs = tuple(gate.GateJobResult(path.parent.name, path.name, 0, 1, output) for path in modules)
             row: dict[str, object] = {key: ledger.text(request, key) for key in ("attempt", "tree", "commit")}
-            row["gate"] = gate_box.encode_run(merge_gate.GateRun(jobs, 1, 0))
+            row["gate"] = gate_box.encode_run(gate.GateRun(jobs, 1, 0))
             emit(mac_gate.RESULT_PREFIX + json.dumps(row) + "\n")
         remote.state = mac_queue_run.RemoteState.EXITED
         return 0
@@ -218,7 +222,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.requests: list[wire.PlacementRequest] = []
         self.mac_runs: list[tuple[placement.PlacementAssignment, TreeSelection]] = []
         self.mac_outcome: MacGateCompleted | MacGatePrelaunchRefused | MacGateUnresolved = MacGateCompleted(
-            merge_gate.GateRun((), 0, 0))
+            gate.GateRun((), 0, 0))
         self.before_mac: Callable[[], None] = lambda: None
         self.cloud_route = mock.Mock(return_value="fixture cloud unavailable")
 
@@ -229,6 +233,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "mac_gate.conf")
         with (self.checkout / ".git/info/exclude").open("a") as exclusions:
             _ = exclusions.write(f"\n/{mac_gate.MODULE_LIST}\n")
         self.exclude_modules()
@@ -258,7 +263,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(assignment.destination.target, "mac")
         self.assertEqual(assignment.source_key, execution_identity.SourceKeyKnown(selected.tree))
         self.assertEqual(self.requests[-1].profile.step, mode.value)
-        self.assertEqual(module_time_limit_s, merge_gate.DEFAULT_MODULE_TIME_LIMIT_S)
+        self.assertEqual(module_time_limit_s, gate.DEFAULT_MODULE_TIME_LIMIT_S)
         self.assertFalse(full)
         self.before_mac()
         self.mac_runs.append((assignment, selected))
@@ -290,9 +295,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         return outcome
 
     def pass_on_mac(self, *paths: str, status: int = 0) -> None:
-        jobs = tuple(merge_gate.GateJobResult(Path(path).parent.name, Path(path).name, status, 1, "")
+        jobs = tuple(gate.GateJobResult(Path(path).parent.name, Path(path).name, status, 1, "")
                      for path in paths)
-        self.mac_outcome = MacGateCompleted(merge_gate.GateRun(jobs, 1, 0))
+        self.mac_outcome = MacGateCompleted(gate.GateRun(jobs, 1, 0))
 
     def assert_request(self, target: str) -> wire.PlacementRequest:
         request, = self.requests
@@ -314,7 +319,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     @contextmanager
     def assigned_queue(self, case: MacTransportCase, *, output: str = "") -> Generator[tuple[str, str]]:
         shim = self.state / "assigned-queue.py"
-        self.write(shim, "from scripts.production.test_merge_gate_suites_mac import run_queue_with_fixture_transport\n"
+        self.write(shim, "from scripts.production.test_gate_suites_mac import run_queue_with_fixture_transport\n"
                    + "raise SystemExit(run_queue_with_fixture_transport())\n")
         command = (str(Path(__file__).resolve().parents[1] / "lib/py"), str(shim))
         self.write(self.state / "assigned-output", output)
@@ -409,7 +414,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_large_assigned_mac_result_reaches_the_gate_whole(self) -> None:
         payload = "fixture module output\n" * (1 << 16)
         with self.assigned_queue(MacTransportCase.COMPLETE, output=payload):
-            run = merge_gate.run_gate_suites(self.checkout)
+            run = gate.run_gate_suites(self.checkout)
         self.assertTrue(run.passed, self.output.getvalue())
         job, = run.jobs
         self.assertEqual((job.suite, job.module), ("hooks", "test_first.py"))
@@ -439,13 +444,13 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_assignment_stays_completed_after_runner_exit_and_claim_release(self) -> None:
         decode = cloud_gate.decode_requested_run
 
-        def settle_after_runner_exit(row: dict[str, object], request: dict[str, object]) -> merge_gate.GateRun:
+        def settle_after_runner_exit(row: dict[str, object], request: dict[str, object]) -> gate.GateRun:
             self.assertEqual(self.state_after_assigned_runner_exit(), placement.ClosedAssignment("completed"))
             return decode(row, request)
 
         with (self.assigned_queue(MacTransportCase.COMPLETE),
               mock.patch.object(cloud_gate, "decode_requested_run", side_effect=settle_after_runner_exit) as decode_result):
-            run = merge_gate.run_gate_suites(self.checkout)
+            run = gate.run_gate_suites(self.checkout)
 
         decode_result.assert_called_once()
         self.assertTrue(run.passed, self.output.getvalue())
@@ -455,7 +460,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_cancel_between_claim_release_and_report_preserves_completion(self) -> None:
         with self.assigned_queue(MacTransportCase.CANCEL_COMPLETION):
             with self.assertRaises(GateRefused):
-                _ = merge_gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout)
         self.assertTrue((self.state / "assigned-before-report").exists(), self.output.getvalue())
         self.assertEqual(self.state_after_assigned_runner_exit(), placement.ClosedAssignment("completed"))
         self.assert_local_modules()
@@ -467,7 +472,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             "from pathlib import Path\n"
             "from scripts.direct.wait_for_test_state import wait_for_file\n"
             "from scripts.lib.atomic_file import write_text_atomic\n"
-            "state = Path(os.environ['MERGE_GATE_TEST_STATE'])\n"
+            "state = Path(os.environ['GATE_TEST_STATE'])\n"
             "def prepare(_repo, folder, *_args, **_options):\n"
             "    write_text_atomic(state / 'assigned-preparing', str(folder))\n"
             "    wait_for_file(state / 'assigned-finish')\n"
@@ -522,10 +527,10 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_owner_start_failure_creates_no_gate_resources(self) -> None:
         with self.assigned_queue(MacTransportCase.UNAVAILABLE_OWNER):
             with self.assertRaisesRegex(GateRefused, "fixture admission service is unavailable"):
-                _ = merge_gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout)
         attempt = (self.state / "owner-unavailable").read_text()
         assignment = self.recorded_assignment(attempt)
-        paths = mac_gate.assigned_gate_paths(assignment)
+        paths = mac_gate.assigned_gate_paths(assignment.attempt)
         self.assertFalse(paths.request_root.exists())
         self.assertFalse(paths.directory.exists())
         self.assertEqual(offload.read_assigned_mac_claim(assignment), offload.MacClaimSettled())
@@ -550,7 +555,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             with self.admission.loop_turn():
                 _ = self.admission.run_pass()
                 self.assertFalse((self.state / "recovery-entered").exists())
-                self.assertTrue(mac_gate.assigned_gate_paths(assignment).journal.exists())
+                self.assertTrue(mac_gate.assigned_gate_paths(assignment.attempt).journal.exists())
                 os.kill(claim.record["pid"], signal.SIGKILL)
                 self.assert_process_stopped(claim.record["pid"])
                 provider = self.admission.server.host_probe
@@ -575,7 +580,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     def assert_admission_recovers_claim_subprocess(self, barrier: ClaimWriteBarrier) -> None:
         self.write(self.state / "claim-at-write.py",
-                   "from scripts.production.test_merge_gate_suites_mac import run_claim_at_write_barrier\n"
+                   "from scripts.production.test_gate_suites_mac import run_claim_at_write_barrier\n"
                    + "raise SystemExit(run_claim_at_write_barrier())\n")
         marker = self.state / "claim-at-write"
         release = self.state / "allow-claim-write"
@@ -602,7 +607,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 attempt, creator_pid = marker.read_text().split()
                 creator = int(creator_pid)
                 assignment = self.recorded_assignment(attempt)
-                paths = mac_gate.assigned_gate_paths(assignment)
+                paths = mac_gate.assigned_gate_paths(assignment.attempt)
                 run = mac_queue_run.read_registered_mac_run(assignment)
                 assert isinstance(run, mac_queue_run.RegisteredMacRun)
                 claim = offload.read_assigned_mac_claim(assignment)
@@ -644,8 +649,8 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("hooks")
     def test_admission_restart_recovers_manual_gate_before_placement(self) -> None:
         manual = (
-            "from scripts.production import merge_gate as gate\n"
-            + "result = mac_gate.run_remote(Path(sys.argv[2]), mode=gate.SuiteMode.MERGE_GATE, full=True, "
+            "from scripts.production import gate\n"
+            + "result = mac_gate.run_remote(Path(sys.argv[2]), mode=gate.SuiteMode.GATE, full=True, "
             + "module_time_limit_s=30, selected=gate.ALL_MODULES, "
             + "cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME)\n"
             + "print(result)\n"
@@ -694,12 +699,12 @@ class MacGateSuitesTests(GateSuitesFixture):
         with (self.recover_fixture_mac(allowed), self.assigned_queue(MacTransportCase.STALLED_CLEANUP),
               mock.patch.object(mac_gate, "run_assigned", side_effect=capture)):
             with self.assertRaisesRegex(GateRefused, "timed out"):
-                _ = merge_gate.run_gate_suites(self.checkout)
+                _ = gate.run_gate_suites(self.checkout)
             self.assertIsInstance(outcomes[0], MacGateUnresolved)
             self.assertTrue((self.state / "cleanup-entered").exists())
             attempt = (self.state / "assigned-streamed").read_text()
             assignment = self.recorded_assignment(attempt)
-            paths = mac_gate.assigned_gate_paths(assignment)
+            paths = mac_gate.assigned_gate_paths(assignment.attempt)
             self.assertTrue(paths.journal.exists())
             self.assertTrue(paths.request.is_dir())
             claim = offload.read_assigned_mac_claim(assignment)
@@ -717,13 +722,13 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_gate_with_exclusions_reuses_an_existing_full_pass(self) -> None:
         self.exclude_modules(LIB_FIRST)
-        local = merge_gate.run_suites(self.checkout)
+        local = gate.run_suites(self.checkout)
         self.assertTrue(local.passed, self.output.getvalue())
         record, = self.pass_records()
         self.assertEqual(record["kind"], "full")
         self.clear_gate_events()
 
-        run = merge_gate.run_gate_suites(self.checkout)
+        run = gate.run_gate_suites(self.checkout)
 
         self.assertTrue(run.tests_reused, self.output.getvalue())
         self.assertIs(run.coverage, ModuleCoverage.COMPLETE)
@@ -733,8 +738,8 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     @gate_suites("hooks", "message")
     def test_full_gate_does_not_reuse_a_one_module_split(self) -> None:
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "scan_roots=\n")
-        self.assertTrue(merge_gate.run_suites(self.checkout).passed, self.output.getvalue())
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
+        self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
         baseline, = self.pass_records()
         self.clear_gate_events()
         self.exclude_modules(MESSAGE)
@@ -743,7 +748,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         _ = self.commit(self.checkout, "Change one test module")
         self.pass_on_mac(HOOKS)
         self.controls.set_host("natedev", placement.TemporaryExclusion("blocked"))
-        split = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+        split = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertTrue(split.passed, self.output.getvalue())
         self.assertIs(split.coverage, ModuleCoverage.SUBSET)
         _ = self.assert_request("mac")
@@ -753,7 +758,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
         self.exclude_modules(HOOKS, MESSAGE)
         self.controls.set_host("natedev", placement.AllowedHost())
-        full = merge_gate.run_gate_suites(self.checkout)
+        full = gate.run_gate_suites(self.checkout)
 
         self.assertTrue(full.passed, self.output.getvalue())
         self.assertFalse(full.tests_reused)
@@ -762,15 +767,15 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual((record["kind"], record["tree"]), ("full", self.mac_runs[0][1].tree))
 
     @gate_suites("lib")
-    def test_merge_gate_cli_submits_one_request_after_aws_declines(self) -> None:
+    def test_gate_cli_submits_one_request_after_aws_declines(self) -> None:
         self.exclude_modules(LIB_FIRST)
         self.pass_on_mac(LIB_SECOND)
         self.controls.set_host("natedev", placement.TemporaryExclusion("blocked"))
 
         def check_aws() -> None:
             self.cloud_route.assert_called_once()
-            self.assertIs(cast(object, self.cloud_route.call_args.kwargs["selected"]), merge_gate.ALL_MODULES)
-            self.assertIs(cast(object, self.cloud_route.call_args.kwargs["mode"]), SuiteMode.MERGE_GATE)
+            self.assertIs(cast(object, self.cloud_route.call_args.kwargs["selected"]), gate.ALL_MODULES)
+            self.assertIs(cast(object, self.cloud_route.call_args.kwargs["mode"]), SuiteMode.GATE)
             self.controls.set_host("natedev", placement.AllowedHost())
 
         self.before_mac = check_aws
@@ -796,7 +801,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
         self.before_mac = check_order
         try:
-            status = targeted_test.main(["--repo", str(self.checkout)])
+            status = gate.main(["--repo", str(self.checkout), "--affected"])
         finally:
             _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, older.episode, older.owner, "fixture ended"))
         self.assertEqual(status, 0, self.output.getvalue())
@@ -806,7 +811,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
-    def test_merge_gate_uses_natedev_for_mac_hold_and_backoff(self) -> None:
+    def test_gate_uses_natedev_for_mac_hold_and_backoff(self) -> None:
         config = Path(self.environment["CONF_DIR"])
         for reason in ("blocked", "backoff"):
             with self.subTest(reason=reason):
@@ -814,8 +819,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.clear_gate_events()
                 self.exclude_modules(LIB_FIRST)
                 self.controls.set_host("mac", placement.TemporaryExclusion(reason))
-                _ = write_config_fixture(config / "build_admission.conf", "program_first_peak_gib.merge-gate=0.5")
-                run = merge_gate.run_gate_suites(self.checkout, ("scripts",), full=True)
+                _ = write_config_fixture(config / "build_admission.conf", "program_first_peak_gib.gate=0.5")
+                run = gate.run_gate_suites(self.checkout, ("scripts",), full=True)
                 self.assertTrue(run.passed, self.output.getvalue())
                 _ = self.assert_request("natedev")
                 self.assertEqual(self.mac_runs, [])
@@ -830,14 +835,14 @@ class MacGateSuitesTests(GateSuitesFixture):
         scope.mkdir()
         self.write(scope / "cgroup.procs", f"{os.getpid()}\n")
 
-        def local(*_args: object, admitted: queue_place.QueuePlace, **_kwargs: object) -> merge_gate.GateRun:
+        def local(*_args: object, admitted: queue_place.QueuePlace, **_kwargs: object) -> gate.GateRun:
             self.write(admitted.sidecar, str(scope))
-            return merge_gate.GateRun((), 0, 0)
+            return gate.GateRun((), 0, 0)
 
-        with (mock.patch.object(merge_gate, "run_suites", side_effect=local),
+        with (mock.patch.object(gate, "run_suites", side_effect=local),
               mock.patch.object(queue_place.QueuePlace, "finish", side_effect=TimeoutError("cleanup expired")),
               self.assertRaisesRegex(TimeoutError, "cleanup expired")):
-            _ = merge_gate.run_gate_suites(self.checkout, full=True)
+            _ = gate.run_gate_suites(self.checkout, full=True)
         request = self.assert_request("natedev")
         self.assertIsInstance(request.local, wire.LocalAdmissionContext)
         assert isinstance(request.local, wire.LocalAdmissionContext)
@@ -850,15 +855,15 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_local_gate_replays_the_saved_result_after_unconfirmed_release(self) -> None:
         self.controls.set_host("mac", placement.TemporaryExclusion("blocked"))
 
-        def local(*_args: object, admitted: queue_place.QueuePlace, **_kwargs: object) -> merge_gate.GateRun:
+        def local(*_args: object, admitted: queue_place.QueuePlace, **_kwargs: object) -> gate.GateRun:
             admitted.observe(1 << 30, 1 << 30)
-            job = merge_gate.GateJobResult("lib", "test_first.py", 1, 1, "")
-            return merge_gate.GateRun((job,), 1, 0)
+            job = gate.GateJobResult("lib", "test_first.py", 1, 1, "")
+            return gate.GateRun((job,), 1, 0)
 
-        with (mock.patch.object(merge_gate, "run_suites", side_effect=local),
+        with (mock.patch.object(gate, "run_suites", side_effect=local),
               mock.patch.object(client, "release", side_effect=wire.AdmissionUnavailable("release unavailable")),
               self.assertRaisesRegex(GateRefused, "release unavailable")):
-            _ = merge_gate.run_gate_suites(self.checkout, full=True)
+            _ = gate.run_gate_suites(self.checkout, full=True)
         request = self.assert_request("natedev")
         assert isinstance(request.local, wire.LocalAdmissionContext)
         assignment = Path(request.local.sidecar).with_suffix(".assignment.json")
@@ -892,23 +897,23 @@ class MacGateSuitesTests(GateSuitesFixture):
                 return 0, 0, None
             return wait4(pid, flags)
 
-        def local(*_args: object, **_kwargs: object) -> merge_gate.GateRun:
-            with merge_gate.gate_recovery(self.checkout) as journal, (self.state / "held-job").open("w+") as output:
+        def local(*_args: object, **_kwargs: object) -> gate.GateRun:
+            with gate.gate_recovery(self.checkout) as journal, (self.state / "held-job").open("w+") as output:
                 journal.add_group(child.pid)
                 self.assertIn(child.pid, journal.groups)
-                job = merge_gate.RunningGateJob("lib", self.checkout / LIB_FIRST, child, 0, 0,
+                job = gate.RunningGateJob("lib", self.checkout / LIB_FIRST, child, 0, 0,
                                                output, Path(output.name), LIB_FIRST)
                 try:
                     with mock.patch.object(os, "wait4", side_effect=stalled):
-                        merge_gate.stop_gate_jobs((job,))
+                        gate.stop_gate_jobs((job,))
                 finally:
                     self.assertIn(child.pid, journal.groups)
             raise AssertionError("The placed gate returned without confirmation")
 
         try:
-            with (mock.patch.object(merge_gate, "run_suites", side_effect=local),
+            with (mock.patch.object(gate, "run_suites", side_effect=local),
                   self.assertRaisesRegex(TimeoutError, "deadline passed")):
-                _ = merge_gate.run_gate_suites(self.checkout, full=True)
+                _ = gate.run_gate_suites(self.checkout, full=True)
             request = self.assert_request("natedev")
             with self.admission.loop_turn():
                 self.assertIn(request.episode, self.admission.server.reservations)
@@ -928,7 +933,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.controls.set_host("natedev", placement.AllowedHost())
 
         self.before_mac = check_before_mac
-        run = merge_gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED_TEST)
+        run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED)
         self.assertTrue(run.passed, self.output.getvalue())
         _ = self.assert_request("mac")
         self.assertEqual(self.mac_runs[0][1].paths, (LIB_SECOND,))
@@ -936,6 +941,26 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assert_types_once()
         self.assertEqual(self.pass_records(), [])
         self.assert_gate_released()
+
+    @gate_suites("lib")
+    def test_empty_exclude_list_sends_all_modules_to_the_mac(self) -> None:
+        self.pass_on_mac(LIB_FIRST, LIB_SECOND)
+        self.controls.set_host("natedev", placement.TemporaryExclusion("blocked"))
+
+        def free_natedev() -> None:
+            self.controls.set_host("natedev", placement.AllowedHost())
+
+        self.before_mac = free_natedev
+        run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED)
+        self.assertTrue(run.passed, self.output.getvalue())
+        _ = self.assert_request("mac")
+        self.assertEqual(self.mac_runs[0][1].paths, (LIB_FIRST, LIB_SECOND))
+        self.cloud_route.assert_not_called()
+        self.assert_local_modules()
+        self.assert_types_once()
+        self.assertCountEqual([job.kind for job in run.jobs],
+                              [gate.GateJobKind.TYPE_CHECK, gate.GateJobKind.TEST_MODULE,
+                               gate.GateJobKind.TEST_MODULE])
 
     @gate_suites("lib")
     def test_red_or_missing_mac_result_does_not_launch_the_assigned_modules_on_natedev(self) -> None:
@@ -946,7 +971,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.pass_on_mac(LIB_FIRST, LIB_SECOND, status=1)
                 if missing:
                     self.mac_outcome = MacGateUnresolved("The fixture lost the result after launch")
-                status = targeted_test.main(["--repo", str(self.checkout)])
+                status = gate.main(["--repo", str(self.checkout), "--affected"])
                 self.assertEqual(status, 1, self.output.getvalue())
                 _ = self.assert_request("mac")
                 self.assert_local_modules()
@@ -961,7 +986,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.controls.set_host("natedev", placement.AllowedHost())
 
         self.before_mac = free_natedev
-        run = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+        run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertTrue(run.passed, self.output.getvalue())
         first, second = self.requests
         self.assertIs(first, second)
@@ -970,7 +995,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         record, = self.pass_records()
         self.assertEqual(record["kind"], "full")
         self.clear_gate_events()
-        reused = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+        reused = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertTrue(reused.tests_reused, self.output.getvalue())
         self.assertEqual(self.requests, [first, second])
         self.assert_local_modules()
@@ -979,7 +1004,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_missing_mac_route_preserves_the_cloud_fallback(self) -> None:
         with mock.patch.object(mac_gate_process, "load_mac_gate_route",
                                side_effect=ModuleNotFoundError(name=mac_gate_process.MAC_GATE_MODULE)):
-            run = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertTrue(run.passed, self.output.getvalue())
         tree, _ = cloud_gate.working_tree(self.checkout)
         self.assertEqual(cast(object, self.cloud_route.call_args.kwargs["selected"]), TreeSelection((HOOKS,), tree))
@@ -989,8 +1014,8 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_missing_exclude_file_preserves_the_cloud_route(self) -> None:
         excluded = self.checkout / mac_gate.MODULE_LIST
         excluded.unlink()
-        hooks = merge_gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
-        self.cloud_route.return_value = merge_gate.GateRun((hooks,), 1, 0)
+        hooks = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
+        self.cloud_route.return_value = gate.GateRun((hooks,), 1, 0)
         is_file = Path.is_file
 
         def avoid_probe(path: Path, *, follow_symlinks: bool = True) -> bool:
@@ -998,15 +1023,15 @@ class MacGateSuitesTests(GateSuitesFixture):
             return is_file(path, follow_symlinks=follow_symlinks)
 
         with mock.patch.object(Path, "is_file", avoid_probe):
-            run = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertEqual(run.jobs, (hooks,))
         self.cloud_route.assert_called_once()
         self.assertEqual(self.requests, [])
 
     @gate_suites("direct", "hooks", "message")
     def test_targeted_gate_places_only_affected_modules_and_runs_types_once(self) -> None:
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "scan_roots=\n")
-        baseline = merge_gate.run_suites(self.checkout)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
+        baseline = gate.run_suites(self.checkout)
         self.assertTrue(baseline.passed, self.output.getvalue())
         passes = self.pass_records()
         self.clear_gate_events()
@@ -1022,7 +1047,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.controls.set_host("natedev", placement.AllowedHost())
 
         self.before_mac = free_natedev
-        run = merge_gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED_TEST)
+        run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED)
         self.assertTrue(run.passed, self.output.getvalue())
         _ = self.assert_request("mac")
         self.assertEqual(self.mac_runs[0][1].paths, (HOOKS,))
@@ -1032,8 +1057,8 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     @gate_suites("hooks", "message")
     def test_all_excluded_affected_modules_reject_a_checkout_edit_during_the_run(self) -> None:
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "scan_roots=\n")
-        baseline = merge_gate.run_suites(self.checkout)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
+        baseline = gate.run_suites(self.checkout)
         self.assertTrue(baseline.passed, self.output.getvalue())
         self.clear_gate_events()
         selected = self.checkout / HOOKS
@@ -1046,6 +1071,6 @@ class CheckoutEdit(unittest.TestCase):
         _ = self.commit(self.checkout, "Add a test that edits the checkout")
         self.exclude_modules(HOOKS)
         with self.assertRaisesRegex(GateRefused, "The checkout changed during the gate"):
-            _ = merge_gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED_TEST)
+            _ = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED)
         self.assertEqual(self.requests, [])
         self.assertEqual([row["suite"] for row in self.module_events() if row["event"] == "start"], ["hooks"])

@@ -31,6 +31,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
+from scripts.production.gate_routes import SuiteMode
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -176,7 +177,7 @@ def local_cargo_request(fixture: PlacementFixture) -> wire.PlacementRequest:
 
 
 def shared_mac_run_request(fixture: PlacementFixture, request: wire.PlacementRequest) -> wire.PlacementRequest:
-    command = ("targeted-test",)
+    command = (SuiteMode.TARGETED.value,)
     assert isinstance(request.local, wire.LocalAdmissionContext)
     first_peak = request.profile.peak.bytes
     sizing = records.HistoryPeakSizing(first_peak, records.FirstProgramPeak(first_peak), fixture.clock.now())

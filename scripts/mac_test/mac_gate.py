@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass, field
-from enum import Enum, StrEnum
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 import fcntl
 import json
 import os
@@ -42,13 +42,17 @@ from scripts.mac_test.claim_state import (
     queue_cancel_seconds as queue_cancel_seconds,
     queue_runs_directory as queue_runs_directory,
     CREATION_LEASE_FD as CREATION_LEASE_FD,
+    REMOTE_CREATION_LEASE_FD,
+    RemotePreparationAction as RemotePreparationAction,
+    remote_creation_command as remote_creation_command,
     QueueProcessUnsettled as QueueProcessUnsettled,
     capture_cleanup_command as capture_cleanup_command,
     close_process_pipes as close_process_pipes,
+    GATE_JOB_LABEL,
     kill_and_wait as kill_and_wait,
     terminate_and_wait as terminate_and_wait,
 )
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.test_times import gate_record
@@ -56,14 +60,13 @@ from scripts.test_times import gate_record
 if TYPE_CHECKING:
     from scripts.build_queue.placement import PlacementAssignment
     from scripts.production.gate_routes import (
-        MacGateCancellation, MacGateCompleted, MacGateExcludeFileMissing, MacGateExclusions,
-        MacGatePrelaunchRefused, MacGateUnresolved,
+        MacGateCancellation, MacGateCompleted,
+        MacGateExcludeFileMissing, MacGateExclusions, MacGatePrelaunchRefused, MacGateUnresolved,
     )
 
 MODULE_LIST = Path('config/mac_gate_modules.txt')
 MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
 REMOTE_PREPARATION = '.local/state/mac-gate-preparation'
-REMOTE_CREATION_LEASE_FD = 'MAC_GATE_REMOTE_CREATION_LEASE_FD'
 REMOTE_SETTLEMENT_DEADLINE = 'MAC_GATE_REMOTE_SETTLEMENT_DEADLINE'
 REMOTE_ROOT = '.local/state/mac-gate'
 CHECKOUT_NAME = 'mac-gate'
@@ -183,7 +186,7 @@ def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
                                         '--exclude-standard', '--', 'scripts').split('\0'))
     excluded = entries & tracked_paths
     return MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
-                                   if (name := path.relative_to(repo).as_posix()) in excluded))
+                                        if (name := path.relative_to(repo).as_posix()) in excluded))
 
 
 def attempt_name(folder: Path) -> str:
@@ -454,39 +457,6 @@ def hold_gate_creation_commands() -> Generator[None]:
         copies.COMMAND_LOCKS.reset(token)
 
 
-class RemotePreparationAction(Enum):
-    PREPARE = "prepare"
-    FINISH = "finish"
-    SETTLE = "settle"
-
-
-def remote_creation_command(path: Path, command: str, action: RemotePreparationAction) -> str:
-    """Keep the terminal record at the same path as the creation lock."""
-    program = """import fcntl, os, pathlib, sys
-path = pathlib.Path.home() / sys.argv[1]
-path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-try:
-    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    sys.exit('Mac gate preparation or cleanup is active')
-if sys.argv[2] == 'settle':
-    os.pwrite(descriptor, b'closed', 0)
-    os.fsync(descriptor)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-elif sys.argv[2] == 'prepare' and os.fstat(descriptor).st_size:
-    sys.exit('Mac gate preparation has settled')
-os.environ[sys.argv[4]] = str(descriptor)
-os.set_inheritable(descriptor, True)
-os.execl('/bin/sh', 'sh', '-c', sys.argv[3])
-"""
-    return shlex.join(["python3", "-c", program, str(path), action.value, command, REMOTE_CREATION_LEASE_FD])
-
-
 def remote_preparation_command(folder: Path, command: str, action: RemotePreparationAction) -> str:
     relative = Path(REMOTE_PREPARATION) / attempt_name(folder)
     guarded = remote_creation_command(relative, command, action)
@@ -727,14 +697,14 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                         or not assignment.attempt.isalnum()):
                     return 'The gate received an invalid Mac assignment'
                 target = assignment.destination.target
-                paths = assigned_gate_paths(assignment)
+                paths = assigned_gate_paths(assignment.attempt)
                 folder = paths.request
                 encoded_assignment = wire.encode_reply(wire.Assignment(assignment))
                 placement_arguments = ['--assignment-file', str(folder / 'assignment.json'),
                                        '--gate-assignment', encoded_assignment]
             cancel_seconds = queue_cancel_seconds(target)
             command = [*QUEUE_COMMAND, *caller_arguments, '--owns-gate-request',
-                       '--what', 'gate tests', '--kind', 'run', '--package', '',
+                       '--what', GATE_JOB_LABEL, '--kind', 'run', '--package', '',
                        '--worktree', str(repo), '--owned-close',
                        '--lifecycle-script', str(Path(__file__).resolve()), *placement_arguments]
             with queue_call(command, [str(folder), str(int(full))], caller_fds, caller_lifetime,
@@ -812,6 +782,29 @@ def run_assigned(repo: Path, *, assignment: PlacementAssignment, mode: gate.Suit
     if isinstance(outcome, MacGateResult):
         return MacGateCompleted(outcome.run)
     return MacGateUnresolved(outcome)
+
+
+def run_manual(repo: Path) -> MacGateResult | str:
+    """Use the gate's assigned claim and wait for the Mac alone."""
+    from scripts.build_queue import admission_records, admission_wire as wire, first_step, placement
+    from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
+    from scripts.build_queue.queue_place import gate_placement_sidecar
+
+    mode = gate.SuiteMode.GATE
+    tree, _ = cloud_gate.working_tree(repo)
+    try:
+        with gate_placement_sidecar() as sidecar:
+            config = admission_records.read_memory_config()
+            request = gate.gate_placement_request(repo, tree, mode.value, (), sidecar, config, GATE_JOB_NOT_RECORDED)
+            request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
+            grant = first_step.placement_grant(request)
+            if not isinstance(grant, wire.Assignment) or grant.assignment.destination.provider != 'mac':
+                raise GateRefused('The manual gate requires a Mac assignment')
+            return run_remote(repo, mode=mode, full=True, module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                              selected=gate.ALL_MODULES, cancellation=USE_CALLER_PROCESS_LIFETIME,
+                              assignment=grant.assignment)
+    except (first_step.FirstStepRefused, SettledMacRefusal, wire.AdmissionUnavailable) as error:
+        return str(error)
 
 
 def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
@@ -938,9 +931,7 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.MERGE_GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
-                                cancellation=USE_CALLER_PROCESS_LIFETIME)
+            result = run_manual(args.repo.resolve())
             if isinstance(result, str):
                 raise GateRefused(result)
             cloud_gate.save(args.output, result.row)

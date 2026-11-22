@@ -5,7 +5,8 @@ from __future__ import annotations
 from scripts.build_queue import execution_identity
 from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -16,9 +17,10 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from pathlib import Path
-from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
+from typing import TYPE_CHECKING, ClassVar, Literal, NotRequired, TypedDict, cast, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
@@ -34,10 +36,12 @@ from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
-from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
+
+if TYPE_CHECKING:
+    from scripts.build_queue.admission_test_support import AdmissionFixture
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -46,6 +50,15 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
+
+
+@contextmanager
+def patch_cleanup_capture(
+    capture: Callable[[list[str], float], subprocess.CompletedProcess[str]],
+) -> Generator[mock.MagicMock]:
+    """Replace the command capture that checks and settles remote cleanup."""
+    with mock.patch.object(claim_state, "capture_cleanup_command", side_effect=capture) as patched:
+        yield patched
 
 
 def write_mac_target_registry(directory: Path, settings_name: str) -> None:
@@ -399,8 +412,15 @@ class OffloadCommandFixture(unittest.TestCase):
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
 
+    def admission_fixture(self) -> AdmissionFixture:
+        from scripts.build_queue.admission_test_support import caller_admission
+
+        return caller_admission(self, self.root, self.environment)
+
     def start_admission(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
+        from scripts.build_queue.admission_test_support import private_provider_evidence
+
+        admission = self.admission_fixture()
         admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -418,7 +438,7 @@ class OffloadCommandFixture(unittest.TestCase):
         """Give command fixtures one real queue assignment before the adapter starts."""
         if "--assignment-file" in runner_options:
             return []
-        admission = caller_admission(self, self.root, self.environment)
+        admission = self.admission_fixture()
         with admission.loop_turn():
             # End settled prelaunch episodes before the next fixture command.
             for key in tuple(self.command_attempts):
@@ -551,7 +571,7 @@ class OffloadCommandFixture(unittest.TestCase):
             if not subprocess_cli:
                 return invoke_cli(offload, assigned_adapter_main, arguments[2:], self.environment, self.root,
                                   combined_output=not separate_stderr,
-                                  environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+                                  environment_lock=self.admission_fixture().loop_access)
             entry = self.root / "assigned-adapter.py"
             _ = entry.write_text(
                 f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
@@ -564,7 +584,7 @@ class OffloadCommandFixture(unittest.TestCase):
                                   text=True, check=False, timeout=timeout)
         return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
                           combined_output=not separate_stderr,
-                          environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+                          environment_lock=self.admission_fixture().loop_access)
 
     def process_command(self, *arguments: str, separate_stderr: bool = False,
                         last_decline: str = "", assigned_adapter: bool = False,
@@ -576,17 +596,20 @@ class OffloadCommandFixture(unittest.TestCase):
                             runner_options=runner_options)
 
     def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
-        # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
+        # Advance the offload clock at work boundaries. Keep process deadlines on the real clock.
         program = r'''
 import subprocess
 import sys
-from scripts.mac_test import eligibility, offload
+from unittest import mock
+from scripts.mac_test import claim_state, offload
+from scripts.mac_test.offload_test_support import patch_cleanup_capture
 
 clock = [100.0]
-offload.time.monotonic = lambda: clock[0]
+offload.time = mock.Mock(wraps=offload.time)
+offload.time.monotonic.side_effect = lambda: clock[0]
 real_capture = offload.ProcessController.capture
 real_stream = offload.ProcessController.stream_mac_run
-real_run = subprocess.run
+real_cleanup = claim_state.capture_cleanup_command
 
 def capture(self, arguments, *args, **kwargs):
     answer = real_capture(self, arguments, *args, **kwargs)
@@ -601,13 +624,13 @@ def stream(self, arguments):
     clock[0] = 103.0
     return answer
 
-def run(arguments, **kwargs):
+def cleanup(arguments, budget, **kwargs):
     if arguments[0] != "ssh" or "select_leftovers()" not in arguments[-1]:
-        return real_run(arguments, **kwargs)
+        return real_cleanup(arguments, budget, **kwargs)
     clock[0] = 105.0
     try:
-        answer = real_run(arguments, **kwargs)
-    except subprocess.TimeoutExpired:
+        answer = real_cleanup(arguments, budget, **kwargs)
+    except (subprocess.TimeoutExpired, TimeoutError, claim_state.QueueProcessUnsettled):
         clock[0] = 113.0
         raise
     clock[0] = 108.0
@@ -615,8 +638,8 @@ def run(arguments, **kwargs):
 
 offload.ProcessController.capture = capture
 offload.ProcessController.stream_mac_run = stream
-subprocess.run = run
-raise SystemExit(offload.main())
+with patch_cleanup_capture(cleanup):
+    raise SystemExit(offload.main())
 '''
         return subprocess.run(
             [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",

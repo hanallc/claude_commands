@@ -7,9 +7,11 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 import fcntl
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -25,12 +27,46 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
     from scripts.buildlog.transfer_bytes import TransferBytes
 
 
 CREATION_LEASE_FD = "MAC_GATE_CREATION_LEASE_FD"
+REMOTE_CREATION_LEASE_FD = 'MAC_GATE_REMOTE_CREATION_LEASE_FD'
 QUEUE_RUNS = ".local/state/mac-queue/runs"
+GATE_JOB_LABEL = "gate tests"
+
+
+class RemotePreparationAction(Enum):
+    PREPARE = "prepare"
+    FINISH = "finish"
+    SETTLE = "settle"
+
+
+def remote_creation_command(path: Path, command: str, action: RemotePreparationAction) -> str:
+    """Keep the terminal record at the same path as the creation lock."""
+    program = """import fcntl, os, pathlib, sys
+path = pathlib.Path.home() / sys.argv[1]
+path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit('Mac gate preparation or cleanup is active')
+if sys.argv[2] == 'settle':
+    os.pwrite(descriptor, b'closed', 0)
+    os.fsync(descriptor)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+elif sys.argv[2] == 'prepare' and os.fstat(descriptor).st_size:
+    sys.exit('Mac gate preparation has settled')
+os.environ[sys.argv[4]] = str(descriptor)
+os.set_inheritable(descriptor, True)
+os.execl('/bin/sh', 'sh', '-c', sys.argv[3])
+"""
+    return shlex.join(["python3", "-c", program, str(path), action.value, command, REMOTE_CREATION_LEASE_FD])
 
 
 def gate_requests_directory() -> Path:
@@ -54,8 +90,7 @@ class AssignedGatePaths:
         return self.request_root / self.request_root.name
 
 
-def assigned_gate_paths(assignment: PlacementAssignment | str) -> AssignedGatePaths:
-    attempt = assignment if isinstance(assignment, str) else assignment.attempt
+def assigned_gate_paths(attempt: str) -> AssignedGatePaths:
     if not attempt.isascii() or not attempt.isalnum():
         raise ValueError("the Mac attempt identifier is invalid")
     runs = queue_runs_directory()
@@ -189,7 +224,7 @@ def capture_cleanup_command(command: list[str], budget: float, *,
         own_group = supervise_session or CREATION_LEASE_FD not in os.environ
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, start_new_session=own_group, cwd=cwd, pass_fds=pass_fds)
+                                   text=True, errors="replace", start_new_session=own_group, cwd=cwd, pass_fds=pass_fds)
         output, errors = collect_command_output(process, deadline, owns_group=own_group, input_text=input_text,
                                                 owns_session=supervise_session)
         assert process.returncode is not None

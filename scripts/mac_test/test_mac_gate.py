@@ -29,7 +29,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import conf, process_group, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -37,7 +37,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state, eligibility, mac_gate, mac_queue_run, mac_test, offload
 from scripts.mac_test.test_mac_queue_run import queue_fixture
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.gate_routes import MacGateCompleted, MacGatePrelaunchRefused, MacGateUnresolved
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
@@ -217,7 +217,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.mac_test import mac_gate
-from scripts.production.merge_gate import ALL_MODULES, SuiteMode
+from scripts.production.gate_routes import ALL_MODULES, SuiteMode
 from scripts.production import gate_routes
 
 repo, callback, fd = sys.argv[1:]
@@ -226,7 +226,7 @@ if 'MAC_GATE_FORCE_QUEUE' in os.environ:
     os.environ['MAC_GATE_QUEUE_ENTRY'] = mac_gate.QUEUE_COMMAND[1]
     mac_gate.QUEUE_COMMAND = (sys.executable, os.environ['MAC_GATE_FORCE_QUEUE'])
 cancellation = gate_routes.MacGateCancellation(int(fd)) if fd else mac_gate.USE_CALLER_PROCESS_LIFETIME
-print(mac_gate.run_remote(Path(repo), mode=SuiteMode.MERGE_GATE, full=True,
+print(mac_gate.run_remote(Path(repo), mode=SuiteMode.GATE, full=True,
                            module_time_limit_s=30, selected=ALL_MODULES, cancellation=cancellation), flush=True)
 """
 
@@ -319,6 +319,9 @@ class MacGateTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = config_environment(self.root / 'settings')
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {**settings, 'GATE_STATE_DIR': str(self.root / 'gate-state')})))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         _ = gate.checked_git(self.repo, 'init', '-q')
@@ -351,7 +354,7 @@ class MacGateTests(unittest.TestCase):
 
     def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
         with self.queue_case(case, job) as selection:
-            outcome = mac_gate.run_remote(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            outcome = mac_gate.run_remote(self.repo, mode=gate.SuiteMode.GATE, full=False,
                 module_time_limit_s=30, selected=selection, cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME)
             return outcome if isinstance(outcome, str) else outcome.run
 
@@ -370,7 +373,7 @@ class MacGateTests(unittest.TestCase):
                       'MAC_GATE_REFUSAL_FILE': mac_gate.ASSIGNED_REFUSAL,
                       'MAC_GATE_COMPLETION_FILE': mac_gate.ASSIGNED_COMPLETION,
                   })):
-                result = mac_gate.run_assigned(self.repo, assignment=assignment, mode=gate.SuiteMode.MERGE_GATE,
+                result = mac_gate.run_assigned(self.repo, assignment=assignment, mode=gate.SuiteMode.GATE,
                                                full=False, module_time_limit_s=30, selected=selection)
                 if case == 'completed':
                     assert isinstance(result, MacGateCompleted), result
@@ -617,7 +620,7 @@ signal.pause()
         self.add_module(module_job('added'))
         _ = commit_repository(self.repo, 'added module')
         folder = self.root / 'mac-gate-bundle'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         argv_file = self.root / 'argv.json'
         real_git = shutil.which('git')
@@ -763,7 +766,7 @@ signal.pause()
                 folder = self.root / f'mac-gate-{kind}'
                 if kind == 'dirty':
                     _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# dirty fixture\n')
-                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+                request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
                 cloud_gate.save(folder / 'request.json', request)
                 cloud_gate.save(folder / 'checkout.json', {'path': str(clone)})
                 _ = (self.repo / 'scripts/fixture/test_one.py').write_text('# fixture\n')
@@ -784,7 +787,7 @@ signal.pause()
 
     def test_remote_commands_set_pythonpath_in_zsh(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         clone = self.exercise_bundle(self.repo, folder, folder / 'argv.json', request, expected=False)
 
@@ -832,7 +835,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         journal = directory / 'run.json'
         # The bundle ref plan belongs beside the other files for this callback.
         folder = directory / 'mac-gate-reffailure'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         cloud_gate.save(journal, {
             'host': 'fixture-mac', 'lifecycle_script': str(Path(mac_gate.__file__)), 'arguments': [str(folder), '1'],
@@ -916,7 +919,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def test_late_remote_preparation_cannot_create_a_cleaned_request(self) -> None:
         folder = self.root / 'mac-gate-delayed'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         cloud_gate.save(folder / 'request.json', request)
         _ = (folder / 'local-repo').write_text(str(self.repo))
         argv = folder / 'argv.json'
@@ -1013,7 +1016,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def test_checkout_probe_rejects_a_nonzero_remote_status(self) -> None:
         folder = self.root / 'mac-gate-fixture'
-        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.MERGE_GATE, 30)
+        request = cloud_gate.prepare_request(self.repo, folder, gate.SuiteMode.GATE, 30)
         error = subprocess.CalledProcessError(3, ['ssh'], output=f"{request['commit']}\npresent\npresent\n")
         with (mock.patch.object(subprocess, 'check_output', side_effect=error),
               self.assertRaises(subprocess.CalledProcessError)):
@@ -1382,6 +1385,14 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         self.assertEqual(empty, MacGateExclusions(()))
         _ = path.write_text('scripts/fixture/test_absent.py\nscripts/fixture/test_one.py\n')
         self.assertEqual(mac_gate.read_modules(self.repo), MacGateExclusions(('scripts/fixture/test_one.py',)))
+
+    def test_listed_production_modules_exist(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        entries = (checkout / mac_gate.MODULE_LIST).read_text().splitlines()
+        missing = [name for line in entries
+                   if (name := line.partition('#')[0].strip()).startswith('scripts/production/')
+                   and not (checkout / name).is_file()]
+        self.assertEqual(missing, [])
 
     def test_list_writer_excludes_failures_and_count_mismatches(self) -> None:
         mac = (module_job('one'), module_job('tests', tests=11), module_job('skips', skips=1),

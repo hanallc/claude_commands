@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
+from scripts.aws_target import cloud_gate
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
@@ -35,25 +36,48 @@ from scripts.mac_test import eligibility, offload
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
+from scripts.lib import build_folders, build_slots, build_steps, conf, copy_record, nix_env
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
-from scripts.production import bump_gate, checkpoint_gate, staff, waiting
+from scripts.production import bump_gate, checkpoint_gate, gate as suite_gate, staff, targeted_test, waiting
+from scripts.production.gate_routes import SuiteMode
 from scripts.production.production_doc import Production
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-GATE_COMMAND = """from pathlib import Path
+MODULE_GATE_OPTIONS = ("--tests-only", "--module", "fixture")
+LOCAL_TARGETS = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+GATE_COMMAND = """from contextlib import contextmanager, redirect_stdout
+from pathlib import Path
 import json, os, sys, time
 sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
-from scripts.build_queue.queue_place import queue_place
+from scripts.aws_target.cloud_gate import working_tree
+from scripts.build_queue import admission_protocol as wire, admission_records, first_step
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.production import gate
+from scripts.production.gate_routes import SuiteMode
+from scripts.build_queue.queue_place import gate_placement_sidecar, placed_program, queue_place
+
+@contextmanager
+def gate_place():
+    source = Path.cwd()
+    config = admission_records.read_memory_config()
+    with gate_placement_sidecar() as sidecar:
+        tree, _ = working_tree(source)
+        request = gate.gate_placement_request(source, tree, SuiteMode.GATE.value, (), sidecar, config, StepJob('test-all'))
+        with redirect_stdout(sys.stderr):
+            grant = first_step.placement_grant(request)
+        assert isinstance(grant, wire.LocalPlacementGranted), grant
+        with placed_program(grant, sidecar, config):
+            yield
 
 for phase in range(2):
-    with queue_place('merge-gate', Path.cwd()):
+    place = queue_place(SuiteMode.GATE.value, Path.cwd()) if '--module' in sys.argv else gate_place()
+    with place:
         print(json.dumps({'phase': phase, 'cwd': str(Path.cwd()), 'run': os.environ.get('BUILDLOG_RUN', ''), 'at': time.monotonic()}), flush=True)
         if not sys.stdin.buffer.read(1):
             break
@@ -119,7 +143,7 @@ class SlotOrderTests(unittest.TestCase):
         super().setUpClass()
         seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
         cls.repository_seed = ImmutableGitSeed.create(seed, "main", "Slot Tests", "slots@example.invalid",
-            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
+            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "gate.py": GATE_COMMAND,
              ".gitignore": "target/\n"})
 
     @override
@@ -299,7 +323,7 @@ class SlotOrderTests(unittest.TestCase):
         production = Production(self.root / "production.md", owner.name, "main", self.source,
                                 self.root / "production.log", ZoneInfo("UTC"), owner)
         unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
-        command = shlex.join((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        command = shlex.join((sys.executable, str(self.source / "gate.py"), *MODULE_GATE_OPTIONS))
         execute = mock.Mock(side_effect=AssertionError("the scratch command started before admission"))
         with (mock.patch.object(waiting, "named_unit", return_value=unit),
               mock.patch.object(waiting, "subprocess", SimpleNamespace(run=execute, STDOUT=subprocess.STDOUT)),
@@ -310,7 +334,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
-        command = [sys.executable, str(self.source / "merge_gate.py"), "--tests-only"]
+        command = [sys.executable, str(self.source / "gate.py"), *MODULE_GATE_OPTIONS]
         record: checkpoint_gate.BumpGateRecord = {
             "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
             "owner_id": self.owner, "unit_id": self.owner, "name": "fixture", "merge_branch": "main",
@@ -327,13 +351,12 @@ class SlotOrderTests(unittest.TestCase):
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             _ = bump_gate.run_gate(path)
         request = next(request for request in self.requests if isinstance(request, wire.AdmitRequest))
-        self.assertEqual(request.identity.job, StepJob("test-all"))
+        self.assertEqual(request.identity.job, StepJob("test-modules", modules=1))
 
     def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
-        _ = (Path(environment["CONF_DIR"]) / "build_targets.conf").write_text(
-            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        _ = (Path(environment["CONF_DIR"]) / "build_targets.conf").write_text(LOCAL_TARGETS)
         tip = copies.commit_at(self.source, "HEAD")
         manifest = self.source / "Cargo.toml"
         _ = manifest.write_text(manifest.read_text().replace('name = "sample"', 'name = "renamed"'))
@@ -369,7 +392,7 @@ class SlotOrderTests(unittest.TestCase):
                         os.environ["UNIT_DETACHED_RUN"] = previous
                     else:
                         _ = os.environ.pop("UNIT_DETACHED_RUN", None)
-                    command = (sys.executable, str(self.source / "merge_gate.py"), "--tests-only")
+                    command = (sys.executable, str(self.source / "gate.py"), "--tests-only")
                     with self.assertRaisesRegex(ValueError, "private command failed") if fails else nullcontext():
                         with first_step.admitted_run(command, self.source) as admitted:
                             self.assertEqual(os.environ["UNIT_DETACHED_RUN"], "1")
@@ -382,6 +405,31 @@ class SlotOrderTests(unittest.TestCase):
                         self.assertEqual(os.environ["UNIT_DETACHED_RUN"], previous)
                     else:
                         self.assertNotIn("UNIT_DETACHED_RUN", os.environ)
+
+    def test_gate_commands_preserve_the_mode_when_placement_is_deferred(self) -> None:
+        gate = str(self.source / "gate.py")
+        for command, expected in (
+            ((sys.executable, gate, "--affected", "--full"), SuiteMode.TARGETED),
+            ((sys.executable, str(self.source / "targeted_test.py")), SuiteMode.TARGETED),
+            ((sys.executable, "-X", "--affected", gate, "--tests-only"), SuiteMode.GATE),
+        ):
+            with self.subTest(command=command):
+                offset = len(self.requests)
+                with first_step.admitted_run(command, self.source) as admitted:
+                    self.assertIsInstance(admitted.grant, first_step.GatePlacementAfterCopy)
+                    admitted.handoff(self.source)
+                    self.assertEqual(os.environ[first_step.GATE_PLACEMENT_EPISODE], admitted.queue_position.episode)
+                    self.assertEqual(float(os.environ[first_step.GATE_PLACEMENT_SINCE]), admitted.queue_position.since)
+                    self.assertFalse(any(isinstance(request, (wire.AdmitRequest, wire.PlacementRequest))
+                                         for request in self.requests[offset:]))
+                    program = build_steps.parse_command_program(command)
+                    assert not isinstance(program, build_steps.OtherCommand)
+                    script, arguments = program
+                    entry = targeted_test.main if script == "targeted_test.py" else suite_gate.main
+                    with (mock.patch.object(suite_gate, "test_run_folder", side_effect=nullcontext),
+                          mock.patch.object(suite_gate, "run_tests_only", return_value=0) as run):
+                        self.assertEqual(entry(arguments), 0)
+                    run.assert_called_once_with(mock.ANY, expected)
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
@@ -435,7 +483,7 @@ placement_once
 
     def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
         self.queue.hold_starts()
-        process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+        process = self.start((sys.executable, str(self.source / "gate.py"), *MODULE_GATE_OPTIONS),
                              separate_command=False)
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the copy run did not enter the memory queue")
         with self.queue.loop_turn():
@@ -444,7 +492,7 @@ placement_once
             reply, = self.queue.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             waiting, = reply.reading.view.waiting
-            self.assertEqual(waiting.job, StepJob("test-all"))
+            self.assertEqual(waiting.job, StepJob("test-modules", modules=1))
         self.assertFalse(self.slot_root.exists())
         self.assertEqual(self.report()["groups"], [])
         process.kill()
@@ -478,7 +526,7 @@ placement_once
             + f'exec {shlex.quote(binary)} "$@"\n')
         wrapper.chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": str(scripts) + os.pathsep + os.environ["PATH"]}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+            process = self.start((sys.executable, str(self.source / "gate.py"), *MODULE_GATE_OPTIONS),
                 "--apply-uncommitted", str(self.source))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         self.assertFalse(self.slot_root.exists())
@@ -506,7 +554,7 @@ placement_once
         self.assertEqual((tree / "tracked.txt").read_text(), "applied after admission\n")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
         memory_requests = [request for request in self.requests if isinstance(request, wire.AdmitRequest)
-            and request.profile.step == "merge-gate"]
+            and request.profile.step == "gate"]
         self.assertGreaterEqual(len(memory_requests), 2)
         self.assertEqual({request.run for request in memory_requests},
             {wire.RunIdentity(process.pid, first["run"].split(":", 1)[1])})
@@ -528,13 +576,25 @@ placement_once
 
     def test_leaving_before_admission_returns_without_a_slot(self) -> None:
         leave = self.root / "leave"
-        _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
         self.queue.hold_starts()
         with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
-        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the caller did not enter the memory queue")
+            process = self.start((sys.executable, str(self.source / "gate.py"), *MODULE_GATE_OPTIONS))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the queue did not report a wait")
+        # The client prints this notice after it receives the wait reply.
+        assert process.stderr is not None
+        descriptor = process.stderr.fileno()
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        notice = bytearray()
+        while b"waiting for memory since " not in notice:
+            remaining = deadline - time.monotonic()
+            self.assertTrue(remaining > 0 and select.select([descriptor], [], [], remaining)[0],
+                notice.decode(errors="replace"))
+            chunk = os.read(descriptor, 4096)
+            self.assertTrue(chunk, notice.decode(errors="replace"))
+            notice.extend(chunk)
         leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertFalse(self.slot_root.exists())
         self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
@@ -542,61 +602,68 @@ placement_once
             self.assertFalse(self.queue.server.waiters)
             self.assertFalse(self.queue.caller_reservations())
 
-    def test_a_busy_copy_keeps_the_admitted_episode_and_since(self) -> None:
+    def test_a_gate_prepares_and_holds_its_copy_before_placement(self) -> None:
+        _ = self.enterContext(mock.patch.object(self.queue.server, "host_probe", side_effect=self.local_provider))
         for since_age in (0.0, 120.0):
             with self.subTest(since_age=since_age):
-                self.busy_copy_race(since_age)
+                self.gate_copy_race(since_age)
 
-    def busy_copy_race(self, since_age: float) -> None:
+    def gate_copy_race(self, since_age: float) -> None:
         self.queue.allow_next_start()
+        self.waiting.clear()
         request_offset = len(self.requests)
-        granted, deliver = threading.Event(), threading.Event()
-        self.addCleanup(deliver.set)
-        observe_reply = self.queue.server.reply_filter
-
-        def pause_grant(reply: wire.Reply) -> wire.Reply:
-            if isinstance(reply, wire.Admitted) and not granted.is_set():
-                granted.set()
-                if not deliver.wait(TEST_HANG_GUARD_SECS):
-                    raise AssertionError("the test did not release the admission reply")
-            return observe_reply(reply)
-
-        with mock.patch.object(self.queue.server, "reply_filter", side_effect=pause_grant):
-            started_at = time.time()
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"), since_age=since_age)
-            self.assertTrue(granted.wait(TEST_HANG_GUARD_SECS))
+        _ = (self.queue.root / "build_targets.conf").write_text(LOCAL_TARGETS)
+        _ = (self.source / "tracked.txt").write_text("prepared gate input\n")
+        started_at = time.time()
+        self.queue.hold_starts()
+        try:
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
+                "--apply-uncommitted", str(self.source), since_age=since_age)
+            self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+            with self.queue.loop_turn():
+                request = next(request for request in self.requests[request_offset:]
+                               if isinstance(request, wire.PlacementRequest))
+                self.assertNotIn(request.episode, self.queue.caller_reservations())
+            checkout = self.slot_root / "origin/slot-order/1"
+            self.assertEqual(Path(request.constraints.repository), checkout)
+            self.assertEqual((checkout / "tracked.txt").read_text(), "prepared gate input\n")
+            tree, _ = cloud_gate.working_tree(checkout)
+            self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(tree))
+            self.assertEqual(build_folders.build_folder_state(checkout), "held")
             with build_slots.take_copy(self.source, "HEAD", showrunner="builds", unit="slot-order",
                     work="race", purpose="competing run") as peer:
-                self.assertEqual(peer.path, self.slot_root / "origin/slot-order/1")
-                deliver.set()
+                self.assertEqual(peer.path, checkout.with_name("2"))
+                write_pressure_reading(self.queue.root / "pressure")
+                self.queue.server.wake_loop()
                 started = self.next_step(process)
-                copy = Path(started["cwd"])
-                self.assertEqual(copy, self.slot_root / "origin/slot-order/2")
+                self.assertEqual(Path(started["cwd"]), checkout)
+                self.assertEqual(request.run, wire.RunIdentity(process.pid, started["run"].split(":", 1)[1]))
                 self.assertEqual(build_folders.build_folder_state(peer.path), "held")
-                self.assertEqual(build_folders.build_folder_state(copy), "held")
+                self.assertEqual(build_folders.build_folder_state(checkout), "held")
                 self.finish(process)
-
+            self.assertEqual(build_folders.build_folder_state(checkout), "free")
             requests = self.requests[request_offset:]
-            memory = [request for request in requests if isinstance(request, wire.AdmitRequest)]
-            self.assertGreaterEqual(len(memory), 2)
-            first = memory[0]
-            self.assertEqual(first.owner.pid, process.pid)
-            self.assertEqual({request.run for request in memory}, {first.run})
-            preparation = [request for request in memory if request.episode == first.episode]
-            self.assertEqual({request.since for request in preparation}, {first.since})
-            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in requests))
-            if since_age:
-                self.assertLess(first.since, started_at - since_age / 2)
+            self.assertFalse(any(isinstance(item, (wire.AdmitRequest, wire.RepositorySlotRequest))
+                                 for item in requests))
+            placement_requests = [item for item in requests if isinstance(item, wire.PlacementRequest)]
+            self.assertGreaterEqual(len(placement_requests), 2)
+            self.assertEqual({(item.episode, item.since) for item in placement_requests},
+                             {(request.episode, request.since)})
+            self.assertGreaterEqual(request.since, started_at - since_age)
+            self.assertLessEqual(request.since, time.time() - since_age)
+        finally:
+            write_pressure_reading(self.queue.root / "pressure")
+            self.queue.server.wake_loop()
 
     def test_verify_waits_for_memory_while_the_gate_keeps_its_copy(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         started, release = self.pause_cargo_check(tools)
-        gate = self.root / "merge_gate.py"
+        gate = self.root / "gate.py"
         _ = gate.write_text(GATE_COMMAND)
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
         with locked_environment({**os.environ, **environment}, self.queue.loop_access):
-            gate_process = self.start((sys.executable, str(gate), "--tests-only"))
+            gate_process = self.start((sys.executable, str(gate), *MODULE_GATE_OPTIONS))
             gate_copy = Path(self.next_step(gate_process)["cwd"])
             self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
             self.queue.hold_starts()
@@ -689,13 +756,14 @@ placement_once
             "LINT_SKIP_SWEEP": "1"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
-        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            if key.destination.provider == "local":
-                return placement.FreshHostEvidence(key, self.queue.clock.now(), "", placement.AllowedHost())
-            return placement.HostEvidenceUnavailable(key, self.queue.clock.now(), "The fixture has no remote provider.")
-        _ = self.enterContext(mock.patch.object(self.queue.server, "host_probe", side_effect=provider))
+        _ = self.enterContext(mock.patch.object(self.queue.server, "host_probe", side_effect=self.local_provider))
         self.source = tools.root
         return environment
+
+    def local_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        if key.destination.provider == "local":
+            return placement.FreshHostEvidence(key, self.queue.clock.now(), "", placement.AllowedHost())
+        return placement.HostEvidenceUnavailable(key, self.queue.clock.now(), "The fixture has no remote provider.")
 
     def test_admission_source_keeps_repository_identity_and_the_real_slot_pool(self) -> None:
         source = self.source

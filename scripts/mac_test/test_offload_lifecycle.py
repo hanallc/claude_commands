@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 from collections.abc import Sequence
 from scripts.mac_test import offload, mac_test, claim_state
-from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.mac_test.offload_test_support import OffloadCommandFixture, patch_cleanup_capture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
@@ -237,7 +237,7 @@ class PendingDispatchTests(unittest.TestCase):
                             real_run = subprocess.run
                             transport_failed = False
 
-                            def release_transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                            def release_transport(arguments: Sequence[str], budget: float, **options: object) -> subprocess.CompletedProcess[str]:
                                 nonlocal transport_failed
                                 del options
                                 self.assertEqual(arguments[0], "ssh")
@@ -246,9 +246,9 @@ class PendingDispatchTests(unittest.TestCase):
                                     transport_failed = True
                                     return subprocess.CompletedProcess(arguments, 255, "", "private SSH failure")
                                 return real_run(["bash", "-c", arguments[-1]], cwd=root, env=environment,
-                                    capture_output=True, text=True, check=False, timeout=5)
+                                    capture_output=True, text=True, check=False, timeout=min(budget, 5))
 
-                            with mock.patch.object(subprocess, "run", side_effect=release_transport):
+                            with patch_cleanup_capture(release_transport):
                                 self.assertEqual(mac_test.command_release(args, paths), 12)
                                 self.assertEqual(paths.run.read_bytes(), before)
                                 self.assertTrue(pending.exists())

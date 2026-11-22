@@ -35,7 +35,6 @@ from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_targets import target_config
-from scripts.buildlog import store
 from scripts.direct import step_selection
 if TYPE_CHECKING:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
@@ -527,6 +526,8 @@ class LocalGateRunFiles:
 
     @staticmethod
     def root() -> Path:
+        from scripts.buildlog import store
+
         return store.root() / "local-gate-runs"
 
     @classmethod

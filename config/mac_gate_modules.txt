@@ -1,5 +1,5 @@
 # List test modules that must run on natedev because the Mac cannot run them.
-# Each module skips tests on the Mac: Linux-only calls, or a tool the Mac lacks.
+# The first block lists modules that skip tests on the Mac because they need Linux or a tool the Mac lacks.
 scripts/agents/test_codex_test_support.py
 scripts/agents/test_detached_runs.py
 scripts/agents/test_models_conf_publish.py
@@ -191,7 +191,6 @@ scripts/herdr/test_conversation_reader.py
 scripts/hooks/test_brp_launch_gate.py
 scripts/lib/test_build_folders.py
 scripts/lib/test_build_slots.py
-scripts/lib/test_cargo_seed.py
 scripts/lib/test_py_root.py
 scripts/lib/test_session_move.py
 scripts/lib/test_zone.py
@@ -233,21 +232,18 @@ scripts/production/test_merge_checkpoint_receipts.py
 scripts/production/test_merge_checkpoint_rerun.py
 scripts/production/test_merge_checkpoint_tree_cancel.py
 scripts/production/test_merge_checkpoint_validation.py
-scripts/production/test_merge_gate_holds.py
-scripts/production/test_merge_gate_ledger.py
-scripts/production/test_merge_gate_promotion.py
-scripts/production/test_merge_gate.py
-scripts/production/test_merge_gate_suites_admission.py
-scripts/production/test_merge_gate_suites_mac.py
-scripts/production/test_merge_gate_suites.py
-scripts/production/test_merge_gate_suites_reruns.py
-scripts/production/test_merge_gate_suites_resources.py
-scripts/production/test_merge_gate_suites_signals.py
-scripts/production/test_merge_gate_suites_tripwires.py
-scripts/production/test_merge_gate_suites_types.py
-scripts/production/test_merge_gate_test_times.py
+scripts/production/test_gate_holds.py
+scripts/production/test_gate_ledger.py
+scripts/production/test_gate_suites_admission.py
+scripts/production/test_gate_suites_mac.py
+scripts/production/test_gate_suites_reruns.py
+scripts/production/test_gate_suites_resources.py
+scripts/production/test_gate_suites_signals.py
+scripts/production/test_gate_suites_tripwires.py
+scripts/production/test_gate_suites_types.py
+scripts/production/test_gate_targeted.py
+scripts/production/test_gate_test_times.py
 scripts/production/test_stall_watch.py
-scripts/production/test_targeted_test.py
 scripts/review_links/test_accounts_page.py
 scripts/review_links/test_change_page.py
 scripts/review_links/test_console.py
@@ -262,3 +258,29 @@ scripts/review_links/test_setting_controls.py
 scripts/test_times/test_module_cost.py
 scripts/test_times/test_module_run.py
 scripts/worktree/test_worktrees.py
+
+# Known Mac failures (Mac run 6). Queue item 48 removes each module it proves safe on the Mac.
+scripts/accounts/test_accounts.py
+scripts/agents/test_stop_resume.py
+scripts/aws_target/test_gate_box.py
+scripts/buildlog/test_report.py
+scripts/build_queue/test_memory_hover.py
+scripts/herdr/test_herdr.py
+scripts/herdr/test_turn_end.py
+scripts/herdr/test_worker_panes.py
+scripts/lib/test_models_registry.py
+scripts/lib/test_tune.py
+scripts/mac_test/test_mac_gate.py
+scripts/mac_test/test_mac_test.py
+scripts/message/test_roster.py
+scripts/production/test_add_unit.py
+scripts/production/test_gate_promotion.py
+scripts/production/test_gate.py
+scripts/production/test_gate_suites.py
+scripts/production/test_mac_run.py
+scripts/production/test_tidy_wrapped.py
+scripts/production/test_unit_lookup.py
+scripts/production/test_worker.py
+scripts/screen_record/test_screen_record.py
+scripts/style/test_bulk_run.py
+scripts/style/test_selection_capture.py

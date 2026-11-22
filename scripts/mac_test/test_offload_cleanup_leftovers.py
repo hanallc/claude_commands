@@ -13,7 +13,9 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test import eligibility, offload
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_support import (
+    HANA_COMMAND_PATTERN, SelectorEvent, patch_cleanup_capture, write_mac_target_registry,
+)
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -81,15 +83,16 @@ class OffloadCommandTests(SeededCleanupFixture):
         connection = eligibility.SshConnectionSettings("current-host", 7, 19)
         repository = eligibility.KnownRepository("hana")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
-        with mock.patch.object(subprocess, "run", return_value=response) as run:
+        with patch_cleanup_capture(lambda _command, _budget: response) as capture:
             result = offload.check_leftovers(connection, "retained-host", repository)
         self.assertEqual(result, offload.LeftoversEnded())
-        arguments = cast(list[str], run.call_args.args[0])
+        self.assertEqual(capture.call_count, 1)
+        arguments = cast(list[str], capture.call_args.args[0])
         self.assertEqual(arguments[-2], "retained-host")
         self.assertNotIn("current-host", arguments)
         self.assertIn("ConnectTimeout=7", arguments)
         self.assertEqual(arguments[-1], offload.leftover_check_script(repository))
-        self.assertEqual(run.call_args.kwargs["timeout"], 19)
+        self.assertEqual(capture.call_args.args[1], 19)
 
     def test_connection_reader_ignores_execution_values_and_reads_changes_at_use(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))

@@ -12,13 +12,13 @@ from uuid import uuid4
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records
-from scripts.build_queue import execution_identity, placement, queue_place
+from scripts.build_queue import queue_place
 from scripts.buildlog import store
 from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import VerifyCommand, command_job, command_program, verify_command
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
+from scripts.lib.build_steps import OtherCommand, VerifyCommand, command_job, parse_command_program, verify_command
 
 
 class FirstStepRefused(RuntimeError):
@@ -155,39 +155,12 @@ def placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrante
         raise
 
 
-def gate_placement_request(source: Path, tree: str, program: str, type_dirs: Sequence[str],
-                           sidecar: Path, config: records.MemoryConfig, job: StepJob | GateJobNotRecorded
-                           ) -> wire.PlacementRequest:
-    """Submit one request for the final test tree."""
-    from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
-    from scripts.build_targets.build_targets import fixed_placement_constraints
-
-    pid = os.getpid()
-    start = records.process_start_time(pid)
-    if start is None:
-        raise FirstStepRefused('the gate has no live process identity')
-    episode = os.environ.pop(GATE_PLACEMENT_EPISODE, '') or uuid4().hex
-    since = float(os.environ.pop(GATE_PLACEMENT_SINCE, '') or time.time())
-    profile = records.ProgramProfile(program, str(Path.home() / '.claude'), str(source),
-                                     queue_place.program_sizing(config, program))
-    arguments = [program, '--type-dirs', *type_dirs] if type_dirs else [program]
-    local = client.step_request(arguments, str(source), wire.Owner(pid, start), since, str(sidecar), episode, profile)
-    session = owning_session()
-    if isinstance(session, NoOwningSession) and local.identity.session_id:
-        session = OwningSession(local.identity.session_id)
-    constraints = fixed_placement_constraints(source, '', 'run', tuple(arguments), session,
-                                              execution_identity.SourceKeyKnown(tree))
-    constraints = replace(constraints, candidates=tuple(candidate for candidate in constraints.candidates
-                          if candidate.destination.provider == 'local' or
-                          (candidate.destination.provider == 'mac' and candidate.destination.target == 'mac')))
-    return wire.PlacementRequest(episode, placement.SubmittingOwner(store.host_name(), pid, start),
-        since, local.profile, constraints, identity=replace(local.identity, job=job), run=local.run,
-        local=local_admission(local), prerequisite=placement.TokenNotRequired())
-
-
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    name = 'targeted-test' if command_program(command) == 'targeted_test.py' else 'merge-gate'
+    program = parse_command_program(command)
+    script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
+    affected = script == 'targeted_test.py' or '--affected' in script_arguments
+    name = 'test-affected' if affected else 'gate'
     resolved_job = command_job(command)
     job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
     config = records.read_memory_config()
@@ -197,10 +170,10 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
         raise FirstStepRefused(str(error)) from error
     profile = records.ProgramProfile(name, str(Path.home() / '.claude'), str(source), sizing)
     arguments = [name]
-    for index, word in enumerate(command):
+    for index, word in enumerate(script_arguments):
         if word in ('--type-dirs', '--type-dir'):
             arguments.append('--type-dirs')
-            for directory in command[index + 1:]:
+            for directory in script_arguments[index + 1:]:
                 if directory.startswith('-'):
                     break
                 arguments.append(directory)
