@@ -238,7 +238,8 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
             + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
+        const desktopWidth = gateMode ? 1400 : 1600;
+        await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
@@ -281,16 +282,25 @@ try {
           assert.deepEqual(result.rows, [{owner:'queue · test · targeted_test.py', color:'role.unit-director',
             mark:'Outside the queue', cpu:'136.0 s CPU'}]);
           const output = join(folder, 'cpumark-dark.png');
+          const pageOutput = join(folder, 'cpumark-page-dark.png');
           if (outsideQueueProof) {
             const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
             await writeFile(output, Buffer.from(shot.data, 'base64'));
+            await evaluate(`(() => {
+              document.querySelector('.legend-box').open = false;
+              scrollTo(0, 0);
+            })()`);
+            const {cssContentSize: {height}} = await call('Page.getLayoutMetrics');
+            const pageShot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,
+              clip:{x:0,y:0,width:desktopWidth,height,scale:1}});
+            await writeFile(pageOutput, Buffer.from(pageShot.data, 'base64'));
           }
           assert.equal(await evaluate(`(() => {
             renderReading({...proofData, outside_queue:[]});
             return document.querySelector('#outside-queue').hidden;
           })()`), true);
           if (outsideQueueProof) {
-            console.log(JSON.stringify({pass:true, views:1, output}));
+            console.log(JSON.stringify({pass:true, views:2, output, pageOutput}));
             break browserProof;
           }
         }
