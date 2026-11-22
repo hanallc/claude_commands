@@ -507,6 +507,7 @@ fi
         self.assert_guest_clean('probe')
 
     def test_route_records_backoff_for_a_guest_outside_the_placement_lists(self) -> None:
+        _ = write_config_fixture(self.registry, 'targets=hana-aws,mac,natedev\npinned_targets=hana-gpu\n')
         registry = conf.read(self.registry)
         for key in ('targets', 'pinned_targets'):
             self.assertNotIn(mac_linux.TARGET, registry.text(key).split(','))

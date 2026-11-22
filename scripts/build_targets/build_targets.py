@@ -291,12 +291,11 @@ def format_state(name: str, state: TargetState,
 
 def probe_target(target: SshTarget) -> TargetState:
     from scripts.build_targets.targets import Unreachable
-    from scripts.mac_test import eligibility, offload
+    from scripts.mac_test import offload
 
-    from scripts.aws_target import hana_placement
-    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
+    config = ssh_target_config(target)
+    if isinstance(config, ExcludedTarget):
         return target_state(target)
-    config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
         return Unreachable(result.reason)
@@ -754,7 +753,10 @@ def command_probe_backoff(name: str, *, probe: bool) -> int:
         return 0
     if not probe:
         return 1
-    config = eligibility.read_config(target_config.configured_ssh_target(name).settings)
+    config = ssh_target_config(target_config.configured_ssh_target(name))
+    # A target without an offload probe keeps its backoff until its own route clears it.
+    if isinstance(config, ExcludedTarget):
+        return 1
     if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
         return 1
     offload.record_reachable(name)
@@ -922,6 +924,8 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     from scripts.mac_test import eligibility
     from scripts.aws_target import hana_placement
 
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        return ExcludedTarget(target, 'The Mac Linux guest requires an exact queue assignment')
     if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 

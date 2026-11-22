@@ -101,6 +101,24 @@ class TargetSyncTests(unittest.TestCase):
             f"fake-mac:{sync.REMOTE_ROOT}", f"fake-spare:{sync.REMOTE_ROOT}",
         })
 
+    def test_mac_linux_guest_is_not_a_sync_peer(self) -> None:
+        _ = (self.registry.parent / "mac_linux.conf").write_text("ssh.hops=mac linux-guest\nguest.user=gate-runner\n")
+        _ = self.registry.write_text(self.registry.read_text().replace(
+            "targets=mac,spare,natedev\n",
+            "targets=mac,spare,mac-linux,natedev\n"
+            + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n"))
+
+        self.assertEqual([exchange.peer.target for exchange in sync.peer_exchanges()], ["mac", "spare"])
+        self.assertEqual(self.exchange(), 0)
+        self.assertEqual(self.peers(), ["fake-mac", "fake-spare"])
+
+    def test_a_peer_without_a_usable_host_still_raises(self) -> None:
+        for host in ("", "-oProxyCommand=x", "two words"):
+            with self.subTest(host=host):
+                _ = (self.registry.parent / "spare.conf").write_text(f"host={host}\nci_repo=\n")
+                with self.assertRaisesRegex(ValueError, "invalid sync host for spare"):
+                    _ = sync.configured_peers()
+
     def test_finished_target_exchanges_only_its_host_with_configured_timeouts(self) -> None:
         _ = (self.registry.parent / "spare.conf").write_text("host=spare-build\nci_repo=\n")
         with redirect_stdout(io.StringIO()):

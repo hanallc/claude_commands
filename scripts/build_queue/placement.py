@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Literal
 
 from scripts.build_queue import execution_identity
-from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test.claim_state import ClaimScope
 
@@ -148,6 +147,8 @@ class UnknownAssignedSettingsGeneration:
 
 
 SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
+# The claim failure reason when the assigned Mac Linux guest took no run.
+MAC_LINUX_NO_ANSWER = "mac_linux_no_answer"
 
 
 @dataclass(frozen=True)

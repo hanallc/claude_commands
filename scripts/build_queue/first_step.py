@@ -15,6 +15,7 @@ from uuid import uuid4
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import execution_identity, placement, queue_place
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_targets import target_config
 from scripts.buildlog import store, treekey
 from scripts.direct.step_selection import Pinned
@@ -23,7 +24,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
-    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_NO_ANSWER, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
+    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
     VerifyCommand, command_job, command_program, parse_command_program, verify_command,
 )
 from scripts.mac_test import claim_state

@@ -57,7 +57,8 @@ from scripts.production import staff
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import MAC_LINUX_NO_ANSWER, gate_job_from_process
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -159,7 +160,7 @@ PLACEMENT_REASON_TEXT = {
     "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
     "mac_linux_backoff": "the guest is in retry backoff",
     "mac_linux_reading_required": "the queue needs a newer guest reading",
-    "mac_linux_no_answer": "the Mac does not answer",
+    MAC_LINUX_NO_ANSWER: "the Mac does not answer",
     "busy": "the target is busy",
     "off": "the target is off",
     "disk": "the target needs more disk space",
@@ -3416,8 +3417,8 @@ class AdmissionServer:
             return current
         if isinstance(self.last_usable_configuration, records.MemoryConfig):
             _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        reason = ("mac_linux_no_answer" if isinstance(current, placement.FreshHostEvidence)
-                  and current.eligibility == placement.TemporaryExclusion("mac_linux_no_answer")
+        reason = (MAC_LINUX_NO_ANSWER if isinstance(current, placement.FreshHostEvidence)
+                  and current.eligibility == placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
                   else "mac_linux_reading_required")
         return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion(reason))
 
@@ -3601,7 +3602,7 @@ class AdmissionServer:
         try:
             _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
         except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
-            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("mac_linux_no_answer"))
+            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
         return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
