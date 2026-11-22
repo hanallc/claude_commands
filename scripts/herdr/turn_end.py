@@ -1100,8 +1100,7 @@ def _result_proves_done(event: WorkerEvent, receipt: worker.DispatchReceipt) -> 
     """Recover the DONE after a confirmed result delivery in this transcript."""
     if not isinstance(receipt, worker.DispatchComplete) or not isinstance(receipt.result_delivery, worker.ResultDeliveryProof):
         return False
-    proof = receipt.result_delivery
-    return proof.assignment is worker.ResultAssignment.EARLIER or proof.delivery.reply.reply == event.reply
+    return receipt.result_delivery.latest_reply.reply == event.reply
 
 
 def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: dict[str, object],
@@ -1321,7 +1320,6 @@ def _handle_locked(event: WorkerEvent,
                 run, row, worker_input=worker_input, resume_parked=resume, input_lock=hold)
             if isinstance(replay, detached_runs.ConfirmedPaneResult):
                 if replay.ownership is detached_runs.ResultPassOwnership.CURRENT:
-                    worker.record_reaped_result(row, run, instance, stage, replay)
                     if parked:
                         _ = progress_history.record_worker_park(run, row.id, instance, delivery.completion_id,
                                                                launch=progress_history.ClearWorkerPark.MARKER)

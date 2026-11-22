@@ -21,7 +21,7 @@ from threading import Event, Timer, current_thread
 from types import SimpleNamespace
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
@@ -603,7 +603,7 @@ class WorkerCommandTests(unittest.TestCase):
         opened, path, run = self.start_orphaned_worker_run()
         _ = self.fixture.world.stop(opened.row, self.fixture.world)
         folder = path.parent
-        delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
+        delivery = send.Result("sent", "the holder received the result")
 
         def resume(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
@@ -843,7 +843,22 @@ class WorkerCommandTests(unittest.TestCase):
                 finally:
                     _ = case.doCleanups()
 
-    def check_restore_parked_account(self, cause: str) -> None:
+    def test_restore_checks_the_saved_result_receipt_on_a_second_invocation(self) -> None:
+        for evidence in (
+            "valid", "different session", "different pane", "different prefix", "different input",
+            "different run id", "different worker", "different folder", "conflicting pass",
+            "wrong record id", "wrong record owner", "wrong record folder",
+            "absent", "malformed", "previous pass", "previous stage", "idle", "closed",
+        ):
+            with self.subTest(evidence=evidence):
+                case = WorkerCommandTests("runTest")
+                case.setUp()
+                try:
+                    case.check_restore_parked_account("legacy result without the prompt", retry=evidence)
+                finally:
+                    _ = case.doCleanups()
+
+    def check_restore_parked_account(self, cause: str, *, retry: str = "") -> None:
         from scripts.whoami import agent_accounts
 
         source = Path(__file__).resolve().parents[2] / "config"
@@ -1002,6 +1017,111 @@ class WorkerCommandTests(unittest.TestCase):
         if cause == "legacy result without the prompt":
             self.assertEqual(report.restored, {row.id})
             self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+            if retry:
+                reopened = started_panes[row.id]
+                self.check_saved_result_restore(self.agent.row(reopened), reopened, active, path, retry)
+
+    def check_saved_result_restore(self, row: staff.StaffRow, pane: str, active: progress_history.ActiveDispatch,
+                                   path: Path, evidence: str) -> None:
+        from scripts.lib.resume_message import BusyPass
+
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        self.assertFalse(progress_history.parked_worker_pass(passed))
+        original = pass_recorder.dispatch_delivery(passed)
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend)
+        record = worker_lifecycle.read_json_object(path)
+        receipt = cast(dict[str, object], record["worker_result_receipt"])
+        expected_pass = active.instance_id
+        expected_command = active.launcher_command
+        if evidence == "different session":
+            transcript = source.read_bytes()
+            self.fixture.world.remove_pane(pane)
+            row = staff.update_current_session(row.current_session, staff.native_id(fixture_runtime_id("new-receipt-session")))
+            self.fixture.world.add(row, pane, family="codex")
+            _ = worker_admission.transcript_source(row, backend).write_bytes(transcript)
+            self.fixture.world.locations[pane]["agent_status"] = "working"
+        elif evidence == "different pane":
+            receipt["pane"] = "w1:p999"
+        elif evidence == "different prefix":
+            first, separator, rest = source.read_text().partition("\n")
+            fields = cast(dict[str, object], json.loads(first))
+            fields["fixture_rewrite"] = True
+            atomic_file.write_text_atomic(source, json.dumps(fields) + separator + rest)
+        elif evidence == "different input":
+            self.agent.append(pane, "user", "An ordinary input.")
+            stream = worker_panes.transcript_stream(row, source)
+            _, cursor = list(worker_panes.transcript_record_cursors(
+                worker_admission.transcript_records(source), stream))[-1]
+            receipt["cursor"] = asdict(cursor)
+        elif evidence == "different run id":
+            receipt["run_id"] = "different-run"
+        elif evidence == "different worker":
+            receipt["worker"] = self.fixture.parent.id
+        elif evidence == "different folder":
+            receipt["session_dir"] = str(self.fixture.root)
+        elif evidence == "conflicting pass":
+            record["pane_dispatch_id"] = active.instance_id
+            receipt["pass_id"] = "different-pass"
+        elif evidence == "wrong record id":
+            record["run_id"] = "different-record"
+        elif evidence == "wrong record owner":
+            record["staff_id"] = self.fixture.parent.id
+        elif evidence == "wrong record folder":
+            record["session_dir"] = str(self.fixture.root)
+        elif evidence == "absent":
+            del record["worker_result_receipt"]
+        elif evidence == "malformed":
+            record["worker_result_receipt"] = "invalid receipt"
+        elif evidence == "previous pass":
+            progress_history.complete_dispatch(self.run_dir, "impl", active.instance_id)
+            expected_pass = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                kind="impl", lens="")
+            expected_command = ("assign.sh",)
+        elif evidence == "previous stage":
+            second_stage = worker_panes.stage_two_completion_id(original.completion_id)
+            progress_history.save_dispatch_delivery(self.run_dir, active.instance_id,
+                replace(original, line=original.line.replace(original.completion_id, second_stage),
+                        completion_id=second_stage))
+        elif evidence == "idle":
+            self.fixture.world.locations[pane]["agent_status"] = "idle"
+        elif evidence == "closed":
+            self.fixture.world.remove_pane(pane)
+
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        report = worker.RestoreReport()
+        steps: list[worker.WorkerResume] = []
+        launches = len(self.fixture.world.launches)
+
+        def capture_resume(_member: staff.StaffRow, plan: worker.WorkerResume,
+                           **_options: object) -> worker.ExitCode:
+            steps.append(plan)
+            return worker.ExitCode.OK
+
+        with patch.object(worker, "_resume_launcher", new=capture_resume):
+            result = worker.restore(self.fixture.parent.id, only=frozenset({row.id}), report=report)
+        if evidence == "valid":
+            self.assertIs(result, worker.ExitCode.OK, report.failures)
+            self.assertEqual(report.restored, {row.id})
+            self.assertEqual(steps, [])
+            self.assertEqual(len(self.fixture.world.launches), launches)
+        elif evidence in ("previous pass", "previous stage"):
+            self.assertIs(result, worker.ExitCode.OK, report.failures)
+            self.assertEqual(report.restored, {row.id})
+            self.assertEqual([step.step for step in steps], [worker.UnsubmittedAssignment(expected_pass, expected_command)])
+        elif evidence in ("idle", "closed"):
+            self.assertIs(result, worker.ExitCode.OK, report.failures)
+            self.assertEqual(report.restored, {row.id})
+            self.assertEqual([step.step for step in steps], [BusyPass(active.instance_id)])
+        else:
+            self.assertIs(result, worker.ExitCode.UNCERTAIN, report.failures)
+            self.assertIn("result delivery is uncertain", report.failures[row.id][1])
+            self.assertEqual(report.restored, set())
+            self.assertEqual(steps, [])
+            self.assertEqual(len(self.fixture.world.launches), launches)
+
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts

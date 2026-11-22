@@ -24,6 +24,7 @@ import unittest
 from weakref import ref
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -2773,6 +2774,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     # A saved pass link remains valid after a clock adjustment.
                     record["started_at"] = 0
                 if case == "done-before-reap-unavailable-link":
+                    reply.unlink(missing_ok=True)
                     record["pane_dispatch_id"] = {"unavailable": "the pass lookup failed"}
                 elif case != "done-before-reap-no-link":
                     record["pane_dispatch_id"] = original
@@ -2847,6 +2849,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(saved["delivery"], "deferred: the result's pass ownership is unknown")
                     self.assertEqual(self.inputs, [])
                     self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                    self.assertFalse(reply.exists())
                     continue
                 if case == "earlier-pass":
                     self.assertEqual(saved["delivery"], detached_runs.OTHER_PASS_DELIVERY)
@@ -3139,12 +3142,15 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     with self.subTest(family=family, pending=pending, order=order):
                         self.check_earlier_uncertainty_during_native_stop(family, pending, order)
 
+    def test_earlier_pass_receipt_cannot_prove_a_duplicate_result_reply(self) -> None:
+        self.check_earlier_result_reply("later duplicate reply")
+
     def check_earlier_result_reply(self, result_case: str) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
         row = self.fixture.worker("impl", family="codex")
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
-        confirmed = result_case in ("confirmed", "later ordinary reply")
+        confirmed = result_case in ("confirmed", "later ordinary reply", "later duplicate reply")
         original, _ = self.begin_pane_pass(row)
         record = self.record(row, "earlier-result")
         record["pane_dispatch_id"] = original
@@ -3194,9 +3200,14 @@ class PaneRunDeliveryTests(unittest.TestCase):
             agent.append(pane, "user", "Check another file.")
             later = "I checked the file."
             agent.append(pane, "assistant", later)
+        if result_case == "later duplicate reply":
+            agent.append(pane, "user", "Detached run: earlier-result\n" + detached_runs.result_message(
+                record, detached_runs.CompletedCommand(0)))
+            later = "I replied to the duplicate."
+            agent.append(pane, "assistant", later)
         self.fixture.world.locations[pane]["agent_status"] = "done"
 
-        if result_case in ("running marker", "quoted in another dispatch"):
+        if result_case in ("running marker", "quoted in another dispatch", "later duplicate reply"):
             self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=later)),
                              turn_end.TurnOutcome.IGNORED)
             self.assertFalse(reply.exists())
@@ -3310,6 +3321,175 @@ class PaneRunDeliveryTests(unittest.TestCase):
                          turn_end.TurnOutcome.IGNORED)
         self.assertFalse(reply.exists())
         self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+
+    def test_definite_transport_refusal_cannot_confirm_unrelated_input(self) -> None:
+        for refusal in (herdr.HerdrCommandNotStarted, herdr.AgentBlocked):
+            with self.subTest(refusal=refusal.__name__):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_refused_result_input(refusal)
+                finally:
+                    _ = case.doCleanups()
+
+    def check_refused_result_input(self, refusal: type[herdr_types.HerdrFailure]) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("refused-receipt", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        record = self.record(row)
+        record.update(status="finished", exit_code=0, pane_dispatch_id="")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        run_command = self.fixture.world.run
+
+        def deny_input(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:3] == ("agent", "prompt", pane):
+                agent.append(pane, "user", arguments[3])
+                raise refusal("the transport refused input")
+            return run_command(*arguments, deadline=deadline)
+
+        with patch.object(self.fixture.world, "run", new=deny_input):
+            self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                             detached_runs.FAILED_WORKER_SUBMISSION + "the transport refused input")
+        self.assertEqual(self.inputs, [])
+        self.assertNotIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+
+    def test_ambiguous_transport_requires_full_result_input(self) -> None:
+        for arrival in ("full", "partial", "absent"):
+            with self.subTest(arrival=arrival):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_ambiguous_result_input(arrival)
+                finally:
+                    _ = case.doCleanups()
+
+    def check_ambiguous_result_input(self, arrival: str) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("ambiguous-receipt", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        record = self.record(row)
+        record.update(status="finished", exit_code=0, pane_dispatch_id="")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        result = detached_runs.CompletedCommand(0)
+        run_command = self.fixture.world.run
+        attempts: list[str] = []
+
+        def fail_after_launch(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:3] != ("agent", "prompt", pane):
+                return run_command(*arguments, deadline=deadline)
+            attempts.append(arguments[3])
+            if arrival == "full":
+                _ = run_command(*arguments, deadline=deadline)
+            elif arrival == "partial":
+                agent.append(pane, "user", "\n".join(arguments[3].splitlines()[:2]))
+            # An I/O error can identify the executable even after launch.
+            raise OSError(5, "transport I/O failed", self.fixture.world.binary)
+
+        with patch.object(self.fixture.world, "run", new=fail_after_launch):
+            delivery = detached_runs.deliver(record, result)
+            if arrival == "full":
+                self.assertEqual(delivery, f"sent: worker {row.name} at {pane}")
+                self.assertIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+                self.assertEqual(len(self.inputs), 1)
+            else:
+                self.assertTrue(delivery.startswith(detached_runs.UNCONFIRMED_WORKER_RESULT), delivery)
+                self.assertEqual(detached_runs.deliver(record, result), delivery)
+                self.assertNotIn("worker_result_receipt", worker_lifecycle.read_json_object(path))
+            self.assertEqual(len(attempts), 1)
+
+    def test_supervisor_keeps_the_worker_lock_through_the_receipt_save(self) -> None:
+        for step in ("before check", "before boundary", "during transport", "during confirmation", "during save"):
+            with self.subTest(step=step):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_result_stage_lock(step)
+                finally:
+                    _ = case.doCleanups()
+
+    def check_result_stage_lock(self, step: str) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("stage-lock", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        agent.append(pane, "user", stage.line)
+        record = self.record(row)
+        record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch,
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        replacement = replace(stage, completion_id=f"{dispatch}-second-stage")
+        changed: list[bool] = []
+
+        def advance_stage() -> None:
+            try:
+                with worker_panes.worker_id_lock(row.id):
+                    progress_history.save_dispatch_delivery(self.run_dir, dispatch, replacement)
+            except BlockingIOError:
+                changed.append(False)
+            else:
+                changed.append(True)
+
+        transcript_records = worker_admission.transcript_records
+        transport = self.fixture.world.run
+        readiness = self.fixture.world.readiness
+
+        def before_check(target: str) -> herdr.WorkerReadiness:
+            advance_stage()
+            return readiness(target)
+
+        reads = 0
+
+        def read_transcript(source: Path, *, offset: int = 0,
+                            boundary: worker_admission.TranscriptRecordBoundary =
+                                worker_admission.TranscriptRecordBoundary.ALL_RECORDS,
+                            ) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+            nonlocal reads
+            if boundary is worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL:
+                reads += 1
+                if (step == "before boundary" and reads == 1) or (step == "during confirmation" and reads == 2):
+                    advance_stage()
+            yield from transcript_records(source, offset=offset, boundary=boundary)
+
+        def during_transport(*arguments: str, deadline: float = math.inf) -> str:
+            if arguments[:3] == ("agent", "prompt", pane):
+                advance_stage()
+            return transport(*arguments, deadline=deadline)
+
+        def during_save(target: Path, text: str) -> None:
+            if target == path and "worker_result_receipt" in text:
+                advance_stage()
+            write_text_atomic(target, text)
+
+        with contextlib.ExitStack() as stack:
+            if step == "before check":
+                _ = stack.enter_context(patch.object(self.fixture.world, "readiness", new=before_check))
+            elif step in ("before boundary", "during confirmation"):
+                _ = stack.enter_context(patch.object(worker_admission, "transcript_records", new=read_transcript))
+            elif step == "during transport":
+                _ = stack.enter_context(patch.object(self.fixture.world, "run", new=during_transport))
+            else:
+                _ = stack.enter_context(patch.object(detached_runs, "write_text_atomic", new=during_save))
+            result = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+        saved = worker_lifecycle.read_json_object(path)
+        if step == "before check":
+            self.assertEqual(result, detached_runs.DEFERRED_WORKER_RESULT + "the worker stage changed")
+            self.assertEqual(changed, [True])
+            self.assertEqual(self.inputs, [])
+            self.assertNotIn("worker_result_receipt", saved)
+            return
+        self.assertEqual(result, f"sent: worker {row.name} at {pane}")
+        self.assertEqual(changed, [False])
+        receipt = detached_runs.read_worker_result_receipt(saved)
+        assert isinstance(receipt, detached_runs.WorkerResultReceipt)
+        self.assertEqual(receipt.assignment, detached_runs.ResultSubmissionPass(dispatch, stage.completion_id))
+        self.assertEqual(len(self.inputs), 1)
 
     def check_earlier_uncertainty_during_native_stop(
             self, family: Literal["claude", "codex"], pending: bool | None, order: str) -> None:
@@ -5176,7 +5356,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 attempts += 1
                 if attempts == 1:
                     error = FileNotFoundError(2, "prompt command unavailable", self.fixture.world.binary)
-                    raise herdr_types.HerdrFailure(str(error)) from error
+                    raise herdr.HerdrCommandNotStarted(str(error)) from error
                 saved = worker_lifecycle.read_json_object(path)
                 self.assertEqual(saved.get("delivery"), "unconfirmed: the prompt may have sent input")
             return run(*arguments, deadline=deadline)
