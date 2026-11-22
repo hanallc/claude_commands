@@ -1058,7 +1058,7 @@ class HoldEnforcerTests(unittest.TestCase):
         entry = build_hold.new_entry(address, worker.name)
         failure = build_hold.ReleaseSendFailed("delivery was not confirmed")
         with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
-            result = build_hold.send_stopped_run_release(entry, run, "released", staff.initial_snapshot())
+            result = build_hold.send_stopped_run_release(entry, (run,), "released", staff.initial_snapshot())
         self.assertEqual(result, failure)
         send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
 
@@ -1294,9 +1294,40 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
-        self.assertEqual([cast(str, call.args[1]) for call in send.call_args_list], [f"codex:{thread}"] * 2)
-        for call, label in zip(send.call_args_list, ("bash verify.sh check", "cargo test"), strict=True):
-            self.assertIn(f"Restart the stopped run {label} ", cast(str, call.args[2]))
+        call, = send.call_args_list
+        self.assertEqual(cast(str, call.args[1]), f"codex:{thread}")
+        notice = cast(str, call.args[2])
+        self.assertIn("Restart the stopped runs for worker: bash verify.sh check (Run ID process:", notice)
+        self.assertIn("; cargo test (Run ID process:", notice)
+
+    def test_release_names_one_run_for_many_processes_of_one_command(self) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="worker", parent=director.id)
+        thread = str(worker.current_session)
+        environment = {"CODEX_THREAD_ID": thread}
+        _ = self.process(5, "codex", argv=("codex", "resume"), environment=environment)
+        _ = self.process(6, "zsh", parent=5, argv=("zsh", "-c", "verify.sh check"), environment=environment)
+        _ = self.process(10, "bash", parent=6, argv=("bash", "verify.sh", "check"), environment=environment)
+        _ = self.process(11, "cargo", parent=10, argv=("cargo", "test"), environment=environment)
+        _ = self.process(12, "python3.13", parent=6, argv=("python3.13", "-m", "unittest"), environment=environment)
+        _ = self.process(13, "cargo", parent=10, argv=("cargo", "build"), environment=environment)
+        table = self.table()
+        owner = OwningSession(thread)
+        signals: list[tuple[int, int]] = []
+        stopper = hold_enforcer.StopBuildsAndTests(
+            self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)))
+        for pid in (11, 12, 13):
+            stopper.stop(hold_enforcer.WouldStopBuild(table[pid], owner, "timed test", holder, table[pid]),
+                         table, (holder,), 999, self.claimed)
+        self.assertEqual([pid for pid, _ in signals], [11, 12, 13])
+
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
+        call, = send.call_args_list
+        self.assertEqual(cast(str, call.args[1]), f"codex:{thread}")
+        self.assertIn("Restart the stopped run cargo test for worker.", cast(str, call.args[2]))
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")

@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -420,6 +421,21 @@ def notice_recipients(
     return owner.session_id, agent.session_id
 
 
+# The agent programs whose child process is the root of one command.
+AGENT_COMMANDS = frozenset({"claude", "codex"})
+
+
+def command_root(lineage: Sequence[build_hold.AuditProcess], stopped: build_hold.AuditProcess) -> build_hold.AuditProcess:
+    """Return the process the nearest agent started; all processes of one command share it.
+
+    Without an agent parent, the stopped process is its own run.
+    """
+    for item, parent in itertools.pairwise(lineage):
+        if build_hold.audit_command(parent) in AGENT_COMMANDS:
+            return item
+    return stopped
+
+
 def restart_entry(detached: DetachedRun | NoDetachedRun, process: build_hold.AuditProcess,
                   lineage: Sequence[build_hold.AuditProcess], recipients: Sequence[str],
                   proc_root: Path) -> build_hold.ReleaseEntry | NoRunNotice:
@@ -434,7 +450,7 @@ def restart_entry(detached: DetachedRun | NoDetachedRun, process: build_hold.Aud
         director_dir = next((value for item in lineage
                              if (value := item.environment.get("UNIT_RUN_DIR") or item.environment.get("UNIT_SESSION_DIR"))), "")
         return {**build_hold.new_entry(session_id, session_id),
-                "run": {"id": f"process:{process_record_id(process.identity, stop_boot_id(proc_root))}",
+                "run": {"id": f"process:{process_record_id(command_root(lineage, process).identity, stop_boot_id(proc_root))}",
                         "label": stop_command_label(process.argv, process.executable or process.command), "staff_id": staff_id,
                         "director_dir": director_dir}}
     try:
