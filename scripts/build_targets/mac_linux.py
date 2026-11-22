@@ -1,7 +1,7 @@
 """Run the gate in the Mac's Linux guest.
 
-Hold the claim until the guest proves the run ended or the proof wait expires.
-At expiry, fail the route. The guest keeps its run lock until the run ends.
+Wait for proof that the guest run ended.
+If the wait expires, fail the route. The guest keeps its run lock until the run ends.
 If the gate parent and module supervisor die, a descendant can keep the lock and prevent proof.
 Without a signal handler, Python can raise KeyboardInterrupt at any bytecode. An interrupt outside the protected block acts like process death. The guest timeout still ends the run.
 """
@@ -39,6 +39,7 @@ from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 TARGET = eligibility.MAC_LINUX_TARGET
 UNREACHABLE_WAIT_KEY = 'run.unreachable_wait_seconds'
+MAX_UNREACHABLE_WAIT_SECONDS = 86400
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -51,7 +52,6 @@ GUEST_CLEANUP_TIMEOUT_SECONDS = 25
 MISSING_PREREQUISITE_STATUS = 75
 MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
-GUEST_END_PENDING_MESSAGE = 'Mac Linux guest run not proven ended; the Mac claim stays held'
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
 ARM_RECORD_PREFIX = 'mac-linux-armed'
@@ -95,27 +95,32 @@ class GuestSettings:
         return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
+def _unreachable_wait_seconds(value: str) -> int:
+    seconds = conf.positive_whole(value)
+    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
+        raise ValueError(f'expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds')
+    return seconds
+
+
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     settings = conf.read(eligibility.mac_linux_target(registry).settings)
     hops = settings.value('ssh.hops', str.split, recover_invalid=False)
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
-    proof_wait = settings.value(UNREACHABLE_WAIT_KEY, int, recover_invalid=False)
+    proof_wait = settings.value(UNREACHABLE_WAIT_KEY, _unreachable_wait_seconds, recover_invalid=False)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
         raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
-    if proof_wait < 1:
-        raise GuestUnavailable(f'{UNREACHABLE_WAIT_KEY} must be positive')
     return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
 
 
 def mac_linux_reservation(_repo: Path, _work: SuiteMode | StepJob,
                           _gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
-    """Keep the reservation through the guest attempt.
+    """Provide the reservation context that item 191 B3 will implement.
 
     B3 adds scripts.build_queue.mac_run.held(repo, 'mac', work, gate_job).
     The context manager takes the native claude_commands repository claim on the Mac.
@@ -639,7 +644,6 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     first_failure = ''
     proof_deadline: float | None = None
     retry_proof = False
-    reported_hold = False
     proof_obtained = False
 
     while True:
@@ -659,17 +663,17 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                     if proof_deadline is None:
                         proof_deadline = now + settings.unreachable_wait_seconds
                     remaining = proof_deadline - now
-                    if retry_proof and remaining > 0:
-                        if not reported_hold:
-                            reported_hold = True
-                            with suppress(OSError, ValueError):
-                                print(GUEST_END_PENDING_MESSAGE, file=sys.stderr, flush=True)
-                        sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
-                        remaining = proof_deadline - monotonic()
                     if remaining <= 0:
                         break
+                    if retry_proof:
+                        sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
+                        remaining = proof_deadline - monotonic()
+                        if remaining <= 0:
+                            break
                     retry_proof = True
                     proof = prove_guest_end(settings, armed, timeout_seconds=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining))
+                    if monotonic() >= proof_deadline:
+                        break
                     if isinstance(proof, GuestEndProven):
                         proof_obtained = True
                     elif not first_failure:

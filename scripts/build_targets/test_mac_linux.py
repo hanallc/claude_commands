@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, suppress
 import fcntl
-from io import StringIO
 import os
 from pathlib import Path
 import pwd
@@ -13,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from threading import Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -373,7 +373,7 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_probe_failure_records_target_backoff(self) -> None:
+    def test_free_now_reads_the_mac_linux_probe_backoff(self) -> None:
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
@@ -389,7 +389,7 @@ fi
         self.assertEqual(self.route(), f'{mac_linux.TARGET}: guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
 
-    def test_unreachable_wait_key_loads_and_missing_key_refuses(self) -> None:
+    def test_unreachable_wait_refuses_a_missing_key_without_a_committed_value(self) -> None:
         key = mac_linux.UNREACHABLE_WAIT_KEY
         settings = mac_linux.read_settings(conf.read(self.registry))
         self.assertEqual(settings.unreachable_wait_seconds, 20)
@@ -400,6 +400,41 @@ fi
         self.assertIn(key, str(result))
         self.assertIn('key is missing', str(result))
         self.assert_guest_clean()
+
+    def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
+        configuration = self.repo / 'config/mac_linux.conf'
+        original = self.registry.with_name('mac_linux.conf').read_text()
+        _ = configuration.write_text(original)
+        _ = self.git('add', 'config/mac_linux.conf')
+        _ = self.git('commit', '-qm', 'Add the guest settings')
+        _ = self.registry.write_text(self.registry.read_text().replace(
+            'settings.mac-linux=mac_linux.conf', f'settings.mac-linux={configuration}'))
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(original.replace(f'{key}=20\n', ''))
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 20)
+
+    def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        configuration = self.registry.with_name('mac_linux.conf')
+        original = configuration.read_text()
+        for value, reason in (
+            ('0', 'expected a positive whole number'),
+            ('-1', 'expected a positive whole number'),
+            ('1.5', 'expected a whole number'),
+            ('1' + '0' * 309, 'expected at most 86400 seconds'),
+            ('86401', 'expected at most 86400 seconds'),
+        ):
+            with self.subTest(value=value):
+                _ = configuration.write_text(original.replace(f'{key}=20', f'{key}={value}'))
+                result = self.route()
+                self.assertIn(key, str(result))
+                self.assertIn(reason, str(result))
+                self.assert_guest_clean()
+
+        _ = configuration.write_text(original.replace(f'{key}=20', f'{key}=86400'))
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 86400)
 
     def test_other_repository_is_refused_before_ssh(self) -> None:
         _ = self.git('remote', 'set-url', 'origin', 'https://example.test/other-repo.git')
@@ -507,7 +542,7 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_unreachable_guest_keeps_the_claim_until_proof(self) -> None:
+    def test_unreachable_guest_keeps_the_fixture_reservation_until_proof(self) -> None:
         events: list[str] = []
         prove_guest_end = mac_linux.prove_guest_end
 
@@ -540,11 +575,9 @@ fi
         with (patch.dict(os.environ, {'FIXTURE_OFFLINE_PROOFS': '2'}),
               patch.object(mac_linux, 'mac_linux_reservation', reservation),
               patch.object(mac_linux, 'prove_guest_end', prove),
-              patch.object(mac_linux, 'sleep') as retry_delay,
-              redirect_stderr(StringIO()) as log):
+              patch.object(mac_linux, 'sleep') as retry_delay):
             result = self.route('disconnect-before-copy')
         self.assertIn('Guest cleanup: ended after fixture cleanup SSH refused the connection', str(result))
-        self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
         self.assertEqual(events, ['reserved', 'unreachable', 'unreachable', 'ended', 'released'])
         self.assertEqual(retry_delay.call_args_list, [call(mac_linux.SSH_CONNECT_TIMEOUT_SECONDS)] * 2)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
@@ -626,7 +659,7 @@ fi
 
         lock = self.run_lock()
         lock.parent.mkdir(parents=True)
-        with lock.open('w') as held, redirect_stderr(StringIO()) as log:
+        with lock.open('w') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
 
             def prove(settings: mac_linux.GuestSettings,
@@ -645,42 +678,57 @@ fi
                 result = self.route()
         self.assertIn('Guest cleanup: ended', str(result))
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup'])
-        self.assertEqual(log.getvalue().splitlines(), ['Mac Linux guest run not proven ended; the Mac claim stays held'])
 
-    def test_broken_stderr_keeps_the_reservation_until_proof(self) -> None:
-        events: list[str] = []
-        prove_guest_end = mac_linux.prove_guest_end
+    def test_full_stderr_pipe_does_not_extend_the_proof_wait(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        key = mac_linux.UNREACHABLE_WAIT_KEY
+        _ = configuration.write_text(configuration.read_text().replace(f'{key}=20', f'{key}=1'))
+        started: list[float] = []
+        reader, writer = os.pipe()
+        with os.fdopen(reader, 'rb') as blocked_reader, os.fdopen(writer, 'w') as blocked_stderr:
+            os.set_blocking(writer, False)
+            for chunk in (b'x' * 4096, b'x'):
+                with suppress(BlockingIOError):
+                    while True:
+                        _ = os.write(writer, chunk)
+            os.set_blocking(writer, True)
+            # Drain the pipe only if the route stalls.
+            guard = Timer(2.5, os.read, args=(blocked_reader.fileno(), 65536))
 
-        class ClosedStderr(StringIO):
-            @override
-            def write(self, message: str) -> int:
-                events.append('stderr failed')
-                raise BrokenPipeError(message)
-
-        def prove(settings: mac_linux.GuestSettings,
-                  armed: mac_linux.ArmedGuestAttempt, *,
-                  timeout_seconds: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
-            if events == ['reserved']:
-                events.append('pending')
+            def pending(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
+                        timeout_seconds: float) -> mac_linux.GuestEndPending:
+                self.assertLessEqual(timeout_seconds, 1)
+                if not started:
+                    started.append(time.monotonic())
+                    guard.start()
                 return mac_linux.GuestEndPending('fixture cleanup pending')
-            proof = prove_guest_end(settings, armed, timeout_seconds=timeout_seconds)
-            events.append('ended' if isinstance(proof, mac_linux.GuestEndProven) else 'pending')
-            return proof
 
-        @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
-            events.append('reserved')
             try:
-                yield
+                with (patch.object(mac_linux, 'prove_guest_end', pending), redirect_stderr(blocked_stderr)):
+                    result = self.route()
+                    returned = time.monotonic()
             finally:
-                events.append('released')
+                if started:
+                    guard.cancel()
+                    guard.join()
+        first_probe, = started
+        self.assertIn('guest unreachable: fixture-guest', str(result))
+        self.assertLess(returned - first_probe, 1.75)
 
-        with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
-              patch.object(mac_linux, 'prove_guest_end', prove),
-              patch.object(mac_linux, 'sleep'), redirect_stderr(ClosedStderr())):
+    def test_proof_received_at_the_deadline_refuses(self) -> None:
+        now = 0.0
+
+        def late_proof(_settings: mac_linux.GuestSettings, _armed: mac_linux.ArmedGuestAttempt, *,
+                       timeout_seconds: float) -> mac_linux.GuestEndProven:
+            nonlocal now
+            self.assertEqual(timeout_seconds, 20)
+            now += timeout_seconds
+            return mac_linux.GuestEndProven()
+
+        with (patch.object(mac_linux, 'monotonic', lambda: now),
+              patch.object(mac_linux, 'prove_guest_end', late_proof)):
             result = self.route()
-        self.assertIsInstance(result, GateRun)
-        self.assertEqual(events, ['reserved', 'pending', 'stderr failed', 'ended', 'released'])
+        self.assertIn('guest unreachable: fixture-guest', str(result))
 
     def test_cleanup_error_timeout_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
@@ -723,7 +771,7 @@ fi
               self.assertRaises(KeyboardInterrupt)):
             _ = self.route('interrupted-before-copy')
 
-    def test_interrupt_at_cleanup_entry_keeps_the_claim_until_proof(self) -> None:
+    def test_interrupt_at_cleanup_entry_keeps_the_fixture_reservation_until_proof(self) -> None:
         prove_guest_end = mac_linux.prove_guest_end
         first_interrupt = KeyboardInterrupt('fixture interruption at cleanup entry')
         events: list[str] = []
@@ -758,16 +806,14 @@ fi
         with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
               patch.object(mac_linux, 'prove_guest_end', prove),
               patch.object(mac_linux, 'sleep', interrupt_retry),
-              redirect_stderr(StringIO()) as log,
               self.assertRaises(KeyboardInterrupt) as raised):
             _ = self.route('disconnect-before-copy')
         self.assertIs(raised.exception, first_interrupt)
         self.assertEqual(events, ['reserved', 'interrupted', 'retry interrupted', 'ended', 'released'])
         self.assertEqual(lock_statuses, [1, 0])
-        self.assertEqual(log.getvalue().splitlines(), [mac_linux.GUEST_END_PENDING_MESSAGE])
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
 
-    def test_interrupt_at_retry_jump_keeps_the_claim_until_proof(self) -> None:
+    def test_interrupt_at_retry_jump_keeps_the_fixture_reservation_until_proof(self) -> None:
         stream_guest_bundle = mac_linux.stream_guest_bundle
         interruption = KeyboardInterrupt('fixture interruption at the retry jump')
         events: list[str] = []
