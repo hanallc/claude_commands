@@ -274,11 +274,13 @@ try {
               color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
             }));
             return {heading:section.querySelector('.section-head').textContent,
+              nextCard:section.nextElementSibling?.id,
               rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
               width:bounds.width,height:bounds.height,scale:1}};
           })()`);
           assert.equal(result.visible, true);
           assert.equal(result.heading, 'Tests outside the queue');
+          assert.equal(result.nextCard, 'leftovers', 'Leftover processes must follow Tests outside the queue.');
           assert.deepEqual(result.rows, [{cells:['queue · test · targeted_test.py', '136.0 s CPU'],
             color:'role.unit-director'}]);
           const output = join(folder, 'cpumark-dark.png');
