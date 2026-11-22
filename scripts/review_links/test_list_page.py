@@ -118,7 +118,7 @@ async function checkReviewCardConflict(card,layout,check,advance){
   const after=await reviewCardPosition(card);
   const marker=notice.textContent;
   check(before.dark && after.dark,'The Review card uses dark mode.');
-  check(before.resized && after.resized,'The linked card height follows the measured document.');
+  check(before.resized && after.resized,'The frame takes the height the card requests, up to the cap.');
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
    before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
