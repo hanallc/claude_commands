@@ -6,10 +6,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -32,6 +35,7 @@ EXISTING_PRODUCERS = ("bob", "brain", "dwight", "morty")
 OPERATIONS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer",
               "BISECT_START")
 ORIGIN_MAIN = "refs/remotes/origin/main"
+FIRST_SAVE_REF = "refs/vault-save/first-save"
 SUBJECT = "vault: Save text files"
 SCAN_FINDINGS_EXIT = 10
 
@@ -124,6 +128,12 @@ def with_paths(vault: Path, paths: list[str], *args: str, env: dict[str, str] | 
 
 def save(vault: Path) -> int:
     with main_push_lock(vault, "vault-save", wait=False):
+        ref = git(vault, "show-ref", "--verify", "--quiet", FIRST_SAVE_REF)
+        if ref.returncode == 1:
+            print("Vault save waits for the reviewed first save.")
+            return 0
+        if ref.returncode:
+            raise SaveError("Git could not verify the reviewed first-save ref.")
         if not writable(vault):
             print("Vault save deferred while main is unavailable.")
             return 0
@@ -208,6 +218,19 @@ def temporary_git_environment(vault: Path, folder: Path) -> dict[str, str]:
     }
 
 
+@contextmanager
+def first_save_folder(vault: Path) -> Generator[Path]:
+    """Use a private folder under the vault lock and remove any previous copy."""
+    root = git_path(vault, "vault-save-work")
+    with suppress(FileNotFoundError):
+        shutil.rmtree(root)
+    root.mkdir(mode=0o700)
+    try:
+        yield Path(tempfile.mkdtemp(dir=root))
+    finally:
+        shutil.rmtree(root)
+
+
 @dataclass(frozen=True)
 class SourceFile:
     mode: int
@@ -280,24 +303,23 @@ def scan(vault: Path, *args: str) -> None:
 
 
 def scan_first_save(vault: Path, manifest: Path) -> None:
-    if staged_paths(vault, ignore_intent=False):
-        raise SaveError("The index has staged changes. Clear them before scanning the first save.")
-    manifest.unlink(missing_ok=True)
-    manifest.with_suffix(".state").unlink(missing_ok=True)
-    base = fetch_main(vault)
-    head = checked(vault, "rev-parse", "HEAD").strip()
-    if not ancestor(vault, base, head):
-        raise SaveError("Reconcile local main with origin/main before scanning the first save.")
-    for name in EXISTING_PRODUCERS:
-        folder = vault / name
-        if folder.is_dir() and not folder.is_symlink():
-            install_producer_media_rules(folder)
-    changed, new = selected_paths(vault)
-    paths = sorted(set(changed + new))
-    if not paths:
-        raise SaveError("The vault has no text changes to scan.")
-    with tempfile.TemporaryDirectory(prefix="vault-save-") as temporary:
-        folder = Path(temporary)
+    with first_save_folder(vault) as folder:
+        if staged_paths(vault, ignore_intent=False):
+            raise SaveError("The index has staged changes. Clear them before scanning the first save.")
+        manifest.unlink(missing_ok=True)
+        manifest.with_suffix(".state").unlink(missing_ok=True)
+        base = fetch_main(vault)
+        head = checked(vault, "rev-parse", "HEAD").strip()
+        if not ancestor(vault, base, head):
+            raise SaveError("Reconcile local main with origin/main before scanning the first save.")
+        for name in EXISTING_PRODUCERS:
+            producer = vault / name
+            if producer.is_dir() and not producer.is_symlink():
+                install_producer_media_rules(producer)
+        changed, new = selected_paths(vault)
+        paths = sorted(set(changed + new))
+        if not paths:
+            raise SaveError("The vault has no text changes to scan.")
         env = temporary_git_environment(vault, folder)
         _ = checked(vault, "read-tree", head, env=env)
         with_paths(vault, paths, "add", "-A", env=env)
@@ -361,8 +383,8 @@ def update_index(vault: Path, review: Review, *, env: dict[str, str] | None = No
 
 
 def create_reviewed_commit(vault: Path, review: Review) -> str:
-    with tempfile.TemporaryDirectory(prefix="vault-save-") as temporary:
-        env = temporary_git_environment(vault, Path(temporary))
+    with first_save_folder(vault) as folder:
+        env = temporary_git_environment(vault, folder)
         _ = checked(vault, "read-tree", review.head, env=env)
         sources = verify_sources(vault, review, env)
         for entry, data in sources:
@@ -439,6 +461,7 @@ def commit_first_save(vault: Path, manifest: Path, manifest_hash: str) -> None:
         print(land_main.hook_report(landed.hook), file=sys.stderr)
     if not ancestor(vault, commit, fetch_main(vault)):
         raise SaveError("Origin main does not contain the reviewed commit.")
+    _ = checked(vault, "update-ref", FIRST_SAVE_REF, commit)
     manifest.unlink()
     state.unlink(missing_ok=True)
     print(f"Published the reviewed first save {commit}.")

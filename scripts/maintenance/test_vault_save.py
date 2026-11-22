@@ -100,7 +100,35 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         return output.splitlines()[-1].removeprefix("Manifest hash ")
 
+    def mark_first_save_published(self) -> None:
+        _ = self.git("update-ref", vault_save.FIRST_SAVE_REF, "HEAD")
+
+    def test_vault_save_waits_for_first_save(self) -> None:
+        self.write("reviewed.md", "Save this after review.\n")
+        base = self.git("rev-parse", "HEAD")
+        index = self.vault / ".git/index"
+        original = index.read_bytes()
+        code, output, errors = self.command()
+        self.assertEqual((code, output, errors), (0, "Vault save waits for the reviewed first save.\n", ""))
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
+        self.assertEqual(index.read_bytes(), original)
+        self.assertEqual(self.git("status", "--short"), "?? reviewed.md")
+
+        code, _, errors = self.command("first-save", "commit", self.scan())
+        self.assertEqual(code, 0, errors)
+        published = self.git("rev-parse", "main", repo=self.origin)
+        self.assertNotEqual(published, base)
+        self.assertEqual(self.git("show-ref", "--hash", "--verify", vault_save.FIRST_SAVE_REF), published)
+
+        self.write("later.md", "Save this on the timer.\n")
+        code, output, errors = self.command()
+        self.assertEqual(code, 0, errors)
+        self.assertIn("Saved 1 paths", output)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), published)
+        self.assertEqual(self.git("show", "HEAD:later.md"), "Save this on the timer.")
+
     def test_vault_save_defaults_to_the_home_vault_from_another_repo(self) -> None:
+        self.mark_first_save_published()
         home = self.vault.parent.parent
         other = home / "other"
         other.mkdir()
@@ -116,6 +144,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("status", "--short", repo=other), "?? other.md")
 
     def test_vault_save_selects_text_at_every_depth(self) -> None:
+        self.mark_first_save_published()
         names = {"new/nested/note [x].MD", "new/nested/note\rline.txt", "new/nested/note\nline.txt",
                  "issues/question-one.md",
                  "change-review/list.md.backup-20261103T014920761519", "new/nested/Cargo.lock"}
@@ -130,6 +159,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(set(map(os.fsdecode, changed)), names | {"remove.md"})
 
     def test_vault_save_passes_fsync_on_the_commit_command(self) -> None:
+        self.mark_first_save_published()
         self.write("note.md", "Save this note.\n")
         with patch.object(subprocess, "run", wraps=subprocess.run) as run:
             code, _, errors = self.command()
@@ -141,6 +171,7 @@ class VaultSaveTests(unittest.TestCase):
         )
 
     def test_vault_save_honors_ignores_and_keeps_tracked_media(self) -> None:
+        self.mark_first_save_published()
         for name in (".obsidian/settings.md", "new/.obsidian/state.json", "settings.local.json",
                      "bob/nested/shot.PNG", "outside/recording.mp4", "outside/vector.svg"):
             self.write(name, "An excluded fixture file.\n")
@@ -156,6 +187,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("check-ignore", "bob/nested/shot.PNG"), "bob/nested/shot.PNG")
 
     def test_vault_save_keeps_generated_bytes(self) -> None:
+        self.mark_first_save_published()
         files = ("machines/configuration/background jobs.md", "hana hierarchy.md", "agents/a.md", "agent sessions.md")
         for name in files:
             self.write(name, "date_modified: old\nGenerated text.\n")
@@ -168,6 +200,7 @@ class VaultSaveTests(unittest.TestCase):
             self.assertEqual((self.vault / name).read_bytes(), b"date_modified: new\nGenerated text.\n")
 
     def test_vault_save_serializes_writers(self) -> None:
+        self.mark_first_save_published()
         self.write("agents/a.md", "New note.\n")
         head = self.git("rev-parse", "HEAD")
         lock_path = self.vault / ".git/main-push.lock"
@@ -183,6 +216,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("show", "HEAD:agents/a.md"), "New note.")
 
     def test_vault_save_preserves_staged_changes(self) -> None:
+        self.mark_first_save_published()
         self.write("reviewed.md", "Staged user content.\n")
         _ = self.git("add", "reviewed.md")
         self.write("reviewed.md", "Unstaged user content.\n")
@@ -194,6 +228,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git("status", "--short"), "AM reviewed.md\n?? unrelated.md")
 
     def test_vault_save_defers_during_bisect(self) -> None:
+        self.mark_first_save_published()
         _ = self.git("bisect", "start", "--no-checkout")
         head = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("branch", "--show-current"), "main")
@@ -220,6 +255,7 @@ class VaultSaveTests(unittest.TestCase):
                 self.assertEqual(index.read_bytes(), original)
                 self.assertEqual(self.git(*list_objects), objects)
                 self.assertFalse(manifest.exists())
+                self.assertFalse(manifest.with_name("vault-save-work").exists())
 
     def test_vault_save_checks_first_push(self) -> None:
         origin = self.git("rev-parse", "origin/main")
@@ -231,6 +267,10 @@ class VaultSaveTests(unittest.TestCase):
         head = self.git("rev-parse", "HEAD")
         index = self.vault / ".git/index"
         manifest = self.vault / ".git/vault-save-manifest.json"
+        work = manifest.with_name("vault-save-work")
+        stale = work / "stopped-scan/snapshot/old.md"
+        stale.parent.mkdir(parents=True)
+        _ = stale.write_text("An old copy.\n", encoding="utf-8")
         original = index.read_bytes()
         self.write("bob/note.md", "derived=old\nReviewed content.\n")
         (self.vault / "remove.md").unlink()
@@ -241,7 +281,8 @@ class VaultSaveTests(unittest.TestCase):
             if args[0] == "dir":
                 self.assertEqual((folder / "files/bob/note.md").read_bytes(), b"derived=old\nReviewed content.\n")
                 self.assertEqual((folder / "blobs/bob/note.md").read_bytes(), b"Reviewed content.\n")
-                self.assertNotEqual(folder, self.vault)
+                self.assertEqual(folder.parent.parent, work)
+                self.assertFalse(stale.exists())
             self.assertEqual(index.read_bytes(), original)
             self.assertFalse(manifest.exists())
 
@@ -250,7 +291,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1], ("dir", "."))
-        self.assertFalse(calls[0][0].exists())
+        self.assertFalse(work.exists())
         self.assertEqual(calls[1], (self.vault, ("git", f"--log-opts=--diff-merges=first-parent {origin}..{head}", ".")))
         self.assertEqual(index.read_bytes(), original)
         digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
@@ -324,7 +365,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.git_output("diff", "--cached", "--name-only", "-z"), os.fsencode(name) + b"\0")
         code, output, errors = self.command()
         self.assertEqual(code, 0, errors)
-        self.assertIn("deferred because the index has staged changes", output)
+        self.assertEqual(output, "Vault save waits for the reviewed first save.\n")
         with patch.object(vault_save, "scan") as scan:
             code, _, errors = self.command("first-save", "scan")
         self.assertEqual(code, 1)
@@ -414,7 +455,7 @@ class VaultSaveTests(unittest.TestCase):
         checked = vault_save.checked
 
         def add_before_ref_update(vault: Path, *args: str, env: dict[str, str] | None = None) -> str:
-            if args[0] == "update-ref":
+            if args[:2] == ("update-ref", "refs/heads/main"):
                 self.write("later.md", "Staged separately.\n")
                 _ = self.git("add", "later.md")
                 self.write("later.md", "Unstaged edit.\n")
@@ -451,6 +492,9 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(self.command("first-save", "commit", digest)[0], 1)
         head = self.git("rev-parse", "HEAD")
         self.assertNotEqual(head, self.git("rev-parse", "main", repo=self.origin))
+        self.write("pending.md", "Wait for publication.\n")
+        self.assertEqual(self.command(), (0, "Vault save waits for the reviewed first save.\n", ""))
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
         # Verify recovery when the state file is missing.
         (self.vault / ".git/vault-save-manifest.state").unlink()
         hook.unlink()
@@ -458,3 +502,4 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.git("rev-parse", "main", repo=self.origin), head)
+        self.assertEqual(self.git("show-ref", "--hash", "--verify", vault_save.FIRST_SAVE_REF), head)

@@ -4,6 +4,7 @@
 
 Add a `vault_save` part to `agent_notes_job.py` on natedev. Run `vault_save.py` on `~/rust/hanadocs`.
 Run the part after the existing vault part when both are due.
+Wait for `refs/vault-save/first-save` before adding or committing paths.
 Run only on `main`. Check for an in-progress Git operation before making a commit.
 Pass `core.fsync=committed` per Git command during the first save and scheduled saves.
 
@@ -56,14 +57,18 @@ Let the scheduled save defer and retry if the lock is busy.
 
 ## First save
 
-Run the first save from the implementation worktree before merge. The scheduled part starts when the code reaches main.
+Run the first save from the implementation worktree if the code has yet to reach main.
+The scheduled part saves changes after the code reaches main and the first save is published.
 
 1. Run `vault_save.py first-save scan` with `scripts/lib/py`.
 2. Review the manifest, count, and stat.
 3. Run `vault_save.py first-save commit <manifest hash>` with `scripts/lib/py`.
 
-Scan takes `main_push_lock` and checks the live index before removing the previous manifest.
+Scan takes `main_push_lock` and removes any `vault-save-work` folder left by a stopped run.
+Scan checks the live index before removing the previous manifest.
 Fetch `origin/main` if the index is clear.
+The scan and commit use a private temporary folder under `vault-save-work` in the vault's Git folder, beside the manifest.
+Each step removes `vault-save-work` on exit.
 Stage the selected paths in a temporary index and object database. Use the vault's objects as an alternate.
 Copy the file bytes into a temporary folder. Include the staged blob bytes when a Git filter changes them.
 Run Gitleaks on the folder and `origin/main..HEAD` through `nix shell nixpkgs#gitleaks`.
@@ -83,11 +88,12 @@ Record the reviewed commit hash in the manifest state after main advances. Keep 
 Use `git update-index --index-info` to sync exact manifest paths in the live index. Use mode zero for deleted paths.
 During the supervised sync, Git can replace a different staged version if someone stages it and restores the reviewed bytes within milliseconds.
 The supervised rerun can also replace a staged descendant when someone turns a reviewed new file into a directory before the rerun. The director runs the rerun at once, so this risk is accepted.
-If an interruption leaves the index out of sync, the scheduled save defers.
+If an interruption leaves the index out of sync, the scheduled save still waits for the first-save ref.
 Rerun the same command with the same manifest hash to recover the reviewed commit from the history of main.
 Allow later commits if `HEAD` still has every reviewed entry. Sync the manifest paths from `HEAD`.
 If main returns to the scanned parent, verify the recorded commit and retry the guarded ref update.
 Publish the reviewed commit with `land_main.land`. Verify that `origin/main` contains it.
+Record the published commit in `refs/vault-save/first-save` before removing the manifest and state file. The ref update is the completion point: a stop after it leaves a finished first save, and a stop before it leaves none. A scan copy left by a stopped scan stays in the vault Git folder until the next scan removes it.
 After a failed push, rerun the same command to publish the existing commit.
 Before the first commit, scan again if a file or the local history changes.
 
@@ -102,6 +108,7 @@ Use temporary fixture repositories and a local bare remote for all tests.
 
 | Test | What it proves |
 | --- | --- |
+| `test_vault_save_waits_for_first_save` | The scheduled save waits for the published first-save ref and then commits new changes. |
 | `test_vault_save_selects_text_at_every_depth` | New folders, backup names, question records, and tracked deletions use one rule. |
 | `test_vault_save_honors_ignores_and_keeps_tracked_media` | Save excludes ignored files and media. Tracked media stays tracked. |
 | `test_add_producer_writes_media_rules` | New producer folders ignore media at every depth. Git can still add media outside producer folders. |
