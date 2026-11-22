@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records, execution_identity, head_stall, placement, queue_snapshot
+from scripts.build_queue.admission_service import QueueHeadAnchor, QueuePin, QueueRowAnchor
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
@@ -369,6 +370,28 @@ class QueueMoveTests(unittest.TestCase):
                 self.assertEqual(claim.owner, records.waiter_owner(fixture.server.waiters[first.episode].row))
                 self.assertEqual(fixture.server.queue_pins, ())
 
+    def test_refreshed_waiter_uses_step_arrival_after_run_exit(self) -> None:
+        with AdmissionFixture() as fixture:
+            now = fixture.clock.now()
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, since=now - 30, need=GIB), end_owner=True)
+            fixture.free(0)
+            fixture.hold_starts()
+            first = fixture.request(run=run, since=now - 40)
+            second = fixture.request(since=now - 10)
+            third = fixture.request(run=run, since=now - 5)
+            for request in (first, second, third):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            self.assertEqual(fixture.server.queue_pins, ())
+            self.assertEqual(fixture.queue_pids(), [first.owner.pid, third.owner.pid, second.owner.pid])
+
+            fixture.end_run(run)
+            self.assertFalse(fixture.server.run_places)
+            expected = [first.owner.pid, second.owner.pid, third.owner.pid]
+            self.assertEqual(fixture.queue_pids(), expected)
+            self.assertIsInstance(fixture.server.handle_request(third)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), expected)
+
     def test_absent_continuation_keeps_its_run_order_after_restart(self) -> None:
         with PlacementFixture() as fixture:
             now = fixture.clock.now()
@@ -398,7 +421,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(move_line(fixture)), [departing_id])
             self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
                 "cancel", departing.episode, departing.owner, "fixture")), [wire.Ok()])
-            self.assertEqual(fixture.server.queue_pins, ((pinned_id, continuing_id),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(pinned_id, QueueRowAnchor(continuing_id)),))
             for request in (pinned, continuation):
                 _ = fixture.server.handle_request(request)
             self.assertEqual(ids(move_line(fixture)), [continuing_id, pinned_id])
@@ -429,12 +452,14 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.run_pass()
             current = move_line(fixture)
             self.assertEqual(ids(current), [first, pinned, third, fourth, last, fifth])
-            self.assertEqual(fixture.server.queue_pins, ((pinned, first), (last, fourth)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(pinned, QueueRowAnchor(first)), QueuePin(last, QueueRowAnchor(fourth))))
             undone, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "undo-last", last, current.revision, wire.QueueUndo("drag-last")))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual(ids(undone.line), [first, pinned, third, fourth, fifth, last])
-            self.assertEqual(fixture.server.queue_pins, ((pinned, first), (last, fifth)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(pinned, QueueRowAnchor(first)), QueuePin(last, QueueRowAnchor(fifth))))
 
     def test_tail_drag_keeps_continuations_in_step_arrival_order(self) -> None:
         with AdmissionFixture() as fixture:
@@ -515,7 +540,8 @@ class QueueMoveTests(unittest.TestCase):
                 "pin-after", first, move.line.revision, wire.QueueDrop(pinned, "after")))
             assert isinstance(move, wire.QueueMoved)
             self.assertEqual(ids(move.line), [second, third, pinned, first, fourth])
-            self.assertEqual(fixture.server.queue_pins, ((pinned, third), (first, pinned)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(pinned, QueueRowAnchor(third)), QueuePin(first, QueueRowAnchor(pinned))))
             _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), move.line)
 
@@ -523,7 +549,8 @@ class QueueMoveTests(unittest.TestCase):
                 "undo-second", first, move.line.revision, wire.QueueUndo("pin-after")))
             assert isinstance(undo, wire.QueueMoved)
             self.assertEqual(ids(undo.line), [first, second, third, pinned, fourth])
-            self.assertEqual(fixture.server.queue_pins, ((first, "first"), (pinned, third)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(first, QueueHeadAnchor()), QueuePin(pinned, QueueRowAnchor(third))))
 
     def test_moving_an_anchor_keeps_its_former_successor_in_place(self) -> None:
         with AdmissionFixture() as fixture:
@@ -541,28 +568,11 @@ class QueueMoveTests(unittest.TestCase):
             moved, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "move-anchor", middle, moved.line.revision, wire.QueueDrop(last, "after")))
             assert isinstance(moved, wire.QueueMoved)
-            self.assertEqual(fixture.server.queue_pins, ((pinned, first), (middle, last)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(pinned, QueueRowAnchor(first)), QueuePin(middle, QueueRowAnchor(last))))
             _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), moved.line)
             self.assertEqual(ids(moved.line), [first, pinned, last, middle])
-
-    def test_restart_upgrades_numbered_pins_to_saved_neighbors(self) -> None:
-        with AdmissionFixture() as fixture:
-            fixture.free(0)
-            fixture.hold_starts()
-            requests = [fixture.request(since=fixture.clock.now() + offset) for offset in range(4)]
-            for request in requests:
-                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
-            first, second, third, last = ids(move_line(fixture))
-            path = fixture.state_dir / "state.json"
-            state = cast(dict[str, object], json.loads(path.read_text()))
-            state["queue_pins"] = [[last, 0], [third, 2]]
-            _ = path.write_text(json.dumps(state))
-            fixture.restart()
-            self.assertEqual(fixture.server.queue_pins, ((last, "first"), (third, first)))
-            for request in reversed(requests):
-                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
-            self.assertEqual(ids(move_line(fixture)), [last, first, third, second])
 
     def test_grant_publishes_the_order_used_to_confirm_moves_after_restart(self) -> None:
         with AdmissionFixture() as fixture:
@@ -633,7 +643,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(move_line(fixture)), [last_id])
             self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
                 "cancel-last", last.episode, last.owner, "fixture")), [wire.Ok()])
-            self.assertEqual(fixture.server.queue_pins, ((pinned_id, first_id),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(pinned_id, QueueRowAnchor(first_id)),))
 
             _ = fixture.server.handle_request(pinned)
             _ = fixture.server.handle_request(first)
@@ -731,7 +741,7 @@ class QueueMoveTests(unittest.TestCase):
             newcomer = fixture.request(since=fixture.clock.now() + 3)
             newcomer = replace(newcomer, identity=replace(newcomer.identity, unit=first.identity.unit))
             _ = fixture.server.handle_request(newcomer)
-            self.assertEqual(fixture.server.queue_pins, ((dragged_id, ordinary_id),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(dragged_id, QueueRowAnchor(ordinary_id)),))
             self.assertEqual(fixture.queue_pids(), [request.owner.pid for request in (first, newcomer, ordinary, dragged)])
 
     def test_cancelled_remote_only_wait_drops_its_saved_rank(self) -> None:
@@ -754,7 +764,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertIsInstance(fixture.server.handle_request(remote)[0], wire.PlacementWait)
             self.assertNotIn(remote.episode, fixture.server.waiters)
             self.assertEqual(move_line(fixture).members[0], records.QueueMoveMember(remote_id, movable=False))
-            self.assertEqual(fixture.server.queue_pins, ((remote_id, "first"),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(remote_id, QueueHeadAnchor()),))
             self.assertEqual(fixture.server.handle_request(wire.CancelPlacement("cancel", remote.episode,
                 remote.owner, "fixture")), [wire.Ok()])
             place = next(place for place in fixture.server.places.values() if place.episode == remote.episode)
@@ -782,7 +792,7 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertIn(requests[1].episode, fixture.server.reservations)
             self.assertEqual(ids(move_line(fixture)), [last, first])
-            self.assertEqual(fixture.server.queue_pins, ((first, last),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(first, QueueRowAnchor(last)),))
             fixture.free(0)
 
             newcomer = fixture.request(since=fixture.clock.now() + 3)
@@ -791,7 +801,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.end_owner(requests[2].owner)
             _ = fixture.run_pass()
             self.assertEqual(ids(move_line(fixture))[0], first)
-            self.assertEqual(fixture.server.queue_pins, ((first, "first"),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(first, QueueHeadAnchor()),))
 
     def test_pin_survives_restart_with_a_newcomer_before_reconnect(self) -> None:
         with AdmissionFixture() as fixture:
@@ -813,7 +823,7 @@ class QueueMoveTests(unittest.TestCase):
             _ = fixture.server.handle_request(newcomer)
             new_id, pinned = ids(move_line(fixture))
             self.assertEqual(pinned, first)
-            self.assertEqual(fixture.server.queue_pins, ((first, third),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(first, QueueRowAnchor(third)),))
             for request in reversed(requests[1:]):
                 _ = fixture.server.handle_request(request)
             self.assertEqual(ids(move_line(fixture)), [new_id, second, third, first])
@@ -845,7 +855,7 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual((undone.old_place, undone.new_place), (2, 5))
             self.assertEqual(ids(undone.line), ids(line))
-            self.assertEqual(fixture.server.queue_pins, ((third, second),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueRowAnchor(second)),))
 
             request = wire.QueueMoveRequest("move", third, undone.line.revision, wire.QueueDrop(merge, "before"))
             moved, = fixture.server.handle_request(request)
@@ -863,9 +873,9 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(inputs, records.QueueInputs)
             self.assertEqual([row["pid"] for _, row in gate.ranked_queue_waiters(inputs)],
                              [requests[index].owner.pid for index in (4, 0, 1, 3, 2)])
-            self.assertEqual(fixture.server.queue_pins, ((third, "first"),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueHeadAnchor()),))
             fixture.restart()
-            self.assertEqual(fixture.server.queue_pins, ((third, "first"),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueHeadAnchor()),))
             newcomer = fixture.request(since=fixture.clock.now() - 30)
             _ = fixture.server.handle_request(newcomer)
             new_id, = ids(move_line(fixture))
@@ -888,7 +898,7 @@ class QueueMoveTests(unittest.TestCase):
                 "undo-after-bump", third, current.revision, wire.QueueUndo("move")))
             assert isinstance(undone, wire.QueueMoved)
             self.assertEqual(ids(undone.line), [merge, urgent, first, new_id, second, third])
-            self.assertEqual(fixture.server.queue_pins, ((third, second),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(third, QueueRowAnchor(second)),))
             restored, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "move-after-undo", third, undone.line.revision, wire.QueueDrop(merge, "before")))
             assert isinstance(restored, wire.QueueMoved)
@@ -943,7 +953,7 @@ class QueueMoveTests(unittest.TestCase):
                 "restore-pin", second, pinned_again.line.revision, wire.QueueUndo("pin-first")))
             assert isinstance(undone_pin, wire.QueueMoved)
             self.assertEqual(ids(undone_pin.line), ids(moved))
-            self.assertEqual(fixture.server.queue_pins, ((second, last),))
+            self.assertEqual(fixture.server.queue_pins, (QueuePin(second, QueueRowAnchor(last)),))
             moved = undone_pin.line
             crossed, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "cross-pinned", first, moved.revision, wire.QueueDrop(second, "after")))
@@ -964,7 +974,8 @@ class QueueMoveTests(unittest.TestCase):
                 "move-again", second, reply.line.revision, wire.QueueDrop(last, "after")))
             fixture.proc.kill(requests[2].owner)
             fixture.restart()
-            self.assertEqual(fixture.server.queue_pins, ((first, "first"), (second, last)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(first, QueueHeadAnchor()), QueuePin(second, QueueRowAnchor(last))))
             for waiting in (requests[0], requests[1], requests[3]):
                 _ = fixture.server.handle_request(waiting)
             current = move_line(fixture)
@@ -1207,7 +1218,8 @@ class QueueMoveTests(unittest.TestCase):
                 "third-first", third_id, current.revision, wire.QueueDrop(first_id, "before")))
             assert isinstance(moved, wire.QueueMoved)
             self.assertEqual(ids(moved.line), [third_id, first_id])
-            self.assertEqual(fixture.server.queue_pins, ((third_id, "first"), (mac_id, third_id)))
+            self.assertEqual(fixture.server.queue_pins,
+                             (QueuePin(third_id, QueueHeadAnchor()), QueuePin(mac_id, QueueRowAnchor(third_id))))
             _ = publish_candidate(fixture, mac, placement.TemporaryExclusion("busy"))
             refused, = fixture.server.handle_request(wire.ClaimFailure("mac-busy", assignment, "busy"))
             assert isinstance(refused, wire.DispatchStatus)
@@ -1254,7 +1266,9 @@ class QueueMoveTests(unittest.TestCase):
                 self.assertEqual(ids(move_line(fixture)), [dragged_id, bumped_id])
                 self.assertEqual(fixture.completed_queue_change(
                     wire.PrioritySetRequest("bump-third", "urgent", "fixture", "fixture")), [wire.Ok()])
-                pins = ((mac_id, "first"), (dragged_id, mac_id)) if pin_mac else ((dragged_id, mac_id),)
+                pins = (QueuePin(dragged_id, QueueRowAnchor(mac_id)),)
+                if pin_mac:
+                    pins = (QueuePin(mac_id, QueueHeadAnchor()), *pins)
                 self.assertEqual(fixture.server.queue_pins, pins)
                 _ = publish_candidate(fixture, mac, placement.TemporaryExclusion("busy"))
                 refused, = fixture.server.handle_request(wire.ClaimFailure("mac-busy", assignment, "busy"))

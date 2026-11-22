@@ -362,18 +362,19 @@ class WaiterPlace:
     episode: str
     priority_since: float | OrderNotStarted = OrderNotStarted()
     token_left_at: float | TokenNotLeft = TokenNotLeft()
-    order_since: float | OrderNotStarted = field(default_factory=OrderNotStarted, kw_only=True)
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
     move_id: str = field(default="", kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
 
 
-def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
+def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
+                 ) -> WaiterPlace:
     """Keep a logical identity with every active place."""
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
-        order_since=row.get("order_since", row["since"]), queue_identity=gate.queue_life_identity(row),
-        move_id=row.get("move_id", ""), ci_runner=row.get("ci_runner", ""))
+        queue_identity=gate.queue_life_identity(row), move_id=row.get("move_id", ""),
+        ci_runner=row.get("ci_runner", ""), run=run)
 
 
 @dataclass(frozen=True)
@@ -594,8 +595,28 @@ class PendingCloudGroup:
     group: status_wire.CloudGroup
 
 
-QUEUE_FIRST = "first"
-QueuePins = tuple[tuple[str, str], ...]
+@dataclass(frozen=True)
+class QueueHeadAnchor:
+    """Place a pinned row at the head of the full order."""
+
+
+@dataclass(frozen=True)
+class QueueRowAnchor:
+    """Place a pinned row directly after this row."""
+
+    row_id: str
+
+
+QueueAnchor = QueueHeadAnchor | QueueRowAnchor
+
+
+@dataclass(frozen=True)
+class QueuePin:
+    row_id: str
+    anchor: QueueAnchor
+
+
+QueuePins = tuple[QueuePin, ...]
 
 
 def pinned_order(order: list[str], pins: QueuePins) -> list[str]:
@@ -603,23 +624,19 @@ def pinned_order(order: list[str], pins: QueuePins) -> list[str]:
     if not pins:
         return order
     members = set(order)
-    followers = {anchor: row_id for row_id, anchor in pins
-                 if row_id in members and (anchor == QUEUE_FIRST or anchor in members)}
+    followers = {pin.anchor: pin.row_id for pin in pins if pin.row_id in members
+                 and (isinstance(pin.anchor, QueueHeadAnchor) or pin.anchor.row_id in members)}
     pinned = set(followers.values())
     ordered: list[str] = []
-    for anchor in (QUEUE_FIRST, *(row_id for row_id in order if row_id not in pinned)):
-        if anchor != QUEUE_FIRST:
-            ordered.append(anchor)
+    roots = (QueueHeadAnchor(), *(QueueRowAnchor(row_id) for row_id in order if row_id not in pinned))
+    for anchor in roots:
+        if isinstance(anchor, QueueRowAnchor):
+            ordered.append(anchor.row_id)
         while anchor in followers:
-            anchor = followers.pop(anchor)
-            ordered.append(anchor)
+            row_id = followers.pop(anchor)
+            ordered.append(row_id)
+            anchor = QueueRowAnchor(row_id)
     return ordered
-
-
-def saved_queue_row(place: WaiterPlace) -> records.RankedWaiter:
-    order_since = place.since if isinstance(place.order_since, OrderNotStarted) else place.order_since
-    return gate.rank_waiter({**place.queue_identity, "need": 0, "order_since": order_since,
-        "move_id": place.move_id, "ci_runner": place.ci_runner}, records.NormalOrder())
 
 
 @dataclass(frozen=True)
@@ -1899,12 +1916,13 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(waiting.row, records.NormalOrder())
             run = waiting.request.run if isinstance(waiting.request, wire.AdmitRequest) else wire.NO_RUN
-            row["order_since"] = self._run_order_since(row.get("order_since", row["since"]), run)
+            row["order_since"] = self._run_order_since(row["since"], run)
             rows.append((self.state_dir / records.waiter_owner(row), row))
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
+            row["order_since"] = self._run_order_since(row["since"], request.run)
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return rows
 
@@ -1920,7 +1938,9 @@ class AdmissionServer:
         present = {row.get("move_id") for _, row in rows}
         for place in self.places.values():
             if place.move_id and place.move_id not in present:
-                row = saved_queue_row(place)
+                row = gate.rank_waiter({**place.queue_identity, "need": 0, "move_id": place.move_id,
+                    "ci_runner": place.ci_runner, "order_since": self._run_order_since(place.since, place.run)},
+                    records.NormalOrder())
                 rows.append((self.state_dir / place.move_id, row))
         if isinstance(self.priority, records.QueuePriority):
             return self._rank_priority_waiters(rows, self.priority)
@@ -2115,8 +2135,7 @@ class AdmissionServer:
             "pid": request.owner.pid, "start_time": request.owner.start_time,
             "need": (0 if isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
                      else profile.peak.bytes), "since": since,
-            "order_since": (place.order_since if isinstance(place, WaiterPlace)
-                            and not isinstance(place.order_since, OrderNotStarted) else since),
+            "order_since": since,
             "session_id": identity.session_id, "session_name": identity.name,
             "step": identity.step, "folder": identity.folder, "unit": identity.unit,
             "estimated_at": profile.estimated_at or self.clock.now(),
@@ -2928,9 +2947,8 @@ class AdmissionServer:
             return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
-        place = waiter_place(row, request.episode)
-        if isinstance(request, (wire.AdmitRequest, wire.PlacementRequest)):
-            place = replace(place, order_since=self._run_order_since(row.get("order_since", row["since"]), request.run))
+        run = request.run if isinstance(request, (wire.AdmitRequest, wire.PlacementRequest)) else wire.NO_RUN
+        place = waiter_place(row, request.episode, run=run)
         if previous is not None:
             if previous.episode == request.episode:
                 place = replace(place, queue_identity=previous.queue_identity)
@@ -2949,15 +2967,17 @@ class AdmissionServer:
     def _depart_queue_id(self, row_id: str) -> None:
         if not self.queue_pins:
             return
-        pins = dict(self.queue_pins)
-        anchor = pins.pop(row_id, "")
-        if not anchor and row_id in pins.values():
+        pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
+        departed = QueueRowAnchor(row_id)
+        anchor = pins.pop(row_id, None)
+        if anchor is None:
+            if departed not in pins.values():
+                return
             order = [row.get("move_id", "") for _, row in self._full_queue_order(self._ranked_waiters())]
             index = order.index(row_id)
-            anchor = order[index - 1] if index else QUEUE_FIRST
-        if anchor:
-            self._set_queue_pins(tuple((member, anchor if previous == row_id else previous)
-                                       for member, previous in pins.items()))
+            anchor = QueueRowAnchor(order[index - 1]) if index else QueueHeadAnchor()
+        self._set_queue_pins(tuple(QueuePin(member, anchor if previous == departed else previous)
+                                   for member, previous in pins.items()))
 
     def _end_move(self, waiting: WaitingAdmission) -> None:
         self._clear_wait_rank(waiting.request.owner, waiting.row["since"], waiting.request.episode)
@@ -3130,7 +3150,7 @@ class AdmissionServer:
             place = self.places.get(key)
             if place is not None and place.episode == record.episode and place.move_id:
                 row_waiter["move_id"] = place.move_id
-            self.places[key] = waiter_place(row_waiter, record.episode)
+            self.places[key] = waiter_place(row_waiter, record.episode, run=record.run)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
                                 self.places, RegisteredServiceWrites(self.writes)),
@@ -3701,7 +3721,6 @@ done
         place = self.places.get(_place_key(admission.owner, admission.since), records.NoWaiter())
         row = self._row(admission, place)
         if isinstance(request.run, wire.RunIdentity):
-            row["order_since"] = self._run_order_since(row.get("order_since", row["since"]), request.run)
             row["build_run"] = _live_run(request.run)
         row["route"] = request.route
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
@@ -4922,20 +4941,21 @@ done
         return wire.QueueMoved(row_id, updated, old_index + 1, place + 1, undo_destination)
 
     def _move_pin(self, row_id: str, destination: wire.QueueDrop, order: list[str], *, first: bool) -> None:
-        pins = dict(self.queue_pins)
+        pins = {pin.row_id: pin.anchor for pin in self.queue_pins}
+        moved = QueueRowAnchor(row_id)
         old_index = order.index(row_id)
-        old_anchor = order[old_index - 1] if old_index else QUEUE_FIRST
+        old_anchor = QueueRowAnchor(order[old_index - 1]) if old_index else QueueHeadAnchor()
         del order[old_index]
-        if old_index < len(order) and pins.get(order[old_index]) == row_id:
+        if old_index < len(order) and pins.get(order[old_index]) == moved:
             pins[order[old_index]] = old_anchor
 
         index = 0 if first else order.index(destination.neighbor) + int(destination.side == "after")
-        anchor = order[index - 1] if index else QUEUE_FIRST
+        anchor = QueueRowAnchor(order[index - 1]) if index else QueueHeadAnchor()
         if index < len(order) and pins.get(order[index]) == anchor:
-            pins[order[index]] = row_id
+            pins[order[index]] = moved
         pins[row_id] = anchor
         order.insert(index, row_id)
-        self._set_queue_pins(tuple((member, pins[member]) for member in order if member in pins))
+        self._set_queue_pins(tuple(QueuePin(member, pins[member]) for member in order if member in pins))
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:
@@ -5536,25 +5556,6 @@ def read_state(directory: Path) -> ServiceState:
     return parse_service_state((directory / "state.json").read_text())
 
 
-def upgrade_numbered_queue_pins(state: ServiceState, pins: tuple[tuple[str, int], ...]) -> QueuePins:
-    """Recover anchors from the saved order when the state uses position numbers."""
-    rows: list[tuple[Path, records.Waiter]] = []
-    for place in state.places.values():
-        if place.move_id:
-            row = saved_queue_row(place)
-            row["unit"] = place.ci_runner or row.get("unit", "")
-            rows.append((Path(place.move_id), row))
-    ranked, _ = gate.apply_queue_priority(rows, gate.QueueOrderContext(state.priority, {}))
-    pinned = {row_id for row_id, _ in pins}
-    members = {path.name for path, _ in ranked}
-    order = [path.name for path, _ in ranked if path.name not in pinned]
-    for row_id, position in sorted(pins, key=lambda pin: pin[1]):
-        if row_id in members:
-            order.insert(position, row_id)
-    return tuple((row_id, anchor) for anchor, row_id in zip((QUEUE_FIRST, *order), order)
-                 if row_id in pinned)
-
-
 def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> ServiceState:
     def check_placement_shape(value: object) -> None:
         if isinstance(value, list):
@@ -5571,18 +5572,7 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
 
     raw_state = cast(dict[str, object], json.loads(text))
     check_placement_shape(raw_state)
-    raw_pins = raw_state.get("queue_pins")
-    pairs = cast(list[object], raw_pins) if isinstance(raw_pins, list) else []
-    first = pairs[0] if pairs else None
-    pair = cast(list[object], first) if isinstance(first, list) else []
-    if len(pair) == 2 and type(pair[1]) is int:
-        schema = tuple[tuple[str, int], ...]
-        pins = cast(tuple[tuple[str, int], ...], codec.parse_snapshot_value(pairs, schema))
-        raw_state["queue_pins"] = []
-        state = wire.parse_record(json.dumps(raw_state), ServiceState)
-        state = replace(state, queue_pins=upgrade_numbered_queue_pins(state, pins))
-    else:
-        state = wire.parse_record(text, ServiceState)
+    state = wire.parse_record(text, ServiceState)
     saved_reservations = cast(dict[str, dict[str, object]], raw_state["reservations"])
     legacy_episodes = {episode for episode, record in saved_reservations.items() if "cargo_folder" not in record}
     if not legacy_episodes:

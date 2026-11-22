@@ -374,6 +374,7 @@ The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
 Durable waiter records retain only the step arrival time.
+An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
@@ -2376,11 +2377,10 @@ The admission service gives each wait an ID when it enters the queue.
 The saved place binds the ID to the owner PID, process start time, original arrival time, and episode.
 A refresh keeps the ID.
 The service saves pins in `state.json` when a move completes.
-A pin records the wait ID and the ID of the row directly ahead.
-A pin at the head records `first`.
+A pin records the wait ID and an anchor.
+The anchor identifies the row directly ahead or the head of the queue.
 The service applies the usual priority and arrival rules to all saved waits.
 It then places each pinned wait directly after its anchor.
-When the service reads an old state file, it converts position numbers to anchors.
 A move gives the moved row a new anchor and keeps its former successor in place.
 Absent waits stay in this order until they return or depart.
 Placement, memory admission, and continuation claims use the visible rows in this order.
