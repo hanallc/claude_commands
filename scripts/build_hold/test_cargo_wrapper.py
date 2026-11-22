@@ -12,8 +12,9 @@ import sys
 import tempfile
 import unittest
 from typing import override
+from unittest.mock import patch
 
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, socket_test_support, test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.build_hold.override_guard import require_checkout
@@ -125,10 +126,13 @@ class CargoWrapperTest(unittest.TestCase):
         self.home = self.root / "home"
         self.cwd = self.root / "working directory"
         self.hold = self.root / "hold"
-        self.runtime = self.root / "run"
+        system_root = conf.read_or_repository("build_folders").text("roots.system")
+        socket_parent = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="cargo-sockets-", dir=system_root)))
+        with patch.object(socket_test_support, "socket_parent", return_value=socket_parent):
+            self.runtime = Path(self.enterContext(socket_test_support.short_socket_directory()))
         for directory in (
             self.front, self.real_bin, self.tools, self.home,
-            self.cwd, self.hold, self.runtime,
+            self.cwd, self.hold,
         ):
             directory.mkdir()
         (self.front / "cargo").symlink_to(self.wrapper)
@@ -269,8 +273,8 @@ class CargoWrapperTest(unittest.TestCase):
             if executable is None:
                 self.skipTest(f"{name} is unavailable")
             (self.tools / name).symlink_to(executable)
-        workspace = self.root / "workspace"
-        build = self.root / "build"
+        workspace = self.home / "workspace"
+        build = self.home / "build"
         self.cwd = workspace / "origin/demo/director"
         self.cwd.mkdir(parents=True)
         common_git = self.root / "checkout.git"
@@ -290,7 +294,7 @@ class CargoWrapperTest(unittest.TestCase):
         (self.cwd / "target").symlink_to(output, target_is_directory=True)
         config = self.home / ".claude/config"
         config.mkdir(parents=True)
-        _ = (config / "build_folders.conf").write_text(f"roots.workspace={workspace}\nroots.build={build}\n")
+        _ = (config / "build_folders.conf").write_text("roots.workspace=~/workspace\nroots.build=~/build\n")
         stamp = output / ".lint-sweep-used"
         self.env["FOLDER_EXIT"] = "1"
         for evidence in (None, f"{workspace}/other\n", f"{self.cwd}\nextra\n",

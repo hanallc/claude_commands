@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -53,9 +54,11 @@ class ScratchGuardTests(unittest.TestCase):
             + f"roots.workspace={self.home / 'worktrees'}\n")
         # session_root is the former root; new_root is the session root, absent until a test makes it.
         self.session_root, self.new_root = base / "sessions", base / "session"
+        # The scratch parent's guard applies even inside a unit's TMPDIR.
         self.enterContext(mock.patch.dict(os.environ, {"SESSION_FORMER_ROOT": str(self.session_root),
                                                        "SESSION_TEMP_ROOT": str(self.new_root),
-                                                       "CONF_DIR": str(config)}))
+                                                       "CONF_DIR": str(config),
+                                                       "SCRATCH_ROOT": str(self.temp / "scratch")}))
         # The home folders a real home holds; a new folder directly in home is refused.
         (self.home / "rust" / "hana").mkdir(parents=True)
         (self.home / "worktrees").mkdir()
@@ -101,15 +104,17 @@ class ScratchGuardTests(unittest.TestCase):
             self.assertIn(f"makes a new loose folder ({folder})", decision["permissionDecisionReason"])
         for path in (rust / "hana" / "new" / "a.rs", rust / "scratch" / "old" / "a", rust / "notes.md"):
             self.assertEqual(self.write_hook("Write", "file_path", path), "", path)
-        self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
+        folder = rust / "scratch" / self.name
+        self.assert_refused(f"mkdir {shlex.quote(str(folder))}", str(folder))
 
     def test_manual_checkout_creation_is_refused_under_managed_roots(self) -> None:
         sources = self.home / "worktrees"
         workspace = sources / "hana/demo/change"
         numbered = self.build / "hana/demo/1"
         for path in (workspace, numbered):
-            self.assert_refused(f"mkdir -p {path}", str(path))
-            self.assert_refused(f"git clone origin {path}", str(path))
+            destination = shlex.quote(str(path))
+            self.assert_refused(f"mkdir -p {destination}", str(path))
+            self.assert_refused(f"git clone origin {destination}", str(path))
             self.assertIn(str(path), self.write_hook("Write", "file_path", path / "README"))
         self.assert_allowed("worktrees.py make hana demo change")
 
@@ -125,9 +130,9 @@ class ScratchGuardTests(unittest.TestCase):
                                check=True, timeout=TEST_HANG_GUARD_SECS, env=environment)
         alias = self.home / "old-worktree"
         alias.symlink_to(workspace, target_is_directory=True)
-        self.assert_allowed(f"mkdir -p {alias}/src/sub")
+        self.assert_allowed(f"mkdir -p {shlex.quote(str(alias / 'src/sub'))}")
         self.assertEqual(self.write_hook("Write", "file_path", alias / "src/new.rs"), "")
-        self.assert_refused(f"git clone origin {alias}/nested", str(workspace / "nested"))
+        self.assert_refused(f"git clone origin {shlex.quote(str(alias / 'nested'))}", str(workspace / "nested"))
 
     def test_deleted_session_temp_folder_is_restored_for_each_tool(self) -> None:
         own = self.session_root / "scratch-session"
@@ -163,9 +168,9 @@ class ScratchGuardTests(unittest.TestCase):
         (self.new_root / "verify").mkdir(parents=True)
         self.assert_refused("mkdir ~/port-gate-tree-test", str(self.home / "port-gate-tree-test"))
         self.assert_refused("git clone a ~/port-gate-tree-test2", str(self.home / "port-gate-tree-test2"))
-        self.assert_refused(f"mkdir {self.new_root}/loose", str(self.new_root / "loose"))
+        self.assert_refused(f"mkdir {shlex.quote(str(self.new_root / 'loose'))}", str(self.new_root / "loose"))
         self.assert_allowed("mkdir ~/rust/hana/notes")
-        self.assert_allowed(f"mkdir -p {self.new_root}/verify/fast-track")
+        self.assert_allowed(f"mkdir -p {shlex.quote(str(self.new_root / 'verify/fast-track'))}")
         self.assertEqual(self.run_hook("mktemp -d", temp=self.new_root / "verify"), "")
 
     def test_missing_or_bad_session_id_does_not_read_or_create_a_folder(self) -> None:
@@ -218,42 +223,42 @@ class ScratchGuardTests(unittest.TestCase):
     def test_line_continuation_after_a_separator_does_not_hide_a_folder_command(self) -> None:
         folder = self.temp / "new"
         for space in ("", " "):
-            for command in (f"mkdir {folder}", f"cp -r source {folder}", f"cargo new {folder}"):
+            for command in ("mkdir new", "cp -r source new", "cargo new new"):
                 with self.subTest(space=space, command=command):
                     self.assert_refused("printf x;\\\n" + space + command, str(folder), cwd=self.temp)
 
     def test_line_continuation_inside_a_command_name_joins_the_word(self) -> None:
         folder = self.temp / "new"
-        self.assert_refused(f"mk\\\ndir {folder}", str(folder), cwd=self.temp)
-        self.assert_refused(f"\\\nmkdir {folder}", str(folder), cwd=self.temp)
+        self.assert_refused("mk\\\ndir new", str(folder), cwd=self.temp)
+        self.assert_refused("\\\nmkdir new", str(folder), cwd=self.temp)
 
     def test_line_continuation_before_a_folder_argument_is_deleted(self) -> None:
         folder = self.temp / "new"
-        self.assert_refused(f"mkdir \\\n{folder}", str(folder), cwd=self.temp)
+        self.assert_refused("mkdir \\\nnew", str(folder), cwd=self.temp)
 
     def test_double_quotes_delete_a_line_continuation(self) -> None:
         folder = self.temp / "new"
-        self.assert_refused(f'"mk\\\ndir" {folder}', str(folder), cwd=self.temp)
-        self.assert_refused(f'mkdir "{self.temp}/ne\\\nw"', str(folder), cwd=self.temp)
+        self.assert_refused('"mk\\\ndir" new', str(folder), cwd=self.temp)
+        self.assert_refused('mkdir "ne\\\nw"', str(folder), cwd=self.temp)
 
     def test_single_quotes_keep_a_line_continuation(self) -> None:
         folder = self.temp / "literal\\\nname"
-        self.assert_allowed(f"'mk\\\ndir' {self.temp}/new", cwd=self.temp)
-        self.assert_refused(f"mkdir '{folder}'", str(folder), cwd=self.temp)
-        self.assert_refused(f"printf 'literal\\\ntext';\\\nmkdir {self.temp}/new",
+        self.assert_allowed("'mk\\\ndir' new", cwd=self.temp)
+        self.assert_refused("mkdir 'literal\\\nname'", str(folder), cwd=self.temp)
+        self.assert_refused("printf 'literal\\\ntext';\\\nmkdir new",
                             str(self.temp / "new"), cwd=self.temp)
 
     def test_an_escaped_backslash_keeps_the_newline_separator(self) -> None:
         folder = self.temp / "new"
         for count in (1, 2, 4):
             with self.subTest(backslashes=count):
-                self.assert_refused("printf x;" + "\\" * count + "\n mkdir " + str(folder),
+                self.assert_refused("printf x;" + "\\" * count + "\n mkdir new",
                                     str(folder), cwd=self.temp)
-        self.assert_allowed("printf x;" + "\\" * 3 + "\n mkdir " + str(folder), cwd=self.temp)
+        self.assert_allowed("printf x;" + "\\" * 3 + "\n mkdir new", cwd=self.temp)
 
     def test_quoted_separator_after_a_line_continuation_remains_data(self) -> None:
-        self.assert_allowed(f"printf x \\\n ';' mkdir {self.temp}/new", cwd=self.temp)
-        self.assert_refused(f"printf x \\\n ';';\\\nmkdir {self.temp}/new", str(self.temp / "new"), cwd=self.temp)
+        self.assert_allowed("printf x \\\n ';' mkdir new", cwd=self.temp)
+        self.assert_refused("printf x \\\n ';';\\\nmkdir new", str(self.temp / "new"), cwd=self.temp)
 
     def test_each_judged_command_making_a_loose_folder_is_refused(self) -> None:
         tmp, rust = os.path.realpath("/tmp"), self.home / "rust"
@@ -272,13 +277,14 @@ class ScratchGuardTests(unittest.TestCase):
 
     def test_a_copy_into_an_existing_root_names_the_folder_it_makes(self) -> None:
         self.assert_allowed("cp -r ~/rust/hana ~/rust/")  # hana exists: nothing new
-        self.assert_refused(f"cp -R hana {self.temp}", f"{self.temp}/hana", cwd=self.home / "rust")
+        self.assert_refused(f"cp -R hana {shlex.quote(str(self.temp))}", f"{self.temp}/hana", cwd=self.home / "rust")
 
     def test_task_scratch_scratchpads_run_folders_and_worktrees_are_allowed(self) -> None:
         for command in [
             "mkdir -p /tmp/claude-1000/-home-x/session/scratchpad/copy",
             "mkdir -p /tmp/claude/unit/abc /tmp/claude/delegate/abc /tmp/claude/scratch/run-x",
-            "git clone x ~/rust/repro/cargo-liner-C54-demo",
+            "mkdir -p ~/rust/repro",
+            "git clone x /tmp/claude/scratch/cargo-liner-C54-demo",
             f"make_a_worktree hana ~/rust/{self.name}",
             "mkdir -p ~/rust/hana/target/sub",
             "mktemp -d -p /tmp/claude-1000/-home-x/session/scratchpad",
@@ -294,9 +300,10 @@ class ScratchGuardTests(unittest.TestCase):
         (self.home / "rust" / "hana" / ".git").mkdir()
         for destination in ("/tmp/claude/unit/private-run/dylib_ab/hana",
                             str(self.session_root / "scratch-session" / "dylib_ab" / "hana")):
-            for command in (f"git clone ~/rust/hana {destination}",
-                            f"git -C ~/rust/hana worktree add {destination}",
-                            f"cp -r ~/rust/hana {destination}", f"rsync -a ~/rust/hana/ {destination}"):
+            target = shlex.quote(destination)
+            for command in (f"git clone ~/rust/hana {target}",
+                            f"git -C ~/rust/hana worktree add {target}",
+                            f"cp -r ~/rust/hana {target}", f"rsync -a ~/rust/hana/ {target}"):
                 with self.subTest(command=command):
                     output = self.run_hook(command)
                     self.assertNotEqual(output, "")
@@ -310,20 +317,21 @@ class ScratchGuardTests(unittest.TestCase):
         (self.home / "rust" / "hana" / ".git").mkdir()
         destination = self.session_root / "scratch-session" / "copy-parent"
         destination.mkdir(parents=True)
-        self.assert_refused(f"cp -a --target-directory={destination} ~/rust/hana", f"{destination}/hana")
+        self.assert_refused(f"cp -a --target-directory={shlex.quote(str(destination))} ~/rust/hana",
+                            f"{destination}/hana")
 
     def test_rsync_previews_do_not_create_repository_copies(self) -> None:
         (self.home / "rust" / "hana" / ".git").mkdir()
         destination = self.session_root / "scratch-session" / "copy"
         for option in ("--dry-run", "-n", "-an"):
             with self.subTest(option=option):
-                self.assert_allowed(f"rsync {option} -a ~/rust/hana/ {destination}")
-        self.assert_refused(f"rsync -a ~/rust/hana/ {destination}", str(destination))
+                self.assert_allowed(f"rsync {option} -a ~/rust/hana/ {shlex.quote(str(destination))}")
+        self.assert_refused(f"rsync -a ~/rust/hana/ {shlex.quote(str(destination))}", str(destination))
 
     def test_rsync_times_flag_does_not_consume_the_repository_source(self) -> None:
         (self.home / "rust" / "hana" / ".git").mkdir()
         destination = self.session_root / "scratch-session" / "copy"
-        self.assert_refused(f"rsync -a -t ~/rust/hana/ {destination}", str(destination))
+        self.assert_refused(f"rsync -a -t ~/rust/hana/ {shlex.quote(str(destination))}", str(destination))
 
     def test_rsync_option_values_do_not_enable_a_preview(self) -> None:
         (self.home / "rust" / "hana" / ".git").mkdir()
@@ -331,14 +339,14 @@ class ScratchGuardTests(unittest.TestCase):
         for option in ("--exclude -n", "--exclude=-n", "--exclude --dry-run", "--include -n",
                        "--filter -n", "--exclude-from -n", "-f -n", "-afn", "-e -n", "-aen"):
             with self.subTest(option=option):
-                self.assert_refused(f"rsync -a {option} ~/rust/hana/ {destination}", str(destination))
+                self.assert_refused(f"rsync -a {option} ~/rust/hana/ {shlex.quote(str(destination))}", str(destination))
 
     def test_rsync_preview_flags_remain_flags_after_option_values(self) -> None:
         (self.home / "rust" / "hana" / ".git").mkdir()
         destination = self.session_root / "scratch-session" / "copy"
         for option in ("--exclude -n --dry-run", "--exclude=-n -an", "-f -n -n", "-afn --dry-run"):
             with self.subTest(option=option):
-                self.assert_allowed(f"rsync -a {option} ~/rust/hana/ {destination}")
+                self.assert_allowed(f"rsync -a {option} ~/rust/hana/ {shlex.quote(str(destination))}")
 
     def test_words_that_are_data_are_never_judged(self) -> None:
         self.assert_allowed(f"cat <<'EOF' > notes.md\nmkdir /tmp/{self.name}\nEOF\necho done")

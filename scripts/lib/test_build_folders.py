@@ -1917,8 +1917,10 @@ assert not loaded, loaded
             self.root.chmod(0o700)
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_explicit_parent_allocates_under_a_private_parent(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+    @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
+                         "the memory filesystem is unavailable")
+    def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -1927,6 +1929,7 @@ assert not loaded, loaded
                 self.assertTrue(path.is_dir())
                 self.assertEqual(path.stat().st_dev, parent.stat().st_dev)
             self.assertFalse(path.exists())
+        self.assertFalse(parent.exists())
 
     def test_context_removes_build_output_after_completion_and_interruption(self) -> None:
         for interrupted in (False, True):

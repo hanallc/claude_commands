@@ -36,10 +36,10 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib import conf, socket_test_support
 from scripts.lint.memory_test_support import config_environment
 from scripts.production import gate
 from scripts.lib.process_group import send_process_group
-from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -55,9 +55,12 @@ def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
 
 @final
 class GuestTests(unittest.TestCase):
+    system_root: str = ""
+
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.system_root = conf.read_or_repository("build_folders").text("roots.system")
         install_aws_fixture_settings(root)
         write_guest_config(root)
         _ = (root / 'gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
@@ -162,11 +165,13 @@ class GuestTests(unittest.TestCase):
             mount.chmod(0o700)
             session = self.tool_session()
             setup = session[session.index('ln -sf'):].split('chown -R', 1)[0]
-            setup = setup.replace('/run/current-system/sw/bin', str(system)).replace('$box_dir/tool-profile', str(root / 'profile'))
-            setup = setup.replace('/bin/bash', str(root / 'bash')).replace('/bin/zsh', str(root / 'zsh'))
+            setup = setup.replace('/run/current-system/sw/bin', '"$fixture_system"')
+            setup = setup.replace('/bin/bash', shlex.quote(str(root / 'bash')))
+            setup = setup.replace('/bin/zsh', shlex.quote(str(root / 'zsh')))
             _ = subprocess.run(['bash', '-ec', setup], check=True, capture_output=True, text=True,
                 timeout=TEST_HANG_GUARD_SECS,
-                env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+                env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH'],
+                     'box_dir': str(root), 'fixture_system': str(system)})
             version = subprocess.check_output([str(system / 'python3'), '-c',
                 'import json, sys; print(json.dumps(list(sys.version_info[:2])))'], text=True,
                 timeout=TEST_HANG_GUARD_SECS)
@@ -202,7 +207,9 @@ class GuestTests(unittest.TestCase):
 
 
     def test_guest_uses_whole_machine_without_types_with_timeout_and_counts(self) -> None:
-        socket_folder = self.enterContext(short_socket_directory())
+        socket_parent = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="guest-sockets-", dir=self.system_root)))
+        with mock.patch.object(socket_test_support, "socket_parent", return_value=socket_parent):
+            socket_folder = self.enterContext(socket_test_support.short_socket_directory())
         with tempfile.TemporaryDirectory() as folder, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
             root = Path(folder)
             ready_path = Path(socket_folder) / 'stalled'
