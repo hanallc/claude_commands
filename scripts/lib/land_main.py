@@ -125,29 +125,58 @@ def checked_git(checkout: Path, *arguments: str,
 def remote_branch_commit(checkout: Path, remote: str, branch: str, *,
                          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> str:
     """Fetch and return the exact commit that the remote advertises for the branch."""
+    return remote_branch_tip(checkout, remote, branch, time_limit=time_limit).commit
+
+
+class RemoteDefaultBranch(Enum):
+    HEAD = "resolve the remote HEAD"
+
+
+@dataclass(frozen=True)
+class AdvertisedBranchTip:
+    branch: str
+    commit: str
+
+
+def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBranch, *,
+                      time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> AdvertisedBranchTip:
+    """Read and fetch one advertised branch tip without updating local refs."""
     # The snapshot protects against fetches in this checkout.
     # Another clone can still publish a different commit after ls-remote.
-    ref = f"refs/heads/{branch}"
-    query = run_git(checkout, "ls-remote", "--refs", "--", remote, ref, time_limit=time_limit)
+    default = isinstance(branch, RemoteDefaultBranch)
+    ref = "HEAD" if default else f"refs/heads/{branch}"
+    query = run_git(checkout, "ls-remote", "--symref" if default else "--refs", "--", remote, ref,
+                    time_limit=time_limit)
+    targets: list[str] = []
     matching_shas: list[str] = []
     for row in git_output(query, "ls-remote").splitlines():
-        sha, _, advertised_ref = row.partition("\t")
-        if not advertised_ref or "\t" in advertised_ref or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        value, _, advertised_ref = row.partition("\t")
+        if not advertised_ref or "\t" in advertised_ref:
+            raise LandError(f"{remote}: malformed ls-remote output for {ref}")
+        if default and advertised_ref == ref and value.startswith("ref: refs/heads/"):
+            targets.append(value.removeprefix("ref: refs/heads/"))
+            continue
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
             raise LandError(f"{remote}: malformed ls-remote output for {ref}")
         if advertised_ref == ref:
-            matching_shas.append(sha)
+            matching_shas.append(value)
     if not matching_shas:
         raise RemoteBranchMissing(f"{remote} does not advertise {ref}")
     if len(matching_shas) != 1:
         raise LandError(f"{remote}: expected one full commit SHA for {ref}")
+    if isinstance(branch, RemoteDefaultBranch):
+        if len(targets) != 1 or not targets[0]:
+            raise LandError(f"{remote}: expected one symbolic HEAD branch")
+        branch = targets[0]
     sha = matching_shas[0]
-    _ = checked_git(checkout, "fetch", "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
+    _ = checked_git(checkout, "-c", "remote.origin.followRemoteHEAD=never", "fetch",
+                    "--no-write-fetch-head", "--no-tags", "--no-prune", "--refmap=",
                     "--", remote, sha, time_limit=time_limit)
     resolved = checked_git(checkout, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}",
                            time_limit=time_limit)
     if resolved != sha:
         raise LandError(f"{remote}: {sha} for {ref} is not a commit")
-    return sha
+    return AdvertisedBranchTip(branch, sha)
 
 
 def land(checkout: Path, commit: str, branch: str = "main", *,

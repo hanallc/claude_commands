@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, git_exclude, git_files, origin_deletion
+from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, git_exclude, git_files, land_main, origin_deletion
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.production import production_doc, staff
@@ -576,35 +576,15 @@ def check_origin_landing(record: WorktreeRecord, origin: CheckedOriginTip) -> Ch
     return origin
 
 
-@dataclass(frozen=True)
-class CleanupLandingTarget:
-    branch: str
-    commit: str
-
-
-def origin_cleanup_tip(repo: Path, ref: str) -> CleanupLandingTarget:
-    """Read the landing target and fetch its commit without changing refs."""
-    result = git(repo, "ls-remote", "--exit-code", "--symref", "origin", ref, check=False)
-    if result.returncode == 2:
-        reason = "origin default branch is missing" if ref == "HEAD" else f"{ref}: origin branch is missing"
-        raise Refused(1, reason)
-    if result.returncode:
-        raise Refused(1, failure_detail(result))
-    target = ref
-    tip = ""
-    for line in result.stdout.splitlines():
-        value, _, name = line.partition("\t")
-        if name == ref:
-            if value.startswith("ref: "):
-                target = value.removeprefix("ref: ")
-            else:
-                tip = value
-    if not target.startswith("refs/heads/") or not tip:
-        raise Refused(1, f"{ref}: origin did not advertise a branch commit")
-    if git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False).returncode != 0:
-        _ = git(repo, "-c", "remote.origin.followRemoteHEAD=never", "fetch", "--no-tags", "--no-prune",
-                "--no-write-fetch-head", "--refmap=", "origin", tip)
-    return CleanupLandingTarget(target.removeprefix("refs/heads/"), tip)
+def origin_cleanup_tip(repo: Path, branch: str | land_main.RemoteDefaultBranch) -> land_main.AdvertisedBranchTip:
+    try:
+        return land_main.remote_branch_tip(repo, "origin", branch)
+    except land_main.RemoteBranchMissing as error:
+        reason = (f"refs/heads/{branch}: origin branch is missing" if isinstance(branch, str)
+                  else "origin default branch is missing")
+        raise Refused(1, reason) from error
+    except land_main.LandError as error:
+        raise Refused(1, str(error)) from error
 
 
 def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | Kept:
@@ -628,7 +608,7 @@ def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | 
     try:
         record = read_record(record_file(path))
     except FileNotFoundError:
-        target = origin_cleanup_tip(repo, "HEAD")
+        target = origin_cleanup_tip(repo, land_main.RemoteDefaultBranch.HEAD)
         base = git(repo, "merge-base", f"refs/heads/{branch}", target.commit).stdout.strip()
         record = new_record(path, branch, repo, base, "", target.branch)
     else:
@@ -636,7 +616,7 @@ def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | 
             return Kept(path, "the worktree does not match its record")
         if record.stage is MakeStage.MAKING:
             return Kept(path, "worktree creation is incomplete")
-        target = origin_cleanup_tip(repo, f"refs/heads/{record.merge_branch}")
+        target = origin_cleanup_tip(repo, record.merge_branch)
     result = landed(record, target.commit)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
