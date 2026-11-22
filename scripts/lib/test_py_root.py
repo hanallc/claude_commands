@@ -6,7 +6,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import tarfile
 import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -108,20 +107,20 @@ class PythonRootTests(unittest.TestCase):
 
     def test_old_revision_uses_its_own_scripts_with_the_new_shim(self) -> None:
         repository = Path(__file__).resolve().parents[2]
+        shim = Path("scripts/lib/py")
+        module = Path("scripts/build_targets/execution_transport.py")
         with tempfile.TemporaryDirectory() as directory:
-            folder = Path(directory)
-            archive = folder / "HEAD.tar"
-            _ = subprocess.run(["git", "archive", "847e0da3f", "-o", str(archive)],
-                               cwd=repository, check=True, timeout=30)
-            checkout = folder / "HEAD"
-            checkout.mkdir()
-            with tarfile.open(archive) as source:
-                source.extractall(checkout, filter="data")
+            checkout = Path(directory).resolve() / "old-checkout"
+            for relative in (shim, module):
+                destination = checkout / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _ = shutil.copy2(repository / relative, destination)
+            self.assertTrue((checkout / shim).is_file())
             self.assertFalse((checkout / "scripts/lib/python_startup/sitecustomize.py").exists())
-            output = self.run_shim(repository / "scripts/lib/py", ["-c",
-                "from scripts.build_targets import test_aws_status; print(test_aws_status.__file__)"],
+            output = self.run_shim(repository / shim, ["-c",
+                "from scripts.build_targets import execution_transport; print(execution_transport.__file__)"],
                 checkout, dict(os.environ))
-            self.assertEqual(Path(output).resolve(), checkout / "scripts/build_targets/test_aws_status.py")
+            self.assertEqual(Path(output).resolve(), checkout / module)
 
     def test_separator_preserves_a_filename_that_starts_with_a_dash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
