@@ -167,7 +167,7 @@ class ConfigRead:
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-                 recover_invalid: bool = True
+                 recover_invalid: bool = True, use_file_limits: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
@@ -180,6 +180,8 @@ class ConfigRead:
                     raise
                 return default, None
             bad = setting.value
+            if not use_file_limits:
+                return convert(setting.value), setting.value
             if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
                 return convert(""), setting.value
             return _converted(setting, convert), setting.value
@@ -207,7 +209,7 @@ class ConfigRead:
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
-        if isinstance(self.settings, dict):
+        if use_file_limits and isinstance(self.settings, dict):
             current = self.settings.get(self.effective_key(key))
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
@@ -230,10 +232,10 @@ class ConfigRead:
             return RecoveredValue(value, reason)
         return fallback if fallback is not None else UnavailableValue(reason)
 
-    def origin(self, key: str, convert: Callable[[str], Result]
+    def origin(self, key: str, convert: Callable[[str], Result], *, use_file_limits: bool = True
                ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-        """Distinguish live values from recovered values without a warning."""
-        return self._resolve(key, convert, warn=False)
+        """Read a live or recovered value. The converter can supply all validation."""
+        return self._resolve(key, convert, warn=False, use_file_limits=use_file_limits)
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,

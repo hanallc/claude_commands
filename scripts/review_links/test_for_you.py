@@ -15,7 +15,7 @@ from scripts.for_you.action import ActionStore
 from scripts.production import staff
 from scripts.rebuild import need
 from scripts.review_links import change_browser, for_you
-from scripts.statusline import rebuild_row
+from scripts.statusline import for_you_count, rebuild_row
 
 
 class ForYouTests(unittest.TestCase):
@@ -226,9 +226,14 @@ class ForYouTests(unittest.TestCase):
 
     def test_global_count_does_not_read_compared_changes(self) -> None:
         self.write_comparison("rebuild natedev")
+        need.add_need("mac", "b" * 40, "Apply Mac settings.", "console", "staff-a")
+        _ = self.add_action()
         with (patch.object(rebuild_row, "DEFAULT_CONFIG", self.config),
               patch.object(rebuild_row, "read_compared_changes", return_value={}) as changes):
-            self.assertEqual(for_you.global_action_count(), "1")
+            self.assertEqual(for_you.global_action_count(), "3")
+            self.assertEqual(for_you_count.global_action_count(self.config), "3")
+            actions = for_you.read_for_status_line(self.config).status_line_actions()
+            self.assertEqual(actions, for_you.StatusLineActions(("natedev", "mac"), 1))
         changes.assert_not_called()
 
     def test_comparison_uses_only_commits_for_its_running_system_and_configured_revision(self) -> None:

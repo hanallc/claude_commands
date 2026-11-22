@@ -23,13 +23,14 @@ from datetime import date, datetime
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
+from inspect import signature
 from io import StringIO
 from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Literal, TextIO, cast, override
 from collections.abc import Callable, Generator
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
@@ -771,6 +772,7 @@ class ChangePageTests(unittest.TestCase):
             "STAFF_FILE": str(self.temporary / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.temporary / "showrunner-state"),
             "REBUILD_NEEDS_DIR": str(self.temporary / "rebuild-needs"),
+            "FOR_YOU_ACTIONS_DIR": str(self.temporary / "for-you-actions"),
             "USER_ZONE": "America/New_York",
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
@@ -1850,7 +1852,7 @@ class ChangePageTests(unittest.TestCase):
         update_registration.write_question_record(update_registration.QuestionRecord(path, owner.id, asker.id, item, "open"))
         return "question/" + owner.id + "/" + path.name
 
-    def test_f075_open_shows_a_legacy_question_when_numbering_fails(self) -> None:
+    def test_f075_open_shows_a_legacy_question_when_another_source_is_unreadable(self) -> None:
         key = self.file_user_question()
         other_key = self.file_user_question("Read the numbered Question?")
         folder = update_registration.question_folder(self.production, update_registration.QuestionStaff.read())
@@ -1863,7 +1865,7 @@ class ChangePageTests(unittest.TestCase):
         blocked.parent.mkdir(parents=True)
         _ = blocked.write_bytes(b"---\n\xff\n")
         items = review_items.read(self.root, show="open", kinds=(review_items.ReviewType.QUESTION,))
-        self.assertEqual({item.key: item.id for item in items}, {key: "", other_key: "page-owner/Q8"})
+        self.assertEqual({item.key: item.id for item in items}, {key: "page-owner/"+path.stem, other_key: "page-owner/Q8"})
         self.assertEqual({record: record.read_bytes() for record in before}, before)
         self.assertFalse((record_store.state_root() / "record-ids" / "question.water").exists())
 
@@ -2142,6 +2144,27 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
+
+    def test_exact_question_save_requires_a_revision_check(self) -> None:
+        key = self.file_user_question("Check the selected question")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("fixture", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        scope = update_registration.question_scope(question.owner, staff.snapshot())
+        args = (scope, question, "answer", "Use the compact layout.")
+        before_write = Mock()
+        with self.assertRaises(TypeError):
+            _ = signature(change_browser.save_question_record).bind(*args, before_write=before_write)
+
+        def refuse() -> object:
+            raise review_items.ReviewRecordChanged("The selected question changed.")
+
+        previous = question.record.path.read_bytes()
+        with self.assertRaises(review_items.ReviewRecordChanged):
+            change_browser.save_question_record(scope, question, "answer", args[3],
+                change_browser.ExactQuestionSave(refuse), before_write=before_write)
+        before_write.assert_not_called()
+        self.assertEqual(question.record.path.read_bytes(), previous)
 
     def test_failed_question_answer_alerts_the_tab_showrunner(self) -> None:
         producer = fixture_member("producer", name="bob")
