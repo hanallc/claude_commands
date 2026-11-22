@@ -16,7 +16,7 @@ from typing import Callable, TypedDict, cast, override
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, fake_memory_readings, write_config_fixture
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -115,14 +115,16 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from contextlib import redirect_stdout
+from dataclasses import replace
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
-from scripts.build_queue import admission_protocol as queue_wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_protocol as queue_wire, execution_identity, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -132,6 +134,8 @@ root = Path(os.environ["TEST_RUNNER_STATE"])
 mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
 if mode in ("disk-once", "lost-once"):
     mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
+if mode == "post-fetch-cleanup-timeout":
+    request = replace(request, fetch=offload.FetchFolder("target/fixture"))
 actions = []
 adopted_claim_ids = []
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
@@ -205,9 +209,31 @@ def copy_source(*arguments):
                                   else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
-def stream(arguments):
+def fetch(*arguments):
+    if mode != "post-fetch-cleanup-timeout":
+        return real_fetch(*arguments)
+    actions.append("fetch")
+    return offload.Fetched(root / "fetched", 1)
+
+def stream(arguments, *limits):
     global remote_output, remote_status
     actions.append("run")
+    if mode == "missing-result-after-authorization":
+        (root / "mac-loss-ready").touch()
+        os._exit(75)
+    if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout") or (
+            mode == "post-fetch-cleanup-timeout" and limits and isinstance(limits[0], offload.CleanupOnly)):
+        (root / "mac-loss-ready").touch()
+        remote_output, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE + "\n", 101)
+                                        if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42\n", 42))
+        program = f"import os, select; print({remote_output.rstrip()!r}, flush=True); "
+        if mode == "post-fetch-cleanup-timeout":
+            program += "os.close(1); os.close(2); "
+        program += "select.select([], [], [])"
+        def start(*_args, **options):
+            return real_popen([sys.executable, "-I", "-S", "-c", program], **options)
+        with mock.patch.object(subprocess, "Popen", side_effect=start):
+            return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
@@ -216,11 +242,13 @@ def stream(arguments):
                 + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix\n"
                 + "mac_cleanup=kept\n")
         status = 75
-    elif mode == "lost":
+    elif mode in ("lost", "lost-cleanup-timeout"):
         wire, status = "connection lost\n", 255
     else:
-        status = 75 if mode == "completed-decline" else 42 if mode == "failed" else 4 if mode == "no-tests" else 0
-        wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
+        statuses = {"completed-decline": 75, "failed": 42, "post-fetch-cleanup-timeout": 42, "no-tests": 4}
+        status = statuses.get(mode, 0)
+        cleanup = "kept" if mode == "post-fetch-cleanup-timeout" else "0"
+        wire = f"mac_exit={status}\nmac_cleanup={cleanup}\n"
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
@@ -230,6 +258,12 @@ def stream(arguments):
             wire += settled.stdout
 
     remote_output, remote_status = wire, status
+
+    if limits:
+        def start(*_args, **options):
+            return real_popen([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", wire], **options)
+        with mock.patch.object(subprocess, "Popen", side_effect=start):
+            return offload.ProcessController.stream_mac_run(controller, arguments, *limits)
 
     class Remote:
         stdout = io.StringIO(wire)
@@ -242,9 +276,17 @@ def stream(arguments):
         return offload.ProcessController.stream_mac_run(controller, arguments)
 
 real_run = subprocess.run
+real_popen = subprocess.Popen
+real_fetch = offload.fetch_folder
 def commands(arguments, **options):
     if arguments[0] == "ssh":
         actions.append("cleanup")
+        if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout", "post-fetch-cleanup-timeout"):
+            raise AssertionError("A timed-out stream must not start another cleanup")
+        if mode in ("lost-cleanup-timeout", "lost-authorization-reply"):
+            (root / "mac-loss-ready").touch()
+            assert 0 < options["timeout"] <= 1, options
+            raise subprocess.TimeoutExpired(arguments, options["timeout"])
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
         count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
         fence = ""
@@ -254,12 +296,22 @@ def commands(arguments, **options):
             "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
 
+real_consume = admission_client.consume_permission
+def consume(request):
+    result = real_consume(request)
+    if mode == "lost-authorization-reply" and isinstance(result, queue_wire.FirstAuthorization):
+        (root / "mac-loss-ready").touch()
+        raise queue_wire.AdmissionUnavailable("the authorization reply was lost")
+    return result
+
 started = time.monotonic()
-with mock.patch.object(controller, "complete_claim", side_effect=complete), \
+with mock.patch.object(admission_client, "consume_permission", side_effect=consume), \
+     mock.patch.object(controller, "complete_claim", side_effect=complete), \
      mock.patch.object(controller, "capture", side_effect=capture), \
      mock.patch.object(controller, "stream_mac_run", side_effect=stream), \
      mock.patch.object(offload, "copy_tracked_scripts", side_effect=copy_scripts), \
      mock.patch.object(offload, "copy_tree_with_key", side_effect=copy_source), \
+     mock.patch.object(offload, "fetch_folder", side_effect=fetch), \
      mock.patch.object(offload, "trusted_linux_source", return_value=True), \
      mock.patch.object(subprocess, "run", side_effect=commands):
     result = offload.run_offload(controller, config, request, started)
@@ -396,7 +448,7 @@ source() {
             f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-            + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
+            + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",

@@ -384,7 +384,8 @@ def _is_placement_control(request: wire.Request) -> bool:
 
 def _waits_for_live_service(request: wire.Request) -> bool:
     """A placement call waits while a live service is slow, and fails at once when it is down."""
-    return _is_placement_control(request) or isinstance(request, status_wire.PlacementStatusRequest)
+    return _is_placement_control(request) or (
+        isinstance(request, status_wire.PlacementStatusRequest) and not request.include_permission)
 
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
@@ -427,6 +428,21 @@ def placement_status(episode: str, attempt: str, *, wait_for_service: bool = Tru
     if isinstance(reply, status_wire.PlacementStatusReply):
         return reply
     raise wire.AdmissionUnavailable("invalid placement status answer")
+
+
+def _print_placement_permission(episode: str, attempt: str) -> int:
+    """Read launch permission once within the query time limit."""
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt, include_permission=True))
+    if isinstance(reply, status_wire.PlacementStatusReply) and isinstance(reply.status, status_wire.KnownPlacementStatus):
+        permission = reply.status.permission
+        if isinstance(permission, placement.PermissionAvailable):
+            print("available")
+            return 0
+        if isinstance(permission, placement.PermissionConsumed):
+            print("consumed")
+            return 0
+    print("unknown")
+    return 1
 
 
 def _print_placement_status(episode: str, attempt: str) -> int:
@@ -1921,6 +1937,7 @@ class ClientArguments(argparse.Namespace):
     sidecar: str = ""
     shell_state: Path | None = None
     wait_events: bool = False
+    launch_only: bool = False
     argv: list[str] = []
     episode: str = ""
     attempt: str = ""
@@ -2164,6 +2181,7 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
+    _ = status_parser.add_argument("--launch-only", action="store_true")
     run_parser = subcommands.add_parser("verify-run-slot")
     _ = run_parser.add_argument("--pid", type=int, required=True)
     _ = run_parser.add_argument("--episode", default="")
@@ -2233,6 +2251,8 @@ def main(argv: list[str] | None = None) -> int:
     retry_token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
     try:
         if args.command == "placement-status":
+            if args.launch_only:
+                return _print_placement_permission(args.episode, args.attempt)
             return _print_placement_status(args.episode, args.attempt)
         if args.command == "down-alert":
             return down_alert()

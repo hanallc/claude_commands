@@ -25,7 +25,8 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
-from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
+                                              write_config_fault, commit_config_fixture)
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
@@ -350,6 +351,75 @@ class RunnerCompletionTests(unittest.TestCase):
                 }])
 
 
+    def test_capture_timeout_closes_the_pipes_before_reaping(self) -> None:
+        arguments = ["ssh", "fixture", "true"]
+        controller = offload.ProcessController()
+        with io.BytesIO() as stdout, io.BytesIO() as stderr:
+            def reap() -> int:
+                self.assertTrue(stdout.closed)
+                self.assertTrue(stderr.closed)
+                return -9
+
+            communicate = mock.Mock(side_effect=[subprocess.TimeoutExpired(arguments, 1, b"partial"), (b"partial", b"")])
+            wait = mock.Mock(side_effect=reap)
+            process = mock.Mock(stdout=stdout, stderr=stderr, communicate=communicate, wait=wait)
+            with mock.patch.object(subprocess, "Popen", return_value=process):
+                result = controller.capture(arguments, offload.CommandTimeLimit(1))
+            self.assertIsInstance(result, offload.CommandTimedOut)
+            communicate.assert_called_once_with(timeout=1)
+            wait.assert_called_once_with()
+            self.assertFalse(controller.attempt_evidence.traffic.transfers[0]["complete"])
+
+    def test_release_deadline_stops_the_helpers_ssh_child(self) -> None:
+        ssh = """
+import socket
+import sys
+
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    peer.sendall(b"+")
+    peer.recv(1)
+"""
+        helper = """
+import subprocess
+import sys
+
+fd = int(sys.argv[1])
+subprocess.run([sys.executable, "-I", "-S", "-c", sys.argv[2], str(fd)], pass_fds=(fd,), check=True)
+"""
+        controller = offload.ProcessController()
+        identity = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        controller.claim_identity = identity
+        reader, sender = socket.socketpair()
+        with reader, sender:
+            reader.settimeout(TEST_HANG_GUARD_SECS)
+
+            def start(arguments: Sequence[str], *, stdout: int, stderr: int,
+                      start_new_session: bool = False) -> subprocess.Popen[bytes]:
+                self.assertEqual(arguments[2], "release")
+                descriptor = sender.fileno()
+                process = START_SUBPROCESS([sys.executable, "-I", "-S", "-c", helper, str(descriptor), ssh],
+                                            stdout=stdout, stderr=stderr, pass_fds=(descriptor,),
+                                            start_new_session=start_new_session)
+                sender.close()
+                try:
+                    self.assertEqual(reader.recv(1), b"+")
+                except BaseException:
+                    process.kill()
+                    _ = process.wait()
+                    raise
+                return process
+
+            with mock.patch.object(subprocess, "Popen", side_effect=start):
+                result = offload.release_claim(controller, deadline=offload.CommandTimeLimit(1))
+
+            self.assertIsInstance(result, offload.ClaimReleaseUnconfirmed)
+            self.assertEqual(controller.claim_identity, identity)
+            reader.settimeout(1)
+            try:
+                self.assertEqual(reader.recv(1), b"")
+            except TimeoutError:
+                self.fail("The SSH child survived the claim release deadline")
+
     def test_split_utf8_tail_preserves_status_and_counts_raw_bytes(self) -> None:
         wire = b"mac_test: tail fragment: \xa9\nmac_exit=42\nmac_cleanup=kept\n"
         process = mock.Mock(stdout=io.BytesIO(wire), wait=mock.Mock(return_value=0))
@@ -506,7 +576,7 @@ class OffloadSettingsTests(unittest.TestCase):
             "offload=on\nhost=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "linux_only.cargo-liner=\nmac_budget_gib=24\nconnect_timeout_s=6\n"
             + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\nunreachable_wait_seconds=45\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **copies_environment(self.root),
@@ -721,6 +791,14 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = unknown.write_text("offload=on\n")
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
             _ = eligibility.read_config(unknown)
+
+    def test_ssh_keepalive_count_follows_the_unreachable_wait(self) -> None:
+        for wait, count in ((45, 3), (50, 4), (600, 40)):
+            with self.subTest(wait=wait):
+                _ = write_config_fixture(self.root / "build_targets.conf",
+                                         f"platform.mac=macos\nunreachable_wait_seconds={wait}\n")
+                options = offload.ssh_options(eligibility.read_config(self.settings).connection)
+                self.assertEqual(options[-4:], ["-o", "ServerAliveInterval=15", "-o", f"ServerAliveCountMax={count}"])
 
     def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
         _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", template="mac_test")
@@ -1270,7 +1348,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
-            + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")
+            + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n"
+            + UNREACHABLE_WAIT_FIXTURE)
         self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
         request_placement = admission_client.request_placement
 
@@ -1873,6 +1952,31 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertNotIn("HANA_TARGET_ONLY", observed)
                 self.assertEqual(observed["CLICOLOR"], "call-value")
                 self.assertEqual(observed["LC_TERMINAL"], "target-terminal")
+
+    def test_mac_cleanup_writes_only_markers_after_the_verdict(self) -> None:
+        request = offload.OffloadRequest(
+            self.repository, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
+        repository = eligibility.KnownRepository("hana")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            config = eligibility.read_config(self.config_path)
+            cleanup = offload.remote_cleanup_command(config, request, repository)
+            mirror = self.root / offload.remote_mirror(repository, request.target, request.slot)
+        # Linux df has no -g option and a missing mirror fails cd; the cleanup hides both error lines.
+        for present in (False, True):
+            with self.subTest(mirror_present=present):
+                if present:
+                    mirror.mkdir(parents=True)
+                result = subprocess.run(["bash", "-c", "echo mac_exit=42; " + cleanup], cwd=self.root,
+                                        env={**self.environment, "HOME": str(self.root), "PATH": os.environ["PATH"]},
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+                                        timeout=30)
+                verdict, *after = result.stdout.splitlines()
+                self.assertEqual(verdict, "mac_exit=42")
+                if present:
+                    self.assertTrue(after and after[0].startswith("mac_trim="), result.stdout)
+                    self.assertTrue(all(line.startswith(("mac_trim=", "mac_cleanup=")) for line in after), result.stdout)
+                else:
+                    self.assertEqual(after, ["mac_cleanup=1"])
 
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(

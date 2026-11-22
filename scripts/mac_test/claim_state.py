@@ -748,10 +748,10 @@ def state_paths(target: str = "") -> StatePaths:
 
 
 @contextmanager
-def locked(path: Path) -> Generator[None, None, None]:
+def locked(path: Path, *, wait: bool = True) -> Generator[None, None, None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with record_after_unlock(), path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             yield
         finally:
