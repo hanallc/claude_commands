@@ -1310,14 +1310,14 @@ function limitWaits(waits, words) {
     <div class="build-limit-count"><span class="build-limit-marks">${limitMarks("wait", names.length)}</span>
       <span>${esc(limitWords(words, "waiting", {count: names.length}))}</span></div>${limitNames(names)}</div>`).join("");
 }
-function limitCell(cell, words) {
+function limitCell(cell, words, showNoLimit) {
   const {limit, used, runs, merge_above, other, other_used, waits, note} = cell;
   let count = "";
   if (limit != null) {
     count = limitWords(words, used == null ? "limit" : "count", {used, limit});
   } else if (used || runs.length || Object.keys(waits).length) {
     count = used ? limitWords(words, "running", {count: used}) : "";
-    if (!cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
+    if (showNoLimit && !cell.has_limit_key) count += count ? ` · ${words.no_limit}` : words.no_limit;
   }
   const marks = limitPlaces(used, limit, Math.max(0, (used ?? 0) - merge_above.length));
   let contents = count ? `<div class="build-limit-count num">${marks}
@@ -1349,7 +1349,7 @@ function renderBuildLimits(limits) {
   }).join("");
   const rows = limits.repositories.map(row =>
     `<tr${row.quiet ? ' class="quiet"' : ""}><th scope="row">${esc(row.name)}${row.owner ? `<small>${esc(row.owner)}</small>` : ""}</th>
-      ${machines.map(([key]) => `<td>${limitCell(row[key], words)}</td>`).join("")}</tr>`).join("");
+      ${machines.map(([key]) => `<td>${limitCell(row[key], words, key !== "mac")}</td>`).join("")}</tr>`).join("");
   const legend = [["run", "legend_run"], ["free", "legend_free"], ["line", "legend_line"],
     ["merge", "merge_above"], ["wait", "legend_wait"]];
   const html = `<div class="build-limits-scroll"><table class="build-limits-table" aria-label="${esc(words.table)}">

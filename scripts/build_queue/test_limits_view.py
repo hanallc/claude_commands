@@ -34,7 +34,7 @@ class BuildLimitsTests(unittest.TestCase):
         hana = "https://example.invalid/team/hana"
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as index:
             root = Path(directory)
-            source = root / "source"
+            source = root / "project"
             source.mkdir()
             scratch = root / "scratch"
             env = fixture_git_environment(root)
@@ -47,11 +47,19 @@ class BuildLimitsTests(unittest.TestCase):
             git(source, "remote", "add", "origin", "git@example.invalid:team/project.git")
             _ = commit_repository(source, "Fixture", allow_empty=True, env=env)
             git(root, "clone", "-q", "--shared", str(source), str(scratch))
+            allowed = root / "mac-quiet"
+            alias = root / "quiet-copy"
+            denied = root / "local-only"
+            for folder, name in ((allowed, "quiet"), (alias, "quiet"), (denied, "denied")):
+                git(root, "init", "-q", str(folder))
+                git(folder, "remote", "add", "origin", f"https://example.invalid/team/{name}.git")
             _ = index.execute("CREATE TABLE steps (repo_identity TEXT, repo_path TEXT, started_at TEXT)")
             _ = index.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
                 (primary, "", store.utc_iso(now)),
                 ("https://example.invalid/other/project", "", store.utc_iso(now)),
-                ("https://example.invalid/team/quiet", "", store.utc_iso(now - 29 * 86400)),
+                ("https://example.invalid/team/quiet", str(allowed), store.utc_iso(now - 29 * 86400)),
+                ("https://example.invalid/team/quiet", str(alias), store.utc_iso(now - 29 * 86400)),
+                ("https://example.invalid/team/denied", str(denied), store.utc_iso(now - 29 * 86400)),
                 ("https://example.invalid/team/old", "", store.utc_iso(now - 31 * 86400)),
                 (str(source), str(source), store.utc_iso(now)),
                 ("unknown", str(scratch), store.utc_iso(now)),
@@ -60,7 +68,7 @@ class BuildLimitsTests(unittest.TestCase):
             origins = limits_view.Origins()
             with mock.patch.object(repository, "output", wraps=repository.output) as git_read:
                 history = limits_view.recent_steps(index, now, origins)
-                self.assertEqual(git_read.call_count, 1)
+                self.assertEqual(git_read.call_count, 4)
             self.assertEqual(origins.folders[str(scratch)], primary)
             mac_snapshot = self.read_mac_fixture(root, scratch)
             mac = limits_view.read_mac((mac_snapshot,))
@@ -108,9 +116,10 @@ class BuildLimitsTests(unittest.TestCase):
             shown = limits_view.build_limits(queue, (mac_snapshot,), waits, cloud_names,
                                              {"session": "Mac build"}, saved, UTC, mac=mac)
         self.assertEqual([(row.name, row.owner, row.quiet) for row in shown.repositories], [
-            ("hana", "", False), ("project", "team", False), ("project", "other", True), ("quiet", "", True),
+            ("hana", "", False), ("project", "team", False), ("denied", "", True),
+            ("project", "other", True), ("quiet", "", True),
         ])
-        hana_row, project_row, spare_project, quiet = shown.repositories
+        hana_row, project_row, denied_row, spare_project, quiet = shown.repositories
         cell = project_row.natedev
         self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
         self.assertEqual(cell.waits, {"The run limit for project on natedev is full.": ["Run limit"]})
@@ -121,13 +130,15 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual(shown.natedev.shared[-1].limit, 2)
         self.assertEqual((hana_row.aws.used, hana_row.aws.limit), (None, 1))
         self.assertEqual(shown.mac.state, "Held until 13:00 UTC")
-        self.assertEqual(shown.mac.shared, (limits_view.Metric("mac_disk", None, 47, "GiB", "minimum"),))
+        self.assertEqual(shown.mac.shared, ())
         self.assertEqual(shown.mac.unattributed, 1)
         self.assertEqual(shown.mac.waits, {"The queue cannot check whether this run can start.": ["Mac wait"]})
         self.assertEqual((project_row.mac.used, project_row.mac.limit, project_row.mac.runs), (1, 1, ["Mac build"]))
         self.assertEqual(project_row.mac.waits, {"The run limit for project on Mac is full.": ["Mac run limit"]})
+        self.assertEqual((quiet.mac.used, quiet.mac.limit, quiet.mac.note), (0, 1, ""))
+        self.assertEqual((denied_row.mac.limit, denied_row.mac.note), (None, "Does not run here"))
         self.assertIsNone(spare_project.mac.limit)
-        self.assertIsNone(quiet.mac.limit)
+        self.assertEqual(spare_project.mac.note, "")
         self.assertEqual(next(metric for metric in shown.natedev.shared if metric.label == "disk").waits,
                          {"The build disk has less free space than the queue requires.": ["Disk wait"]})
         self.assertEqual(shown.natedev.shared[0].waits, {"This run needs more free memory to start.": ["Memory wait"]})
@@ -152,7 +163,9 @@ class BuildLimitsTests(unittest.TestCase):
 
     def read_mac_fixture(self, root: Path, scratch: Path) -> targets.TargetSnapshot:
         settings = root / "mac.conf"
-        _ = settings.write_text("# range: 1..1000\nfree_floor_gib=47\n", encoding="utf-8")
+        _ = settings.write_text(
+            "# range: 1..1000\nfree_floor_gib=47\nlinux_only.project=linux_package\nlinux_only.mac-quiet=\n",
+            encoding="utf-8")
         _ = (root / "build_targets.conf").write_text(
             "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n", encoding="utf-8")
         state = root / "state"

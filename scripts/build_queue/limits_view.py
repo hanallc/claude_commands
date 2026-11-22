@@ -20,7 +20,7 @@ from scripts.build_targets.execution_transport import HanaControlTransport, Hana
 from scripts.buildlog import charts, repository, store
 from scripts.lib import conf
 from scripts.lint.memory_admit import gpu_test_reservation, repository_run_owner, reserved_repository_runs
-from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test import claim_state, eligibility, mac_test
 
 WORDS: Mapping[str | type[object], str] = {
     "title": "Build limits",
@@ -33,6 +33,7 @@ WORDS: Mapping[str | type[object], str] = {
     "count": "{used} of {limit}",
     "limit": "Limit {limit}",
     "no_limit": "No limit",
+    "does_not_run": "Does not run here",
     "running": "{count} running",
     "other_running": "{count} other running",
     "merge_above": "A merge run above the limit",
@@ -43,7 +44,6 @@ WORDS: Mapping[str | type[object], str] = {
     "memory": "Memory for builds",
     "gpu": "GPU tests",
     "disk": "Free disk",
-    "mac_disk": "Disk for builds",
     "cloud": "Places",
     "money": "Money today",
     "minimum_value": "{used} · {limit} minimum",
@@ -142,21 +142,15 @@ class BuildLimits:
 
 
 @dataclass(frozen=True)
-class MacClaim:
-    record: claim_state.RunRecord
-    limit: int | None
-
-
-@dataclass(frozen=True)
 class MacReading:
-    target: str
+    paths: claim_state.StatePaths
     state: targets.TargetState
-    claims: tuple[MacClaim, ...]
-    disk_floor: float | None
+    claims: tuple[claim_state.RunRecord, ...]
+    settings: conf.ConfigRead
 
 
 def read_mac(snapshots: target_availability.Snapshots) -> MacReading | None:
-    """Read Mac claim capacity from the same records and reader as admission."""
+    """Read live claims and the settings for the Mac target."""
     if isinstance(snapshots, target_availability.SnapshotsUnreadable):
         return None
     for snapshot in snapshots:
@@ -165,28 +159,36 @@ def read_mac(snapshots: target_availability.Snapshots) -> MacReading | None:
             break
     else:
         return None
-    claims: dict[claim_state.ClaimIdentity, MacClaim] = {}
-    capacities: dict[tuple[str, str], int | None] = {}
+    claims: dict[claim_state.ClaimIdentity, claim_state.RunRecord] = {}
     paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target.name), target.name,
                                   registry_selected=True, platform=target.platform)
-    settings = conf.read(target.settings)
-    try:
-        disk_floor = settings.number("free_floor_gib")
-    except conf.Unusable:
-        disk_floor = None
     for claim in snapshot.claims:
         record = claim.record
-        if not mac_test.run_is_live(record):
-            continue
-        name, key = record.get("repo_name", ""), record.get("repo_key", "")
-        if name and (name, key) not in capacities:
-            try:
-                capacities[name, key] = mac_test.slot_capacity(
-                    paths, claim_state.RepositoryScope(name, key), configuration=settings)
-            except conf.Unusable:
-                capacities[name, key] = None
-        claims[claim_state.claim_identity(record)] = MacClaim(record, capacities.get((name, key)))
-    return MacReading(target.name, snapshot.states[0], tuple(claims.values()), disk_floor)
+        if mac_test.run_is_live(record):
+            claims[claim_state.claim_identity(record)] = record
+    return MacReading(paths, snapshot.states[0], tuple(claims.values()), conf.read(target.settings))
+
+
+def apply_mac_policy(mac: MacReading, origin: str, names: set[str], cell: Cell) -> None:
+    if not names:
+        return
+    try:
+        # A check reads the repository rule without testing workspace packages.
+        allowed: list[eligibility.KnownRepository] = []
+        for name in names:
+            policy = eligibility.linux_only_policy(
+                mac.settings, eligibility.KnownRepository(name, origin), Path(), "", "check")
+            if isinstance(policy, eligibility.KnownRepository):
+                allowed.append(policy)
+        if not allowed:
+            cell.note = WORDS["does_not_run"]
+        elif len(allowed) == 1:
+            policy, = allowed
+            cell.limit = mac_test.slot_capacity(
+                mac.paths, claim_state.RepositoryScope(policy.name, policy.key), configuration=mac.settings)
+            cell.used = cell.used or 0
+    except conf.Unusable:
+        return
 
 
 def recorded_origin(identity: str) -> str:
@@ -204,6 +206,7 @@ class Origins:
     folders: dict[str, str] = field(default_factory=dict[str, str])
     active_folders: set[str] = field(default_factory=set[str])
     sources: dict[str, str] = field(default_factory=dict[str, str])
+    names: dict[str, set[str]] = field(default_factory=dict[str, set[str]])
 
     def resolve(self, identity: str, folder: str) -> str:
         """Use a recorded origin or an origin from the last refresh."""
@@ -236,6 +239,8 @@ class Origins:
                 self.sources[source] = recorded_origin(repository.remote_identity(remote.strip(), folder)) if remote else ""
             except ValueError:
                 self.sources[source] = ""
+            if (origin := self.sources[source]) and (name := repository.repo_name(folder)):
+                self.names.setdefault(origin, set()).add(name)
         self.folders[folder] = self.sources[source]
         return self.folders[folder]
 
@@ -249,8 +254,10 @@ def recent_steps(connection: sqlite3.Connection, now: float, origins: Origins) -
     for identity, path in rows:
         key = identity if isinstance(identity, str) else ""
         folder = path if isinstance(path, str) else ""
-        if origin := recorded_origin(key) or origins.read(key) or origins.read(folder):
-            history.add(origin)
+        origin = recorded_origin(key) or origins.read(key)
+        checkout_origin = origins.read(folder)
+        if origin or checkout_origin:
+            history.add(origin or checkout_origin)
     return frozenset(history)
 
 
@@ -465,6 +472,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     metric_waits: dict[str, dict[str, list[str]]] = {}
     policy_rows: dict[str, set[str]] = {}
     unbound_waits: dict[str, dict[str, list[str]]] = {}
+    mac_names: dict[str, set[str]] = {}
 
     def row(origin: str) -> RepositoryRow:
         if origin not in rows:
@@ -475,16 +483,15 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         _ = row(origin)
     mac_unattributed = 0
     if mac is not None:
-        for claim in mac.claims:
-            record = claim.record
+        for record in mac.claims:
             origin = origins.resolve(record.get("repo_key", ""), record["worktree"])
             if not origin:
                 mac_unattributed += 1
                 continue
             cell = row(origin).mac
             cell.used = (cell.used or 0) + 1
-            if claim.limit is not None:
-                cell.limit = claim.limit
+            if name := record.get("repo_name"):
+                mac_names.setdefault(origin, set()).add(name)
             if name := names.get(record["submitting_session"]):
                 cell.runs.append(name)
     prefix = local + "."
@@ -545,17 +552,15 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 destination = unbound_waits.setdefault(reason.repository, {})
         elif mac is not None and (
                 isinstance(step.route, target_config.MacOnly)
-                or isinstance(step.route, target_config.PinnedTarget) and step.route.target == mac.target
-                or isinstance(reason, records.RunLimitWait) and reason.machine == mac.target):
+                or isinstance(step.route, target_config.PinnedTarget) and step.route.target == mac.paths.target
+                or isinstance(reason, records.RunLimitWait) and reason.machine == mac.paths.target):
             destination = mac_waits
-            if isinstance(reason, records.RunLimitWait) and reason.machine == mac.target:
+            if isinstance(reason, records.RunLimitWait) and reason.machine == mac.paths.target:
                 machine_name = WORDS["mac"]
                 waiter = ordered.get((step.pid, step.since))
                 if origin := origins.resolve(waiter.get("repo_identity", "") if waiter is not None else "", step.folder):
-                    cell = row(origin).mac
-                    if cell.limit is None:
-                        cell.limit = reason.limit
-                    destination = cell.waits
+                    mac_names.setdefault(origin, set()).add(reason.repository)
+                    destination = row(origin).mac.waits
         elif isinstance(step.route, target_config.PinnedTarget) and step.route.target in saved.aws_targets:
             destination = aws_waits
         elif (isinstance(step.route, target_config.MacOnly)
@@ -632,6 +637,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
 
     counts = Counter(item.name for item in rows.values())
     for origin, item in rows.items():
+        if mac is not None:
+            apply_mac_policy(mac, origin, origins.names.get(origin, set()) | mac_names.get(origin, set()), item.mac)
         if counts[item.name] > 1:
             namespace = urlsplit(origin).path.strip("/").split("/")[:-1]
             item.owner = "/".join(namespace)
@@ -642,7 +649,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.other.clear()
                 cell.other_used = 0
                 cell.merge_above.clear()
-            if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
+            if cell.used or (cell is not item.mac and cell.limit is not None) or cell.waits or cell.runs or cell.other_used:
                 item.quiet = False
 
     room = explanation.room
@@ -661,10 +668,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     aws_state = WORDS["in_use"] if cloud_used or any(hana.used for hana in saved.hana) else ""
     cloud = Metric("cloud", cloud_used, cloud_slots, waits=metric_waits.get("cloud", {}),
                    unreadable=cloud_slots is None and not cloud_recorded)
-    mac_metrics = (Metric("mac_disk", None, mac.disk_floor, "GiB", "minimum"),) if mac and mac.disk_floor is not None else ()
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
                                     (*limits, *unbound), local_waits, unattributed),
-                       MachineLimits(mac_state(mac, snapshots, zone), mac_metrics, mac_waits, mac_unattributed),
+                       MachineLimits(mac_state(mac, snapshots, zone), (), mac_waits, mac_unattributed),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, len(aws_unattributed)),
                        tuple(sorted(rows.values(), key=lambda item: (item.quiet, item.name.casefold(), item.owner.casefold()))),
                        isinstance(saved.history, charts.IndexUnavailable), saved.history_stale, unplaced)
