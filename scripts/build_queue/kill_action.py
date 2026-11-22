@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+import fcntl
 from hashlib import sha256
 import hmac
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -15,16 +18,18 @@ import re
 import secrets
 import signal
 import subprocess
+import sys
 import threading
 import time
-from typing import TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
-from scripts.build_queue import admission_client, admission_records, execution_identity
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf, process_start
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import GATE_PROGRAMS, command_program, live_process_arguments
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit
@@ -35,7 +40,6 @@ from scripts.production import staff
 PATH = "/console/build-kill"
 PROC = Path("/proc")
 CARGO_PROGRAMS = frozenset({"cargo", "cargo-nextest", "cargo-tile-real"})
-BUILD_PROGRAMS = CARGO_PROGRAMS | {"verify.sh"}
 BUILD_STEPS = CARGO_BUILD_VERBS | {"cargo", "cargo-nextest", "fmt"}
 
 
@@ -51,7 +55,6 @@ class KillCandidate:
     step: str
     admitted_at: str
     sidecar: str
-    verify_call: bool = False
 
     @property
     def reference(self) -> str:
@@ -78,14 +81,13 @@ def candidate(step: admission_records.RunningStep, reservation: admission_record
             or step.pid != reservation["pid"] or reservation["pid"] <= 1
             or not reservation["start_time"].isdecimal()
             or step.step in GATE_PROGRAMS or isinstance(step.job, StepJob)
-            or not (step.step in BUILD_STEPS or isinstance(step.verify, admission_records.VerifyCall))):
+            or isinstance(step.verify, admission_records.VerifyCall) or step.step not in BUILD_STEPS):
         return NoKillCandidate()
     run = step.run
     row_pid, row_start = ((run.pid, run.start_time) if isinstance(run, LiveBuildRun)
                           else (reservation["pid"], reservation["start_time"]))
     return KillCandidate(reservation["pid"], reservation["start_time"], row_pid, row_start,
-                         step.session_id, step.step, reservation["admitted_at"], reservation["sidecar"],
-                         isinstance(step.verify, admission_records.VerifyCall))
+                         step.session_id, step.step, reservation["admitted_at"], reservation["sidecar"])
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,8 @@ class ProgramScope:
     path: Path
     device: int
     inode: int
+    anchor_pid: int
+    anchor_start: str
 
 
 @dataclass(frozen=True)
@@ -108,15 +112,7 @@ class DetachedCommand:
     supervisor_start: str
 
 
-@dataclass(frozen=True)
-class VerifyRun:
-    """The exact Verify shell that owns the run and its step scopes."""
-
-    pid: int
-    start: str
-
-
-StopRoute = ProgramScope | DetachedCommand | VerifyRun
+StopRoute = ProgramScope | DetachedCommand
 
 
 @dataclass(frozen=True)
@@ -149,6 +145,46 @@ def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str
     return command_program(args) if isinstance(args, list) else ""
 
 
+class ProcessStopApi(Protocol):
+    """The shared stop API becomes available when phase 44fh reaches main."""
+
+    def supported(self) -> bool: ...
+    def ProcessLifetime(self, pid: int, start: str, /) -> object: ...
+    def ScopeUnit(self, slice_name: str, scope_name: str, /) -> object: ...
+    def pin_process(self, process: object, /) -> AbstractContextManager[int]: ...
+    def stop_command_tree(self, leader: object, scope: object, number: int, /) -> None: ...
+
+
+def process_stop_api() -> ProcessStopApi | NoStopRoute:
+    try:
+        module = cast(ProcessStopApi, cast(object, import_module("scripts.lib.process_stop")))
+    except ModuleNotFoundError as error:
+        if error.name != "scripts.lib.process_stop":
+            raise
+        return NoStopRoute()
+    return module if module.supported() else NoStopRoute()
+
+
+def read_scope_file(directory: int, name: str) -> bytes:
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as source:
+        return source.read()
+
+
+def matches_scope(directory: int, scope: ProgramScope) -> bool:
+    identity = os.fstat(directory)
+    return (identity.st_dev, identity.st_ino) == (scope.device, scope.inode)
+
+
+def anchor_in_scope(directory: int, scope: ProgramScope) -> bool:
+    try:
+        observed = (PROC / str(scope.anchor_pid) / "cgroup").read_bytes().splitlines()
+        expected = b"0::/" + os.fsencode(scope.path.relative_to("/sys/fs/cgroup"))
+        return expected in observed and str(scope.anchor_pid).encode() in read_scope_file(directory, "cgroup.procs").split()
+    except (OSError, ValueError):
+        return False
+
+
 def program_scope(run: KillCandidate, processes: dict[int, memory_admit.ProcessIdentity],
                   descendants: set[int]) -> ProgramScope | NoStopRoute:
     if not run.sidecar:
@@ -161,16 +197,24 @@ def program_scope(run: KillCandidate, processes: dict[int, memory_admit.ProcessI
         if (scope.parent != memory_admit.builds_slice_cgroup().resolve(strict=True)
                 or not re.fullmatch(r"run-[a-zA-Z0-9]+\.scope", scope.name)):
             return NoStopRoute()
-        memory_admit.check_memory_reading(scope / "cgroup.events")
-        identity = scope.stat()
-        members = memory_admit.scope_members(scope)
-        running = members & processes.keys()
-        if (run.holder_pid in members or not running or not members <= descendants
-                or not any(program(pid, processes) in BUILD_PROGRAMS for pid in running)):
-            return NoStopRoute()
+        memory_admit.check_memory_reading(scope / "cgroup.procs")
+        descriptor = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            identity = os.fstat(descriptor)
+            direct_members = {int(pid) for pid in read_scope_file(descriptor, "cgroup.procs").split()}
+            members = memory_admit.scope_members(scope)
+            if not members or members != direct_members or run.holder_pid in members or not members <= descendants:
+                return NoStopRoute()
+            for pid in sorted(members & processes.keys()):
+                if program(pid, processes) in CARGO_PROGRAMS:
+                    route = ProgramScope(scope, identity.st_dev, identity.st_ino, pid, processes[pid].start)
+                    if anchor_in_scope(descriptor, route) and live(pid, route.anchor_start):
+                        return route
+        finally:
+            os.close(descriptor)
     except (OSError, ValueError):
-        return NoStopRoute()
-    return ProgramScope(scope, identity.st_dev, identity.st_ino)
+        pass
+    return NoStopRoute()
 
 
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
@@ -219,7 +263,7 @@ def detached_build(command: object, leader: str) -> bool:
     if not all(isinstance(value, str) for value in arguments):
         return False
     recorded = command_program(cast(list[str], arguments))
-    return recorded in BUILD_PROGRAMS | {"lint"} and leader in (recorded, "systemd-run")
+    return recorded in CARGO_PROGRAMS | {"lint"} and leader in (recorded, "systemd-run")
 
 
 def in_group(pid: int, group: int) -> bool:
@@ -231,7 +275,9 @@ def in_group(pid: int, group: int) -> bool:
 
 def stop_route(run: KillCandidate, recipient: staff.StaffId,
                processes: dict[int, memory_admit.ProcessIdentity]) -> StopRoute | NoStopRoute:
-    """Require a live Cargo or Verify process with a dedicated stop boundary."""
+    """Require a live Cargo process with a dedicated stop boundary."""
+    if isinstance(process_stop_api(), NoStopRoute):
+        return NoStopRoute()
     if not live(run.holder_pid, run.holder_start) or not live(run.row_pid, run.row_start):
         return NoStopRoute()
     descendants = memory_admit.process_tree({run.holder_pid: run.holder_start}, processes)
@@ -239,21 +285,13 @@ def stop_route(run: KillCandidate, recipient: staff.StaffId,
     if run.holder_pid not in row_tree:
         return NoStopRoute()
     ancestor = run.holder_pid
-    verify_shell = 0
     while ancestor in processes:
-        name = program(ancestor, processes)
-        if name in {"validate_ci.sh", "ci_cargo_front.py"}:
+        if program(ancestor, processes) in {"verify.sh", "validate_ci.sh", "ci_cargo_front.py"}:
             return NoStopRoute()
-        if name == "verify.sh":
-            verify_shell = ancestor
         parent = processes[ancestor].parent
         if parent not in processes or int(processes[parent].start) > int(processes[ancestor].start):
             break
         ancestor = parent
-    if verify_shell:
-        return VerifyRun(run.row_pid, run.row_start) if verify_shell == run.row_pid else NoStopRoute()
-    if run.verify_call:
-        return NoStopRoute()
     if isinstance(scope := program_scope(run, processes, descendants), ProgramScope):
         return scope
     return detached_command(run, recipient, processes, row_tree)
@@ -317,26 +355,45 @@ class KillResult(TypedDict):
     reference: str
     step: str
     pid: int
-    stop: StopState
-    delivery: DeliveryState
+    stop: Literal[StopState.STOPPING, StopState.STOPPED, StopState.UNCONFIRMED]
+    delivery: Literal[DeliveryState.PENDING, DeliveryState.SENT, DeliveryState.QUEUED, DeliveryState.FAILED]
     time: str
     recipient_name: str
     recipient_role: str
 
 
 @dataclass(frozen=True)
-class PendingNotice:
-    """Keep the words until the stop can be confirmed."""
-
-    result: KillResult
-    recipient: staff.StaffId
-    message: str
+class StopRequested:
+    """The action is durable and has no saved stop receipt."""
 
 
 @dataclass(frozen=True)
-class StopFinished:
+class WatchingStop:
+    """The stop route accepted the request."""
+
+
+@dataclass(frozen=True)
+class SendingNotice:
+    """Cleanup is confirmed and the keyed notice needs a result."""
+
+
+@dataclass(frozen=True)
+class FinishedStop:
+    """The action is complete. Its result stays visible until this time."""
+
+    visible_until: float
+
+
+@dataclass(frozen=True)
+class SavedKillAction:
+    id: str
+    run: KillCandidate
+    route: StopRoute
     result: KillResult
-    expires: float
+    recipient: staff.StaffId
+    message: str
+    reason: str
+    stage: StopRequested | WatchingStop | SendingNotice | FinishedStop
 
 
 def notification(run: KillCandidate, at: datetime) -> str:
@@ -350,249 +407,258 @@ def scope_empty(route: ProgramScope) -> bool:
     except FileNotFoundError:
         return True
     try:
-        identity = os.fstat(descriptor)
-        if (identity.st_dev, identity.st_ino) != (route.device, route.inode):
-            return False
-        events = os.open("cgroup.events", os.O_RDONLY, dir_fd=descriptor)
-        with os.fdopen(events, "rb") as evidence:
-            return b"populated 0" in evidence.read().splitlines()
+        return matches_scope(descriptor, route) and b"populated 0" in read_scope_file(descriptor, "cgroup.events").splitlines()
     except FileNotFoundError:
         return not route.path.exists()
     finally:
         os.close(descriptor)
 
 
-StopConfirmation = Callable[[], bool]
-
-
-def stop_program_scope(route: ProgramScope, run: KillCandidate, seconds: float) -> StopConfirmation | NoStopRoute:
-    """Ask the user manager to stop the verified scope."""
-    processes = memory_admit.process_table(PROC)
-    descendants = memory_admit.process_tree({run.holder_pid: run.holder_start}, processes)
-    if not live(run.row_pid, run.row_start) or program_scope(run, processes, descendants) != route:
-        return NoStopRoute()
+def stop_program_scope(route: ProgramScope, run: KillCandidate) -> bool:
+    """Use the shared scope route with the exact scope and anchor from the handle."""
+    api = process_stop_api()
+    if isinstance(api, NoStopRoute):
+        return False
+    memory_admit.check_memory_reading(route.path / "cgroup.procs")
+    descriptor = os.open(route.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        result = subprocess.run(["systemctl", "--user", "stop", route.path.name],
-                                capture_output=True, check=False, timeout=seconds)
-    except subprocess.TimeoutExpired:
-        # The manager can finish its stop after the client exits.
-        return lambda: scope_empty(route)
-    if result.returncode:
-        return NoStopRoute()
-    return lambda: scope_empty(route)
-
-
-def member_scope(pid: int) -> ProgramScope | NoStopRoute:
-    """Find a scope in builds.slice from a verified member's kernel record."""
-    for line in (PROC / str(pid) / "cgroup").read_text().splitlines():
-        if line.startswith("0::"):
-            path = Path("/sys/fs/cgroup", line[3:].lstrip("/"))
-            root = memory_admit.builds_slice_cgroup()
-            for scope in (path, *path.parents):
-                if scope.is_relative_to(root) and scope.suffix == ".scope":
-                    memory_admit.check_memory_reading(scope / "cgroup.events")
-                    info = scope.stat()
-                    return ProgramScope(scope, info.st_dev, info.st_ino)
-    return NoStopRoute()
-
-
-@dataclass
-class RunCleanup:
-    """Keep each observed descendant and scope until cleanup can be confirmed."""
-
-    pid: int
-    start: str
-    members: dict[int, str] = field(default_factory=dict[int, str])
-    scopes: set[ProgramScope] = field(default_factory=set[ProgramScope])
-    incomplete: bool = False
-
-    def sample(self) -> None:
-        processes = memory_admit.process_table(PROC)
-        roots = {self.pid: self.start, **self.members}
-        for pid in memory_admit.process_tree(roots, processes) - {self.pid}:
-            start = processes[pid].start
-            if not live(pid, start):
-                continue
-            self.members[pid] = start
-            try:
-                scope = member_scope(pid)
-                if isinstance(scope, ProgramScope) and live(pid, start):
-                    self.scopes.add(scope)
-            except OSError:
-                if live(pid, start):
-                    self.incomplete = True
-
-    def complete(self) -> bool:
-        self.sample()
-        return (not self.incomplete and ended(self.pid, self.start)
-                and all(ended(pid, start) for pid, start in self.members.items())
-                and all(scope_empty(scope) for scope in self.scopes))
-
-
-def stop_verify(route: VerifyRun, run: KillCandidate) -> StopConfirmation | NoStopRoute:
-    """Signal the Verify shell through its pidfd so its exit trap can run."""
-    descriptor = os.pidfd_open(route.pid)
-    try:
-        argv = live_process_arguments(PROC / str(route.pid), route.start)
-        if not isinstance(argv, list) or command_program(argv) != "verify.sh":
-            return NoStopRoute()
-        cleanup = RunCleanup(route.pid, route.start)
-        cleanup.sample()
-        if run.sidecar:
-            table = memory_admit.process_table(PROC)
-            descendants = memory_admit.process_tree({run.holder_pid: run.holder_start}, table)
-            scope = program_scope(run, table, descendants)
-            if isinstance(scope, ProgramScope):
-                cleanup.scopes.add(scope)
-        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-        return cleanup.complete
+        anchor = api.ProcessLifetime(route.anchor_pid, route.anchor_start)
+        with api.pin_process(anchor):
+            if (not matches_scope(descriptor, route) or not anchor_in_scope(descriptor, route)
+                    or not live(run.row_pid, run.row_start) or not live(run.holder_pid, run.holder_start)):
+                return False
+            scope = api.ScopeUnit(route.path.parent.name, route.path.name)
+            api.stop_command_tree(anchor, scope, signal.SIGTERM)
+        return True
     finally:
         os.close(descriptor)
 
 
-def stop_detached(route: DetachedCommand, run: KillCandidate, reason: str) -> StopConfirmation | NoStopRoute:
-    """Ask the supervisor to stop the exact command named in the handle."""
-    from scripts.agents import detached_runs, worker_lifecycle
+def stop_detached(route: DetachedCommand, run: KillCandidate, reason: str) -> bool:
+    """Use the verified stop API published by the shared detached-run change."""
+    from scripts.agents import detached_runs
 
     stop = cast(Callable[[Path, str, detached_runs.CommandGroup], bool] | None,
                 getattr(detached_runs, "stop_verified_command", None))
-    if stop is None or not live(run.holder_pid, run.holder_start) or not live(run.row_pid, run.row_start):
-        return NoStopRoute()
-    cleanup = RunCleanup(route.group, route.started)
-    cleanup.sample()
-    if not stop(route.record, reason, detached_runs.CommandGroup(route.group, route.started)):
-        return NoStopRoute()
-
-    def complete() -> bool:
-        raw = worker_lifecycle.read_json_object(route.record)
-        return (raw.get("status") == "finished" and raw.get("stop_reason") == reason
-                and ended(run.holder_pid, run.holder_start) and ended(run.row_pid, run.row_start)
-                and cleanup.complete())
-
-    return complete
+    return (stop is not None and live(run.holder_pid, run.holder_start) and live(run.row_pid, run.row_start)
+            and stop(route.record, reason, detached_runs.CommandGroup(route.group, route.started)))
 
 
-def observe(confirmation: StopConfirmation, seconds: float, sample_seconds: float) -> bool:
-    deadline = time.monotonic() + seconds
-    while True:
-        try:
-            if confirmation():
-                return True
-        except (OSError, ValueError):
-            pass
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(remaining, sample_seconds))
+def detached_receipt(route: DetachedCommand, reason: str) -> dict[str, object]:
+    from scripts.agents import worker_lifecycle
+
+    raw = worker_lifecycle.read_json_object(route.record)
+    if (raw.get("stop_reason") == reason and raw.get("command_group") == route.group
+            and raw.get("command_started") == route.started):
+        return raw
+    return {}
 
 
-def deliver(recipient: staff.StaffId, message: str) -> DeliveryState:
-    response = subprocess.run(session_send.send_argv("--to", f"staff:{recipient}", "--from", "nate",
-                                                     "--text", message),
+def stop_complete(action: SavedKillAction) -> bool:
+    route = action.route
+    if isinstance(route, ProgramScope):
+        return scope_empty(route)
+    receipt = detached_receipt(route, action.reason)
+    return (receipt.get("status") == "finished" and ended(action.run.holder_pid, action.run.holder_start)
+            and ended(action.run.row_pid, action.run.row_start))
+
+
+@dataclass(frozen=True)
+class RetryNotice:
+    """The sender reports a delivery in progress."""
+
+
+def deliver(action: SavedKillAction) -> DeliveryState | RetryNotice:
+    from scripts.review_links.change_page import review_send_options
+
+    options = review_send_options(f"builds-kill:{action.id}", f"staff:{action.recipient}")
+    response = subprocess.run(session_send.send_argv("--to", f"staff:{action.recipient}", "--from", "nate",
+                                                     *options, "--text", action.message),
                               capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
                               timeout=send_budget.seconds(), check=False)
-    if response.returncode == 0 and response.stdout.startswith("SENT:"):
+    output = response.stdout
+    if response.returncode == 0 and (output.startswith("SENT:") or
+            output.startswith("SKIPPED:") and "postmaster confirmed delivery" in output):
         return DeliveryState.SENT
-    if response.returncode == 1 and response.stdout.startswith("QUEUED:"):
+    if (response.returncode == 1 and output.startswith("QUEUED:")
+            or response.returncode == 0 and output.startswith("SKIPPED:")):
         return DeliveryState.QUEUED
+    if output.startswith(("RETRY:", "PENDING:")):
+        return RetryNotice()
     return DeliveryState.FAILED
 
 
 class KillActions:
-    """Issue handles and retain pending notices and stop results."""
+    """Persist each stop, recover its notice, and publish recent results."""
 
-    def __init__(self) -> None:
+    def __init__(self, root: Path) -> None:
+        self._folder: Path = root / ".review-link-build-kill"
         self._key: bytes = secrets.token_bytes(32)
         self._lock: threading.Lock = threading.Lock()
-        self._pending: dict[str, PendingNotice] = {}
-        self._finished: dict[str, StopFinished] = {}
-
-    def has_pending(self) -> bool:
-        with self._lock:
-            return bool(self._pending)
+        self._actions: dict[str, SavedKillAction] = {}
 
     def handle(self, target: KillTarget) -> str:
         data = repr((target.candidate.reference, target.route, target.recipient)).encode()
         return hmac.new(self._key, data, sha256).hexdigest()
 
-    def _expire(self) -> None:
-        now = time.monotonic()
-        for reference, finished in tuple(self._finished.items()):
-            if finished.expires <= now:
-                del self._finished[reference]
+    def _cache(self, action: SavedKillAction) -> None:
+        with self._lock:
+            self._actions[action.result["reference"]] = action
+
+    def _read(self, reference: str) -> SavedKillAction:
+        text = (self._folder / f"{reference}.json").read_text()
+        action = admission_wire.parse_record(text, SavedKillAction)
+        if action.result["reference"] != reference or action.run.reference != reference:
+            raise ValueError("the Builds stop record has a different run")
+        return action
+
+    def _save(self, action: SavedKillAction) -> None:
+        reference = action.result["reference"]
+        write_text_atomic(self._folder / f"{reference}.json", admission_wire.encode_record(action), new_file_mode=0o600)
+        self._cache(action)
+
+    @contextmanager
+    def _record_lock(self, reference: str) -> Generator[None]:
+        self._folder.mkdir(exist_ok=True, mode=0o700)
+        descriptor = os.open(self._folder / f"{reference}.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
 
     def options(self) -> tuple[dict[str, KillOffer], list[KillResult]]:
-        targets = live_targets()
-        now = datetime.now(user_zone())
         with self._lock:
-            self._expire()
-            offers: dict[str, KillOffer] = {
-                reference: {"handle": self.handle(target), "pid": target.candidate.row_pid,
-                            "started_by": target.starter, "recipient_name": target.recipient_name,
-                            "step": target.candidate.step, "message": notification(target.candidate, now)}
-                for reference, target in targets.items()
-                if reference not in self._pending and reference not in self._finished}
-            return offers, [*(entry.result for entry in self._pending.values()),
-                            *(entry.result for entry in self._finished.values())]
+            now = time.time()
+            for reference, action in tuple(self._actions.items()):
+                if isinstance(action.stage, FinishedStop) and action.stage.visible_until <= now:
+                    del self._actions[reference]
+            actions = dict(self._actions)
+        try:
+            targets = live_targets()
+        except (OSError, ValueError, admission_wire.AdmissionUnavailable):
+            targets = {}
+        now_in_zone = datetime.now(user_zone())
+        offers: dict[str, KillOffer] = {
+            reference: {"handle": self.handle(target), "pid": target.candidate.row_pid,
+                        "started_by": target.starter, "recipient_name": target.recipient_name,
+                        "step": target.candidate.step, "message": notification(target.candidate, now_in_zone)}
+            for reference, target in targets.items() if reference not in actions
+        }
+        return offers, [action.result for action in actions.values()]
 
-    def _finish(self, notice: PendingNotice, stopped: bool, retention: float) -> KillResult:
-        result: KillResult = {**notice.result, "stop": StopState.UNCONFIRMED}
-        if stopped:
-            delivery = DeliveryState.FAILED
+    def _finish(self, action: SavedKillAction, result: KillResult, retention: float) -> SavedKillAction:
+        finished = replace(action, result=result, stage=FinishedStop(time.time() + retention))
+        self._save(finished)
+        return finished
+
+    def _advance(self, action: SavedKillAction, retention: float) -> SavedKillAction:
+        """Record each step before proceeding. Recovery only checks or sends."""
+        if isinstance(action.stage, StopRequested):
+            if not isinstance(action.route, DetachedCommand) or not detached_receipt(action.route, action.reason):
+                return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED}, retention)
+            action = replace(action, stage=WatchingStop())
+            self._save(action)
+        if isinstance(action.stage, WatchingStop) and stop_complete(action):
+            action = replace(action, stage=SendingNotice())
+            self._save(action)
+        if isinstance(action.stage, SendingNotice):
             try:
-                delivery = deliver(notice.recipient, notice.message)
+                delivery = deliver(action)
             except (OSError, ValueError, subprocess.SubprocessError):
-                pass
-            result = {**result, "stop": StopState.STOPPED, "delivery": delivery}
-        with self._lock:
-            reference = result["reference"]
-            del self._pending[reference]
-            self._finished[reference] = StopFinished(result, time.monotonic() + retention)
-        return result
+                return action
+            if isinstance(delivery, RetryNotice):
+                return action
+            return self._finish(action, {**action.result, "stop": StopState.STOPPED, "delivery": delivery}, retention)
+        return action
 
-    def _finish_later(self, notice: PendingNotice, confirmation: StopConfirmation,
-                      seconds: float, sample: float, retention: float) -> None:
-        _ = self._finish(notice, observe(confirmation, seconds, sample), retention)
+    def _watch(self, reference: str, sample: float, retention: float) -> None:
+        while True:
+            try:
+                with self._record_lock(reference):
+                    action = self._advance(self._read(reference), retention)
+                    if isinstance(action.stage, FinishedStop):
+                        self._cache(action)
+                        return
+            except FileNotFoundError:
+                return
+            except (OSError, ValueError) as error:
+                print(f"review-links build kill {reference}: {error}", file=sys.stderr)
+            time.sleep(sample)
+
+    def _start_watch(self, reference: str, settings: conf.ConfigRead) -> None:
+        threading.Thread(target=self._watch, args=(reference, settings.number("kill_pending_check_seconds"),
+                         settings.number("kill_result_seconds")), daemon=True).start()
+
+    def resume(self) -> None:
+        for path in self._folder.glob("*.json"):
+            if re.fullmatch(r"[0-9a-f]{64}", path.stem) is None:
+                continue
+            try:
+                action = self._read(path.stem)
+            except (OSError, ValueError) as error:
+                print(f"review-links build kill {path}: {error}", file=sys.stderr)
+                continue
+            self._cache(action)
+            if not isinstance(action.stage, FinishedStop):
+                self._start_watch(path.stem, conf.read_or_repository("review_links"))
 
     def stop(self, reference: str, handle: str, words: str) -> KillResult | NoStopRoute:
         target = live_targets().get(reference)
         if target is None or not hmac.compare_digest(self.handle(target), handle):
             return NoStopRoute()
+        if re.fullmatch(r"[0-9a-f]{64}", reference) is None:
+            return NoStopRoute()
         settings = conf.read_or_repository("review_links")
         seconds = settings.number("kill_stop_seconds")
         sample = settings.number("kill_sample_seconds")
         retention = settings.number("kill_result_seconds")
-        late_seconds = settings.number("kill_late_confirmation_seconds")
         run = target.candidate
         at = datetime.now(user_zone())
-        reason = notification(run, at)
+        message = notification(run, at)
+        identity = secrets.token_hex(16)
+        reason = f"{message} [Builds action {identity}]"
         result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
                               "stop": StopState.STOPPING, "delivery": DeliveryState.PENDING,
                               "time": at.strftime("%H:%M %Z"), "recipient_name": target.recipient_name,
                               "recipient_role": target.recipient_role}
-        notice = PendingNotice(result, target.recipient, f"{reason}\n{words}" if words else reason)
-        with self._lock:
-            self._expire()
-            if reference in self._pending or reference in self._finished:
-                return NoStopRoute()
-            self._pending[reference] = notice
-        try:
-            route = target.route
-            if isinstance(route, VerifyRun):
-                confirmation = stop_verify(route, run)
-            elif isinstance(route, ProgramScope):
-                confirmation = stop_program_scope(route, run, seconds)
+        body = f"{message}\n{words}" if words else message
+        action = SavedKillAction(identity, run, target.route, result, target.recipient, body, reason, StopRequested())
+        with self._record_lock(reference):
+            try:
+                previous = self._read(reference)
+            except FileNotFoundError:
+                pass
             else:
-                confirmation = stop_detached(route, run, reason)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return self._finish(notice, False, retention)
-        if isinstance(confirmation, NoStopRoute):
-            return self._finish(notice, False, retention)
-        if observe(confirmation, seconds, sample):
-            return self._finish(notice, True, retention)
-        notice = replace(notice, result={**result, "stop": StopState.UNCONFIRMED})
-        with self._lock:
-            self._pending[reference] = notice
-        threading.Thread(target=self._finish_later, args=(notice, confirmation, late_seconds, sample, retention),
-                         daemon=True).start()
-        return notice.result
+                if not isinstance(previous.stage, FinishedStop) or previous.stage.visible_until > time.time():
+                    return NoStopRoute()
+            self._save(action)
+            try:
+                route = target.route
+                started = (stop_program_scope(route, run) if isinstance(route, ProgramScope)
+                           else stop_detached(route, run, reason))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                started = False
+            if not started:
+                return self._finish(action, {**result, "stop": StopState.UNCONFIRMED}, retention).result
+            action = replace(action, stage=WatchingStop())
+            self._save(action)
+            deadline = time.monotonic() + seconds
+            while True:
+                try:
+                    action = self._advance(action, retention)
+                except (OSError, ValueError):
+                    break
+                if isinstance(action.stage, FinishedStop):
+                    return action.result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or isinstance(action.stage, SendingNotice):
+                    break
+                time.sleep(min(remaining, sample))
+            # A delivery write can fail after cleanup is saved. Resume the durable state.
+            action = self._read(reference)
+            if isinstance(action.stage, WatchingStop):
+                action = replace(action, result={**result, "stop": StopState.UNCONFIRMED})
+                self._save(action)
+        self._start_watch(reference, settings)
+        return action.result

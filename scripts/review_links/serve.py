@@ -517,7 +517,7 @@ def accepts_gzip(header: str, *, allow_wildcard: bool = False) -> bool:
     return wildcard
 
 
-def kill_operator(peer: tuple[str, int]) -> bool:
+def builds_operator(peer: tuple[str, int]) -> bool:
     """Authenticate the TCP peer through Tailscale."""
     def read(timeout: float, *args: str) -> dict[str, object]:
         result = subprocess.run(["tailscale", *args], capture_output=True, text=True,
@@ -527,7 +527,7 @@ def kill_operator(peer: tuple[str, int]) -> bool:
     try:
         settings = conf.read_or_repository("review_links")
         timeout = settings.number("tailscale_timeout_seconds")
-        login = settings.text("kill_operator_login")
+        login = settings.text("builds_operator_login")
         if not login:
             return False
         address, port = peer
@@ -1138,7 +1138,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if not self.same_origin(required=required_origin) or self.tailscale_refusal():
             return False
         server = cast(ReviewLinksServer, self.server)
-        return server.mode is ServerMode.LIVE and kill_operator(self.client_address)
+        return server.mode is ServerMode.LIVE and builds_operator(self.client_address)
 
     def build_kill_post(self, query: str) -> None:
         if not self.same_origin(required=True):
@@ -1758,7 +1758,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
             staff_scope=self.staff_read_scope)
         self.new_item_token: str = secrets.token_urlsafe()
-        self.kill_actions: kill_action.KillActions = kill_action.KillActions()
+        self.kill_actions: kill_action.KillActions = kill_action.KillActions(self.store_folder)
         self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
         self.page_captures: PageCaptures = PageCaptures()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
@@ -1772,6 +1772,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         super().__init__(address, ReviewLinksHandler)
         if mode is ServerMode.LIST_FIXTURE:
             return
+        self.kill_actions.resume()
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()
@@ -1948,8 +1949,6 @@ class ReviewLinksServer(ThreadingHTTPServer):
             for path, stamp in stamps.items():
                 if (stamp is ModuleStampUnavailable.UNREADABLE or stamp[0] >= STARTED_NS
                         or (path in self.module_stamps and self.module_stamps[path] != stamp)):
-                    if self.kill_actions.has_pending():
-                        return
                     with self.delivery_status.locked():
                         if self.delivery_status.request_attempts or self.delivery_status.question_jobs:
                             return

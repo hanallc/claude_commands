@@ -1806,22 +1806,24 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 
 ### Stop a Builds run
 
-The Running table offers **Kill this run** beside a verified natedev Cargo or Verify PID.
+The Running table offers **Kill this run** beside a verified natedev Cargo PID.
 The confirmation shows the row, process tree, progress, and recorded caller.
 The server determines the caller from the reservation's session ID and the current staff record.
 
 1. The feed publishes an opaque reference for each eligible reservation.
 2. The console supplies a handle when it can verify the current PID, start identity, staff recipient, and stop route.
 3. The server reads the reservation and process evidence again when the operator confirms.
-4. The server signals the exact Verify shell through a pidfd.
-5. The server uses the user manager to stop a dedicated Cargo scope.
+4. The server saves a private action record with the notice before it requests the stop.
+5. The shared stop helper signals the confirmed Cargo scope members through pidfds.
 6. The server uses the detached stop record when the supervisor supports a verified stop.
-7. The Verify shell, holder, or supervisor follows its usual cleanup path.
-8. The server confirms that Verify ended and its observed scopes are empty.
+7. The holder or supervisor follows its usual cleanup path.
+8. The server confirms that the Cargo scope is empty or reads the detached stop result.
 9. The server sends the notice after it confirms the stop.
 
-The server keeps the pending notice after the confirmation deadline.
-It checks for late confirmation for `kill_late_confirmation_seconds`.
+Cargo scopes and detached commands need the phase 44fh helper.
+Verify only creates scopes per step, so the console leaves Kill off for Verify.
+The action record keeps the notice after the confirmation deadline or a console restart.
+The server checks the pending records every `kill_pending_check_seconds`.
 The server supplies the first line of the notice.
 The operator can add words in the confirmation.
 The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.

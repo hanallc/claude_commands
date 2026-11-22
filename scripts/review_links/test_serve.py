@@ -4213,7 +4213,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.QUEUED,
             "time": "19:41 EST", "recipient_name": "fixture", "recipient_role": "worker"}
         with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(serve, "kill_operator", return_value=False) as operator,
+              patch.object(serve, "builds_operator", return_value=False) as operator,
               patch.object(self.server.kill_actions, "options", return_value=({}, [])) as options,
               patch.object(self.server.kill_actions, "stop", return_value=result) as stop):
             self.assertEqual(self.request(kill_action.PATH).status, 403)
@@ -4235,10 +4235,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((status, json.loads(body)), (200, {"result": result}))
             stop.assert_called_once_with(reference, handle, form["words"])
 
-    def test_build_kill_operator_checks_the_peer_against_the_local_owner(self) -> None:
+    def test_builds_operator_checks_the_peer_against_the_local_owner(self) -> None:
         settings = self.root.parent / "operator-config"
         settings.mkdir()
-        _ = write_config_fixture(settings / "review_links.conf", "kill_operator_login=local-node-owner")
+        _ = write_config_fixture(settings / "review_links.conf", "builds_operator_login=local-node-owner")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
         peer = ("100.64.0.17", 43210)
         whois = ["tailscale", "whois", "--json", "--proto=tcp", "100.64.0.17:43210"]
@@ -4252,7 +4252,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 local = subprocess.CompletedProcess(status, 0, json.dumps(
                     {"Self": {"UserID": 52, "Tags": local_tags}}))
                 with patch.object(subprocess, "run", side_effect=(remote, local)) as run:
-                    self.assertIs(serve.kill_operator(peer), allowed)
+                    self.assertIs(serve.builds_operator(peer), allowed)
                 self.assertEqual(run.call_args_list[0].args[0], whois)
                 self.assertEqual(run.call_count, 1 if tags else 2)
 
