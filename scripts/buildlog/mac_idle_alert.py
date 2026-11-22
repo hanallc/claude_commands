@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
+from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
@@ -147,24 +148,13 @@ def waiting_steps_text(count: int) -> str:
     return f"{count} step waits" if count == 1 else f"{count} steps wait"
 
 
-def _live_state_agrees(saved: SavedAlert, now: float) -> bool:
-    """Compare the saved state and cause with the live Mac state.
+def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN,
+               live_agrees: Callable[[SavedAlert], bool] | None = None) -> str | None:
+    """Format the saved reading.
 
-    The saved reading can be one sample old. In that time a block can end or a claim can start work.
-    The live read uses only local files and never contacts the Mac.
+    A view passes `live_agrees`, and a Mac condition line shows only when the live Mac state agrees with it.
+    The watch passes None, because it formats the reading that it just wrote from the live state.
     """
-    from scripts.buildlog import mac_idle
-
-    live = mac_idle.mac_work(mac_idle.watch_paths(), now)
-    if saved["state"] == "unreachable":
-        return isinstance(live, mac_idle.MacUnreachable)
-    if saved["cause"] in ("blocked", "claim_idle"):
-        return isinstance(live, mac_idle.IdleReservation) and live.cause == saved["cause"]
-    return isinstance(live, mac_idle.FreeMac)
-
-
-def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN) -> str | None:
-    """Show the saved Mac condition only when the live Mac state agrees with it."""
     saved = read_alert(path)
     if isinstance(saved, NoSavedAlert):
         return None
@@ -185,13 +175,13 @@ def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = Blo
         return quiet
     waiting = saved["waiting"]
     if saved["state"] == "unreachable":
-        if not _live_state_agrees(saved, now):
+        if live_agrees is not None and not live_agrees(saved):
             return quiet
         return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting_steps_text(waiting)} for the Mac."
     elapsed = now - saved["since"]
-    if elapsed < settings.alert_seconds or saved["cause"] == "blocked" and block is BlockText.OMITTED:
+    if elapsed < settings.alert_seconds or (saved["cause"] == "blocked" and block is BlockText.OMITTED):
         return quiet
-    if not _live_state_agrees(saved, now):
+    if live_agrees is not None and not live_agrees(saved):
         return quiet
     holder, detail = display_field(saved["holder"]), display_field(saved["detail"])
     suffix = f"; {query_reason}" if query_reason else ""

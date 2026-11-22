@@ -14,7 +14,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.buildlog import mac_idle_alert
+from scripts.buildlog import mac_idle, mac_idle_alert
 from scripts.buildlog.test_index import use_test_log
 from scripts.buildlog.mac_idle_test_support import LiveClaim, write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.lint.memory_test_support import commit_config_fixture
@@ -111,10 +111,11 @@ class SavedAlertTests(unittest.TestCase):
                     row.update(state=state, cause="" if state == "unreachable" else saved_cause, until=1900)
                     for admission_error in ("", "socket closed"):
                         with self.subTest(saved=saved_cause, live=live_name, admission_error=admission_error), \
-                             mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent), "MAC_TEST_STATE_DIR": str(live)}):
+                             mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent), "MAC_TEST_STATE_DIR": str(live),
+                                                          "MAC_IDLE_STATE_DIR": str(path.parent)}):
                             row["admission_error"] = admission_error
                             _ = path.write_text(json.dumps(row))
-                            line = mac_idle_alert.alert_line(path, 1600, ZoneInfo("UTC"))
+                            line = mac_idle.view_alert_line(1600, ZoneInfo("UTC"))
                             if (saved_cause, live_name) in agreeing:
                                 self.assertIn(shown, line or "")
                             else:

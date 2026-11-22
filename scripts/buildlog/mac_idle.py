@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from scripts.direct import step_record
     from scripts.mac_test import mac_test
     from scripts.buildlog import mac_idle_alert
+    from zoneinfo import ZoneInfo
+
     from scripts.message.unit_labels import UnitLabels
 else:
     from scripts.direct import step_record
@@ -335,6 +337,27 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
         return FreeMac(sum(mac_test.run_is_kept(claim.record) for claim in claims))
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))
+
+
+def live_state_agrees(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    """Compare the saved state and cause with the live Mac state.
+
+    The saved reading can be one sample old. In that time a block can end or a claim can start work.
+    The live read uses only local files and never contacts the Mac.
+    """
+    live = mac_work(watch_paths(), now)
+    if saved["state"] == "unreachable":
+        return isinstance(live, MacUnreachable)
+    if saved["cause"] in ("blocked", "claim_idle"):
+        return isinstance(live, IdleReservation) and live.cause == saved["cause"]
+    return isinstance(live, FreeMac)
+
+
+def view_alert_line(now: float, zone: ZoneInfo,
+                    *, block: mac_idle_alert.BlockText = mac_idle_alert.BlockText.SHOWN) -> str | None:
+    """The saved alert line for a view; a Mac condition that the live state does not agree with is hidden."""
+    return mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", now, zone, block=block,
+                                     live_agrees=lambda saved: live_state_agrees(saved, now))
 
 
 def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: float,

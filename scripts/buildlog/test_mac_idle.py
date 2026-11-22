@@ -28,6 +28,7 @@ from scripts.buildlog import mac_idle, mac_idle_alert, sample
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.buildlog.mac_idle_test_support import write_idle_alert
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
 from scripts.direct import step_record
 from scripts.lib import conf
@@ -211,6 +212,13 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertNotIn("disk", messages[0])
         push.assert_not_called()
         self.assertEqual([row["call_id"] for row in self.rows()], ["waiting-125"])
+
+    def test_outage_message_keeps_its_line_when_the_mac_state_changes_after_the_reading(self) -> None:
+        saved = mac_idle_alert.read_alert(write_idle_alert(self.paths.state, 1600))
+        assert isinstance(saved, dict)
+        with mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send:
+            self.assertTrue(REAL_NOTIFY_OUTAGE(self.paths, saved, 1600, (), {}, mac_idle.AdmissionWaiters([])))
+        self.assertTrue(cast(str, send.call_args.args[0]).startswith("MAC BLOCKED by research"))
 
     def test_unparseable_wait_time_still_alerts(self) -> None:
         self.step(updated="invalid-time")
