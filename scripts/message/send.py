@@ -5152,9 +5152,10 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
 DIRECTOR_RESULT_ACCEPTED = frozenset(("sent", "queued", "kept", "replaced", "skipped"))
 
 
-def detached_result_notice_arguments(marker: str) -> list[str]:
-    """Use the same delivery identity for each route to the director."""
-    key = f"detached-run-alert:{marker.removeprefix('Detached run: ')}"
+def detached_result_notice_arguments(marker: str, *, direct_result: bool = False) -> list[str]:
+    """Use the same delivery identity for a worker notice and its alert."""
+    kind = "result" if direct_result else "alert"
+    key = f"detached-run-{kind}:{marker.removeprefix('Detached run: ')}"
     return ["--key", key, "--recipient-key", "detached-run-director", "--repeat-minutes", "52596000"]
 
 
@@ -5167,14 +5168,30 @@ class WorkerResultReceipt:
     before_holder: Callable[[], object] = lambda: None
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+        return self._received(worker, membership)
+
+    def director_alert_received(self, director: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+        run_id = self.marker.removeprefix("Detached run: ")
+        return self._received(director, membership, alert=f"Detached run {run_id}.")
+
+    def _received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot, *, alert: str = "") -> bool:
         from scripts.production import worker_admission
 
-        backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
-        if isinstance(backend, staff.BackendUnavailable):
-            raise ValueError("worker transcript backend is unavailable")
-        source = worker_admission.transcript_source(worker, backend)
-        return any(isinstance(entry, str) and self.marker in worker_admission.transcript_user_lines(entry)
-                   for entry in worker_admission.transcript_entries(source, set()))
+        if worker.kind == "worker":
+            backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
+            if isinstance(backend, staff.BackendUnavailable):
+                raise ValueError("worker transcript backend is unavailable")
+            source = worker_admission.transcript_source(worker, backend)
+        else:
+            try:
+                source = worker_admission.transcript_source(worker, staff.ClaudeBackend())
+            except ValueError:
+                if not isinstance(worker.home, staff.SessionHome):
+                    raise
+                source = worker_admission.transcript_source(worker, staff.CodexBackend(worker.home.path))
+        return any(line == self.marker or bool(alert and (line == alert or line.startswith(alert + " ")))
+                   for entry in worker_admission.transcript_entries(source, set()) if isinstance(entry, str)
+                   for line in worker_admission.transcript_user_lines(entry))
 
 
 class OrdinaryWorkerMessage(Enum):
@@ -5329,7 +5346,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         arguments.extend(detached_result_notice_arguments(receipt.marker))
     options = parse(arguments)._replace(selection=WorkerHolderRecipient(address, holder.id))
     result = _send(options, membership=membership)
-    return WorkerResultHolderDelivery(*result) if isinstance(receipt, WorkerResultReceipt) else result
+    if isinstance(receipt, WorkerResultReceipt) and not isinstance(result, (RefusedRelayRequest, UncertainRelayDelivery)):
+        return WorkerResultHolderDelivery(*result)
+    return result
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:

@@ -250,7 +250,10 @@ from scripts.agents import detached_runs
 def deliver_result(path: Path) -> int:
     return detached_runs.main(["deliver", str(path)])
 
-with (patch.object(detached_runs, "deliver", return_value="private fixture"),
+def record_delivery(record, result):
+    return detached_runs._save_delivery(Path(record["log"]).with_suffix(".json"), "private fixture", suppressed=True)
+
+with (patch.object(detached_runs, "deliver", side_effect=record_delivery),
       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver_result),
       patch.object(detached_runs.staff, "local_snapshot", return_value=detached_runs.staff.StaffSnapshot(()))):
     raise SystemExit(detached_runs.main(["supervise", sys.argv[1]]))

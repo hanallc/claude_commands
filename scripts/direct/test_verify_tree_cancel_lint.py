@@ -129,6 +129,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         path = self.control / "lint-run.json"
         with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
               patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
             self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
             pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))

@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Generator, Iterable
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, StrEnum
@@ -24,13 +24,14 @@ from typing import Callable, cast
 
 from scripts.agents import detached_runs, shutdown_record, worker_lifecycle
 from scripts.direct import pass_record as pass_recorder
-from scripts.direct import progress_history, recorder_state
+from scripts.direct import plan_history, progress_history, recorder_state
 from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.herdr import herdr, worker_panes
 from scripts.message import send
 from scripts.production import staff, worker, worker_admission, worker_pass_alerts
 from scripts.production.worker_pass_alerts import AlertReason
+from scripts.usage.rollouts import parse_timestamp
 
 COMPLETION_NOTICE_REPEAT_MINUTES = 52_596_000
 
@@ -47,6 +48,8 @@ class WorkerEvent:
     kind: EventKind = EventKind.TURN_END
     reply: str = ""
     completed_run: detached_runs.RunRecord | None = None
+    turn_started_at: float | None = None
+    stopped_at: str = ""
 
 
 class TurnOutcome(StrEnum):
@@ -66,10 +69,41 @@ class TurnOutcome(StrEnum):
     IGNORED = "ignored"
 
 
-def hook_event(value: dict[str, object]) -> WorkerEvent:
+def _stop_prompt_time(source: Path, stopped_at: datetime) -> float | None:
+    started_at = None
+    try:
+        for fields in worker_admission.transcript_records(source):
+            if (not isinstance(fields, dict) or fields.get("isMeta") or fields.get("isSidechain")
+                    or fields.get("isCompactSummary")
+                    or fields.get("sourceToolAssistantUUID") or fields.get("toolUseResult")
+                    or not worker_admission.transcript_entry(fields, set()).startswith("user:\n")):
+                continue
+            message = pass_recorder.object_dict(fields.get("message")) or {}
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                    (pass_recorder.object_dict(block) or {}).get("type") == "tool_result"
+                    for block in cast(list[object], content)):
+                continue
+            timestamp = parse_timestamp(fields.get("timestamp"))
+            if timestamp is not None and timestamp <= stopped_at:
+                started_at = timestamp
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return started_at.timestamp() if started_at is not None else None
+
+
+def hook_event(value: dict[str, object], *, stopped_at: str = "") -> WorkerEvent:
     """Convert each native hook input at the boundary."""
     if value.get("hook_event_name") == "Stop":
-        return WorkerEvent(str(value.get("session_id", "")), reply=str(value.get("last_assistant_message") or ""))
+        reply = str(value.get("last_assistant_message") or "")
+        thread = str(value.get("session_id", ""))
+        if reply:
+            return WorkerEvent(thread, reply=reply)
+        source = value.get("transcript_path")
+        stamp = parse_timestamp(stopped_at)
+        if isinstance(source, str) and source and stamp is not None:
+            return WorkerEvent(thread, turn_started_at=_stop_prompt_time(Path(source), stamp))
+        return WorkerEvent(thread, stopped_at=stopped_at)
     kind = value.get("event")
     if kind in (EventKind.RUN_FINISHED, EventKind.STAGE_READY):
         return WorkerEvent(str(value.get("thread_id", "")), EventKind(str(kind)))
@@ -869,6 +903,31 @@ def _recover_replaced_stops(event: WorkerEvent, row: staff.StaffRow, run: Path, 
     return TurnOutcome.STOPPED if recovered else NoLateDone.UNRECORDED
 
 
+def _stops_at(archived_stops: Iterable[tuple[Path, progress_history.StoppedPassReceipt]],
+              turn_started_at: float) -> list[tuple[Path, progress_history.StoppedPassReceipt]]:
+    by_run: dict[Path, dict[str, progress_history.StoppedPassReceipt]] = {}
+    for directory, receipt in archived_stops:
+        by_run.setdefault(directory, {})[receipt.instance_id] = receipt
+    matches: list[tuple[Path, progress_history.StoppedPassReceipt]] = []
+    for directory, receipts in by_run.items():
+        try:
+            state = worker_lifecycle.read_json_object(pass_recorder.state_path(directory))
+        except worker_lifecycle.WorkerStateUnreadable:
+            continue
+        history_file = pass_recorder.string(state.get("history_file"))
+        if not history_file:
+            continue
+        for event in plan_history.read_run_events(Path(history_file)):
+            if event.get("event_type") != "pass_finished" or event.get("status") != "canceled":
+                continue
+            receipt = receipts.get(pass_recorder.string(event.get("pass_instance_id")))
+            start = pass_recorder.number(event.get("pass_started_at"))
+            end = pass_recorder.number(event.get("timestamp_epoch"))
+            if receipt is not None and 0 < start <= turn_started_at <= end:
+                matches.append((directory, receipt))
+    return matches
+
+
 def _completion_receipt(event: WorkerEvent, row: staff.StaffRow, run: Path,
                         delivery: pass_recorder.DispatchDelivery, *, require_transcript: bool
                         ) -> worker.DispatchReceipt:
@@ -1031,6 +1090,15 @@ def _handle_locked(event: WorkerEvent,
         row = current
         if not isinstance(owner, WorkerByThread):
             event = replace(event, thread_id=str(row.current_session))
+        if event.kind == EventKind.TURN_END and not event.reply and event.turn_started_at is None:
+            stamp = parse_timestamp(event.stopped_at)
+            backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
+            if stamp is not None and not isinstance(backend, staff.BackendUnavailable):
+                with suppress(OSError, ValueError):
+                    source = worker_admission.transcript_source(row, backend)
+                    event = replace(event, turn_started_at=_stop_prompt_time(source, stamp))
+            if event.turn_started_at is None:
+                return _ignored(event, "anomaly: the empty Stop has no dated user prompt at or before its stamp", row.name)
         run = worker_panes.worker_run(row, record=record)
         passed = worker_panes.worker_pass(row, run, record=record)
         instance = str(passed.get("instance_id", ""))
@@ -1039,11 +1107,24 @@ def _handle_locked(event: WorkerEvent,
                 Path(completed_run["session_dir"]) != run
                 or not detached_runs.result_in_pass(completed_run, instance, since=passed.get("started_at") or 0)):
             return _ignored(event, "the detached run belongs to a different pass", row.name)
-        _ = after_unlock.callback(_retry_pass_alerts, row.id)
-        pass_alert = passed.get("status") == "active" and event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED)
         delivery = pass_recorder.dispatch_delivery(passed)
         archived_stops = [(directory, receipt) for directory in _stopped_pass_folders(parent, record, run)
                           for receipt in progress_history.stopped_pass_receipts(directory, row.id)]
+        marker = _done_marker(event.reply) if event.kind == EventKind.TURN_END else ""
+        current_done = bool(marker and marker == (delivery.completion_id or instance))
+        if event.kind == EventKind.TURN_END and not event.reply and event.turn_started_at is not None:
+            older = event.turn_started_at < pass_recorder.number(passed.get("started_at"))
+            if older or (not instance and archived_stops):
+                matches = _stops_at(archived_stops, event.turn_started_at)
+                if len(matches) == 1:
+                    recovered = _recover_replaced_stops(event, row, run, instance, "", matches)
+                    if recovered == TurnOutcome.STOPPED:
+                        return TurnOutcome.STOPPED
+                if older or matches:
+                    return _ignored(event, "the empty Stop event belongs to an earlier pass", row.name)
+
+        _ = after_unlock.callback(_retry_pass_alerts, row.id)
+        pass_alert = passed.get("status") == "active" and event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED)
 
         def retry_stopped_diagnostics() -> None:
             for directory, receipt in archived_stops:
@@ -1055,9 +1136,8 @@ def _handle_locked(event: WorkerEvent,
 
         if archived_stops:
             _ = after_unlock.callback(retry_stopped_diagnostics)
-        marker = _done_marker(event.reply) if event.kind == EventKind.TURN_END else ""
         late: TurnOutcome | NoLateDone = NoLateDone.UNRECORDED
-        if event.kind == EventKind.TURN_END and (not marker or marker != (delivery.completion_id or instance)):
+        if event.kind == EventKind.TURN_END and event.reply and not current_done:
             late = _recover_replaced_stops(event, row, run, instance, marker, archived_stops)
             if marker and isinstance(late, TurnOutcome):
                 return late
@@ -1083,10 +1163,9 @@ def _handle_locked(event: WorkerEvent,
         if event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED):
             worker_input = (detached_runs.WorkerResultInput.TURN_ENDED if event.kind == EventKind.TURN_END
                             else detached_runs.WorkerResultInput.TYPE)
-            matching_done = marker and marker == (delivery.completion_id or instance)
             replay = detached_runs.submit_finished_worker_result(
                 run, row, worker_input=worker_input, pane_dispatch_id=instance, since=passed.get("started_at") or 0,
-                alerts_after_unlock=after_unlock if matching_done else None)
+                read_membership=lambda: record, alerts_after_unlock=after_unlock if current_done else None)
             if replay == detached_runs.WorkerResultReplay.SUBMITTED:
                 return TurnOutcome.SUBMITTED
             if replay == detached_runs.WorkerResultReplay.RETRY:
@@ -1237,6 +1316,7 @@ def run_finished(owner: staff.StaffId, completed_run: detached_runs.RunRecord | 
 
 
 def main(arguments: list[str] | None = None) -> int:
+    entered_at = datetime.now(timezone.utc).isoformat()
     args = sys.argv[1:] if arguments is None else arguments
     try:
         if len(args) == 2 and args[0] == "stage-ready":
@@ -1251,8 +1331,11 @@ def main(arguments: list[str] | None = None) -> int:
         payload = args[0] if args and not separate else sys.stdin.read()
         value = cast(dict[str, object], json.loads(payload))
         if separate:
-            _ = handle(hook_event(value))
+            _ = handle(hook_event(value, stopped_at=pass_recorder.string(value.get("_stop_stamp"), entered_at)))
         else:
+            if value.get("hook_event_name") == "Stop" and not value.get("last_assistant_message"):
+                value["_stop_stamp"] = entered_at
+                payload = json.dumps(value)
             child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--handle-hook"],
                 start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             with cast(io.BufferedWriter, child.stdin) as stream:

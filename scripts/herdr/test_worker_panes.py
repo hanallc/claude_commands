@@ -37,6 +37,7 @@ from scripts.message import sessions
 from scripts.whoami import quota_state
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
@@ -3930,6 +3931,7 @@ class WorkerPaneTests(StaffTestCase):
                                                 {"pid": claude_pid, "name": "claude", "argv": arguments}]
             return reply
 
+        _ = write_config_fixture(self.root / "conf/send.conf")
         record = staff.snapshot()
         marker = "Detached run: fixture-run"
         body = marker + "\nRun finished: fixture checks"

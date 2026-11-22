@@ -12,11 +12,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -42,12 +43,34 @@ from scripts.whoami import agent_accounts, note_file, quota_alert
 class NativeHookEntryTests(unittest.TestCase):
     def test_native_entry_starts_a_separate_handler_without_calling_handle(self) -> None:
         real_popen = subprocess.Popen
-        for family, size in (("codex", 1), ("claude", 1), ("codex", 5_000)):
+        for family, size in (("codex", 1), ("claude", 1), ("codex", 5_000), ("codex", 0), ("claude", 0)):
             with self.subTest(family=family, size=size), TemporaryDirectory() as folder:
                 reply = 'The work is complete.\nDONE "dispatch"' * size
                 value: dict[str, object] = {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply}
+                started_at = None
+                transcript = Path(folder) / "claude.jsonl"
                 if family == "codex":
-                    value.update({"turn_id": "turn-1", "model": "sol", "transcript_path": None})
+                    value.update({"turn_id": "018bcfe5-6be8-7000-8000-000000000000", "model": "sol", "transcript_path": None})
+                    if not reply:
+                        started_at = 1_700_000_000.0
+                        value["transcript_path"] = str(transcript)
+                        atomic_file.write_text_atomic(transcript, json.dumps({
+                            "type": "event_msg", "timestamp": "2023-11-14T22:13:20Z",
+                            "payload": {"type": "user_message", "message": "Stopped prompt"},
+                        }) + "\n")
+                elif not reply:
+                    started_at = 1_700_000_000.0
+                    value["transcript_path"] = str(transcript)
+                    atomic_file.write_text_atomic(transcript, "\n".join(map(json.dumps, (
+                        {"type": "user", "timestamp": "2023-11-14T22:13:19Z", "message": {"content": "Earlier prompt"}},
+                        {"type": "user", "timestamp": "2023-11-14T22:13:20Z", "message": {"content": "Stopped prompt"}},
+                        {"type": "user", "timestamp": "2023-11-14T22:13:21Z", "sourceToolAssistantUUID": "tool",
+                         "message": {"content": "Tool result"}},
+                        {"type": "user", "timestamp": "2023-11-14T22:13:22Z", "isMeta": True,
+                         "message": {"content": "Metadata"}},
+                        {"type": "user", "timestamp": "2023-11-14T22:13:23Z",
+                         "message": {"content": [{"type": "tool_result"}, {"type": "text", "text": "Tool result"}]}},
+                    ))) + "\n")
                 payload = json.dumps(value)
                 receiver = Path(folder) / "receive.py"
                 receipt = Path(folder) / "receipt.json"
@@ -61,6 +84,13 @@ class NativeHookEntryTests(unittest.TestCase):
                     "raise SystemExit(turn_end.main(sys.argv[2:]))", ""))))
                 children: list[subprocess.Popen[bytes]] = []
 
+                def read_payload() -> str:
+                    if transcript.exists():
+                        with transcript.open("a", encoding="utf-8") as stream:
+                            _ = stream.write(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                                        "message": {"content": "Replacement prompt"}}) + "\n")
+                    return payload
+
                 def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
                             stdout: int, stderr: int) -> subprocess.Popen[bytes]:
                     child = real_popen([arguments[0], str(receiver), str(receipt), *arguments[2:]],
@@ -73,7 +103,7 @@ class NativeHookEntryTests(unittest.TestCase):
                 output = io.StringIO()
                 with (patch.object(turn_end, "handle") as handler,
                       patch.object(subprocess, "Popen", side_effect=receive) as start,
-                      patch.object(sys, "stdin", io.StringIO(payload)),
+                      patch.object(sys, "stdin", SimpleNamespace(read=read_payload)),
                       patch.object(sys, "stdout", output)):
                     self.assertEqual(turn_end.main([]), 0)
                 handler.assert_not_called()
@@ -82,15 +112,17 @@ class NativeHookEntryTests(unittest.TestCase):
                     start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.assertEqual(children[0].wait(timeout=TEST_HANG_GUARD_SECS), 0)
                 self.assertEqual(json.loads(receipt.read_text()),
-                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply})
+                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply,
+                                  "completed_run": None, "turn_started_at": started_at, "stopped_at": ""})
                 self.assertEqual(output.getvalue(), "")
 
     def test_separate_invocation_calls_handle_once_without_starting_another_process(self) -> None:
         cases: tuple[tuple[dict[str, object], turn_end.WorkerEvent], ...] = (
             ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": "The work is complete."},
              turn_end.WorkerEvent("native-thread", reply="The work is complete.")),
-            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": None},
-             turn_end.WorkerEvent("native-thread")),
+            ({"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": None,
+              "_stop_stamp": "2023-11-14T22:13:20Z"},
+             turn_end.WorkerEvent("native-thread", stopped_at="2023-11-14T22:13:20Z")),
             ({"type": "agent-turn-complete", "thread-id": "native-thread", "last-assistant-message": "The work is complete."},
              turn_end.WorkerEvent("")),
         )
@@ -178,7 +210,7 @@ class TurnEndTests(unittest.TestCase):
         active = progress_history.active_dispatch(row.id, self.case.run_dir)
         assert isinstance(active, progress_history.ActiveDispatch)
         path, record = self.case.detached_record(row, "completed-check")
-        record.update(completion_pending=True, pane_dispatch_id="earlier-pass", worker_received=True)
+        record.update(completion_pending=True, pane_dispatch_id="earlier-pass", result_suppressed=True)
         atomic_file.write_text_atomic(path, json.dumps(record))
 
         self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
@@ -459,7 +491,8 @@ class TurnEndTests(unittest.TestCase):
                  "unknown", "no staff row for the current thread"),
                 ("", "unknown", "no staff row for the current thread")):
             with self.subTest(identity=identity):
-                self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(identity))), turn_end.TurnOutcome.IGNORED)
+                event = turn_end.WorkerEvent(str(identity), turn_started_at=time.time())
+                self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
                 self.assertEqual((entry["thread_id"], entry["worker_name"], entry["reason"]), (identity, name, reason))
         self.assertEqual(len(log.read_text().splitlines()), 5)
@@ -538,9 +571,16 @@ class TurnEndTests(unittest.TestCase):
                                          turn_end.TurnOutcome.IGNORED)
                 else:
                     before = (self.case.run_dir / "progress_history_state.json").read_bytes()
-                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.IGNORED)
+                    outcome = (turn_end.TurnOutcome.NO_DONE if cause == "pending assignment" else
+                               turn_end.TurnOutcome.IGNORED)
+                    self.assertEqual(self.case.finish(name, event), outcome)
                 self.assertEqual(opened.pane not in self.case.fixture.world.locations, closes)
                 self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
+                if cause == "pending assignment":
+                    notice, = self.case.agent.notices[len(notices):]
+                    self.assertIn("no DONE.", notice)
+                    self.assertIn(f"worker.py answer {name} --text", notice)
+                    notices.append(notice)
                 self.assertEqual(self.case.agent.notices, notices)
                 self.assertEqual(staff.by_id(opened.row.id), opened.row)
 
@@ -579,7 +619,7 @@ class TurnEndTests(unittest.TestCase):
                              worker_panes.Kept("a detached run is live"))
             self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
             self.assertIn(opened.pane, world.locations)
-        record.update(status="finished", exit_code=0)
+        record.update(status="finished", exit_code=0, worker_received=True)
         atomic_file.write_text_atomic(path, json.dumps(record))
         self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
         self.assertNotIn(opened.pane, world.locations)
@@ -685,6 +725,7 @@ class TurnEndTests(unittest.TestCase):
                     self.assertIn("DONE ", self.case.reply.read_text())
                 else:
                     notices: list[str] = []
+                    waiting_for_delivery = reply_state == "waiting for delivery"
                     for number in (1, 2):
                         run_id = f"{name}-check-{number}"
                         path, record = self.case.detached_record(row, run_id)
@@ -695,24 +736,27 @@ class TurnEndTests(unittest.TestCase):
                         before = len(self.case.agent.notices)
                         for current_event in (event, event):
                             self.assertEqual(self.case.finish(name, current_event), turn_end.TurnOutcome.WAITING_ON_REPLY)
-                            self.assertEqual(len(self.case.agent.notices), before + 1)
+                            self.assertEqual(len(self.case.agent.notices), before + int(waiting_for_delivery or number == 1))
                         notice = self.case.agent.notices[-1]
-                        self.assertIn("; runs ", notice)
-                        self.assertIn(run_id, notice.partition("; runs ")[2].splitlines()[0])
                         notices.append(notice)
                         turn_path = self.case.reply.with_name(self.case.reply.stem + "_turn" + self.case.reply.suffix)
+                        if waiting_for_delivery:
+                            self.assertIn("; runs ", notice)
+                            self.assertIn(run_id, notice.partition("; runs ")[2].splitlines()[0])
+                            self.assertIn(f"; reply {turn_path}", notice)
+                        else:
+                            assert isinstance(active, progress_history.ActiveDispatch)
+                            self.assertIn(f"{name}: pass {active.instance_id}: waiting on run reply.", notice)
                         if reply_state == "empty reply":
                             self.assertFalse(turn_path.exists())
-                            self.assertNotIn("; reply ", notice)
                         else:
-                            self.assertIn(f"; reply {turn_path}", notice)
                             self.assertEqual(turn_path.read_text().strip(), self.case.agent.final)
                         self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
                         if reply_state == "waiting for delivery":
                             self.case.agent.append(pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
                         if reply_state != "empty reply":
                             self.case.agent.append(pane, "assistant", self.case.agent.final)
-                    self.assertNotEqual(*notices)
+                    self.assertEqual(notices[0] == notices[1], not waiting_for_delivery)
                     self.case.agent.without_done = False
                     self.case.agent.complete(pane)
                     self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
@@ -1513,6 +1557,7 @@ class TurnEndTests(unittest.TestCase):
                       patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
                       patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
                       patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
+                      patch.object(time, "sleep"),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
                     if not finishes_during_turn:
                         with patch.object(detached_runs, "live_runs", return_value=[record]):
@@ -1520,6 +1565,13 @@ class TurnEndTests(unittest.TestCase):
                     if transcript_unavailable:
                         with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
                             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    else:
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    if self_stop:
+                        (alert,) = self.case.agent.notices[notices:]
+                        self.assertIn(f"Detached run {name}. Result delivery reached the retry limit.", alert)
+                        notices += 1
+                    if transcript_unavailable:
                         saved = worker_lifecycle.read_json_object(path)
                         self.assertEqual(saved.get("delivery"),
                                          "deferred: worker transcript is unavailable: fixture read failure")
@@ -1532,8 +1584,6 @@ class TurnEndTests(unittest.TestCase):
                         self.assertEqual(saved.get("delivery"), "deferred: worker pane is closed")
                         self.assertNotIn("delivered_at", saved)
                         self.assertEqual(len(self.case.agent.notices), notices)
-                    else:
-                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
                     if finishes_during_turn:
                         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         self.assertTrue(saved.get("completion_pending"))

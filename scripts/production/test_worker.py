@@ -355,6 +355,7 @@ class WorkerCommandTests(unittest.TestCase):
             + "# range: 0.001..\ncaller_margin_seconds=2\n"
             + "# range: 0.001..\nremote_transport_seconds=2\n"
             + "# one of: on, off\nreview_hold=off\n")
+        _ = write_config_fixture(config.with_name("detached_runs.conf"))
         atomic_file.write_text_atomic(config.with_name("scratch.conf"),
             "# whole: 1..\nsuffix_length=6\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n"
@@ -438,8 +439,9 @@ class WorkerCommandTests(unittest.TestCase):
 
     def finish(self, name: str = "impl", kind: turn_end.EventKind = turn_end.EventKind.TURN_END) -> turn_end.TurnOutcome:
         row = next(row for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id) if row.name == name)
-        return turn_end.handle(turn_end.WorkerEvent(str(row.current_session), kind,
-            self.agent.last_replies.get(str(row.current_session), "") if kind == turn_end.EventKind.TURN_END else ""))
+        reply = self.agent.last_replies.get(str(row.current_session), "") if kind == turn_end.EventKind.TURN_END else ""
+        at = time.time() if kind == turn_end.EventKind.TURN_END and not reply else None
+        return turn_end.handle(turn_end.WorkerEvent(str(row.current_session), kind, reply, turn_started_at=at))
 
     def receipt(self, name: str = "impl") -> worker.DispatchReceipt:
         row = next(row for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id) if row.name == name)
@@ -768,8 +770,6 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertNotIn(pane, world.locations)
 
     def assert_restore_live_run(self, *, active: bool) -> None:
-        from scripts.whoami import agent_accounts
-
         opened = self.opened("active-run" if active else "idle-run")
         dispatch_id = ""
         if active:
@@ -777,21 +777,30 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch_id}.")
-        _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        run = self.run_dir / "detached_runs" / opened.row.name
+        self.assertTrue(self.fixture.world.stop(opened.row, self.fixture.world))
+        path, record = self.detached_record(opened.row, opened.row.name)
+        supervisor = os.getpid()
+        record.update(status="running", pid=supervisor)
+        atomic_file.write_text_atomic(path, json.dumps(record))
         context = (f"Detached run {opened.row.name} remains live. "
-                   + f"Result: {run}.json; log: {run}.log. Read it with: `cat -- {run}.json {run}.log`. "
+                   + f"Result: {path}; log: {record['log']}. Read it with: `cat -- {path} {record['log']}`. "
                    + "Its result follows this worker after the move.")
         target = self.fixture.root / ".codex2"
         target.mkdir()
         (target / "sessions").symlink_to(self.fixture.root / "codex/sessions", target_is_directory=True)
-        with (pane_fixtures.live_detached_run(self.run_dir, opened.row), redirect_stdout(io.StringIO()),
-              patch.object(agent_accounts, "codex_account_home", return_value=agent_accounts.CodexHomeHoldingLogin(
-                  "codex2", self.fixture.root / ".codex2", "fixture")),
-              patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture"))):
-            code = worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({opened.row.id}))
+        destination = accounts.CodexWorkersAccount("codex2", target)
+        requests = self.fixture.world.requests
+        before = len(requests)
+
+        def supervises(pid: int, source: Path) -> bool:
+            return pid == supervisor and source == path
+
+        with (redirect_stdout(io.StringIO()),
+              patch.object(detached_run_process, "supervises", side_effect=supervises)):
+            code = worker.restore(self.fixture.parent.id, account=destination, only=frozenset({opened.row.id}))
         self.assertEqual(code, worker.ExitCode.OK)
-        self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(self.fixture.root / ".codex2"))
+        self.assertEqual(len(requests), before + 1)
+        self.assertEqual(requests[-1][2]["CODEX_HOME"], str(target))
         prompt = self.fixture.prompts()[-1]
         self.assertEqual(prompt[2], opened.pane)
         self.assertEqual(prompt[3], (
@@ -2103,7 +2112,13 @@ class WorkerCommandTests(unittest.TestCase):
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                "detached_runs.py", "supervise", str(path)], stdin=subprocess.PIPE, text=True) as supervisor:
             record.update(status="running", pid=supervisor.pid)
-            self.agent.during_prompt = lambda: atomic_file.write_text_atomic(path, json.dumps(record))
+            def start_run_for_pass() -> None:
+                active = progress_history.active_dispatch(opened.row.id, self.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                record["pane_dispatch_id"] = active.instance_id
+                atomic_file.write_text_atomic(path, json.dumps(record))
+
+            self.agent.during_prompt = start_run_for_pass
             self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
             active = progress_history.active_dispatch(opened.row.id, self.run_dir)
             self.assertIsInstance(self.receipt(), worker.DispatchWaitingForRuns)
@@ -2142,6 +2157,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assert_detached_dispatch(False)
 
     def test_a_director_receipt_leaves_the_closed_workers_result_pending(self) -> None:
+        _ = write_config_fixture(self.fixture.root / "conf/postmaster.conf")
         self.assert_detached_dispatch(True, closed=True)
 
     def test_done_after_a_delivered_result_without_a_reply_returns_no_done_after_one_quiet_wait(self) -> None:
@@ -2240,7 +2256,9 @@ class WorkerCommandTests(unittest.TestCase):
             "staff_id": row.id, "session_dir": str(self.run_dir), "label": "private verification", "command": [],
             "log": str(directory / f"{run_id}.log"), "started_at": time.time(), "pid": 0,
             "director_dir": str(self.run_dir), "done_message_file": ""}
-        return directory / f"{run_id}.json", record
+        path = directory / f"{run_id}.json"
+        path.with_suffix(".record.lock").touch()
+        return path, record
 
     def test_stage_two_accepts_a_run_result_delivered_during_stage_one(self) -> None:
         self.unfinished_turn("review")
@@ -2599,8 +2617,9 @@ class WorkerCommandTests(unittest.TestCase):
 
         self.agent.append(pane, "user", "Detached run: late-check\nRun finished: verification")
         self.agent.append(pane, "assistant", "The result passed.")
-        with patch.object(herdr.Herdr, "prompt") as prompt:
+        with patch.object(self.fixture.world, "prompt") as prompt:
             self.assertEqual(self.command(*options), (0, "done\n", ""))
+        prompt.assert_called_once()
         self.assertIn(f"DONE {instance}", cast(str, prompt.call_args.args[1]))
         self.agent.append(pane, "assistant", f"The result passed.\nDONE {instance}")
         code, _, error = self.command(*options)
@@ -3929,7 +3948,7 @@ class WorkerCommandTests(unittest.TestCase):
                 code, output, errors = self.command(*args)
                 self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
                 self.assertIn(f"active pass {instance}", errors)
-                self.assertIn("no prompt sent", errors)
+                self.assertIn("worker.py answer impl --text", errors)
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), confirmed_state)
                 atomic_file.write_text_atomic(self.prompt, original_prompt)
@@ -3957,7 +3976,7 @@ class WorkerCommandTests(unittest.TestCase):
                         code, output, errors = self.command(*args, "--name", self.agent.row(submitted_pane).name)
                 self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
                 self.assertIn(f"active pass {instance}", errors)
-                self.assertIn("no prompt sent", errors)
+                self.assertIn("worker.py answer impl --text", errors)
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), confirmed_state)
                 atomic_file.write_text_atomic(self.prompt, original_prompt)

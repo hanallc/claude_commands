@@ -39,7 +39,7 @@ def deliver(member, membership, text, **options):
     messages = previous.get("messages", [])
     messages.append(text.split("\\n", 1)[1])
     write_text_atomic(path, json.dumps({"messages": messages}))
-    return send.Result("queued", "private fixture")
+    return send.PaneTextDelivered("sent", "private fixture")
 
 def deliver_result(path: Path) -> int:
     return detached_runs.main(["deliver", str(path)])

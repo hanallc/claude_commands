@@ -906,6 +906,9 @@ class HoldEnforcerTests(unittest.TestCase):
                       mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
                       mock.patch.object(detached_runs, "_run", side_effect=run),
                       mock.patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
+                    saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+                    saved["result_suppressed"] = True
+                    _ = record.write_text(json.dumps(saved))
                     self.assertEqual(detached_runs.main(["supervise", str(record)]), 0)
 
                 saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))

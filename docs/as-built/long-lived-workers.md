@@ -720,7 +720,8 @@ After the first delivery attempt, it marks the run finished and keeps the latest
 A worker in the restart record keeps its result pending if its pane cannot receive input.
 A finished run leaves the live-run limit and keeps its record and log.
 The delivery text describes the outcome.
-The record saves worker receipt, possible input, delivery failure, and director acceptance as separate facts.
+The record saves worker receipt, possible input, and delivery failure separately.
+The record also saves director alerts and direct result receipts in separate fields.
 The reaper saves an ended orphan as finished before it attempts delivery.
 Worker replay and the supervisor retry pending results in the current pass.
 When input may have started, replay checks the transcript for a receipt.
@@ -730,9 +731,11 @@ An unconfirmed attempt stays eligible for a director alert.
 The current pass can finish while an unconfirmed result stays pending.
 The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
 The supervisor and reaper alert the director when delivery fails or the pending result has no visible active pass.
-A saved director receipt stops further director alerts.
-The alert holds the delivery lock through submission and saves the director receipt after sender acceptance.
-Every route to the director uses the same key for a run.
+A saved director alert receipt stops further alerts for that run.
+The alert holds the delivery lock through submission and saves its receipt after sender acceptance.
+A worker result sent to its director uses the same key as the director alert.
+A direct result uses a separate key and can retry after the director receives an alert.
+Legacy alert text confirms delivery of the alert only.
 The reaper can recover director acceptance after an interrupted receipt write.
 An alert for unconfirmed delivery says that the result may have arrived.
 The alert records its run record path in `detached-director-alerts.json` before it attempts delivery.
@@ -792,8 +795,15 @@ After it releases the worker lock, the hook records a close refusal and sends th
 The hook releases the worker lock before it retries undelivered close refusals, including refusals from replaced passes.
 The notice lock prevents duplicate delivery.
 The recorder retains the original prompt and reply path after a replacement pass starts.
-If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
-The hook records an unreadable archived reply in `turn-end-ignored.jsonl` and continues with the current pass.
+A DONE marker identifies its current or archived pass, even when no current dispatch exists.
+For an empty Stop, the native hook records the Stop time at entry.
+The handler uses the last dated user prompt at or before the Stop time.
+The handler skips undated user entries, metadata, and tool results.
+A replacement prompt written before hook entry can cause the old Stop to report `NO_DONE` for the replacement pass.
+An earlier turn uses the stopped pass archive that matches its prompt time, including archives from another run.
+An empty Stop for the current pass uses the normal completion rules.
+If the handler cannot find a prompt time, it records one anomaly in `turn-end-ignored.jsonl` and skips the event.
+The hook records unreadable archived replies in the same log.
 A run without a pane pass uses the ordinary result delivery.
 A newer run of the same command suppresses the older orphan result for an ordinary run.
 A repeated request to stop a pass sends no additional signal or notice.
@@ -939,6 +949,7 @@ The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
 A canceled or interrupted submission keeps its open or stopped pane until the saved stage receipt and reply match.
 Pruning requires a saved worker or director receipt.
+A director-owned result requires a result receipt before pruning.
 Pruning also requires the saved stage receipt and reply for results from the current pass.
 A live detached run keeps the pass active, so the hook closes no pane until that run ends.
 A live detached run also keeps a stopped worker's pane at the shell, so the Codex capacity stop cannot close it.
