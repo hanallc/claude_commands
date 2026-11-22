@@ -1867,17 +1867,27 @@ class OffloadCommandTests(OffloadCommandFixture):
     def test_mac_cleanup_writes_only_markers_after_the_verdict(self) -> None:
         request = offload.OffloadRequest(
             self.repository, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
+        repository = eligibility.KnownRepository("hana")
         with mock.patch.dict(os.environ, self.environment, clear=True):
             config = eligibility.read_config(self.config_path)
-            cleanup = offload.remote_cleanup_command(config, request, eligibility.KnownRepository("hana"))
-        # Linux df has no -g option, so the cleanup writes an error line here.
-        result = subprocess.run(["bash", "-c", "echo mac_exit=42; " + cleanup], cwd=self.root,
-                                env={**self.environment, "HOME": str(self.root), "PATH": os.environ["PATH"]},
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
-        verdict, *after = result.stdout.splitlines()
-        self.assertEqual(verdict, "mac_exit=42")
-        self.assertTrue(after, result.stdout)
-        self.assertTrue(all(line.startswith(("mac_trim=", "mac_cleanup=")) for line in after), result.stdout)
+            cleanup = offload.remote_cleanup_command(config, request, repository)
+            mirror = self.root / offload.remote_mirror(repository, request.target, request.slot)
+        # Linux df has no -g option and a missing mirror fails cd; the cleanup hides both error lines.
+        for present in (False, True):
+            with self.subTest(mirror_present=present):
+                if present:
+                    mirror.mkdir(parents=True)
+                result = subprocess.run(["bash", "-c", "echo mac_exit=42; " + cleanup], cwd=self.root,
+                                        env={**self.environment, "HOME": str(self.root), "PATH": os.environ["PATH"]},
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+                                        timeout=30)
+                verdict, *after = result.stdout.splitlines()
+                self.assertEqual(verdict, "mac_exit=42")
+                if present:
+                    self.assertTrue(after and after[0].startswith("mac_trim="), result.stdout)
+                    self.assertTrue(all(line.startswith(("mac_trim=", "mac_cleanup=")) for line in after), result.stdout)
+                else:
+                    self.assertEqual(after, ["mac_cleanup=1"])
 
     def test_probe_copy_and_run_arguments_preserve_nextest_words(self) -> None:
         _ = (self.repository / ".gitignore").write_text(

@@ -86,7 +86,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
-            + '{ cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
+            + '{ if cd "$HOME"/.local/state/mac-test/test-mirror/hana; then trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
@@ -110,7 +110,8 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
             + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; } 2>/dev/null'
+            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; '
+            + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
