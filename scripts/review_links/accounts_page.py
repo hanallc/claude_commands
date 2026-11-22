@@ -1,7 +1,7 @@
 """Render the accounts board on the Hana console Accounts page."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -499,7 +499,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
                        after=f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "")
 
 
-def _count_tooltip(cell_id: str, value: str, lines: list[str],
+def _count_tooltip(cell_id: str, value: str, lines: Sequence[str],
                    attribute: Literal["data-model-sessions", "data-role-counts"]) -> str:
     tooltip = html.escape("\n".join(lines), quote=True)
     label = html.escape(value + ": " + ", ".join(lines), quote=True)
