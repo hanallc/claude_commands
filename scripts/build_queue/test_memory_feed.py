@@ -566,7 +566,7 @@ class MemoryFeedTests(unittest.TestCase):
         tips, table = self.render_assignment_table(payload)
         self.assertIn("mac-linux: not enabled", "\n".join(tips["walk"][page["walk"].index(row)]))
         self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
-            '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
+            + '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
 
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
@@ -613,9 +613,9 @@ class MemoryFeedTests(unittest.TestCase):
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         _tips, table = self.render_assignment_table(payload)
         self.assertIn('<td class="machine" data-machine="natedev or mac-linux or hana-aws">'
-            '<span class="machine" data-machine="natedev">natedev</span> or '
-            '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
-            '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
+            + '<span class="machine" data-machine="natedev">natedev</span> or '
+            + '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
+            + '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
