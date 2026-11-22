@@ -364,15 +364,14 @@ def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
     return False
 
 
-def read_pane_workers(record: staff.StaffSnapshot, deadline: float) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
-    """Read pane activity once for the directors and their workers."""
-    parents = {parent.id: parent for row in record.find(kind="worker")
-               if (parent := record.parent_of(row)) is not None}
+def read_pane_workers(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot,
+                      deadline: float) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
+    """Read pane activity for the selected directors and their workers."""
     if not parents or time.monotonic() >= deadline:
         return {}
     try:
         with operation_deadline.within(deadline):
-            return worker_panes.observe_parents(tuple(parents.values()), record)
+            return worker_panes.observe_parents(parents, record)
     except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError) as error:
         print(f"stall-watch: pane workers: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return {}
@@ -1543,12 +1542,14 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
                 continue
     runs = unit_lookup.HeldRunLookup(record=record)
-    pane_workers = read_pane_workers(record, inspection_deadline)
-    busy_pane_workers = {parent for parent, workers in pane_workers.items()
-                         if any(worker_panes.worker_state(observed) == "busy" for observed in workers)}
     pending.extend(Delivery(path, "pending-worker-pass", []) for path in worker_pass_alerts.pending_paths())
-    pending.extend(blocked_worker_deliveries(pane_workers, record, now, inspection_deadline))
     pending.extend(detached_result_alerts())
+    worker_parents = {item.row.id: item.row for item in work if record.find(kind="worker", parent=item.row.id)}
+    # Reserve half of the remaining inspection time for the units.
+    worker_deadline = (time.monotonic() + inspection_deadline) / 2
+    pane_workers = read_pane_workers(tuple(worker_parents.values()), record, worker_deadline)
+    with operation_deadline.within(worker_deadline):
+        pending.extend(blocked_worker_deliveries(pane_workers, record, now, worker_deadline))
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
     build_holds = read_build_holds() if work else BuildHolds(frozenset(), frozenset())
@@ -1694,10 +1695,13 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 report.decision = "waiting"
                 continue
             running_work = work_running(pid, rows, session_id)
-            if not running_work:
-                running_work = row.id in busy_pane_workers
+            if not running_work and row.id in worker_parents:
+                observed_workers = read_pane_workers((row,), record, inspection_deadline).get(row.id, ())
+                running_work = any(worker_panes.worker_state(observed) == "busy" for observed in observed_workers)
             if not running_work:
                 running_work = has_live_detached_worker_run(row, run, record)
+            if not pane_budget_left(name, inspection_deadline):
+                continue
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")

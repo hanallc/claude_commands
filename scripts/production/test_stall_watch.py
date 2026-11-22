@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.agents import detached_runs
+from scripts.agents import detached_runs, worker_lifecycle
 from scripts.build_hold.build_hold_test_support import write_holder
 from scripts.buildlog.test_holds import write_mac_block
 from scripts.lib import unit_runs
@@ -1001,6 +1001,43 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(sessions, [unit_session("unit-one")])
         panes.assert_not_called()
         self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+        self.assertEqual(self.sent(), [])
+
+    def test_slow_worker_scans_leave_time_for_the_unit_cursor_to_advance(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        director = unit_membership("showrunner", "unit-one")
+        _ = fixture_worker("watched", director.id)
+        other = fixture_member("unit", name="unwatched", parent=showrunner_relationship("other").id)
+        _ = fixture_worker("unwatched", other.id)
+        clock = [0.0]
+        reads: list[str] = []
+
+        def observe(parents: tuple[staff.StaffRow, ...], _record: staff.StaffSnapshot
+                    ) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
+            self.assertEqual(tuple(parent.id for parent in parents), (director.id,))
+            clock[0] = worker_lifecycle.effective_deadline()
+            return {}
+
+        def inspect(place: unit_lookup.Place, _lines: int, *, joined: bool, deadline: float) -> str:
+            self.assertTrue(joined)
+            self.assertLess(clock[0], deadline)
+            reads.append(place.pane)
+            clock[0] = deadline
+            raise HerdrFailure("fixture pane deadline exhausted")
+
+        cursor = self.state / "inspection.cursor"
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(worker_panes, "observe_parents", side_effect=observe) as scans,
+              mock.patch.object(stall_watch, "read_place", side_effect=inspect)):
+            for name in ("unit-one", "unit-two"):
+                clock[0] = 0.0
+                result = self.tick(START)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(cursor.read_text()), {"name": "showrunner", "unit": name})
+        self.assertEqual(scans.call_count, 2)
+        self.assertEqual(reads, ["w1:p1", "w2:p1"])
         self.assertEqual(self.sent(), [])
 
     def test_staff_unit_without_a_document_row_is_still_inspected(self) -> None:
@@ -3027,6 +3064,32 @@ runpy.run_path(str(script), run_name='__main__')
                     sent = self.sent()
                     self.assertEqual(len(sent), 2)
                     self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+
+    def test_worker_that_starts_during_unit_inspection_prevents_both_idle_sends(self) -> None:
+        director = unit_membership("showrunner", "unit-one")
+        worker = fixture_worker("impl", director.id)
+        status = herdr.AgentStatus.IDLE
+        observations: list[herdr.AgentStatus] = []
+
+        def observe(_parents: tuple[staff.StaffRow, ...], _record: staff.StaffSnapshot
+                    ) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
+            observations.append(status)
+            return {director.id: [worker_panes.OpenWorker(worker, "w2:p1", "worker-terminal", status)]}
+
+        def inspect(place: unit_lookup.Place, lines: int, *, joined: bool, deadline: float) -> str:
+            nonlocal status
+            status = herdr.AgentStatus.WORKING
+            return read_place(place, lines, joined=joined, deadline=deadline)
+
+        with mock.patch.object(worker_panes, "observe_parents", side_effect=observe):
+            self.assertEqual(self.tick(START).returncode, 0)
+            observations.clear()
+            with mock.patch.object(stall_watch, "read_place", side_effect=inspect):
+                result = self.tick(START + 300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(observations, [herdr.AgentStatus.IDLE, herdr.AgentStatus.WORKING])
+        self.assertIn("inspected showrunner/unit-one: running", result.stdout)
+        self.assertEqual(self.sent(), [])
 
     def test_work_the_unit_started_outside_its_tree_prevents_a_bump(self) -> None:
         """A build a unit backgrounded is reparented away from its Claude but keeps the unit's marks."""
