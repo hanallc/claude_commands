@@ -9,6 +9,8 @@ import argparse
 import fcntl
 import json
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -41,6 +43,31 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 def record_path() -> Path:
     return shutdown_state_root() / "restart.json"
+
+
+def _activity_path() -> Path:
+    return record_path().with_suffix(".active")
+
+
+@contextmanager
+def active_operation() -> Generator[None]:
+    path = _activity_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        yield
+
+
+def active() -> bool:
+    try:
+        with _activity_path().open("r") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def read() -> list[str]:

@@ -471,7 +471,7 @@ class WorkerCommandTests(unittest.TestCase):
         folder = path.parent
         delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
 
-        def resume(_row: staff.StaffRow, _active: progress_history.ActiveDispatch) -> worker.ExitCode:
+        def resume(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
@@ -640,9 +640,9 @@ class WorkerCommandTests(unittest.TestCase):
                           patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
                           redirect_stdout(io.StringIO())):
                         self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
-                    self.assertEqual(active.call_count, 2)
+                    self.assertEqual(active.call_count, 4)
                     self.assertEqual(searches.call_count, 0)
-                    self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+                    self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, first] * 2)
                 if unknown:
                     self.assertEqual(self.fixture.world.process_reads.count(pane) - before, 1)
                     self.assertEqual(sum("pane evidence is unknown" in line
@@ -705,7 +705,7 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
         resume.assert_called_once_with(replace(busy.row, role=staff.KnownWorkerRole("impl")),
-            progress_history.ActiveDispatch(dispatch_id, ("assign.sh", "--to", "impl")))
+            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", "impl"))))
         self.assertEqual(self.fixture.staff_state(), before[0])
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
@@ -785,7 +785,8 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")), active)
+        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")),
+            worker.WorkerResume(worker.UnsubmittedAssignment(active.instance_id, active.launcher_command)))
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
@@ -2643,9 +2644,12 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(len(self.fixture.world.launches), launches + (effort == "low"))
                 self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
 
-    def test_restore_keeps_an_open_busy_worker_without_sending_a_launcher(self) -> None:
+    def test_restore_keeps_a_working_worker_with_a_submitted_dispatch(self) -> None:
         opened = self.opened()
-        self.fixture.dispatch(opened.row, "review")
+        dispatch = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch}.")
         self.fixture.world.locations[opened.pane]["agent_status"] = "working"
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         self.assertEqual(self.command("restore"), (0, "unit: workers unchanged\n", ""))
@@ -4491,11 +4495,11 @@ class WorkerCommandTests(unittest.TestCase):
     def test_launcher_recovery_reports_an_absent_director(self) -> None:
         opened = self.opened()
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
-              patch.object(self.fixture.world, "prompt") as prompt, redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(worker._resume_launcher(opened.row, progress_history.ActiveDispatch("saved-pass", ("assign.sh",))),  # pyright: ignore[reportPrivateUsage]
-                             worker.ExitCode.UNCERTAIN)
+              patch.object(self.fixture.world, "prompt") as prompt):
+            plan = worker.WorkerResume(worker.UnsubmittedAssignment("saved-pass", ("assign.sh",)))
+            self.assertEqual(worker._resume_launcher(opened.row, plan),  # pyright: ignore[reportPrivateUsage]
+                             worker.DispatchEvidenceUnknown("director session is unavailable"))
         prompt.assert_not_called()
-        self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 
     def test_publication_failure_reports_that_its_new_pane_close_failed(self) -> None:
         with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),

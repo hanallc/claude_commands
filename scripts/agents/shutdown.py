@@ -760,9 +760,9 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "add-producer":
             return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
-            return restart.stop_all(dry_run=options.dry_run,
+            return restart.run_command(lambda: restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),
-                                    account=_restart_account(options.account))
+                                    account=_restart_account(options.account)), arguments, stop=True, dry_run=options.dry_run)
         if options.command == "move":
             move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
             if options.dry_run:
@@ -771,9 +771,9 @@ def main(argv: list[str] | None = None) -> int:
                 move_arguments.extend(("--why", options.why))
             return accounts.main(move_arguments)
         if options.command == "restart":
-            return restart.restart(stop_all=options.all, dry_run=options.dry_run,
+            return restart.run_command(lambda: restart.restart(stop_all=options.all, dry_run=options.dry_run,
                                    only=tuple(item for item in options.only.split(",") if item),
-                                   account=_restart_account(options.account), why=options.why)
+                                   account=_restart_account(options.account), why=options.why), arguments, dry_run=options.dry_run)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0

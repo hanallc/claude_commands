@@ -6,6 +6,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.agents import remote
 from scripts.herdr import herdr_types
 
+import errno
 import io
 import math
 import json
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +39,7 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.message import sessions, session_records
 from scripts.agents import restart, shutdown
 from scripts.agents.unit_staff_test_support import unit_host
-from scripts.production import fake_unit_host, session_staff, staff, worker
+from scripts.production import fake_unit_host, session_staff, staff, worker, worker_admission
 from scripts.production import test_worker
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts, note_file, quota_state
@@ -56,6 +58,7 @@ from scripts.lib.script_envelope import script_prompt
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
+STOP_UNIT_WORKERS = stop_resume.stop_unit_workers
 CODEX_CONVERSATIONS = herdr.codex_conversations
 NATIVE_PROCESS = herdr.native_process
 HERDR_RESULT = herdr.Herdr.result
@@ -1072,12 +1075,13 @@ class MixedRestartTests(ShutdownTestCase):
                 self.assertNotIn(991104, signals)
                 self.assertEqual(launched_sessions, {row.current_session for row in expected_restarts}, errors.getvalue())
                 self.assertEqual(shutdown_record.read(), [])
-                (anomaly,) = errors.getvalue().splitlines()
+                self.assertEqual(errors.getvalue(), "")
+                (anomaly,) = [line for line in output.getvalue().splitlines() if " / impl:" in line]
                 if invalid_role:
-                    self.assertIn("impl: restart anomaly: invalid role configuration", anomaly)
+                    self.assertIn("impl: invalid role configuration", anomaly)
                     self.assertIn("invalid-effort", anomaly)
                 else:
-                    self.assertIn("impl: restart anomaly: worker role changed from impl to review", anomaly)
+                    self.assertIn("impl: worker role changed from impl to review", anomaly)
                     current = staff.initial_snapshot().rows_by_id[workers[0].id]
                     self.assertEqual(worker_panes.dispatch_role(current), "review")
                 continue
@@ -1090,7 +1094,7 @@ class MixedRestartTests(ShutdownTestCase):
                 self.assertNotIn("w1:p4", live)
                 self.assertEqual(shutdown_record.read(), [str(workers[0].id)])
                 self.assertEqual(sum("impl:" in line and "target process still runs" in line
-                    for line in errors.getvalue().splitlines()), 1, errors.getvalue())
+                    for line in output.getvalue().splitlines()), 1, output.getvalue())
                 self.assertIn(workers[1].current_session, launched_sessions)
                 continue
             self.assertEqual(errors.getvalue(), "", output.getvalue())
@@ -1133,7 +1137,7 @@ class WorkerRestartTests(unittest.TestCase):
               patch.object(restart, "session_launch", wraps=restart.session_launch) as generic,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.start_row(opened.row, staff.snapshot(), world), "")
-        self.assertIn(f"{opened.row.name}: closed; its next assign resumes it\n", output.getvalue())
+        self.assertEqual(output.getvalue(), f"{self.case.fixture.parent.name}: 0 workers restored\n")
         self.assertEqual(len(world.launches), before)
         self.assertNotIn(opened.pane, world.foreground)
         saved.assert_not_called()
@@ -1151,7 +1155,7 @@ class WorkerRestartTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.start_row(selected.row, staff.snapshot(), world,
                 worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), "")
-        self.assertIn(f"{selected.row.name}: closed; its next assign resumes it\n", output.getvalue())
+        self.assertEqual(output.getvalue(), f"{self.case.fixture.parent.name}: 0 workers restored\n")
         self.assertEqual(errors.getvalue(), f"herdr agents:{sibling.pane} tab w1:t1: pane evidence is unknown: "
                          + "sibling process is unreadable; row placement retained\n")
         self.assertEqual(len(world.launches), before)
@@ -1267,6 +1271,17 @@ class RestartTests(RestartTestCase):
     launches: list[tuple[str, herdr.NewTab | herdr.SplitPane | herdr.ExistingPane]] = []
     stops: list[str] = []
     workspace_label: str | None = "live"
+    inherited_log: int = -1
+
+    def capture_log(self, _arguments: list[str], _task: str, *, log: Path, log_fd: int, **_options: object) -> Path:
+        self.inherited_log = os.dup(log_fd)
+        self.addCleanup(os.close, self.inherited_log)
+        return log
+
+    def detached_stop(self, path: Path, arguments: list[str]) -> int:
+        argv = ["restart.py", "--log", str(path), "--log-fd", str(self.inherited_log), *arguments]
+        with patch.object(sys, "argv", argv):
+            return restart.main()
 
     @override
     def setUp(self) -> None:
@@ -1501,17 +1516,594 @@ class RestartTests(RestartTestCase):
         self.assertEqual(shutdown_record.read(), [str(row.id)])
         launch.assert_called_once()
 
-    def test_worker_restore_output_names_its_owner(self) -> None:
-        from scripts.production import worker
+    def test_restart_reports_workers_without_finished_dispatches(self) -> None:
+        owner = replace(self.rows[0], name="efficiency-unit")
+        good, bad = (replace(row, name=name, kind="worker", role=staff.KnownWorkerRole("impl"),
+                             unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id))
+                     for row, name in zip(self.rows[1:], ("restart-output", "macdata-bytes")))
+        record = staff.StaffSnapshot((owner, good, bad))
+        run = self.root / "owner-run"
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({
+            unit_runs.OWNER_FIELD: str(owner.id),
+            "main_agent": {"session_id": str(owner.current_session)},
+            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}],
+            "pass": {}, "history_file": str(run / "history.jsonl")}))
+        reason = "pane identity is unavailable"
+        states: list[worker_panes.WorkerPane] = [
+            worker_panes.OpenWorker(good, "w1:p1", "terminal", herdr.AgentStatus.WORKING),
+            worker_panes.UncertainWorker(bad, reason)]
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
+              patch.object(worker_panes, "worker_run", return_value=run)):
+            for number in range(30):
+                prompt = run / f"prompt-{number}.md"
+                write_text_atomic(prompt, f"Read report {number}.\n")
+                dispatch = progress_history.begin_dispatch(run, slot=good.name, phase="46", role="impl",
+                    worker_name=good.name, worker_id=good.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+                progress_history.complete_dispatch(run, good.name, dispatch)
+            shutdown_record.save([str(row.id) for row in record.rows])
+            with redirect_stdout(io.StringIO()) as manual, redirect_stderr(io.StringIO()):
+                self.assertEqual(worker.restore(owner.id, record=record), worker.ExitCode.UNCERTAIN)
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(restart.restart(), 0)
+        self.assertEqual(sum("; dispatch " in line for line in manual.getvalue().splitlines()), 30)
+        self.assertEqual(output.getvalue().splitlines(), ["efficiency-unit: 1 of 2 workers restored; see anomaly"])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "restart anomaly: efficiency-unit: worker macdata-bytes not restored: pane identity is unavailable; "
+            + "run worker.py restore in efficiency-unit"])
+        self.assertEqual(shutdown_record.read(), [str(owner.id), str(bad.id)])
+
+    def test_bulk_command_output_with_twenty_units_and_506_finished_dispatches(self) -> None:
+        history_sizes = (1, 2, 3, 3, 4, 5, 5, 5, 6, 8, 12, 18, 20, 29, 46, 54, 63, 65, 68, 89)
+        self.assertEqual(sum(history_sizes), 506)
+        rows: list[staff.StaffRow] = []
+        observed: dict[staff.StaffId, worker.PaneWorkerStates] = {}
+        last_director: staff.StaffRow | None = None
+        causes = ("The worker session is unavailable", "The worker transcript is unreadable",
+                  "A detached run is waiting for the worker's DONE line", "The worker's staff row is unavailable")
+        for index, size in enumerate(history_sizes):
+            name = f"unit-{index:02}"
+            owner = replace(self.rows[0], id=staff.StaffId(name), name=name, current_session=staff.StaffId(f"director-{index}"))
+            ready, waiting = (replace(self.rows[1], kind="worker", name=label, id=staff.StaffId(f"{name}-{label}"),
+                                      current_session=staff.StaffId(f"{name}-{label}-session"), unit_type=staff.NotUnit(),
+                                      role=staff.KnownWorkerRole("impl"), parent=staff.ReportsTo(owner.id))
+                              for label in ("ready", "waiting"))
+            rows.extend((owner, ready, waiting))
+            run = self.root / "scale" / name
+            history = run / "history.jsonl"
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
+                "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}],
+                "pass": {}, "history_file": str(history)}))
+            write_text_atomic(history, "".join(json.dumps({"event_type": "pass_finished", "status": "completed",
+                "phase_id": "46", "phase_instance_id": "open-phase", "worker_id": ready.id,
+                "pass_instance_id": f"dispatch-{number}"}) + "\n" for number in range(size)))
+            waiting_state: worker_panes.WorkerPane
+            if index == len(history_sizes) - 1:
+                last_director = owner
+                waiting_state = worker_panes.OpenWorker(waiting, "last-worker", "last-terminal", herdr.AgentStatus.WORKING)
+            else:
+                waiting_state = worker_panes.UncertainWorker(waiting, causes[index % len(causes)])
+            observed[owner.id] = worker.PaneWorkerStates([
+                worker_panes.OpenWorker(ready, f"pane-{index}", f"terminal-{index}", herdr.AgentStatus.WORKING),
+                waiting_state], [run])
+        bob = replace(self.rows[2], id=staff.StaffId("scale-bob"), name="bob", kind="producer", unit_type=staff.NotUnit())
+        rows.append(bob)
+        self.rows = tuple(rows)
+        record = staff.StaffSnapshot(tuple(rows))
+        assert last_director is not None
+        last_identity = last_director.current_session
+        row_operation = staff.row_operation
+        patch_text = json.dumps("*** Begin Patch\n*** Update File: part`one\n*** End Patch").replace("`", r"\`")
+        saved_tool: dict[str, object] = {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
+            "input": f"await tools.apply_patch({patch_text});"}}
+
+        def read_workers(owner: staff.StaffRow, _record: staff.StaffSnapshot, **_options: object) -> worker.PaneWorkerStates:
+            _ = worker_admission.transcript_entry(saved_tool, set())
+            herdr.conversation_note(herdr.UnknownConversation("The worker observation is incomplete"))
+            return observed[owner.id]
+
+        def worker_run(row: staff.StaffRow, **_options: object) -> Path:
+            owner = record.parent_of(row)
+            assert owner is not None
+            return observed[owner.id].runs[0]
+
+        def observe(owner: staff.StaffId, _record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            # Exercise worker diagnostics during the stop observation.
+            _ = worker.restore(owner, record=record)
+            return observed[owner].states
+
+        def conversation(identity: str, _kind: str = "", **_options: object
+                         ) -> herdr.LiveConversation | herdr.StoppedConversation:
+            if identity == last_identity and identity not in self.running:
+                return herdr.StoppedConversation()
+            return herdr.LiveConversation("claude", ())
+
+        @contextmanager
+        def locked_row(reference: str) -> Generator[None]:
+            if reference == bob.id:
+                raise staff.StaffRefused("Herdr upkeep still holds bob (pid 123)")
+            with row_operation(reference):
+                yield
+
+        def notice_stop(row: staff.StaffRow, _client: herdr.Herdr, **_options: object) -> bool:
+            print(f"{row.name}: stopped")
+            return True
+
+        for arguments in (["restart"], ["stop", "--all"]):
+            with (patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(staff, "row_operation", side_effect=locked_row),
+                  patch.object(herdr, "read_conversation", side_effect=conversation),
+                  patch.object(restart.DirectorResumeCheck, "progress", return_value=restart.ResumeCheckState.RESUMED),
+                  patch.object(worker, "_read_workers", side_effect=read_workers),
+                  patch.object(worker_panes, "worker_run", side_effect=worker_run),
+                  patch.object(worker_panes, "observe", side_effect=observe),
+                  patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows(rows)),
+                  patch.object(stop_resume, "stop_unit_workers", wraps=STOP_UNIT_WORKERS),
+                  patch.object(restart, "stop_row", side_effect=notice_stop),
+                  warnings.catch_warnings(record=True) as notices, redirect_stdout(io.StringIO()) as output,
+                  redirect_stderr(io.StringIO()) as errors):
+                warnings.simplefilter("always", SyntaxWarning)
+                shutdown_record.save([str(row.id) for row in rows] if arguments == ["restart"] else [])
+                self.assertEqual(shutdown.main(arguments), 0)
+            combined = (output.getvalue() + errors.getvalue()).splitlines()
+            with self.subTest(command=arguments[0], output_kind="finished dispatches"):
+                self.assertEqual(sum("; dispatch " in line for line in combined), 0)
+            with self.subTest(command=arguments[0], output_kind="syntax warnings"):
+                self.assertEqual(sum(issubclass(item.category, SyntaxWarning) for item in notices), 0)
+            with self.subTest(command=arguments[0], output_kind="unnamed anomalies"):
+                self.assertEqual(sum(line.startswith("anomaly: ") for line in combined), 0)
+            with self.subTest(command=arguments[0], output_kind="line limit"):
+                self.assertLessEqual(len(combined), len(rows) + 5)
+            lines = output.getvalue().splitlines()
+            with self.subTest(command=arguments[0], output_kind="report"):
+                self.assertEqual(len(lines), 23)
+                self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+                self.assertIn("41 of 61 sessions " + ("back" if arguments == ["restart"] else "stopped"), lines[1])
+                self.assertIn("bob: Herdr upkeep still holds bob", lines[2])
+                self.assertIn("19 units need a step", lines[-1])
+                self.assertIn(f"Nate runs agents {' '.join(arguments)} again.", lines[-1])
+                for index in range(19):
+                    self.assertIn(f"unit-{index:02} / waiting", lines[index + 3])
+                for cause, count in zip(causes, (5, 5, 5, 4)):
+                    self.assertEqual(sum(cause in line for line in lines), count)
+                for legacy in ("worker restore is incomplete", "directors resumed", "workers unchanged", ": unchanged", ": stopped\n"):
+                    self.assertNotIn(legacy, output.getvalue())
+
+    def test_restart_waits_for_upkeep_and_names_a_row_still_locked(self) -> None:
+        row = self.rows[0]
+        path = staff.record_path().parent / "rows" / f"{row.id}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for release in (True, False):
+            with self.subTest(release=release):
+                config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
+                text = config.read_text().replace("UPKEEP_ROW_WAIT_SECONDS=5", "UPKEEP_ROW_WAIT_SECONDS=0.04")
+                write_text_atomic(config, text)
+                shutdown_record.save([str(row.id)])
+                with path.open("w+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _ = lock.write(json.dumps({"pid": 123, "command": "/path/herdr_upkeep.py --work"}) + "\n")
+                    lock.flush()
+
+                    def release_row(_seconds: float) -> None:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+
+                    with (patch.object(time, "sleep", side_effect=release_row if release else time.sleep) as waited,
+                          redirect_stdout(io.StringIO()) as output):
+                        self.assertEqual(shutdown.main(["restart"]), 0)
+                    waited.assert_called()
+                lines = output.getvalue().splitlines()
+                self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
+                if release:
+                    self.assertIn("1 of 1 sessions back", lines[1])
+                    self.assertEqual(lines[-1], "Nothing for you to do.")
+                    self.assertEqual(shutdown_record.read(), [])
+                else:
+                    self.assertIn("0 of 1 sessions back", lines[1])
+                    self.assertIn(f"{row.name}: Herdr upkeep still holds {row.name}", lines[2])
+                    self.assertIn("Nate runs agents restart again.", lines[-1])
+                    self.assertEqual(shutdown_record.read(), [str(row.id)])
+
+    def test_detached_stop_appends_to_the_log_printed_by_the_caller(self) -> None:
+        row = self.rows[0]
+        with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(restart, "stop_row", return_value=True) as stop,
+              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+              redirect_stdout(io.StringIO()) as caller):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+            stop.assert_not_called()
+            path = Path(caller.getvalue().strip())
+            self.assertEqual(detach.call_args.kwargs["log"], path)
+            self.assertEqual(path.read_text(), caller.getvalue())
+            arguments = cast(list[str], detach.call_args.args[0])
+            moved = path.rename(path.with_suffix(".moved"))
+            path.mkdir()
+            with redirect_stdout(io.StringIO()) as child:
+                self.assertEqual(self.detached_stop(path, arguments), 0)
+            stop.assert_called_once()
+        self.assertEqual(child.getvalue(), "")
+        self.assertEqual(moved.read_text().splitlines(), [str(path), "Sessions to stop (1).", f"{row.name} ({row.id})",
+            "agents stop --all: 1 of 1 sessions stopped.", "Nothing for you to do."])
+
+    def test_detached_stop_reports_a_session_with_unreadable_liveness(self) -> None:
+        caller, unreadable, stopped = self.rows
+
+        def conversation(identity: str, **_options: object
+                         ) -> herdr.LiveConversation | herdr.StoppedConversation | herdr.UnknownConversation:
+            if identity == unreadable.current_session:
+                return herdr.UnknownConversation("The session liveness is unreadable")
+            if identity == stopped.current_session:
+                return herdr.StoppedConversation()
+            return herdr.LiveConversation("claude", ())
+
+        with (patch.object(herdr, "read_conversation", side_effect=conversation),
+              patch.object(restart, "stop_row", return_value=True) as stop,
+              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.dict(os.environ, {"CODEX_THREAD_ID": str(caller.current_session)}),
+              redirect_stdout(io.StringIO()) as parent):
+            self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+            stop.assert_not_called()
+            path = Path(parent.getvalue().strip())
+            arguments = cast(list[str], detach.call_args.args[0])
+            self.assertEqual(self.detached_stop(path, arguments), 0)
+            self.assertEqual(stop.call_args.args[0], caller)
+        self.assertTrue(path.read_text().startswith(parent.getvalue()))
+        lines = path.read_text().splitlines()[3:]
+        self.assertEqual(lines[0], "agents stop --all: 1 of 2 sessions stopped.")
+        self.assertIn(f"{unreadable.name}: The session liveness is unreadable.", lines[1])
+        self.assertIn(f"{unreadable.name}: Nate runs agents stop --all again.", lines[-1])
+
+    def test_detached_stop_refuses_a_log_descriptor_that_cannot_write(self) -> None:
+        path = self.root / "read-only.log"
+        header = f"{path}\n"
+        write_text_atomic(path, header)
+        row = self.rows[0]
+        shutdown_record.save([str(row.id)])
+        with (path.open("rb") as log, patch.object(restart, "stop_row") as stop,
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              redirect_stderr(io.StringIO()) as errors):
+            self.inherited_log = log.fileno()
+            self.assertEqual(self.detached_stop(path, ["stop", "--all", "--only", str(row.id)]), 2)
+        stop.assert_not_called()
+        self.assertEqual(path.read_text(), header)
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+        self.assertIn(f"Could not write the log at {path}. The command did not start.", errors.getvalue())
+
+    def test_detached_stop_refuses_to_stop_when_only_one_plan_byte_fits(self) -> None:
+        row = self.rows[0]
+        path = self.root / "short-plan.log"
+        shutdown_record.save([str(row.id)])
+
+        class ShortLog(io.FileIO):
+            @override
+            def write(self, b: object, /) -> int | None:
+                return super().write(bytes(memoryview(cast(bytes, b))[:1]))
+
+        with (path.open("wb") as log, patch.object(io, "FileIO", ShortLog),
+              patch.object(restart, "stop_row") as stop,
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              redirect_stderr(io.StringIO()) as errors):
+            self.inherited_log = log.fileno()
+            self.assertEqual(self.detached_stop(path, ["stop", "--all", "--only", str(row.id)]), 2)
+        stop.assert_not_called()
+        self.assertEqual(path.read_text(), "S")
+        self.assertIn("The command did not start. Incomplete log write", errors.getvalue())
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+
+    def test_detached_stop_reports_a_failed_result_write_to_stderr(self) -> None:
+        row = self.rows[0]
+        path = self.root / "failed-result.log"
+        stopped = False
+
+        def stop_row(*_args: object, **_options: object) -> bool:
+            nonlocal stopped
+            self.assertEqual(path.read_text().splitlines(), ["Sessions to stop (1).", f"{row.name} ({row.id})"])
+            stopped = True
+            return True
+
+        class FailingLog(io.FileIO):
+            @override
+            def write(self, b: object, /) -> int | None:
+                if stopped:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                return super().write(cast(bytes, b))
+
+        with (path.open("wb") as log, patch.object(io, "FileIO", FailingLog),
+              patch.object(restart, "stop_row", side_effect=stop_row) as stop,
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              redirect_stderr(io.StringIO()) as errors):
+            self.inherited_log = log.fileno()
+            self.assertEqual(self.detached_stop(path, ["stop", "--all", "--only", str(row.id)]), 2)
+        stop.assert_called_once()
+        self.assertIn("No space left on device", errors.getvalue())
+        self.assertIn("agents stop --all: 1 of 1 sessions stopped.", errors.getvalue())
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+
+    def test_detached_launcher_passes_the_open_log_on_both_platforms(self) -> None:
+        path = self.root / "detach.log"
+        program = Path(restart.__file__)
+        with path.open("xb") as log:
+            for platform in ("darwin", "linux"):
+                with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                      patch.object(subprocess, "Popen") as popen, patch.object(subprocess, "run") as run):
+                    self.assertEqual(stop_resume.detach(["stop", "--all", "--requester", "fixture"],
+                        "restart", program=program, log=path, log_fd=log.fileno()), path)
+                    launch = run if platform == "linux" else popen
+                    launch.assert_called_once()
+                    argv = cast(list[str], launch.call_args.args[0])
+                    self.assertEqual(argv[argv.index("--log-fd") + 1], "1")
+                    if platform == "linux":
+                        self.assertEqual(argv[0], "systemd-run")
+                        self.assertTrue(run.call_args.kwargs["check"])
+                        self.assertIn("--service-type=exec", argv)
+                        self.assertIn(f"--property=StandardOutput=append:/proc/{os.getpid()}/fd/{log.fileno()}", argv)
+                        self.assertIn("--property=StandardError=journal", argv)
+                    else:
+                        self.assertEqual(argv[0], sys.executable)
+                        self.assertEqual(popen.call_args.kwargs["stdout"], log.fileno())
+                        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_self_stop_reports_a_failed_linux_launch_and_can_run_from_a_shell(self) -> None:
+        row = self.rows[0]
+        arguments = ["stop", "--all"]
+        reason = "The user manager refused the service"
+        error = subprocess.CalledProcessError(1, ["systemd-run"], stderr=reason)
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(restart, "stop_row", return_value=True) as stop):
+            with (patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+                  patch.object(stop_resume, "detach", wraps=stop_resume.detach) as detach,
+                  patch.object(subprocess, "run", side_effect=error) as launch,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(shutdown.main(arguments), 2)
+            detach.assert_called_once()
+            launch.assert_called_once()
+            stop.assert_not_called()
+            path, count, issue, _step = output.getvalue().splitlines()
+            self.assertEqual(Path(path).read_text(), output.getvalue())
+            self.assertEqual(count, "agents stop --all: 0 of 1 sessions stopped.")
+            self.assertIn(f"{row.name}: Could not confirm the detached launch. {reason}.", issue)
+            self.assertIn("Nate opens a plain terminal without a staff session. Nate runs agents stop --all there.", issue)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(shutdown.main(arguments), 0)
+        stop.assert_called_once()
+
+    def test_restart_counts_an_idle_worker_when_its_last_turn_has_no_reply(self) -> None:
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(),
+            parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+        record = staff.StaffSnapshot((owner, child))
+        run = self.root / "idle-worker"
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
+        state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.IDLE)
+        shutdown_record.save([str(child.id)])
+        with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [run])),
+              patch.object(worker_panes, "worker_run", return_value=run),
+              patch.object(worker_panes, "_transcript_messages", return_value=["user:\nOne moment."]) as messages,
+              patch.object(worker_panes, "close") as close, redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["restart"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[1:], [
+            "agents restart: 1 of 1 sessions back.", "Nothing for you to do."])
+        self.assertEqual(shutdown_record.read(), [])
+        messages.assert_called_once_with(child)
+        close.assert_not_called()
+
+    def test_restart_sends_an_unsubmitted_dispatch_even_when_the_worker_is_working(self) -> None:
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", name="impl", unit_type=staff.NotUnit(),
+            parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+        record = staff.StaffSnapshot((owner, child))
+        current, previous = self.root / "current", self.root / "previous"
+        for run in (current, previous):
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
+                "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}], "pass": {}}))
+        prompt = previous / "prompt.md"
+        write_text_atomic(prompt, "Read the report.\n")
+        state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.WORKING)
+        director = herdr.TabSession("w1:p0", owner.name, "", owner.current_session)
+        shutdown_record.save([str(child.id)])
+        with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(worker, "resume_receipt", return_value=worker.DispatchNotSubmitted()) as receipt,
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
+              patch.object(worker_panes, "worker_run", return_value=current),
+              patch.object(herdr.Herdr, "tab_sessions", return_value=[director]),
+              patch.object(herdr.Herdr, "prompt") as send, redirect_stdout(io.StringIO()) as output):
+            dispatch = progress_history.begin_dispatch(previous, slot=child.name, phase="46", role="impl",
+                worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+            self.assertEqual(shutdown.main(["restart"]), 0)
+        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
+        send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),
+                                     target=str(owner.current_session))
+        self.assertIn("1 of 1 sessions back", output.getvalue())
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_restart_keeps_a_renamed_workers_row_until_it_sends_the_resume(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
 
         owner = self.rows[0]
-        child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id))
+        child = replace(self.rows[1], kind="worker", name="new-worker", unit_type=staff.NotUnit(),
+            parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+        former = replace(child, name="old-worker")
         record = staff.StaffSnapshot((owner, child))
-        with (patch.object(staff, "snapshot", return_value=record),
-              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([], [])),
-              redirect_stdout(io.StringIO()) as output):
-            _ = restart._restore_workers(owner, record)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(output.getvalue().splitlines(), [f"{owner.name}: workers unchanged"])
+        current, previous = self.root / "current", self.root / "previous"
+        for run in (current, previous):
+            write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
+        pane = "w1:p1"
+        state = worker_panes.OpenWorker(child, pane, "terminal", herdr.AgentStatus.IDLE)
+        saved = [str(child.id)]
+        shutdown_record.save(saved)
+        with (live_detached_run(previous, former), patch.object(staff, "initial_snapshot", return_value=record),
+              staff.supplied_snapshot(record), patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
+              patch.object(worker_panes, "worker_run", return_value=current),
+              patch.object(herdr.Herdr, "tab_sessions", return_value=[herdr.TabSession(pane, child.name, "", child.current_session)]),
+              patch.object(herdr.Herdr, "agents", return_value=[{"pane_id": pane, "agent_status": herdr.AgentStatus.IDLE}]),
+              patch.object(herdr.Herdr, "prompt", side_effect=herdr_types.HerdrFailure("Could not send the resume message")) as send,
+              patch.object(worker_panes, "close") as close):
+            with redirect_stdout(io.StringIO()) as failed:
+                self.assertEqual(shutdown.main(["restart"]), 0)
+            self.assertEqual(shutdown_record.read(), saved)
+            self.assertIn("0 of 1 sessions back", failed.getvalue())
+            self.assertIn(f"{child.name}: Could not send the resume message", failed.getvalue())
+            send.assert_called_once()
+            send.reset_mock(side_effect=True)
+            with redirect_stdout(io.StringIO()) as retried:
+                self.assertEqual(shutdown.main(["restart"]), 0)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], pane)
+        self.assertIn(f"Detached run {former.name} remains live", cast(str, send.call_args.args[1]))
+        self.assertEqual(send.call_args.kwargs["target"], child.current_session)
+        self.assertEqual(shutdown_record.read(), [])
+        self.assertIn("1 of 1 sessions back", retried.getvalue())
+        close.assert_not_called()
+
+    def test_stop_waits_for_upkeep_to_start_a_producer_before_reading_liveness(self) -> None:
+        producer = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
+        launched = replace(producer, current_session=staff.StaffId("upkeep-new-session"))
+        self.rows = (producer,)
+        self.running.clear()
+        path = staff.record_path().parent / "rows" / f"{producer.id}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        def conversation(identity: str, **_options: object) -> herdr.LiveConversation | herdr.StoppedConversation:
+            if identity not in self.running:
+                return herdr.StoppedConversation()
+            return herdr.LiveConversation("claude", ())
+
+        with path.open("w+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _ = lock.write(json.dumps({"pid": 123, "command": "/path/herdr_upkeep.py --work"}) + "\n")
+            lock.flush()
+
+            def finish_upkeep(_seconds: float) -> None:
+                self.assertTrue(shutdown_record.active())
+                self.running.add(launched.current_session)
+                self.rows = (launched,)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+            with (patch.object(staff, "initial_snapshot", side_effect=lambda: staff.StaffSnapshot(self.rows)),
+                  patch.object(time, "sleep", side_effect=finish_upkeep) as waited,
+                  patch.object(herdr, "read_conversation", side_effect=conversation),
+                  patch.object(restart, "stop_row", return_value=True) as stop,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(shutdown.main(["stop", "--all"]), 0)
+        waited.assert_called_once()
+        self.assertEqual(stop.call_args.args[0], launched)
+        self.assertEqual(shutdown_record.read(), [str(producer.id)])
+        self.assertEqual(output.getvalue().splitlines()[1:], [
+            "agents stop --all: 1 of 1 sessions stopped.", "Nothing for you to do."])
+
+    def test_restart_prints_the_report_when_the_log_directory_is_unavailable(self) -> None:
+        row = self.rows[0]
+        logs = self.root / "logs"
+        _ = logs.touch()
+        shutdown_record.save([str(row.id)])
+        with (patch.object(restart, "start_row", side_effect=staff.StaffRefused("The row is locked")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(shutdown.main(["restart"]), 0)
+        first, count, issue, last = output.getvalue().splitlines()
+        self.assertTrue(first.startswith(f"Could not write the log at {logs}/restart-"))
+        self.assertEqual(count, "agents restart: 0 of 1 sessions back.")
+        self.assertEqual(issue, f"{row.name}: The row is locked. Nate runs agents restart again.")
+        self.assertIn("Nate runs agents restart again.", last)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_self_stop_succeeds_after_the_named_log_folder_repair(self) -> None:
+        row = self.rows[0]
+        logs = self.root / "logs"
+        logs.touch()
+        arguments = ["stop", "--all"]
+        with (patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(restart, "stop_row", return_value=True) as stop,
+              patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+              patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)})):
+            with redirect_stdout(io.StringIO()) as failed:
+                self.assertEqual(shutdown.main(arguments), 2)
+            detach.assert_not_called()
+            stop.assert_not_called()
+            lines = failed.getvalue().splitlines()
+            self.assertIn("0 of 1 sessions stopped", lines[1])
+            self.assertIn(f"Nate moves the file at {logs} and creates a writable folder at that path.", lines[-1])
+            self.assertIn("Then Nate runs agents stop --all again.", lines[-1])
+            _ = logs.rename(logs.with_suffix(".old"))
+            logs.mkdir()
+            with redirect_stdout(io.StringIO()) as retry:
+                self.assertEqual(shutdown.main(arguments), 0)
+            stop.assert_not_called()
+            path = Path(retry.getvalue().strip())
+            self.assertEqual(self.detached_stop(path, cast(list[str], detach.call_args.args[0])), 0)
+            stop.assert_called_once()
+        self.assertIn("1 of 1 sessions stopped", path.read_text())
+
+    def test_self_stop_uses_the_log_error_to_choose_a_repair(self) -> None:
+        row = self.rows[0]
+        arguments = ["stop", "--all"]
+        create_log = restart._create_log  # pyright: ignore[reportPrivateUsage]
+        for cause in (errno.EACCES, errno.ENOSPC, errno.EIO):
+            with self.subTest(cause=cause):
+                root = self.root / str(cause)
+                logs = root / "logs"
+                logs.mkdir(parents=True)
+                full = root / "space-used"
+                if cause == errno.EACCES:
+                    logs.chmod(0o500)
+                if cause == errno.ENOSPC:
+                    full.touch()
+
+                def open_log(files: ExitStack, path: Path) -> io.FileIO:
+                    # Simulate the filesystem refusal even when the test user has extra permissions.
+                    if cause == errno.EIO or (cause == errno.EACCES and not logs.stat().st_mode & 0o200) or full.exists():
+                        raise OSError(cause, os.strerror(cause), str(path))
+                    return create_log(files, path)
+
+                with (patch.object(restart, "shutdown_state_root", return_value=root),
+                      patch.object(restart, "_create_log", side_effect=open_log),
+                      patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+                      patch.object(restart, "stop_row", return_value=True) as stop,
+                      patch.object(stop_resume, "detach", side_effect=self.capture_log) as detach,
+                      patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)})):
+                    with redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(shutdown.main(arguments), 2)
+                    detach.assert_not_called()
+                    stop.assert_not_called()
+                    _, count, issue, step = output.getvalue().splitlines()
+                    self.assertEqual(count, "agents stop --all: 0 of 1 sessions stopped.")
+                    self.assertIn(os.strerror(cause), issue)
+                    if cause == errno.EACCES:
+                        self.assertIn(f"Nate gives this account write and search access to {logs}.", step)
+                        logs.chmod(0o700)
+                    elif cause == errno.ENOSPC:
+                        self.assertIn(f"Nate frees space on the filesystem that contains {logs}.", step)
+                        full.unlink()
+                    else:
+                        self.assertIn("Nate sends this error to the efficiency unit.", step)
+                        self.assertNotIn("again", output.getvalue())
+                        continue
+                    self.assertIn("Then Nate runs agents stop --all again.", step)
+                    with redirect_stdout(io.StringIO()) as retried:
+                        self.assertEqual(shutdown.main(arguments), 0)
+                    path = Path(retried.getvalue().strip())
+                    self.assertEqual(self.detached_stop(path, cast(list[str], detach.call_args.args[0])), 0)
+                    stop.assert_called_once()
+                    self.assertIn("1 of 1 sessions stopped", path.read_text())
+
+    def test_restart_dry_run_prints_a_count_and_only_named_entries(self) -> None:
+        row, *other = self.rows
+        shutdown_record.save([str(row.id), "missing-row"])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["restart", "--dry-run"]), 0)
+        path, count, *entries, last = output.getvalue().splitlines()
+        self.assertEqual(Path(path).read_text(), output.getvalue())
+        self.assertEqual(count, "agents restart: 0 of 1 sessions back (dry run).")
+        self.assertCountEqual([line.partition(":")[0] for line in entries],
+                              [row.name, *(item.name for item in other), "missing-row"])
+        self.assertEqual(last, "Nothing for you to do.")
+        self.assertEqual(shutdown_record.read(), [str(row.id), "missing-row"])
+        self.assertEqual((self.stops, self.launches), ([], []))
 
     def account_processes(self) -> None:
         def observe(identity: str, _kind: str = "", *,
@@ -1596,7 +2188,11 @@ class RestartTests(RestartTestCase):
             with self.subTest(account=account), redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(shutdown.main(["restart", *account, "--all", "--only",
                     str(requested.id), "--dry-run"]), 0)
-                self.assertEqual([line.split(":", 1)[0] for line in output.getvalue().splitlines()],
+                lines = output.getvalue().splitlines()
+                self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
+                self.assertEqual(lines[-1], "Nothing for you to do.")
+                self.assertEqual(lines[1], f"agents restart: 0 of {0 if account else 1} sessions back (dry run).")
+                self.assertEqual([line.split(":", 1)[0] for line in lines[2:-1]],
                                  [self.rows[0].name] if not account else [])
 
     def test_restart_all_only_stops_and_starts_only_the_requested_live_row(self) -> None:
@@ -1610,6 +2206,9 @@ class RestartTests(RestartTestCase):
                     fixture = WorkerPaneTests("runTest")
                     fixture.setUp()
                     _ = scope.callback(fixture.doCleanups)
+                    config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
+                    write_text_atomic(config, config.read_text()
+                        + "\n# range: 0..300\nUPKEEP_ROW_WAIT_SECONDS=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")
@@ -1693,10 +2292,11 @@ class RestartTests(RestartTestCase):
               patch.object(agent_accounts, "codex_account_home",
                   return_value=agent_accounts.CodexSetupHome("codex987654321", self.root / ".codex987654321")),
               patch.object(restart, "restart") as run,
-              redirect_stderr(io.StringIO()) as errors):
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["restart", "codex987654321", "--all"]), 2)
         run.assert_not_called()
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("unknown account codex987654321", output.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[-1], "1 item needs a step: Nate selects an available account.")
 
     def test_account_filters_partition_an_owner_and_its_workers_by_their_own_accounts(self) -> None:
         self.account_processes()
@@ -1737,11 +2337,11 @@ class RestartTests(RestartTestCase):
                   side_effect=UnknownAccountName("unknown account: missing")),
               patch.object(restart, "stop_row") as stop,
               patch.object(restart, "start_row") as start,
-              redirect_stderr(io.StringIO()) as errors):
+              redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["restart", "missing", "--all"]), 2)
         stop.assert_not_called()
         start.assert_not_called()
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("unknown account: missing", output.getvalue())
 
     def test_restart_uses_each_reader_outcome_for_both_runtimes(self) -> None:
         self.running.clear()
@@ -2812,6 +3412,7 @@ class RestartTests(RestartTestCase):
                           if delivery is ContinuationDelivery.FAILED else None)) as prompt,
                       patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                           "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
+                      redirect_stdout(io.StringIO()) as output,
                       redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(shutdown.main(["restart", *flags]), 0)
                 if held:
@@ -2849,8 +3450,9 @@ class RestartTests(RestartTestCase):
                     prompt_text = cast(str, prompt.call_args.args[1])
                     self.assertIn(cause, prompt_text)
                     self.assertIn("Continue where you stopped.", prompt_text)
-                    self.assertEqual(errors.getvalue(),
-                        "renamed: restart anomaly: continuation message was not sent: fixture prompt failed\n")
+                    self.assertEqual(errors.getvalue(), "")
+                    self.assertIn("renamed: Could not send the continuation message: fixture prompt failed. "
+                        + "The director checks the continuation message.", output.getvalue().splitlines())
 
         class TranscriptAfterRestart(Enum):
             ASSISTANT = "assistant"
@@ -2954,12 +3556,16 @@ class RestartTests(RestartTestCase):
                     write_text_atomic(source, previous + "".join(json.dumps(item) + "\n" for item in rows) + tail)
                     return herdr.AgentLaunched("w1:p0", herdr.PromptSubmissionNotRequired())
 
+                def restore_worker(_parent: staff.StaffId, *, report: worker.RestoreReport, **_options: object) -> worker.ExitCode:
+                    report.restored.add(child.id)
+                    return worker.ExitCode.OK
+
                 staff_before = Path(os.environ["STAFF_FILE"]).read_bytes()
                 with (patch.object(staff, "initial_snapshot", return_value=record),
                       patch.object(restart, "session_launch", return_value=(family, {},
                           ["--resume" if family == "claude" else "resume", str(row.current_session)])),
                       patch.object(member_account, "resume_account", return_value=account),
-                      patch.object(restart, "_restore_workers", return_value=""),
+                      patch.object(worker, "restore", side_effect=restore_worker),
                       patch.object(herdr, "launch_prepared_agent", side_effect=launched),
                       patch.object(time, "monotonic", side_effect=lambda: now[0]),
                       patch.object(time, "sleep", side_effect=advance),
@@ -3352,6 +3958,7 @@ class RestartTests(RestartTestCase):
                 self.running = {str(row.current_session) for row in self.rows[:2]}
                 shutdown_record.save([retained])
                 with (patch.object(herdr, "read_conversation", side_effect=observe),
+                      redirect_stdout(io.StringIO()) as output,
                       redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(shutdown.main(command), 0)
                 self.assertIn(retained, shutdown_record.read())
@@ -3360,7 +3967,11 @@ class RestartTests(RestartTestCase):
                 else:
                     self.assertNotIn(str(self.rows[1].id), shutdown_record.read())
                 self.assertNotIn(str(failed.id), shutdown_record.read())
-                self.assertEqual(errors.getvalue().count("partial liveness read"), 1)
+                if command[0] == "stop":
+                    self.assertEqual(output.getvalue().count(f"{failed.name}: fixture liveness read failed"), 1)
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(errors.getvalue().count("partial liveness read"), 1)
 
     def test_refused_row_lock_saves_no_live_row_for_both_unscoped_commands(self) -> None:
         operation = staff.row_operation
@@ -3430,7 +4041,10 @@ class RestartTests(RestartTestCase):
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": str(self.rows[0].current_session)}),
               patch.object(stop_resume, "detach", return_value=self.root / "stop.log") as detached):
             self.assertEqual(shutdown.main(["stop", "--all"]), 0)
-        self.assertEqual(detached.call_args.args[0], ["stop", "--all", "--only", ",".join(selected)])
+        arguments = cast(list[str], detached.call_args.args[0])
+        self.assertEqual(arguments[:-1], ["stop", "--all", "--only", ",".join(selected), "--parent-report"])
+        self.assertEqual(json.loads(arguments[-1]), {
+            "retry": "agents stop --all", "targets": {}, "units": {}, "issues": {}})
         self.assertEqual(shutdown_record.read(), ["earlier"])
         self.assertEqual((self.stops, self.launches), ([], []))
 
@@ -3450,7 +4064,11 @@ class RestartTests(RestartTestCase):
     def test_stop_all_dry_run_saves_nothing_and_names_each_row_once(self) -> None:
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["stop", "--all", "--dry-run"]), 0)
-        self.assertEqual(output.getvalue().splitlines(), [
+        lines = output.getvalue().splitlines()
+        self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
+        self.assertEqual(lines[-1], "Nothing for you to do.")
+        self.assertEqual(lines[1], "agents stop --all: 0 of 3 sessions stopped (dry run).")
+        self.assertEqual(lines[2:-1], [
             f"{row.name}: {row.id}, {row.kind}, workspace live, tab {n + 1} ({row.name}); would stop and save"
             for n, row in enumerate(self.rows)])
         self.assertFalse(shutdown_record.record_path().exists())
@@ -3960,8 +4578,19 @@ class RestartTests(RestartTestCase):
         record = staff.StaffSnapshot((holder, child))
         self.running.clear()
         shutdown_record.save([str(holder.id), str(child.id)])
+
+        first = True
+
+        def restore_attempt(_parent: staff.StaffId, *, report: worker.RestoreReport, **_options: object) -> worker.ExitCode:
+            nonlocal first
+            if first:
+                first = False
+                return worker.ExitCode.UNCERTAIN
+            report.restored.add(child.id)
+            return worker.ExitCode.OK
+
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(worker, "restore", side_effect=[worker.ExitCode.UNCERTAIN, worker.ExitCode.OK]) as restore):
+              patch.object(worker, "restore", side_effect=restore_attempt) as restore):
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
             self.assertEqual(restart.restart(), 0)
@@ -3979,13 +4608,16 @@ class RestartTests(RestartTestCase):
 
         def restore(_parent: staff.StaffId, *, record: staff.StaffSnapshot,
                     runs: dict[str, list[str]],
-                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> worker.ExitCode:
+                    report: worker.RestoreReport,
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                    **_options: object) -> worker.ExitCode:
             _ = record, runs
             self.assertIsInstance(codex, herdr.CodexConversations)
             if not resumed:
                 resumed.add(children[0].id)
                 raise OSError("interrupted after first worker")
             resumed.update(child.id for child in children)
+            report.restored.update(resumed)
             return worker.ExitCode.OK
 
         shutdown_record.save([str(row.id) for row in record.rows])

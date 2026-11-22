@@ -641,7 +641,36 @@ An unreadable native identity in a retained pane excludes that pane from placeme
 It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
-A running row prints `unchanged`.
+`agents restart` and `agents stop --all` print the log path first.
+The commands keep the full report under `shutdown_state_root()/logs` and retain the files.
+A command that stops its caller continues in a detached process.
+The detached process writes and flushes the full list of sessions before it stops any session.
+On Linux, `systemd-run` confirms that Python started and gives it access to the open log file.
+If a log write fails after a stop, the child reports the result on stderr and returns a nonzero status.
+The Linux user service sends stderr to the journal.
+Its final line includes the names and steps for unresolved sessions from the first process.
+If log setup fails, the first line gives the path and the rest of the report still appears.
+If the command needs to detach, the report gives the repair for the log error.
+For an unknown log error, Nate sends the error to the efficiency unit.
+The report counts confirmed sessions out of the total, including workers.
+Restart counts sessions that resumed and sessions that already run.
+Dry runs show the count and list sessions without making changes.
+Each unresolved session gets one line with its name, the reason, and who does the next step.
+A worker line also names its owner.
+The final line gives the open steps for the directors and Nate.
+If there are no steps, the final line says `Nothing for you to do.`
+Restart keeps entries that need another restore attempt.
+Restart reads the dispatch state and live detached runs by worker staff ID.
+Restart counts a worker as back when it needs no resume message or when restart sends the message.
+Restart removes only worker entries that it resolves.
+Run `worker.py restore` in the owner session to see completed dispatches in open phases.
+
+Herdr upkeep skips row work while a stop or restart holds the activity lock.
+Saved rows can remain after the activity lock closes.
+Stop pauses upkeep and waits for its producer row locks before reading fresh staff and liveness data.
+The `UPKEEP_ROW_WAIT_SECONDS` setting in `config/shutdown.conf` limits the wait.
+If the time expires, the report names the row and gives the command to run again.
+
 A restarted unit director or showrunner gets one continuation message in its current conversation.
 The shared resume message builder supplies the text.
 The default cause is "agents restart ran".
@@ -714,14 +743,9 @@ A Claude transcript missing from the current read also makes the transcript unre
 A matching user turn followed by an assistant turn or tool call confirms resumed work.
 All checked directors share one deadline.
 The check ends as soon as every director resumes.
-At the deadline, each failed check prints one of these lines:
-
-- `<name>: restart check: no continuation message`
-- `<name>: restart check: no work after the continuation message`
-- `<name>: restart check: transcript unreadable`
-
-The check then prints `restart check: <passed> of <checked> directors resumed`.
-The check prints nothing when it checks no director.
+After the deadline, the report names each director whose check failed.
+The reason can be a missing continuation message, no work after the message, or an unreadable transcript.
+The director checks the continuation message.
 It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
 It does not change the exit code, restart record, or staff.
 config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
@@ -751,7 +775,8 @@ The record stores no session facts, progress, claims, recovery states, or pane p
 The record holds only rows that a restart starts:
 - `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
 - `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
-- `restart` removes a saved id with no staff row, or a saved worker that `worker.not_restored` names, with one anomaly line: `<name>: restart anomaly: <reason>; removed from the restart record`.
+- `restart` removes a saved id with no staff row or a saved worker that `worker.not_restored` names.
+- The report names the removed entry and gives the reason.
 - `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
 - `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
 - An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.

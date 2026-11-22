@@ -6,16 +6,19 @@ except FileNotFoundError:
     pass
 
 import argparse
+import errno
 import io
+import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
-from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Iterable
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout, suppress
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from threading import Event
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -24,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from importlib import import_module
+from uuid import uuid4
 
 from scripts.herdr import herdr
 from scripts.herdr import herdr_types
@@ -31,16 +35,16 @@ from scripts.message import sessions, codex_daemon, session_records
 from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import codex_transcript_homes, open_transcript, transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
-from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
+from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed, shutdown_state_root
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
-from scripts.whoami.account import named_account_environment
+from scripts.whoami.account import UnknownAccountName, named_account_environment
 
 if TYPE_CHECKING:
     from scripts.herdr.worker_panes import AllWorkers, SelectedWorkerRows as WorkerRowSelection
+    from scripts.production.worker import RestoreReport
 
 class StopReadArguments(TypedDict, total=False):
     """Forward shared observations only when the caller supplies them."""
@@ -253,12 +257,332 @@ class ReplacedRestartPane:
             return False
 
 
+class WorkerRestoreIncomplete(OSError):
+    """Keep the relevant rows in the restart record."""
+
+
+@dataclass(frozen=True)
+class FollowUp:
+    name: str
+    reason: str
+    step: str
+    unit: str = ""
+    operator: bool = False
+    director_check: bool = False
+
+
+class FollowUpFields(TypedDict):
+    name: str
+    reason: str
+    step: str
+    unit: str
+    operator: bool
+    director_check: bool
+
+
+class DetachedReport(TypedDict):
+    retry: str
+    targets: dict[str, str]
+    units: dict[str, str]
+    issues: dict[str, FollowUpFields]
+
+
+@dataclass
+class BulkReport:
+    log: Path
+    command: str
+    retry: str
+    targets: dict[str, str] = field(default_factory=dict)
+    units: dict[str, str] = field(default_factory=dict)
+    completed: set[str] = field(default_factory=set)
+    issues: dict[str, FollowUp] = field(default_factory=dict)
+    preview: list[str] = field(default_factory=list)
+    inherited: set[str] = field(default_factory=set)
+    deferred: bool = False
+    log_stream: io.FileIO | None = None
+    log_error: OSError | ValueError | None = None
+
+    def track(self, row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
+        owner = record.parent_of(row) if row.kind == "worker" else row
+        self.targets[row.id] = f"{owner.name} / {row.name}" if row.kind == "worker" and owner is not None else row.name
+        if owner is not None and owner.kind in ("unit", "showrunner"):
+            self.units[row.id] = owner.name
+
+    def failure(self, key: str, name: str, reason: str) -> None:
+        self.issues[key] = FollowUp(self.targets.get(key, name), reason, f"Nate runs {self.retry} again.", operator=True)
+
+    def log_repair_step(self) -> str:
+        error = self.log_error
+        path = shlex.quote(str(self.log.parent))
+        cause = error.errno if isinstance(error, OSError) else None
+        if cause in (errno.EACCES, errno.EPERM):
+            folder = self.log.parent
+            with suppress(OSError):
+                folder = next((parent for parent in self.log.parents if parent.is_dir()), folder)
+            repair = f"gives this account write and search access to {shlex.quote(str(folder))}"
+            return (f"Nate {repair}. Nate gives this account search access to the parent folders. "
+                    f"Then Nate runs {self.retry} again.")
+        elif cause in (errno.EEXIST, errno.ENOTDIR):
+            blocked = None
+            with suppress(OSError):
+                blocked = next((parent for parent in self.log.parents if parent.is_file()), None)
+            if blocked is None:
+                return "Nate sends this error to the efficiency unit."
+            repair = f"moves the file at {shlex.quote(str(blocked))} and creates a writable folder at that path"
+        elif cause == errno.ENOSPC:
+            repair = f"frees space on the filesystem that contains {path}"
+        else:
+            return "Nate sends this error to the efficiency unit."
+        return f"Nate {repair}. Then Nate runs {self.retry} again."
+
+    def finish(self, key: str) -> None:
+        self.completed.add(key)
+        _ = self.issues.pop(key, None)
+
+    def detach_data(self) -> str:
+        issues: dict[str, FollowUpFields] = {key: {
+            "name": issue.name, "reason": issue.reason, "step": issue.step,
+            "unit": issue.unit, "operator": issue.operator, "director_check": issue.director_check,
+        } for key, issue in self.issues.items()}
+        data: DetachedReport = {
+            "retry": self.retry,
+            "targets": {key: name for key, name in self.targets.items() if key in self.issues},
+            "units": {key: unit for key, unit in self.units.items() if key in self.issues},
+            "issues": issues,
+        }
+        return json.dumps(data)
+
+    def receive(self, data: DetachedReport) -> None:
+        self.retry = data["retry"]
+        self.targets.update(data["targets"])
+        self.units.update(data["units"])
+        self.issues.update({key: FollowUp(**issue) for key, issue in data["issues"].items()})
+        self.inherited.update(self.issues)
+
+    def lines(self, *, dry_run: bool = False) -> list[str]:
+        status = "stopped" if self.command == "agents stop --all" else "back"
+        completed = len(self.targets.keys() & self.completed)
+        suffix = " (dry run)" if dry_run else ""
+        lines = [f"{self.command}: {completed} of {len(self.targets)} sessions {status}{suffix}.", *self.preview]
+        issues = dict(self.issues)
+        if not dry_run:
+            for key in self.targets.keys() - self.completed - issues.keys():
+                issues[key] = FollowUp(self.targets[key], f"Could not confirm the session is {status}",
+                                       f"Nate runs {self.retry} again.", operator=True)
+        for item in sorted(issues.values(), key=lambda issue: (issue.name, issue.reason)):
+            reason = " ".join(item.reason.split()).rstrip(".")
+            lines.append(f"{item.name}: {reason}. {item.step}")
+        actions: list[str] = []
+        units = {item.unit or self.units.get(key, "") for key, item in issues.items() if item.operator or item.unit} - {""}
+        if units:
+            count = len(units)
+            actions.append("1 unit needs a step." if count == 1 else f"{count} units need a step.")
+        if any(item.unit and not item.director_check for item in issues.values()):
+            actions.append("The affected directors run worker.py restore.")
+        if any(item.director_check for item in issues.values()):
+            actions.append("The affected directors check the continuation message.")
+        operator_steps = dict.fromkeys(item.step for key, item in issues.items()
+                                       if item.operator and key not in self.inherited)
+        pending = sum(item.operator for key, item in issues.items() if key not in self.inherited)
+        if pending and not units:
+            count = "1 item needs a step" if pending == 1 else f"{pending} items need a step"
+            actions.append(f"{count}: {' '.join(operator_steps)}")
+        elif pending:
+            actions.extend(operator_steps)
+        elif actions and not any(item.operator for item in issues.values()):
+            actions.append("Nate has no step.")
+        actions.extend(f"{item.name}: {item.step}" for item in sorted(
+            (item for key, item in issues.items() if key in self.inherited), key=lambda issue: issue.name))
+        lines.append(" ".join(actions) or "Nothing for you to do.")
+        return lines
+
+
+@dataclass(frozen=True)
+class DetachedLog:
+    path: Path
+    descriptor: int
+
+
+_BULK_REPORT: ContextVar[BulkReport | None] = ContextVar("_BULK_REPORT", default=None)
+_DETACHED_LOG: ContextVar[DetachedLog | None] = ContextVar("_DETACHED_LOG", default=None)
+_DETACHED_REPORT: ContextVar[DetachedReport | None] = ContextVar("_DETACHED_REPORT", default=None)
+
+
+def _retry_command(arguments: list[str]) -> str:
+    retry = ["agents"]
+    options = iter(arguments)
+    for option in options:
+        if option == "--why":
+            _ = next(options, "")
+        elif not option.startswith("--why="):
+            retry.append(option)
+    return shlex.join(retry)
+
+
+def _create_log(files: ExitStack, path: Path) -> io.FileIO:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = files.enter_context(io.FileIO(path, "xb"))
+    _write_log(log, f"{path}\n")
+    return log
+
+
+def _write_log(log: io.FileIO, text: str) -> None:
+    data = text.encode("utf-8")
+    if log.write(data) != len(data):
+        raise OSError("Incomplete log write")
+    log.flush()
+
+
+class StopPlanWriteFailed(Exception):
+    """The child could not save the stop plan."""
+
+
+def _record_stop_plan(report: BulkReport, rows: Iterable[staff.StaffRow]) -> None:
+    names = [f"{report.targets[row.id]} ({row.id})" for row in rows]
+    header = "\n".join([f"Sessions to stop ({len(names)}).", *names]) + "\n"
+    try:
+        log = report.log_stream
+        if log is None:
+            raise OSError("The log is unavailable")
+        _write_log(log, header)
+        os.fsync(log.fileno())
+    except (OSError, ValueError) as error:
+        raise StopPlanWriteFailed(_error_reason(error)) from error
+
+
+def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool = False, dry_run: bool = False) -> int:
+    """Write the command output to the terminal and the same log."""
+    detached = _DETACHED_LOG.get()
+    path = detached.path if detached is not None else (
+        shutdown_state_root() / "logs" / f"{'stop' if stop else 'restart'}-{uuid4().hex}.log")
+    report = BulkReport(path, "agents stop --all" if stop else "agents restart", _retry_command(arguments))
+    if (data := _DETACHED_REPORT.get()) is not None:
+        report.receive(data)
+    with ExitStack() as files:
+        try:
+            if detached is None:
+                log = _create_log(files, path)
+                print(path, flush=True)
+            else:
+                log = files.enter_context(io.FileIO(detached.descriptor, "wb", closefd=False))
+                _ = log.seek(0, os.SEEK_END)
+            report.log_stream = log
+        except (OSError, ValueError) as error:
+            if detached is not None:
+                print(f"Could not write the log at {path}. The command did not start.", file=sys.stderr, flush=True)
+                return 2
+            log = None
+            report.log_error = error
+            print(f"Could not write the log at {path}. {_error_reason(error)}", flush=True)
+
+        token = _BULK_REPORT.set(report)
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output), redirect_stderr(output):
+                code = action()
+        except StopPlanWriteFailed as error:
+            print(f"Could not write the log at {path}. The command did not start. {error}",
+                  file=sys.stderr, flush=True)
+            return 2
+        except UnknownAccountName as error:
+            report.issues[""] = FollowUp(report.command, _error_reason(error),
+                "Nate selects an available account.", operator=True)
+            code = 2
+        except (OSError, ValueError, conf.Unusable, staff.StaffRefused, herdr_types.HerdrFailure,
+                subprocess.SubprocessError) as error:
+            report.failure("", report.command, _error_reason(error))
+            code = 2
+        finally:
+            _BULK_REPORT.reset(token)
+        if code and not report.issues:
+            report.failure("", report.command, "Could not complete the command")
+        if not report.deferred:
+            result = "\n".join(report.lines(dry_run=dry_run)) + "\n"
+            if log is not None:
+                try:
+                    _write_log(log, result)
+                    if detached is not None:
+                        os.fsync(log.fileno())
+                except (OSError, ValueError) as error:
+                    print(f"Could not finish writing the log at {path}. {_error_reason(error)}",
+                          file=sys.stderr, flush=True)
+                    if detached is not None:
+                        print(result, end="", file=sys.stderr, flush=True)
+                        return code or 2
+            if detached is None:
+                print(result, end="", flush=True)
+        return code
+
+
+@dataclass
+class WorkerRestoreReports:
+    attempts: dict[staff.StaffId, tuple[staff.StaffRow, RestoreReport]] = field(default_factory=dict)
+
+    def resolved(self, scope: staff.StaffId) -> set[staff.StaffId]:
+        attempt = self.attempts.get(scope)
+        if attempt is None:
+            return set()
+        _owner, result = attempt
+        return (result.restored | result.skipped.keys()) - result.failures.keys()
+
+    def report(self) -> None:
+        owners: dict[staff.StaffId, staff.StaffRow] = {}
+        scopes: dict[staff.StaffId, dict[staff.StaffId, RestoreReport]] = {}
+        for scope, (owner, result) in self.attempts.items():
+            owners[owner.id] = owner
+            scopes.setdefault(owner.id, {})[scope] = result
+        for owner in sorted(owners.values(), key=lambda row: (row.name, row.id)):
+            restored: set[staff.StaffId] = set()
+            failures: dict[staff.StaffId, tuple[str, str]] = {}
+            run_failures: dict[Path, str] = {}
+            skipped: dict[staff.StaffId, str] = {}
+            for result in scopes[owner.id].values():
+                restored.update(result.restored)
+                failures.update(result.failures)
+                run_failures.update(result.run_failures)
+                skipped.update(result.skipped)
+            restored.difference_update(failures)
+            if (bulk := _BULK_REPORT.get()) is not None:
+                for identity in restored:
+                    _ = bulk.targets.setdefault(identity, str(identity))
+                    bulk.finish(identity)
+                for identity, (name, reason) in failures.items():
+                    bulk.targets[identity] = name
+                    bulk.issues[identity] = FollowUp(f"{owner.name} / {name}", reason,
+                        f"The director runs worker.py restore in {owner.name}.", owner.name)
+                for identity, reason in skipped.items():
+                    if identity in bulk.targets and identity not in restored and identity not in failures:
+                        bulk.issues[identity] = FollowUp(bulk.targets[identity], reason,
+                            "The director assigns work when needed.")
+                if run_failures:
+                    reason = "; ".join(f"{run}: {error}" for run, error in sorted(run_failures.items()))
+                    bulk.issues[f"run:{owner.id}"] = FollowUp(owner.name, f"Could not reap detached runs: {reason}",
+                        f"The director runs worker.py restore in {owner.name}.", owner.name)
+                continue
+            count = len(restored)
+            next_step = f"run worker.py restore in {owner.name}"
+            for name, reason in sorted(failures.values()):
+                print(f"restart anomaly: {owner.name}: worker {name} not restored: "
+                      + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
+            for run, reason in sorted(run_failures.items()):
+                print(f"restart anomaly: {owner.name}: cannot reap detached runs in {run}: "
+                      + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
+            if failures:
+                print(f"{owner.name}: {count} of {count + len(failures)} workers restored; see anomaly")
+            else:
+                noun = "worker" if count == 1 else "workers"
+                suffix = "; see anomaly" if run_failures else ""
+                print(f"{owner.name}: {count} {noun} restored{suffix}")
+
+
 @dataclass
 class DirectorResumeChecks:
     checks: list[DirectorResumeCheck] = field(default_factory=list)
     replaced_panes: list[ReplacedRestartPane] = field(default_factory=list)
+    worker_restores: WorkerRestoreReports = field(default_factory=WorkerRestoreReports)
 
     def report(self) -> None:
+        self.worker_restores.report()
         if not self.checks and not self.replaced_panes:
             return
         try:
@@ -267,7 +591,7 @@ class DirectorResumeChecks:
             interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
         except (OSError, ValueError):
             for check in self.checks:
-                print(f"{check.name}: restart check: {ResumeCheckState.UNREADABLE.value}")
+                self.report_check(check, ResumeCheckState.UNREADABLE)
             print(f"restart check: 0 of {len(self.checks)} directors resumed")
             return
         states = [ResumeCheckState.NO_MESSAGE] * len(self.checks)
@@ -284,13 +608,20 @@ class DirectorResumeChecks:
             time.sleep(min(interval, remaining))
         for check, state in zip(self.checks, states):
             if state is not ResumeCheckState.RESUMED:
-                print(f"{check.name}: restart check: {state.value}")
+                self.report_check(check, state)
         passed = sum(state is ResumeCheckState.RESUMED for state in states)
         if self.checks:
             print(f"restart check: {passed} of {len(self.checks)} directors resumed")
         for pane in self.replaced_panes:
             _anomaly(pane.source.row, f"source pane {pane.source.client.session}:"
                      + f"{pane.source.publication.entry['pane_id']} still has work after the restart check")
+
+    def report_check(self, check: DirectorResumeCheck, state: ResumeCheckState) -> None:
+        if (bulk := _BULK_REPORT.get()) is not None:
+            _ = bulk.issues.setdefault(f"check:{check.name}", FollowUp(check.name, state.value,
+                "The director checks the continuation message.", check.name, director_check=True))
+        else:
+            print(f"{check.name}: restart check: {state.value}")
 
 
 class ClaudeTrustWriteFailed(OSError):
@@ -320,24 +651,20 @@ class WorkerRestore(Protocol):
     def not_restored(self, row: staff.StaffRow, record: staff.StaffSnapshot, *,
                      runs: dict[str, list[str]] | None = None) -> RestoreSkip | None: ...
 
-    def restore(self, parent: staff.StaffId, *, record: staff.StaffSnapshot | None = None,
-                only: frozenset[staff.StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
-                started_panes: dict[staff.StaffId, str] | Literal["discard"] = "discard",
-                runs: dict[str, list[str]] | None = None,
-                codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> int: ...
-
 
 class AgentsCommand(Protocol):
     def main(self, argv: list[str]) -> int: ...
 
 
 class MemberLifecycle(Protocol):
-    def detach(self, arguments: list[str], task: str, *, program: Path) -> Path: ...
+    def detach(self, arguments: list[str], task: str, *, program: Path, log: Path | None = None,
+               log_fd: int | None = None) -> Path: ...
     def stop(self, session: str, *, deadline: float,
              codex: herdr.CodexConversations | None = None) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot, *,
                           codex: herdr.CodexConversations | None = None,
-                          keep_running: frozenset[staff.StaffId] = ...) -> list[str]: ...
+                          keep_running: frozenset[staff.StaffId] = ...,
+                          failures: dict[staff.StaffId, str] | None = None) -> list[str]: ...
 
 
 worker_panes = cast(WorkerPanes, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -368,7 +695,18 @@ def _error_reason(error: object) -> str:
 
 
 def _anomaly(row: staff.StaffRow, error: object) -> None:
-    print(f"{row.name}: restart anomaly: {_error_reason(error)}", file=sys.stderr)
+    if (report := _BULK_REPORT.get()) is not None:
+        report.failure(row.id, row.name, _error_reason(error))
+    else:
+        step = ". Run agents restart again." if isinstance(error, staff.UpkeepRowBusy) else ""
+        print(f"{row.name}: restart anomaly: {_error_reason(error)}{step}", file=sys.stderr)
+
+
+def _discovery_anomaly(reason: str) -> None:
+    if (report := _BULK_REPORT.get()) is not None:
+        report.failure("", report.command, reason)
+    else:
+        print(f"restart: {reason}", file=sys.stderr)
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
@@ -507,26 +845,46 @@ def leaves_record(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                      observed: RestartObservations | None = None,
-                     target_account: str | accounts.AccountSelection = "") -> str:
-    worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
+                     target_account: str | accounts.AccountSelection = "",
+                     reports: WorkerRestoreReports | None = None) -> str:
+    from scripts.herdr.worker_panes import defer_worker_anomalies
+    from scripts.production import worker
+
     started_panes: dict[staff.StaffId, str] = {}
+    only: frozenset[staff.StaffId] | Literal["all"] = "all"
     if row.kind == "worker":
         parent = record.parent_of(row)
         if parent is None:
             raise OSError("worker parent is unavailable")
-        result = worker.restore(parent.id, record=record, only=frozenset({row.id}), started_panes=started_panes,
-            account=target_account,
-            runs=observed.runs if observed is not None else None,
-            codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT)
-    elif row.kind in ("unit", "showrunner") and any(
-            child.kind == "worker" and child.parent == staff.ReportsTo(row.id) for child in record.rows
-            ):
-        result = (worker.restore(row.id, record=record) if observed is None else
-                  worker.restore(row.id, record=record, runs=observed.runs, codex=observed.codex))
+        members = [row]
+        only = frozenset({row.id})
+    elif row.kind in ("unit", "showrunner"):
+        if (bulk := _BULK_REPORT.get()) is not None:
+            bulk.finish(row.id)
+        parent = row
+        members = record.find(kind="worker", parent=parent.id)
+        if not members:
+            return ""
     else:
         return ""
-    if result != 0:
-        raise OSError("worker restore is incomplete")
+    report = worker.RestoreReport()
+    try:
+        with defer_worker_anomalies():
+            result = worker.restore(parent.id, record=record, only=only, started_panes=started_panes,
+                account=target_account if only != "all" else "",
+                runs=observed.runs if observed is not None else None,
+                codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, report=report)
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        for member in members:
+            if member.id not in report.restored:
+                _ = report.failures.setdefault(member.id, (member.name, _error_reason(error)))
+        result = worker.ExitCode.UNCERTAIN
+    if reports is None:
+        WorkerRestoreReports({row.id: (parent, report)}).report()
+    else:
+        reports.attempts[row.id] = parent, report
+    if result != worker.ExitCode.OK:
+        raise WorkerRestoreIncomplete(f"run worker.py restore in {parent.name}")
     return started_panes.get(row.id, "")
 
 
@@ -551,6 +909,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
               live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
               success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
+    restore_workers = (partial(_restore_workers, reports=resume_checks.worker_restores)
+                       if isinstance(resume_checks, DirectorResumeChecks) else _restore_workers)
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
@@ -558,16 +918,16 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             if live.pids:
                 member_account.repair_home(row, live.kind, live.pids[0])
             if row.kind == "worker" and live_worker_recovery is LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL:
-                return _restore_workers(row, record, observed=observed, target_account=target_account)
+                return restore_workers(row, record, observed=observed, target_account=target_account)
             if row.kind != "worker" and worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _ = (_restore_workers(row, record) if observed is None else
-                     _restore_workers(row, record, observed=observed))
+                _ = (restore_workers(row, record) if observed is None else
+                     restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(live)
         if row.kind == "worker":
-            return _restore_workers(row, record, observed=observed, target_account=target_account)
+            return restore_workers(row, record, observed=observed, target_account=target_account)
         machine, folder = shutdown_record.row_folder(row, record, resolver=resolver)
         from scripts.agents import remote
         if machine != remote.local_machine():
@@ -659,8 +1019,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             if current.pids:
                 member_account.repair_home(row, current.kind, current.pids[0])
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _ = (_restore_workers(row, record) if observed is None else
-                     _restore_workers(row, record, observed=observed))
+                _ = (restore_workers(row, record) if observed is None else
+                     restore_workers(row, record, observed=observed))
             print(f"{row.name}: unchanged")
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
@@ -715,7 +1075,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             try:
                 client.prompt(result.pane, opening.text, target=str(row.current_session))
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-                _anomaly(row, f"continuation message was not sent: {error}")
+                reason = f"Could not send the continuation message: {_error_reason(error)}"
+                if (bulk := _BULK_REPORT.get()) is not None:
+                    bulk.issues[f"check:{row.name}"] = FollowUp(row.name, reason,
+                        "The director checks the continuation message.", row.name, director_check=True)
+                else:
+                    _anomaly(row, f"continuation message was not sent: {error}")
         if row.kind == "producer":
             home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
             try:
@@ -753,11 +1118,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 client.close_startup_workspaces(result.pane.split(":", 1)[0])
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             _anomaly(row, error)
-        if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-            _ = (_restore_workers(row, record) if observed is None else
-                 _restore_workers(row, record, observed=observed))
         if isinstance(resume_checks, DirectorResumeChecks) and isinstance(check, DirectorResumeCheck):
             resume_checks.checks.append(check)
+        if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+            _ = (restore_workers(row, record) if observed is None else
+                 restore_workers(row, record, observed=observed))
         if success_report is RestartSuccessReport.START_ROW:
             print(f"{row.name}: restarted")
         return result.pane
@@ -856,12 +1221,17 @@ def _read_live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapsh
                     print(f"{row.name}: left alone; account unknown")
             elif isinstance(observed, herdr.UnknownConversation):
                 complete = False
+                if (report := _BULK_REPORT.get()) is not None:
+                    report.track(row, record)
+                    report.failure(row.id, row.name, observed.reason)
                 if observed.shared_codex:
                     shared_unknown += 1
                 if not observed.shared_codex or os.environ.get("SHUTDOWN_DETAIL") == "1":
                     herdr.conversation_note(observed)
         except (OSError, ValueError) as error:
             complete = False
+            if (report := _BULK_REPORT.get()) is not None:
+                report.track(row, record)
             _anomaly(row, error)
     if shared_unknown:
         print(f"anomaly: {shared_unknown} rows not proved live or stopped (shared cause above); not blocking", file=sys.stderr)
@@ -931,14 +1301,14 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             try:
                 registry = session_records.read_registry()
             except (OSError, ValueError) as error:
-                print(f"restart: session registry discovery failed: {error}", file=sys.stderr)
+                _discovery_anomaly(f"session registry discovery failed: {error}")
                 return PartialLiveRows([], registry_discovery_failed=True)
             if registry.unreadable:
-                print(f"restart: {session_records.registry_unreadable_reason(registry.unreadable)}", file=sys.stderr)
+                _discovery_anomaly(session_records.registry_unreadable_reason(registry.unreadable))
                 return PartialLiveRows([], registry_discovery_failed=True)
             running = session_records.enumerate_running_sessions(registry=registry)
             if isinstance(running, session_records.RunningSessionDiscoveryFailed):
-                print(f"restart: {running.reason}", file=sys.stderr)
+                _discovery_anomaly(running.reason)
                 return PartialLiveRows([], registry_discovery_failed=True)
             _ = selection_scope.enter_context(session_records.use_registry_for_liveness(registry))
             candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
@@ -948,8 +1318,12 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
             owned = {row.current_session for row in record.rows}
             for identity in sorted(candidates.keys() - owned):
                 if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-                    print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
-                          + "restart anomaly: unassigned live session", file=sys.stderr)
+                    name = " ".join(observed.pane_names.get(identity, candidates[identity]).splitlines())
+                    if (report := _BULK_REPORT.get()) is not None:
+                        report.issues[f"unassigned:{identity}"] = FollowUp(name, "The live session has no staff row",
+                            "Nate checks who owns this session.", operator=True)
+                    else:
+                        print(f"{name}: restart anomaly: unassigned live session", file=sys.stderr)
             owners = [row for row in record.rows if row.id in observed.pane_owners]
             observations = worker_panes.observe_parents(owners, record) if owners else {}
         else:
@@ -968,6 +1342,11 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
         complete = isinstance(reading, CompleteLiveRows) and not any(
             isinstance(state, (UncertainWorker, ProcessUnknownWorker))
             for state in workers.values())
+        if (report := _BULK_REPORT.get()) is not None:
+            for state in workers.values():
+                if isinstance(state, (UncertainWorker, ProcessUnknownWorker)) and state.row.id not in report.issues:
+                    report.track(state.row, record)
+                    report.failure(state.row.id, state.row.name, state.reason)
         selected = reading.rows
         if isinstance(account, AllRestartAccounts):
             selected.extend(active_workers)
@@ -993,7 +1372,7 @@ def prune_live_rows(reading: CompleteLiveRows | PartialLiveRows) -> None:
         return
     saved = set(shutdown_record.read())
     for row in reading.rows:
-        if str(row.id) not in saved:
+        if row.kind == "worker" or str(row.id) not in saved:
             continue
         try:
             with staff.row_operation(str(row.id)):
@@ -1070,7 +1449,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
             after_stop: AfterStop = AfterStop.RESTART,
             why: str = DEFAULT_RESTART_CAUSE) -> int:
-    with ExitStack() as pane_evidence:
+    activity = nullcontext() if dry_run else shutdown_record.active_operation()
+    with activity, ExitStack() as pane_evidence:
         _ = pane_evidence.enter_context(herdr.pane_evidence_run())
         return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
                         after_stop=after_stop, why=why)
@@ -1078,11 +1458,28 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
 
 def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
              account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
+    report = _BULK_REPORT.get()
+    upkeep_blocked: dict[staff.StaffId, tuple[staff.StaffRow, staff.UpkeepRowBusy]] = {}
     try:
         record = staff.initial_snapshot()
+        if stop_all and not dry_run:
+            deadline = time.monotonic() + conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS")
+            only = tuple(str(row.id) if (row := record.by_member_reference(reference)) is not None else reference
+                         for reference in only)
+            for row in record.find(kind="producer"):
+                if only and row.id not in only:
+                    continue
+                try:
+                    staff.wait_for_upkeep_row(row, deadline)
+                except staff.UpkeepRowBusy as error:
+                    upkeep_blocked[row.id] = row, error
+            record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
-        print(f"restart: staff anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        _discovery_anomaly(f"Could not prepare staff discovery: {_error_reason(error)}")
         return 0
+    selection = (SelectedRestartRows(frozenset(row.id for reference in only
+        if (row := record.by_member_reference(reference)) is not None)) if only else AllRestartRows.CURRENT)
+    preview = report.preview.append if report is not None else print
     with herdr.observation_snapshot():
         resolver = session_staff.RowResolver(record)
         client = herdr.Herdr(herdr.shared_session())
@@ -1090,38 +1487,51 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         selected: list[staff.StaffRow] = []
         reading: CompleteLiveRows | PartialLiveRows = CompleteLiveRows([])
         if stop_all:
-            selection = (SelectedRestartRows(frozenset(row.id for reference in only
-                if (row := record.by_member_reference(reference)) is not None)) if only else AllRestartRows.CURRENT)
             reading = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account,
                                 observed=observed, selection=selection)
             if isinstance(reading, PartialLiveRows) and reading.registry_discovery_failed:
                 return 1
-            selected = reading.rows
+            selected = [row for row in reading.rows if row.id not in upkeep_blocked]
+            if upkeep_blocked:
+                reading = PartialLiveRows(selected)
+                for identity, (before, error) in upkeep_blocked.items():
+                    row = record.by_id(identity) or before
+                    if report is not None:
+                        report.track(row, record)
+                    _anomaly(row, error)
         select_only = bool(only) and not stop_all
         pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
                        list(only) if select_only else
                        [] if stop_all and (only or not isinstance(account, AllRestartAccounts)) else shutdown_record.read())
         if dry_run and not select_only and not stop_all and isinstance(account, AllRestartAccounts):
-            path = shutdown_record.record_path()
-            saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
-            print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
+            if report is None:
+                path = shutdown_record.record_path()
+                saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
+                print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
             shown = live_rows(record, client, resolver=resolver, observed=observed)
             if isinstance(shown, PartialLiveRows) and shown.registry_discovery_failed:
                 return 1
             for row in shown.rows:
                 if str(row.id) not in pending_ids:
-                    print(f"{row.name}: live, not in the restart record")
+                    preview(f"{row.name}: live, not in the restart record")
         for reference in pending_ids:
             row = record.by_member_reference(reference) if select_only else record.by_id(staff.StaffId(reference))
             if select_only and row is None:
                 matches = [item for item in record.rows if item.name == reference]
                 row = matches[0] if len(matches) == 1 else None
             if row is None and select_only:
+                if report is not None:
+                    report.issues[reference] = FollowUp(reference, "The staff row is unknown or ambiguous",
+                        "Nate selects a staff row ID.", operator=True)
                 print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
                 continue
             # A retry cannot start these ids, so they leave the record.
             reason = "no staff row" if row is None else None if select_only else leaves_record(row, record, runs=observed.runs)
             if row is None or reason is not None:
+                if report is not None:
+                    name = reference if row is None else row.name
+                    report.issues[reference] = FollowUp(name, reason or "No staff row",
+                        "The restart entry can be removed." if dry_run else "Restart removed the entry.")
                 print(f"{' '.join((reference if row is None else row.name).split())}: restart anomaly: {reason}; "
                       + ("would leave the restart record" if dry_run else "removed from the restart record"), file=sys.stderr)
                 if not dry_run:
@@ -1135,7 +1545,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 except (OSError, ValueError) as error:
                     _anomaly(row, error)
                     continue
-            if row not in selected:
+            if row not in selected and row.id not in upkeep_blocked:
                 selected.append(row)
         if dry_run:
             positions = {tab["staff_id"]: f"workspace {space['name']}, tab {index} ({record.rows_by_id[staff.StaffId(tab['staff_id'])].name})"
@@ -1152,13 +1562,16 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                     _anomaly(row, error)
             for row in selected:
+                if report is not None:
+                    report.track(row, record)
                 action = "; would stop and save" if after_stop == AfterStop.KEEP_STOPPED else ""
-                print(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}{action}")
+                preview(f"{row.name}: {row.id}, {row.kind}, {positions.get(str(row.id), 'no tab')}{action}")
             for row in {row.id: row for row, _pane in visible if row not in selected}.values():
-                print(f"{row.name}: left alone; no proved local restart target")
+                preview(f"{row.name}: left alone; no proved local restart target")
             return 0
-    if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
-        prune_live_rows(reading)
+    if report is not None:
+        for row in selected:
+            report.track(row, record)
     errors = (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError)
     started: list[str] = []
     worker_scope = (WorkerRestartScope.SELECTED_ROWS if only or not isinstance(account, AllRestartAccounts)
@@ -1187,9 +1600,41 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             if after_stop is AfterStop.KEEP_STOPPED:
                 arguments.append("--account")
             arguments.append(account.label)
-        log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve())
-        print(f"restart continues outside this session; log: {log}")
+        if report is None:
+            path = shutdown_state_root() / "logs" / f"restart-{uuid4().hex}.log"
+            with ExitStack() as files:
+                stream = _create_log(files, path)
+                log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
+                                         log=path, log_fd=stream.fileno())
+            print(f"restart continues outside this session; log: {log}")
+        else:
+            if report.log_stream is None:
+                step = report.log_repair_step()
+                reason = _error_reason(report.log_error) if report.log_error is not None else "The log is unavailable"
+                for key, issue in report.issues.items():
+                    if issue.operator and issue.step == f"Nate runs {report.retry} again.":
+                        report.issues[key] = replace(issue, step=step)
+                for row in selected:
+                    report.issues[row.id] = FollowUp(report.targets[row.id],
+                        f"Could not write the log. {reason}", step, operator=True)
+                return 2
+            arguments.extend(("--parent-report", report.detach_data()))
+            try:
+                _ = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
+                                       log=report.log, log_fd=report.log_stream.fileno())
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                detail = cast(str | None, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
+                reason = _error_reason(detail or error)
+                step = ("Nate sends this launcher error to the efficiency unit."
+                        if isinstance(error, subprocess.TimeoutExpired) else
+                        f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there.")
+                for row in selected:
+                    report.issues[row.id] = FollowUp(report.targets[row.id],
+                        f"Could not confirm the detached launch. {reason}", step, operator=True)
+                return 2
+            report.deferred = True
         return 0
+    lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
     )
@@ -1216,6 +1661,11 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 worker_policies[row.id] = policy
         omit_refused_workers(refused_workers)
 
+    if report is not None and _DETACHED_LOG.get() is not None and stop_all:
+        _record_stop_plan(report, (row for row in selected if row.id not in refused_workers))
+    if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
+        prune_live_rows(reading)
+
     pre_stop_codex = observed.codex
     keep_running = (frozenset(row.id for row in record.rows if row.kind == "worker" and row.id not in worker_policies)
                     if stop_all and after_stop is AfterStop.RESTART else frozenset[staff.StaffId]())
@@ -1241,7 +1691,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     def stop_holder(holder: staff.StaffRow, previous: Event, recorded: Event) -> tuple[bool, tuple[staff.StaffId, ...]]:
         _ = previous.wait()
         try:
-            with ExitStack() as locks:
+            with ExitStack() as locks, staff.upkeep_lock_wait(lock_wait):
                 _ = locks.enter_context(staff.row_operation(str(holder.id)))
                 for member in members_by_holder[holder.id]:
                     if member != str(holder.id):
@@ -1256,13 +1706,19 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
+                    failures: dict[staff.StaffId, str] = {}
                     unresolved = stop_resume.stop_unit_workers(holder.id, record, codex=observed.codex,
-                                                              keep_running=keep_running.union(changed))
+                                                              keep_running=keep_running.union(changed), failures=failures)
                     if unresolved and holder.id in observed.pane_owners:
                         workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
-                                        if child.id in selected_ids)
+                                        if child.id in selected_ids and (not failures or child.id in failures))
+                        if report is not None and after_stop is AfterStop.KEEP_STOPPED:
+                            for identity in workers:
+                                row = record.rows_by_id[identity]
+                                if identity not in report.issues and identity in failures:
+                                    report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
-                if not stopped:
+                if not stopped and holder.kind != "worker":
                     shutdown_record.remove_started([str(holder.id)])
                 return stopped, workers
         finally:
@@ -1280,9 +1736,21 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     unconfirmed_workers.update(workers)
                     if not stopped:
                         unconfirmed.add(holder.id)
+                    if report is not None and after_stop is AfterStop.KEEP_STOPPED:
+                        unresolved = set(workers)
+                        if not stopped:
+                            unresolved.add(holder.id)
+                        for member in members_by_holder[holder.id]:
+                            if staff.StaffId(member) not in unresolved:
+                                report.finish(member)
                 except staff.StaffRefused as error:
                     _ = holders.pop(holder.id)
                     _anomaly(holder, error)
+                    if report is not None:
+                        for member in members_by_holder[holder.id]:
+                            if member != holder.id:
+                                report.failure(member, report.targets[member],
+                                    f"Could not lock all rows in {holder.name}")
                 except errors as error:
                     unconfirmed.add(holder.id)
                     if holder.id in observed.pane_owners:
@@ -1319,7 +1787,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                      session_kind=herdr.security_session())
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
-            print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+            _discovery_anomaly(f"Could not restore the server: {_error_reason(error)}")
         if stop_all:
             # A stop read can still show a worker that has exited. Read pane evidence again for restore.
             pane_evidence.close()
@@ -1328,23 +1796,41 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     resume_policies = {record.rows_by_id[identity].current_session: policy
                        for identity, policy in worker_policies.items() if identity not in blocked_workers}
 
+    def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
+        resolved = resume_checks.worker_restores.resolved(holder.id)
+        done = [member for member in members_by_holder[holder.id]
+                if (member_id := staff.StaffId(member)) not in blocked_workers
+                and (member_id in resolved or (started_holder and record.rows_by_id[member_id].kind != "worker"))]
+        if done:
+            shutdown_record.remove_started(done)
+
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition:
-        with ExitStack() as locks, use_checked_resume_policies(resume_policies):
+        with ExitStack() as locks, use_checked_resume_policies(resume_policies), staff.upkeep_lock_wait(lock_wait):
             _ = locks.enter_context(staff.row_operation(str(holder.id)))
             for member in members_by_holder[holder.id]:
                 if member != str(holder.id):
                     _ = locks.enter_context(staff.row_operation(member))
             shutdown_record.update(started=[], pending=saved_by_holder[holder.id])
+            if holder.id in blocked_workers:
+                return RestartDisposition.HELD
             current_record = staff.initial_snapshot()
-            current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             current = current_record.by_id(holder.id)
             if current is None:
-                shutdown_record.forget(members_by_holder[holder.id])
+                shutdown_record.forget([member for member in members_by_holder[holder.id]
+                                        if current_record.by_id(staff.StaffId(member)) is None])
+                if report is not None:
+                    report.issues[holder.id] = FollowUp(holder.name, "The staff row is gone", "Restart removed the entry.")
                 print(f"{holder.name}: restart anomaly: no staff row; removed from the restart record", file=sys.stderr)
                 return RestartDisposition.REMOVED
+            current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             if current.kind in ("unit", "showrunner") and (
                     isinstance(current.paused, staff.Paused) or isinstance(current.exited, staff.Exited)):
+                if report is not None:
+                    hold = "exited" if isinstance(current.exited, staff.Exited) else "paused"
+                    for member in members_by_holder[holder.id]:
+                        report.issues[member] = FollowUp(report.targets[member], f"{current.name} is {hold}",
+                            "The session stays stopped.")
                 print(f"{current.name}: {'exited' if isinstance(current.exited, staff.Exited) else 'paused'}")
                 return RestartDisposition.HELD
             if holder.id in unconfirmed:
@@ -1352,13 +1838,17 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 if isinstance(fresh, herdr.UnknownConversation):
                     raise OSError(fresh.reason)
                 if isinstance(fresh, herdr.LiveConversation):
-                    if current.kind == "worker":
-                        _ = _restore_workers(current, current_record)
-                    elif worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                        _ = _restore_workers(current, current_record, observed=observed)
+                    if report is not None and current.kind != "worker":
+                        report.finish(current.id)
+                    try:
+                        if current.kind == "worker" or worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                            _ = _restore_workers(current, current_record, observed=observed,
+                                                 reports=resume_checks.worker_restores)
+                    except WorkerRestoreIncomplete:
+                        remove_started(holder, started_holder=False)
+                        raise
                     print(f"{current.name}: unchanged")
-                    shutdown_record.remove_started([member for member in members_by_holder[holder.id]
-                                                    if staff.StaffId(member) not in blocked_workers])
+                    remove_started(holder, started_holder=True)
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
@@ -1367,15 +1857,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                           partial(start_row, success_report=success_report))
             if current.kind == "worker":
                 launch_row = partial(launch_row, live_worker_recovery=LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL)
-            if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                pane = launch_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
-                                  opening=opening, resume_checks=resume_checks)
-            else:
-                pane = launch_row(current, current_record, client, present=focus, resolver=facts,
-                                  target_account="" if isinstance(account, AllRestartAccounts) else account,
-                                  worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
-            shutdown_record.remove_started([member for member in members_by_holder[holder.id]
-                                            if staff.StaffId(member) not in blocked_workers])
+            try:
+                if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                    pane = launch_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
+                                      opening=opening, resume_checks=resume_checks)
+                else:
+                    pane = launch_row(current, current_record, client, present=focus, resolver=facts,
+                                      target_account="" if isinstance(account, AllRestartAccounts) else account,
+                                      worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
+            except WorkerRestoreIncomplete:
+                remove_started(holder, started_holder=False)
+                raise
+            remove_started(holder, started_holder=True)
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     restarted: set[Path] = set()
@@ -1384,6 +1877,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         members = members_by_holder[holder.id]
         if disposition in (RestartDisposition.HELD, RestartDisposition.REMOVED):
             return
+        if report is not None and holder.kind != "worker":
+            report.finish(holder.id)
         started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
         if disposition is RestartDisposition.STARTED and isinstance(holder.worktree, staff.PresentWorktree):
             restarted.add(holder.worktree.path)
@@ -1399,6 +1894,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                     record_start(holder, future.result())
                 except ClaudeTrustWriteFailed:
                     exit_code = 1
+                    if report is not None:
+                        report.failure(holder.id, holder.name, "Could not write the account trust record")
                 except staff.StaffRefused as error:
                     _anomaly(holder, error)
                 except errors as error:
@@ -1413,7 +1910,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             except errors:
                 pass
         if not isinstance(fresh, herdr.StoppedConversation):
-            _anomaly(holder, failed.error)
+            if not isinstance(failed.error, WorkerRestoreIncomplete):
+                _anomaly(holder, failed.error)
             continue
         try:
             disposition = start_holder(holder, failed.focus, RestartSuccessReport.CALLER)
@@ -1422,10 +1920,17 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 print(f"{holder.name}: down; started")
         except ClaudeTrustWriteFailed:
             exit_code = 1
+            if report is not None:
+                report.failure(holder.id, holder.name, "Could not write the account trust record")
+        except WorkerRestoreIncomplete:
+            continue
         except staff.StaffRefused as error:
             _anomaly(holder, error)
         except errors as error:
-            print(f"{holder.name}: down: {_error_reason(error)}")
+            if report is not None:
+                report.failure(holder.id, holder.name, _error_reason(error))
+            else:
+                print(f"{holder.name}: down: {_error_reason(error)}")
     if started:
         try:
             _ = client.sort_tabs()
@@ -1447,20 +1952,25 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
 def main() -> int:
     """Run detached restart work and save its output."""
+    if __name__ == "__main__":
+        sys.modules["scripts.agents.restart"] = sys.modules[__name__]
     command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
 
     parser = argparse.ArgumentParser(add_help=False)
     _ = parser.add_argument("--log", type=Path, required=True)
+    _ = parser.add_argument("--log-fd", type=int, required=True)
     _ = parser.add_argument("--requester", default="")
+    _ = parser.add_argument("--parent-report", type=json.loads)
     options, arguments = parser.parse_known_args()
-    output = io.StringIO()
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     _ = os.environ.pop("CODEX_THREAD_ID", None)
+    token = _DETACHED_LOG.set(DetachedLog(cast(Path, options.log), cast(int, options.log_fd)))
+    data_token = _DETACHED_REPORT.set(cast(DetachedReport | None, options.parent_report))
     try:
-        with redirect_stdout(output), redirect_stderr(output):
-            return command.main(arguments)
+        return command.main(arguments)
     finally:
-        write_text_atomic(cast(Path, options.log), output.getvalue())
+        _DETACHED_REPORT.reset(data_token)
+        _DETACHED_LOG.reset(token)
 
 
 if __name__ == "__main__":
