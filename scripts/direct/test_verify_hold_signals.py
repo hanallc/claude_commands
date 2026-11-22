@@ -206,6 +206,28 @@ finish_verify_run() { :; }
         self.assertFalse(token.exists())
         self.assertFalse((self.fixture.root / "run.log.exit-diagnostics").exists())
 
+    def test_normal_exit_keeps_result_messages_on_stdout(self) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        result = subprocess.run(self.verify_exit_command(token, "start_run_log\nverify_exit 0 exit"),
+                                env=verify_test_environment(), capture_output=True, text=True,
+                                check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "completed\n")
+        self.assertEqual(result.stderr, "cleanup diagnostic\n")
+        self.assertFalse(token.exists())
+
+    def test_normal_exit_releases_the_token_with_full_stdout(self) -> None:
+        token = self.fixture.root / "held-token"
+        token.touch()
+        with full_output_pipe() as write_fd:
+            result = subprocess.run(self.verify_exit_command(token, "verify_exit 0 exit"),
+                                    env=verify_test_environment(), stdout=write_fd, stderr=subprocess.PIPE,
+                                    text=True, check=False, timeout=SIGNAL_EXIT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "cleanup diagnostic\n")
+        self.assertFalse(token.exists())
+
     def test_stderr_closes_while_a_step_child_is_still_running(self) -> None:
         cargo = self.fixture.bin_directory / "cargo"
         cargo.rename(cargo.with_name("cargo-original"))

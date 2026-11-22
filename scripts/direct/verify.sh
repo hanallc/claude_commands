@@ -3102,11 +3102,16 @@ wait_for_placement() {
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment
     fi
-    (
-        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
-        exec "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" \
-            "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target"
-    ) &
+    local -a request=("$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID"
+                     "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target")
+    if [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]]; then
+        "${request[@]}" &
+    else
+        (
+            close_verify_exit_stderr
+            exec "${request[@]}"
+        ) &
+    fi
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || true
     HOLD_WAITER_PID=""
@@ -4484,15 +4489,30 @@ verify_exit() {
     local outcome=error
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
-        outcome=interrupted
         interrupt_hold_wait >&2
-    elif (( EXIT_STATUS == 0 )); then
-        outcome=completed
-    fi
-    verify_cleanup "$outcome" >&2
-    finish_verify_run "$EXIT_STATUS" >&2
-    if [[ "$outcome" == interrupted ]]; then
+        verify_cleanup interrupted >&2
+        finish_verify_run "$EXIT_STATUS" >&2
         printf 'verify.sh: interrupted before %s completed (status %s).\n' "$CMD" "$EXIT_STATUS" >&2
+    else
+        if (( EXIT_STATUS == 0 )); then outcome=completed; fi
+        local exit_output=""
+        # Keep result messages on stdout and release resources before writing to the pipe.
+        exit_output="$(mktemp "${TMPDIR:-/tmp}/verify-result.XXXXXX" 2>/dev/null)" || exit_output=""
+        {
+            verify_cleanup "$outcome"
+            finish_verify_run "$EXIT_STATUS"
+            :
+        } >>"${exit_output:-/dev/null}" || {
+            verify_cleanup "$outcome" >/dev/null
+            finish_verify_run "$EXIT_STATUS" >/dev/null
+        }
+        if [[ -n "$exit_output" ]]; then
+            if [[ -s "$exit_output" ]]; then
+                VERIFY_PY_HELPER=VERIFY_EXIT_DIAGNOSTIC "$PY" "$VERIFY_START_DIR/../lib/time_limit.py" 1 0 \
+                    cat -- "$exit_output" 2>/dev/null || true
+            fi
+            rm -f -- "$exit_output" || true
+        fi
     fi
     finish_exit_diagnostics
     exit "$EXIT_STATUS"
