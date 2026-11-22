@@ -22,7 +22,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
-from scripts.lib import build_folders, process_group
+from scripts.lib import build_folder_lock, build_folders, process_group
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Zombie, process_start
@@ -704,6 +704,91 @@ gate.run_suites(Path.cwd(), full=True)
                     self.assertIs(saved["finished"], False)
                     self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), recovery.path)
 
+    def assert_unresolved_folder_cleanup(self, folders: list[Path]) -> gate.GateRecovery:
+        self.assertEqual(self.jobserver_tokens(), b"")
+        [reservation] = self.admission.server.reservations.values()
+        self.assertTrue(Path(reservation.sidecar).is_file())
+        [record_path] = gate.gate_run_directory(self.checkout).glob("*.json")
+        recovery = gate.read_gate_recovery(record_path)
+        assert recovery is not None
+        self.assertFalse(recovery.finished)
+        self.assertEqual(recovery.folders, list(map(str, folders)))
+        self.assertEqual([(token.value, token.operation) for token in recovery.tokens], [(b"Q".hex(), "held")])
+        for folder in folders:
+            self.assertEqual((folder / build_folders.RECOVERY_MARKER).readlink(), record_path)
+        return recovery
+
+    @gate_suites("hooks")
+    def test_module_cleanup_checks_a_lock_before_its_folder_exists(self) -> None:
+        self.supply_jobserver(b"Q")
+        finish = gate.finish_gate_job
+        locks: list[Path] = []
+        with mock.patch.dict(os.environ, self.environment, clear=True), ExitStack() as holder:
+            def lock_before_allocation(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+                lock = job.log.parent / "allocating.lock"
+                stream = holder.enter_context(lock.open("xb"))
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locks.append(lock)
+                return finish(job, status)
+
+            with (mock.patch.object(gate, "finish_gate_job", side_effect=lock_before_allocation),
+                  self.assertRaises(gate.GateRecoveryUnresolved)):
+                _ = gate.run_suites(self.checkout)
+            [lock] = locks
+            self.assertTrue(lock.is_file())
+            self.assertFalse(lock.with_suffix("").exists())
+            self.assertFalse(lock.with_suffix(".lease.json").exists())
+            recovery = self.assert_unresolved_folder_cleanup([lock.parent.parent, lock.parent])
+            with self.assertRaises(gate.GateRecoveryUnresolved):
+                gate.check_gate_folder_leases(recovery)
+
+    @gate_suites("hooks", "lib")
+    def test_top_level_lease_keeps_capacity_after_modules_finish(self) -> None:
+        self.supply_jobserver(b"Q")
+        finish = gate.finish_gate_job
+        folders: list[Path] = []
+        with mock.patch.dict(os.environ, self.environment, clear=True), ExitStack() as holder:
+            def keep_gate_lease(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+                if not folders:
+                    folder = job.log.parent.parent
+                    descriptor = os.dup(build_folders.build_folder_lock_fd(folder))
+                    _ = holder.callback(os.close, descriptor)
+                    folders.append(folder)
+                return finish(job, status)
+
+            with (mock.patch.object(gate, "finish_gate_job", side_effect=keep_gate_lease),
+                  self.assertRaises(gate.GateRecoveryUnresolved)):
+                _ = gate.run_suites(self.checkout, max_running_jobs=1)
+            self.assert_all_modules_started()
+            [folder] = folders
+            self.assertEqual(build_folders.build_folder_state(folder), "held")
+            _ = self.assert_unresolved_folder_cleanup([folder])
+
+    @gate_suites("hooks")
+    def test_module_cleanup_keeps_capacity_when_lock_open_fails(self) -> None:
+        self.supply_jobserver(b"Q")
+        finish = gate.finish_gate_job
+        open_lock = build_folder_lock.open_lock
+        blocked: list[Path] = []
+
+        def refuse_open(path: Path, directory: int, *, create: bool) -> int:
+            if path in blocked:
+                raise PermissionError("fixture refuses the module lock")
+            return open_lock(path, directory, create=create)
+
+        def refuse_after_finish(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            blocked.append(job.log.parent)
+            return finish(job, status)
+
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=refuse_open),
+              mock.patch.object(gate, "finish_gate_job", side_effect=refuse_after_finish)):
+            with self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture refuses the module lock"):
+                _ = gate.run_suites(self.checkout)
+            [folder] = blocked
+            self.assertTrue(folder.with_name(folder.name + ".lock").is_file())
+            _ = self.assert_unresolved_folder_cleanup([folder.parent, folder])
+
     def test_gate_keeps_the_recovery_entry_when_a_lease_file_stays(self) -> None:
         parent = self.root / "gate-with-lease-file"
         parent.mkdir()
@@ -712,7 +797,6 @@ gate.run_suites(Path.cwd(), full=True)
         with mock.patch.dict(os.environ, self.environment, clear=True):
             for suffix in (".lease.json", ".lock"):
                 with (self.subTest(suffix=suffix),
-                      redirect_stderr(io.StringIO()) as report,
                       gate.private_gate_recovery(self.checkout, parent) as recovery,
                       ExitStack() as cleanup):
                     folder = cleanup.enter_context(gate.gate_temporary(recovery, "merge-gate", parent))
@@ -724,7 +808,7 @@ gate.run_suites(Path.cwd(), full=True)
                             raise PermissionError("fixture refuses the lease file")
                         unlink(path, dir_fd=dir_fd)
 
-                    with (self.assertRaisesRegex(PermissionError, "fixture refuses the lease file"),
+                    with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture refuses the lease file"),
                           mock.patch.object(os, "unlink", side_effect=refuse_lease_file)):
                         cleanup.close()
                     self.assertFalse(folder.exists())
@@ -732,10 +816,7 @@ gate.run_suites(Path.cwd(), full=True)
                     self.assertEqual(recovery.folders, [str(folder)])
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [str(folder)])
-                self.assertIs(saved["finished"], True)
-                [notice] = report.getvalue().splitlines()
-                self.assertTrue(notice.startswith("kept for a manual removal list: "))
-                self.assertIn(str(blocked), notice)
+                self.assertIs(saved["finished"], False)
 
     def test_failed_gate_removes_its_folder(self) -> None:
         parent = self.root / "gate-temporary"

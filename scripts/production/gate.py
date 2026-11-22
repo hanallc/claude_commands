@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -354,6 +354,7 @@ class SharedCPUPool:
     blocking: int
     owned: list[SharedCPUSlot] = field(default_factory=list)
     deadline: float = math.inf
+    idle: list[SharedCPUSlot] = field(default_factory=list, init=False)
 
     def acquire(self) -> SharedCPUSlot:
         """Wait for a CPU slot or cancellation while no module runs."""
@@ -385,8 +386,12 @@ class SharedCPUPool:
             print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
     def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
+        if time.monotonic() >= self.deadline:
+            return WaitingForCPU()
+        if self.idle:
+            return self.idle.pop()
         # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
-        if time.monotonic() >= self.deadline or not select.select([self.descriptor], [], [], 0)[0]:
+        if not select.select([self.descriptor], [], [], 0)[0]:
             return WaitingForCPU()
         recovery = ACTIVE_GATE_RECOVERY.get()
         record = None
@@ -485,7 +490,12 @@ def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
         with queue_place(program, repo,
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
-            yield place
+            try:
+                yield place
+            finally:
+                recovery = ACTIVE_GATE_RECOVERY.get()
+                if isinstance(recovery, GateRecovery) and recovery.unresolved:
+                    place.keep_reservation = True
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
 
@@ -969,32 +979,23 @@ def check_gate_folder_leases(recovery: GateRecovery) -> None:
     """Check the recorded folders for live lease holders before returning capacity."""
     paths = {Path(folder) for folder in recovery.folders}
     with ExitStack() as leases:
-        held: list[Path] = []
         for path in sorted(paths):
             try:
-                parent = leases.enter_context(build_folder_lock.folder_parent(path, path.parent, create=False))
-            except FileNotFoundError:
-                continue
-            lease = build_folders._hold_free_lease(path, parent, leases, wait=False, create=True)  # pyright: ignore[reportPrivateUsage]
-            marker = path / build_folders.RECOVERY_MARKER
-            if (not isinstance(lease, build_folders.HeldFolderRemovalLease)
-                    or marker.is_symlink() and marker.readlink() != recovery.path.absolute()):
-                raise GateRecoveryUnresolved(f"gate recovery kept held folder {path}")
-            held.append(path)
-
-        for path in held:
-            try:
-                children = list(path.iterdir())
-            except FileNotFoundError:
-                continue
-            nested = {child for child in children if not child.is_symlink() and child.is_dir()}
-            for child in children:
-                if child.name.endswith(".lease.json"):
-                    nested.add(child.with_suffix("").with_suffix(""))
-            for child in sorted(nested - paths):
-                lease = leases.enter_context(build_folders.folder_removal_lease(child, children=True, wait=False))
-                if isinstance(lease, build_folders.RefusedRemovalLease):
-                    raise GateRecoveryUnresolved(f"gate recovery kept held folder {child}")
+                try:
+                    parent = leases.enter_context(build_folder_lock.folder_parent(path, path.parent, create=False))
+                except FileNotFoundError:
+                    continue
+                lease = build_folders._hold_free_lease(path, parent, leases, wait=False, create=True)  # pyright: ignore[reportPrivateUsage]
+                marker = path / build_folders.RECOVERY_MARKER
+                if (not isinstance(lease, build_folders.HeldFolderRemovalLease)
+                        or marker.is_symlink() and marker.readlink() != recovery.path.absolute()):
+                    raise GateRecoveryUnresolved(f"gate recovery kept held folder {path}")
+                refusal = build_folders._hold_child_leases(  # pyright: ignore[reportPrivateUsage]
+                    path, leases, wait=False, separately_checked=paths)
+                if refusal is not None:
+                    raise GateRecoveryUnresolved(f"gate recovery kept held leases or recovery records in {path}")
+            except (OSError, ValueError) as error:
+                raise GateRecoveryUnresolved(f"gate recovery could not check {path}: {error}") from error
 
 
 class GateRollbackMismatch(GateRefused):
@@ -1307,28 +1308,26 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
         finally:
             try:
                 cleanup.close()
+                if not recovery.unresolved:
+                    check_gate_folder_removal(recovery, folder)
             except build_folders.TemporaryFolderRemovalUnresolved as error:
                 recovery.unresolved = True
                 raise GateRecoveryUnresolved(str(error)) from error
-            finally:
-                if not recovery.unresolved:
-                    check_gate_folder_removal(recovery, folder)
+            except BaseException:
+                recovery.unresolved = True
+                raise
 
 
 def check_gate_folder_removal(recovery: GateRecovery, folder: Path) -> None:
     try:
         remaining = build_folders.temporary_allocation_entries(folder)
-    except OSError:
-        report_retained_gate_folder(str(folder), "the gate could not confirm removal")
-    else:
-        if folder in remaining:
-            report_retained_gate_folder(str(folder), "the gate could not remove its folder")
-        elif remaining:
-            paths = ", ".join(map(str, remaining))
-            report_retained_gate_folder(paths, "the gate could not remove its lease files")
-        else:
-            recovery.folders.remove(str(folder))
-            recovery.save()
+    except OSError as error:
+        raise GateRecoveryUnresolved(f"could not confirm removal of {folder}: {error}") from error
+    if remaining:
+        paths = ", ".join(map(str, remaining))
+        raise GateRecoveryUnresolved(f"could not remove {paths}")
+    recovery.folders.remove(str(folder))
+    recovery.save()
 
 
 def suite_scope_prefix() -> list[str]:
@@ -2088,11 +2087,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     # Folder keys stay unchanged until chunk 6.
     folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
+    # Close the gate folders before releasing the shared slot and reservation.
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
-          ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+          ExitStack() as capacity, ExitStack() as folders):
+        temporary = folders.enter_context(gate_temporary(recovery, folder_tool, tmpfs))
+        module_folders = folders.enter_context(ExitStack())
+        reservation = (capacity.enter_context(gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode))
+                       if hold is not None else None)
+        cpu_pool = capacity.enter_context(shared_cpu_pool()) if shared else NoSharedCPU()
         if reservation is not None:
             scope_prefix = publish_gate_scope(recovery, reservation, scope_prefix)
         # The wall time and the time limit start here, after the queue admits the gate.
@@ -2134,8 +2136,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         continue
                     result = finish_gate_job(job, status)
                     executions.append(result)
-                    if isinstance(job.cpu_slot, SharedCPUSlot) and not recovery.unresolved:
-                        job.cpu_slot.release()
+                    if isinstance(cpu_pool, SharedCPUPool) and isinstance(job.cpu_slot, SharedCPUSlot):
+                        cpu_pool.idle.append(job.cpu_slot)
                     running.remove(job)
                     if admission is not None:
                         admission.release(job.process.pid)
@@ -2238,7 +2240,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                             except TimeoutError:
                                 break
                             if hold is not None and not hold.admits():
-                                slot.release()
+                                cpu_pool.idle.append(slot)
                                 hold.wait_until_free()
                                 break
                     else:
@@ -2313,18 +2315,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                       config.program_sample_seconds)
                     recovery.scope = ""
                     recovery.save()
-                module_folders.close()
             except BaseException:
                 recovery.unresolved = True
-                if reservation is not None:
-                    reservation.keep_reservation = True
                 raise
-            if reservation is not None and recovery.unresolved:
-                reservation.keep_reservation = True
             for job in running:
                 job.output.close()
-                if isinstance(job.cpu_slot, SharedCPUSlot) and not recovery.unresolved:
-                    job.cpu_slot.release()
             if shared:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)

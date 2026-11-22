@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -1800,7 +1800,8 @@ def _recovery_record_present(folder: str, directory: int) -> bool:
 
 
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
-                       probe_fds: list[int] | None = None) -> RefusedRemovalLease | None:
+                       probe_fds: list[int] | None = None,
+                       separately_checked: Collection[Path] = ()) -> RefusedRemovalLease | None:
     """Hold leases below the path. Refuse removal for a held lock or pending recovery."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
@@ -1813,14 +1814,16 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
                       or ("run.json" in files and gate_recovery_folder(folder)))
         if current != path and has_record and _folder_needs_recovery(folder, directory):
             return RefusedRemovalLease()
-        for name in files:
+        for name in (*files, *folders):
             stem = name.removesuffix(".lock")
-            if stem != name and (stem in folders or stem + ".lease.json" in files):
+            if stem != name and current / stem not in separately_checked:
                 lease = _hold_free_lease(current / stem, directory, stack, wait=wait)
                 if isinstance(lease, RefusedRemovalLease):
                     return lease
                 if probe_fds is not None and isinstance(lease, HeldFolderRemovalLease):
                     probe_fds.append(lease.descriptor)
+        if separately_checked:
+            folders[:] = [name for name in folders if current / name not in separately_checked]
     return None
 
 
@@ -2028,16 +2031,17 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
             _remove_folder(path, directory, allocated)
             return True
         with ExitStack() as leases:
-            try:
-                refusal = _hold_child_leases(path, leases, wait=False)
-            except (OSError, ValueError) as error:
-                raise TemporaryFolderRemovalUnresolved(f"could not check nested leases in {path}: {error}") from error
-            if refusal is not None:
+            if _hold_child_leases(path, leases, wait=False) is not None:
                 return False
             _remove_folder(path, directory, allocated)
         return True
 
-    removed = remove_build_folder(path, cleanup, temporary=temporary, dir_fd=directory, wait=not children)
+    try:
+        removed = remove_build_folder(path, cleanup, temporary=temporary, dir_fd=directory, wait=not children)
+    except (OSError, ValueError) as error:
+        if children:
+            raise TemporaryFolderRemovalUnresolved(f"could not remove {path} safely: {error}") from error
+        raise
     if children and not removed:
         raise TemporaryFolderRemovalUnresolved(f"could not remove {path} safely")
 
