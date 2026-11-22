@@ -1,85 +1,56 @@
-"""A long temporary root cannot lengthen a fixture's Unix socket path."""
+"""Test the socket folder routes and cleanup."""
 from __future__ import annotations
 
 import os
 import socket
 import stat
-import subprocess
-import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.lib import build_folders
-from scripts.lib.socket_test_support import PARENT, SOCKET_ROOT_ENV, short_socket_directory
-from scripts.lib.testing_folders import RUN_FOLDER_ENV
-from scripts.lint.memory_test_support import config_environment
+from scripts.lib.socket_test_support import UNIX_SOCKET_PATH_LIMIT, short_socket_directory
 
 
 class ShortSocketDirectoryTests(unittest.TestCase):
-    def test_socket_parent_uses_the_current_run_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _ = config_environment(root)
-            for name in ("first", "second"):
-                parent = root / name
-                parent.mkdir()
-                with patch.dict(os.environ, {"CONF_DIR": str(root), RUN_FOLDER_ENV: str(parent), SOCKET_ROOT_ENV: ""}):
-                    with short_socket_directory() as socket_directory:
-                        path = Path(socket_directory)
-                        self.assertEqual(path.parent, parent / PARENT)
-                        with socket.socket(socket.AF_UNIX) as listener:
-                            listener.bind(str(path / "s"))
-                    self.assertFalse(path.exists())
+    def test_socket_folder_uses_a_short_tmpdir(self) -> None:
+        with (tempfile.TemporaryDirectory(dir="/tmp", prefix="t") as tmpdir,
+              patch.dict(os.environ, {"TMPDIR": tmpdir}),
+              patch.object(tempfile, "tempdir", None)):
+            with short_socket_directory() as directory:
+                folder = Path(directory)
+                self.assertEqual(folder.parent, Path(tmpdir))
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(folder / "s"))
+            self.assertFalse(folder.exists())
 
-    def test_socket_binds_with_long_tmpdir_and_private_folder_is_removed(self) -> None:
+    def test_daemon_socket_uses_fallback_with_a_long_spaced_tmpdir(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            long_tmpdir = Path(root) / ("long-session-" * 8)
+            long_tmpdir = Path(root) / "long tmpdir".ljust(99 - len(os.fsencode(root)), "x")
             long_tmpdir.mkdir()
-            self.assertGreater(len(os.fsencode(long_tmpdir)), 108)
-            configuration = Path(root) / "config"
-            _ = config_environment(configuration)
-            with (patch.dict(os.environ, {SOCKET_ROOT_ENV: root, "TMPDIR": str(long_tmpdir), "CONF_DIR": str(configuration)}),
+            with (patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}),
                   patch.object(tempfile, "tempdir", None)):
                 self.assertEqual(tempfile.gettempdir(), str(long_tmpdir))
-                with short_socket_directory() as directory:
-                    folder = Path(directory)
-                    self.assertEqual(folder.parent, Path(root) / PARENT)
-                    self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
-                    path = folder / "s"
-                    self.assertLess(len(os.fsencode(path)), 108)
-                    with socket.socket(socket.AF_UNIX) as listener:
-                        listener.bind(str(path))
-                        self.assertTrue(path.is_socket())
-                self.assertFalse(folder.exists())
+                for fail in (False, True):
+                    with self.subTest(fail=fail):
+                        outcome = self.assertRaisesRegex(RuntimeError, "fixture failure") if fail else nullcontext()
+                        with outcome, short_socket_directory() as directory:
+                            folder = Path(directory)
+                            self.bind_daemon_socket(folder)
+                            if fail:
+                                raise RuntimeError("fixture failure")
+                        self.assertFalse(folder.exists())
 
-    def test_a_new_folder_removes_the_free_folders_a_killed_run_left(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _ = config_environment(root)
-            killed = ("from scripts.lib.socket_test_support import short_socket_directory\n"
-                      "import os\nfolder = short_socket_directory()\nprint(folder.name, flush=True)\nos._exit(0)\n")
-            with patch.dict(os.environ, {"CONF_DIR": str(root), SOCKET_ROOT_ENV: str(root)}):
-                left = Path(subprocess.run([sys.executable, "-c", killed], check=True, capture_output=True,
-                                           text=True, cwd=Path(__file__).resolve().parents[2]).stdout.strip())
-                self.assertTrue(left.is_dir())
-                with short_socket_directory() as held:
-                    self.assertFalse(left.exists())
-                    self.assertFalse(left.with_name(left.name + ".lease.json").exists())
-                    build_folders.sweep_temporary_build_folders(Path(held).parent, wait=False)
-                    self.assertTrue(Path(held).is_dir())
-
-    def test_one_process_sweeps_a_parent_once(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _ = config_environment(root)
-            with (patch.dict(os.environ, {"CONF_DIR": str(root), SOCKET_ROOT_ENV: str(root)}),
-                  patch.object(build_folders, "sweep_temporary_build_folders") as sweep):
-                for _ in range(3):
-                    with short_socket_directory():
-                        pass
-            sweep.assert_called_once_with(root / PARENT, wait=False)
+    def bind_daemon_socket(self, folder: Path) -> None:
+        self.assertEqual(folder.parent, Path("/tmp"))
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+        path = folder / ".codex2/app-server-control/app-server-control.sock"
+        path.parent.mkdir(parents=True)
+        self.assertLessEqual(len(os.fsencode(path)), UNIX_SOCKET_PATH_LIMIT)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path))
+            self.assertTrue(path.is_socket())
 
 
 if __name__ == "__main__":

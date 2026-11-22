@@ -45,7 +45,7 @@ from scripts.build_hold import override_guard
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
-from scripts.lib.socket_test_support import SOCKET_ROOT_ENV
+from scripts.lib.socket_test_support import UNIX_SOCKET_PATH_LIMIT
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
@@ -5244,17 +5244,19 @@ class ServiceTests(unittest.TestCase):
 
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            long_tmpdir = Path(root) / ("nested-" * 24)
+            long_tmpdir = Path(root) / ("nested folder" + "x" * 140)
             long_tmpdir.mkdir()
-            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir), SOCKET_ROOT_ENV: root}), \
-                 mock.patch.object(tempfile, "tempdir", str(long_tmpdir)), \
+            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), \
+                 mock.patch.object(tempfile, "tempdir", None), \
                  AdmissionFixture() as fixture:
                 self.assertEqual(fixture.root.parent, long_tmpdir)
                 self.assertGreater(len(os.fsencode(fixture.root / "admission.sock")), 108)
-                self.assertLess(len(os.fsencode(fixture.socket_path)), 108)
+                self.assertLessEqual(len(os.fsencode(fixture.socket_path)), UNIX_SOCKET_PATH_LIMIT)
+                self.assertEqual(fixture.socket_dir.parent, Path("/tmp"))
                 self.assertTrue(fixture.socket_path.is_socket())
                 peer = fixture.connect(wire.ViewRequest())
                 self.assertTrue(any(isinstance(reply, wire.ViewReply) for reply in peer.replies()))
+            self.assertFalse(fixture.socket_dir.exists())
 
 
     def test_second_request_and_oversized_input_end_admission_before_next_pass(self) -> None:
