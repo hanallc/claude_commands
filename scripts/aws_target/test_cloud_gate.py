@@ -3410,6 +3410,69 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         return root / ledger.text(cloud_gate.read(root / 'current.json'), 'attempt')
 
+    def test_incompatible_pending_gate_settles_before_a_new_attempt_runs(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        current = root / 'current.json'
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        fake = FakeGateAws()
+        api = AwsCli('fixture-scaler', 'us-east-2', 1, execute=fake)
+        events: list[tuple[str, Path]] = []
+        confirm_cleanup = False
+
+        def leave_incompatible_request(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            request = cloud_gate.read(folder / 'request.json')
+            request['modules'] = ['scripts/fixture/test_one.py']
+            cloud_gate.save(folder / 'request.json', request)
+            self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+                folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+            book.resolve_gate(folder.name, ledger.GateRunning('i-fixture'), instance_type='m7a.8xlarge')
+            return 0
+
+        with redirect_stdout(StringIO()):
+            self.assertIsInstance(self._run_gate_for_resume(leave_incompatible_request), cloud_gate.LocalFallback)
+        old = root / ledger.text(cloud_gate.read(current), 'attempt')
+
+        def settle_or_run(command: Sequence[str]) -> int:
+            if '--cleanup' in command:
+                folder = Path(command[command.index('--cleanup') + 1])
+                events.append(('settle', folder))
+                self.assertEqual(folder, old)
+                self.assertIn('--unit=cloud-gate-' + old.name, command)
+                self.assertFalse(any(argument.startswith('--property=ExecStopPost=') for argument in command))
+                self.assertEqual(cloud_gate.read(current)['attempt'], old.name)
+                if not confirm_cleanup:
+                    return 0
+                worker = cloud_gate.GateWorker(api, book, self.settings, folder / 'reservation.cgroup',
+                                               clock=lambda: now)
+                return int(not cloud_gate.cleanup_folder(folder, worker))
+            folder = Path(command[command.index('--worker') + 1])
+            events.append(('run', folder))
+            rows = book.read_snapshot().gate_reservations
+            self.assertIsInstance(next(row.state for row in rows if row.attempt == old.name), ledger.GateTerminated)
+            return self._finish_gate_for_resume(command)
+
+        with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')),
+              redirect_stdout(StringIO())):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=settle_or_run)
+            self.assertEqual(outcome, cloud_gate.LocalFallback('The incompatible cloud attempt has not ended'))
+            self.assertEqual(cloud_gate.read(current)['attempt'], old.name)
+            self.assertEqual(events, [('settle', old)])
+            events.clear()
+            confirm_cleanup = True
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                                     module_time_limit_s=1800, service=settle_or_run)
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        new = root / ledger.text(cloud_gate.read(current), 'attempt')
+        self.assertNotEqual(new, old)
+        self.assertEqual(events, [('settle', old), ('run', new)])
+        self.assertEqual(fake.terminated_instances, {'i-fixture'})
+        self.assertTrue((old / 'request.json').is_file())
+
     def test_complete_unimported_gate_resumes_without_a_service(self) -> None:
         folder = self._unimported_gate(status=1)
         (self.state / 'gate-deployment.json').unlink()

@@ -1237,12 +1237,41 @@ def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float
     return request
 
 
+class IncompatibleSavedGateRequest(ValueError):
+    """The saved request cannot run the selected modules."""
+
+
 def read_saved_request(repo: Path, path: Path, tree: str,
                        selected: gate.AllModules | gate.TreeSelection) -> dict[str, object]:
     request = read(path)
+    if request.get('attempt', path.parent.name) != path.parent.name:
+        raise ValueError('The saved request differs from the current cloud attempt')
     if request.get('modules') != request_test_modules(repo, tree, selected):
-        raise ValueError('The saved request has a different module list')
+        raise IncompatibleSavedGateRequest('The saved request has a different module list')
     return request
+
+
+def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
+                         directory: Path, sidecar: Path) -> list[str]:
+    return service_command('scripts.aws_target.cloud_gate',
+        [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
+         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
+
+
+def settle_incompatible_attempt(folder: Path, book: ledger.CostLedger,
+                                service: Callable[[Sequence[str]], int]) -> bool:
+    def settled(*, cleanup_finished: bool) -> bool:
+        rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
+        for row in rows:
+            if row.attempt == folder.name:
+                return not ledger.gate_is_open(row)
+        return cleanup_finished and not (folder / 'launch.json').exists()
+
+    if settled(cleanup_finished=False):
+        return True
+    # Use the old unit name so systemd refuses cleanup while its worker runs.
+    command = gate_attempt_command('--cleanup', folder, book.directory, folder / 'reservation.cgroup')
+    return service(command) == 0 and settled(cleanup_finished=True)
 
 
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
@@ -1337,12 +1366,33 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if previous.get('mode') == mode.value:
             previous['mode'] = mode.wire
         same_request = all(previous.get(key) == value for key, value in identity.items())
+        book = ledger.CostLedger(directory)
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         result_path = folder / 'outcome.json'
         saved_result = read(result_path) if result_path.exists() else {}
+        ended = same_request and saved_result.get('status') != 'complete' and book.path.exists() and any(
+            row.attempt == folder.name and not ledger.gate_is_open(row)
+            for row in book.read_snapshot().gate_reservations)
+        saved_request: dict[str, object] = {}
+        if same_request and (folder / 'request.json').exists():
+            try:
+                saved_request = read_saved_request(repo, folder / 'request.json', tree, selected)
+            except IncompatibleSavedGateRequest:
+                if not settle_incompatible_attempt(folder, book, service):
+                    attempt.identifier = folder.name
+                    attempt.gate_job = _saved_gate_job(previous)
+                    return LocalFallback('The incompatible cloud attempt has not ended')
+                same_request = False
+                ended = False
+                folder = root / uuid4().hex
+                result_path = folder / 'outcome.json'
+                saved_result = {}
+            except (OSError, ValueError, KeyError, TypeError):
+                if not ended and saved_result.get('status') in (None, 'pending'):
+                    raise
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
-                request = read_saved_request(repo, folder / 'request.json', tree, selected)
+                request = saved_request
                 saved_attempt = request.setdefault('attempt', folder.name)
                 if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
                         or saved_attempt != folder.name):
@@ -1367,12 +1417,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
-        book = ledger.CostLedger(directory)
-        ended = book.path.exists() and any(
-            row.attempt == folder.name and isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))
-            for row in book.read_snapshot().gate_reservations)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
             folder = root / uuid4().hex
+            saved_request = {}
         elif same_request:
             attempt.gate_job = _saved_gate_job(previous)
         attempt.identifier = folder.name
@@ -1412,15 +1459,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         if box_failures > box_retry_limit:
                             reservation.status = 0
                             return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
-                    command = service_command('scripts.aws_target.cloud_gate',
-                        ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
-                         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
-                    request_path = folder / 'request.json'
-                    if request_path.exists():
-                        request = read_saved_request(repo, request_path, tree, selected)
-                    else:
-                        request = prepare(repo, folder, mode, module_time_limit_s,
-                                          selected=selected, gate_job=attempt.gate_job)
+                    command = gate_attempt_command('--worker', folder, directory, sidecar)
+                    request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
+                                                       selected=selected, gate_job=attempt.gate_job)
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
@@ -1469,6 +1510,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         return LocalFallback(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
                     return LocalFallback('No cloud capacity choice remains')
                 folder = root / uuid4().hex
+                saved_request = {}
                 attempt.identifier = folder.name
                 attempt.gate_job = command_job
                 folder.mkdir()
@@ -1483,13 +1525,14 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
              if name in os.environ]
     cleanup: list[str] = []
     stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
-    if paired:
-        folder = arguments[arguments.index('--paired-worker') + 1]
-        command = shlex.join([sys.executable, '-m', module, '--paired-cleanup', folder])
-    else:
-        cleanup_arguments = ['--cleanup' if value == '--worker' else value for value in arguments]
+    if '--cleanup' not in arguments:
+        if paired:
+            folder = arguments[arguments.index('--paired-worker') + 1]
+            cleanup_arguments = ['--paired-cleanup', folder]
+        else:
+            cleanup_arguments = ['--cleanup' if value == '--worker' else value for value in arguments]
         command = shlex.join([sys.executable, '-m', module, *cleanup_arguments])
-    cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
+        cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
     return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
             '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
             *configuration, *owner, *cleanup,

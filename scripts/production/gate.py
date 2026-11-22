@@ -1320,15 +1320,23 @@ class PassedTreeLedger:
     def record_pass(self, selection: AffectedSelection | FullSuite, *,
                     discovered: Sequence[tuple[str, Path]] = (),
                     required: FullSuite | NoFullRunRequired = NO_FULL_RUN_REQUIRED) -> None:
-        if (self.unavailable or isinstance(self.tree, UnrecordableTestTree)
-                or not matches_routed_gate_tree(self.repo, self.tree.tree)):
+        if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
             return
         try:
-            if discovered and list(discovered) != discover_test_modules(self.repo):
-                return
+            modules_match = not discovered or list(discovered) == discover_test_modules(self.repo)
             ending = clean_test_tree(self.repo)
-            if not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree:
-                return
+        except (GateRefused, OSError, ValueError) as error:
+            self.report_error(error)
+            return
+        if (not isinstance(ending, CleanTestTree) or ending.tree != self.tree.tree
+                or not matches_routed_gate_tree(self.repo, self.tree.tree)):
+            routed = ACTIVE_ROUTED_GATE_TREE.get()
+            if isinstance(routed, RoutedGateTree) and routed.repo == self.repo:
+                raise GateRefused("The checkout changed during the gate")
+            return
+        if not modules_match:
+            return
+        try:
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
                       "checkout": str(self.repo.resolve()), "suites": self.suites, "source": self.source,

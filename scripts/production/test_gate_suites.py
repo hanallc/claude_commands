@@ -391,6 +391,33 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(record["tree"], working_tree(self.checkout)[0])
         self.assertFalse(marker.exists())
 
+    @gate_suites("hooks")
+    def test_cloud_fallback_refuses_a_tree_change_at_pass_publication(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        marker, notice = self.write_nightly_red_marker()
+        working_tree = cloud_gate.working_tree
+        calls = 0
+
+        def change_after_final_check(repo: Path) -> tuple[str, set[str]]:
+            nonlocal calls
+            tree = working_tree(repo)
+            calls += 1
+            if calls == 2:
+                self.write(repo / "subject.txt", "changed before publication\n")
+                _ = self.commit(repo, "Change the tree before publication")
+            return tree
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value="fixture cloud unavailable"),
+              mock.patch.object(cloud_gate, "working_tree", side_effect=change_after_final_check),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+                _ = gate.run_gate_suites(self.checkout)
+
+        self.assertEqual(self.pass_records(), [])
+        self.assertEqual(marker.read_text(), notice)
+
     @gate_suites("hooks", "direct")
     def test_whole_machine_orders_modules_from_supplied_times_without_writing_them(self) -> None:
         path = self.state / "module_seconds.json"
