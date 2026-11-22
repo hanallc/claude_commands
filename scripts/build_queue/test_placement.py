@@ -115,10 +115,10 @@ def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registe
     _ = (fixture.root / "build_targets.conf").write_text(
         f"targets={names}\nkind.natedev=local\nplatform.natedev=linux\n"
         + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n"
-        + f"enabled.mac-linux={enabled}\n")
+        + f"enabled.mac-linux={enabled}\nunreachable_wait_seconds=600\n")
     _ = (fixture.root / "mac_linux.conf").write_text(
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=8\n"
-        + "run.time_limit_seconds=7200\nrun.unreachable_wait_seconds=600\n")
+        + "run.time_limit_seconds=7200\n")
     backoff = fixture.root / "target-state" / "mac-linux" / "unreachable_until"
     backoff.parent.mkdir(parents=True, exist_ok=True)
     return backoff
