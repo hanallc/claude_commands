@@ -392,6 +392,16 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(isinstance(eligibility.read_backoff(NOW.timestamp() + 15, name), eligibility.ActiveBackoff), active)
         self.assertEqual(self.snapshot(), before)
 
+    def test_mac_linux_backoff_uses_the_state_path_without_a_registry_entry(self) -> None:
+        target = eligibility.MAC_LINUX_TARGET
+        self.assertNotIn(target, self.config.read_text())
+        now = NOW.timestamp()
+        directory = self.directory(target)
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory.parent)}):
+            offload.write_backoff(now + 30, target, strict=True)
+            self.assertEqual(float((directory / "unreachable_until").read_text()), now + 30)
+            self.assertIs(eligibility.read_backoff(now, target), eligibility.ACTIVE_BACKOFF)
+
     def test_free_now_uses_only_the_selected_targets_backoff(self) -> None:
         offload.write_backoff(NOW.timestamp() + 30, "linux")
         for name, answer in zip(TARGET_NAMES, ("free", "backoff", "free"), strict=True):

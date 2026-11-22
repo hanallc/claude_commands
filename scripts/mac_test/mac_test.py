@@ -72,7 +72,6 @@ from scripts.mac_test.claim_state import (
     RunState as RunState,
     NO_RUN as NO_RUN,
     StatePaths as StatePaths,
-    state_paths as state_paths,
     locked as locked,
     read_json_object as read_json_object,
     read_run as read_run,
@@ -347,6 +346,16 @@ class CliArguments(argparse.Namespace):
         self.attempt: str = ""
         self.identity: bool = False
         self.session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION
+
+
+def state_paths(target: str = "") -> StatePaths:
+    from scripts.mac_test import eligibility
+
+    if target == eligibility.MAC_LINUX_TARGET:
+        guest = eligibility.configured_ssh_target(target)
+        return StatePaths(eligibility.ssh_target_state_directory(target), target,
+                          registry_selected=True, platform=guest.platform)
+    return claim_state.state_paths(target)
 
 
 def config_path(target: str = "") -> Path:
@@ -2260,7 +2269,10 @@ def free_now(
     else:
         path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
         capacity_settings = conf.read(path)
-    if not isinstance(origin, placement.ManualMacCommand) and not eligibility.placement_enabled(paths.platform):
+    guest = paths.target == eligibility.MAC_LINUX_TARGET
+    enabled = (eligibility.mac_linux_enabled(conf.read("build_targets")) if guest
+               else isinstance(origin, placement.ManualMacCommand) or eligibility.placement_enabled(paths.platform))
+    if not enabled:
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2280,7 +2292,7 @@ def free_now(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
-    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+    if not guest and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
             scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
                            for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))

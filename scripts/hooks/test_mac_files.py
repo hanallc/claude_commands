@@ -4,7 +4,6 @@ import json
 import os
 import runpy
 import shlex
-import signal
 import sys
 import tempfile
 import unittest
@@ -117,8 +116,6 @@ class MacFilesTests(unittest.TestCase):
         with (
             mock.patch.object(sys, "stdin", stdin),
             redirect_stdout(output),
-            mock.patch.object(signal, "signal"),
-            mock.patch.object(signal, "alarm"),
             mock.patch.object(compaction_marker, "clear"),
             mock.patch.object(conversation_pause, "prompt_source", return_value=source),
             mock.patch.object(conversation_pause, "now_epoch", new=timestamp),
