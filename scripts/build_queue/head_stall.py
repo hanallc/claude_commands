@@ -1,4 +1,4 @@
-"""Alert once when the queue head waits while holders keep memory and nothing starts."""
+"""Alert once when no step starts while memory or disk space holds the queue."""
 
 from __future__ import annotations
 try:
@@ -12,22 +12,23 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Literal, cast
+from typing import cast
 
 from scripts.build_queue import admission_records as records
 from scripts.build_queue.queue_evidence import gib
 from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot
 from scripts.buildlog import store
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import memory_admit as gate
+from scripts.production import staff
 
 SENDER = "head-stall watch"
 TIMES_TAIL_BYTES = 1 << 20
 PROC = gate.PROC
 
-type AlertRecipient = Literal["builds", "bob"]
-ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = ("builds", "bob")
+ROLLOUT_RECIPIENT = "staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d"
+LEGACY_RECEIPT = "bob"
 
 
 @dataclass(frozen=True)
@@ -93,9 +94,8 @@ def default_paths() -> StallPaths:
     return StallPaths(store.root() / "admission", store.root() / "head_stall.json")
 
 
-def configured_limits() -> tuple[float, float]:
+def configured_limits(settings: conf.ConfigRead) -> tuple[float, float]:
     """The stall limit and the oldest usable snapshot age, in seconds."""
-    settings = conf.read("build_admission")
     return settings.number("head_stall_alert_minutes") * 60, settings.number("silence_seconds")
 
 
@@ -237,19 +237,22 @@ def _run(command: list[str], text: str = "") -> bool:
     return False
 
 
-def _delivered_stalls(state: Path) -> dict[AlertRecipient, float | str]:
+def _delivered_stalls(state: Path) -> dict[str, float | str]:
     try:
         raw = cast(object, json.loads(state.read_text()))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        if state.is_symlink():
+            raise
         return {}
     saved = cast(dict[str, object], raw).get("alerted") if isinstance(raw, dict) else None
-    # An old key covers builds only. It cannot confirm delivery to bob.
+    # A scalar receipt covers the Builds session.
     values = cast(dict[str, object], saved) if isinstance(saved, dict) else {"builds": saved}
-    delivered: dict[AlertRecipient, float | str] = {}
-    for recipient in ALERT_RECIPIENTS:
-        value = values.get(recipient)
+    delivered: dict[str, float | str] = {}
+    for recipient, value in values.items():
         if isinstance(value, (int, float, str)) and not isinstance(value, bool):
             delivered[recipient] = value
+        else:
+            raise ValueError(f"{state}: invalid receipt for {recipient}")
     return delivered
 
 
@@ -261,15 +264,19 @@ def _already_alerted(value: float | str, last_start: float) -> bool:
     return last_start <= value
 
 
-def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[str], str], bool]) -> None:
+def _send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[str], str], bool],
+                recipients: tuple[str, ...]) -> None:
     """Record each accepted alert before sending to the next recipient."""
     from scripts.message.session_send import session_send_argv
 
     delivered = _delivered_stalls(state)
     text = builds_text(stall)
     write_errors: list[OSError] = []
-    for recipient in ALERT_RECIPIENTS:
-        if recipient in delivered and _already_alerted(delivered[recipient], stall.last_start):
+    for recipient in recipients:
+        receipt = delivered.get(recipient)
+        if receipt is None and recipient == ROLLOUT_RECIPIENT:
+            receipt = delivered.get(LEGACY_RECEIPT)
+        if receipt is not None and _already_alerted(receipt, stall.last_start):
             continue
         command = session_send_argv(recipient, sender=SENDER)
         command.extend(["--key", f"head-stall-{stall.last_start}"])
@@ -285,8 +292,18 @@ def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[st
 
 def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bool] = _run) -> HeadStall | NoStall:
     """Alert once for each stall. A new step start permits another alert."""
-    limit, freshest = configured_limits()
+    settings = conf.read("build_admission")
+    limit, freshest = configured_limits(settings)
     stall = current_stall(paths, now, limit, freshest)
-    if isinstance(stall, HeadStall):
-        send_alert(stall, paths.state, now, run)
+    if isinstance(stall, NoStall):
+        return stall
+    try:
+        identity = staff.native_id(settings.text("head_stall_alert_producer_id", recover_invalid=False))
+        recipients = ("builds", f"staff:{identity}")
+    except (conf.Unusable, staff.StaffRefused) as error:
+        print(f"head-stall watch: producer recipient unavailable: {error}", file=sys.stderr)
+        recipients = ("builds",)
+    state = paths.state
+    with file_lock.exclusive(state.with_suffix(".lock")):
+        _send_alert(stall, state, now, run, recipients)
     return stall

@@ -46,6 +46,8 @@ from scripts.message import send
 from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
+FYI_STAFF_IDS = ("00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000011")
+FYI_ROUTES = tuple(f"staff:{identity}" for identity in FYI_STAFF_IDS)
 
 REGISTRY = registry_text({
     'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
@@ -134,7 +136,8 @@ def fixture_configuration(root: Path) -> dict[str, str]:
         "no_worker_mode_on=Codex workers have no capacity. Send no assign. Do your current work yourself: "
         + "write the code, run the tests and do the reviews directly. Keep to this rule until the workers-back notice arrives.\n"
         + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends no-worker mode.\n"
-        + "no_worker_mode_fyi=morty dwight\nusage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
+        + f"no_worker_mode_fyi_staff_ids={' '.join(FYI_STAFF_IDS)}\n"
+        + "usage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
         + "half_point_pace_minutes=30\nhold_default_minutes=40\n")
     return environment
 

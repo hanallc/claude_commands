@@ -377,7 +377,7 @@ window.fetch=(url,options)=>{
         evidence = new_item_dialog.PageDataEvidence("Review", (("Page", "Console"),))
         state = new_item_dialog.BugPageState(
             "http://127.0.0.1/console/review.html#owner=builds", new_item_dialog.PageViewport(1280, 800, True),
-            2.4, ("Could not load brain.",), (), "Type All · State Open · Owner <builds>", True)
+            2.4, ("Could not load planner.",), (), "Type All · State Open · Owner <builds>", True)
         request = self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
         viewport = new_item_dialog.PageViewport(1280, 800, True)
         created = cache.create_submission(
@@ -885,12 +885,12 @@ window.fetch=(url,options)=>{
         self.assertEqual(snapshot.notices, ())
 
     def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
-        directory = self.fixture.temporary / 'brain'
+        directory = self.fixture.temporary / 'planner'
         directory.mkdir()
         missing_producer = self.fixture.temporary / 'current.md'
         missing_production = self.fixture.temporary / 'production-missing.md'
-        _ = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
-        _ = fixture_member('producer', name='morty', doc=staff.LiveDoc(local_machine(), missing_producer))
+        _ = fixture_member('producer', name='planner', doc=staff.LiveDoc(local_machine(), directory))
+        _ = fixture_member('producer', name='keeper', doc=staff.LiveDoc(local_machine(), missing_producer))
         _ = fixture_member('showrunner', name='missing', doc=staff.LiveDoc(local_machine(), missing_production))
 
         snapshot = review_page.build_snapshot(self.root)
@@ -4653,7 +4653,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
 
     def test_recovery_alerts_the_showrunner_after_a_failed_send_and_completion_write(self) -> None:
-        producer = fixture_member("producer", name="bob")
+        producer = fixture_member("producer", name="editor")
         _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=page-owner\n")
         question = self.file_sent_question(producer.id)
         open_record = investigation.file(producer.id, "Why did the gate stop?", "Read the gate log.",

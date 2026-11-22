@@ -42,10 +42,11 @@ def _take(name: str, caller: str, pane: str, client: herdr.Herdr, model: str, ef
     if isinstance(account, accounts.NamedAccount) and account.dir.resolve() != home.path.resolve():
         raise ValueError(f"{name} runs on {account.label}; first run: agents move {native} {account.label}")
     folder = Path(entry["cwd"])
+    producer_id = staff.native_id(row.id)
     if model:
-        settings = models_registry.producer_settings(name, kind, model, effort)
+        settings = models_registry.producer_settings(producer_id, kind, model, effort)
     else:
-        settings = models_registry.launch_settings("producers", name)
+        settings = models_registry.launch_settings("producers", producer_id)
         if settings.kind != kind:
             raise ValueError(f"{name} uses {settings.kind}; give --model and --effort for {kind}")
     if row.current_session != caller:
@@ -58,7 +59,7 @@ def _take(name: str, caller: str, pane: str, client: herdr.Herdr, model: str, ef
             if not client.close_retained_pane(old):
                 raise ValueError(f"{name}: the old pane {old} did not close")
     if model:
-        _ = models_registry.store_producer(name, kind, model, effort)
+        _ = models_registry.store_producer(producer_id, kind, model, effort)
         # The stored row replaces a launch configuration that this process inherited.
         _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
     row = staff.transfer_producer(row.id, native, home, staff.PresentWorktree(remote.local_machine(), folder))

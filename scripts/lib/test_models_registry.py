@@ -25,6 +25,11 @@ from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+PRODUCER_ID = "3420906d-183a-4f32-b328-e72c74dd4ca9"
+SECOND_PRODUCER_ID = "3420906d-183a-4f32-b328-e72c74dd4caa"
+THIRD_PRODUCER_ID = "3420906d-183a-4f32-b328-e72c74dd4cab"
+
+
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
 
@@ -409,14 +414,14 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
 
 class RegistryRowReplayTests(unittest.TestCase):
     def test_replay_places_new_rows_and_edits_existing_rows_in_place(self) -> None:
-        edit = registry_rows.RowChange("producers", "bob", "bob=claude:fable:high")
+        edit = registry_rows.RowChange("producers", "fixture_builder", "fixture_builder=claude:fable:high")
         for case, keys, tail in (
             ("before another section",
-             "morty=claude:fable:high\ndwight=claude:fable:high\n", "\n# Directors\n[production.claude]\n"),
+             "fixture_keeper=claude:fable:high\ndwight=claude:fable:high\n", "\n# Directors\n[production.claude]\n"),
             ("without keys",
              "", "# No producers\n\n[production.claude]\n"),
             ("at the end",
-             "dwight=claude:fable:high\n", "\n# End of registry\n"),
+             "fixture_planner=claude:fable:high\n", "\n# End of registry\n"),
         ):
             with self.subTest(case=case):
                 prefix = f"[producers]\n{keys}"
@@ -424,13 +429,13 @@ class RegistryRowReplayTests(unittest.TestCase):
                                  f"{prefix}{edit.replacement}\n{tail}")
 
         prefix = "[producers]\nmorty=claude:fable:high\n\n[assignments]\nproduction=claude\n\n[producers]\n"
-        last_key = "dwight=claude:fable:high\n"
+        last_key = "fixture_planner=claude:fable:high\n"
         suffix = "\n# Directors\n[production.claude]\n"
         for case, change, expected in (
             ("new row in a repeated section", edit, f"{last_key}{edit.replacement}\n"),
             ("replace a key in the second block",
-             registry_rows.RowChange("producers", "dwight", "dwight=claude:opus:high"), "dwight=claude:opus:high\n"),
-            ("delete a key in the second block", registry_rows.RowChange("producers", "dwight", ""), ""),
+             registry_rows.RowChange("producers", "fixture_planner", "fixture_planner=claude:opus:high"), "fixture_planner=claude:opus:high\n"),
+            ("delete a key in the second block", registry_rows.RowChange("producers", "fixture_planner", ""), ""),
         ):
             with self.subTest(case=case):
                 self.assertEqual(registry_rows.replay(prefix + last_key + suffix, [change], False),
@@ -475,6 +480,13 @@ class LaunchSettingsTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, f"{self.path}: producer_defaults.model: [^\n]+$"):
                         _ = models_registry.producer_defaults()
 
+    def test_producer_profile_requires_the_staff_id(self) -> None:
+        identity = "3420906d-183a-4f32-b328-e72c74dd4ca9"
+        _ = write_registry(self.path, {"producers": {identity: "codex:gpt-test:high"}})
+        self.assertEqual(models_registry.producer_profile(identity).value(), "codex:gpt-test:high")
+        with self.assertRaisesRegex(ValueError, "canonical producer staff ID"):
+            _ = models_registry.producer_profile("fixture-producer")
+
     def test_launch_settings_match_shell_role_resolution_and_tier_precedence(self) -> None:
         from scripts.lib import models_registry
 
@@ -484,8 +496,8 @@ class LaunchSettingsTests(unittest.TestCase):
             for section, keys, reference_section in (
                 ("direct", ("impl", "review"), "direct"),
                 ("design_roles", ("designer",), "design_roles"),
-                ("producers", ("morty",), "producers"),
-                ("producers", ("producer_only",), "direct"),
+                ("producers", (PRODUCER_ID,), "producers"),
+                ("producers", (THIRD_PRODUCER_ID,), "direct"),
             ):
                 for key in keys:
                     reference_key = key if reference_section == section else "impl"
@@ -529,8 +541,8 @@ class LaunchSettingsTests(unittest.TestCase):
 
         _ = write_registry(self.path, {
             "assignments": {"producers": "claude"},
-            "producers.claude": {"dwight": "fable:max"},
-            "producers": {"dwight": "claude:fable:max"},
+            "producers.claude": {PRODUCER_ID: "fable:max"},
+            "producers": {PRODUCER_ID: "claude:fable:max"},
         })
         text = self.path.read_text()
         _ = cast(object, self.enterContext(patch.dict(os.environ, claude_catalog_environment(
@@ -544,7 +556,7 @@ class LaunchSettingsTests(unittest.TestCase):
         for comment_length, section, key, expected_model in (
             (0, "direct", "impl", "gpt-test"),
             (70_000, "direct", "impl", "gpt-test"),
-            (0, "producers", "dwight", "fable"),
+            (0, "producers", PRODUCER_ID, "fable"),
         ):
             with self.subTest(comment_length=comment_length, section=section, key=key):
                 _ = self.path.write_text("#" + "x" * comment_length + "\n" + text)
@@ -564,14 +576,14 @@ class LaunchSettingsTests(unittest.TestCase):
             ("direct", "impl", {"direct.codex": {"impl": None}}),
             ("direct", "impl", {"assignments": {"direct": "unknown-family"}}),
             ("direct", "impl", {"direct.options": {"codex_service_tier": "unknown-tier"}}),
-            ("producers", "morty", {"producers": {"morty": "codex:missing-agent:high"}}),
-            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:invalid-effort"}}),
-            ("producers", "morty", {"producers": {"morty": None}}),
-            ("producers", "morty", {"producers": {"morty": "unknown-family:gpt-test:high"}}),
-            ("producers", "morty", {"producers": {"morty": "codex:gpt-test"}}),
-            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:"}}),
-            ("producers", "morty", {"producers": {"morty": "codex::high"}}),
-            ("producers", "morty", {"producers": {"morty": "codex:gpt-test:high:extra"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex:missing-agent:high"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex:gpt-test:invalid-effort"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: None}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "unknown-family:gpt-test:high"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex:gpt-test"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex:gpt-test:"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex::high"}}),
+            ("producers", PRODUCER_ID, {"producers": {PRODUCER_ID: "codex:gpt-test:high:extra"}}),
         )
         for section, key, rows in cases:
             with self.subTest(section=section, key=key, rows=rows):
@@ -582,25 +594,25 @@ class LaunchSettingsTests(unittest.TestCase):
     def test_a_producer_row_is_validated_before_the_write_and_an_equal_row_changes_nothing(self) -> None:
         from scripts.lib import models_registry
 
-        _ = write_registry(self.path, {"producers": {"morty": "codex:gpt-test:high", "brain": "codex:gpt-test:medium"}})
+        _ = write_registry(self.path, {"producers": {PRODUCER_ID: "codex:gpt-test:high", SECOND_PRODUCER_ID: "codex:gpt-test:medium"}})
         unchanged = self.path.read_bytes()
-        checked = models_registry.producer_settings("morty", "claude", "sonnet", "max")
+        checked = models_registry.producer_settings(PRODUCER_ID, "claude", "sonnet", "max")
         self.assertEqual(self.path.read_bytes(), unchanged)
-        stored = models_registry.store_producer("morty", "claude", "sonnet", "max")
+        stored = models_registry.store_producer(PRODUCER_ID, "claude", "sonnet", "max")
         self.assertEqual(stored, checked)
         self.assertEqual((stored.kind, stored.model, stored.effort), ("claude", "sonnet", "max"))
-        self.assertEqual(models_registry.launch_settings("producers", "morty"), stored)
+        self.assertEqual(models_registry.launch_settings("producers", PRODUCER_ID), stored)
         self.assertEqual(models_registry.parse_registry(self.path.read_text())["producers"],
-                         {"morty": "claude:sonnet:max", "brain": "codex:gpt-test:medium"})
+                         {PRODUCER_ID: "claude:sonnet:max", SECOND_PRODUCER_ID: "codex:gpt-test:medium"})
         before = self.path.read_bytes(), self.path.stat().st_mtime_ns
-        self.assertEqual(models_registry.store_producer("morty", "claude", "sonnet", "max"), stored)
+        self.assertEqual(models_registry.store_producer(PRODUCER_ID, "claude", "sonnet", "max"), stored)
         for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "sonnet", "invalid-effort"),
                                       ("unknown-family", "sonnet", "max"), ("claude", "sonnet", "")):
             with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
-                _ = models_registry.store_producer("morty", family, model, effort)
+                _ = models_registry.store_producer(PRODUCER_ID, family, model, effort)
         self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
-        added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
-        self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
+        added = models_registry.store_producer(THIRD_PRODUCER_ID, "codex", "gpt-test", "high")
+        self.assertEqual(models_registry.launch_settings("producers", THIRD_PRODUCER_ID), added)
 
 
 @final

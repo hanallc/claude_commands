@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 from scripts.lib.session_paths import sessions_directory
 from scripts.message import sessions
-from scripts.production import showrunners, staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import showrunners
+from scripts.production.staff_test_support import fixture_member, fixture_rename_producer, isolated_staff_file
 
 
 class SessionPathTests(unittest.TestCase):
@@ -29,7 +29,7 @@ class SessionPathTests(unittest.TestCase):
                 with patch.dict(os.environ, {"HOME": str(home), "NOTIFIER_SESSIONS_DIR": ""}):
                     self.assertEqual(sessions_directory(), registry)
                     self.assertEqual(sessions.sessions_dir(), registry)
-                    _ = staff.rename(owner.id, name)
+                    owner = fixture_rename_producer(owner, name)
                     self.assertEqual(showrunners.session_name(owner.current_session), name)
             for name in ("override-one", "override-two"):
                 registry = root / name
@@ -38,5 +38,5 @@ class SessionPathTests(unittest.TestCase):
                     json.dumps({"sessionId": owner.current_session, "name": "stale registry label"}))
                 with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}):
                     self.assertEqual(sessions.sessions_dir(), registry)
-                    _ = staff.rename(owner.id, name)
+                    owner = fixture_rename_producer(owner, name)
                     self.assertEqual(showrunners.session_name(owner.current_session), name)

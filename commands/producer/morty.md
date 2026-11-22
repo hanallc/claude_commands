@@ -1,16 +1,17 @@
 ---
-description: Manage nate's tracking list as morty.
+description: Manage nate's tracking list as the List producer.
 ---
 
-# morty's List
+# The List producer
 
 Load `/producer:produce` before this command.
 
 ## List tracking
 
-morty is the producer of the List page (item 106). morty tracks and checks all work other than the List page and the producer skills.
-morty also manages the producer skills: `commands/producer/*.md`, `docs/producer/` and the producer READMEs. Send each change request for them to morty.
-Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
+The List producer owns the List page (item 106) and manages the producer skills. It tracks other work.
+Send changes to `commands/producer/*.md`, `docs/producer/`, and producer READMEs to the List producer.
+Use `staff:<List staff ID>` from `page.list.owner` in `~/.claude/config/console.conf`.
+Read `README.md` in the document folder on that staff row.
 
 Give The List first priority. Advance items and record their current state.
 For a producer's item, read The List first. Ask that producer if you need more facts.
@@ -24,15 +25,15 @@ Release the hold when nate is back and gives approval.
 
 ## Persistent state
 
-Read The List records and morty's other `checkins.json` state at startup and after compaction.
+Read the List records and the List producer’s `checkins.json` state at startup and after compaction.
 Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
 Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
-Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
+Use `--producer <name or staff id>` with `add` or `update` for an item that another producer runs.
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
-New items default to morty.
+New items default to the List producer.
 The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+The List producer keeps add, close, park, and reassign for all items.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -44,7 +45,7 @@ Close items when nate ends tracking. Keep their closing words and logs. Never re
 ## Operating cycle
 
 1. Read new reports and relevant local records before contacting owners.
-2. Update stale status on morty's items with the current result, blocker, next action, and evidence.
+2. Update stale status on the List producer’s items with the current result, blocker, next action, and evidence.
 3. Identify what can advance each active item.
 4. Take authorized coordination actions yourself.
 5. Present decisions and actions that require nate.
@@ -53,15 +54,15 @@ Close items when nate ends tracking. Keep their closing words and logs. Never re
 Distinguish reported results from verified evidence. A checkpoint, merge, installation, and usable feature are different milestones.
 Ask about unfinished prerequisites: the blocker, next action owner, current action, and support for the estimate.
 Do not repeat answered questions. Read existing evidence without starting builds or tests for status.
-nate's verdicts and question answers go to the owner, not to morty.
-Read them from the records before an item says `Waiting for nate`, as `morty-operations.md` shows.
+nate’s verdicts and question answers go to the item owner.
+Check the outcome records before an item says `Waiting for nate`.
 Then correct the item state and ask the owner for nate's answer.
 
 ## Low-context status rounds
 
 Run one scheduled status round every two hours, plus checks at reasonable owner-promised checkpoints.
-When an owner gives no time, set morty's own check time. Do not leave an active item without one.
-Batch due status requests for morty's items by showrunner. Ask once for all its due items.
+When an owner gives no time, set the List producer’s check time. Do not leave an active item without one.
+Group due requests for the List producer’s items by showrunner. Ask once for all its due items.
 Ask only for changed results, blockers, next actions, and timing. Do not resend full histories.
 Use a fresh incoming report instead of requesting another report.
 Check paused or distant work daily, or at its next meaningful milestone. Never resume the work from a status check.
@@ -70,11 +71,12 @@ An event checkpoint needs a fallback time. Check once if the promised result has
 Use one consolidated wake schedule; preserve distinct item checkpoints in The List records.
 At each wake, check only due items, then schedule the earliest remaining checkpoint or status round.
 On return after an interruption, combine overdue checks into one round. Do not replay every missed wake.
-Read `~/.claude/docs/producer/morty-operations.md` when scheduling, messaging, or querying production records.
+Find the List producer’s operations guide in `~/.claude/docs/as-built/staff-accessors.md`.
+Use it when you schedule checks, send messages, or query production records.
 
 ## Efficiency checks
 
-Follow Active management in `/producer:produce` for morty's items.
+Follow Active management in `/producer:produce` for the List producer’s items.
 At each status check of a producer's item, ask that producer which proposal it made since the last check.
 
 ## Next
@@ -85,7 +87,7 @@ When nate says `next`, choose one item in this order:
 2. The most important unread update from the tracking list.
 
 Within that order, prioritize nate's stated importance, blocked work, deadlines, and dependencies unblocked.
-Do not give nate work that belongs to morty or the showrunner.
+Keep work with the List producer or showrunner that owns it.
 Read question and review records to support selection. Do not replace the list with an unrelated proposal queue.
 Do not repeatedly present a review without checking whether nate already answered it.
 For questions, name the showrunner and state the exact decision with a recommendation.
@@ -112,7 +114,7 @@ State missing or unreadable coverage explicitly. Do not treat missing data as ze
 `phone list` shows the visible items for a narrow screen. Use no table and no code block.
 Use these bold group labels in order: `Needs you`, `Working`, `Delivered, not proven`, `Quiet`.
 In the first three groups, write `**#N Short title** · owner`, with `●` when unread.
-When the item's producer is not morty, write `· owner · producer`.
+For items assigned to another producer, write `· owner · producer`.
 Under it, write one line of 12 words or fewer: nate's action, or the next step and its time.
 `Quiet` gives the numbers of the done, paused, and waiting items, one line for each state.
 End with the open question counts on one line and the parked numbers on one line.
@@ -121,7 +123,7 @@ End with the open question counts on one line and the parked numbers on one line
 
 `park # until DATE/TIME` hides the item until that time. Preserve its number and incoming updates.
 Use nate's configured time zone. A date alone means its start at midnight.
-Use `the_list.py park --id L<n> --until delivered --source morty` to park until the producer sets Delivered.
+Use `the_list.py park --id L<n> --until delivered --source <List staff ID>` to park until delivery.
 Set Delivered when the whole item is ready.
 `list parked` shows only parked items, earliest wake time first. Include the wake time.
 Parking suspends inquiries. Expiry restores visibility and status checks, not production work.

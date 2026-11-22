@@ -1,4 +1,4 @@
-"""Keep The List as numbered records under morty's fixed staff ID."""
+"""Keep List records under the configured producer staff ID."""
 from __future__ import annotations
 
 try:
@@ -23,8 +23,10 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
+from scripts.message import morty_identity as list_identity
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
@@ -47,7 +49,10 @@ class ItemState(StrEnum):
 
 class RequestedBy(StrEnum):
     NATE = "nate"
-    DWIGHT = "dwight"
+    LEGACY_PRODUCER = "dwight"
+
+
+type ListRequester = RequestedBy | staff.StaffId
 
 
 @dataclass(frozen=True)
@@ -220,7 +225,7 @@ class ListItem:
     parked_until: Parking
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
-    requested_by: RequestedBy
+    requested_by: ListRequester
     opened: Timestamp
     updated: Timestamp
     closed: Timestamp
@@ -297,7 +302,7 @@ class ItemChanges(TypedDict, total=False):
     eta: Eta
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
-    requested_by: RequestedBy
+    requested_by: ListRequester
     next_step: str
     latest_status: str
     evidence: str
@@ -599,10 +604,18 @@ def _item_state(value: str) -> ItemState:
     return ItemState(value)
 
 
-def _requester(value: str) -> RequestedBy:
-    if value not in RequestedBy:
-        raise ListError("invalid requester")
-    return RequestedBy(value)
+def _requester(value: str) -> ListRequester:
+    if value in RequestedBy:
+        return RequestedBy(value)
+    try:
+        return staff.native_id(value)
+    except staff.StaffRefused as error:
+        raise ListError("invalid requester") from error
+
+
+def _new_requester(value: ListRequester) -> None:
+    if value == RequestedBy.LEGACY_PRODUCER:
+        raise ListError("use a staff ID for the requester")
 
 
 def _validate_unit(value: str) -> None:
@@ -1068,7 +1081,7 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "unread_since": _time_text(item.unread_since), "parked_until": _parking_text(item.parked_until),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
               "related_to": json.dumps(item.related_to), "reviews": json.dumps(item.reviews),
-              "requested_by": item.requested_by.value,
+              "requested_by": item.requested_by,
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     if item.questions:
@@ -1191,7 +1204,7 @@ class _CreationDefaults(TypedDict):
     parked_until: Parking
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
-    requested_by: RequestedBy
+    requested_by: ListRequester
     closing_words: str
     next_step: str
     latest_status: str
@@ -1208,9 +1221,10 @@ _CREATION_DEFAULTS: _CreationDefaults = {
 
 def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
-        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
+        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: ListRequester = _CREATION_DEFAULTS["requested_by"],
         ) -> ListItem:
     """Create an item without reusing an existing record number."""
+    _new_requester(changes.get("requested_by", requested_by))
     store = _store(keeper)
     with store.locked():
         chosen = store.next_number() if isinstance(number, NextNumber) else number
@@ -1415,6 +1429,8 @@ def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
 
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str, add_evidence: str = "",
             assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED) -> ListEdit:
+    if "requested_by" in changes:
+        _new_requester(changes["requested_by"])
     scope: staff.StaffId | AllItems = AllItems.INCLUDED
     if assigned_to is not AllItems.INCLUDED:
         _check_producer_update_fields(changes)
@@ -1422,7 +1438,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
             raise ListError("the assigned producer has no producer staff row")
         if isinstance(assigned_to.retirement, staff.RetiredProducer):
             raise ListError(f"{assigned_to.name}: retired producer. Choose an active producer.")
-        source = assigned_to.name
+        source = assigned_to.id
         scope = assigned_to.id
 
     def edit(item: ListItem, _: datetime) -> ListItem:
@@ -1761,7 +1777,7 @@ class _ListQuestionStore:
             questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
                               for question in current.questions)
             moment = now()
-            entry = ItemChange(moment, QuestionAnswered(question_id), "morty")
+            entry = ItemChange(moment, QuestionAnswered(question_id), self.keeper)
             changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
             try:
                 _save(store, changed)
@@ -1809,7 +1825,7 @@ def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
     """Save the request identity, words, and pending state in one locked write."""
     if not feedback.words.strip() or feedback.state != "pending":
-        raise ListError("enter a new request and words for morty")
+        raise ListError("enter a new request and words for the List producer")
     store = _store(keeper)
     with store.locked():
         item = load(keeper, identity)
@@ -1857,7 +1873,7 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
             feedback_claims.remove(claim)
 
 
-def sent_to_morty(item: ListItem) -> Timestamp:
+def sent_to_list_producer(item: ListItem) -> Timestamp:
     """Keep the sent notice until the next writer adds a log entry."""
     for entry in reversed(item.log):
         if entry.source != PAGE_SOURCE:
@@ -1949,7 +1965,14 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
     if isinstance(eta, str):
         changes["eta"] = _cli_eta(eta)
     if isinstance(requested, str):
-        changes["requested_by"] = RequestedBy(requested)
+        if requested == RequestedBy.NATE:
+            changes["requested_by"] = RequestedBy.NATE
+        else:
+            identity = staff.configured_staff_id(conf.read_or_repository("staff"), "list_requester_producer_id")
+            name = staff.producer_name(identity, members=members) if identity is not None else None
+            if identity is None or name is None or requested not in (identity, name):
+                raise ListError("requester must be nate or the configured requester producer")
+            changes["requested_by"] = identity
     blocked_by, related_to = options.get("blocked_by"), options.get("related_to")
     if isinstance(blocked_by, list):
         dependencies: list[ItemDependency] = []
@@ -1962,9 +1985,8 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
     return changes
 
 
-def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
-    command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
-                                     "--from", "morty", "--text", text)
+def _send_assignment_notice(recipient: staff.StaffRow, sender: str, text: str) -> None:
+    command = session_send.send_argv("--to", f"staff:{recipient.id}", "--from", sender, "--text", text)
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True):
         return
@@ -1978,6 +2000,9 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
         members = staff.snapshot()
     except (ValueError, staff.StaffRefused, OSError) as error:
         raise ListError(f"{item.id} was saved. The producer and showrunner notices were not sent. {error}") from error
+    sender = staff.producer_name(keeper, members=members)
+    if sender is None:
+        raise ListError(f"{item.id} was saved. The List producer is unavailable for the notices.")
     producer = next((row for row in staff.active(members, "producer") if row.id == item.producer), None)
     owner = next((row for row in staff.active(members, "showrunner") if row.id == item.owner), None)
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
@@ -2001,7 +2026,7 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
                 if isinstance(reference, UnassignedOwner):
                     raise ListError("the item has no assigned showrunner")
                 raise ListError("the owner has no current showrunner staff row")
-            _send_assignment_notice(recipient, message)
+            _send_assignment_notice(recipient, sender, message)
         except (ListError, OSError, subprocess.SubprocessError, UnicodeError) as error:
             details = " ".join(str(error).splitlines())
             print(f"the_list: {item.id} was saved. The {role} notice to {reference} failed. {details}", file=sys.stderr)
@@ -2033,7 +2058,7 @@ def main(argv: list[str] | None = None) -> int:
             for key in ("unit", "next-check", "eta", "next-step", "latest-status", "evidence", "add-evidence", "done-when"):
                 _ = command.add_argument("--" + key)
             _ = command.add_argument("--state", choices=[state.value for state in ItemState if state != ItemState.CLOSED])
-            _ = command.add_argument("--requested-by", choices=list(RequestedBy))
+            _ = command.add_argument("--requested-by", help="nate or the configured requester producer name or staff ID")
             _ = command.add_argument("--blocked-by", nargs="*")
             _ = command.add_argument("--related-to", nargs="*")
         if name == "add":
@@ -2063,7 +2088,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session has no staff row")
         if caller.kind != "producer":
             raise ListError("the current session must be a producer")
-        keeper = producer_id(record, "morty")
+        list_producer = list_identity.list_producer(record)
+        if list_producer is None:
+            raise ListError("the List producer is unavailable")
+        keeper = list_producer.id
+        if source is not None:
+            source = next((row.id for row in record.find(kind="producer") if row.name == source), source)
         assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
         if name == "list":
             include_closed = cast(bool, args.all)
@@ -2091,13 +2121,13 @@ def main(argv: list[str] | None = None) -> int:
                             add_evidence=add_evidence or "", assigned_to=caller)
                 return 0
             if source is None:
-                parser.error("update requires --source for morty")
+                parser.error("update requires --source for the List producer")
             changed = _update(keeper, identity, _cli_changes(args, record), source=source, add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
         if assigned_to is not AllItems.INCLUDED:
-            raise ListError(f"only morty can run {name}")
+            raise ListError(f"only the List producer can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
             result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))

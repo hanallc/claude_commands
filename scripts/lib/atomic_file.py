@@ -28,6 +28,13 @@ def sync_folder(folder: Path) -> None:
         os.close(descriptor)
 
 
+def sync_folder_ancestry(folder: Path) -> None:
+    """Persist directory entries even if a previous attempt created them."""
+    resolved = folder.resolve(strict=True)
+    for parent in resolved.parents:
+        sync_folder(parent)
+
+
 def remove_dead_temporary_files(path: Path) -> None:
     """Remove sibling temporary files whose writing process has ended."""
     for sibling in path.parent.iterdir():

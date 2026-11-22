@@ -29,7 +29,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
@@ -261,9 +261,16 @@ with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.curr
 
 def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
     """Seed an old unit name in the private staff file."""
+    if row.kind != "unit":
+        raise AssertionError("A saved unit name requires a unit.")
+    return fixture_legacy_staff_name(row, name)
+
+
+def fixture_legacy_staff_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Seed an old name in the private staff file."""
     configured = os.environ.get("STAFF_FILE") or os.environ.get("STAFF_TEST_OWNER_FILE")
-    if row.kind != "unit" or not configured:
-        raise AssertionError("A saved unit name requires a private staff fixture.")
+    if not configured:
+        raise AssertionError("A saved name requires a private staff fixture.")
     path = Path(configured).resolve()
     temporary_roots = (Path(tempfile.gettempdir()), Path("/tmp"))
     if path != _PRIVATE_STAFF_FILE.get() and not any(path.is_relative_to(root.resolve()) for root in temporary_roots):
@@ -275,6 +282,18 @@ def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
         fields["name"] = name
         write_text_atomic(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
     return replace(row, name=name)
+
+
+def fixture_rename_producer(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Rename a test producer without moving its folder."""
+    plan = staff.ProducerRename(uuid4().hex, row, replace(row, name=name))
+    with mock.patch.object(staff, "producer_creation_registry",
+                           return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+        staff.reserve_producer_rename(plan)
+    try:
+        return staff.rename(row.id, name, operation=plan.operation)
+    finally:
+        staff.release_producer_rename(plan.operation)
 
 
 def fixture_member(kind: staff.Kind, *, name: str,

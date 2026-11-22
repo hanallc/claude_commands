@@ -164,7 +164,7 @@ def seed_rebuild_cache(home: Path, configuration: Path, row: str = "", *, cache:
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
 UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), unit_type=staff.UnitDetails("direct"))
 WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
-PRODUCER = staff.StaffRow(staff.StaffId("01a18dbb-0000-7000-8000-00000000c0de"), "producer", "morty", staff.StaffRoot(), current_session=staff.StaffId("c27e8199-0000-4000-8000-0000000c1a0d"))
+PRODUCER = staff.StaffRow(staff.StaffId("01a18dbb-0000-7000-8000-00000000c0de"), "producer", "fixture_keeper", staff.StaffRoot(), current_session=staff.StaffId("c27e8199-0000-4000-8000-0000000c1a0d"))
 
 
 def staff_text(*rows: staff.StaffRow) -> str:
@@ -1063,7 +1063,7 @@ class RoleTests(ConfiguredShellTests):
         (self.home / ".git").mkdir()
         _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
         for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"),
-                                  (PRODUCER.current_session, "morty the producer"), ("unknown", "unassigned")):
+                                  (PRODUCER.current_session, "fixture_keeper the producer"), ("unknown", "unassigned")):
             for shell in SHELLS:
                 with self.subTest(session_id=session_id, shell=shell):
                     self.assertEqual(self.first_line(session_id, shell=shell), f"{label} | ~")
@@ -1397,7 +1397,7 @@ class CountsRowTests(ConfiguredShellTests):
                          + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
 
     def test_a_producer_session_counts_its_own_questions_without_a_timer(self) -> None:
-        producer = staff.StaffRow(staff.StaffId("dd65ec85-c812-4a59-bfa1-2a8c31b8f510"), "producer", "dwight",
+        producer = staff.StaffRow(staff.StaffId("dd65ec85-c812-4a59-bfa1-2a8c31b8f510"), "producer", "fixture_planner",
                                   staff.StaffRoot(), current_session=staff.StaffId("9616a9a0-bb22-486c-89fd-514d3d7e0804"))
         record = self.home / ".local/state/staff/staff.json"
         _ = record.write_text(staff_text(producer))

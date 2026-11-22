@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import BinaryIO
@@ -13,6 +14,33 @@ from typing import BinaryIO
 
 def uncompressed_path(path: Path) -> Path:
     return path.with_suffix("") if path.suffix == ".zst" else path
+
+
+def claude_project_key(folder: Path | str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(folder))
+
+
+def prepare_claude_resume(home: Path, folder: Path, session: str) -> None:
+    """Restore the plain transcript in the project that Claude resumes."""
+    from scripts.lib.atomic_file import sync_folder
+
+    path = home / "projects" / claude_project_key(folder) / f"{session}.jsonl"
+    source = transcript_source(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"{path}: current Claude transcript is absent from its project")
+    if source == path:
+        return
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{session}.", suffix=".tmp") as temporary:
+        with open_transcript(source) as archived:
+            shutil.copyfileobj(archived, temporary)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        try:
+            os.link(temporary.name, path)
+        except FileExistsError:
+            if not path.is_file():
+                raise
+        sync_folder(path.parent)
 
 
 def config_dirs() -> list[Path]:

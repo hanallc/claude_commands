@@ -2,23 +2,33 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.lib.transcripts import config_dirs
+from scripts.lib.transcripts import claude_project_key, config_dirs
 
 
-def link_transcripts(old: Path, new: Path) -> None:
-    """Give the new start path access to each existing Claude transcript folder."""
-    old_name = re.sub(r"[^A-Za-z0-9]", "-", str(old))
-    new_name = re.sub(r"[^A-Za-z0-9]", "-", str(new))
+@dataclass(frozen=True)
+class TranscriptLink:
+    source: Path
+    destination: Path
+
+
+def transcript_links(old: Path, new: Path) -> tuple[TranscriptLink, ...]:
+    """Find the Claude transcript folders that need a link."""
+    old_name, new_name = claude_project_key(old), claude_project_key(new)
     if old_name == new_name:
-        return
-    for projects in sorted({(folder / "projects").resolve() for folder in config_dirs()}):
-        source, destination = projects / old_name, projects / new_name
+        return ()
+    roots = sorted({(folder / "projects").resolve() for folder in config_dirs()})
+    return tuple(TranscriptLink(root / old_name, root / new_name) for root in roots if (root / old_name).is_dir())
+
+
+def link_transcripts(links: tuple[TranscriptLink, ...]) -> None:
+    """Give the new start path access to each existing Claude transcript folder."""
+    for link in links:
+        source, destination = link.source, link.destination
         if not source.is_dir():
             continue
         try:

@@ -11,13 +11,13 @@ The hierarchy connects the user's product choices to work in separate repository
 | Role | Responsibility | Contract |
 | --- | --- | --- |
 | User, the executive producer | Decides product direction, scope changes, and irreversible actions. | [Decision criteria](../decision_criteria.md) |
-| Producer | Runs its own named job through shared producer management. | `commands/producer/produce.md`; morty also loads `commands/producer/morty.md` |
+| Producer | Runs its own named job through shared producer management. | `commands/producer/produce.md`; the List producer also loads its List skill |
 | Showrunner | Coordinates units, resolves dependencies, integrates checkpoints, and presents user decisions. | `commands/showrunner/produce.md` |
 | Unit director | Defines assignments, dispatches workers, checks results, and prepares checkpoints. | `commands/unit/direct.md` |
 | Worker | Changes or inspects its assigned files through a native Claude or Codex conversation. | [Worker lifecycle](long-lived-workers.md) |
 | Held designer or reviewer | Serves one design through a fixed staff identity and an explicit binding. | `scripts/astra/design_roles.py` |
 
-Morty, brain, and dwight have staff kind `producer` and no parent.
+Each producer has staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
 Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.

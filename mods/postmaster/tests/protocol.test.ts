@@ -74,13 +74,13 @@ describe("postmaster protocol validators", () => {
 
   test("reply logs require a nonempty list of nonempty sender names", () => {
     const log = { at_ms: 1000, socket: "uds:/test-sockets/recipient.sock", name: "Recipient",
-      session_id: "recipient", senders: ["Alice", "Bob"], body: "answer", targets: [] };
+      session_id: "recipient", senders: ["Alice", "Casey"], body: "answer", targets: [] };
     expect(isReplyLog(log)).toBe(true);
     for (const senders of [[], [""], ["Alice", ""], [17], "Alice", null]) {
       expect(isReplyLog({ ...log, senders })).toBe(false);
     }
     const { senders: _senders, ...rest } = log;
-    expect(isReplyLog({ ...rest, sender: "Alice, Bob" })).toBe(false);
+    expect(isReplyLog({ ...rest, sender: "Alice, Casey" })).toBe(false);
   });
 
   test("entry accepts the specified fields and preserves message text", () => {

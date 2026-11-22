@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.build_targets import target_config
+from scripts.production import staff
 
 
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
@@ -76,7 +77,7 @@ class SpendingSettings:
     cost_explorer_lookback_days: int
     cost_explorer_watch_days: int
     cost_explorer_unchanged_reads: int
-    cost_explorer_change_recipient: str
+    cost_explorer_change_recipient_id: staff.StaffId
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
@@ -110,6 +111,16 @@ def _live(settings: conf.ConfigRead, key: str, convert: Callable[[str], T]) -> T
     if not isinstance(result, conf.UsableLiveValue):
         raise ValueError(f'{key}: {result.reason}; live input is unavailable')
     return result.value
+
+
+def cost_explorer_change_recipient_id(settings: conf.ConfigRead) -> staff.StaffId:
+    """Read the live staff ID for Cost Explorer notices."""
+    key = 'cost_explorer_change_recipient_id'
+    value = _live(settings, key, str)
+    try:
+        return staff.native_id(value)
+    except staff.StaffRefused as error:
+        raise ValueError(f'{key}: expected a canonical UUID') from error
 
 
 def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
@@ -169,13 +180,14 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     if watch_days < lookback_days:
         raise SpendingConfigurationUnavailable(
             'cost_explorer_watch_days must be at least cost_explorer_lookback_days', tuple(limits))
-    cost_explorer_change_recipient = live_text('cost_explorer_change_recipient').strip()
-    if not cost_explorer_change_recipient or cost_explorer_change_recipient.casefold() == 'user':
-        raise SpendingConfigurationUnavailable('cost_explorer_change_recipient must name a session', tuple(limits))
+    try:
+        recipient_id = cost_explorer_change_recipient_id(settings)
+    except ValueError as error:
+        raise SpendingConfigurationUnavailable(str(error), tuple(limits)) from error
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, lookback_days, watch_days, unchanged_reads, cost_explorer_change_recipient,
+                            explorer, lookback_days, watch_days, unchanged_reads, recipient_id,
                             live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
                             live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),

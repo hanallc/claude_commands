@@ -1046,20 +1046,24 @@ The sender prints each send outcome header to the journal.
 `build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
 It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
 The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
-The head must wait at least that long. At least one step must hold memory.
+The head must wait at least that long. A step must hold memory or a disk space hold must block local work.
 The last admission or step start with a memory need above zero must also be at least that old.
-Merge gates and targeted tests start with a memory need of zero.
+Gates and targeted tests start with a memory need of zero.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
-The watch sends one alert per stall to each of the `builds` and `bob` sessions.
+The watch sends one alert per stall to the Builds session and the producer in `head_stall_alert_producer_id`.
+If the producer ID is invalid or unavailable, the watch sends only to the Builds session.
 The alert names the head and lists each holder's time since admission, memory promise, and memory use.
 It adds a note when an incomplete sccache scan can make the use values too low.
+For a disk space hold, the alert gives the reason for the hold.
 The stall key is the most recent admission or step start with a memory need above zero.
 A head change keeps the same key. A new admission or step start ends the stall.
 The sender uses the stall key to keep one queued copy per recipient.
 The watch accepts `SENT`, `SKIPPED`, `QUEUED`, and `KEPT` as delivery outcomes.
-After each accepted send, the watch records the recipient and stall key in `~/.local/state/buildlog/head_stall.json`.
-An old shared key counts for `builds` only.
+The watch holds a lock while it reads receipts, sends alerts, and saves each accepted send in `~/.local/state/buildlog/head_stall.json`.
+A legacy shared receipt applies to `builds` only.
+A legacy producer receipt applies only to the rollout staff ID. A receipt for that staff ID takes precedence.
+The watch sends no alerts if it cannot read the receipts.
 If a state write fails, the watch continues to the next recipient and reports one write error after the sends.
 If the stall continues, the watch retries each unaccepted send the next minute.
 

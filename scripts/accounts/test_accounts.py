@@ -157,11 +157,13 @@ class AccountsConfigurationTests(unittest.TestCase):
                     with self.subTest(key=key):
                         self.assertEqual(len(kinds), 1)
                         kind = next(iter(kinds))
-                        self.assertIn(kind, ("whole", "number", "text"))
+                        self.assertIn(kind, ("whole", "number", "text", "words"))
                         if kind == "whole":
                             self.assertEqual(account_config.whole(key), int(configured[key]))
                         elif kind == "number":
                             self.assertEqual(account_config.number(key), float(configured[key]))
+                        elif kind == "words":
+                            self.assertEqual(account_config.words(key, allow_blank=True), tuple(configured[key].split()))
                         else:
                             self.assertEqual(account_config.text(key), configured[key])
 
@@ -685,7 +687,7 @@ class AccountsTests(unittest.TestCase):
         runner = fixture_member("showrunner", name="fixture-runner")
         membership = staff.StaffSnapshot((claude, codex, paused, stopped, remote_member, unmapped, runner))
         registry = write_registry(self.root / "producer-models.conf", {"producers": {
-            member.name: "claude:opus:max" if member == claude else "codex:gpt-test:high"
+            member.id: "claude:opus:max" if member == claude else "codex:gpt-test:high"
             for member in (claude, codex, paused, stopped, remote_member, unmapped)}})
         live = [sessions.SessionRecord(pid=990901 + index, sessionId=member.current_session,
             name=member.name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
@@ -732,8 +734,10 @@ class AccountsTests(unittest.TestCase):
 
         for label in ("claude2", "claude4"):
             self.login_directory(label, label + "@example.invalid")
+        claude = fixture_member("producer", name="producer-claude")
+        codex = fixture_member("producer", name="producer-codex")
         registry = write_registry(self.root / "producer-models.conf", {"producers": {
-            "producer-claude": "claude:opus:max", "producer-codex": "codex:gpt-test:high"}})
+            claude.id: "claude:opus:max", codex.id: "codex:gpt-test:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
         cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str, str], ...] = (
             ("unit", "units", "claude", "", ""), ("producer", "producers", "claude", "", ""),
@@ -773,8 +777,10 @@ class AccountsTests(unittest.TestCase):
                     messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
                 members = [member]
                 live = [owner]
+                invalid_id = ""
                 if missing_settings:
                     invalid = fixture_member("producer", name="missing-settings-producer")
+                    invalid_id = invalid.id
                     members.append(invalid)
                     if missing_settings == "live":
                         live.append(sessions.SessionRecord(pid=990902, sessionId=invalid.current_session, name=invalid.name,
@@ -800,7 +806,7 @@ class AccountsTests(unittest.TestCase):
                             unproved = accounts.move_group(group, "claude2", dry_run=True)
                 if missing_settings:
                     self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors.getvalue())
+                    self.assertIn(f"producers.{invalid_id}:", errors.getvalue())
                 else:
                     self.assertEqual(errors.getvalue(), "")
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
@@ -7918,6 +7924,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(self.home / ".codex2"),
                     doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
                     worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+                profiles: dict[str, str] = {producer.id: "codex:gpt-test:high"}
                 for name, paused, document_machine, worktree_machine in (
                         ("paused-producer", True, machine, machine),
                         ("remote-document-producer", False, remote.other_machine(), machine),
@@ -7925,17 +7932,15 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     excluded = fixture_member("producer", name=name,
                         doc=staff.LiveDoc(document_machine, self.root / name / "plan.md"),
                         worktree=staff.PresentWorktree(worktree_machine, self.root / name))
+                    profiles[excluded.id] = "codex:gpt-test:high"
                     if paused:
                         _ = staff.set_hold(str(excluded.id), staff.Paused("now", "user", "hold"))
-                _ = fixture_member("producer", name="claude-producer")
-                if missing_settings:
-                    _ = fixture_member("producer", name="missing-settings-producer",
-                        doc=staff.LiveDoc(machine, self.root / "missing-settings-producer/plan.md"),
-                        worktree=staff.PresentWorktree(machine, self.root / "missing-settings-producer"))
-                registry = write_registry(self.root / "producer-models.conf", {"producers": {
-                    "codex-producer": "codex:gpt-test:high", "claude-producer": "claude:opus:max",
-                    "paused-producer": "codex:gpt-test:high", "remote-document-producer": "codex:gpt-test:high",
-                    "remote-worktree-producer": "codex:gpt-test:high"}})
+                claude = fixture_member("producer", name="claude-producer")
+                profiles[claude.id] = "claude:opus:max"
+                missing = fixture_member("producer", name="missing-settings-producer",
+                    doc=staff.LiveDoc(machine, self.root / "missing-settings-producer/plan.md"),
+                    worktree=staff.PresentWorktree(machine, self.root / "missing-settings-producer")) if missing_settings else None
+                registry = write_registry(self.root / "producer-models.conf", {"producers": profiles})
                 _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
                 before = Path(os.environ["STAFF_FILE"]).read_bytes()
 
@@ -7953,10 +7958,10 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                       patch.object(stop_resume, "move_sessions", return_value=[stop_results.ResumePending(
                           producer.current_session, "codex1", "destination is not ready")]) as producer_move):
                     code, output, errors = self.run_cli("swap", "workers", "codex1")
-                if missing_settings:
+                if missing is not None:
                     self.assertEqual(code, 1)
                     self.assertEqual(len(errors.splitlines()), 1)
-                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors)
+                    self.assertIn(f"producers.{missing.id}:", errors)
                 else:
                     self.assertEqual((code, errors), (1, ""), errors)
                 self.assertEqual(agent_accounts.workers_home(), target)
@@ -7980,10 +7985,10 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                           failed.id, "preview refusal")) as preview,
                       patch.object(stop_resume, "move_sessions") as producer_move):
                     code, output, errors = self.run_cli("swap", "workers", "codex1", "--dry-run")
-                if missing_settings:
+                if missing is not None:
                     self.assertEqual(code, 0)
                     self.assertEqual(len(errors.splitlines()), 1)
-                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors)
+                    self.assertIn(f"producers.{missing.id}:", errors)
                 else:
                     self.assertEqual((code, errors), (0, ""))
                 self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in preview.call_args_list}, {failed.id, pending.id})
@@ -10445,7 +10450,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_staff_kind_uses_the_board_role_color_keys(self) -> None:
         from scripts.production import staff
 
-        row = staff.StaffRow(staff.StaffId("producer"), "producer", "morty", staff.StaffRoot(), current_session=staff.StaffId("producer"))
+        row = staff.StaffRow(staff.StaffId("producer"), "producer", "fixture-producer", staff.StaffRoot(), current_session=staff.StaffId("producer"))
         self.assertEqual(accounts.staff_role_color(row, {"role.producer": "pink"}),
                          accounts.StaffRoleColor(accounts.ROLE_COLOR_KEYS["producers"], "#ff87af"))
         self.assertIsInstance(accounts.staff_role_color(row, {}), accounts.NoAccountColor)

@@ -47,7 +47,7 @@ Find, classify, remove and report a command's full footprint.
    If the caller requests a board post, post a summary of at most 900 characters.
    Put the full table in the reply.
    With `--dry-run`, state in the report that this is a dry run and nothing changed.
-   With `--dry-run`, stop after step 3: delete nothing, edit no file, run no test and send no morty notice.
+   With `--dry-run`, stop after step 3.
 
 4. **Remove.** Delete the `dedicated` parts and remove the `embedded` parts.
    Resolve shared dependencies before you delete their config.
@@ -64,11 +64,12 @@ Find, classify, remove and report a command's full footprint.
    Repeat every search from step 1.
    Confirm that only `history`, `shared` and `permission` hits remain.
 
-6. **Notify morty.** Send the notice after the removal commit exists.
-   Include the command name, removal statement, commit hash and removed support for morty's tracking list:
+6. Send the List producer a notice after the removal commit exists.
+   Read the List staff ID from `page.list.owner` in `~/.claude/config/console.conf`.
+   Replace `<List staff ID>` and the message placeholders.
 
    ```bash
-   python3 ~/.claude/scripts/message/send.py --to morty \
+   ~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to "staff:<List staff ID>" \
      --from "<session name>" \
      --text "/<command name> is removed. Commit: <hash>. Removed support: <one line>. Add the removal to your tracking list."
    ```

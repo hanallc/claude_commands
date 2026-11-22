@@ -32,9 +32,11 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
 from scripts.lib import build_folders, build_slots, cargo_output, conf, git_exclude, git_files, scratch
+from scripts.lib.transcripts import claude_project_key
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 from scripts.worktree import worktree_links, worktrees
 
 
@@ -2181,6 +2183,86 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertEqual(record.path, str(relocated))
             self.assertEqual(record.repo, str(new))
             self.assertFalse(worktrees.record_file(member).exists())
+
+    def test_migration_checks_the_producer_reservation_before_new_and_saved_moves(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        old = self.add_linked_tree(main, self.trees / "legacy-checkout", "fixture-branch")
+        new = self.trees / "origin/fixture-unit/edit"
+        list_file = self.root / "list"
+        _ = list_file.write_text(f"{old} fixture-unit edit\n")
+        registered = self.git(main, "worktree", "list", "--porcelain")
+        with patch.dict(os.environ, self.environment, clear=True), redirect_stdout(StringIO()):
+            machine = socket.gethostname().split(".", 1)[0]
+            location = staff.PresentWorktree(machine, self.root / "producer-checkout")
+            producer = fixture_member("producer", name="fixture-producer", worktree=location)
+            destination = staff.PresentWorktree(machine, new)
+            plan = staff.ProducerRename(uuid4().hex, producer,
+                                        replace(producer, name="fixture-renamed", worktree=destination),
+                                        (location.path, new))
+            with patch.object(staff, "producer_creation_registry", return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+                staff.reserve_producer_rename(plan)
+                with self.assertRaisesRegex(staff.StaffRefused, "has a producer rename reservation"):
+                    _ = worktrees.migrate_worktrees(list_file, dry_run=False)
+                self.assertFalse(worktrees.move_file(old).exists())
+                self.assertFalse(new.parent.exists())
+                staff.release_producer_rename(plan.operation)
+
+                with patch.object(worktrees, "_finish_worktree_move", side_effect=OSError("fixture interrupted after saving")):
+                    with self.assertRaisesRegex(OSError, "fixture interrupted after saving"):
+                        _ = worktrees.migrate_worktrees(list_file, dry_run=False)
+                journal = worktrees.move_file(old)
+                before = journal.read_bytes()
+                producer = staff.set_worktree(producer.id, staff.PresentWorktree(machine, old), expected=location)
+                staff.reserve_producer_rename(staff.ProducerRename(
+                    uuid4().hex, producer, replace(producer, name="fixture-renamed")))
+                with self.assertRaisesRegex(staff.StaffRefused, "has a producer rename reservation"):
+                    _ = worktrees.migrate_worktrees(list_file, dry_run=False)
+                self.assertEqual(journal.read_bytes(), before)
+                self.assertEqual(staff.by_id(producer.id), producer)
+            self.assertFalse(new.parent.exists())
+            self.assertFalse(old.is_symlink())
+            self.assertTrue((old / ".git").is_file())
+            self.assertEqual(self.git(main, "worktree", "list", "--porcelain"), registered)
+
+    def test_migration_refuses_a_reserved_claude_project(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        old = self.add_linked_tree(main, self.trees / "legacy-checkout", "fixture-branch")
+        new = self.trees / "origin/fixture-unit/edit"
+        producer_new = self.trees / "origin-fixture-unit-edit"
+        projects = Path(self.environment["CLAUDE_CONFIG_DIR"]) / "projects"
+        source_project = projects / claude_project_key(old)
+        destination_project = projects / claude_project_key(new)
+        self.assertEqual(destination_project.name, claude_project_key(producer_new))
+        source_project.mkdir(parents=True)
+        list_file = self.root / "list"
+        _ = list_file.write_text(f"{old} fixture-unit edit\n")
+        registered = self.git(main, "worktree", "list", "--porcelain")
+        with patch.dict(os.environ, self.environment, clear=True), redirect_stdout(StringIO()):
+            machine = socket.gethostname().split(".", 1)[0]
+            location = staff.PresentWorktree(machine, self.root / "producer-checkout")
+            producer = fixture_member("producer", name="fixture-producer", worktree=location)
+            destination = staff.PresentWorktree(machine, producer_new)
+            transcript = f"{producer.current_session}.jsonl"
+            producer_project = projects / claude_project_key(location.path)
+            producer_project.mkdir()
+            _ = (producer_project / transcript).write_text("history\n")
+            plan = staff.ProducerRename(uuid4().hex, producer,
+                                        replace(producer, name="fixture-renamed", worktree=destination),
+                                        (location.path, producer_new, producer_project / transcript,
+                                         destination_project / transcript))
+            with patch.object(staff, "producer_creation_registry", return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+                staff.reserve_producer_rename(plan)
+            with self.assertRaisesRegex(staff.StaffRefused, re.escape(str(destination_project))
+                                        + ": .*has a producer rename reservation"):
+                _ = worktrees.migrate_worktrees(list_file, dry_run=False)
+            self.assertFalse(worktrees.move_file(old).exists())
+            self.assertFalse(os.path.lexists(destination_project))
+            self.assertEqual(self.git(main, "worktree", "list", "--porcelain"), registered)
+            staff.release_producer_rename(plan.operation)
+            self.assertEqual(worktrees.migrate_worktrees(list_file, dry_run=False), 0)
+            self.assertEqual(destination_project.resolve(), source_project)
 
     def test_migration_moves_scratch_clone_and_repairs_its_linked_worktrees(self) -> None:
         self.layout_fixture()

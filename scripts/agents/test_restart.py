@@ -48,11 +48,12 @@ from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record, worker_lifecycle
-from scripts.lib import conf, file_lock, unit_runs, resume_message
+from scripts.lib import conf, file_lock, transcripts, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lib import models_registry
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import pass_record, progress_history
 from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
@@ -1299,9 +1300,11 @@ class RestartTests(RestartTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
-            "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
-            "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
-            "TEST-brain": "codex:gpt-test:high", "owner": "claude:opus:max"}})
+            fixture_runtime_id("row-0"): "claude:opus:max",
+            fixture_runtime_id("row-2"): "claude:opus:max",
+            fixture_runtime_id("probe-codex"): "codex:gpt-test:high",
+            fixture_runtime_id("probe-owner"): "claude:opus:max",
+            fixture_runtime_id("probe-other-codex"): "codex:gpt-test:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(configuration / "models.conf")})))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / ".claude2"
@@ -1314,14 +1317,14 @@ class RestartTests(RestartTestCase):
                                                      "CODEX_HOME": str(self.root / ".codex"),
                                                      "CLAUDE_CONFIG_DIR": str(config)})))
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
-        self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
+        self.rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(f"row-{n}")), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
             worktree=staff.PresentWorktree(remote.local_machine(), self.root),
             home=staff.SessionHome(config), unit_type=staff.UnitDetails("direct")) for n in range(3))
-        from scripts.production.staff_test_support import fixture_session
-
         for row in self.rows:
-            fixture_session(str(row.current_session), staff.ClaudeBackend())
+            for home in (config, self.root / ".claude3"):
+                transcript = home / "projects" / transcripts.claude_project_key(self.root) / f"{row.current_session}.jsonl"
+                write_text_atomic(transcript, "")
         self.running = {str(row.current_session) for row in self.rows}
         self.launches = []
         self.stops = []
@@ -1594,8 +1597,9 @@ class RestartTests(RestartTestCase):
             observed[owner.id] = worker.PaneWorkerStates([
                 worker_panes.OpenWorker(ready, f"pane-{index}", f"terminal-{index}", herdr.AgentStatus.WORKING),
                 waiting_state], [run])
-        bob = replace(self.rows[2], id=staff.StaffId("scale-bob"), name="bob", kind="producer", unit_type=staff.NotUnit())
-        rows.append(bob)
+        producer = replace(self.rows[2], id=staff.native_id(fixture_runtime_id("scale-producer")),
+                           name="fixture-producer", kind="producer", unit_type=staff.NotUnit())
+        rows.append(producer)
         self.rows = tuple(rows)
         record = staff.StaffSnapshot(tuple(rows))
         assert last_director is not None
@@ -1628,8 +1632,8 @@ class RestartTests(RestartTestCase):
 
         @contextmanager
         def locked_row(reference: str) -> Generator[None]:
-            if reference == bob.id:
-                raise staff.StaffRefused("Herdr upkeep still holds bob (pid 123)")
+            if reference == producer.id:
+                raise staff.StaffRefused(f"Herdr upkeep still holds {producer.name} (pid 123)")
             with row_operation(reference):
                 yield
 
@@ -1669,7 +1673,7 @@ class RestartTests(RestartTestCase):
                 self.assertEqual(Path(lines[0]).read_text(), output.getvalue())
                 self.assertEqual(errors.getvalue(), "")
                 self.assertIn("41 of 61 sessions " + ("back" if arguments == ["restart"] else "stopped"), lines[1])
-                self.assertIn("bob: Herdr upkeep still holds bob", lines[2])
+                self.assertIn(f"{producer.name}: Herdr upkeep still holds {producer.name}", lines[2])
                 self.assertIn("19 units need a step", lines[-1])
                 self.assertIn(f"Nate runs agents {' '.join(arguments)} again.", lines[-1])
                 for index in range(19):
@@ -3337,7 +3341,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_start_row_selects_the_workers_account_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
-        for row in (self.rows[0], replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="probe-codex")):
+        for row in (self.rows[0], replace(self.rows[0], id=staff.StaffId(fixture_runtime_id("probe-codex")),
+                              kind="producer", unit_type=staff.NotUnit(), name="probe-codex")):
             for saved in (False, True):
                 for requested in ("", "codex3"):
                     expected = requested or "codex1"
@@ -3438,7 +3443,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_a_claude_producer_starts_and_resumes_with_remote_control(self) -> None:
         row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
-        _kind, first = restart.producer_first_arguments(row.name)
+        settings = models_registry.launch_settings("producers", row.id)
+        _kind, first = restart.producer_first_arguments(row.name, settings)
         self.assertEqual(first[first.index("--remote-control") + 1], row.name)
         # A producer that started without the flag gets it at its next restart.
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root), {},
@@ -3448,6 +3454,47 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(kind, "claude")
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], row.name)
         self.assertFalse(entry["remote_control"])
+
+    def test_producer_native_resume_keeps_a_turn_from_the_moved_folder(self) -> None:
+        self.running.clear()
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                folder = self.root / f"moved-{kind}-producer"
+                folder.mkdir()
+                account = (accounts.NamedAccount("claude2", self.root / ".claude2") if kind == "claude"
+                           else accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
+                home = account.dir if isinstance(account, accounts.NamedAccount) else account.home
+                row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(),
+                              id=self.rows[0].id if kind == "claude" else staff.StaffId(fixture_runtime_id("probe-codex")),
+                              name="unit-0" if kind == "claude" else "probe-codex",
+                              worktree=staff.PresentWorktree(remote.local_machine(), folder), home=staff.SessionHome(home))
+                path = (home / "projects" / transcripts.claude_project_key(folder) / f"{row.current_session}.jsonl"
+                        if kind == "claude" else home / "sessions" / f"rollout-fixture-{row.current_session}.jsonl")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text("old turn\n")
+                if kind == "claude":
+                    _ = compressed_copy(path)
+
+                def prepare(_identity: str, cwd: str, environment: dict[str, str],
+                            _removals: frozenset[str]) -> herdr.PreparedAgentEnvironment:
+                    return herdr.PreparedAgentEnvironment(Path(cwd), environment)
+
+                def launch(_server: str, _target: object, prepared: herdr.PreparedAgentEnvironment,
+                           backend: str, arguments: list[str], *_args: object, **_kwargs: object) -> herdr.AgentLaunched:
+                    self.assertEqual((backend, prepared.directory), (kind, folder))
+                    resume_flag = "--resume" if kind == "claude" else "resume"
+                    self.assertEqual(arguments[arguments.index(resume_flag) + 1], row.current_session)
+                    self.assertEqual(path.read_text(), "old turn\n")
+                    with path.open("a") as stream:
+                        _ = stream.write("new turn\n")
+                    return herdr.AgentLaunched("w1:p0", herdr.PromptSubmissionNotRequired())
+
+                with (patch.object(member_account, "resume_account", return_value=account),
+                      patch.object(pane_record, "publication_for_session", return_value=None),
+                      patch.object(herdr, "prepare_session_environment", side_effect=prepare),
+                      patch.object(herdr, "launch_prepared_agent", side_effect=launch)):
+                    self.assertEqual(restart.start_row(row, staff.StaffSnapshot((row,)), herdr.Herdr("agents")), "w1:p0")
+                self.assertEqual(path.read_text(), "old turn\nnew turn\n")
 
     def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
         target = self.root / ".claude2"
@@ -3518,8 +3565,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         trust.assert_not_called()
         self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(target))
 
-    def test_dry_run_names_a_morty_producer_with_an_unproved_native_identity(self) -> None:
-        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="morty", worktree=staff.WORKTREE_UNFILLED)
+    def test_dry_run_names_a_fixture_keeper_producer_with_an_unproved_native_identity(self) -> None:
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="fixture_keeper", worktree=staff.WORKTREE_UNFILLED)
         self.rows = (row,)
         record = staff.StaffSnapshot(self.rows)
         entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
@@ -3528,11 +3575,11 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(herdr, "read_conversation", return_value=herdr.UnknownConversation("native identity unavailable")),
               patch.object(herdr.Herdr, "panes", return_value=[{
-                  "pane_id": "w1:p0", "workspace_id": "w1", "session_id": None, "label": "morty"}]),
+                  "pane_id": "w1:p0", "workspace_id": "w1", "session_id": None, "label": "fixture_keeper"}]),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
         self.assertEqual(output.getvalue().splitlines(), [
-            "morty: left alone; no proved local restart target"])
+            "fixture_keeper: left alone; no proved local restart target"])
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
@@ -3545,8 +3592,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
-            replace(self.rows[2], kind="producer", unit_type=staff.NotUnit(), name="morty", parent=staff.StaffRoot(),
-                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc(remote.local_machine(), self.root / "morty.md")))
+            replace(self.rows[2], kind="producer", unit_type=staff.NotUnit(), name="fixture_keeper", parent=staff.StaffRoot(),
+                    worktree=staff.WORKTREE_UNFILLED, doc=staff.LiveDoc(remote.local_machine(), self.root / "fixture_keeper.md")))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": str(self.rows[1].id), "seen": 1}]}]}
         shutdown_record.save([str(self.rows[2].id)])
@@ -3587,7 +3634,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                     "foreground_processes": [{"pid": 990090, "name": "zsh", "argv": ["zsh"]}]}}
             return self.layout_result(*arguments)
 
-        self.rows = (replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="morty"), *self.rows[1:])
+        self.rows = (replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="fixture_keeper"), *self.rows[1:])
         row = self.rows[0]
         older: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p2", "session_id": str(row.id),
             "config_dir": "/account", "cwd": str(self.root), "name": row.name, "model": "",
@@ -3731,7 +3778,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.running.clear()
         parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "production", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("parent-session"))
-        owner = staff.StaffRow(staff.StaffId("owner"), "producer", "owner", staff.ReportsTo(parent.id),
+        owner = staff.StaffRow(staff.StaffId(fixture_runtime_id("probe-owner")), "producer", "owner", staff.ReportsTo(parent.id),
                                current_session=staff.StaffId("owner-session"))
         row = replace(self.rows[0], parent=staff.ReportsTo(owner.id))
         record = staff.StaffSnapshot((parent, owner, row))
@@ -3754,7 +3801,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
         _ = write_config_fixture(settings, "OWN_PANE_SHELL_SECONDS=0.2\n")
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
-            "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
+            "tabs": [{"staff_id": self.rows[0].id, "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)))
         sibling_identity = str(self.rows[1].current_session)
@@ -3789,7 +3836,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                 return {"panes": [own] if own_only else [sibling, own]}
             if arguments[:2] == ("pane", "process-info"):
                 pid = 990101 if arguments[-1] == "w1:sibling" else 990000
-                if workspace_label == "morty" and own_only:
+                if workspace_label == "fixture_keeper" and own_only:
                     pid = 990102
                 argv = ["claude"] if pid in (990101, 990102) else ["zsh"]
                 return {"process_info": {"shell_pid": 990000, "foreground_process_group_id": pid,
@@ -3800,21 +3847,21 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(herdr, "saved_layout", return_value=layout),
               patch.object(client, "result", side_effect=result),
               patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()) as activity):
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
+            self.assertEqual(client.saved_row_tab(self.rows[0].id, "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
             activity.assert_called_once_with("w1:own")
             # The move race: the stopped agent and the shell setup still hold the own pane for a moment.
             activity.side_effect = [herdr.PaneRunning(("claude",)), herdr.PaneRunning(("direnv",)), herdr.PaneAtShell()]
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
+            self.assertEqual(client.saved_row_tab(self.rows[0].id, "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
             activity.side_effect = None
             activity.return_value = herdr.PaneRunning(("codex",))
             with self.assertRaises(herdr.OwnPaneNotAtShell) as refused:
-                _ = client.saved_row_tab("row-0", "unit-0", "fallback")
+                _ = client.saved_row_tab(self.rows[0].id, "unit-0", "fallback")
             self.assertEqual(str(refused.exception),
                 f"unit-0: restart refused: own pane w1:own is not at the shell after 0.2 s; session {self.rows[0].current_session} "
                 + "stays stopped; when that pane is at the shell, run: agents resume unit-0")
             pane_launch.save(path, {})
             activity.reset_mock()
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"),
+            self.assertEqual(client.saved_row_tab(self.rows[0].id, "unit-0", "fallback"),
                              herdr.NewTab(herdr.row_workspace(self.rows[0], staff.StaffSnapshot(self.rows), "fallback"), "unit-0"))
             activity.assert_not_called()
 
@@ -3828,7 +3875,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return restart.producer_launch(row)
 
         _ = self.enterContext(patch.object(restart, "producer_resume", side_effect=resume))
-        for workspace_label, own_only, shell in (("morty", True, True), ("producers", False, False), ("producers", True, False),
+        for workspace_label, own_only, shell in (("fixture_keeper", True, True), ("producers", False, False), ("producers", True, False),
                                                  ("producers", False, True), ("producers", True, True)):
             with self.subTest(workspace=workspace_label, own_only=own_only, shell=shell):
                 layout["workspaces"][0]["name"] = workspace_label
@@ -3867,6 +3914,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                     folder.mkdir(exist_ok=True)
                     producer = replace(producer, worktree=staff.WORKTREE_UNFILLED,
                                        doc=staff.LiveDoc(remote.local_machine(), folder / "plan.md"))
+                transcript = self.root / ".claude2/projects" / transcripts.claude_project_key(folder) / f"{producer.current_session}.jsonl"
+                write_text_atomic(transcript, "")
                 record = staff.StaffSnapshot((producer,))
                 client = FakeClient([{"pane_id": "old", "tab_id": "old-tab", "label": producer.name,
                     "workspace_id": "old-space", "agent_session": {"kind": "id", "value": producer.current_session}}])
@@ -3976,9 +4025,9 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
               patch.object(herdr.Herdr, "remember_row_tab") as remember,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        self.assertEqual(shutdown_record.read(), ["row-2"])
+        self.assertEqual(shutdown_record.read(), [self.rows[2].id])
         save.assert_called_once()
-        self.assertEqual([call.args for call in remember.call_args_list], [("row-0", "w1:p0"), ("row-1", "w1:p1")])
+        self.assertEqual([call.args for call in remember.call_args_list], [(self.rows[0].id, "w1:p0"), (self.rows[1].id, "w1:p1")])
         wait.assert_called_once()
         self.assertRegex(output.getvalue(), r"^saved 2 live row tabs at \d{2}:\d{2}\n$")
         self.assertEqual(self.stops, [])
@@ -3999,7 +4048,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.running.clear()
         home = self.root / ".claude2"
         requested = herdr.SessionTranscript(home, str(row.current_session))
-        original = home / "projects/fixture" / f"{row.current_session}.jsonl"
+        original = home / "projects" / transcripts.claude_project_key(self.root) / f"{row.current_session}.jsonl"
         history = json.dumps({"timestamp": "2020-01-01T00:00:00+00:00", "type": "assistant",
                               "message": {"role": "assistant", "content": "prelaunch-only-history"}}) + "\n"
         for native_identity_changes in (False, True):
@@ -4583,15 +4632,15 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), "missing"])
 
     def test_bare_dry_run_reports_record_time_and_missing_rows(self) -> None:
-        shutdown_record.save(["row-0", "gone"])
+        shutdown_record.save([self.rows[0].id, "gone"])
         saved_at = time.strftime("%H:%M", time.localtime(shutdown_record.record_path().stat().st_mtime))
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(restart.restart(dry_run=True), 0)
         self.assertEqual(output.getvalue().splitlines(), [f"restart record: 2 rows saved at {saved_at}",
             "unit-1: live, not in the restart record", "unit-2: live, not in the restart record",
-            "unit-0: row-0, unit, workspace live, tab 1 (unit-0)"])
+            f"unit-0: {self.rows[0].id}, unit, workspace live, tab 1 (unit-0)"])
         self.assertEqual(errors.getvalue(), "gone: restart anomaly: no staff row; would leave the restart record\n")
-        self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
+        self.assertEqual(shutdown_record.read(), [self.rows[0].id, "gone"])
 
     def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
         with (patch.object(herdr.Herdr, "save_layout", side_effect=herdr_types.HerdrFailure("layout unavailable")),
@@ -4675,7 +4724,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_stop_all_prunes_43_live_entries_and_keeps_a_recorded_down_row(self) -> None:
         base = self.rows[0]
-        self.rows = tuple(replace(base, id=staff.StaffId(f"row-{index}"), name=f"unit-{index}",
+        self.rows = tuple(replace(base, id=staff.StaffId(fixture_runtime_id(f"row-{index}")), name=f"unit-{index}",
                                   current_session=staff.StaffId(f"conversation-{index}")) for index in range(44))
         self.running = {str(row.current_session) for row in self.rows[:43]}
         down = str(self.rows[43].id)
@@ -4865,6 +4914,10 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_stop_all_keeps_a_producer_for_its_saved_tab(self) -> None:
         row = fixture_member("producer", name="TEST-agent")
+        _ = write_registry(models_registry.registry_path(), {"producers": {row.id: "claude:opus:max"}}, update=True)
+        for home in (self.root / ".claude2", self.root / ".claude3"):
+            transcript = home / "projects" / transcripts.claude_project_key(self.root) / f"{row.current_session}.jsonl"
+            write_text_atomic(transcript, "")
         self.rows = (row,)
         self.running = {str(row.current_session)}
         with (patch.object(staff, "initial_snapshot", side_effect=staff.snapshot),
@@ -4915,7 +4968,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit(), name="TEST-brain", worktree=staff.WORKTREE_UNFILLED,
+        row = replace(self.rows[0], id=staff.StaffId(fixture_runtime_id("probe-other-codex")),
+                      kind="producer", unit_type=staff.NotUnit(), name="TEST-fixture_organizer", worktree=staff.WORKTREE_UNFILLED,
                       current_session=staff.StaffId(str(uuid5(NAMESPACE_URL, "codex-resume-without-rollout"))))
         self.rows = (row,)
         self.running.clear()
@@ -4935,7 +4989,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return json.dumps({"result": layout(*arguments)})
 
         def codex_inventory() -> herdr.CodexConversations:
-            return herdr.CodexConversations({}, ("TEST-brain (Codex thread unknown)",))
+            return herdr.CodexConversations({}, ("TEST-fixture_organizer (Codex thread unknown)",))
 
         def native_process(*arguments: object) -> herdr.NativeAgentProcess:
             del arguments
@@ -5018,8 +5072,9 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
         for row in self.rows:
-            assert isinstance(row.home, staff.SessionHome)
-            (row.home.path / "projects/fixture" / f"{row.current_session}.jsonl").unlink()
+            for home in (self.root / ".claude2", self.root / ".claude3"):
+                project = home / "projects" / transcripts.claude_project_key(self.root)
+                (project / f"{row.current_session}.jsonl").unlink()
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):
                 records = self.records_for(self.running | {"orphan"})

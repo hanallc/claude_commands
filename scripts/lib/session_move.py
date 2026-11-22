@@ -424,7 +424,8 @@ def rename_exclusive(source_parent: int, source: str, target_parent: int, target
         number = ctypes.get_errno()
         raise OSError(number, os.strerror(number), source, None, target)
     os.fsync(target_parent)
-    os.fsync(source_parent)
+    if source_parent != target_parent:
+        os.fsync(source_parent)
 
 
 class HashedEntry(Enum):

@@ -171,10 +171,10 @@ describe("reply routes", () => {
     await replies.sending(entry(), fake.calls.now());
     await replies.sending(entry(), fake.calls.now());
     expect(await replies.receive(reply("first"))).toEqual(consumed);
-    await replies.sending(entry("Bob", "bob-session"), fake.calls.now());
+    await replies.sending(entry("Casey", "casey-session"), fake.calls.now());
     expect(await replies.receive(reply("second"))).toEqual(consumed);
     expect(fake.sent.map(message => message.to)).toEqual([
-      { sessionId: "original-session" }, { sessionId: "original-session" }, { sessionId: "bob-session" },
+      { sessionId: "original-session" }, { sessionId: "original-session" }, { sessionId: "casey-session" },
     ]);
     expect(fake.logs().map(log => log.body)).toEqual(["first", "second"]);
   });
@@ -264,16 +264,16 @@ describe("reply routes", () => {
     const fake = fakeCalls();
     const replies = await startReplies(fake.calls);
     await replies.sending(entry("Alice", "alice-session"), fake.calls.now());
-    await replies.sending(entry("Bob", "bob-session"), fake.calls.now());
+    await replies.sending(entry("Casey", "casey-session"), fake.calls.now());
     expect(await replies.receive(reply())).toEqual(consumed);
-    expect(fake.sent.map(message => message.to)).toEqual([{ sessionId: "alice-session" }, { sessionId: "bob-session" }]);
+    expect(fake.sent.map(message => message.to)).toEqual([{ sessionId: "alice-session" }, { sessionId: "casey-session" }]);
     for (const message of fake.sent) {
       expect(message.text).toEqual(expect.stringMatching(
-        /^Recipient \(answer to one of Alice, Bob\): My answer\n\nTag: 1000-\d+$/,
+        /^Recipient \(answer to one of Alice, Casey\): My answer\n\nTag: 1000-\d+$/,
       ));
     }
-    expect(onlyForwarded(fake.forwards())).toEqual(["alice-session", "bob-session"]);
-    expect(onlyLog(fake.logs()).senders).toEqual(["Alice", "Bob"]);
+    expect(onlyForwarded(fake.forwards())).toEqual(["alice-session", "casey-session"]);
+    expect(onlyLog(fake.logs()).senders).toEqual(["Alice", "Casey"]);
   });
 
   test("each route has its own file and adding a route does not rewrite an earlier one", async () => {

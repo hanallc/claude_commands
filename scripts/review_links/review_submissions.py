@@ -25,6 +25,7 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
+from scripts.message import morty_identity as list_identity
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
@@ -1117,18 +1118,15 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
 
 
 def _configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.by_id(staff.StaffId(configured.value))
+    identity = staff.list_producer_id(settings)
+    row = members.by_id(identity) if identity is not None else None
     return row if row is not None and row.kind == "producer" else PageOwnerUnavailable()
 
 
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    row = _configured_list_producer(settings, members)
-    if (isinstance(row, PageOwnerUnavailable) or row.id not in members.rows_by_id
-            or not _page_owner_is_active(row, members)):
+    row = list_identity.list_producer(members, settings)
+    if row is None or row.id not in members.rows_by_id or not _page_owner_is_active(row, members):
         return PageOwnerUnavailable()
     return row
 

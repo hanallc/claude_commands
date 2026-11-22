@@ -115,7 +115,7 @@ When the selected recipient becomes unavailable, the dialog clears the selection
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
-List delivery notices color morty and the recorded showrunner through the same page renderer.
+List delivery notices use the same renderer for the List producer and the recorded showrunner.
 They keep the notice words and time.
 Review colors Owner, Source, staff log names, and owner menu options.
 Proposal and efficiency cards show Assign next to Approve.
@@ -1026,11 +1026,12 @@ Click Clear filter or press Escape in the box to remove the words.
 The other filters stay selected.
 The address stores the words as `q` and restores them on reload.
 The List ignores form text that the browser restores without an input event.
-The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
+The chip order is All, Needs me, `<List producer> answering`, Working, Blocked, and Parked.
+The address uses `awaiting-answer` for the answering chip.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
 An unread delivery release belongs to Needs me even if the question remains open.
-Morty answering includes unparked items with an open question and no unread answer.
+The answering chip includes unparked items with an open question and no unread answer.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
@@ -1085,9 +1086,9 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
-A new item without the option, and an old record without the field, belong to the record keeper, morty.
+A new item without the option, and an old record without the field, belong to the List producer.
 The terminal list shows a Producer column after Owner.
-The CLI shows producers only their assigned items. Morty can see every item.
+The CLI shows producers only their assigned items. The List producer can see every item.
 See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
@@ -1203,9 +1204,10 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-The dialog shows Remove, Park until, and a text box for Ask question and Tell morty when those actions are available.
-The text box shows “Your words for morty about this item” as its placeholder and accessible name.
-Ask question and Tell morty sit below the box at its right edge, beside the send status.
+The dialog shows Remove, Park until, and a text box when the actions are available.
+The feedback button shows the current List producer's name.
+The text box shows “Your words for <List producer> about this item” as its placeholder and accessible name.
+Ask question and the feedback button sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
 Clearing the box disables both buttons.
 Record text uses the shared review formatter for bold text, headings, lists, code spans, and links.
@@ -1217,16 +1219,16 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
-Ask question and Tell morty use the same path to mark the update read after the action saves.
+Ask question and Tell the List producer use the same path to mark the update read after the action saves.
 The form signature includes the identity of the unread update that the row shows.
-A new Ask question or Tell morty request can mark only that update read.
+A new Ask question or Tell the List producer request can mark only that update read.
 A repeated request cannot mark a newer update read.
-An exact Tell morty retry uses the read target saved with the feedback.
+An exact Tell the List producer retry uses the read target saved with the feedback.
 The store checks the update identity under its lock.
 This check preserves an update that arrives between the action save and the read write.
 An update identity includes its time and log history.
 Two updates with the same time keep separate identities.
-Ask question and Tell morty add no read entry when the form shows no unread update.
+Ask question and Tell the List producer add no read entry when the form shows no unread update.
 The POST response includes the current unread state.
 The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
@@ -1235,15 +1237,15 @@ Mark read, Park until, and Remove release the link to the item.
 If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
-Tell morty applies the current filters. A read item leaves the view when Unread only is on.
-Tell morty with empty words changes no record.
+Sending feedback applies the current filters. A read item leaves the view when Unread only is on.
+Empty feedback changes no record.
 Ask question saves an open question in the item record under the List lock.
 List and Images share the code that saves and sends the question.
-After the server replies to the browser, it sends morty the item number, title, question, and answer command.
+After the server replies to the browser, it sends the List producer the item number, title, question, and answer command.
 The List uses the keeper as the recipient even when another producer owns the work.
 Equal words select the open question. Different words create a new question.
-An exact request retry uses the same question ID, even after morty answers it.
-The row moves to Morty answering when the question saves.
+An exact request retry uses the same question ID, even after the List producer answers it.
+The row moves to <List producer> answering when the question saves.
 The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
@@ -1274,8 +1276,8 @@ The section does not change the results count.
 The List address preserves a linked item outside the filters when the console reloads.
 It counts in its current status chip.
 Close the linked item or change a filter to dismiss the section.
-An open question adds a Morty answering note below the saved state.
-Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
+An open question adds a <List producer> answering note below the saved state.
+The List producer runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
 The entry keeps the question ID, words, and time.
@@ -1294,7 +1296,7 @@ A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
 The item stays in Parked while its park is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request moves the item to Morty answering and shows its confirmation next to Show.
+That request moves the item to <List producer> answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening a row leaves its unread state and status chip unchanged.
@@ -1326,7 +1328,7 @@ Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURC
 Remove sits at the left edge of the dialog above the four-line text box.
 Park and Remove close the dialog after the save.
 The table applies the saved state before the next refresh.
-Park, Remove, Tell morty, Ask question, and Mark read show a message if the page cannot confirm the save.
+Park, Remove, producer feedback, Ask question, and Mark read show a message if the page cannot confirm the save.
 **Unpark** and **Park until** sit at the right edge of the row.
 The dialog shows a parked item's parking condition above the buttons.
 **Unpark** appears in the form when the item has active parking and its state is outside Closed.
@@ -1342,9 +1344,9 @@ The writer checks a new parking time against the current time under the List loc
 The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
 The picker can resend the original request and instant after the parking time passes.
 When the saved date has passed, the picker gives focus to an enabled day.
-The page keeps the words for Tell morty.
+The page keeps the words for Tell the List producer.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
-It records one Unparked event and saves one notice for morty.
+It records one Unparked event and saves one notice for the List producer.
 If the item has no active parking time, the writer saves only a hidden request receipt.
 The receipt records whether the time expired or was absent.
 A replay of that request preserves any newer parking time.
@@ -1361,23 +1363,23 @@ If All is active when Unpark saves, the item dialog stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
-Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
+The List producer can set this parking condition with `the_list.py park --id L<N> --until delivered --source NAME`.
 The List ends this park automatically when the producer sets the item state to Delivered.
 The same write clears the park, marks the item unread, and records an Unparked event.
 Linked changes supply review information on the List.
 The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
-After Mark read, an open question returns the item to Morty answering.
+After Mark read, an open question returns the item to <List producer> answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
-The notice tells morty which action nate completed.
+The notice tells the List producer which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
-Tell morty sends the user's words without changing the item's state or parking time.
+Tell the List producer sends the user's words without changing the item's state or parking time.
 Remove hides the item at once and closes it when the save succeeds.
 Park moves an item to the parked group at once.
 The item stays visible in All if it matches the other filters.
-With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell the List producer.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
@@ -1387,7 +1389,7 @@ The page applies the saved state and parking status from the response.
 The page uses the saved parking condition to update the labels in the row and dialog.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
-If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
+If Mark read, Ask question, or Tell the List producer loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
 After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
@@ -1399,7 +1401,7 @@ The page keeps each unconfirmed request ID for an exact retry, even after anothe
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
 The page discards each request ID when it receives a success or refusal for that request.
 A sent or alerted notice sends no second message.
-The one-off `the_list.py clean-evidence --source morty` command removes migration JSON copies and matching List row blocks from Evidence.
+The one-off `the_list.py clean-evidence --source NAME` command removes migration JSON copies and matching List row blocks from Evidence.
 It preserves other text and saves each changed record once, with one log entry per copy kind.
 The row block requires the record's own number, a List state line, and field bullets.
 Only field bullets and their continuation lines belong to the block.
@@ -1419,13 +1421,13 @@ A successful send appends the same request ID with the sent state.
 Exhausted tries alert the item owner's showrunner.
 The request becomes alerted only when at least one showrunner receives the alert.
 Failed alerts leave the request pending for repeated POSTs and startup recovery.
-An alerted request shows “not sent; <showrunner> told” until morty writes the item again.
+An alerted request shows “not sent; <showrunner> told” until the List producer writes the item again.
 The server startup hook retries pending List requests separately from change and question recovery.
 A repeated POST retries a pending request without adding another pending log entry.
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows “sent to morty” with its time until the next log entry from morty.
+The Update cell shows `sent to <List producer>` with its time until the next log entry from the List producer.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.

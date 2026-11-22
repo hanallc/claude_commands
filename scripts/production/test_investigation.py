@@ -22,7 +22,7 @@ RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "
                         current_session=staff.StaffId("2b7d4419-b8d4-4c43-b9b2-48bed9337f27"))
 OWNER = staff.StaffRow(staff.StaffId("62ec2f46-df7a-40fd-b919-789581e63d53"), "unit", "example", staff.ReportsTo(RUNNER.id),
                        current_session=staff.StaffId("07990246-10cf-440e-a32a-13e62f15b78b"), unit_type=staff.UnitDetails("direct"))
-OTHER = staff.StaffRow(staff.StaffId("4fc94517-b49f-4979-9308-37bb5cc90236"), "producer", "dwight", staff.StaffRoot(),
+OTHER = staff.StaffRow(staff.StaffId("4fc94517-b49f-4979-9308-37bb5cc90236"), "producer", "fixture_planner", staff.StaffRoot(),
                        current_session=staff.StaffId("e289fc59-9b1f-44b2-bb22-beb7359f97bb"))
 
 

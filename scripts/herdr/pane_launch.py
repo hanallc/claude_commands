@@ -753,7 +753,7 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         raise ValueError("producer publication does not match the current process")
     expected = observed_launch.copy()
     expected["session_id"] = owner.id
-    expected["kind"] = models_registry.launch_settings("producers", owner.name).kind
+    expected["kind"] = models_registry.launch_settings("producers", staff.native_id(owner.id)).kind
     if isinstance(request, ProducerLaunchRequest):
         if request.member != owner.id or request.session != owner.current_session:
             raise ValueError("producer start expectation names another conversation")

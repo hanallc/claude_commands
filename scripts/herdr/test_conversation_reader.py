@@ -283,13 +283,13 @@ class ConversationReaderTests(StaffTestCase):
         self.assertAlmostEqual(observed_deadlines[0], deadline, places=3)
 
     def test_unknown_other_process_names_the_target_first(self) -> None:
-        unknown = ["morty (Codex thread unknown)\nprivate detail", "other (Codex thread unknown)", "pid 42 (Codex thread unknown)"]
+        unknown = ["fixture_keeper (Codex thread unknown)\nprivate detail", "other (Codex thread unknown)", "pid 42 (Codex thread unknown)"]
         with patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, tuple(unknown))):
             observed = herdr.read_conversation(self.identity, "codex")
         self.assertIsInstance(observed, herdr.UnknownConversation)
         assert isinstance(observed, herdr.UnknownConversation)
         self.assertEqual(observed.reason, f"{self.identity} is not proved live or stopped: "
-                         + "3 processes unknown, first: morty (Codex thread unknown) private detail")
+                         + "3 processes unknown, first: fixture_keeper (Codex thread unknown) private detail")
         self.assertEqual(len(observed.reason.splitlines()), 1)
         with redirect_stderr(io.StringIO()) as output:
             herdr.conversation_note(observed)

@@ -1109,7 +1109,7 @@ class UnitFolderRename:
             ensure_target_link(new, checked_output(layout))
         else:
             layout = UnassignedOutput()
-        worktree_links.link_transcripts(old, new)
+        worktree_links.link_transcripts(worktree_links.transcript_links(old, new))
         _ = _update_worktree_staff(old, new)
         if record is not None:
             head = git_files.head(git_files.at(new))
@@ -1377,6 +1377,12 @@ def _worktree_copy_required(source: Path, destination: Path) -> bool:
         _ = directories.callback(os.close, new)
         return os.fstat(old).st_dev != os.fstat(new).st_dev or mount_identity(old) != mount_identity(new)
 
+def _require_unreserved_paths(*paths: Path) -> None:
+    from scripts.agents.remote import local_machine
+    from scripts.production import staff
+
+    staff.require_no_producer_rename_paths(local_machine(), paths)
+
 
 def _open_move(move: WorktreeMove, *, clone_members: tuple[Path, ...] = ()) -> MoveJournal:
     if move.new == move.old or move.new.is_relative_to(move.old) or move.old.is_relative_to(move.new):
@@ -1385,6 +1391,9 @@ def _open_move(move: WorktreeMove, *, clone_members: tuple[Path, ...] = ()) -> M
         raise FileExistsError(f"{move.new}: worktree destination already exists")
     before = FolderIdentity.read(move.old)
     entry = git_files.at(move.old)
+    links = worktree_links.transcript_links(move.old, move.new)
+    project_paths = tuple(path for link in links for path in (link.source, link.destination))
+    _require_unreserved_paths(move.old, move.new, entry.git_dir, *clone_members, *project_paths)
     _ = _git_move_options(entry)
     copy_tag = uuid4().hex if _worktree_copy_required(move.old, move.new) else ""
     journal = MoveJournal(move, before, before, copy_tag,
@@ -1509,6 +1518,7 @@ def _copy_across_filesystems(journal: MoveJournal, protect: RenameGuard) -> Move
                 reason = "the prior stage can differ from the current source"
             report_retained_folder(stage, reason)
             journal = replace(journal, destination=journal.source, copy_tag=uuid4().hex)
+            _require_unreserved_paths(journal.staging, journal.backup)
             write_move(journal)
             stage = journal.staging
         with protect(old, journal) as final_check:
@@ -1549,7 +1559,8 @@ def _relocated_clone_member(move: WorktreeMove, member: Path) -> Path:
     return member
 
 
-def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> tuple[MoveJournal, WorktreeRecord]:
+def _publish_move_source(journal: MoveJournal, protect: RenameGuard,
+                         links: tuple[worktree_links.TranscriptLink, ...]) -> tuple[MoveJournal, WorktreeRecord]:
     old, new = journal.move.old, journal.move.new
     new.parent.mkdir(parents=True, exist_ok=True)
     destination_exists = os.path.lexists(new)
@@ -1558,6 +1569,7 @@ def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> tuple[Mo
             raise ValueError(f"{old}: source identity changed during the move")
         if _worktree_copy_required(old, new):
             journal = replace(journal, copy_tag=uuid4().hex)
+            _require_unreserved_paths(journal.staging, journal.backup)
             write_move(journal)
     with ExitStack() as relocation:
         if journal.copy_tag:
@@ -1600,7 +1612,7 @@ def _publish_move_source(journal: MoveJournal, protect: RenameGuard) -> tuple[Mo
         except FileExistsError:
             if not old.is_symlink() or old.resolve() != new:
                 raise ValueError(f"{old}: the former path does not point to {new}") from None
-    worktree_links.link_transcripts(old, new)
+    worktree_links.link_transcripts(links)
     _ = _update_worktree_staff(old, new)
     record = _relocate_worktree_records(journal)
     journal = replace(journal, stage=MoveStage.LINKED)
@@ -1654,12 +1666,32 @@ def _relocate_worktree_records(journal: MoveJournal) -> WorktreeRecord:
     return record
 
 
+def _check_saved_move_reservations(journal: MoveJournal, *, defer_output: bool
+                                   ) -> tuple[worktree_links.TranscriptLink, ...]:
+    move = journal.move
+    git_entry = journal.git_entry if journal.git_entry.is_absolute() else move.old / journal.git_entry
+    copy_paths = (journal.staging, journal.backup) if journal.copy_tag else ()
+    output_paths = ((output_record(move.repo, move.unit, move.short_name).output,)
+                    if move.output is MoveOutput.LIVE_UNIT and not defer_output else ())
+    links = worktree_links.transcript_links(move.old, move.new) if journal.stage is MoveStage.PLANNED else ()
+    project_paths = tuple(path for link in links for path in (link.source, link.destination))
+    _require_unreserved_paths(move.old, move.new, git_entry, *journal.clone_members, *copy_paths, *output_paths,
+                              *project_paths)
+    return links
+
+
+def _move_output_deferred(move: WorktreeMove) -> bool:
+    return move.output is MoveOutput.LIVE_UNIT and move.repo == "claude" and _legacy_claude_present()
+
+
 def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> MoveJournal:
     if journal.stage is MoveStage.FINISHED:
         return journal
     move = journal.move
+    defer_output = _move_output_deferred(move)
+    links = _check_saved_move_reservations(journal, defer_output=defer_output)
     if journal.stage is MoveStage.PLANNED:
-        journal, record = _publish_move_source(journal, protect)
+        journal, record = _publish_move_source(journal, protect, links)
     elif journal.destination.matches(move.new):
         # An older journal can record LINKED before it moves the checkout record.
         record = _relocate_worktree_records(journal)
@@ -1668,7 +1700,7 @@ def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> Move
     retained_copy = bool(journal.copy_tag) and journal.source.matches(journal.backup)
     if retained_copy:
         report_retained_folder(journal.backup, "the worktree moved to a new filesystem")
-    if move.output is MoveOutput.LIVE_UNIT and move.repo == "claude" and _legacy_claude_present():
+    if defer_output:
         print(f"defer output {move.new}: archive the old build root first")
         return journal
 
@@ -2883,6 +2915,7 @@ def _migration_journals(selection: MigrationSelection, folders: MigrationFolders
                     relocated.append(journal)
             case MigrationJournalState.UNMOVED:
                 if not dry_run and selection.includes(move.old):
+                    _ = _check_saved_move_reservations(journal, defer_output=_move_output_deferred(move))
                     if journal.copy_tag and os.path.lexists(journal.staging):
                         report_retained_folder(journal.staging, "a discarded move left a staged copy")
                     path.unlink()
@@ -3068,6 +3101,8 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
             if reason := _migration_target_lock(main.checkout, common, output):
                 progress.kept[main.checkout] = reason
                 continue
+            if not dry_run:
+                _require_unreserved_paths(main.checkout / "target", common, output)
         verb = "main output" if places_output else "defer main output"
         print(f"{verb} {main.checkout} -> {output}")
         if not dry_run and places_output:

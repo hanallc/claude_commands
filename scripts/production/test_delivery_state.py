@@ -11,7 +11,7 @@ from scripts.production import delivery_state, staff
 class DeliveryStateTests(unittest.TestCase):
     def test_legacy_page_question_evidence_keeps_acceptance_and_uncertainty(self) -> None:
         state = delivery_state.QuestionSendState
-        recipient = staff.StaffId("morty")
+        recipient = staff.StaffId("keeper")
         source = delivery_state.QuestionSource(str(Path("/fixture/L1.md")), "L1", "Q1", "Why?", "List item 1/Q1")
         saved = {"source": source.path, "owner": recipient, "row": source.row, "saved": True, "message": "Why?"}
         accepted = {**saved, "image_question_dispatch": {"attempt": "new", "state": "accepted"}}

@@ -30,6 +30,7 @@ from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -265,7 +266,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
 
         _, parent, member = self.tree()
         with mock.patch.object(pane_launch, "staff_admitted", wraps=pane_launch.staff_admitted) as publication:
-            _ = staff.ensure("producer", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
+            _ = staff.ensure("producer", name="test-no-pane-read", runtime_id=fixture_runtime_id("test-no-pane-read"))
             _ = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-no-worker-pane-read")), "TEST-new", parent.id)
             _ = staff.update_current_session(member.current_session, staff.native_id(fixture_runtime_id("TEST-next-native")))
         publication.assert_not_called()
@@ -421,20 +422,20 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
 
 
     def test_guarded_cli_adds_a_producer_without_a_parent_and_reads_its_locations(self) -> None:
-        identity = fixture_runtime_id("morty-agent")
+        identity = fixture_runtime_id("fixture_keeper-agent")
         for field, state in (("worktree", "present"), ("doc", "live")):
             with self.subTest(field=field):
                 self.staff_file.unlink(missing_ok=True)
-                result = self.cli("ensure", "producer", "--name", "morty", "--runtime-id", identity,
-                                  "--" + field, "natedev", str(self.root / "morty"), state, "--json")
+                result = self.cli("ensure", "producer", "--name", "fixture-keeper", "--runtime-id", identity,
+                                  "--" + field, "natedev", str(self.root / "fixture-keeper"), state, "--json")
                 payload = cast(object, json.loads(result.stdout))
                 row = staff.StaffRow.from_json(payload)
                 self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
-                                 (identity, identity, "producer", "morty", staff.StaffRoot()))
+                                 (identity, identity, "producer", "fixture-keeper", staff.StaffRoot()))
                 self.assertEqual(staff.snapshot().rows, (row,))
-                self.assertEqual(staff.by_path("morty"), row)
+                self.assertEqual(staff.by_path("fixture-keeper"), row)
                 shown = self.cli("show", "--kind", "producer")
-                self.assertIn("morty", shown.stdout)
+                self.assertIn("fixture-keeper", shown.stdout)
                 self.assertIn("producer", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
 
@@ -796,6 +797,160 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_producer_rename_compares_and_protects_fields_until_release(self) -> None:
+        self.rename_path_machines()
+        machine = remote.this_machine()
+        old, new = self.root / "producer-old", self.root / "producer-new"
+        row = fixture_member("producer", name="fixture-producer",
+                             worktree=staff.PresentWorktree(machine, old),
+                             doc=staff.LiveDoc(machine, old / "missing.md"))
+        target = replace(row, name="fixture-renamed", worktree=staff.PresentWorktree(machine, new),
+                         doc=staff.LiveDoc(machine, new / "missing.md"))
+        plan = staff.ProducerRename("1" * 32, row, target, (old, new))
+        with self.assertRaisesRegex(staff.StaffRefused, "requires its reservation"):
+            _ = staff.rename(row.id, target.name)
+        changed = staff.set_doc(row.id, staff.LiveDoc(machine, old / "changed.md"))
+        with self.assertRaisesRegex(staff.StaffRefused, "changed before the rename reservation"):
+            staff.reserve_producer_rename(plan)
+        target = replace(target, doc=staff.LiveDoc(machine, new / "changed.md"))
+        plan = replace(plan, before=changed, after=target)
+        with mock.patch.object(staff, "producer_creation_registry",
+                               return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+            staff.reserve_producer_rename(plan)
+            staff.reserve_producer_rename(plan)
+            with self.assertRaisesRegex(staff.StaffRefused, "finish the producer rename"):
+                staff.reserve_producer_rename(replace(plan, operation="2" * 32))
+        with self.assertRaisesRegex(staff.StaffRefused, "protected fields"):
+            _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.root / "changed"))
+        with self.assertRaisesRegex(staff.StaffRefused, "finish the producer rename"):
+            _ = staff.update_current_session(row.current_session, staff.StaffId(fixture_runtime_id("rename-replacement")))
+        with self.assertRaisesRegex(staff.StaffRefused, "reserves this name"):
+            _ = fixture_member("showrunner", name=target.name)
+        hold = staff.Paused("2026-11-21T14:00:00+00:00", "actor before rename", "paused")
+        paused = staff.set_hold(row.id, hold)
+        committed = staff.rename(row.id, target.name, operation=plan.operation)
+        self.assertEqual(committed, replace(target, paused=paused.paused))
+        staff.release_producer_rename("2" * 32)
+        with self.assertRaises(staff.StaffRefused):
+            staff.require_no_producer_rename(row.id)
+        staff.release_producer_rename(plan.operation)
+        staff.require_no_producer_rename(row.id)
+
+    def test_producer_rename_refuses_a_name_with_a_prior_creation_marker(self) -> None:
+        row = fixture_member("producer", name="fixture-producer")
+        target = replace(row, name="fixture-renamed")
+        plan = staff.ProducerRename("1" * 32, row, target)
+        registry = self.root / "models.conf"
+        marker = "fixture-machine:" + "2" * 32
+        _ = registry.write_text(f"[producer_creations]\n{target.name}={marker}\n")
+        with mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
+            with self.assertRaisesRegex(staff.StaffRefused, "a producer creation reserves this name"):
+                staff.reserve_producer_rename(plan)
+        self.assertEqual(staff.by_id(row.id), row)
+        staff.require_no_producer_rename(target.name)
+
+    def test_producer_rename_refuses_promotion_to_a_reserved_name(self) -> None:
+        row = fixture_member("producer", name="fixture-producer")
+        showrunner = fixture_member("showrunner", name="fixture-showrunner")
+        unit = fixture_member("unit", name=row.name, parent=showrunner.id)
+        target = replace(row, name="fixture-renamed")
+        plan = staff.ProducerRename("1" * 32, row, target)
+        doc = staff.LiveDoc("natedev", self.root / "showrunner.md")
+        with mock.patch.object(staff, "producer_creation_registry",
+                               return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+            staff.reserve_producer_rename(plan)
+        for name in (row.name, target.name):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(staff.StaffRefused, "a producer rename reserves this name"):
+                    _ = staff.promote_unit(unit.id, name=name, parent=showrunner.id, doc=doc)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        staff.release_producer_rename(plan.operation)
+
+    def rename_path_machines(self) -> None:
+        configuration = self.root / "rename-config"
+        local, peer = ("darwin", "linux") if sys.platform == "darwin" else ("linux", "darwin")
+        _ = write_config_fixture(configuration / "machines.conf", f"""aliases=natedev mac
+natedev.platform={local}
+natedev.hosts=fixture-local
+mac.platform={peer}
+mac.hosts=fixture-remote
+""")
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration),
+        })))
+
+    def test_producer_rename_reserves_equivalent_paths_at_the_staff_writer(self) -> None:
+        self.rename_path_machines()
+        old, new = self.root / "producer-old", self.root / "producer-new"
+        old.mkdir()
+        machine = remote.this_machine()
+        row = fixture_member("producer", name="fixture-producer", worktree=staff.PresentWorktree(machine, old))
+        target = replace(row, name="fixture-renamed", worktree=staff.PresentWorktree(machine, new))
+        plan = staff.ProducerRename("1" * 32, row, target, (old, new))
+        source_link, destination_link = self.root / "source-alias", self.root / "destination-alias"
+        source_link.symlink_to(old, target_is_directory=True)
+        destination_link.symlink_to(new, target_is_directory=True)
+        traversed = self.root / "links"
+        traversed.mkdir()
+        nested = old / "nested"
+        nested.mkdir()
+        (traversed / "nested").symlink_to(nested, target_is_directory=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (old / "escape").symlink_to(outside, target_is_directory=True)
+        chain = self.root / "chain"
+        chain.symlink_to(Path(source_link.name) / "escape", target_is_directory=True)
+        foreign = fixture_member("producer", name="fixture-foreign",
+                                 worktree=staff.PresentWorktree(remote.other_machine(), source_link))
+        aliases = (self.root / "other" / ".." / new.name, source_link,
+                   destination_link, traversed / "nested" / "..", source_link / "escape", chain)
+        for index, alias in enumerate(aliases):
+            for field, path in (("worktree", alias), ("doc", alias / "notes.md")):
+                worktree = staff.PresentWorktree(machine, self.root / f"tree-{index}-{field}")
+                document = staff.LiveDoc(machine, self.root / f"doc-{index}-{field}.md")
+                other = fixture_member("producer", name=f"fixture-owner-{index}-{field}", worktree=worktree, doc=document)
+                linked_tree = staff.PresentWorktree(machine, path)
+                linked_doc = staff.LiveDoc(machine, path)
+                with self.subTest(field=field, path=path):
+                    with mock.patch.object(staff, "producer_creation_registry",
+                                           return_value=staff.ProducerCreationRegistryStatus.ABSENT):
+                        staff.reserve_producer_rename(plan)
+                        with self.assertRaisesRegex(staff.StaffRefused, "reserves this path"):
+                            if field == "worktree":
+                                _ = staff.set_worktree(other.id, linked_tree, expected=worktree)
+                            else:
+                                _ = staff.set_doc(other.id, linked_doc)
+                        self.assertEqual(staff.by_id(other.id), other)
+                        staff.release_producer_rename(plan.operation)
+                        if field == "worktree":
+                            _ = staff.set_worktree(other.id, linked_tree, expected=worktree)
+                        else:
+                            _ = staff.set_doc(other.id, linked_doc)
+                        with self.assertRaisesRegex(staff.StaffRefused, "uses a producer rename path"):
+                            staff.reserve_producer_rename(plan)
+                    if field == "worktree":
+                        _ = staff.set_worktree(other.id, worktree, expected=linked_tree)
+                    else:
+                        _ = staff.set_doc(other.id, document)
+        self.assertEqual(staff.by_id(foreign.id), foreign)
+
+    def test_producer_rename_checks_aliases_on_the_machine_that_owns_the_path(self) -> None:
+        self.rename_path_machines()
+        machine = remote.other_machine()
+        old, new, alias = (self.root / name for name in ("old", "new", "alias"))
+        row = fixture_member("producer", name="fixture-producer", worktree=staff.PresentWorktree(machine, old))
+        target = replace(row, name="fixture-renamed", worktree=staff.PresentWorktree(machine, new))
+        plan = staff.ProducerRename("1" * 32, row, target, (old, new))
+        _ = fixture_member("producer", name="fixture-owner", doc=staff.LiveDoc(machine, alias / "notes.md"))
+        request = json.dumps([str(old), str(new), str(alias / "notes.md")])
+        response = [[str(old)], [str(new)], [str(old), str(self.root / "outside/notes.md")]]
+        with (mock.patch.object(staff, "producer_creation_registry",
+                                return_value=staff.ProducerCreationRegistryStatus.ABSENT),
+              mock.patch.object(staff, "_remote", return_value=response) as resolve):
+            with self.assertRaisesRegex(staff.StaffRefused, "uses a producer rename path"):
+                staff.reserve_producer_rename(plan)
+        resolve.assert_called_once_with(["resolve-rename-paths"], input_text=request, machine=machine)
+
     def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
         producer = fixture_member("producer", name="planner")
         mark = staff.RetiredProducer("claude:sonnet:high")
@@ -1616,33 +1771,33 @@ class StaffTests(StaffCommandTestCase):
 
     def test_a_producer_transfer_sets_the_session_home_and_launch_folder_in_one_write(self) -> None:
         _, unit, _ = self.tree()
-        morty = fixture_member("producer", name="morty", doc=staff.LiveDoc("natedev", self.root / "morty/current.md"))
-        brain = fixture_member("producer", name="brain")
-        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        fixture_keeper = fixture_member("producer", name="fixture-keeper", doc=staff.LiveDoc("natedev", self.root / "fixture_keeper/current.md"))
+        fixture_organizer = fixture_member("producer", name="fixture-organizer")
+        session = staff.native_id(fixture_runtime_id("fixture_keeper-claude"))
         home, folder = staff.SessionHome(self.root / ".claude5"), staff.PresentWorktree("natedev", self.root / "launch")
-        moved = staff.transfer_producer(morty.id, session, home, folder)
-        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
-        self.assertEqual(staff.by_id(morty.id), moved)
-        payload = self.assert_rerun("transfer-producer", morty.id, session, "--home", str(home.path),
+        moved = staff.transfer_producer(fixture_keeper.id, session, home, folder)
+        self.assertEqual(moved, replace(fixture_keeper, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(fixture_keeper.id), moved)
+        payload = self.assert_rerun("transfer-producer", fixture_keeper.id, session, "--home", str(home.path),
                                     "--machine", "natedev", "--path", str(folder.path))
         self.assertEqual(staff.StaffRow.from_json(payload), moved)
-        for wrong in (brain.id, brain.current_session, unit.id):
-            self.assert_refused(lambda: staff.transfer_producer(morty.id, wrong, home, folder))
+        for wrong in (fixture_organizer.id, fixture_organizer.current_session, unit.id):
+            self.assert_refused(lambda: staff.transfer_producer(fixture_keeper.id, wrong, home, folder))
         self.assert_refused(lambda: staff.transfer_producer(unit.id, session, home, folder))
         with self.assertRaises(staff.StaffNotFound):
             _ = staff.transfer_producer(staff.native_id(fixture_runtime_id("absent")), session, home, folder)
-        back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
-        self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
+        back = staff.transfer_producer(fixture_keeper.id, fixture_keeper.id, staff.SessionHome(self.root / ".codex2"), folder)
+        self.assertEqual(back, replace(fixture_keeper, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
 
     def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
-        morty = fixture_member("producer", name="morty")
-        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        fixture_keeper = fixture_member("producer", name="fixture-keeper")
+        session = staff.native_id(fixture_runtime_id("fixture_keeper-claude"))
         home, folder = staff.SessionHome(self.root / "mac/.claude5"), staff.PresentWorktree("mac", self.root / "mac/launch")
         with self.machine("mac"):
-            moved = staff.transfer_producer(morty.id, session, home, folder)
+            moved = staff.transfer_producer(fixture_keeper.id, session, home, folder)
         self.assertEqual([command[0] for command in self.ssh_commands()], ["transfer-producer"])
-        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
-        self.assertEqual(staff.by_id(morty.id), moved)
+        self.assertEqual(moved, replace(fixture_keeper, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(fixture_keeper.id), moved)
 
         with self.subTest(operation="producer creation"):
             registry = self.root / "models.conf"
@@ -1650,19 +1805,19 @@ class StaffTests(StaffCommandTestCase):
             marker = f"mac:{'1' * 32}"
             with (self.machine("mac"),
                   mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
-                _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
-                self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
-                                 staff.RecordedProducerCreation("dwight", marker))
+                _ = staff.producer_creation_registry("claim", "fixture-planner", marker, "claude:sonnet:high")
+                self.assertEqual(staff.producer_creation_registry("read", "Fixture-planner"),
+                                 staff.RecordedProducerCreation("fixture-planner", marker))
                 with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
-                    _ = staff.producer_creation_registry("claim", "Dwight", f"natedev:{'1' * 32}", "claude:sonnet:high")
+                    _ = staff.producer_creation_registry("claim", "fixture-planner", f"natedev:{'1' * 32}", "claude:sonnet:high")
                 with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
-                    _ = staff.producer_creation_registry("finish", "dwight", f"natedev:{'1' * 32}")
-                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
-                                 staff.RecordedProducerCreation("dwight", marker))
-                _ = staff.producer_creation_registry("finish", "Dwight", marker)
-                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
+                    _ = staff.producer_creation_registry("finish", "fixture-planner", f"natedev:{'1' * 32}")
+                self.assertEqual(staff.producer_creation_registry("read", "fixture-planner"),
+                                 staff.RecordedProducerCreation("fixture-planner", marker))
+                _ = staff.producer_creation_registry("finish", "Fixture-planner", marker)
+                self.assertEqual(staff.producer_creation_registry("read", "fixture-planner"),
                                  staff.ProducerCreationRegistryStatus.ABSENT)
-            self.assertIn("dwight=claude:sonnet:high", registry.read_text())
+            self.assertNotIn("fixture-planner=", registry.read_text())
             self.assertEqual([command[:2] for command in self.ssh_commands()[1:]],
                              [["producer-creation", action] for action in
                               ("claim", "read-named", "claim", "finish", "read-named", "finish", "read-named")])
@@ -1670,12 +1825,12 @@ class StaffTests(StaffCommandTestCase):
     def test_old_caller_reads_a_marker_from_the_new_owner(self) -> None:
         registry = self.root / "models.conf"
         marker = f"mac:{'1' * 32}"
-        _ = registry.write_text(f"[producer_creations]\ndwight={marker}\n")
+        _ = registry.write_text(f"[producer_creations]\nfixture_planner={marker}\n")
         with (self.machine("mac"),
               mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
             result = subprocess.run(["ssh", "-o", "BatchMode=yes", "natedev",
                 "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
-                + "producer-creation read --name=Dwight --marker= --profile= --json"],
+                + "producer-creation read --name=Fixture_planner --marker= --profile= --json"],
                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout, json.dumps(marker) + "\n")
 
@@ -1686,7 +1841,7 @@ class StaffTests(StaffCommandTestCase):
         def old_owner(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             remote = shlex.split(command[-1])
             self.assertEqual(remote[2], "producer-creation")
-            self.assertIn("--name=Dwight", remote)
+            self.assertIn("--name=Fixture_planner", remote)
             action = remote[3]
             actions.append(action)
             if action == "read-named":
@@ -1697,19 +1852,19 @@ class StaffTests(StaffCommandTestCase):
             return subprocess.CompletedProcess(command, 0, json.dumps(marker), "")
 
         with self.machine("mac"), mock.patch.object(subprocess, "run", side_effect=old_owner):
-            self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
-                             staff.RecordedProducerCreation("Dwight", marker))
+            self.assertEqual(staff.producer_creation_registry("read", "Fixture_planner"),
+                             staff.RecordedProducerCreation("Fixture_planner", marker))
         self.assertEqual(actions, ["read-named", "read"])
 
     def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
         _, unit, _ = self.tree()
         folder = staff.PresentWorktree("natedev", self.root)
-        morty = fixture_member("producer", name="morty", worktree=folder)
-        brain = fixture_member("producer", name="brain", worktree=folder)
+        fixture_keeper = fixture_member("producer", name="fixture-keeper", worktree=folder)
+        fixture_organizer = fixture_member("producer", name="fixture-organizer", worktree=folder)
         checkout = self.root / "checkout"
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", checkout), expected=unit.worktree)
         record = staff.snapshot()
-        self.assertEqual((morty.worktree, brain.worktree), (folder, folder))
+        self.assertEqual((fixture_keeper.worktree, fixture_organizer.worktree), (folder, folder))
         self.assertIsNone(record.by_worktree("natedev", self.root / "unowned"))
         self.assertEqual(record.by_worktree("natedev", checkout / "src"), unit)
 

@@ -838,7 +838,7 @@ raise SystemExit(1)
                 if outcome == "ancestor":
                     # A producer's launch folder is not a checkout; it keeps no branch.
                     (self.root / "producer-folder").mkdir()
-                    _ = staff.ensure("producer", name="dwight", runtime_id=fixture_runtime_id("dwight"),
+                    _ = staff.ensure("producer", name="fixture-planner", runtime_id=fixture_runtime_id("fixture-planner"),
                                      worktree=staff.PresentWorktree(local_machine(), self.root / "producer-folder"))
                 if outcome == "merge-branch":
                     doc = self.root / "other-production.md"

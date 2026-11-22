@@ -286,7 +286,7 @@ A completed recovery rerun restores the workers again.
 
 ## Producer launch and admission
 
-`resume morty`, `resume brain`, and `resume dwight` use `stop_resume.resume`.
+`resume NAME` and `resume STAFF_ID` use `stop_resume.resume`.
 Account moves and restart share the same resume arguments, account selection, and pane launch code.
 Each producer uses its own tab in the `producers` workspace of the shared herdr session.
 `config/staff.conf` supplies the workspace through `PRODUCER_WORKSPACE`.
@@ -304,17 +304,8 @@ First admission binds the new conversation to the existing producer row.
 A retry uses the saved admission record to complete the launch or bind the live conversation.
 If an interruption occurs after tab creation and before the admission write, a retry can leave an extra shell tab open.
 
-`models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
-The configured lines are:
-
-```ini
-[producers]
-morty=claude:fable:high
-brain=claude:fable:high
-dwight=claude:fable:high
-```
-
-These model names are aliases that the shared model registry resolves.
+`models_registry.launch_settings("producers", staff_id)` validates the `family:model:effort` value for that staff ID.
+The shared model registry resolves the model aliases.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
 An admitted producer's same-family resume uses `member_account.resume_account`.
 Both functions select the workers account for Codex.
@@ -362,12 +353,14 @@ The reader finds transcripts through `scripts/lib/transcripts.py` and reads from
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
 The create command validates the name and records its profile and README text before it writes them.
-The staff owner publishes the creation machine and creation ID under `[producer_creations]` with the profile.
+Use only lower-case letters, digits, and hyphens in a new producer name.
+The local creation record keeps the profile.
+The staff owner publishes the creation machine and ID under `[producer_creations]`.
 The staff owner compares names without case distinctions and refuses a claim when a marker or staff row exists.
 The staff owner checks the current marker before removal.
 A pending creation requires the local creation record on that machine.
 Resume on another machine names the machine that holds the record and gives the `add-producer` command.
-It creates the README from `templates/producer/README.md` when the README is absent.
+The command creates the README from `templates/producer/README.md` when the README is absent.
 The first conversation receives a prompt to read the README and run `/producer:produce`.
 The creation record keeps the time for prompt recovery after a failed start.
 Resume accepts a matching Codex user turn even when the turn has no timestamp.
@@ -380,32 +373,80 @@ The command reports the staff id, account and tab.
 
 ### Rename or retire a producer
 
-`agents rename OLD NEW` moves the registry key and retains the staff id.
-If the old name no longer belongs to the saved staff id, the retry keeps the old key.
-It updates the session label and tab title.
-The staff document path still names the original folder.
+`agents rename OLD NEW` changes the producer's name and retains its staff ID, profile, and native conversation.
+It requires a stopped native conversation.
+Close Obsidian before you run a rename that moves the folder.
+The command moves the folder when the recorded worktree is `PRODUCER_FOLDER_ROOT/<old name>`.
+It updates full paths and standard inline and wiki link destinations in Markdown notes.
+It can change a path in unusual code blocks, such as indented code after an HTML block.
+Other files keep their bytes, including `.gitignore` and `workspace.json`.
+It can also update destination text that does not form a valid link.
+It scans the vault text for remaining references to the old folder, including those in code.
+The command reports each remaining path with its file and line. The rename still completes.
+For a Claude folder move, it moves the native transcript to the new project path.
+For any other recorded worktree, it keeps the recorded document and worktree paths.
 Rename and retire refuse while the producer has a pending admission.
 
 `agents retire NAME [--to PRODUCER]` requires a handoff file and no open questions.
+`page.list.owner` identifies the protected producer and the default handoff destination.
 Without `handoff.md`, it asks the producer for the file and returns.
 The command stops the conversation and closes its tab before it reads the open List items.
 It moves those items with log source `agents retire` and tells each item's showrunner.
-The retirement receipt keeps the profile, session id, and notices.
+The retirement receipt keeps the profile, session ID, destination staff ID, and notices.
 The command records notice delivery after the send succeeds.
 A retry refuses if the producer has a different session id.
-The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
+The command removes the staff ID from `[producers]` after it confirms that no open List items refer to it.
 The staff row keeps the profile in `retired_producer`.
 Active staff lookups omit retired producers.
-The fixed-id lookup supplies their names for closed List items.
+The staff ID lookup supplies their names for closed List items.
 `agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+
+### Native resume check after a producer rename
+
+Use the normal producer commands with a test account for each backend.
+Set `CONF_DIR` to a scratch copy of the config directory.
+Set `PRODUCER_FOLDER_ROOT` in the scratch `staff.conf` before creating either producer.
+Use scratch paths for `STAFF_FILE`, `MODELS_CONFIG_FILE`, and `HERDR_PANE_RECORD_DIR`.
+Set `MODELS_CONFIG_PUBLISH=0`.
+Use a separate Herdr session and isolated native transcript stores.
+
+**Claude**
+
+1. Create a Claude producer under the scratch root with `agents add-producer`.
+2. Send a unique marker in the native Claude pane.
+3. Record the staff ID and the native session ID.
+4. Stop the producer.
+5. Compress its exact project transcript with `zstd --rm`.
+6. Verify that the old project has only the compressed transcript for that ID.
+7. Run `agents rename OLD NEW`.
+8. Verify that the compressed transcript moved to the project for the new folder.
+9. Run `agents resume NEW`.
+10. Verify that the native pane uses the new worktree.
+11. Send a second unique marker in the native pane.
+12. Verify that the new project’s native transcript has both user turns under the original session ID.
+13. Verify that the renamed producer has the original staff ID.
+
+**Codex**
+
+1. Create a Codex producer under the scratch root with `agents add-producer`.
+2. Send a unique marker in the native Codex pane.
+3. Record the staff ID and the native thread ID.
+4. Stop the producer.
+5. Record the rollout path in the Codex thread store.
+6. Run `agents rename OLD NEW`.
+7. Verify that the rollout still uses that path.
+8. Run `agents resume NEW`.
+9. Verify that the native pane uses the new worktree.
+10. Send a second unique marker in the native pane.
+11. Verify that the native rollout has both user turns under the original thread ID.
+12. Verify that the renamed producer has the original staff ID.
 
 ### First start
 
-`ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
-It is separate from an admitted `StaffRow`.
+`ProducerFirstStart(name, folder)` carries a producer request through admission.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
-The first start requires `<root>/<name>/README.md`.
-Dwight uses `~/rust/hanadocs/dwight/README.md`.
+A new producer uses `<root>/<name>/README.md`.
+An admitted producer reads the README from its recorded document folder.
 
 The first-start path uses this order:
 
@@ -413,11 +454,12 @@ The first-start path uses this order:
 2. Adopt one proved live session with the producer name before a new reservation.
 3. Reserve the producer's tab in the configured workspace.
 4. Save `PendingProducerAdmission(pane, terminal, kind, home)` at `_producer_admission_path(name)`.
-5. Start without a resume argument through `restart.producer_first_arguments(name)`.
+5. Build the launch arguments from the saved creation profile or the admitted staff ID.
 6. Prove the native identity through `Herdr.producer_admission_launch`.
 7. Admit the row through `staff.ensure("producer", ..., runtime_id=identity)`.
-8. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
-9. Remove the pending admission record after publication succeeds.
+8. Publish the saved profile by staff ID.
+9. Publish the retained binding through `pane_launch.staff_admitted` under `producer_start`.
+10. Remove the pending admission record after publication succeeds.
 
 `producer_conflicts` uses `sessions.running_sessions`, the Codex index, and loaded daemon threads.
 It checks live agents in producer workspace tabs and panes with the producer label.
@@ -425,6 +467,7 @@ An empty labeled shell does not count as a live session.
 `adopt_named_producer` adopts exactly one proved native conversation without a launch.
 It records that session as `current_session` and preserves its account and working folder.
 It records the configured producer folder as the document location.
+It publishes the saved profile by staff ID before it binds the pane.
 It publishes a retained binding when the live session has a proved pane.
 Two live sessions cause refusal before any staff write or launch.
 An unproved live session also causes refusal.
@@ -449,7 +492,7 @@ If an admission is pending, transfer asks the user to run `agents resume NAME` f
 3. Refuse a Claude caller outside the selected producer account. Print the `agents move` command.
 4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
 5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
-6. Publish `[producers].NAME` through `models_registry.store_producer`.
+6. Publish `[producers].STAFF_ID` through `models_registry.store_producer`.
 7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
 8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
 
@@ -621,7 +664,7 @@ Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
-The selection includes producers, such as brain, morty, and dwight.
+The selection includes active producers.
 A complete unscoped read prunes recorded rows whose sessions still run.
 Each prune checks current liveness again while it holds the row lock.
 A refused row lock preserves the entry.

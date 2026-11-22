@@ -16,7 +16,7 @@ from scripts.accounts import accounts
 from scripts.agents import pane_record, remote, restart, shutdown, shutdown_record, stop_resume, test_stop_resume, worker_lifecycle
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
-from scripts.lib import operation_deadline
+from scripts.lib import operation_deadline, transcripts
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.production import gate, staff
@@ -162,11 +162,15 @@ class UpkeepTests(unittest.TestCase):
         rows = {name: fixture_member("producer", name=name,
                     worktree=staff.PresentWorktree(other if name == "remote" else machine, folder))
                 for name, folder in folders.items()}
+        for name in ("alpha", "failed"):
+            project = case.root / ".claude3/projects" / transcripts.claude_project_key(folders[name])
+            project.mkdir(parents=True)
+            (project / f"{rows[name].current_session}.jsonl").touch()
         _ = staff.set_hold(str(rows["paused"].id), staff.Paused("now", "user", "keep stopped"))
         _ = staff.set_hold(str(rows["exited"].id), staff.Exited("now", "user", "keep stopped"))
         _ = write_registry(case.root / "configuration/models.conf", {"producers": {
-            name: "codex:gpt-test:high" if name == "own-codex" else
-                  "invalid" if name == "invalid" else "claude:opus:max" for name in rows}})
+            row.id: "codex:gpt-test:high" if name == "own-codex" else
+                    "invalid" if name == "invalid" else "claude:opus:max" for name, row in rows.items()}})
         ready = False
         restores: list[str] = []
         attempts: list[str] = []

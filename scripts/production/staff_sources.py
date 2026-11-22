@@ -27,7 +27,8 @@ from scripts.production import staff, unit_config, session_staff  # noqa: E402
 from scripts.herdr import pane_launch  # noqa: E402
 from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.message import morty_identity, sessions  # noqa: E402
+from scripts.message import morty_identity as list_identity  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 
 
@@ -170,9 +171,9 @@ class CodexProcessThreads:
         self.conversations: dict[HerdrPlace, herdr.ProvedMatch[str] | herdr.UnknownPaneOwner] = {}
 
     @cached_property
-    def morty(self) -> morty_identity.MortyHolder | morty_identity.NoMortyHolder:
+    def list_producer(self) -> list_identity.ListProducerHolder | list_identity.NoListProducerHolder:
         """One staff read serves every process of a report."""
-        return morty_identity.holder()
+        return list_identity.holder()
 
     def _foreground(self, place: HerdrPlace) -> herdr.ForegroundPaneAgent | herdr.ObservedEmpty | herdr.UnknownPaneOwner:
         from scripts.herdr import herdr
@@ -233,7 +234,7 @@ class CodexProcessThreads:
             except (OSError, ValueError, herdr_types.HerdrFailure):
                 pass
         return session_staff.ReportProcessIdentity(
-            native, bool(native) and self.morty == morty_identity.MortyHolder(staff.StaffId(native)))
+            native, bool(native) and self.list_producer == list_identity.ListProducerHolder(staff.StaffId(native)))
 
 
 @dataclass(frozen=True)
@@ -334,7 +335,7 @@ class _WorkerSources:
                         self.codex_scan_incomplete = True
                         _problem(f"Codex process {process.pid}", reason, pid=process.pid)
                     case herdr.ProvedMatch(owner=native):
-                        if (not session_staff.report_process(process.pid, native).is_morty
+                        if (not session_staff.report_process(process.pid, native).is_list_producer
                                 and record.by_current_session(native) is not None):
                             self.native_running[native] = {"codex": native}
                     case NoStandaloneCodexThread():

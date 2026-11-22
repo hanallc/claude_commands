@@ -2,7 +2,7 @@
 
 `/remove_command <command name> [--dry-run]` removes a command and every part that only it uses.
 With `--dry-run`, it reports the impact and stops after step 3.
-It deletes nothing, edits no file, runs no test and sends no morty notice.
+It deletes nothing, edits no file, runs no test and sends no List notice.
 The report states that this is a dry run and nothing changed.
 It is a prompt only, in `commands/remove_command.md`, with no script and no test.
 Its first use removed `/ask_a_friend`.
@@ -41,7 +41,7 @@ The command gives seven steps:
    A requested board post holds at most 900 characters.
 4. **Remove.** Resolve shared dependencies and move shared fixtures to live values before the config they use is deleted. Move a removed CLI path's tests to the live function they also cover. Keep every assertion that checks live behavior. Rename test names and labels that name the command.
 5. **Verify.** Run the tests of every changed module and of its shared callers and importers. Lint every changed Python file. Repeat every search; only `history`, `shared` and `permission` hits stay.
-6. **Notify morty.** After the removal commit exists, send morty the command name, the commit hash and the removed support through `send.py --to morty`, for its tracking list. Show the `send.py` result.
+6. **Notify the List producer.** Resolve `page.list.owner`. After the commit, send the command name, commit hash, and removed support with `send.py --to staff:<id>`. Show the result.
 7. **Change-Review.** The commit carries `Change-Review: /<command name> is removed | <machine>, any session: type /<command name> | The command is not in the command list`.
 
 ## Invariants

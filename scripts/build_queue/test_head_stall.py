@@ -19,11 +19,13 @@ from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
 from scripts.buildlog import cli, mac_idle, sample
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
+from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, write_config_fixture
 
 GIB = records.GIB
 NOW = 1_800_000_000.0
 LIMIT = 30 * 60
+PRODUCER_ID = "00000000-0000-4000-8000-000000000007"
+PRODUCER_RECIPIENT = f"staff:{PRODUCER_ID}"
 IDLE_SCOPE = Path("/cgroup/builds.slice/idle.scope")
 COMPILER_SCOPE = records.ScopeSource(IDLE_SCOPE.parent / "sccache.service", frozenset({7}))
 COMPILER_SCOPE_UNAVAILABLE = records.NoSource()
@@ -235,6 +237,7 @@ class LastAdmissionTests(unittest.TestCase):
 
 class WatchTests(unittest.TestCase):
     paths: head_stall.StallPaths = head_stall.StallPaths(Path(), Path())
+    config: Path = Path()
     sent: list[tuple[list[str], str]] = []
 
     @override
@@ -242,9 +245,13 @@ class WatchTests(unittest.TestCase):
         folder = self.enterContext(tempfile.TemporaryDirectory())
         self.paths = head_stall.StallPaths(Path(folder) / "admission", Path(folder) / "head_stall.json")
         self.paths.admission.mkdir()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(Path(folder) / "config"))))
-        _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
+        self.config = Path(folder) / "config"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.config))))
+        self.set_producer_recipient(PRODUCER_ID)
         self.sent = []
+
+    def set_producer_recipient(self, identity: str) -> None:
+        _ = write_config_fixture(self.config / "build_admission.conf", f"head_stall_alert_producer_id={identity}\n")
 
     def run_send(self, result: bool) -> Callable[[list[str], str], bool]:
         def run(command: list[str], text: str) -> bool:
@@ -282,7 +289,7 @@ class WatchTests(unittest.TestCase):
         write_queue_snapshot(self.paths.admission, STALLED.inputs, STALLED.policy)
         _ = head_stall.watch_once(self.paths, NOW)
         _ = head_stall.watch_once(self.paths, NOW + 60)
-        self.assertEqual(self.sent_recipients(), ["builds", "bob", "bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", PRODUCER_RECIPIENT, PRODUCER_RECIPIENT])
         self.assertEqual(self.sent[1][0], self.sent[2][0])
 
     def test_a_queued_alert_does_not_repeat(self) -> None:
@@ -290,7 +297,7 @@ class WatchTests(unittest.TestCase):
         write_queue_snapshot(self.paths.admission, STALLED.inputs, STALLED.policy)
         _ = head_stall.watch_once(self.paths, NOW)
         _ = head_stall.watch_once(self.paths, NOW + 60)
-        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", PRODUCER_RECIPIENT])
         self.assertEqual([argv[argv.index("--key") + 1] for argv, _ in self.sent],
                          [f"head-stall-{NOW - 3 * 3600}"] * 2)
 
@@ -301,7 +308,7 @@ class WatchTests(unittest.TestCase):
             _ = head_stall.watch_once(self.paths, NOW)
         self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": NOW - 3 * 3600})
         _ = head_stall.watch_once(self.paths, NOW + 60)
-        self.assertEqual(self.sent_recipients(), ["builds", "bob", "bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", PRODUCER_RECIPIENT, PRODUCER_RECIPIENT])
 
     def test_pending_and_retry_outcomes_retry_until_acceptance(self) -> None:
         self.mock_send_outcomes((5, "PENDING"), (6, "RETRY"), (0, "KEPT"), (0, "SKIPPED"))
@@ -310,9 +317,9 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(self.paths.state.exists())
         _ = head_stall.watch_once(self.paths, NOW + 60)
         _ = head_stall.watch_once(self.paths, NOW + 120)
-        self.assertEqual(self.sent_recipients(), ["builds", "bob", "builds", "bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", PRODUCER_RECIPIENT, "builds", PRODUCER_RECIPIENT])
 
-    def test_four_heads_in_one_stall_alert_builds_and_bob_once(self) -> None:
+    def test_four_heads_in_one_stall_alert_builds_and_the_producer_once(self) -> None:
         self.admit_at(NOW - 32 * 60)
         for index, minutes in enumerate((0, 18, 19, 32)):
             now = NOW + minutes * 60
@@ -322,7 +329,7 @@ class WatchTests(unittest.TestCase):
             stall = self.observe(queue, now)
             self.assertIsInstance(stall, head_stall.HeadStall)
 
-        self.assertEqual([command[command.index("--to") + 1] for command, _ in self.sent], ["builds", "bob"])
+        self.assertEqual([command[command.index("--to") + 1] for command, _ in self.sent], ["builds", PRODUCER_RECIPIENT])
 
     def test_one_alert_per_stall_and_a_new_stall_alerts_again(self) -> None:
         _ = self.observe(STALLED, NOW)
@@ -336,12 +343,12 @@ class WatchTests(unittest.TestCase):
         later = self.observe(STALLED, admission + LIMIT)
         assert isinstance(later, head_stall.HeadStall)
         self.assertEqual(len(self.sent), 4)
-        (builds, builds_message), (bob, bob_message) = self.sent[2:]
+        (builds, builds_message), (producer, producer_message) = self.sent[2:]
         recipient = builds.index("--to") + 1
         self.assertEqual(builds[recipient], "builds")
-        self.assertEqual(bob, [*builds[:recipient], "bob", *builds[recipient + 1:]])
+        self.assertEqual(producer, [*builds[:recipient], PRODUCER_RECIPIENT, *builds[recipient + 1:]])
         self.assertEqual(builds_message, head_stall.builds_text(later))
-        self.assertEqual(bob_message, builds_message)
+        self.assertEqual(producer_message, builds_message)
         self.assertEqual(builds[builds.index("--key") + 1], f"head-stall-{admission}")
 
     def test_failed_sends_retry_on_the_next_minute(self) -> None:
@@ -351,7 +358,7 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(self.paths.state.exists())
         _ = self.observe(STALLED, NOW + 60)
         self.assertEqual(len(self.sent), 4)
-        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, "bob": last_start})
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, PRODUCER_RECIPIENT: last_start})
 
     def test_a_snapshot_gap_and_an_older_holder_do_not_repeat_an_alert(self) -> None:
         later_holder = replace(holder(NOW - 3600), pid=706238)
@@ -369,20 +376,61 @@ class WatchTests(unittest.TestCase):
             with self.subTest(saved=saved):
                 _ = self.paths.state.write_text(json.dumps({"alerted": saved, "at": NOW}))
                 self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
-                self.assertEqual(self.sent_recipients(), ["bob"])
+                self.assertEqual(self.sent_recipients(), [PRODUCER_RECIPIENT])
                 self.sent.clear()
                 self.assertIsInstance(self.observe(STALLED, NOW + 120), head_stall.HeadStall)
                 self.assertEqual(self.sent, [])
 
-    def test_a_legacy_delivery_record_still_allows_bobs_first_alert(self) -> None:
+    def test_a_legacy_delivery_record_still_allows_the_first_producer_alert(self) -> None:
         last_start = NOW - 3600 + 0.25
         self.admit_at(last_start)
         _ = self.paths.state.write_text(json.dumps({"alerted": last_start, "at": NOW}))
         self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)
-        self.assertEqual(self.sent_recipients(), ["bob"])
-        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, "bob": last_start})
+        self.assertEqual(self.sent_recipients(), [PRODUCER_RECIPIENT])
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, PRODUCER_RECIPIENT: last_start})
         self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
-        self.assertEqual(self.sent_recipients(), ["bob"])
+        self.assertEqual(self.sent_recipients(), [PRODUCER_RECIPIENT])
+
+    def test_legacy_producer_receipt_applies_only_to_the_rollout_staff_id(self) -> None:
+        last_start = NOW - 3600
+        self.admit_at(last_start)
+        receipts = {"builds": last_start, head_stall.LEGACY_RECEIPT: last_start}
+        _ = self.paths.state.write_text(json.dumps({"alerted": receipts}))
+        self.set_producer_recipient(head_stall.ROLLOUT_RECIPIENT.removeprefix("staff:"))
+        _ = self.observe(STALLED, NOW)
+        self.assertEqual(self.sent_recipients(), [])
+
+        self.set_producer_recipient(PRODUCER_ID)
+        _ = self.observe(STALLED, NOW + 60)
+        self.assertEqual(self.sent_recipients(), [PRODUCER_RECIPIENT])
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {**receipts, PRODUCER_RECIPIENT: last_start})
+
+    def test_rollout_staff_receipt_takes_precedence_over_the_legacy_receipt(self) -> None:
+        last_start = NOW - 3600
+        self.admit_at(last_start)
+        self.set_producer_recipient(head_stall.ROLLOUT_RECIPIENT.removeprefix("staff:"))
+        receipts = {"builds": last_start, head_stall.LEGACY_RECEIPT: last_start,
+                    head_stall.ROLLOUT_RECIPIENT: last_start - 60}
+        _ = self.paths.state.write_text(json.dumps({"alerted": receipts}))
+        _ = self.observe(STALLED, NOW)
+        _ = self.observe(STALLED, NOW + 60)
+        self.assertEqual(self.sent_recipients(), [head_stall.ROLLOUT_RECIPIENT])
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"],
+                         {**receipts, head_stall.ROLLOUT_RECIPIENT: last_start})
+
+    def test_unreadable_receipts_prevent_sends(self) -> None:
+        self.paths.state.mkdir()
+        with self.assertRaises(OSError):
+            _ = self.observe(STALLED, NOW)
+        self.assertEqual(self.sent, [])
+
+    def test_invalid_producer_id_still_sends_to_builds(self) -> None:
+        self.set_producer_recipient("invalid")
+        diagnostics = StringIO()
+        with redirect_stderr(diagnostics):
+            _ = self.observe(STALLED, NOW)
+        self.assertEqual(self.sent_recipients(), ["builds"])
+        self.assertIn("producer recipient unavailable", diagnostics.getvalue())
 
     def test_state_write_failures_do_not_stop_sends_and_report_once(self) -> None:
         diagnostics = StringIO()
@@ -402,7 +450,7 @@ class WatchTests(unittest.TestCase):
               mock.patch.object(head_stall, "write_text_atomic", side_effect=fail_write),
               redirect_stderr(diagnostics)):
             self.assertEqual(cli.main(["sample"]), 0)
-        self.assertEqual(attempts, [["builds"], ["builds", "bob"]])
+        self.assertEqual(attempts, [["builds"], ["builds", PRODUCER_RECIPIENT]])
         self.assertEqual(diagnostics.getvalue().splitlines(),
                          ["buildlog sample: head-stall check failed: fixture cannot write alert state"])
 

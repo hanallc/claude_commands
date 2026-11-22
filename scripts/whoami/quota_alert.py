@@ -727,29 +727,36 @@ def _worker_mode_text(active: bool) -> str:
 
 
 def _broadcast_worker_mode(active: bool) -> None:
-    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers.
+    """Announce the mode after the state lock closes.
 
-    Each producer in `no_worker_mode_fyi` gets one copy marked as information only.
+    Send one FYI copy per configured staff ID. Stop Codex workers when the mode starts.
     """
+    from scripts.production import staff
+
     def notice() -> list[str]:
         text = _worker_mode_text(active)
         return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
     try:
-        producers = conf.read("accounts").text("no_worker_mode_fyi").split()
+        producer_ids = conf.read("accounts").words("no_worker_mode_fyi_staff_ids", allow_blank=True)
     except conf.Unusable as error:
         print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
-        producers = []
-    for producer in producers:
-        _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
+        producer_ids = ()
+    for producer_id in dict.fromkeys(producer_ids):
+        try:
+            recipient = f"staff:{staff.native_id(producer_id)}"
+        except staff.StaffRefused as error:
+            print(f"quota-alert: no-worker mode FYI failed: {error}")
+            continue
+        _start_detached(f"no-worker mode FYI to {recipient}", "message/send.py", _fyi(recipient, active))
     if active:
         _start_detached("Codex worker stop", "production/worker_capacity.py", lambda: ["stop"])
 
 
-def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
+def _fyi(recipient: str, active: bool) -> Callable[[], list[str]]:
     def arguments() -> list[str]:
-        return ["--to", producer, "--from", NO_WORKER_MODE_SENDER,
+        return ["--to", recipient, "--from", NO_WORKER_MODE_SENDER,
                 "--text", f"{NO_WORKER_MODE_FYI} {_worker_mode_text(active)}"]
     return arguments
 

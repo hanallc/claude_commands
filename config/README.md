@@ -370,7 +370,7 @@ The reader makes one scheduled query each day.
 AWS charges USD 0.01 for each page of the answer.
 The 45-day answer can take more than one page.
 The ledger records the actual fee for each read.
-`cost_explorer_change_recipient=bob` names the session that receives notices of changes to settled amounts.
+`cost_explorer_change_recipient_id` gives the staff ID that receives notices about changes to settled costs and gaps in billed hours.
 
 Both the controller and the gate worker use one Cost Explorer reader.
 It requests daily `UnblendedCost` and `UsageQuantity` for the account, grouped by `USAGE_TYPE`, and reads every page.

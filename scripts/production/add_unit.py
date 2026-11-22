@@ -1392,6 +1392,7 @@ def _main(argv: list[str]) -> int:
         from scripts.accounts import moves
 
         request = launch_request(args)
+        staff.require_no_producer_rename(request.unit_id)
         session = request.session
         with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id),
                                       join_recovery=cast(bool, args.join_recovery_locks))

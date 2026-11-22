@@ -729,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
                     or producer_lifecycle.pending_admission(options.old)
                     or producer_lifecycle.lookup(options.old, staff.initial_snapshot()) is not None):
                 if options.to_doc or options.to_branch:
-                    raise ValueError("producer rename keeps the document folder and has no branch option")
+                    raise ValueError("producer rename derives the document path and has no branch option")
                 return producer_lifecycle.rename(options.old, options.new, rename_repair_displays)
             return rename_named_member(options.old, options.new, to_doc=options.to_doc, to_branch=options.to_branch)
         if options.command == "retire":
@@ -1988,6 +1988,7 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     row = rename_member(old, new, record)
     if row.kind == "worker":
         staff.validate_name(row.kind, new)
+        staff.require_no_producer_rename(new)
         return RenamePlan(row, new, KeepDocBranch())
     if row.kind not in {"showrunner", "unit"}:
         raise staff.StaffRefused(f"{old}: the staff row is a {row.kind}, not a showrunner")
@@ -1998,6 +1999,7 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         if name != row.name:
             staff.validate_unit_name_for_write(name)
         staff.validate_name(row.kind, name)
+        staff.require_no_producer_rename(name)
         if any(other.id != row.id and other.name == name and other.parent == row.parent
                for other in record.find(kind="unit")):
             raise staff.StaffRefused(f"unit name already exists: {name}")
@@ -2017,6 +2019,7 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     if bool(to_doc) != bool(to_branch):
         raise RenameRefused("--to-doc and --to-branch are required together")
     staff.validate_name(row.kind, new)
+    staff.require_no_producer_rename(new)
     if any(other.id != row.id and other.name == new
            for other in record.find(kind="showrunner")):
         raise staff.StaffRefused(f"{new}: a showrunner already has this name")
@@ -2253,6 +2256,7 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
     if request.member.kind == "unit":
         return rename_apply_unit(request)
     with staff.operation():
+        staff.require_no_producer_rename(request.name)
         if request.member.kind == "worker":
             _ = staff.rename(request.member.id, request.name)
             print("done" if request.member.name != request.name else "unchanged")
@@ -2293,6 +2297,8 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         changed = row.name != request.name
         if changed:
             staff.validate_unit_name_for_write(request.name)
+        staff.validate_name("unit", request.name)
+        staff.require_no_producer_rename(request.name)
         replaced_pending = False
         pending = unit_move.pending_rename(row.id)
         if pending is not None and (pending.name != request.name or isinstance(request.move, UnitBranchMove)

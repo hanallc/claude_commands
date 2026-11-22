@@ -244,6 +244,37 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual((new_build / new.name / "artifact").read_text(), "cached")
         self.assertEqual(unit_move.checkout_folders(new).git_dir, saved_entry)
 
+    def test_managed_rename_refuses_a_producer_root_inside_a_moved_folder(self) -> None:
+        workspace = self.root / "worktrees"
+        build = self.root / "build"
+        config = Path(self.env["CONF_DIR"])
+        _ = write_config_fixture(config / "build_folders.conf",
+                                 f"roots.workspace={workspace}\nroots.build={build}\nroots.build.natedev={build}\n")
+        repo = build_folders.repo_word(self.source)
+        old = build_folders.worktree_path(repo, self.old_name, "edit")
+        new = build_folders.worktree_path(repo, self.new_name, "edit")
+        old.parent.mkdir(parents=True)
+        _ = self.git("worktree", "move", str(self.source), str(old))
+        owner = staff.set_worktree(self.owner.id, staff.PresentWorktree(remote.local_machine(), old),
+                                   expected=self.owner.worktree)
+        moved_folders = (old.parent, new.parent, build_folders.unit_folder(repo, self.old_name),
+                         build_folders.unit_folder(repo, self.new_name))
+        external_root = self.root / "external-producer-root"
+        external_root.mkdir()
+        linked_root = old.parent / "producer-link"
+        linked_root.symlink_to(external_root, target_is_directory=True)
+        producer_roots = [folder / "producer-root" for folder in moved_folders]
+        for producer_root in (*producer_roots, linked_root):
+            with self.subTest(producer_root=producer_root):
+                _ = write_config_fixture(config / "staff.conf", f"PRODUCER_FOLDER_ROOT={producer_root}\n")
+                with self.assertRaisesRegex(unit_move.RenameRefused, "unit moves cannot use the producer folder root"):
+                    _ = unit_move.prepare_rename(owner, new, unit_move.KeepBranch.CURRENT, self.new_name)
+                self.assertIsNone(unit_move.pending_rename(owner.id))
+                self.assertEqual(staff.by_id(owner.id), owner)
+                self.assertTrue((old / ".git").is_file())
+                self.assertFalse(new.parent.exists())
+        self.assertEqual(linked_root.readlink(), external_root)
+
     def test_processes_inside_reads_the_selected_process_root(self) -> None:
         process_root = self.root / "selected-proc"
         process_root.mkdir()

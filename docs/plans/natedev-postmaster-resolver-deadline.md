@@ -90,7 +90,9 @@ The user, 2026-11-21 (typed "go" in the postmaster pane): "go" for the pushes th
 
 ### Phase 3 — A push text that nate approves in words passes review  · status: todo
 
-List item 180 (producer morty). Design: `/session/postmaster/run/1965ff92-8600-4c23-8a41-ad0d87146d77/l180_design.md`. The hook change and the nate_style rule start only on nate's go typed in the postmaster pane. The security unit reads the design before code.
+The List producer owns item 180. The design is in `/session/postmaster/run/1965ff92-8600-4c23-8a41-ad0d87146d77/l180_design.md`.
+Start the hook change and the nate_style rule after Nate types approval in the postmaster pane.
+Read the design before the security unit changes the code.
 
 #### Work Order
 

@@ -228,8 +228,8 @@ is one changed path in `config/test_times.conf` (`TOP_AWS_CHECKOUT`), which aws 
    ("Name 2 gate-box").
 
 The verify unit first wrote items 5 and 6 as approved when builds wrote "your calls stand". The user had not seen
-them; morty then put them to the user. Decisions 5, 6 and 7 (exact matchers, `GATE_*` variables, the state
-folder `~/.local/state/gate`) are unit calls; morty tells the user each one in one line.
+them. The List producer sends them to the user. Decisions 5, 6 and 7 (exact matchers, `GATE_*` variables, the state
+folder `~/.local/state/gate`) are unit decisions. The List producer tells the user each decision in one line.
 
 ## What sdlc agreed (2026-11-16, through builds)
 

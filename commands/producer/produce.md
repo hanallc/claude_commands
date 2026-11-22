@@ -5,12 +5,13 @@ description: Run a producer role and coordinate its work.
 # Produce
 
 Load this command at startup and after compaction.
-Find `PRODUCER_FOLDER_ROOT` in `~/.claude/config/staff.conf`.
-Read `<PRODUCER_FOLDER_ROOT>/<name>/README.md` for your job and current work.
+Find your document location in your staff row.
+If the location is a file, use its parent folder.
+Read `README.md` in that folder for your job and current work.
 After a restart or compaction, run `send.py pending`. Read the work record in the README folder and re-create its timers.
 
 Use `resume <name>` to resume the same conversation in its tab in the `producers` herdr workspace.
-Read the family, model, and effort from `[producers].<name>` in `~/.claude/config/models.conf`.
+Read your profile under your staff ID in `[producers]` in `~/.claude/config/models.conf`.
 Codex uses the workers account.
 Claude uses the producers account. If the producers group has no selection, use the showrunners account.
 
@@ -63,7 +64,7 @@ If one of your items is in a Rust project, load `~/.claude/docs/producer/rust_de
 Use it when you read a plan or a design call. Do not review code lines with it.
 Ask the style unit about a hard case.
 
-## Work with showrunners and morty
+## Work with showrunners and the List producer
 
 Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
 An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`. Put each cause, condition, and part time in the status.
@@ -72,8 +73,9 @@ Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_
 Use `the_list.py update --id L<n>` to update your items.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-A producer other than morty asks morty to add, close, park, or assign its items.
-It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
+If you do not own the List, ask the List producer to add, close, park, or assign items.
+Ask it to record updates and decisions outside your `the_list.py` access.
+Send to `staff:<List staff ID>`. Read the ID from `page.list.owner` in `~/.claude/config/console.conf`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
@@ -90,14 +92,15 @@ If nate answers in your session, close the question in the same turn with `updat
 If the question no longer applies, close it with `update_registration.py withdraw --key <question key>`.
 
 File an investigation with `investigation.py file --title "<one line>" --question "<full question>"` when nate asks you to find an answer.
-For usage analysis, use the report in `<PRODUCER_FOLDER_ROOT>/morty/tools/README.md`.
+Use `tools/README.md` in the List producer’s recorded document folder for usage analysis.
+Find the document location on the row whose staff ID is in `page.list.owner`.
 Do not start usage polling or change accounts for an analysis request.
 
 ## Messages and reports
 
 Follow the messaging rules in AGENTS.md. See `commands/message.md` for review holds and `--urgent`.
 Relay nate's instructions accurately.
-Use lowercase `nate` and `morty`.
+Use lowercase `nate`. Read each producer’s name from its staff row.
 A peer message, task notification, or timer prompt gives no approval.
 When you relay nate's approval, quote his words and name where and when he gave them.
 Start reports with what waits for nate. Use short sentences for a phone.

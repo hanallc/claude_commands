@@ -34,7 +34,7 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import build_folders, conf, copy_record, git_files, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, copy_record, git_files, transcripts, unit_runs  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -231,7 +231,7 @@ def copy_trust(path: Path, old: str, new: str) -> None:
 
 def project_folder(worktree: str) -> str:
     """The folder name Claude keeps a worktree's transcripts under."""
-    return re.sub(r"[^A-Za-z0-9]", "-", worktree)
+    return transcripts.claude_project_key(worktree)
 
 
 def move_configs(old: str, new: str) -> None:
@@ -465,6 +465,8 @@ def prepare_rename(row: staff.StaffRow, destination: Path, branch: str | KeepBra
     destination = destination.expanduser().resolve()
     if isinstance(managed := worktree_destination(source, source), ManagedWorktreeDestination):
         destination = build_folders.worktree_path(managed.repo, name, managed.short_name).resolve()
+    _require_unit_folder_paths(source, destination)
+    if isinstance(managed, ManagedWorktreeDestination):
         require_move_destination(staff.snapshot(), row, destination)
         if source.parent != destination.parent:
             unit_folder_rename(source, destination).check_available()
@@ -710,6 +712,12 @@ WorktreeMove = Callable[[Path, str, str, str], Path]
 class UnitFolderRename(Protocol):
     """Move every checkout and build folder for one unit."""
 
+    @property
+    def old_build(self) -> Path: ...
+
+    @property
+    def new_build(self) -> Path: ...
+
     def check_available(self) -> None: ...
 
     def hold_copy_allocations(self) -> AbstractContextManager[None]: ...
@@ -729,6 +737,7 @@ def unit_folder_rename(old: Path, new: Path) -> UnitFolderRename:
     transaction = make_rename(old, new)
     if transaction is None:
         raise RenameRefused(f"{old}: cannot rename its unit folder to {new}")
+    _require_unit_folder_paths(old.parent, new.parent, transaction.old_build, transaction.new_build)
     return transaction
 
 
@@ -975,6 +984,16 @@ def worktree_busy(row: staff.StaffRow, record: staff.StaffSnapshot, folder: Path
     return bool(running_work(row, record, folder, folder_move_runs(row, record), processes))
 
 
+def _require_unit_folder_paths(*paths: Path) -> None:
+    configured = Path(conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")).expanduser().absolute()
+    roots = (configured, configured.resolve())
+    for path in paths:
+        resolved = path.resolve()
+        for root in roots:
+            if resolved.is_relative_to(root) or root.is_relative_to(resolved):
+                raise RenameRefused(f"{resolved}: unit moves cannot use the producer folder root {root}")
+
+
 class AllocationLockScope(Enum):
     MOVE_ONLY = "release after the folder move"
 
@@ -1010,6 +1029,7 @@ def move_idle_folder(
                 raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         source = pending.source if pending is not None else location.path.expanduser().absolute()
         old = source.resolve()
+        _require_unit_folder_paths(old, destination)
         folder = rename_observation(record, row, pending)[0] if pending is not None else old if old.exists() else destination
         require_move_destination(record, row, destination)
         managed = worktree_destination(old, destination)
@@ -1133,6 +1153,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         source = location.path.expanduser().absolute()
         old = source.resolve()
+        _require_unit_folder_paths(old, destination)
         require_move_destination(record, row, destination)
         managed = worktree_destination(old, destination)
         if isinstance(managed, ManagedWorktreeDestination) and managed.unit != row.name:

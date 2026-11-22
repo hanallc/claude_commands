@@ -1286,7 +1286,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
 
 
 def hold_text(member: staff.StaffRow, *, now: float, zone: ZoneInfo) -> str:
-    """Describe a recorded pause or stop."""
+    """Describe a pause or stop with the actor's name at the time of the hold."""
     hold = member.paused if isinstance(member.paused, staff.Paused) else member.exited
     if isinstance(hold, staff.Active):
         return ""

@@ -69,19 +69,24 @@ A repeated command prints `unchanged` when no cleanup record or selected resourc
 ## Rename or retire a producer
 
 Use `agents rename OLD NEW` to rename a producer.
-The command keeps the staff id and document folder.
-It reports the path of the document folder.
+Stop the producer before you rename it.
+The command keeps the staff ID, launch profile, and native conversation.
+When the recorded worktree is `PRODUCER_FOLDER_ROOT/<old name>`, it moves the folder and updates vault links.
+For any other worktree, the command keeps the recorded paths.
+Close Obsidian before a folder move.
+The command reports the document folder path.
 
 Use `agents retire NAME [--to PRODUCER]` to retire a producer.
 The command requires the producer to close its open questions.
 If the producer has no `handoff.md`, the command requests the file.
 Repeat the command after the file exists.
 The command stops the conversation and closes its tab before it moves open List items.
-Open List items move to the selected producer, or to morty by default.
+Open List items move to the selected producer. The List producer is the default.
 Use `--to` only with a producer whose conversation is live.
 The command retains the conversation and document folder.
 Use `agents resume NAME --retired` to restore the profile and conversation.
-You cannot rename or retire morty.
+`page.list.owner` in `config/console.conf` identifies the List producer by staff ID.
+The command permits a rename of the List producer and refuses its retirement.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.
@@ -144,7 +149,8 @@ See `docs/accounts.md` for account checks and refusals.
 Transfer runs in a session that has no staff row, on the producer's machine.
 It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
 It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
-`--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
+The caller supplies the family.
+`--model` and `--effort` replace the profile under the producer’s staff ID in `[producers]`.
 A Claude caller must use the producers account, or the showrunners account while the producers group has no selection. The refusal gives the `agents move` command.
 After a failure, run the same command again.
 

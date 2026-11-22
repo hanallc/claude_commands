@@ -144,7 +144,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
             for case in cases:
                 with self.subTest(kind=kind, case=case), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    owner = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "TEST-owner", staff.STAFF_ROOT,
+                    owner = staff.StaffRow(staff.native_id("00000000-0000-4000-8000-000000000009"), "producer", "TEST-owner", staff.STAFF_ROOT,
                         current_session=staff.StaffId("native-producer"), home=staff.SessionHome(root / "account"),
                         worktree=staff.PresentWorktree("fixture", root))
                     other = replace(owner, id=staff.StaffId("other-producer"), name="TEST-other",
@@ -152,7 +152,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                     member = replace(owner, id=staff.StaffId("unit"), kind="unit", current_session=staff.StaffId("unit-native"))
                     record = staff.StaffSnapshot((owner, other, member))
                     model = "opus" if kind == "claude" else "gpt-test"
-                    registry = write_registry(root / "models.conf", {"producers": {owner.name: f"{kind}:{model}:high"}})
+                    registry = write_registry(root / "models.conf", {"producers": {owner.id: f"{kind}:{model}:high"}})
                     source = root / "source.json"
                     destination = root / "destination.json" if case in ("different records", "interrupted records", "interrupted then unit write") else source
                     observation = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)

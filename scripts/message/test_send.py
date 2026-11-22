@@ -1186,18 +1186,18 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertEqual(self.log()[-1]["sender_native_id"], send.sender_native_id(expected))
 
 
-    def test_claude_stamp_does_not_show_the_morty_entry_matched_by_from_name(self) -> None:
+    def test_claude_stamp_does_not_show_the_fixture_keeper_entry_matched_by_from_name(self) -> None:
         native = "00000000-0000-4000-8000-000000000002"
-        morty = replace(self.sender_entry(), kind="codex", name="morty",
+        fixture_keeper = replace(self.sender_entry(), kind="codex", name="fixture_keeper",
                         reach=roster.Messageable("codex:00000000-0000-4000-8000-000000000001"),
                         thread=roster.CodexThread("00000000-0000-4000-8000-000000000001"),
                         session=roster.NoClaudeSession())
         with (mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession(native)),
-              mock.patch.object(roster, "roster", return_value=self.recipient_roster([morty], []))):
-            self.assertEqual(self.send("--from", "morty", "--text", "A decision").outcome, "sent")
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([fixture_keeper], []))):
+            self.assertEqual(self.send("--from", "fixture_keeper", "--text", "A decision").outcome, "sent")
         message = self.relayed[-1]
         self.assertEqual(message.stamp, send.ClaudeSender(native))
-        self.assertEqual(message.sender, "morty")
+        self.assertEqual(message.sender, "fixture_keeper")
         self.assertNotIn("Shown sender:", send.agent_text(message))
         self.assertNotIn("Shown sender: sdlc · roles · worker test", send.relay_prompt(message))
 
@@ -1231,8 +1231,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertNotIn("Shown sender:", send.agent_text(self.relayed[-1]))
 
     def test_postmaster_sink_receives_the_stamp_and_no_producer_gets_an_authority_line(self) -> None:
-        self.staff_rows["morty-fixed"] = staff.StaffRow(
-            staff.StaffId("morty-fixed"), "producer", "morty", staff.StaffRoot(),
+        self.staff_rows["fixture_keeper-fixed"] = staff.StaffRow(
+            staff.StaffId("fixture_keeper-fixed"), "producer", "fixture_keeper", staff.StaffRoot(),
             current_session=staff.StaffId("00000000-0000-4000-8000-000000000001"))
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -1345,7 +1345,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         errors = io.StringIO()
         with (mock.patch.dict(os.environ, environment, clear=True), redirect_stderr(errors),
               self.assertRaises(SystemExit) as stopped):
-            _ = send.parse(["--here", "--to", "session:recipient", "--from", "morty",
+            _ = send.parse(["--here", "--to", "session:recipient", "--from", "fixture_keeper",
                             "--forwarded-sender-stamp", "codex:00000000-0000-4000-8000-000000000001",
                             "--text", "Caller text"])
         self.assertEqual(stopped.exception.code, 2)
@@ -1795,7 +1795,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertFalse((self.root / "queue").exists())
 
     def test_nonstaff_live_names_refuse_and_native_addresses_deliver(self) -> None:
-        for target in ("morty", "unowned-name"):
+        for target in ("fixture_keeper", "unowned-name"):
             with self.subTest(target=target):
                 entry = self.claude_row("free-session", target)
                 director = self.claude_row("director-session", "queue")
@@ -1846,7 +1846,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_nonstaff_repeat_notice_uses_the_default_owner(self) -> None:
         self.staff_rows.clear()
         with mock.patch.object(rca, "owner_address", return_value="session:default-owner") as owner:
-            self.assertEqual(send.repeat_notice_owner("morty"), "session:default-owner")
+            self.assertEqual(send.repeat_notice_owner("fixture_keeper"), "session:default-owner")
         owner.assert_called_once_with("")
 
     def test_parent_showrunner_path_uses_staff_current_session(self) -> None:
@@ -1922,7 +1922,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         native = "00000000-0000-4000-8000-000000000002"
         for target, staff_name in (
             ("hierarchies-unit", "hierarchies"),
-            ("morty", "morty"),
+            ("fixture_keeper", "fixture_keeper"),
             ("postmaster reply", ""),
             ("sdlc-merge-gate", "sdlc-merge-gate"),
             ("natedev", "natedev"),
@@ -2341,13 +2341,13 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
-            outcomes = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100").outcome
+            outcomes = [self.send("--text", "Fixture_keeper stopped at 02:00 EDT, pid 100").outcome
                         for _ in range(5)]
         self.assertEqual([cast(repeat_guard.Attempt, call.args[1]).receiver for call in guard.call_args_list], ["staff:bogus"] * 5)
         self.assertEqual(outcomes, ["sent", "sent", "held", "held", "held"])
         self.assertEqual(len(self.relayed), 2)
         self.assertEqual([row["outcome"] for row in self.log()], outcomes)
-        self.assertEqual(self.send("--text", "Morty recovered").outcome, "sent")
+        self.assertEqual(self.send("--text", "Fixture_keeper recovered").outcome, "sent")
 
     def test_named_processes_are_distinct_and_a_busy_guard_admits_delivery(self) -> None:
         for name in ("Ada", "Abe", "Bea"):
@@ -3986,11 +3986,11 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual([row["to"] for row in self.log()], ["session:before", "session:after"])
 
     def test_staff_name_restart_preserves_repeat_window(self) -> None:
-        options = local_options(["--to", "morty", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        options = local_options(["--to", "fixture_keeper", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
         started = send.now()
         for index, identity in enumerate(("before", "after")):
-            entry = self.claude_row(identity, "morty")
-            self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "morty", staff.StaffRoot(),
+            entry = self.claude_row(identity, "fixture_keeper")
+            self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "fixture_keeper", staff.StaffRoot(),
                                                        current_session=staff.StaffId(identity))}
             with (mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])),
                   mock.patch.object(send, "now", return_value=started + timedelta(minutes=index))):
@@ -4255,23 +4255,23 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 1)
 
     def test_name_retry_does_not_remove_an_explicit_recipients_window(self) -> None:
-        entry = self.claude_row("recipient", "morty")
+        entry = self.claude_row("recipient", "fixture_keeper")
         started = send.now()
         options = local_options(["--to", "session:recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
         with (mock.patch.object(send, "now", return_value=started),
               mock.patch.object(roster, "roster", return_value=roster.Roster([entry], []))):
             self.assertEqual(send.send(options).outcome, "sent")
-            self.assertEqual(send.send(options._replace(selection=send.RosterLookup("morty"))).outcome, "sent")
+            self.assertEqual(send.send(options._replace(selection=send.RosterLookup("fixture_keeper"))).outcome, "sent")
             self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual(self.claims("notice"), {"staff:recipient": started.isoformat(), "session:recipient": started.isoformat()})
         self.assertEqual(len(self.relayed), 2)
 
     def test_failed_alias_claim_keeps_an_older_successful_logical_claim(self) -> None:
-        entry = self.claude_row("recipient", "morty")
+        entry = self.claude_row("recipient", "fixture_keeper")
         self.staff_rows.clear()
         started = send.now()
         options = local_options(["--to", "session:recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
-        options = options._replace(recipient_identity=send.LogicalRecipientIdentity("morty"))
+        options = options._replace(recipient_identity=send.LogicalRecipientIdentity("fixture_keeper"))
 
         def overlap(message: send.Message, timeout: float) -> send.Result:
             del message, timeout
@@ -4287,7 +4287,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                   mock.patch.object(send, "relay", overlap)):
                 self.assertEqual(send.send(options._replace(selection=send.RosterLookup("session:recipient"), repeat_minutes=0)).outcome, "failed")
             self.assertEqual(send.send(options).outcome, "skipped")
-        self.assertEqual(self.claims("notice"), {"morty": started.isoformat(), "session:recipient": started.isoformat()})
+        self.assertEqual(self.claims("notice"), {"fixture_keeper": started.isoformat(), "session:recipient": started.isoformat()})
         self.assertEqual(len(self.relayed), 1)
 
     def test_queued_staff_message_reaches_its_new_session_once(self) -> None:
@@ -5863,16 +5863,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.log()[0]["to"], "session:id-1")
 
     def test_a_claude_name_with_different_case_routes_to_its_session_address(self) -> None:
-        recipient = self.claude_row("id-1", "morty")
+        recipient = self.claude_row("id-1", "fixture_keeper")
         with mock.patch.object(roster, "roster", return_value=self.recipient_roster([recipient], [])):
             output = io.StringIO()
             with redirect_stdout(output):
-                code = send.main(["--here", "--to", "Morty", "--from", "test", "--text", "hello by name"])
+                code = send.main(["--here", "--to", "Fixture_keeper", "--from", "test", "--text", "hello by name"])
         self.assertEqual(code, 0)
         self.assertTrue(output.getvalue().startswith("SENT:"), output.getvalue())
         self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'id-1.sock'}"])
         self.assertEqual(self.log()[0]["to"], "session:id-1")
-        self.assertFalse(send.queue_path("Morty").exists())
+        self.assertFalse(send.queue_path("Fixture_keeper").exists())
 
     def test_blind_reviewer_by_name_cannot_send_and_names_its_director(self) -> None:
         reviewer = roster.RosterEntry(
@@ -7634,9 +7634,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_nonstaff_peer_names_refuse_and_addresses_keep_their_transport(self) -> None:
         for address in ("session:peer", "codex:peer-thread", "worker:peer-run/impl"):
-            for target in ("morty", address, "unowned-name"):
+            for target in ("fixture_keeper", address, "unowned-name"):
                 with self.subTest(address=address, target=target):
-                    name = "unowned-name" if target == "unowned-name" else "morty"
+                    name = "unowned-name" if target == "unowned-name" else "fixture_keeper"
                     self.peer([self.row(name, address)])
                     director = self.row("queue", "session:director-session", machine="natedev")
                     self.local = self.recipient_roster([director], [])
@@ -8142,17 +8142,17 @@ class AccountDaemonRoutingTests(unittest.TestCase):
                          {"type": "text", "text": words + "\nSender native id: unavailable"})
 
     def test_a_codex_name_with_different_case_reaches_its_loaded_account_daemon(self) -> None:
-        with self.daemon(self.homes[1], name="morty"):
-            delivered = self.command("send.py", "--here", "--to", "Morty", "--from", "sdlc", "--text", "hello by name")
+        with self.daemon(self.homes[1], name="fixture_keeper"):
+            delivered = self.command("send.py", "--here", "--to", "Fixture_keeper", "--from", "sdlc", "--text", "hello by name")
         self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
-        self.assertEqual(delivered.stdout, "SENT: queued on Codex session morty\n")
+        self.assertEqual(delivered.stdout, "SENT: queued on Codex session fixture_keeper\n")
         self.assert_daemon_payload("hello by name")
-        self.assertFalse((self.root / "state/message/queue/Morty.jsonl").exists())
+        self.assertFalse((self.root / "state/message/queue/Fixture_keeper.jsonl").exists())
         self.assert_queues_unchanged()
 
     def test_names_that_differ_only_in_case_are_ambiguous_even_with_an_exact_match(self) -> None:
-        with self.daemon(self.homes[0], name="Morty"), self.daemon(self.homes[1], name="morty"):
-            for target in ("MORTY", "Morty", "morty"):
+        with self.daemon(self.homes[0], name="Fixture_keeper"), self.daemon(self.homes[1], name="fixture_keeper"):
+            for target in ("FIXTURE_KEEPER", "Fixture_keeper", "fixture_keeper"):
                 with self.subTest(target=target):
                     delivered = self.command("send.py", "--here", "--to", target, "--from", "sdlc", "--text", "hello")
                     self.assertEqual(delivered.returncode, 2, delivered.stdout + delivered.stderr)

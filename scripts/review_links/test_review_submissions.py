@@ -36,7 +36,7 @@ from scripts.production.production_doc import read_production
 from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
-PRODUCER = staff.StaffId("producer-staff")
+PRODUCER = staff.StaffId("64be306a-b29b-48e4-951b-862b4a81940d")
 PNG = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAHUlEQVQ4y2O0bH/6n4ECwESJ5lEDRg0YNWAwGQAA9/QCxAu8SdgAAAAASUVORK5CYII="
 IMAGE = submissions.PastedImage("image/png", PNG)
 EVIDENCE = submissions.BuildStepEvidence(
@@ -198,7 +198,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
 
     def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
-        directory = self.root / "brain"
+        directory = self.root / "planner"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
         self.assertEqual(submissions.proposal_folder(producer),
@@ -264,8 +264,9 @@ class ReviewSubmissionTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
         _ = write_config_fixture(conf.path("console"),
                                  f"page.review.owner={OWNER}\npage.list.owner={PRODUCER}\n")
-        morty = replace(self.members.rows[1], name="morty")
-        members = replace(self.members, rows=(self.members.rows[0], morty))
+        keeper = replace(self.members.rows[1], name="keeper",
+                        doc=staff.LiveDoc(local_machine(), self.root / "unavailable.md"))
+        members = replace(self.members, rows=(self.members.rows[0], keeper))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
         for at, kind in enumerate((submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.INVESTIGATION,
                                    submissions.SubmissionKind.BUG)):
@@ -276,7 +277,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                 folder = (record_store.default_question_folder(PRODUCER) if kind == submissions.SubmissionKind.QUESTION
                           else investigation.folder(PRODUCER))
                 self.assertTrue(saved.path.is_relative_to(folder))
-                self.assertEqual(saved.owner, morty.id)
+                self.assertEqual(saved.owner, keeper.id)
                 self.assertEqual(submissions.submit(selected).key, saved.key)
                 self.assertEqual(submissions.submit(standard).key, saved.key)
                 default = replace(selected, recipient_id=OWNER, page_recipient=new_item_dialog.PageRecipient.PAGE_OWNER)

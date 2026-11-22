@@ -354,6 +354,8 @@ def _main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     name = cast(str, args.child)
     staff.validate_unit_name_for_write(name)
+    staff.validate_name("unit", name)
+    staff.require_no_producer_rename(name)
     record = staff.snapshot()
     parent = read_production(showrunners.own_name(), record=record)
     path = record_path(parent, name)

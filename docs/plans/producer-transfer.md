@@ -8,12 +8,12 @@
 
 - **Project:** `~/.claude` scripts — agent sessions, the staff record and message delivery.
 - **Stack:** Python 3 with `unittest`; basedpyright with zero errors and zero warnings.
-- **Layout:** `scripts/message/` (delivery and the morty mark), `scripts/production/` (staff record and units table),
+- **Layout:** `scripts/message/` (delivery and List producer identity), `scripts/production/` (staff record and units table),
   `scripts/agents/` (session verbs), `scripts/lib/` (transcripts), `commands/` (operator commands), `docs/as-built/`.
 - **Key files:**
-  - `scripts/message/morty_identity.py` — the native id on the producer row named `morty`.
+  - `scripts/message/morty_identity.py` — the current native ID for `page.list.owner`.
   - `scripts/message/send.py` — stamps each message with the sender native id.
-  - `scripts/production/staff_sources.py` — the units table drops morty's process from its anomaly lines.
+  - `scripts/production/staff_sources.py` — the units table drops the List producer process from its anomaly lines.
   - `scripts/production/staff.py` — the staff record; `update_current_session`, `set_home`, `ensure`.
   - `scripts/agents/stop_resume.py`, `scripts/agents/restart.py`, `scripts/agents/shutdown.py` — producer resume and the `agents` verbs.
   - `scripts/lib/transcripts.py` — the one path to transcript files.
@@ -114,7 +114,7 @@ The session that takes the role runs `agents transfer NAME [--model MODEL --effo
    Refuse a `NAME` with no producer row. Refuse a Claude caller outside the showrunners account.
 2. Validate the settings. The caller supplies the family; the options supply the model and effort.
 3. Stop the old producer conversation and close its tab. Keep its transcript and print its `catch_up.py` command.
-4. Write `[producers] NAME=<family>:<model>:<effort>` through `models_registry.store_producer`.
+4. Write the profile under its staff ID through `models_registry.store_producer`.
    `pane_launch._publish_producer` compares the backend with this value, so this write comes before step 5.
 5. Set `current_session`, `home` and the launch folder in one staff transaction. The fixed id, the document and the staff queue stay.
    Claude resume depends on the folder, and staff is the only source of the launch folder.

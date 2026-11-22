@@ -89,7 +89,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 self.assertTrue(any('Keep these words.' in entry.words for entry in item.log))
 
     def test_investigation_feedback_uses_the_shared_retry_and_showrunner_alert(self) -> None:
-        producer = fixture_member("producer", name="bob")
+        producer = fixture_member("producer", name="editor")
         runner = staff.snapshot().by_path("page-owner")
         assert runner is not None
         _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=page-owner\n")
