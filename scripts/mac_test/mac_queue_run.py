@@ -33,8 +33,11 @@ import time
 from typing import TextIO, TypedDict, cast
 import uuid
 
+from scripts.build_hold import override_guard
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.mac_test import claim_state, mac_test
 
 
 def admission_command() -> list[str]:
@@ -206,9 +209,11 @@ def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
 
 
 MAC_BUSY_STATUS = 78
+MAC_RUN_REFUSED_STATUS = 9
 RUNS = ".local/state/mac-queue/runs"
 RECEIPTS = ".local/state/mac-queue/receipts"
 MAC_GATE_SCRIPT = Path("scripts/mac_test/mac_gate.py")
+MAC_RUN_SCRIPT = Path("scripts/production/mac_run.sh")
 
 
 class SavedRun(TypedDict):
@@ -278,8 +283,8 @@ def ended_run_callback(saved_script: str) -> tuple[Path, str]:
     name = Path(saved_script).name
     if name == MAC_GATE_SCRIPT.name:
         return installed / MAC_GATE_SCRIPT, "cleanup-ended"
-    if name == "mac_run.sh":
-        return installed / "scripts/production/mac_run.sh", "cleanup"
+    if name == MAC_RUN_SCRIPT.name:
+        return installed / MAC_RUN_SCRIPT, "cleanup"
     return Path(saved_script), "cleanup"
 
 
@@ -296,16 +301,78 @@ class Arguments(argparse.Namespace):
     argv: list[str] = []
 
 
+def blocking_run(
+    args: Arguments, owner: OwningSession | NoOwningSession,
+) -> claim_state.MacBlockState | mac_test.ClaimFinished:
+    if args.kind != "run":
+        return mac_test.NO_MAC_BLOCK
+    paths = claim_state.state_paths()
+    is_mac_run = Path(args.lifecycle_script).name == MAC_RUN_SCRIPT.name
+    try:
+        block = mac_test.blocking_claim_block(paths, owner)
+    except (OSError, claim_state.StateReadError):
+        if is_mac_run:
+            return mac_test.unreadable_claim(paths.block)
+        raise
+    if is_mac_run and not isinstance(block, claim_state.NoMacBlock):
+        return mac_test.blocked_claim(block)
+    return block
+
+
+def wait_to_retry() -> None:
+    time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
+
+
 def run(args: Arguments) -> int:
-    episode, since, pid = uuid.uuid4().hex, time.time(), os.getpid()
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    since = time.time()
+    owner = owning_session() if args.kind == "run" else NoOwningSession()
+    if isinstance(owner, NoOwningSession):
+        session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        if session:
+            owner = OwningSession(session)
+    announced = False
+    reported_block = False
+    try:
+        while True:
+            block = blocking_run(args, owner)
+            if isinstance(block, claim_state.NoMacBlock):
+                if not announced:
+                    print(f"Mac queue: {args.what}", file=sys.stderr)
+                    announced = True
+                result = run_attempt(args, since, owner)
+                if isinstance(result, int):
+                    return result
+                block = result
+            if isinstance(block, mac_test.ClaimFinished):
+                return MAC_RUN_REFUSED_STATUS
+            block = mac_test.lift_expired_claim_block(claim_state.state_paths(), owner, block)
+            if isinstance(block, claim_state.NoMacBlock):
+                continue
+            if not reported_block:
+                holder = mac_test.holder_name(block.holder)
+                reason = " ".join(block.reason.splitlines())
+                message = "Mac blocked" if args.no_wait else "Waiting for the Mac block"
+                print(f"{message} held by {holder}: {reason}", flush=True)
+                reported_block = True
+            if args.no_wait:
+                return MAC_BUSY_STATUS
+            wait_to_retry()
+    except (OSError, ValueError) as error:
+        print(f"mac queue: {error}", file=sys.stderr)
+        return 2
+
+
+def run_attempt(
+    args: Arguments, since: float, owner: OwningSession | NoOwningSession,
+) -> int | claim_state.PendingMacBlock | claim_state.ActiveMacBlock:
+    episode, pid = uuid.uuid4().hex, os.getpid()
     source = subprocess.run(["git", "-C", str(args.worktree), "rev-parse", "HEAD"],
                             capture_output=True, text=True)
     source_key = source.stdout.strip() if source.returncode == 0 else ""
     command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
-    print(f"Mac queue: {args.what}", file=sys.stderr)
     original_command = command.copy()
     status = 1
+    block: claim_state.MacBlockState | mac_test.ClaimFinished = mac_test.NO_MAC_BLOCK
     remote = RemoteRun()
     prepared = False
     placement = MacPlacement("", episode, "")
@@ -321,20 +388,26 @@ def run(args: Arguments) -> int:
         try:
             while True:
                 code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
-                    args.worktree, args.package, args.kind, source_key, session, assignment_file, command))
-                if code != MAC_BUSY_STATUS or args.no_wait:
+                    args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
+                    assignment_file, command))
+                if code in (0, MAC_BUSY_STATUS):
+                    block = blocking_run(args, owner)
+                if code != MAC_BUSY_STATUS or args.no_wait or not isinstance(block, claim_state.NoMacBlock):
                     break
                 print(output, end="", flush=True)
-                time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
-            if code:
+                wait_to_retry()
+            if not isinstance(block, claim_state.NoMacBlock):
+                status = 0
+            elif code:
                 print(output, end="", flush=True)
-                status = 9 if args.lifecycle_script and code in (10, 11, 12) else code
+                status = MAC_RUN_REFUSED_STATUS if args.lifecycle_script and code in (10, 11, 12) else code
             else:
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
                 clean_ended_runs(callback_environment)
+                block = blocking_run(args, owner)
                 on_close = ""
-                if args.lifecycle_script:
+                if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
@@ -351,13 +424,17 @@ def run(args: Arguments) -> int:
                             fcntl.flock(lease_descriptor, fcntl.LOCK_EX)
                 else:
                     status = 0
-                if status == 0:
-                    # A run that ends before the Mac answers reports a failure, not success.
-                    status = 1
-                    if args.owned_close and not on_close:
-                        raise ValueError("the run needs a close hook")
-                    status = stream_remote(remote_command(placement, args.cwd, command, on_close,
-                                                          owned_close=args.owned_close), remote, ssh)
+                if status == 0 and isinstance(block, claim_state.NoMacBlock):
+                    block = blocking_run(args, owner)
+                    if isinstance(block, claim_state.NoMacBlock):
+                        # Record failure until the Mac reports an exit status.
+                        status = 1
+                        if args.owned_close and not on_close:
+                            raise ValueError("the run needs a close hook")
+                        status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                                                              owned_close=args.owned_close), remote, ssh)
+            if isinstance(block, mac_test.ClaimFinished):
+                status = MAC_RUN_REFUSED_STATUS
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
@@ -403,9 +480,14 @@ def run(args: Arguments) -> int:
                 print("mac queue: the Mac run may still be live; placement release is withheld", file=sys.stderr)
             # The queue ends the placement when this process ends, so the receipt has no later use.
             assignment_file.unlink(missing_ok=True)
+            if not isinstance(block, claim_state.NoMacBlock):
+                for receipt in receipts.glob(assignment_file.name + ".*"):
+                    receipt.unlink(missing_ok=True)
             if not released:
                 print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1
+    if status == 0 and isinstance(block, (claim_state.PendingMacBlock, claim_state.ActiveMacBlock)):
+        return block
     return status
 
 
@@ -508,11 +590,13 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--lifecycle-script", default="")
     _ = parser.add_argument("--caller-fd", type=int, help=argparse.SUPPRESS)
     _ = parser.add_argument("--owned-close", action="store_true", help=argparse.SUPPRESS)
-    _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy")
+    _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy or blocked")
     _ = parser.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.argv or args.argv == ["--"]:
         parser.error("an argv is required")
+    if args.kind == "run":
+        override_guard.refuse_overrides(Path(__file__), "mac_test/mac_queue_run.py")
     if args.caller_fd < 0:
         return run(args)
     try:

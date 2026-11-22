@@ -3117,13 +3117,16 @@ def _sweep_nightly_build_folders() -> None:
                     raise RuntimeError("the build folder sweep failed")
             else:
                 scripts = Path(__file__).resolve().parents[1]
-                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
-                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
-                                    "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                    # The nightly runs from $HOME, which is not a repository; the queue refuses that as "repo".
-                                    "--worktree", str(scripts.parent), "--", "/bin/zsh", "-c",
-                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
-                                   check=True, capture_output=True, text=True)
+                caller, lifetime = os.pipe()
+                with os.fdopen(caller, "rb"), os.fdopen(lifetime, "wb"):
+                    _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                        sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                        "--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
+                                        # The queue requires a repository. Nightly runs from the home directory.
+                                        "--worktree", str(scripts.parent), "--caller-fd", str(caller), "--", "/bin/zsh", "-c",
+                                        '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" --unused-folders'],
+                                       check=True, capture_output=True, text=True,
+                                       pass_fds=(caller,), start_new_session=True)
         except (Exception, KeyboardInterrupt) as error:
             detail = f"Nightly build folder sweep on {machine} failed: " + " ".join(str(error).splitlines())
             if isinstance(error, subprocess.CalledProcessError):
