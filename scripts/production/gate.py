@@ -1307,7 +1307,7 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
         finally:
             try:
                 cleanup.close()
-            except build_folders.TemporaryFolderChildrenUnresolved as error:
+            except build_folders.TemporaryFolderRemovalUnresolved as error:
                 recovery.unresolved = True
                 raise GateRecoveryUnresolved(str(error)) from error
             finally:

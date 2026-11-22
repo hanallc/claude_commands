@@ -2010,8 +2010,8 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
         return FolderPairRelease.PAIR_KEPT
 
 
-class TemporaryFolderChildrenUnresolved(RuntimeError):
-    """The owner cannot prove that the temporary folder's children are free."""
+class TemporaryFolderRemovalUnresolved(RuntimeError):
+    """The owner cannot confirm safe removal of the temporary folder."""
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
@@ -2031,13 +2031,15 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
             try:
                 refusal = _hold_child_leases(path, leases, wait=False)
             except (OSError, ValueError) as error:
-                raise TemporaryFolderChildrenUnresolved(f"could not check nested leases in {path}: {error}") from error
+                raise TemporaryFolderRemovalUnresolved(f"could not check nested leases in {path}: {error}") from error
             if refusal is not None:
-                raise TemporaryFolderChildrenUnresolved(f"nested leases or recovery records prevent removal of {path}")
+                return False
             _remove_folder(path, directory, allocated)
         return True
 
-    _ = remove_build_folder(path, cleanup, temporary=temporary, dir_fd=directory, wait=not children)
+    removed = remove_build_folder(path, cleanup, temporary=temporary, dir_fd=directory, wait=not children)
+    if children and not removed:
+        raise TemporaryFolderRemovalUnresolved(f"could not remove {path} safely")
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
@@ -2088,7 +2090,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 @contextmanager
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec, *,
                            keep: Callable[[], bool] | None = None, children: bool = False) -> Generator[Path]:
-    """Remove private work on exit. With children, raise if a nested lease prevents removal."""
+    """Remove private work on exit. With children, raise if the removal check fails."""
     with ExitStack() as cleanup:
         yield create_build_folder(_TemporaryFolderRequest(request, cleanup, keep, children))
 
