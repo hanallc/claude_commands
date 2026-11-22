@@ -596,7 +596,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
-  The bootstrap decides once, at interpreter startup, while `GATE_PARENT_PID` marks a gate job.
+  The bootstrap checks for a gate parent once, at the first unittest load or run.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
   These folders use `<inherited TMPDIR>/test-runs/r*`.

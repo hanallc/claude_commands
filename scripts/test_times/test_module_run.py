@@ -787,6 +787,36 @@ class FixtureCPU(unittest.TestCase):
             self.assertEqual(list(root.glob(".output.*")), [])
 
 
+class MacGateModuleTests(unittest.TestCase):
+    def test_macos_gate_keeps_the_module_temporary_folder(self) -> None:
+        from scripts.lib import build_folders
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        module = self.enterContext(build_folders.tool_folder("test-module", root))
+        case = root / "test_gate_parent.py"
+        _ = case.write_text(f"""import os
+from pathlib import Path
+import unittest
+
+class GateParent(unittest.TestCase):
+    def test_module_folder(self):
+        module = Path({str(module)!r})
+        self.assertEqual(Path(os.environ['TMPDIR']), module)
+        self.assertEqual(Path(os.environ['SCRATCH_ROOT']), module / 'test-run-roots' / 'scratch')
+        self.assertEqual(Path(os.environ['ASTRA_REVIEW_DIR']), module / 'test-run-roots' / 'astra')
+        self.assertEqual(Path(os.environ['CONF_READ_LOG']), module / 'config-reads' / 'reads')
+""", encoding="utf-8")
+        environment = direct_test_fixture_environment(root)
+        environment.update(GATE_PARENT_PID=str(os.getpid()), HOME=str(root / "home"), PYTHONPATH=str(root))
+        entry = "import runpy, sys; sys.platform = 'darwin'; runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        result = subprocess.run(
+            [str(gate.python_shim(RUNNER.parents[2])), "-c", entry, str(RUNNER), str(root), case.name],
+            cwd=RUNNER.parents[2], env=gate.test_module_environment(module, environment),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
 class ModuleProcessCleanupTests(unittest.TestCase):
     def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:

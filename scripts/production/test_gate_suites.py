@@ -812,7 +812,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
         repository = "claude_commands"
         _ = self.git(checkout, "remote", "set-url", "origin", str(self.root / f"{repository}.git"))
-        self.configure_gate(f"# whole: 1..\nmax_runs.natedev.{repository}=2\nmax_runs_exempt_unit=natemerge\n")
+        self.configure_gate(f"# whole: 1..\nmax_runs.natedev.{repository}=2\nmax_runs.exempt_unit=natemerge\n")
         holder = Path(self.environment["BUILD_HOLD_DIR"]) / "fixture-holder"
         self.write(holder, "Fixture build hold\n")
 

@@ -639,11 +639,11 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
-    parent = gate_parent(consume=True)
     if not adopt_descendants():
         cleanup.enter_context(private_run_roots(owner))
         main(owner)
         return
+    parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
