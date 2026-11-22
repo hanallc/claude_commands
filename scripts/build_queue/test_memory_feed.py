@@ -3045,9 +3045,10 @@ process.stdout.write(JSON.stringify({
         process = self.root / "proc" / str(pid)
         write_process(process.parent, pid)
         stat = process / "stat"
+        # The feed reads no tty. Only the client stores a terminal name, so an empty stored name stays unknown.
         for members, tty, name, unit, showrunner, caller in (
-            ((), 34816, "hana build", "", "", "terminal · hana_catalyst"),
-            ((), 0, "hana build", "", "", "terminal · hana_catalyst"),
+            ((), 34816, "hana build", "", "", "unregistered session"),
+            ((), 0, "hana build", "", "", "unregistered session"),
             ((runner, director), 34816, "startup build", "startup", "hana", "startup"),
         ):
             with self.subTest(tty=tty, unit=unit):

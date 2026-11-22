@@ -951,7 +951,30 @@ BRP launches use `launch`; launch permission creates no reservation.
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
 The client checks the staff name, the exported name, and the session folder name in that order.
-It uses `terminal · <folder>` for a direct command with a known folder.
+A caller with no session and no staff reference gets its exported name from `family_owner_name(pid, proc_root)`.
+That function reads the process and its parents in `/proc` once.
+The read stops at the first `claude` or `codex` process, so a session launcher never names the work.
+A read error stops the read, and the next rule applies.
+The script of a process is its first argument that is not an option and ends in `.py`, `.sh`, `.zsh` or `.bash`.
+The read skips the value of `-X`, `-W`, `-o`, `+o`, `-O` and `+O`.
+A relative script path starts at the `/proc/<pid>/cwd` folder of that process.
+The function uses the first rule that matches:
+1. No process can be read, for example on macOS, which has no `/proc`. The name stays `terminal · <folder>`.
+2. A family process runs a script under the showrunner state root, in `<root>/<id>/...`.
+   The name is `<staff name> · <script file>`, for example `cargo-liner · install_rest.sh`.
+   When no staff member has that id, the name uses the first 8 characters of the id.
+   `scripts/lib/showrunner_state.py` `state_root()` gives the root for this rule, `record_store` and `showrunners`.
+3. A family process has a tty, and the read did not stop at an agent: the user's terminal.
+   The client then uses `terminal · <folder>` for a direct command with a known folder.
+4. The process runs in a unit that `systemd-run` made (`run-*.service`).
+   The name is `systemd · <outermost script file>`, else `systemd · <folder of the process cwd>`.
+5. The process runs in another systemd `.service` unit: `systemd · <unit>`.
+6. Other callers: `script · <outermost script file>`, else `script · <command of the process>`.
+The service uses the same function for a scope with no recorded caller.
+It reads the family of the oldest scope process.
+The Builds page and the queue evidence lines never make a `terminal ·` name from a folder alone.
+When the stored name is empty, they show the staff name or `unregistered session`.
+On Linux, a caller with no tty gets a `terminal ·` name only when its family cannot be read, for example when its process ended during the read.
 The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
 The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
 It returns `unregistered session` when no candidate is usable.

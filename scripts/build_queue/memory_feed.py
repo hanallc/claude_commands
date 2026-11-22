@@ -897,9 +897,9 @@ def public_owner_name(name: str, session: str = "") -> str:
     return "" if name in (session, f"session:{session}") else name
 
 
-def recorded_caller_name(session: str, name: str, folder: str) -> str:
-    return admission_records.queue_caller(session, "", public_owner_name(name, session),
-                                          "", public_owner_name(Path(folder).name)).name
+def recorded_caller_name(session: str, name: str) -> str:
+    """Use the stored name; a folder alone does not prove a terminal."""
+    return codec.select_queue_name(public_owner_name(name, session))
 
 
 class FeedStaff:
@@ -1375,7 +1375,7 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
     member = members.labels_for(step.session_id, machine, Path(step.folder))
     caller = codec.resolve_queue_caller(
         stored_caller=public_owner_name(step.session_name, step.session_id), reservation_caller=reservation_caller,
-        staff_caller=member.session if member is not None else recorded_caller_name(step.session_id, "", step.folder))
+        staff_caller=member.session if member is not None else "")
     for current in (member, labels.get(step.session_id)):
         if current is not None and public_owner_name(current.owner_text, step.session_id):
             return StepPageOwner(current, caller, unit=staff_unit(current, missing="—"))
@@ -2768,7 +2768,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
         label = public_owner_name(identity.session, activity.session_id) if identity is not None else ""
-        owner = label or recorded_caller_name(activity.session_id, activity.session_name, activity.folder)
+        owner = label or recorded_caller_name(activity.session_id, activity.session_name)
         scope_members: list[LeftoverProcess] = [
             {"pid": member.pid, "program": leftover_program(member.pid, member.program)} for member in activity.members]
         if not scope_members:
@@ -3088,10 +3088,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             ) if label is not None and public_owner_name(label.owner_text, recorded.session_id)), None)
             unit = staff_unit(current, missing="—") if current is not None else ""
             identity = current if current is not None else unit_labels.UnitLabels(
-                recorded_caller_name(recorded.session_id, recorded.name, recorded.folder))
+                recorded_caller_name(recorded.session_id, recorded.name))
             caller = codec.resolve_queue_caller(
                 stored_caller=public_owner_name(recorded.name, recorded.session_id),
-                staff_caller=member.session if member is not None else recorded_caller_name(recorded.session_id, "", recorded.folder))
+                staff_caller=member.session if member is not None else "")
             job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
