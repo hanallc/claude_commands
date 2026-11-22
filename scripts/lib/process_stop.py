@@ -1,7 +1,6 @@
 """Stop an exact Linux process lifetime or its dedicated command tree."""
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -290,27 +289,21 @@ def _in_scope(process: ProcessLifetime, scope: ScopeIdentity) -> bool:
     return False
 
 
-def _term_scope(directory: int, scope: ScopeIdentity, deadline: float) -> int:
-    seen: set[ProcessLifetime] = set()
+def _term_scope(directory: int, scope: ScopeIdentity) -> int:
     reached = 0
-    while time.monotonic() < deadline:
+    try:
+        members = _scope_processes(directory)
+    except (OSError, ValueError) as error:
+        _check_saved_scope(scope)
+        raise ScopeStopFailed(f"cannot read scope members: {error}") from error
+    for process in members:
         try:
-            members = _scope_processes(directory) - seen
-        except (OSError, ValueError):
-            break
-        if not members:
-            break
-        for process in members:
-            if time.monotonic() >= deadline:
-                return reached
-            try:
-                with pin_process(process) as descriptor:
-                    if _in_scope(process, scope):
-                        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-                        reached += 1
-            except OSError:
-                continue
-        seen.update(members)
+            with pin_process(process) as descriptor:
+                if _in_scope(process, scope):
+                    signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                    reached += 1
+        except OSError:
+            continue
     return reached
 
 
@@ -361,84 +354,142 @@ def stop_scope(
 
 
 @dataclass(frozen=True)
-class _ScopeAwaitingExit:
+class _OpenScope:
     scope: ScopeIdentity
     directory: int
     events: int
-    term_reached: int
-    term_deadline: float
+
+
+def _freeze_scope(item: _OpenScope, thaw: ExitStack) -> None:
+    try:
+        descriptor = os.open("cgroup.freeze", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=item.directory)
+        _ = thaw.callback(os.close, descriptor)
+        _ = os.write(descriptor, b"1\n")
+        _ = thaw.callback(_thaw_scope, item, descriptor)
+    except OSError as error:
+        _check_saved_scope(item.scope)
+        raise ScopeStopFailed(f"cannot freeze scope with cgroup.freeze: {error}") from error
+
+
+def _thaw_scope(item: _OpenScope, descriptor: int) -> None:
+    try:
+        _ = os.lseek(descriptor, 0, os.SEEK_SET)
+        _ = os.write(descriptor, b"0\n")
+    except OSError as error:
+        with suppress(_ScopeRemoved):
+            _check_saved_scope(item.scope)
+            raise ScopeStopFailed(f"{item.scope['unit']}: cannot thaw scope with cgroup.freeze: {error}") from error
+
+
+def _await_frozen(item: _OpenScope, deadline: float) -> None:
+    while True:
+        try:
+            lines = os.pread(item.events, 4096, 0).splitlines()
+        except OSError as error:
+            _check_saved_scope(item.scope)
+            raise ScopeStopFailed(f"cannot read cgroup.events: {error}") from error
+        if b"frozen 1" in lines:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _check_saved_scope(item.scope)
+            raise ScopeStopFailed("the scope did not freeze in time")
+        _wait_scope_event(item.events, remaining)
+
+
+@contextmanager
+def _frozen_scopes(
+    opened: ExitStack, scopes: tuple[ScopeIdentity, ...], grace: float,
+    discover: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
+) -> Generator[tuple[tuple[ScopeIdentity, ...], list[_OpenScope]]]:
+    known: list[ScopeIdentity] = []
+    frozen: list[_OpenScope] = []
+    deadline = time.monotonic() + grace
+    with ExitStack() as thaw:
+        while scopes:
+            for scope in scopes:
+                if scope in known:
+                    continue
+                known.append(scope)
+                try:
+                    directory, events = opened.enter_context(_scope_events(scope))
+                    item = _OpenScope(scope, directory, events)
+                    _freeze_scope(item, thaw)
+                    _await_frozen(item, deadline)
+                except _ScopeRemoved:
+                    continue
+                except (OSError, ValueError) as error:
+                    raise ScopeStopFailed(f"{scope['unit']}: {error}") from error
+                frozen.append(item)
+            candidates = discover() if discover is not None else ()
+            scopes = tuple(scope for scope in candidates if scope not in known)
+        yield tuple(known), frozen
+
+
+def _is_populated(item: _OpenScope) -> bool:
+    with suppress(_ScopeRemoved):
+        return not _scope_is_empty(item.scope, item.events)
+    return False
 
 
 def stop_scopes(
     scopes: tuple[ScopeIdentity, ...], grace: float, kill_grace: float, *,
     on_term: Callable[[int], None] | None = None,
-    next_scopes: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
+    discover: Callable[[], tuple[ScopeIdentity, ...]] | None = None,
+    prepare: Callable[[tuple[ScopeIdentity, ...], tuple[ScopeIdentity, ...]], bool] | None = None,
 ) -> ScopeStopReceipt:
-    """Report the TERM count after discovery finds no new scopes.
+    """Freeze the fixed set and report one TERM count before cleanup.
 
-    Return a hook error after cleanup so the caller can save the result.
+    Call prepare with the saved and populated scopes before TERM. False cancels the stop.
     """
-    errors: list[str] = []
     hook_error: BaseException | None = None
     term_reached = 0
-    with ExitStack() as opened:
-        pending: deque[_ScopeAwaitingExit] = deque()
-
-        def term_new_scopes(batch: tuple[ScopeIdentity, ...]) -> None:
-            nonlocal term_reached
-            while True:
-                for scope in batch:
-                    deadline = time.monotonic() + grace
+    errors: list[str] = []
+    try:
+        with ExitStack() as opened:
+            with _frozen_scopes(opened, scopes, grace, discover) as (saved, frozen):
+                populated = [item for item in frozen if _is_populated(item)]
+                if prepare is not None and not prepare(saved, tuple(item.scope for item in populated)):
+                    return ScopeStopReceipt(0)
+                for item in populated:
+                    with suppress(_ScopeRemoved):
+                        term_reached += _term_scope(item.directory, item.scope)
+                if on_term is not None:
                     try:
-                        directory, events = opened.enter_context(_scope_events(scope))
-                        if not _scope_is_empty(scope, events):
-                            reached = _term_scope(directory, scope, deadline)
-                            term_reached += reached
-                            pending.append(_ScopeAwaitingExit(scope, directory, events, reached, deadline))
+                        on_term(term_reached)
+                    except BaseException as error:
+                        hook_error = error
+            if populated:
+                deadline = time.monotonic() + grace
+                for item in frozen:
+                    try:
+                        _finish_scope_stop(item, deadline, kill_grace, term_reached=term_reached,
+                                           require_term=on_term is not None)
                     except _ScopeRemoved:
-                        continue
-                    except ScopeStopFailed as error:
-                        errors.append(f"{scope['unit']}: {error}")
-                if next_scopes is None:
-                    return
-                try:
-                    batch = next_scopes()
-                except (OSError, ValueError) as error:
-                    errors.append(f"scope discovery: {error}")
-                    return
-                if not batch:
-                    return
-
-        term_new_scopes(scopes)
-        reported = term_reached
-        if on_term is not None:
-            try:
-                on_term(reported)
-            except BaseException as error:
-                hook_error = error
-            if not pending:
-                term_new_scopes(())
-        while pending:
-            item = pending.popleft()
-            try:
-                _finish_scope_stop(item, kill_grace, require_term=on_term is not None)
-            except _ScopeRemoved:
-                pass
-            except ScopeStopFailed as error:
-                errors.append(f"{item.scope['unit']}: {error}")
-            term_new_scopes(())
+                        pass
+                    except (OSError, ValueError) as error:
+                        errors.append(f"{item.scope['unit']}: {error}")
+                if not errors and len(saved) > 1:
+                    with _frozen_scopes(opened, saved, grace) as (_, confirmed):
+                        for item in confirmed:
+                            if _is_populated(item):
+                                errors.append(f"{item.scope['unit']}: the scope became populated again")
+    except (OSError, ValueError) as error:
+        errors.append(str(error))
     if errors:
         cleanup_error = ScopeStopFailed("; ".join(errors))
         if hook_error is not None:
             raise cleanup_error from hook_error
         raise cleanup_error
-    return ScopeStopReceipt(reported if on_term is not None else term_reached, hook_error)
+    return ScopeStopReceipt(term_reached, hook_error)
 
 
-def _finish_scope_stop(item: _ScopeAwaitingExit, kill_grace: float, *, require_term: bool) -> None:
-    if _scope_ends_on(item.scope, item.events, item.term_deadline):
+def _finish_scope_stop(
+    item: _OpenScope, deadline: float, kill_grace: float, *, term_reached: int, require_term: bool,
+) -> None:
+    if _scope_ends_on(item.scope, item.events, deadline):
         return
-    if require_term and not item.term_reached:
+    if require_term and not term_reached:
         raise ScopeStopFailed("no TERM signal reached a member of the populated scope")
     try:
         descriptor = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=item.directory)
@@ -449,7 +500,7 @@ def _finish_scope_stop(item: _ScopeAwaitingExit, kill_grace: float, *, require_t
     except OSError as error:
         if _scope_is_empty(item.scope, item.events):
             return
-        detail = "" if item.term_reached else "no TERM signal reached a member. "
+        detail = "" if term_reached else "no TERM signal reached a member. "
         raise ScopeStopFailed(f"{detail}cgroup.kill failed: {error}") from error
     if not _scope_ends_on(item.scope, item.events, time.monotonic() + kill_grace):
         raise ScopeStopFailed("the scope remains populated after KILL")

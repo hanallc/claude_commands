@@ -879,8 +879,9 @@ class HoldEnforcerTests(unittest.TestCase):
                 cgroups = self.root / "cgroups"
                 scope = cgroups / f"builds.slice/hold-{exit_code}.scope"
                 scope.mkdir(parents=True)
+                _ = (scope / "cgroup.freeze").write_text("0\n")
                 events = scope / "cgroup.events"
-                _ = events.write_text("populated 1\n")
+                _ = events.write_text("populated 1\nfrozen 1\n")
                 stat = scope.stat()
                 identity: process_stop.ScopeIdentity = {"unit": scope.name, "path": f"/builds.slice/{scope.name}",
                                                        "device": stat.st_dev, "inode": stat.st_ino}
@@ -892,10 +893,10 @@ class HoldEnforcerTests(unittest.TestCase):
                 table = self.table()
                 stopped_before = len([row for row in self.rows() if row["action"] == "stopped"])
 
-                def send_term(_directory: int, saved_scope: process_stop.ScopeIdentity, _deadline: float) -> int:
+                def send_term(_directory: int, saved_scope: process_stop.ScopeIdentity) -> int:
                     self.assertEqual(saved_scope, identity)
                     self.assertEqual(len([row for row in self.rows() if row["action"] == "stopped"]), stopped_before)
-                    _ = events.write_text("populated 0\n")
+                    _ = events.write_text("populated 0\nfrozen 1\n")
                     return 1
 
                 def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:

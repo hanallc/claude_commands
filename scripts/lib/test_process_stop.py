@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import errno
 import os
 from pathlib import Path
 import signal
@@ -83,8 +84,10 @@ class ProcessStopTests(unittest.TestCase):
             relative = "/" + str(scope.relative_to(cgroups))
             _ = (fixture.proc / str(LEADER.pid) / "cgroup").write_text(f"0::{relative}\n")
             _ = (scope / "cgroup.procs").write_text(f"{LEADER.pid}\n")
+            freeze = scope / "cgroup.freeze"
+            _ = freeze.write_text("0\n")
             events = scope / "cgroup.events"
-            _ = events.write_text("populated 1\n")
+            _ = events.write_text("populated 1\nfrozen 0\n")
             kill = scope / "cgroup.kill"
             _ = kill.write_text("0\n")
             identity_stat = scope.stat()
@@ -95,15 +98,20 @@ class ProcessStopTests(unittest.TestCase):
             failure = OSError("cannot save the TERM receipt")
 
             def receipt(count: int) -> None:
+                self.assertEqual(freeze.read_text(), "1\n")
                 self.assertEqual(count, 1)
                 self.assertEqual(kill.read_text(), "0\n")
                 raise failure
 
             def advance_clock(_descriptor: int, seconds: float) -> None:
                 nonlocal now
+                if freeze.read_text() == "1\n":
+                    send.assert_not_called()
+                    _ = events.write_text("populated 1\nfrozen 1\n")
+                    return
                 if kill.read_text() == "1\n":
                     self.assertGreaterEqual(now, 2)
-                    _ = events.write_text("populated 0\n")
+                    _ = events.write_text("populated 0\nfrozen 0\n")
                 now += seconds
 
             def open_pidfd(pid: int) -> int:
@@ -122,3 +130,36 @@ class ProcessStopTests(unittest.TestCase):
                 send.assert_called_once_with(ANY, signal.SIGTERM)
                 self.assertEqual(kill.read_text(), "1\n")
                 self.assertTrue(process_stop.scope_has_ended(identity))
+
+    def test_freeze_denial_thaws_every_scope_that_froze(self) -> None:
+        with TemporaryDirectory() as folder:
+            cgroups = Path(folder)
+            scopes: list[process_stop.ScopeIdentity] = []
+            controls: list[Path] = []
+            for unit in ("first.scope", "second.scope", "denied.scope"):
+                directory = cgroups / unit
+                directory.mkdir()
+                stat = directory.stat()
+                scopes.append({"path": f"/{unit}", "unit": unit, "device": stat.st_dev, "inode": stat.st_ino})
+                _ = (directory / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+                control = directory / "cgroup.freeze"
+                _ = control.write_text("0\n")
+                controls.append(control)
+            write = os.write
+            denied = controls[-1].stat()
+
+            def write_control(descriptor: int, data: bytes) -> int:
+                if os.path.samestat(os.fstat(descriptor), denied):
+                    self.assertEqual([control.read_text() for control in controls[:2]], ["1\n", "1\n"])
+                    raise PermissionError(errno.EACCES, "Permission denied", "cgroup.freeze")
+                return write(descriptor, data)
+
+            with (patch.object(process_stop, "CGROUP_ROOT", cgroups),
+                  patch.object(os, "write", side_effect=write_control),
+                  patch.object(signal, "pidfd_send_signal") as send,
+                  self.assertRaisesRegex(process_stop.ScopeStopFailed,
+                                         "denied.scope: cannot freeze scope with cgroup.freeze: "
+                                         + r"\[Errno 13\] Permission denied: 'cgroup.freeze'")):
+                _ = process_stop.stop_scopes(tuple(scopes), 2, 2)
+            send.assert_not_called()
+            self.assertEqual([control.read_text() for control in controls], ["0\n", "0\n", "0\n"])

@@ -722,24 +722,25 @@ The launcher uses one process for scope publication and command startup.
 On natedev, five samples of the former helper took 179–294 ms elapsed and 161–183 ms CPU.
 Five samples of the replacement guard took 63–131 ms elapsed and 52–65 ms CPU.
 The samples used private records outside the expected scope and measured the launch check.
-`detached_runs.py stop` saves the stop reason and any pass cancellation request before it sends TERM.
-It sends TERM through individual pidfds to verified members of the saved scope tree.
-It saves each newly found scope before it sends TERM to that scope.
-It checks for new scopes after each round of TERM.
-The optional callback reports one TERM count when a check finds no new scopes.
-The exit wait starts after the callback.
-It also stops scopes that it finds during the exit wait.
-It saves completion only when every saved scope is empty or removed.
-A retry uses the full set of saved scopes.
+`detached_runs.py stop` freezes the saved scopes with `cgroup.freeze`.
+It checks for more scopes after the kernel confirms the freeze.
+It freezes each scope it finds and repeats the check until the set stops growing.
+It saves the fixed set, the stop reason and any pass cancellation request before it sends TERM.
+It sends TERM through pidfds to the verified members of the frozen scope trees.
+The optional callback receives one count of the members that received TERM.
+The stop thaws every frozen scope before it waits for exit.
+It also attempts to thaw every frozen scope if an error occurs.
+After the stop grace, it uses `cgroup.kill` on each scope that stays populated.
+It saves completion only when every scope in the fixed set is empty or removed.
+A retry freezes the full set of saved scopes again.
 If the callback raises, the stop saves the cleanup result before it raises the error.
 If cleanup also fails, the cleanup error includes the callback error as its cause.
-It uses `cgroup.kill` after the stop grace if the scope stays populated.
 A failed scope kill reports a stop error if the scope stays populated.
-A verified empty scope or removal of its directory proves the run ended.
 A replacement directory with a different identity reports an error.
 A legacy group TERM without a verified scope reports an unconfirmed stop.
 A separate session in the saved scope receives the same stop signals.
 After a normal exit, the supervisor gives scope members the stop grace to exit.
+It uses the same freeze and discovery steps to check for remaining members before it records completion.
 The supervisor stops any remaining scope members and includes their scope and PIDs in the result.
 An unreadable scope produces a cleanup error result.
 The explicit stop requires Linux pidfd support.
