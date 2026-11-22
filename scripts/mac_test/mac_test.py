@@ -78,6 +78,7 @@ from scripts.mac_test.claim_state import (
     read_run as read_run,
     aware_timestamp as aware_timestamp,
     required_string as required_string,
+    scopes_overlap as scopes_overlap,
     target_claim_scope as target_claim_scope,
     claim_files as claim_files,
     read_claims as read_claims,
@@ -692,13 +693,6 @@ def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
         suffix = f".slot-{scope.slot}" if scope.slot else ""
         return paths.claims / f"{key}{suffix}.json"
     return paths.run
-
-
-def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
-    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
-        return True
-    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
-    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
 
 
 def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
@@ -1888,7 +1882,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
-            if scopes_overlap(claim.scope, scope) and run_is_kept(record):
+            if claim_state.cleanup_scope_matches(paths, claim, scope) and run_is_kept(record):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -1975,7 +1969,8 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     worktree = claim_worktree_path(args.worktree)
     checks: tuple[tuple[WaitClaimCheck, Callable[[HeldClaim], bool]], ...] = (
         (WaitClaimCheck.IDENTITY, lambda claim: claim_state.claim_identity(claim.record) == identity),
-        (WaitClaimCheck.SCOPE, lambda claim: scopes_overlap(claim.scope, scope)),
+        (WaitClaimCheck.SCOPE, lambda claim: claim_state.cleanup_scope_matches(paths, claim, scope)
+            if claim.record.get("cleanup_pending") is True else scopes_overlap(claim.scope, scope)),
         (WaitClaimCheck.PID, lambda claim: claim.record["pid"] == args.from_pid),
         (WaitClaimCheck.SESSION, lambda claim: claim.record["submitting_session"] == claim_state.session_id(session)),
         (WaitClaimCheck.REMOTE_HOST, lambda claim: "remote_host" not in claim.record or claim.record.get("cleanup_pending") is True),
