@@ -11,7 +11,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import cast
 from unittest import mock
 
 from scripts.lib.helper_tree_test_support import verify_test_environment
@@ -27,16 +27,9 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 
 SIGNAL_EXIT_SECONDS = 5
-_SIGNAL_FIXTURE_PARENT = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
-    @classmethod
-    @override
-    def setUpClass(cls, *, fixture_parent: Path | None = _SIGNAL_FIXTURE_PARENT) -> None:
-        # Keep fixture copies and cleanup writes off the disk shared by other tests.
-        super().setUpClass(fixture_parent=fixture_parent)
-
     def assert_group_stop_clears_memory_wait(self, signum: signal.Signals) -> None:
         process = self.start_memory_queued_lint()
         queued = self.memory_queue_pids()

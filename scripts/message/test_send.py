@@ -146,6 +146,19 @@ def write_send_config(path: Path, values: str) -> int:
     write_configs(path.parent)
     return write_config_fixture(path, values)
 
+
+@contextmanager
+def relay_socket_directory() -> Generator[str]:
+    """Keep both ends of the relay in a short private folder."""
+    with short_socket_directory("r-") as directory:
+        config = Path(directory) / "config"
+        _ = write_send_config(config / "send.conf", "")
+        proxy = partial(send._relay_proxy_directory, root=directory)  # pyright: ignore[reportPrivateUsage]
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(send, "_relay_proxy_directory", proxy)):
+            yield directory
+
+
 def fixture_bound_message(address: str, sender: str, summary: str, text: str, shown_sender: str = "") -> send.Message:
     attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), os.getpid(), "fixture-start"), os.getpid(),
                                          "fixture-start", address.removeprefix("uds:"))
@@ -183,27 +196,35 @@ def relay_mismatches(state: Path) -> list[dict[str, object]]:
 
 class RelayAccountTests(unittest.TestCase):
     def test_killing_the_sender_removes_the_private_relay_socket(self) -> None:
-        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+        with relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
             path = str(Path(directory) / "recipient.sock")
             listener.bind(path)
             listener.listen()
             started = sessions.process_start(os.getpid())
             assert started
             program = """
-import os, re, signal, sys
+import json, os, signal, sys
+from functools import partial
+from pathlib import Path
 from scripts.message import review_hold, send, send_later
 
 def killed(_command, prompt, _timeout, _environment, _cwd):
-    print(re.search(r'uds:(/tmp/claude-send-[^"]+/delivery.sock)', prompt)[1], flush=True)
+    target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith("- to: ")))
+    assert isinstance(target, str) and target.startswith("uds:"), target
+    proxy = Path(target.removeprefix("uds:"))
+    assert proxy.parent.parent == Path(sys.argv[4]), proxy
+    assert proxy.parent.name.startswith("claude-send-") and proxy.name == "delivery.sock", proxy
+    print(proxy, flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
 
 send.run = killed
+send._relay_proxy_directory = partial(send._relay_proxy_directory, root=sys.argv[4])
 send._validate_attempt_recipient = lambda _attempt: send.SocketAttemptValidated()
 message = send.Message("uds:" + sys.argv[1], "fixture", "Preview", "body", None)
 attempt = send.ClaudeDeliveryAttempt(send.RelayProcessRecipient(send.machine(), int(sys.argv[2]), sys.argv[3]), int(sys.argv[2]), sys.argv[3], sys.argv[1])
 send._bound_relay(message, 2, [], {}, attempt)
 """
-            result = subprocess.run([sys.executable, "-B", "-c", program, path, str(os.getpid()), started],
+            result = subprocess.run([sys.executable, "-B", "-c", program, path, str(os.getpid()), started, directory],
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                                     cwd=Path(send.__file__).resolve().parents[2])
             self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
@@ -234,7 +255,7 @@ send._bound_relay(message, 2, [], {}, attempt)
     def test_delivery_refuses_an_unbound_socket_and_sends_over_the_checked_connection(self) -> None:
         from scripts.herdr import herdr
 
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(sessions, "sessions_dir", return_value=Path(directory)),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
@@ -429,7 +450,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 self.assertEqual(result.outcome, "sent", result.detail)
 
     def test_early_response_cannot_confirm_a_partial_request(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               socket.socket(socket.AF_UNIX) as client,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
@@ -470,7 +491,7 @@ send._bound_relay(message, 2, [], {}, attempt)
         self.assertEqual(result, send.Result("failed", "SendMessage has no matching completed proxy forward"))
 
     def test_proxy_accepts_only_the_approved_claude_message_body(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
               mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
@@ -555,7 +576,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                         self.assertEqual(result, refused)
 
     def test_proxy_forwarding_failure_reaches_the_sender(self) -> None:
-        with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
+        with (relay_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
               mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
@@ -1167,6 +1188,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
+        proxy = partial(send._relay_proxy_directory, root=str(self.root))  # pyright: ignore[reportPrivateUsage]
+        _ = self.enterContext(mock.patch.object(send, "_relay_proxy_directory", proxy))
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
@@ -1987,9 +2010,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         """Record a live Claude session, or its rename: this test process stands in for it."""
         path = self.root / f"{session_id}.sock"
         if not path.exists():
-            held = socket.socket(socket.AF_UNIX)
+            held = self.enterContext(socket.socket(socket.AF_UNIX))
             held.bind(str(path))
-            self.addCleanup(held.close)
         if session_id != "recipient" and name.casefold() == "recipient":
             _ = self.staff_rows.pop("recipient", None)
         self.staff_member(session_id, name)
@@ -8050,7 +8072,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(short_socket_directory()))
+        self.root = Path(self.enterContext(short_socket_directory("d-")))
         self.homes = (self.root / ".codex", self.root / ".codex2")
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
@@ -8085,7 +8107,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
-            "CONF_DIR": str(self.root / "config"),
+            "CONF_DIR": str(self.root / "config"), "TMPDIR": str(self.root),
             "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
@@ -8125,8 +8147,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         return FakeDaemon(home / "app-server-control/app-server-control.sock",
                           partial(self.serve_loaded_thread, name=name), repeat=True)
 
-    def command(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(staff_child_command(Path(send.__file__).with_name(script), self.members, *arguments),
+    def command(self, script: str | Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(staff_child_command(Path(send.__file__).parent / script, self.members, *arguments),
                               capture_output=True, text=True, check=False, timeout=30)
 
     def assert_queues_unchanged(self) -> None:
@@ -8249,8 +8271,17 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             _ = (self.root / "claude-sessions" / f"{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": sender_id, "name": "sdlc", "updatedAt": 1,
                 "procStart": started, "messagingSocketPath": address.removeprefix("uds:")}))
+            relay_script = self.root / "send-reply.py"
+            _ = relay_script.write_text("""import sys
+from functools import partial
+from scripts.message import send
+
+send._relay_proxy_directory = partial(send._relay_proxy_directory, root=sys.argv.pop(1))
+raise SystemExit(send.main(sys.argv[1:]))
+""")
             with mock.patch.dict(os.environ, {**host, "CODEX_THREAD_ID": "account-thread"}):
-                returned = self.command("send.py", "--to", address, "--from", "Account window", "--text", response)
+                returned = self.command(relay_script, str(self.root), "--to", address,
+                                        "--from", "Account window", "--text", response)
             self.assertEqual(returned.returncode, 0, returned.stderr)
             self.assertTrue(returned.stdout.startswith("SENT:"), returned.stdout)
             with sender.accept()[0] as connection:
