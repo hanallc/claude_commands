@@ -271,10 +271,28 @@ class CheckoutUse:
     reservation: str = ""
 
 
-def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse]:
-    checkouts = {CheckoutUse(item["worktree"], wire.Owner(item["pid"], item["start_time"]),
-                             item.get("reservation_id", item["admitted_at"]))
-                 for item in reading.explanation.decided_from.reservations if item["worktree"]}
+@dataclass(frozen=True)
+class WaitingCheckout:
+    folder: str
+    pid: int
+    since: float
+
+
+def waiting_cause(step: records.WaitingStep) -> records.WaitReason:
+    return step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
+
+
+def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse | WaitingCheckout]:
+    inputs = reading.explanation.decided_from
+    checkouts: set[CheckoutUse | WaitingCheckout] = {
+        CheckoutUse(item["worktree"], wire.Owner(item["pid"], item["start_time"]),
+                    item.get("reservation_id", item["admitted_at"]))
+        for item in inputs.reservations if item["worktree"]
+    }
+    for step in reading.view.waiting:
+        reason = waiting_cause(step)
+        if isinstance(reason, records.RunLimitWait) and reason.machine == inputs.local_machine and step.folder:
+            checkouts.add(WaitingCheckout(step.folder, step.pid, step.since))
     if isinstance(reading, wire.CloudQueueRead):
         checkouts.update(CheckoutUse(row.identity.folder, row.owner) for row in reading.cloud if row.identity.folder)
     return frozenset(checkouts)
@@ -450,7 +468,7 @@ def background_once(now: float, reading: records.QueueRead) -> Background:
                       safe_read(lambda: Origins().refresh({use.folder for use in active_checkouts(reading)})))
 
 
-type RefreshKey = date | frozenset[CheckoutUse] | tuple[HanaRoute, ...]
+type RefreshKey = date | frozenset[CheckoutUse | WaitingCheckout] | tuple[HanaRoute, ...]
 
 
 @dataclass(frozen=True)
@@ -561,8 +579,6 @@ def policy_label(key: str) -> str:
 
 
 def wait_words(reason: records.WaitReason | wire.CloudSlotWait) -> WaitWords:
-    if isinstance(reason, records.HeadAdmissionStatus):
-        reason = reason.cause
     if isinstance(reason, records.RunLimitWait):
         name = policy_label(reason.repository)
         machine = clean_label(reason.machine)
@@ -581,6 +597,13 @@ def wait_words(reason: records.WaitReason | wire.CloudSlotWait) -> WaitWords:
 def add_wait(groups: WaitGroups, words: WaitWords, name: str, *, policy_index: int = 0) -> None:
     heading_key = f"{policy_index}:{words.one}" if policy_index else words.one
     groups.setdefault(heading_key, WaitGroup(words)).names.append(name)
+
+
+@dataclass(frozen=True)
+class LocalPolicyWait:
+    reason: records.RunLimitWait
+    repository: str
+    name: str
 
 
 def local_state(snapshots: target_availability.Snapshots, machine: str, active: bool, zone: tzinfo) -> str:
@@ -622,7 +645,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     aws_waits: WaitGroups = {}
     unplaced: WaitGroups = {}
     metric_waits: dict[str, WaitGroups] = {}
-    policy_rows: dict[str, set[str]] = {}
+    keys_by_row: dict[str, set[str]] = {}
+    unresolved_policy = False
     run_labels: dict[tuple[str, str], tuple[str, str]] = {}
     mac_targets = (frozenset(snapshot.target.name for snapshot in snapshots if snapshot.target.platform == "macos")
                    if isinstance(snapshots, tuple) else frozenset[str]())
@@ -632,19 +656,23 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             rows[name] = RepositoryRow(name)
         return rows[name]
 
-    def record_local_policy(name: str, origin: str, repository_name: str = "") -> None:
-        cell = row(name).natedev
-        if name in local_limits or origin in local_limits or repository_name in local_limits:
-            cell.policy = CellPolicy.CONFIGURED
-        elif cell.policy is CellPolicy.UNRESOLVED:
-            cell.policy = CellPolicy.NO_LIMIT
+    def observe_local(origin: str, repository_key: str = "") -> str:
+        nonlocal unresolved_policy
+        name = short_name(origin)
+        if name:
+            keys = keys_by_row.setdefault(name, set())
+            keys.update(key for key in (name, origin, repository_key) if key in local_limits)
+            _ = row(name)
+        elif repository_key in local_limits:
+            # The checkout can match any row, even one with a known key.
+            unresolved_policy = True
+        return name
 
     def remote_wait(machine: str) -> WaitGroups:
         return aws_waits if machine in saved.aws_targets else unplaced
 
     for origin in history:
-        if name := short_name(origin):
-            record_local_policy(name, origin)
+        _ = observe_local(origin)
 
     occupancy = reserved_repository_runs(inputs, policy)
     seen = {owner for owners in occupancy.values() for owner in owners}
@@ -659,15 +687,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if not (waiting_origin and reserved_origin and waiting_origin != reserved_origin):
             identity = waiting_origin or reserved_origin or recorded_origin(reservation["repo"])
             origin = origins.resolve(identity, reservation["worktree"])
-        name = short_name(origin)
         recorded_unit = reservation.get("unit", "") or (waiter.get("unit", "") if waiter is not None else "")
         session = waiter.get("session_id", "") if waiter is not None else reservation.get("session_id", "")
         session_name = waiter.get("session_name", "") if waiter is not None else reservation.get("session_name", "")
         repository_name = waiter.get("repository_name", reservation["repo"]) if waiter is not None else reservation["repo"]
-        if name:
-            record_local_policy(name, origin, repository_name)
-        if repository_name in local_limits:
-            policy_rows.setdefault(repository_name, set()).add(name)
+        name = observe_local(origin, repository_name)
         if owner in limited_owners:
             if policy.for_step(local, repository_name, reservation["step"]):
                 _ = run_labels.setdefault((repository_name, owner),
@@ -684,12 +708,17 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if label := clean_label(recorded_unit, names.get(session, ""), session_name, name):
             cell.other.append(label)
 
-    bindings = Counter(name for bound in policy_rows.values() for name in bound if name)
-    bound_rows = {key: name for key, bound in policy_rows.items() if len(bound) == 1 for name in bound if name}
-    unresolved_policy = any("" in bound for bound in policy_rows.values())
     repository_wait_counts: dict[str, set[tuple[int, int]]] = {}
     policy_wait_indices: dict[str, int] = {}
+    local_policy_waits: list[LocalPolicyWait] = []
     gpu_wait_counts: set[tuple[int, int]] = set()
+
+    def record_wait(destination: WaitGroups, reason: records.WaitReason, name: str) -> None:
+        # Keep each policy group separate without publishing private keys.
+        policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
+                        if isinstance(reason, records.RunLimitWait) else 0)
+        add_wait(destination, wait_words(reason), name, policy_index=policy_index)
+
     for visible in waits:
         entry = visible.source
         if isinstance(entry, wire.CloudRow):
@@ -705,15 +734,15 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else local
         if isinstance(step.route, target_config.MacOnly) or pinned in mac_targets:
             continue
-        reason = step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
+        reason = waiting_cause(step)
         if pinned != local:
             destination = remote_wait(pinned)
         elif isinstance(reason, records.RunLimitWait) and reason.machine == local:
             repository_wait_counts.setdefault(reason.repository, set()).add((reason.used, reason.limit))
-            name = bound_rows.get(reason.repository, "")
-            destination = row(name).natedev.waits if name else local_waits
-            if reason.repository in local_limits and step.folder and not origins.resolve("", step.folder):
-                unresolved_policy = True
+            origin = origins.resolve("", step.folder)
+            name = observe_local(origin, reason.repository)
+            local_policy_waits.append(LocalPolicyWait(reason, name, visible.name))
+            continue
         elif isinstance(reason, (records.BuildSpaceLow, records.BuildSpaceUnreadable)):
             destination = metric_waits.setdefault("disk", {})
         elif isinstance(reason, records.GpuSlotWait):
@@ -723,10 +752,14 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             destination = metric_waits.setdefault("memory", {})
         else:
             destination = local_waits
-        # Keep each policy group separate without publishing private keys.
-        policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
-                        if isinstance(reason, records.RunLimitWait) else 0)
-        add_wait(destination, wait_words(reason), visible.name, policy_index=policy_index)
+        record_wait(destination, reason, visible.name)
+
+    bindings = Counter(key for keys in keys_by_row.values() for key in keys)
+    bound_rows = {key: name for name, keys in keys_by_row.items() for key in keys if bindings[key] == 1}
+    for waiting in local_policy_waits:
+        destination = (row(waiting.repository).natedev.waits
+                       if waiting.repository and not unresolved_policy else local_waits)
+        record_wait(destination, waiting.reason, waiting.name)
 
     shared: list[Metric] = []
     for repository_key, limit in local_limits.items():
@@ -746,7 +779,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         if used - limit > len(merge_above):
             continue
         name = bound_rows.get(repository_key, "")
-        if not name or bindings[name] > 1:
+        if unresolved_policy or not name or len(keys_by_row[name]) > 1:
             key_label = policy_label(repository_key)
             label = PAGE_WORDS["policy_key"].format(name=key_label) if key_label else PAGE_WORDS["repository_run_limit"]
             shared.append(Metric(label, used, limit, exempt_runs=len(merge_above)))
@@ -794,14 +827,19 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             cell.note = PAGE_WORDS["not_available"]
 
     for name, item in rows.items():
-        if item.natedev.policy is CellPolicy.NO_LIMIT and unresolved_policy:
-            item.natedev.policy = CellPolicy.UNRESOLVED
-        for cell, has_limited_runs in ((item.natedev, name in bindings), (item.aws, False)):
-            if cell.limit is None and not has_limited_runs and (cell is item.natedev or cell.other_used):
-                cell.runs.extend(cell.other)
-                cell.used = (cell.used or 0) + cell.other_used
-                cell.other.clear()
-                cell.other_used = 0
+        cell = item.natedev
+        if name in keys_by_row and not unresolved_policy:
+            cell.policy = CellPolicy.CONFIGURED if keys_by_row[name] else CellPolicy.NO_LIMIT
+        if cell.policy is CellPolicy.NO_LIMIT:
+            cell.runs.extend(cell.other)
+            cell.used = cell.other_used
+            cell.other.clear()
+            cell.other_used = 0
+        elif unresolved_policy and cell.other_used:
+            unattributed += cell.other_used
+            cell.other_used = 0
+            cell.other.clear()
+        for cell in (item.natedev, item.aws):
             if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used:
                 item.quiet = False
 
