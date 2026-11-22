@@ -1847,28 +1847,38 @@ class RestartTests(RestartTestCase):
     def test_self_stop_reports_a_failed_linux_launch_and_can_run_from_a_shell(self) -> None:
         row = self.rows[0]
         arguments = ["stop", "--all"]
-        reason = "The user manager refused the service"
-        error = subprocess.CalledProcessError(1, ["systemd-run"], stderr=reason)
-        with (patch.object(sys, "platform", "linux"),
-              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
-              patch.object(restart, "stop_row", return_value=True) as stop):
-            with (patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
-                  patch.object(stop_resume, "detach", wraps=stop_resume.detach) as detach,
-                  patch.object(subprocess, "run", side_effect=error) as launch,
-                  redirect_stdout(io.StringIO()) as output):
-                self.assertEqual(shutdown.main(arguments), 2)
-            detach.assert_called_once()
-            launch.assert_called_once()
-            self.assertEqual(launch.call_args.args[0][0], "systemd-run")
-            stop.assert_not_called()
-            path, count, issue, _step = output.getvalue().splitlines()
-            self.assertEqual(Path(path).read_text(), output.getvalue())
-            self.assertEqual(count, "agents stop --all: 0 of 1 sessions stopped.")
-            self.assertIn(f"{row.name}: The launcher could not start the detached command. {reason}.", issue)
-            self.assertIn("Nate opens a plain terminal without a staff session. Nate runs agents stop --all there.", issue)
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(shutdown.main(arguments), 0)
-        stop.assert_called_once()
+        refusal = "The user manager refused the service"
+        step = "Nate opens a plain terminal without a staff session. Nate runs agents stop --all there."
+        for error, reason in (
+            (subprocess.CalledProcessError(1, ["systemd-run"], stderr=refusal), refusal),
+            (FileNotFoundError(errno.ENOENT, "No such file or directory", "systemd-run"),
+             "The systemd-run command is missing"),
+            (OSError(errno.EIO, "Input/output error"), "Input/output error"),
+            (subprocess.CalledProcessError(-signal.SIGTERM, ["systemd-run"]),
+             f"A signal stopped the launcher (signal {signal.SIGTERM})"),
+        ):
+            with (self.subTest(error=error), patch.object(sys, "platform", "linux"),
+                  patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+                  patch.object(restart, "stop_row", return_value=True) as stop):
+                with (patch.dict(os.environ, {"CODEX_THREAD_ID": str(row.current_session)}),
+                      patch.object(stop_resume, "detach", wraps=stop_resume.detach) as detach,
+                      patch.object(subprocess, "run", side_effect=error) as launch,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(arguments), 2)
+                detach.assert_called_once()
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0][0], "systemd-run")
+                stop.assert_not_called()
+                path, count, issue, summary = output.getvalue().splitlines()
+                self.assertEqual(Path(path).read_text(), output.getvalue())
+                self.assertEqual(count, "agents stop --all: 0 of 1 sessions stopped.")
+                self.assertIn(f"{row.name}: The launcher could not start the detached command.", issue)
+                self.assertIn(reason, issue)
+                self.assertIn(step, issue)
+                self.assertIn(step, summary)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(shutdown.main(arguments), 0)
+                stop.assert_called_once()
 
     def test_self_stop_leaves_the_child_report_intact_after_a_linux_launch_timeout(self) -> None:
         row = self.rows[0]
@@ -2044,6 +2054,72 @@ class RestartTests(RestartTestCase):
         self.assertEqual(output.getvalue().splitlines()[1:], [
             "agents restart: 1 of 1 sessions back.", "Nothing for you to do."])
         self.assertEqual(shutdown_record.read(), [])
+
+    def test_restart_reports_save_errors_after_the_worker_resumes(self) -> None:
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", name="impl", unit_type=staff.NotUnit(),
+            parent=staff.ReportsTo(owner.id), role=staff.KnownWorkerRole("impl"))
+        record = staff.StaffSnapshot((owner, child))
+        run = self.root / "active-worker"
+        write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id,
+            "open_phases": [{"id": "46", "instance_id": "open-phase", "status": "active"}], "pass": {}}))
+        prompt = run / "prompt.md"
+        write_text_atomic(prompt, "Read the report.\n")
+        source, reply_path = run / "transcript.jsonl", run / "reply.md"
+        pane = "w1:p1"
+        state = worker_panes.OpenWorker(child, pane, "terminal", herdr.AgentStatus.IDLE)
+        saved = [str(child.id)]
+
+        def transcript_entry(role: str, text: str) -> str:
+            return json.dumps({"type": role, "message": {"role": role, "content": text}}) + "\n"
+
+        with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "local_snapshot", return_value=record),
+              patch.object(staff, "backend", return_value=staff.ClaudeBackend()),
+              patch.object(worker_admission, "transcript_source", return_value=source),
+              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [run])),
+              patch.object(worker_panes, "worker_run", return_value=run),
+              patch.object(herdr.Herdr, "tab_sessions", return_value=[herdr.TabSession(pane, child.name, "", child.current_session)]),
+              patch.object(herdr.Herdr, "agents", return_value=[{"pane_id": pane, "agent_status": herdr.AgentStatus.IDLE}])):
+            dispatch = progress_history.begin_dispatch(run, slot=child.name, phase="46", role="impl",
+                worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+            line = f"Read the report. End your final reply with DONE {dispatch}."
+            reply = f"The report is ready.\nDONE {dispatch}"
+            progress_history.save_dispatch_delivery(run, dispatch, pass_record.DispatchDelivery(line, dispatch, str(reply_path)))
+            prompt_entry = transcript_entry("user", line)
+
+            def send_reply(*_args: object, **_options: object) -> None:
+                write_text_atomic(source, prompt_entry + transcript_entry("assistant", reply))
+
+            error = OSError(errno.EIO, "Input/output error")
+            for failed_save in ("reply", "restart record"):
+                shutdown_record.save(saved)
+                write_text_atomic(source, prompt_entry)
+                with (self.subTest(failed_save=failed_save), redirect_stdout(io.StringIO()) as output,
+                      patch.object(herdr.Herdr, "prompt", side_effect=send_reply) as send,
+                      patch.object(worker, "save_reply", wraps=worker.save_reply,
+                                   side_effect=error if failed_save == "reply" else None) as save,
+                      patch.object(shutdown_record, "remove_started", wraps=shutdown_record.remove_started,
+                                   side_effect=error if failed_save == "restart record" else None) as remove):
+                    self.assertEqual(shutdown.main(["restart"]), 0)
+                    send.assert_called_once()
+                    self.assertEqual(send.call_args.args[0], pane)
+                    save.assert_called_once_with(reply_path, reply)
+                    remove.assert_called_once_with(saved)
+                    path, count, issue, summary = output.getvalue().splitlines()
+                    self.assertEqual(Path(path).read_text(), output.getvalue())
+                    self.assertEqual(count, "agents restart: 1 of 1 sessions back.")
+                    self.assertIn(f"{owner.name} / {child.name}:", issue)
+                    self.assertIn("Input/output error", issue)
+                    self.assertIn("1 unit needs a step.", summary)
+                    if failed_save == "reply":
+                        self.assertEqual(shutdown_record.read(), [])
+                        self.assertIn(f"The director runs worker.py restore in {owner.name}.", issue)
+                        self.assertIn("The affected directors run worker.py restore.", summary)
+                    else:
+                        self.assertEqual(shutdown_record.read(), saved)
+                        self.assertIn("Could not save the restart record.", issue)
+                        self.assertEqual(summary, "1 unit needs a step. Nate sends this error to the efficiency unit.")
 
     def test_stop_waits_for_upkeep_to_start_a_producer_before_reading_liveness(self) -> None:
         producer = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())

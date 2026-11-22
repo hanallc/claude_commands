@@ -1493,6 +1493,7 @@ def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
 @dataclass
 class RestoreReport:
     restored: set[StaffId] = field(default_factory=set)
+    # A restored worker can still need a step to recover its reply.
     failures: dict[StaffId, tuple[str, str]] = field(default_factory=dict)
     run_failures: dict[Path, str] = field(default_factory=dict)
     skipped: dict[StaffId, str] = field(default_factory=dict)
@@ -1629,9 +1630,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         failed(row, resumed.reason, notice=f"anomaly: {name}: {resumed.reason}")
                         continue
                     resume_sent = True
-                    _ = cleanup.pop_all()
                     if report is not None:
                         report.restored.add(row.id)
+                    _ = cleanup.pop_all()
                     recovery = completion_notices.recover_completion(row, holder, run, hold, record=record,
                                                                      pane=KeepCompletedPane.KEEP)
                     if report is None and recovery in pending_completion:
@@ -1641,7 +1642,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 reason = " ".join(str(error).splitlines()) or type(error).__name__
                 if not resume_sent:
                     failed(state.row, reason, notice=f"anomaly: {name}: {reason}")
-                elif report is None:
+                elif report is not None:
+                    report.failures[state.row.id] = name, f"Could not finish restore. {reason}"
+                else:
                     print(f"anomaly: {name}: {reason}", file=sys.stderr)
     if report is None:
         if outcome == ExitCode.OK:

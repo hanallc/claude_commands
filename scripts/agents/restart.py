@@ -289,7 +289,7 @@ class DetachedReport(TypedDict):
 
 class LogHandoff(Enum):
     LOCAL = "the parent can write the result"
-    PENDING = "the launcher may have started the child"
+    TIMED_OUT = "the launcher timed out before it confirmed the start"
     STARTED = "the launcher confirmed the child started"
 
 
@@ -506,10 +506,8 @@ def run_command(action: Callable[[], int], arguments: list[str], *, stop: bool =
         finally:
             _BULK_REPORT.reset(token)
         if detached is None and log is not None:
-            if report.handoff is LogHandoff.PENDING:
-                notice = ("The launcher could not confirm the start. Read any report in this log."
-                          if code else _background_status(report.command))
-                print(f"  {notice}", flush=True)
+            if report.handoff is LogHandoff.TIMED_OUT:
+                print(f"  {_background_status(report.command)}", flush=True)
             else:
                 print(flush=True)
         if report.handoff is not LogHandoff.LOCAL:
@@ -542,7 +540,7 @@ class WorkerRestoreReports:
         if attempt is None:
             return set()
         _owner, result = attempt
-        return (result.restored | result.skipped.keys()) - result.failures.keys()
+        return result.restored | (result.skipped.keys() - result.failures.keys())
 
     def report(self) -> None:
         owners: dict[staff.StaffId, staff.StaffRow] = {}
@@ -560,7 +558,6 @@ class WorkerRestoreReports:
                 failures.update(result.failures)
                 run_failures.update(result.run_failures)
                 skipped.update(result.skipped)
-            restored.difference_update(failures)
             if (bulk := _BULK_REPORT.get()) is not None:
                 for identity in restored:
                     _ = bulk.targets.setdefault(identity, str(identity))
@@ -580,17 +577,19 @@ class WorkerRestoreReports:
                 continue
             count = len(restored)
             next_step = f"run worker.py restore in {owner.name}"
-            for name, reason in sorted(failures.values()):
-                print(f"restart anomaly: {owner.name}: worker {name} not restored: "
+            for identity, (name, reason) in sorted(failures.items(), key=lambda item: item[1]):
+                status = "restored" if identity in restored else "not restored"
+                print(f"restart anomaly: {owner.name}: worker {name} {status}: "
                       + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
             for run, reason in sorted(run_failures.items()):
                 print(f"restart anomaly: {owner.name}: cannot reap detached runs in {run}: "
                       + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
-            if failures:
-                print(f"{owner.name}: {count} of {count + len(failures)} workers restored; see anomaly")
+            not_restored = len(failures.keys() - restored)
+            if not_restored:
+                print(f"{owner.name}: {count} of {count + not_restored} workers restored; see anomaly")
             else:
                 noun = "worker" if count == 1 else "workers"
-                suffix = "; see anomaly" if run_failures else ""
+                suffix = "; see anomaly" if failures or run_failures else ""
                 print(f"{owner.name}: {count} {noun} restored{suffix}")
 
 
@@ -711,6 +710,19 @@ def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> Regist
 def _error_reason(error: object) -> str:
     reason = str(error).splitlines()
     return reason[0] if reason else type(error).__name__
+
+
+def _launch_failure_reason(error: Exception) -> str:
+    if isinstance(error, FileNotFoundError) and cast(object, error.filename) == "systemd-run":
+        return "The systemd-run command is missing"
+    if isinstance(error, subprocess.CalledProcessError):
+        detail = cast(str | None, error.stderr)
+        if detail and detail.strip():
+            return detail.strip()
+        if error.returncode < 0:
+            return f"A signal stopped the launcher (signal {-error.returncode})"
+        return f"The launcher returned exit status {error.returncode}"
+    return _error_reason(error)
 
 
 def _anomaly(row: staff.StaffRow, error: object) -> None:
@@ -1643,18 +1655,14 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                         f"Could not write the log. {reason}", step, operator=True)
                 return 2
             arguments.extend(("--parent-report", report.detach_data()))
-            report.handoff = LogHandoff.PENDING
             try:
                 _ = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve(),
                                        log=report.log, log_fd=report.log_stream.fileno())
             except subprocess.TimeoutExpired:
+                report.handoff = LogHandoff.TIMED_OUT
                 return 0
-            except subprocess.CalledProcessError as error:
-                if error.returncode <= 0:
-                    raise
-                report.handoff = LogHandoff.LOCAL
-                detail = cast(str | None, error.stderr)
-                reason = _error_reason(detail or error)
+            except Exception as error:
+                reason = _launch_failure_reason(error)
                 step = f"Nate opens a plain terminal without a staff session. Nate runs {report.retry} there."
                 for row in selected:
                     report.issues[row.id] = FollowUp(report.targets[row.id],
@@ -1823,6 +1831,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     resume_checks = DirectorResumeChecks()
     resume_policies = {record.rows_by_id[identity].current_session: policy
                        for identity, policy in worker_policies.items() if identity not in blocked_workers}
+    record_save_failures: dict[str, str] = {}
 
     def remove_started(holder: staff.StaffRow, *, started_holder: bool) -> None:
         resolved = resume_checks.worker_restores.resolved(holder.id)
@@ -1830,7 +1839,13 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 if (member_id := staff.StaffId(member)) not in blocked_workers
                 and (member_id in resolved or (started_holder and record.rows_by_id[member_id].kind != "worker"))]
         if done:
-            shutdown_record.remove_started(done)
+            try:
+                shutdown_record.remove_started(done)
+            except (OSError, ValueError) as error:
+                if report is None:
+                    raise
+                reason = f"Could not save the restart record. {_error_reason(error)}"
+                record_save_failures.update(dict.fromkeys(done, reason))
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition:
@@ -1975,6 +1990,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktrees.Refused) as error:
             print(f"restart: kept old worktree links: {_error_reason(error)}", file=sys.stderr)
     resume_checks.report()
+    if report is not None:
+        step = "Nate sends this error to the efficiency unit."
+        for member, reason in record_save_failures.items():
+            issue = report.issues.get(member)
+            report.issues[member] = (FollowUp(report.targets[member], reason, step, operator=True) if issue is None else
+                replace(issue, reason=f"{issue.reason.rstrip('.')}. {reason}", step=f"{issue.step} {step}", operator=True))
     return exit_code
 
 
