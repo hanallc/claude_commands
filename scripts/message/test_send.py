@@ -203,13 +203,18 @@ class RelayAccountTests(unittest.TestCase):
             started = sessions.process_start(os.getpid())
             assert started
             program = """
-import os, re, signal, sys
+import json, os, signal, sys
 from functools import partial
+from pathlib import Path
 from scripts.message import review_hold, send, send_later
 
 def killed(_command, prompt, _timeout, _environment, _cwd):
-    root = re.escape(sys.argv[4])
-    print(re.search(rf'uds:({root}/claude-send-[^"]+/delivery.sock)', prompt)[1], flush=True)
+    target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith("- to: ")))
+    assert isinstance(target, str) and target.startswith("uds:"), target
+    proxy = Path(target.removeprefix("uds:"))
+    assert proxy.parent.parent == Path(sys.argv[4]), proxy
+    assert proxy.parent.name.startswith("claude-send-") and proxy.name == "delivery.sock", proxy
+    print(proxy, flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
 
 send.run = killed
