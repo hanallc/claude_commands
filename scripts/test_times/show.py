@@ -594,14 +594,18 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     return request
 
 
+def open_read_only_index(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(index.read_only_path_uri(path), uri=True,
+                           timeout=index.BUSY_TIMEOUT_MS / 1000)
+
+
 def open_report_index() -> sqlite3.Connection:
     """Read a complete index and build one only when none qualifies."""
     path = index.complete_gate_index_in(store.root())
     if isinstance(path, index.NoCompleteGateIndex):
         _ = index.update()
         path = index.index_path()
-    connection = sqlite3.connect(index.read_only_path_uri(path), uri=True,
-                                 timeout=index.BUSY_TIMEOUT_MS / 1000)
+    connection = open_read_only_index(path)
     _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
@@ -647,7 +651,11 @@ def main(argv: list[str] | None = None) -> int:
     request = arguments(sys.argv[1:] if argv is None else argv)
     if request.command == "seed-gate-times":
         try:
-            with closing(index.read_only()) as connection:
+            path = index.complete_gate_index_in(store.root())
+            if isinstance(path, index.NoCompleteGateIndex):
+                print("recent gate times not seeded: no complete index has compatible gate tables", file=sys.stderr)
+                return 1
+            with closing(open_read_only_index(path)) as connection:
                 connection.execute("BEGIN").close()
                 keys = recent_gate_times.seed(connection)
         except (OSError, sqlite3.Error, conf.Unusable) as error:

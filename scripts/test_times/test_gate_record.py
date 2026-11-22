@@ -44,6 +44,7 @@ class GateRecordTests(unittest.TestCase):
         }))
         _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5\nTOP_RUNS=2")
         _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=1")
 
     def fixture_index(self) -> sqlite3.Connection:
         self.buildlog.mkdir(exist_ok=True)
@@ -163,7 +164,12 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(50))
         self.assertEqual(read(8, ["scripts/scripts/test_example.py"], 2, True), gate_record.GateTimeLimit(22))
         path.unlink()
+        connection.execute("INSERT INTO meta (key, value) VALUES ('updated_at', '100')").close()
         connection.commit()
+        connection.close()
+        current_index = index.index_path()
+        _ = current_index.rename(current_index.with_name("index-fixture.sqlite"))
+        self.fixture_index().commit()
         output = io.StringIO()
         with (mock.patch.object(index, "update", side_effect=AssertionError("seed updated the index")),
               redirect_stdout(output)):
@@ -172,6 +178,16 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), expected)
         self.assertEqual(read(8, (), 2, False), gate_record.GateTimeLimit(50))
         self.assertEqual(read(8, ["scripts/scripts/test_example.py"], 2, True), gate_record.GateTimeLimit(22))
+
+    def test_seed_requires_a_completed_index_refresh(self) -> None:
+        self.fixture_index().commit()
+        stderr = io.StringIO()
+        with (mock.patch.object(index, "update", side_effect=AssertionError("seed updated the index")),
+              redirect_stderr(stderr)):
+            self.assertEqual(show.main(["seed-gate-times"]), 1)
+        self.assertEqual(stderr.getvalue(),
+                         "recent gate times not seeded: no complete index has compatible gate tables\n")
+        self.assertFalse(self.recent_path.exists())
 
     def test_missing_and_corrupt_times_disable_the_limit(self) -> None:
         path = self.recent_path
