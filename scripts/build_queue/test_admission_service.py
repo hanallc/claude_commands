@@ -12,7 +12,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 import io
@@ -44,7 +44,7 @@ from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
 
 from scripts.lib import conf
-from scripts.lib import inotify, test_hang_guard
+from scripts.lib import inotify, socket_test_support, test_hang_guard
 from scripts.lib.socket_test_support import UNIX_SOCKET_PATH_LIMIT
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
@@ -5246,17 +5246,20 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             long_tmpdir = Path(root) / ("nested folder" + "x" * 140)
             long_tmpdir.mkdir()
-            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), \
-                 mock.patch.object(tempfile, "tempdir", None), \
-                 AdmissionFixture() as fixture:
-                self.assertEqual(fixture.root.parent, long_tmpdir)
-                self.assertGreater(len(os.fsencode(fixture.root / "admission.sock")), 108)
-                self.assertLessEqual(len(os.fsencode(fixture.socket_path)), UNIX_SOCKET_PATH_LIMIT)
-                self.assertEqual(fixture.socket_dir.parent, Path("/tmp"))
-                self.assertTrue(fixture.socket_path.is_socket())
-                peer = fixture.connect(wire.ViewRequest())
-                self.assertTrue(any(isinstance(reply, wire.ViewReply) for reply in peer.replies()))
-            self.assertFalse(fixture.socket_dir.exists())
+            fallback = Path("fallback")
+            with (chdir(root), mock.patch.object(socket_test_support, "FALLBACK_SOCKET_ROOT", fallback),
+                  mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}),
+                  mock.patch.object(tempfile, "tempdir", None)):
+                fallback.mkdir()
+                with AdmissionFixture() as fixture:
+                    self.assertEqual(fixture.root.parent, long_tmpdir)
+                    self.assertGreater(len(os.fsencode(fixture.root / "admission.sock")), 108)
+                    self.assertLessEqual(len(os.fsencode(fixture.socket_path)), UNIX_SOCKET_PATH_LIMIT)
+                    self.assertEqual(fixture.socket_dir.parent, fallback)
+                    self.assertTrue(fixture.socket_path.is_socket())
+                    peer = fixture.connect(wire.ViewRequest())
+                    self.assertTrue(any(isinstance(reply, wire.ViewReply) for reply in peer.replies()))
+                self.assertFalse(fixture.socket_dir.exists())
 
 
     def test_second_request_and_oversized_input_end_admission_before_next_pass(self) -> None:

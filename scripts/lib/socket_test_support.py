@@ -12,6 +12,7 @@ from typing import override
 
 UNIX_SOCKET_PATH_LIMIT = 103 if sys.platform == "darwin" else 107
 LONGEST_SOCKET_SUFFIX = ".codex2/app-server-control/app-server-control.sock"
+FALLBACK_SOCKET_ROOT = Path("/tmp")
 
 
 def socket_parent(prefix: str = "s") -> Path:
@@ -19,7 +20,7 @@ def socket_parent(prefix: str = "s") -> Path:
     parent = Path(tempfile.gettempdir())
     # tempfile.mkdtemp adds eight characters to the prefix.
     longest_path = parent / (prefix + "xxxxxxxx") / LONGEST_SOCKET_SUFFIX
-    return parent if len(os.fsencode(longest_path)) <= UNIX_SOCKET_PATH_LIMIT else Path("/tmp")
+    return parent if len(os.fsencode(longest_path)) <= UNIX_SOCKET_PATH_LIMIT else FALLBACK_SOCKET_ROOT
 
 
 class ShortSocketDirectory:
@@ -27,9 +28,11 @@ class ShortSocketDirectory:
 
     def __init__(self, prefix: str) -> None:
         short_prefix = prefix[:1]
+        parent = socket_parent(short_prefix)
         self._folder: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(
-            dir=socket_parent(short_prefix), prefix=short_prefix)
-        self.name: str = self._folder.name
+            dir=parent, prefix=short_prefix)
+        # Keep relative fixture paths short for bind and connect.
+        self.name: str = str(parent / Path(self._folder.name).name)
 
     def __enter__(self) -> str:
         return self.name
