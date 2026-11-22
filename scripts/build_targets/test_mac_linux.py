@@ -12,7 +12,7 @@ from typing import cast, override
 import unittest
 from unittest.mock import patch
 
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 
@@ -30,22 +30,17 @@ if host == 'fixture-mac':
 assert host == 'fixture-guest'
 assert sys.argv[-4:-2] == ['-l', os.environ['FIXTURE_GUEST_USER']]
 shell = shlex.split(command)[-1]
-cleanup = 'flock -n -E 75' in shell
+assert 'checkout="$HOME/.claude"' in shell
+assert 'mkdir -p -- "$checkout"' in shell
+assert 'exec 9< .' in shell
+assert shell.count('$HOME') == 1
 with Path(os.environ['FIXTURE_SSH_TRACE']).open('a') as trace:
-    trace.write(('cleanup' if cleanup else 'run') + '\\n')
+    trace.write('run\\n')
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
-if not cleanup and os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
+if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
     print('fixture SSH refused the connection', file=sys.stderr)
     sys.exit(255)
-if not cleanup and os.environ['FIXTURE_GUEST_RESULT'] == 'disconnect':
-    match = re.search(r'^run="\\$HOME"/(mac-linux-[a-f0-9]+)$', shell, re.M)
-    assert match
-    (home / match[1]).mkdir()
-    print('fixture SSH lost its connection during upload', file=sys.stderr)
-    sys.exit(255)
 environment = dict(os.environ, HOME=str(home))
-if cleanup:
-    sys.exit(subprocess.call(['bash', '-c', shell], env=environment))
 payload = sys.stdin.buffer.read()
 offset = re.search(r'^head -c ([0-9]+) [|] zstd', shell, re.M)
 assert offset
@@ -53,14 +48,18 @@ bootstrap_bytes = int(offset[1])
 magic = bytes.fromhex('28 b5 2f fd')
 assert payload.startswith(magic) and payload[bootstrap_bytes:].startswith(magic)
 Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(payload) - bootstrap_bytes))
+if os.environ['FIXTURE_GUEST_RESULT'] == 'disconnect':
+    payload = payload[:bootstrap_bytes + 12]
 sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment).returncode)
 '''
 
 
-GATE_FIXTURE = '''import os
+GATE_FIXTURE = '''import fcntl
+import os
 from pathlib import Path
 import subprocess
 
+from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
 from scripts.production.gate_routes import GateJobResult, GateRun, SelectedModules, SuiteMode
 
@@ -69,19 +68,35 @@ def checked_git(repo, *args):
     return subprocess.check_output(['git', *args], cwd=repo, text=True).strip()
 
 
-def WholeMachine():
-    return None
+def WholeMachine(*, gate_parent):
+    return gate_parent
 
 
 def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time_limit):
-    assert Path.home() == repo.parent / 'home'
+    guest = Path(os.environ['FIXTURE_GUEST_HOME'])
+    assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
+    assert Path.home().is_relative_to(repo / 'target')
+    assert Path(os.environ['XDG_RUNTIME_DIR']).is_relative_to(repo / 'target')
+    assert machine.path == Path(os.environ['TMPDIR'])
+    assert machine.path.is_relative_to(repo / 'target')
     assert (Path.home() / '.claude/config').resolve() == repo / 'config'
+    assert os.environ['CARGO_TARGET_DIR'] == str(repo / 'target')
+    assert Path(os.environ['RUSTUP_HOME']).is_relative_to(repo / 'target')
+    with repo.with_suffix('.lock').open('r') as lock:
+        descriptor, = copies.COMMAND_LOCKS.get()
+        assert os.path.samestat(os.fstat(descriptor), os.fstat(lock.fileno()))
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise AssertionError('The numbered copy is not locked.')
     assert os.environ['USER'] == os.environ['LOGNAME']
     assert os.environ['USER'] == os.environ['FIXTURE_GUEST_USER']
     assert not {'SSH_AUTH_SOCK', 'GH_TOKEN', 'XDG_CONFIG_HOME', 'CONF_DIR'} & os.environ.keys()
     assert os.cpu_count() == 2 and time_limit.seconds == 7 and module_time_limit_s == 3
     assert checked_git(repo, 'show', 'origin/main:history.txt') == 'old source'
-    assert checked_git(repo, 'rev-list', '--count', '--all') == '1'
+    assert checked_git(repo, 'rev-list', '--count', 'main', 'origin/main') == '1'
     head = checked_git(repo, 'rev-parse', 'HEAD')
     assert checked_git(repo, 'rev-parse', 'main') == head
     assert checked_git(repo, 'rev-parse', 'origin/main') == head
@@ -90,6 +105,8 @@ def run_suites(repo, *, full, mode, machine, selected, module_time_limit_s, time
     scenario = os.environ['FIXTURE_GUEST_RESULT']
     if scenario == 'runner-failure':
         raise RuntimeError('fixture guest runner failed')
+    if scenario == 'leave-edit':
+        (repo / 'history.txt').write_text('copy edit\\n')
     timing = dict(wall_s=1.3, cpu_s=1.0, tests_s=0.7, tests_run=3, failures=0, errors=0, tests=[])
     paths = [(suite, path) for suite, path in discover_test_modules(repo)
              if not isinstance(selected, SelectedModules) or str(path.relative_to(repo)) in selected.paths]
@@ -104,16 +121,21 @@ GUEST_BOOTSTRAP = '''from importlib.util import module_from_spec, spec_from_file
 import os
 from pathlib import Path
 import runpy
+import socket
 import sys
 
 from scripts.aws_target import gate_box, ledger
 
 os.chdir(sys.argv[1])
-spec = spec_from_file_location('scripts.production.gate', Path('scripts/production/gate.py'))
-gate = module_from_spec(spec)
-sys.modules[spec.name] = gate
-spec.loader.exec_module(gate)
-runpy.run_path(sys.argv[2], run_name='__main__')
+socket.gethostname = lambda: 'nixos'
+if sys.argv[-1] == '--run-copy':
+    spec = spec_from_file_location('scripts.production.gate', Path('scripts/production/gate.py'))
+    gate = module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+path = sys.argv[2]
+sys.argv = sys.argv[2:]
+runpy.run_path(path, run_name='__main__')
 '''
 
 
@@ -154,6 +176,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             'FIXTURE_SSH_TRACE': str(self.trace), 'FIXTURE_GUEST_HOME': str(self.guest_home),
             'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
             'FIXTURE_GUEST_USER': account, 'FIXTURE_GUEST_RESULT': 'pass',
+            'BUILDLOG_UNIT': 'caller', 'FIXTURE_EXPECTED_UNIT': 'caller',
             'GH_TOKEN': 'fixture-token', 'SSH_AUTH_SOCK': str(self.root / 'agent.sock'),
             'XDG_CONFIG_HOME': str(self.root / 'outside-config'),
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
@@ -164,18 +187,27 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
         _ = self.git('commit', '-qm', 'base')
-        _ = self.git('remote', 'add', 'origin', 'https://example.test/repo.git')
+        _ = self.git('remote', 'add', 'origin', 'https://example.test/claude_commands.git')
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
             (self.repo / folder).mkdir(parents=True)
-        _ = (self.repo / 'config/fixture.conf').touch()
+        model = Path(__file__).resolve().parents[2] / 'config/build_folders.conf'
+        _ = (self.repo / 'config/build_folders.conf').write_bytes(model.read_bytes())
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()
         package_root = shlex.quote(str(Path(__file__).resolve().parents[2]))
-        self.executable(self.repo / 'scripts/lib/py', '#!/usr/bin/env bash\n'
-                        + f'candidate="$PWD"\ncd {package_root}\nexport PYTHONPATH={package_root}\n'
-                        + f'exec {shlex.quote(sys.executable)} -B "$1" "$2"'
-                        + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$3"\n')
+        shim = """#!/usr/bin/env bash
+candidate="$PWD"
+options=()
+if [[ "$1" == "-X" ]]; then
+    options=("$1" "$2")
+    shift 4
+fi
+"""
+        self.executable(self.repo / 'scripts/lib/py', shim
+                        + f'cd {package_root}\nexport PYTHONPATH={package_root}\n'
+                        + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}"'
+                        + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$@"\n')
         _ = self.git('add', '.')
         _ = self.git('commit', '-qm', 'candidate')
 
@@ -187,14 +219,27 @@ class MacLinuxRouteTests(unittest.TestCase):
     def git(self, *args: str) -> str:
         return subprocess.check_output(['git', *args], cwd=self.repo, text=True, timeout=10).strip()
 
-    def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str:
+    def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
-        with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': scenario}):
+        temporary_directory = tempfile.TemporaryDirectory
+
+        def snapshot_index(*, prefix: str) -> tempfile.TemporaryDirectory[str]:
+            self.assertEqual(prefix, 'cloud-gate-index-')
+            return temporary_directory(prefix=prefix)
+
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': scenario}),
+              patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
+              patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             return mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                   module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED)
+                                   module_time_limit_s=3, gate_job=gate_job)
 
     def assert_guest_clean(self, events: list[str]) -> None:
-        self.assertEqual(list(self.guest_home.iterdir()), [])
+        main = self.guest_home / '.claude'
+        build = self.guest_home / 'build'
+        self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
+        self.assertFalse((main / '.git/mac-linux').exists())
+        self.assertEqual(list(build.rglob('mac-linux*')), [])
         self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), events)
 
     def test_switch_off_returns_local_reason_without_ssh(self) -> None:
@@ -206,7 +251,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         result = self.route('offline')
         self.assertIsInstance(result, str)
         self.assertIn('fixture SSH refused the connection', str(result))
-        self.assert_guest_clean(['run', 'cleanup'])
+        self.assert_guest_clean(['run'])
 
     def test_guest_returns_module_metrics(self) -> None:
         result = self.route()
@@ -237,13 +282,60 @@ class MacLinuxRouteTests(unittest.TestCase):
         result = self.route('runner-failure')
         self.assertIsInstance(result, str)
         self.assertIn('fixture guest runner failed', str(result))
-        self.assert_guest_clean(['run', 'cleanup'])
+        self.assert_guest_clean(['run'])
 
-    def test_cleanup_removes_a_partial_upload(self) -> None:
+    def test_copy_can_retry_after_a_partial_upload(self) -> None:
+        main = self.guest_home / '.claude'
+        self.assertIsInstance(self.route(), GateRun)
+        _ = (self.repo / 'scripts/fixture/test_added.py').touch()
         result = self.route('disconnect')
         self.assertIsInstance(result, str)
-        self.assertIn('lost its connection during upload', str(result))
-        self.assert_guest_clean(['run', 'cleanup'])
+        self.assertIn('SSH or source stream exited', str(result))
+        self.assertEqual((main / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
+        self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
+        self.assert_guest_clean(['run', 'run'])
+        retry = self.route()
+        assert isinstance(retry, GateRun), retry
+        self.assertTrue(retry.passed)
+        self.assert_guest_clean(['run', 'run', 'run'])
+
+    def test_copy_uses_the_job_unit(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_EXPECTED_UNIT': 'checkpoint-owner'}):
+            result = self.route(gate_job=StepJob('integrate', unit='checkpoint-owner'))
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assert_guest_clean(['run'])
+
+    def test_copy_reuses_number_after_main_moves_to_a_new_root(self) -> None:
+        main = self.guest_home / '.claude'
+        numbered = self.guest_home / 'build/claude/caller/1'
+        self.assertIsInstance(self.route(), GateRun)
+        first = subprocess.check_output(['git', '-C', str(main), 'rev-parse', 'HEAD'], text=True).strip()
+        use_stamp = numbered / 'target/fixture-output'
+        use_stamp.touch()
+        (self.repo / 'scripts/fixture/test_first.py').unlink()
+        self.assertIsInstance(self.route(), GateRun)
+        second = subprocess.check_output(['git', '-C', str(main), 'rev-list', '--all'], text=True).splitlines()
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(second[0], first)
+        self.assertFalse((main / 'scripts/fixture/test_first.py').exists())
+        self.assertFalse((numbered / 'scripts/fixture/test_first.py').exists())
+        self.assertTrue(use_stamp.is_file())
+        self.assertTrue(numbered.with_suffix('.lease.json').is_file())
+        self.assert_guest_clean(['run', 'run'])
+
+    def test_copy_rescues_edits_after_main_moves(self) -> None:
+        self.assertIsInstance(self.route('leave-edit'), GateRun)
+        main = self.guest_home / '.claude'
+        numbered = self.guest_home / 'build/claude/caller/1'
+        _ = (self.repo / 'scripts/fixture/test_added.py').touch()
+        result = self.route()
+        assert isinstance(result, GateRun), result
+        rescue = subprocess.check_output(['git', '-C', str(main), 'for-each-ref', '--format=%(refname)',
+                                          'refs/rescue/'], text=True).strip()
+        saved = subprocess.check_output(['git', '-C', str(main), 'show', f'{rescue}:history.txt'], text=True)
+        self.assertEqual(saved, 'copy edit\n')
+        self.assertEqual((numbered / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
 
     def test_selected_modules_keep_subset_coverage(self) -> None:
         tree = self.git('rev-parse', 'HEAD^{tree}')

@@ -6,6 +6,8 @@ Editable source lives under `~/worktrees`. Cargo output lives under the configur
 
 The build root is `/build` on natedev and `~/build` on the Mac. The table uses `/build` for the build root.
 
+The Mac Linux guest uses the default build root `~/build` and the main checkout `~/.claude` for the `gate-runner` user.
+
 | Form | Path | Cargo output |
 | --- | --- | --- |
 | Worktree | `~/worktrees/<repo>/<unit>/<short-name>` | `target` links to the worktree output. |

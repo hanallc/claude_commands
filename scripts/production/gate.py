@@ -195,9 +195,16 @@ class SharedMachine:
 
 
 @dataclass(frozen=True)
+class ConfiguredGateParent:
+    """Use the gate parent from build_folders.conf."""
+
+
+@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
+        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1460,10 +1467,12 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused('selected modules are absent from the tested tree')
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     runner = module_runner(repo)
-    tmpfs = build_folders.tmpfs_temporary_parent()
-    if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
-    report_retained_gate_test_folders(tmpfs)
+    gate_parent = (machine.gate_parent.path
+                   if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent)
+                   else build_folders.tmpfs_temporary_parent())
+    if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
+        raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
+    report_retained_gate_test_folders(gate_parent)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
@@ -1513,7 +1522,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
     scope_prefix = suite_scope_prefix() if shared else []
-    state_directory = gate_state_dir() if shared else tmpfs
+    state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
     timings = read_measures(timings_path) if isinstance(machine, SharedMachine) else machine.module_seconds.copy()
     cpu_path = state_directory / "module_cpu_seconds.json"
@@ -1574,8 +1583,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
 
     # Folder keys stay unchanged until chunk 6.
     folder_tool = "merge-gate" if mode is SuiteMode.GATE else "targeted-test"
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, folder_tool, tmpfs) as temporary,
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+          gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -1779,7 +1788,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if running or pending:
                     time.sleep(0.05)
         finally:
-            # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
+            # Reap this runner's groups before the gate folder cleanup.
             with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
