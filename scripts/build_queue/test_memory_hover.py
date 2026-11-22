@@ -11,7 +11,7 @@ import unittest
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import limits_view, memory_feed, progress_profile as progress, snapshot_codec
 from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
@@ -39,6 +39,52 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_build_limits_move_names_and_wait_reasons_to_hover(self) -> None:
+        wait = limits_view.WaitGroup(limits_view.WaitWords("1 run waits for space.", "{count} runs wait for space."),
+                                     ["Test <one>", "Test two"])
+        waits = {"disk": wait}
+        cell = limits_view.Cell(limit=2, used=1, runs=["Build <one>"], waits=waits)
+        disk = limits_view.Metric("disk", 20, 31, "GiB", "minimum", waits)
+        machine = limits_view.MachineLimits("In use", (disk,), waits)
+        empty = limits_view.MachineLimits("", (), {})
+        mac = limits_view.MachineLimits("On", (), waits, 1, "A Mac claim has no verified repository origin.")
+        unknown = limits_view.Cell(waits=waits, count_note="The queue waits and the reservations disagree.")
+        section = limits_view.BuildLimits(machine, mac, empty,
+            (limits_view.RepositoryRow("repo:example", natedev=cell),
+             limits_view.RepositoryRow("hana", natedev=unknown)), False, {})
+        keys = ("limit:cell:natedev:repo:example", "limit:machine:natedev", "limit:metric:natedev:disk",
+                "limit:cell:natedev:hana", "limit:machine:mac")
+        rendered, tooltip, heading, metric, unknown_tip, mac_tip = cast(list[str], self.page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return [$('build-limits-content').innerHTML, ...data.keys.map(key => pageTooltipHtml(key, data))];
+        })()""", {"build_limits": snapshot_codec.snapshot_value(section), "keys": keys}, limits=True))
+        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        detail = table.find(f".//td[@data-tip='{keys[0]}']/span")
+        assert detail is not None
+        self.assertEqual(detail.get("data-wait-count"), "2")
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/span")],
+            [f"build-limit-mark {kind}" for kind in ("run", "free", "line", "wait", "wait")])
+        self.assertEqual(detail.findtext("span[2]"), "1 of 2")
+        self.assertNotIn("Test two", rendered)
+        self.assertNotIn("wait for space", rendered)
+        pending = table.find(f".//td[@data-tip='{keys[3]}']/span")
+        assert pending is not None
+        self.assertEqual(pending.findtext("span[2]"), "?")
+        self.assertEqual([mark.get("class") for mark in pending.findall("span/span")], ["build-limit-mark wait"] * 2)
+        self.assertIn("Count not known", rendered)
+        self.assertIsNotNone(table.find(".//th[@data-tip='limit:machine:mac']"))
+        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, unknown_tip, mac_tip)]
+        for column in columns:
+            assert column is not None
+            self.assertIn("Waiting", [row.text for row in column.findall("dt")])
+            self.assertIn("Because", [row.text for row in column.findall("dt")])
+            self.assertIn("Test <one>, Test two", [row.text for row in column.findall("dd")])
+            self.assertIn("2 runs wait for space.", [row.text for row in column.findall("dd")])
+        self.assertIn("Build &lt;one&gt;", tooltip)
+        self.assertNotIn("Build &lt;one&gt;", rendered)
+        self.assertIn("The queue waits and the reservations disagree.", unknown_tip)
+        self.assertIn("A Mac claim has no verified repository origin.", mac_tip)
+
     def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)

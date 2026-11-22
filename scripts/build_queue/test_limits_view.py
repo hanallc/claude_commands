@@ -154,6 +154,12 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertEqual([(row.name, row.quiet) for row in shown.repositories], [
             ("hana", False), ("project", False), ("quiet", True),
         ])
+        extra_history = frozenset({"https://example.invalid/team/aaa", "https://example.invalid/team/claude_commands"})
+        ordered = limits_view.build_limits(queue, (), limits_view.visible_waits(queue_view.QueueModel(queue, {}), names,
+            cloud_names), cloud_names, {}, replace(saved, history=extra_history), UTC)
+        self.assertEqual([row.name for row in ordered.repositories], ["claude_commands", "hana", "aaa", "project"])
+        self.assertTrue(ordered.repositories[2].quiet)
+        self.assertFalse(ordered.repositories[3].quiet)
         hana_row, project_row, quiet = shown.repositories
         cell = project_row.natedev
         self.assertEqual((cell.used, cell.limit, cell.runs, cell.merge_above), (2, 1, ["regular"], ["merge-owner"]))
@@ -240,6 +246,7 @@ class BuildLimitsTests(unittest.TestCase):
         self.assertIsNone(wait_cell.used)
         self.assertEqual(wait_cell.runs, [])
         self.assertEqual((wait_cell.other_used, wait_cell.other), (1, ["check-owner"]))
+        self.assertEqual(wait_cell.count_note, "The queue waits and the reservations disagree on the run count or limit.")
         gpu_meter = next(metric for metric in wait_limits.natedev.shared if metric.label == "gpu")
         self.assertEqual((gpu_meter.used, gpu_meter.limit, wait_names(gpu_meter.waits)),
                          (None, None, {"1 run waits because all GPU test places are in use.": ["Memory wait"]}))
@@ -331,11 +338,13 @@ class BuildLimitsTests(unittest.TestCase):
         for shown, total in ((keyless, 2), (unresolved, 3)):
             with self.subTest(mac_claims=total):
                 self.assertEqual(shown.mac.unattributed, total)
+                self.assertIn("no verified repository origin", shown.mac.unattributed_note)
                 self.assertEqual(shown.mac.waits, normal.mac.waits)
                 self.assertTrue(all(row.mac == limits_view.Cell() for row in shown.repositories))
                 self.assertNotIn("other", {row.name for row in shown.repositories})
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
+        self.assertEqual(full_mac.mac.unattributed_note, "")
         self.assertTrue(all(row.mac.limit is None and row.mac.used != 0 for row in full_mac.repositories))
         self.assertEqual(sum(row.mac.used or 0 for row in full_mac.repositories), 2)
         self.assertTrue(all(row.mac == limits_view.Cell() for row in bad_claims.repositories))
@@ -502,17 +511,24 @@ class BuildLimitsTests(unittest.TestCase):
             self.assertEqual(row.findtext("th"), old_row.findtext("th"))
             self.assertEqual(["".join(cell.itertext()) for cell in old_row.findall("td")],
                              ["".join(row.findall("td")[index].itertext()) for index in (0, 2)])
-        self.assertIn("2 runs wait behind an earlier step in the queue.", "".join(headings[1].itertext()))
-        self.assertIn("1 run waits behind an earlier step in the queue.", "".join(headings[2].itertext()))
-        self.assertIn("1 run waits behind an earlier step in the queue.", "".join(headings[3].itertext()))
-        self.assertNotIn("2 waiting", current)
-        self.assertNotIn("1 waiting", current)
+        for index, machine, count in ((1, "natedev", 2), (2, "mac", 1), (3, "aws", 1)):
+            badge = headings[index].find(f"div[@data-tip='limit:machine:{machine}']")
+            assert badge is not None
+            self.assertEqual(badge.get("data-wait-count"), str(count))
+            self.assertEqual(badge.findtext("span[2]"), f"{count} waiting")
+            self.assertEqual(len(badge.findall("span/span[@class='build-limit-mark wait']")), count)
+        self.assertNotIn("wait behind an earlier step", current)
+        self.assertNotIn("Regular step", current)
         self.assertIsNone(table.find(".//tbody/tr/th/small"))
+        project = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "project")
+        self.assertEqual("".join("".join(project.findall("td")[0].itertext()).split()), "2of1")
+        self.assertNotIn("regular", current)
         quiet = next(row for row in table.findall(".//tbody/tr") if row.findtext("th") == "quiet")
         cells = quiet.findall("td")
-        self.assertEqual(cells[0].findtext("span[@class='build-limit-note']"), "No limit")
+        self.assertEqual(cells[0].findtext("span/span[@class='build-limit-note']"), "—")
         self.assertEqual("".join(cells[1].itertext()), "")
         self.assertEqual("".join(cells[2].itertext()), "")
+        self.assertIn("No limit", current)
 
     def check_cache_expiry(self) -> None:
         cache = limits_view.SourceCache[int]()

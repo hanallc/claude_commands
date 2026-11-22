@@ -159,6 +159,7 @@ class Cell:
     waits: WaitGroups = field(default_factory=dict[str, WaitGroup])
     note: str = ""
     show_marks: bool = True
+    count_note: str = ""
 
 
 @dataclass
@@ -176,6 +177,7 @@ class MachineLimits:
     shared: tuple[Metric, ...]
     waits: WaitGroups
     unattributed: int = 0
+    unattributed_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -766,7 +768,7 @@ def mac_state(snapshots: target_availability.Snapshots, zone: tzinfo) -> str:
     return PAGE_WORDS["on"] if isinstance(state, (targets.Free, targets.Running)) else ""
 
 
-def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Mapping[str, str]) -> int:
+def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Mapping[str, str]) -> tuple[int, str]:
     """Put each confirmed claim in its repository row or in the heading."""
     by_row: dict[str, list[MacClaim]] = {}
     scope_use: Counter[claim_state.ClaimScope] = Counter()
@@ -777,7 +779,8 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
         if isinstance(claim.scope, claim_state.RepositoryScope):
             name = short_name(claim.origin)
             if not name:
-                return len(mac.claims)
+                return len(mac.claims), ("A Mac claim has no verified repository origin. "
+                                         "All Mac claim counts appear in this heading.")
             by_row.setdefault(name, []).append(claim)
         else:
             unattributed += 1
@@ -808,7 +811,7 @@ def place_mac_counts(mac: MacReading, rows: dict[str, RepositoryRow], names: Map
             if scope_rows[scope] == 1 and not scope_use[claim_state.RepositoryScope(scope)]:
                 cell = rows[name].mac
                 cell.used, cell.limit, cell.policy = 0, limit, CellPolicy.CONFIGURED
-    return unattributed
+    return unattributed, ""
 
 
 def build_limits(reading: records.QueueRead, snapshots: target_availability.Snapshots,
@@ -1000,11 +1003,13 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.note = PAGE_WORDS["not_available"]
 
     shared: list[Metric] = []
+    count_notes: dict[str, str] = {}
     for repository_key, limit in local_limits.items():
         owners = occupancy.get(repository_key, set[str]())
         used = len(owners)
         wait_counts = repository_wait_counts.get(repository_key)
         if wait_counts and wait_counts != {(used, limit)}:
+            count_notes[repository_key] = "The queue waits and the reservations disagree on the run count or limit."
             continue
         runs: list[str] = []
         merge_above: list[str] = []
@@ -1015,6 +1020,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             elif label:
                 runs.append(label)
         if used - limit > len(merge_above):
+            count_notes[repository_key] = "The run count exceeds the limit without enough exempt runs."
             continue
         name = bound_rows.get(repository_key, "")
         if unresolved_policy or name not in rows or len(keys_by_row[name]) > 1:
@@ -1025,6 +1031,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
         cell = rows[name].natedev
         cell.limit, cell.used = limit, used
         cell.runs, cell.merge_above = runs, merge_above
+
+    for waiting in local_policy_waits:
+        if waiting.repository and not unresolved_policy:
+            cell = rows[waiting.repository].natedev
+            if cell.used is None and not cell.count_note:
+                cell.count_note = count_notes.get(waiting.reason.repository, "")
 
     for name, item in rows.items():
         if name in keys_by_row and not unresolved_policy:
@@ -1051,7 +1063,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             item.aws.other.clear()
             item.aws.show_marks = item.aws.limit is None
 
-    mac_unattributed = place_mac_counts(mac, rows, names) if mac is not None else 0
+    mac_unattributed, mac_note = place_mac_counts(mac, rows, names) if mac is not None else (0, "")
     room = explanation.room
     memory_used = room.cap_use / records.GIB if isinstance(room, records.MemoryRoom) else None
     memory_cap = room.cap / records.GIB if isinstance(room, records.MemoryRoom) and isinstance(room.cap, int) else None
@@ -1076,9 +1088,11 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     cloud = Metric("cloud", cloud_used if isinstance(cloud_slots, int) else None,
                    cloud_slots if isinstance(cloud_slots, int) else None, waits=metric_waits.get("cloud", {}),
                    unreadable=cloud_slots is ReadingState.UNAVAILABLE, reserved_waiting=cloud_waiting)
+    first_rows = {"claude_commands": 0, "hana": 1}
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
                                     (*limits, *shared), local_waits, unattributed),
-                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed),
+                       MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_unattributed, mac_note),
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits),
-                       tuple(sorted(rows.values(), key=lambda item: (item.quiet, item.name.casefold()))),
+                       tuple(sorted(rows.values(), key=lambda item: (first_rows.get(item.name, len(first_rows)),
+                                                                     item.name.casefold(), item.name))),
                        saved.history is ReadingState.UNAVAILABLE, unplaced)
