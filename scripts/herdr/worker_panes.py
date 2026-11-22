@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from threading import Event
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -332,6 +332,7 @@ class WorkerLockHold:
         self.name = name
         self._operations = operations
         self._after_unlock = after_unlock
+        self._deferred: set[Hashable] = set()
         self._held: set[StaffId] = set()
         self._blocking = blocking
         self.active = True
@@ -347,11 +348,13 @@ class WorkerLockHold:
     def owns(self, row: staff.StaffRow) -> bool:
         return self.active and row.id in self._held
 
-    def defer_until_unlock(self, action: Callable[[], None]) -> None:
-        """Run the action after this context releases both locks."""
+    def defer_until_unlock(self, key: Hashable, action: Callable[[], None]) -> None:
+        """Run one action per key after this context releases both locks."""
         if not self.active:
             raise ValueError("the worker lock is no longer active")
-        _ = self._after_unlock.callback(action)
+        if key not in self._deferred:
+            self._deferred.add(key)
+            _ = self._after_unlock.callback(action)
 
 
 @contextmanager
@@ -952,6 +955,12 @@ class CompletedWorkerPass:
 class StoppedPassCleanup(Enum):
     COMPLETE = "no stop cleanup needs a retry"
     RETRY = "retry the stop cleanup"
+
+
+class StoppedDiagnosticRecovery(Enum):
+    SETTLED = "all diagnostics were delivered"
+    PENDING = "diagnostic delivery remains pending"
+    UNREADABLE = "diagnostic evidence is unreadable"
 
 
 @dataclass(frozen=True)

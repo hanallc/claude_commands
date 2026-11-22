@@ -681,14 +681,21 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
     with path.with_suffix(".completion.lock").open("a") as claim:
         fcntl.flock(claim, fcntl.LOCK_EX)
         current = _read_record(path)
-        if current["status"] == "finished":
-            if current.get("completion_pending") is True:
-                return _replay_completion(path, current)
-            if current.get("completion_pending") is False or current.get("delivery"):
-                return CompletionReplay.HANDLED
-        record["completion_pending"] = True
-        record = _write_record(path, record)
-        return _replay_completion(path, record)
+        if current["status"] == "finished" and current.get("completion_pending") is True:
+            return _replay_completion(path, current)
+        if (current["status"] != "finished"
+                or not (current.get("completion_pending") is False or current.get("delivery"))):
+            record["completion_pending"] = True
+            record = _write_record(path, record)
+            return _replay_completion(path, record)
+    if not _cancels_pass(current):
+        return CompletionReplay.HANDLED
+    from scripts.herdr.worker_panes import StoppedDiagnosticRecovery
+
+    retry = cast(Callable[[Path, staff.StaffId], StoppedDiagnosticRecovery],
+                 import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
+    outcome = retry(Path(current["session_dir"]), staff.StaffId(current["staff_id"]))
+    return CompletionReplay.HANDLED if outcome is StoppedDiagnosticRecovery.SETTLED else CompletionReplay.RETRY
 
 
 def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:

@@ -2104,6 +2104,18 @@ class LinkedResultsForStoppedPass(Enum):
 
 
 @dataclass(frozen=True)
+class StoppedDiagnosticRoute:
+    worker_id: staff.StaffId
+    worker_name: str
+    director_id: staff.StaffId
+    sender_native_id: str
+
+
+class MissingStoppedDiagnosticRoute(Enum):
+    UNRECORDED = "the stopped pass has no saved diagnostic route"
+
+
+@dataclass(frozen=True)
 class StoppedPassReceipt:
     instance_id: str
     line: str
@@ -2111,6 +2123,12 @@ class StoppedPassReceipt:
     reply_file: str
     results: LegacyResultsForStoppedPass | LinkedResultsForStoppedPass = LinkedResultsForStoppedPass.ONLY
     worker_session: str = ""
+    diagnostic_route: StoppedDiagnosticRoute | MissingStoppedDiagnosticRoute = MissingStoppedDiagnosticRoute.UNRECORDED
+
+
+@dataclass(frozen=True)
+class UnreadableStoppedPassReceipt:
+    instance_id: str
 
 
 def _stopped_pass_receipt(instance: str, fields: dict[str, object]) -> StoppedPassReceipt:
@@ -2118,9 +2136,15 @@ def _stopped_pass_receipt(instance: str, fields: dict[str, object]) -> StoppedPa
     legacy_start = receipt.get("legacy_results_since")
     results = (LegacyResultsForStoppedPass(float(legacy_start)) if isinstance(legacy_start, (int, float))
                else LinkedResultsForStoppedPass.ONLY)
+    worker_id = pass_recorder.string(fields.get("worker_id"))
+    worker_name = pass_recorder.string(fields.get("worker_name"))
+    director_id = pass_recorder.string(fields.get("director_id"))
+    route = (StoppedDiagnosticRoute(staff.StaffId(worker_id), worker_name, staff.StaffId(director_id),
+                                    pass_recorder.string(receipt.get("sender_native_id")))
+             if worker_id and worker_name and director_id else MissingStoppedDiagnosticRoute.UNRECORDED)
     return StoppedPassReceipt(instance, pass_recorder.string(receipt.get("line")),
                               pass_recorder.string(receipt.get("completion_id")) or instance, pass_recorder.string(receipt.get("reply_file")),
-                              results, pass_recorder.string(receipt.get("worker_session")))
+                              results, pass_recorder.string(receipt.get("worker_session")), route)
 
 
 def stopped_pass_receipt(run: Path, passed: dict[str, object]) -> StoppedPassReceipt:
@@ -2133,19 +2157,35 @@ def stopped_pass_receipt(run: Path, passed: dict[str, object]) -> StoppedPassRec
     return StoppedPassReceipt(instance, delivery.line, delivery.completion_id or instance, delivery.reply_file)
 
 
+def read_stopped_pass_receipts(run: Path) -> Generator[StoppedPassReceipt | UnreadableStoppedPassReceipt]:
+    """Read archived receipts and report each unreadable receipt separately."""
+    state = worker_lifecycle.read_json_object(pass_recorder.state_path(run))
+    recorder_state.require_current_shape(pass_recorder.state_path(run), state)
+    notices = pass_recorder.object_dict(state.get("stopped_pass_notices", {}))
+    if notices is None:
+        raise worker_lifecycle.WorkerStateUnreadable(pass_recorder.state_path(run), "invalid stopped pass notices")
+    for instance_id, value in notices.items():
+        fields = pass_recorder.object_dict(value)
+        receipt_fields = pass_recorder.object_dict(fields.get("receipt")) if fields is not None else None
+        if fields is None or receipt_fields is None or not isinstance(receipt_fields.get("sender_native_id", ""), str):
+            yield UnreadableStoppedPassReceipt(instance_id)
+            continue
+        receipt = _stopped_pass_receipt(instance_id, fields)
+        if isinstance(receipt.diagnostic_route, MissingStoppedDiagnosticRoute):
+            yield UnreadableStoppedPassReceipt(instance_id)
+        else:
+            yield receipt
+
+
 def stopped_pass_receipts(run: Path, worker_id: staff.StaffId) -> Generator[StoppedPassReceipt]:
     """Read the archived receipts for this worker's stopped passes."""
     try:
-        state = worker_lifecycle.read_json_object(pass_recorder.state_path(run))
+        for receipt in read_stopped_pass_receipts(run):
+            if (isinstance(receipt, StoppedPassReceipt) and isinstance(receipt.diagnostic_route, StoppedDiagnosticRoute)
+                    and receipt.diagnostic_route.worker_id == worker_id):
+                yield receipt
     except worker_lifecycle.WorkerStateUnreadable as error:
         unit_runs.report_anomaly(" ".join(f"anomaly: stopped pass receipts: {error}".splitlines()))
-        return
-    recorder_state.require_current_shape(pass_recorder.state_path(run), state)
-    notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
-    for instance_id, value in notices.items():
-        fields = pass_recorder.object_dict(value) or {}
-        if fields.get("worker_id") == worker_id:
-            yield _stopped_pass_receipt(instance_id, fields)
 
 
 def stopped_run_notice(run: Path, run_id: str) -> StoppedPassNotice | NoStoppedPassNotice:
@@ -2187,6 +2227,7 @@ def _stage_stopped_pass(state: dict[str, object], passed: dict[str, object], wor
     receipt: dict[str, object] = {
         "line": delivery.line, "completion_id": delivery.completion_id or instance_id,
         "reply_file": delivery.reply_file, "worker_session": worker.current_session,
+        "sender_native_id": stopped_sender_native_id(worker),
     }
     if not run_id:
         receipt["legacy_results_since"] = pass_recorder.number(passed.get("started_at"))
@@ -2194,6 +2235,15 @@ def _stage_stopped_pass(state: dict[str, object], passed: dict[str, object], wor
     notices[instance_id] = {**asdict(notice), "receipt": receipt}
     state["stopped_pass_notices"] = notices
     return notice
+
+
+def stopped_sender_native_id(row: staff.StaffRow) -> str:
+    backend = staff.backend(row)
+    if row.current_session and isinstance(backend, staff.ClaudeBackend):
+        return f"session:{row.current_session}"
+    if row.current_session and isinstance(backend, staff.CodexBackend):
+        return f"codex:{row.current_session}"
+    return "unavailable"
 
 
 def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
@@ -6948,9 +6998,12 @@ def end_run(session_dir: Path, request: RunEndRequested | RetryRunEnd,
         missing_state = True
     else:
         missing_state = False
+    if isinstance(request, RetryRunEnd):
+        if not unit_runs.terminal_run(state):
+            return RunEndSettled.OPEN
+        retry = cast(Callable[[Path], object], import_module("scripts.herdr.turn_end").retry_stopped_diagnostics)
+        _ = retry(session_dir)
     record = staff.initial_snapshot()
-    if isinstance(request, RetryRunEnd) and not unit_runs.terminal_run(state):
-        return RunEndSettled.OPEN
     pointer = _run_pointer(session_dir, record)
     if (not state or unit_runs.terminal_run(state)) and not isinstance(pointer, staff.StaffRow):
         return RunEndSettled.CLOSED
