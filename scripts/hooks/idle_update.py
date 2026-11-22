@@ -40,11 +40,13 @@ class IdleRecord(TypedDict):
 class Limits:
     after_seconds: int
     renew_seconds: int
+    retention_seconds: int
 
 
 def limits() -> Limits:
     settings = conf.read("idle_update")
-    return Limits(settings.whole("after_minutes") * 60, settings.whole("renew_minutes") * 60)
+    return Limits(settings.whole("after_minutes") * 60, settings.whole("renew_minutes") * 60,
+                  settings.whole("retention_days") * 86400)
 
 
 def has_role(record: staff.StaffSnapshot) -> bool:
@@ -101,6 +103,22 @@ def typed(session_id: str, now: float) -> None:
     """Record that nate typed in the session; idle update mode ends."""
     with _locked(session_id):
         _write(session_id, {"typed_at": now, "updated_at": None})
+
+
+def sweep(now: float, limit: Limits) -> None:
+    """Delete the records and lock files of sessions with no change for the retention time."""
+    for path in state_dir().glob(".*.lock"):
+        session_id = path.name.removeprefix(".").removesuffix(".lock")
+        try:
+            if now - path.stat().st_mtime <= limit.retention_seconds:
+                continue
+            record = _record_path(session_id)
+            if record.exists() and now - record.stat().st_mtime <= limit.retention_seconds:
+                continue
+            record.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def context(session_id: str, now: float, limit: Limits) -> str:

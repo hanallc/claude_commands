@@ -16,7 +16,7 @@ from scripts.lib import conf
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.production import staff
 
-LIMITS = idle_update.Limits(after_seconds=300, renew_seconds=600)
+LIMITS = idle_update.Limits(after_seconds=300, renew_seconds=600, retention_seconds=86400)
 
 
 @final
@@ -63,6 +63,16 @@ class IdleUpdateContextTests(unittest.TestCase):
         self.assertEqual(idle_update.context("fixture", 1500, LIMITS), "")
         self.assertIn("what you last had on deck", idle_update.context("fixture", 1700, LIMITS))
 
+    def test_the_sweep_deletes_only_records_past_the_retention_time(self) -> None:
+        idle_update.typed("old", 1000)
+        idle_update.typed("new", 1000)
+        old_time = 1000.0
+        for name in (".old.lock", "old.json", ".new.lock"):
+            os.utime(idle_update.state_dir() / name, (old_time, old_time))
+        os.utime(idle_update.state_dir() / "new.json", (old_time + 86400, old_time + 86400))
+        idle_update.sweep(old_time + 86401, LIMITS)
+        self.assertEqual(sorted(path.name for path in idle_update.state_dir().iterdir()), [".new.lock", "new.json"])
+
     def test_a_damaged_record_restarts_the_count(self) -> None:
         idle_update.state_dir().mkdir(parents=True)
         _ = (idle_update.state_dir() / "fixture.json").write_text("{", encoding="utf-8")
@@ -75,9 +85,10 @@ class IdleUpdateLimitsTests(unittest.TestCase):
     def test_the_limits_come_from_the_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             _ = (Path(folder) / "idle_update.conf").write_text(
-                "# whole: 1..120\nafter_minutes=3\n# whole: 1..240\nrenew_minutes=20\n", encoding="utf-8")
+                "# whole: 1..120\nafter_minutes=3\n# whole: 1..240\nrenew_minutes=20\n# whole: 1..365\nretention_days=2\n",
+                encoding="utf-8")
             with mock.patch.dict(os.environ, {"CONF_DIR": folder}):
-                self.assertEqual(idle_update.limits(), idle_update.Limits(180, 1200))
+                self.assertEqual(idle_update.limits(), idle_update.Limits(180, 1200, 172800))
 
     def test_the_repository_file_holds_both_keys_in_range(self) -> None:
         source = Path(__file__).resolve().parents[2] / "config"

@@ -70,6 +70,7 @@ def _idle_update_context(session_id: str, typed: bool, now: int, record: staff.S
             return ""
         if typed:
             idle_update.typed(session_id, now)
+            idle_update.sweep(now, idle_update.limits())
             return ""
         if conversation_pause.director_turn(session_id, record=record) is conversation_pause.DirectorTurn.HOLD:
             return ""
