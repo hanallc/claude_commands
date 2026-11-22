@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,13 @@ class ReviewLog:
     time: datetime
     who: str
     words: str
+    feedback_request_id: str = ''
+
+    def matches_feedback(self, request_id: str, text: str) -> bool:
+        """Match by ID when the log has one."""
+        if self.feedback_request_id:
+            return self.feedback_request_id == request_id
+        return self.words.rstrip().splitlines() == ('feedback: ' + text).rstrip().splitlines()
 
 
 class ReviewMark(StrEnum):
@@ -62,6 +69,7 @@ class StoredReviewLog(TypedDict):
     time: str
     who: str
     words: str
+    feedback_request_id: NotRequired[str]
 
 
 def decode(text: str) -> tuple[ReviewLog, ...]:
@@ -76,12 +84,26 @@ def encode(events: tuple[ReviewLog, ...]) -> str:
 
 
 def from_rows(stored: list[StoredReviewLog]) -> tuple[ReviewLog, ...]:
-    return tuple(ReviewLog(datetime.fromisoformat(row['time']), row['who'], row['words']) for row in stored)
+    return tuple(ReviewLog(datetime.fromisoformat(row['time']), row['who'], row['words'],
+                           row.get('feedback_request_id', '')) for row in stored)
 
 
 def rows(events: tuple[ReviewLog, ...]) -> list[StoredReviewLog]:
-    return [{'time':event.time.isoformat(),'who':event.who,'words':event.words} for event in events]
+    stored: list[StoredReviewLog] = []
+    for event in events:
+        row: StoredReviewLog = {'time': event.time.isoformat(), 'who': event.who, 'words': event.words}
+        if event.feedback_request_id:
+            row['feedback_request_id'] = event.feedback_request_id
+        stored.append(row)
+    return stored
 
 
 def append(events: tuple[ReviewLog, ...], event: ReviewLog) -> tuple[ReviewLog, ...]:
-    return events if events and (events[-1].who, events[-1].words) == (event.who, event.words) else (*events, event)
+    if event.feedback_request_id:
+        if any(saved.feedback_request_id == event.feedback_request_id for saved in events):
+            return events
+    elif events:
+        last = events[-1]
+        if not last.feedback_request_id and (last.who, last.words) == (event.who, event.words):
+            return events
+    return (*events, event)

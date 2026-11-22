@@ -10,11 +10,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
+from threading import Event
 from scripts.lib.transcript_test_support import compressed_copy
-from typing import ClassVar, cast, final, override
+from typing import ClassVar, IO, cast, final, override
 from unittest.mock import patch
 
 
@@ -30,7 +33,7 @@ from scripts.whoami import account
 from scripts.herdr import herdr
 from scripts.message import session_records, sessions
 from scripts.production import showrunners
-from scripts.agents import shutdown
+from scripts.agents import status_entry
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.herdr import fake_herdr
@@ -295,6 +298,13 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual([session["session_id"] for session in found["sessions"]], [DESKTOP_ID])
         self.assertEqual(read_model.call_count, 1)
         self.assertIn(DESKTOP_ID, read_model.call_args.args)
+
+        with patch.object(inventory, "_unit_sessions", side_effect=AssertionError("no selected session needs a pane")):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({OTHER_ID, UNKNOWN_ID}))
+        self.assertEqual(found["sessions"], [])
+        self.assertEqual(found["unattributed"], [
+            {"pid": UNKNOWN_PID, "name": "hidden-account", "reason": "account unreadable"},
+        ])
 
     def test_listing_agrees_with_full_inventory_and_excludes_expensive_work(self) -> None:
         full = inventory.inventory(TARGET_LOGIN)["sessions"] + inventory.inventory(OTHER_LOGIN)["sessions"]
@@ -980,7 +990,7 @@ elif "comm=" in joined:
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
         self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(status_entry._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
 
     def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
         with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
@@ -1020,7 +1030,7 @@ elif "comm=" in joined:
         self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
         self.assertEqual(unit["host"].get("session_host"), "herdr")
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(status_entry._host_text(unit["host"]), "unit shutdown (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
 
 
@@ -1190,6 +1200,26 @@ elif "comm=" in joined:
             {"kind": "plan", "path": "docs/shutdown-plan.md"},
         )
 
+        history = self.history / "runs"
+        large = history / "newer.jsonl"
+        with large.open("ab") as log:
+            _ = log.write(b" " * 1_048_576 + b"\xff\n")
+        _ = (history / "empty.jsonl").write_bytes(b"")
+        _ = (history / "broken.jsonl").write_bytes(b"\xff\n")
+        with TranscriptReadCounter(large) as counted:
+            open_file = Path.open
+
+            def open_log(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                         errors: str | None = None, newline: str | None = None) -> IO[str] | IO[bytes]:
+                if path == large:
+                    return counted if "b" in mode else io.TextIOWrapper(counted, encoding=encoding)
+                return open_file(path, mode, buffering, encoding, errors, newline)
+
+            with patch.object(Path, "open", open_log):
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({UNIT_ID}))
+            self.assertLess(counted.bytes_read, large.stat().st_size)
+        self.assertEqual(found["sessions"][0]["host"].get("plan"), unit["host"].get("plan"))
+
     def test_absent_values_are_explicit_variants(self) -> None:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
@@ -1234,6 +1264,39 @@ elif "comm=" in joined:
                 "dirty": ["dirty.txt"],
             },
         )
+
+    def test_checkout_reads_can_finish_out_of_order_and_keep_session_order_and_errors(self) -> None:
+        later_read = Event()
+        read_git = inventory._git  # pyright: ignore[reportPrivateUsage]
+        fast_folder = str(self.checkout)
+        slow_folder = str(self.root / "plain")
+
+        class ObserveCheckoutCompletion(ThreadPoolExecutor):
+            @override
+            def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+                result = super().submit(fn, *args, **kwargs)
+                if args == (fast_folder,):
+                    def release_first(completed: Future[T]) -> None:
+                        _ = completed.result()
+                        later_read.set()
+
+                    result.add_done_callback(release_first)
+                return result
+
+        def git(folder: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+            if folder == slow_folder and not later_read.wait(timeout=5):
+                self.fail("the later checkout must finish before the first checkout")
+            return read_git(folder, *arguments)
+
+        with (patch.object(inventory, "_git", git),
+              patch.object(inventory, "ThreadPoolExecutor", ObserveCheckoutCompletion)):
+            report = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID, UNIT_ID}))
+        first, second, *workers = report["sessions"]
+        self.assertEqual(first["session_id"], DIRECTOR_ID)
+        self.assertEqual(first["checkout"], {"kind": "not a checkout"})
+        self.assertEqual(second["session_id"], UNIT_ID)
+        self.assertEqual(second["checkout"]["kind"], "git")
+        self.assertEqual([worker["session_id"] for worker in workers], [WORKER_ID])
 
     def test_config_dir_records_the_process_directory_for_the_same_login(self) -> None:
         default_dir = self.home / ".claude"

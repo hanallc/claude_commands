@@ -47,6 +47,21 @@ These fields do not change the recipient, reply name, or message key.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
+`send.py` keeps local messages during an open review and returns `KEPT`.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a unique name match, it gives a `session:` address.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
+
 ### Replies to relay sockets
 
 The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.

@@ -510,6 +510,16 @@ A shell with another session's retained launch stays unchanged; recovery opens a
 A registry error during pending admission returns `ResumeFailed` and preserves the record.
 Without pending admission, a registry error permits the generic resume lookup.
 The [upkeep service](herdr-restore.md#restore-services) recovers admitted producers after server loss or reboot.
+`agents stop NAME`, `agents stop --all`, and local producer exit save an exit hold before the stop.
+If the stop fails, the command restores the previous hold.
+A remote producer exit saves a pause before the stop and changes it to an exit hold after confirmation.
+If the exit hold write fails, the pause keeps the producer stopped.
+The staff row stores the hold. The restart record keeps the producer's fixed ID for `agents restart`.
+Upkeep checks the hold under the producer's row lock. It reports the skipped producer once per run.
+`agents resume` and `agents restart` clear the hold after the producer starts or a live process confirms it already runs.
+Resume in the producer's own pane clears the hold before `execvpe`, so upkeep can retry if the new agent exits.
+A saved restart ID alone does not block upkeep. A crash without an exit hold remains eligible for recovery.
+Accepted limit: a storage fault after the hold write (a failed directory sync, or an unreadable staff record during rollback) can leave a running producer with a hold. Upkeep then does not recover it after a crash; `agents resume NAME` clears the hold.
 
 ## Worker resume results
 
