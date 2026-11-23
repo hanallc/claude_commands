@@ -212,6 +212,24 @@ unittest.TextTestRunner().run(case)
                   mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, properties))):
                 self.assertFalse(startup.within_test_limit())
 
+    @unittest.skipUnless(sys.platform == "linux", "Gate commands use Linux process records")
+    def test_each_installed_gate_entry_point_is_a_gate_parent(self) -> None:
+        home = self.root / "installed-home"
+        production = home / ".claude/scripts/production"
+        production.mkdir(parents=True)
+        for name, expected in (("gate.py", True), ("merge_gate.py", True), ("targeted_test.py", True),
+                               ("merge_checkpoint.py", True), ("other_tool.py", False)):
+            entry = production / name
+            _ = entry.write_text("import sys\nsys.stdin.read()\n")
+            with self.subTest(entry=name):
+                process = subprocess.Popen([sys.executable, str(entry)], cwd=self.root, stdin=subprocess.PIPE)
+                try:
+                    with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=str(home))):
+                        recognized = startup._gate_command(str(process.pid))  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(recognized, expected)
+                finally:
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
     def test_short_direct_test_preserves_output_and_exit_status(self) -> None:
         self.environment["PYTHONWARNINGS"] = "default"
         result = self.invoke(sys.executable, "-c", """

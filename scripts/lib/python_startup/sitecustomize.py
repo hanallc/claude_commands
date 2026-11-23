@@ -336,7 +336,7 @@ def _gate_command(pid: str) -> bool:
             entry = (cwd / item).resolve(strict=True)
             installed = Path(getpwuid(os.getuid()).pw_dir, ".claude").resolve()
             roots = (Path(__file__).resolve().parents[3], installed)
-            return (entry.name in {"gate.py", "targeted_test.py", "merge_checkpoint.py"}
+            return (entry.name in {"gate.py", "merge_gate.py", "targeted_test.py", "merge_checkpoint.py"}
                     and any(entry.parent == root / "scripts/production" for root in roots))
     except (KeyError, OSError, ValueError):
         pass
