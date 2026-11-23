@@ -36,13 +36,15 @@ from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
-from scripts.mac_test import eligibility
+from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
+# The guest route holds a repository claim on this Mac target while its run lasts.
+GUEST_CLAIM_TARGET = 'mac'
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -141,11 +143,38 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
 
 
 def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
-                          gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[None]:
+                          gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[claim_state.ClaimIdentity]:
     """Take the Mac repository claim for the guest route."""
     from scripts.build_queue import mac_run
 
-    return mac_run.held(repo, 'mac', work, gate_job)
+    return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
+
+
+def consume_launch_permission(claim: claim_state.ClaimIdentity) -> None:
+    """Consume the launch permission of the gate assignment before the guest run starts.
+
+    The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
+    A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
+    """
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.buildlog import store
+    from scripts.lib import process_start
+
+    start = process_start.process_start(os.getpid())
+    if not isinstance(start, process_start.Started):
+        raise GuestTookNoRun('the gate process has no start time to hold the launch permission')
+    try:
+        assignment = admission_client.read_assignment(Path(os.environ['BUILDLOG_PLACEMENT_FILE'])).assignment
+        destination = assignment.destination
+        reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                     claim.claim_id, assignment.episode, assignment.attempt)
+        holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+        permission = admission_client.consume_permission(
+            wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
+    except wire.AdmissionUnavailable as error:
+        raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
+    if isinstance(permission, wire.DispatchStatus):
+        raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
 
 
 class GuestRunRequest(TypedDict):
@@ -1302,7 +1331,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         try:
-            with mac_linux_reservation(repo, mode, gate_job):
+            with mac_linux_reservation(repo, mode, gate_job) as claim:
+                consume_launch_permission(claim)
                 reply = transfer_source(repo, settings, source, request)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:

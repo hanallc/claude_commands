@@ -25,10 +25,11 @@ import unittest
 from unittest.mock import call, patch
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import mac_run
+from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
-from scripts.lib import conf, process_group
+from scripts.buildlog import store
+from scripts.lib import conf, process_group, process_start
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -495,12 +496,23 @@ class GuestCommandParityTests(unittest.TestCase):
         self.assertIn(f'the guest PATH finds {self.copy / "target/built"}', refusal)
 
 
+# A Mac claim identity for a fixture reservation that holds no claim.
+FIXTURE_CLAIM = claim_state.ClaimIdentity(mac_test.MAC_LINUX_CLAIM_ID_PREFIX + 'fixture', 'episode', 'attempt')
+
+
 class MacLinuxRouteTests(unittest.TestCase):
     root: Path = Path()
     guest_home: Path = Path()
     trace: Path = Path()
     repo: Path = Path()
     registry: Path = Path()
+    placed: placement.PlacementAssignment = placement.PlacementAssignment(
+        'gate-episode', 'gate-attempt', placement.PlacementDestination(
+            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude', slot=1), 1),
+        execution_identity.SourceKeyUnavailable('fixture'), placement.SubmittingOwner('natedev', 1, 'start'),
+        OwningSession('submitting-session'), 0.0)
+    # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
+    consumed: tuple[tuple[wire.ConsumePermission, str, bool], ...] = ()
 
     @override
     def setUp(self) -> None:
@@ -549,7 +561,20 @@ class MacLinuxRouteTests(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.test',
             'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.test',
+            'BUILDLOG_PLACEMENT_FILE': str(self.root / 'assignment.json'),
+            'ADMISSION_SOCKET': str(self.root / 'no-queue.sock'),
         })))
+        admission_client.write_assignment(self.root / 'assignment.json', wire.Assignment(self.placed))
+        self.consumed = ()
+
+        def consume(request: wire.ConsumePermission) -> wire.FirstAuthorization:
+            holder = request.holder
+            assert isinstance(holder, placement.ClaimHolderIdentity)
+            held = mac_run.claim_held(mac_linux.GUEST_CLAIM_TARGET, request.claim.claim_id, holder.pid, holder.start_time)
+            self.consumed = (*self.consumed, (request, self.trace.read_text(encoding='utf-8'), held))
+            return wire.FirstAuthorization(request.assignment, request.claim)
+
+        _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
@@ -656,6 +681,40 @@ fi
                     self.assertEqual(claim_state.read_claims(paths), ())
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
+
+    def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
+        result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, trace, held), = self.consumed
+        start = process_start.process_start(os.getpid())
+        assert isinstance(start, process_start.Started)
+        self.assertEqual(request.assignment, self.placed)
+        self.assertEqual(request.holder, placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start))
+        destination = self.placed.destination
+        self.assertEqual(request.claim, placement.ProviderClaimReference(destination.provider, destination.target,
+            destination.scope, request.claim.claim_id, self.placed.episode, self.placed.attempt))
+        self.assertTrue(request.claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+        self.assertTrue(held)
+        self.assertEqual(trace, '')
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
+        refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),
+                                      'the attempt is closed: cancelled')
+        def refuse(_request: wire.ConsumePermission) -> wire.DispatchStatus:
+            return refusal
+
+        cases: tuple[tuple[Callable[[wire.ConsumePermission], wire.DispatchStatus] | wire.AdmissionUnavailable, str], ...] = (
+            (refuse, 'the queue refused the launch permission: the attempt is closed: cancelled'),
+            (wire.AdmissionUnavailable('the queue is down'), 'the launch permission is unavailable: the queue is down'))
+        for answer, reason in cases:
+            with self.subTest(reason=reason):
+                with patch.object(admission_client, 'consume_permission', side_effect=answer) as consume:
+                    self.assertEqual(self.not_started(self.route()), reason)
+                consume.assert_called_once()
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
+                self.assert_guest_clean()
 
     def test_busy_mac_claim_refuses_the_route_before_ssh(self) -> None:
         paths = claim_state.state_paths('mac')
@@ -820,6 +879,7 @@ fi
             'from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED',
             'from scripts.build_targets import mac_linux',
             'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
+            'mac_linux.consume_launch_permission = lambda claim: None',
             'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
             '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)'))
         environment = {**os.environ, 'FIXTURE_GUEST_RESULT': 'hang',
@@ -1011,10 +1071,10 @@ fi
 
         @contextmanager
         def record_failure(repo: Path, work: SuiteMode | StepJob,
-                           gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
-            with reservation(repo, work, gate_job):
+                           gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
+            with reservation(repo, work, gate_job) as claim:
                 try:
-                    yield
+                    yield claim
                 except mac_linux.GuestUnavailable as error:
                     unproven.append(error)
                     raise
@@ -1164,9 +1224,9 @@ fi
         prove_guest_end = mac_linux.prove_guest_end
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual([type(proof) for proof in proofs],
                                  [mac_linux.GuestEndPending, mac_linux.GuestEndPending, mac_linux.GuestEndProven])
@@ -1325,9 +1385,9 @@ fi
             raise KeyboardInterrupt
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
@@ -1344,10 +1404,10 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 events.append('released')
 
@@ -1386,10 +1446,10 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('released')
