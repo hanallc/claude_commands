@@ -781,6 +781,9 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    # An older reader has no session field; a request with no session leaves it out.
+    if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
+        del record["session"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
