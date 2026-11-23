@@ -11,7 +11,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import stat
 import select
+import shutil
 import signal
 import shlex
 import socket
@@ -1024,6 +1025,11 @@ class MacBackoffTestFixture:
 
 
 class LocalHoldPlacementTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The service applies natedev holds only on natedev; the guest has another host name.
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
+
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
         from scripts.build_queue import placement
@@ -5564,6 +5570,58 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(os.environ.get("USER_ZONE", ""), zone)
                 self.assertEqual("USER_ZONE" in os.environ, bool(zone))
 
+    def test_serving_loop_never_reads_the_empty_environment_inside_a_patch_dict_exit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture_cgroup = gate.builds_slice_cgroup()
+            probing = threading.Event()
+            probed = threading.Event()
+            probe_finished: list[bool] = []
+            loop_reads: list[Path] = []
+            child_prints: list[str] = []
+            # An empty PATH cannot find printenv; the child reads only the variable under test.
+            printenv = shutil.which("printenv")
+            assert printenv is not None
+            serve_once = fixture.server.run_once
+
+            def probe_or_serve(timeout: float) -> None:
+                # The probe turn reads the environment and does no other work.
+                if probing.is_set() and not probed.is_set():
+                    try:
+                        loop_reads.append(gate.builds_slice_cgroup())
+                        # The loop starts its own threads too, for example the reading alert and the roster.
+                        started = threading.Thread(target=lambda: loop_reads.append(gate.builds_slice_cgroup()))
+                        started.start()
+                        started.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                        # The loop starts child processes with env=None, for example session_send and systemctl.
+                        child = subprocess.run([printenv, "BUILDLOG_BUILDS_CGROUP"], capture_output=True, text=True,
+                                               check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                        child_prints.append(child.stdout)
+                    finally:
+                        probed.set()
+                else:
+                    serve_once(timeout)
+
+            refill_update = os.environ.update
+
+            def probe_update(values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+                # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
+                probing.set()
+                probe_finished.append(probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                refill_update(values, **keywords)
+
+            with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
+                update_probe = mock.patch.object(os.environ, "update", probe_update)
+                try:
+                    with mock.patch.dict(os.environ, {"ADMISSION_PATCH_DICT_PROBE": "1"}):
+                        # The probe wraps only the update of this exit; the patch.dict entry already ran.
+                        _ = update_probe.start()
+                finally:
+                    _ = update_probe.stop()
+                self.assertNotIn("ADMISSION_PATCH_DICT_PROBE", os.environ)
+            self.assertEqual(probe_finished, [True])
+            self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
+            self.assertEqual(child_prints, [f"{fixture_cgroup}\n"])
+
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -6323,7 +6381,7 @@ class ServiceTests(unittest.TestCase):
                         "since": request.since, "need": GIB, "step": "nextest", "session_name": caller,
                         "unit": unit, "folder": folder}
                     waiting = service.WaitingAdmission(request, row, service.NO_CONNECTION)
-                    self.assertEqual(service.wait_line_name(waiting), f"{expected} · nextest")
+                    self.assertEqual(service.wait_line_name(waiting), f"{expected}: nextest")
 
     def test_wait_lines_then_ranked_admissions_and_release_frees_charge(self) -> None:
         for owner_name in ("session", "CI", "unit", "folder", "pid", "continuation"):
@@ -6337,20 +6395,20 @@ class ServiceTests(unittest.TestCase):
                 fixture.hold_starts()
                 request = fixture.request(need=12 * GIB if owner_name == "continuation" else 8 * GIB, run=run)
                 head: wire.AdmitRequest | wire.ServiceEstimateRequest = request
-                label = "fixture · nextest"
+                label = "fixture: nextest"
                 if owner_name == "CI":
                     head = replace(fixture.service_request(runner="hana-linux-2"), argv=("cargo", "test"))
-                    label = "hana CI · hana-linux-2 · compile · test"
+                    label = "hana CI · hana-linux-2 · compile: test"
                 elif owner_name == "unit":
                     head = replace(request, identity=replace(request.identity, unit="compiler"))
-                    label = "compiler · nextest"
+                    label = "compiler: nextest"
                 elif owner_name in ("folder", "pid"):
                     head = replace(request, identity=replace(request.identity, session_id="", name="",
                         folder="/builds/hana" if owner_name == "folder" else "/"))
-                    label = "terminal · hana · nextest" if owner_name == "folder" else "unregistered session · nextest"
+                    label = "hana: nextest" if owner_name == "folder" else "unregistered session: nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
-                    label = "ordinary · nextest"
+                    label = "ordinary: nextest"
                     ordinary = fixture.request(need=8 * GIB, since=fixture.clock.now() - 1)
                     ordinary = replace(ordinary, identity=replace(ordinary.identity, name="ordinary"))
                     ordinary_peer = fixture.connect(ordinary)
@@ -6373,7 +6431,7 @@ class ServiceTests(unittest.TestCase):
                             self.assertIn("this build is the queue head", output.getvalue())
                         else:
                             self.assertEqual(waits[-1].snapshot.head_need, 8 * GIB)
-                            self.assertIn("head ordinary · nextest needs 8.0 GiB", output.getvalue())
+                            self.assertIn("head ordinary: nextest needs 8.0 GiB", output.getvalue())
                             self.assertNotIn("this build is the queue head", output.getvalue())
                 fixture.free((20 if owner_name == "continuation" else 60) * GIB)
                 if owner_name == "continuation":

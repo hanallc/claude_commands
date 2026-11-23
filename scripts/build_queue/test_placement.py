@@ -2119,8 +2119,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
+            window = conf.read(settings).whole("permit_max_seconds")
             self.commit_settings(settings)
-            _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+            _ = settings.write_text(good.replace(f"permit_max_seconds={window}", "permit_max_seconds=broken"))
             warnings = io.StringIO()
 
             def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
@@ -2137,8 +2138,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
                 self.assertEqual(evidence.eligibility, ALLOWED_HOST)
                 start.assert_called_once()
-                self.assertEqual(warnings.getvalue().count("enabled='broken'"), 1)
-                self.assertTrue(hana_spend.read_settings(conf.read(settings)).enabled)
+                self.assertEqual(warnings.getvalue().count("permit_max_seconds='broken'"), 1)
+                self.assertEqual(hana_spend.read_settings(conf.read(settings)).permit_max_seconds, window)
 
                 _ = settings.write_text(good.replace("mount_timeout_seconds=15", "mount_timeout_seconds=broken"))
                 with mock.patch.object(conf, "_committed_files", return_value=()):
@@ -2148,6 +2149,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     self.assertEqual(start.call_count, 2)
                     with self.assertRaisesRegex(conf.Unusable, "mount_timeout_seconds"):
                         _ = hana_spend.read_settings(conf.read(settings))
+
+                # An unattended reader counts an invalid switch as off; it does not recover the committed value.
+                _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
+                evidence = self.read_target(fixture, request)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                self.assertEqual(evidence.eligibility, placement.FixedExclusion("off"))
+                self.assertEqual(start.call_count, 2)
 
     def test_linux_kinds_recovers_the_committed_command(self) -> None:
         with PlacementFixture() as fixture:

@@ -187,7 +187,8 @@ def start_script(mirror: str, program: Program, placement: MacPlacement) -> str:
       is compiled: a wrapper's execvp goes on to a later match when a start fails, and bash opens a script
       on PATH with no execute bit;
     - a later word names no folder with a __main__ entry of any suffix, which python runs, and no folder that
-      cannot be listed, as main_folder in mac_linux.py, which hand_made.py uses.
+      cannot be listed. The zsh [[ -d ]] test follows links and is false for a stat error, so a word that names
+      a link loop passes here; the natedev folder check refuses it before the model call.
     zsh expands no word that starts with =. A missing mirror ends the script with no line; a refusal prints
     REFUSED; START comes just before the start.
     """

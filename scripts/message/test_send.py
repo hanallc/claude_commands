@@ -6797,9 +6797,10 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertFalse((self.root / "log.jsonl").exists())
         self.assertEqual(self.relayed, [])
 
-    def mac_locked_main(self, sender: str = "hana", *extra: str) -> tuple[int, str, mock.MagicMock]:
+    def mac_locked_main(self, sender: str = "hana", *extra: str,
+                        clears_when: str = "true") -> tuple[int, str, mock.MagicMock]:
         arguments = ["--to", "user", "--text-id", "mac.locked", "--value", f"sender={sender}",
-                     "--value", "waiting=One unit's phase waits for 2 shots", "--clears-when", "true", *extra]
+                     "--value", "waiting=One unit's phase waits for 2 shots", "--clears-when", clears_when, *extra]
         with (mock.patch.object(send, "send", return_value=send.Result("sent", "to the user")) as sent,
               redirect_stdout(output := io.StringIO()), redirect_stderr(io.StringIO())):
             code = send.main(arguments)
@@ -6901,7 +6902,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_mac_locked_forward_to_natedev_asks_only_on_the_delivering_host(self) -> None:
         _, mac_test_conf, _ = self.mac_in_use()
         _ = write_config_fixture(mac_test_conf, "offload=off\n")
-        self.assert_mac_locked_sent("hana", "--machine", "natedev")
+        code, output, sent = self.mac_locked_main("hana", "--machine", "natedev")
+        self.assertEqual(code, 0)
+        self.assertIn("SENT: to the user", output)
+        sent.assert_called_once()
+        # The forward sends --self-clearing, so no host adds the off-check; the sender keeps its own check.
+        self.assertEqual(cast(send.Options, sent.call_args.args[0]).clears_when, "true")
         self.assert_mac_locked_not_sent()
 
     def test_mac_locked_skip_on_natedev_is_a_confirmed_skip_on_the_mac(self) -> None:
@@ -6917,6 +6923,35 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result.outcome, "skipped")
         self.assertIsInstance(result.failure, send.NoFailedPush)
         self.assertIn("the Mac is off on purpose (offload=off)", result.detail)
+
+    def test_a_sent_mac_locked_push_stops_when_the_user_turns_the_mac_off(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        code, _, sent = self.mac_locked_main(clears_when="exit 1")
+        self.assertEqual(code, 0)
+        options = cast(send.Options, sent.call_args.args[0])
+        scripts = Path(send.__file__).resolve().parents[1]
+        off_check = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose",
+                                "--asking=hana"])
+        self.assertEqual(options.clears_when, f"{off_check} || /bin/sh -c 'exit 1'")
+        sent_at = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")),
+              mock.patch.object(send, "now", return_value=sent_at)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        [record] = self.emergencies()
+        self.assertEqual(record["check"], options.clears_when)
+        key = record["key"]
+        name = f"{key} from hana"
+        with mock.patch.object(send, "run") as channel:
+            self.assertEqual(self.clear_check(sent_at + timedelta(minutes=1)), (0, [f"kept: {name}: its check exits 1"]))
+        channel.assert_not_called()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: cancelled 1\n", "")),
+              mock.patch.object(silence, "drop", return_value=0)):
+            code, lines = self.clear_check(sent_at + timedelta(minutes=2))
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, [f"retired: {name}: its check passed;"
+                                 + f" cancelled: the emergency push for {key} stopped"])
+        self.assertEqual(self.emergencies(), [])
 
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",

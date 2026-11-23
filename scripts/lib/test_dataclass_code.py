@@ -61,7 +61,10 @@ def cache(test: unittest.TestCase) -> tuple[str, str]:
 
 class DataclassCodeTests(unittest.TestCase):
     def test_the_startup_hook_gives_dataclasses_the_cached_exec_on_this_python(self) -> None:
-        result = subprocess.run([str(ROOT / "scripts/lib/py"), "-c", ACTIVE_CHECK], cwd=ROOT,
+        # A gate shell can turn the cache off; the child checks the hook with the cache on.
+        environment = {name: value for name, value in os.environ.items()
+                       if name != "CLAUDE_DISABLE_DATACLASS_CODE_CACHE"}
+        result = subprocess.run([str(ROOT / "scripts/lib/py"), "-c", ACTIVE_CHECK], cwd=ROOT, env=environment,
                                 capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(), [startup.dataclass_exec.__name__, "1", "1"])
