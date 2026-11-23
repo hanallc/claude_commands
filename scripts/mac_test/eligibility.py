@@ -202,6 +202,14 @@ ACTIVE_BACKOFF = ActiveBackoff()
 
 
 UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+# SSH sends a keepalive check at this interval.
+SERVER_ALIVE_INTERVAL_SECONDS = 15
+
+
+def server_alive_options(unreachable_wait_s: int) -> tuple[str, ...]:
+    """The SSH keepalive options: a session with no answer ends after the unreachable wait, on each route."""
+    count = math.ceil(unreachable_wait_s / SERVER_ALIVE_INTERVAL_SECONDS)
+    return ("-o", f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}", "-o", f"ServerAliveCountMax={count}")
 
 
 def config_path() -> Path:
