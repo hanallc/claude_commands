@@ -579,7 +579,12 @@ class BuildLimitsTests(unittest.TestCase):
                              (1, 1, ["Build name"]))
             self.assertEqual((mac_cells["cleanup"].used, mac_cells["cleanup"].runs), (1, []))
             self.assertEqual((mac_cells["quiet"].used, mac_cells["quiet"].limit), (0, 1))
-        for shown, project_count in ((keyless, 1), (unresolved, 2)):
+        # A Mac claim with no repository key holds the whole Mac, so the heading counts it.
+        self.assertEqual((keyless.mac.unattributed, keyless.mac.unattributed_note, keyless.mac.waits),
+                         (1, "", normal.mac.waits))
+        keyless_cells = {row.name: row.mac for row in keyless.repositories}
+        self.assertEqual((keyless_cells["project"].used, keyless_cells["cleanup"].used), (None, 1))
+        for shown, project_count in ((unresolved, 2),):
             with self.subTest(mac_claims=project_count):
                 self.assertEqual(shown.mac.unattributed, 0)
                 self.assertEqual(shown.mac.waits, normal.mac.waits)

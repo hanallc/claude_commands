@@ -152,9 +152,9 @@ def complete(arguments, attempt):
                                             session=assigned.session, assignment=assigned)
         else:
             status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False)
-    attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, text.getvalue(), ""))
-    if status in (0, 13):
-        controller.claim_identity = claim_state.reply_claim_identity(text.getvalue())
+    answer = offload.CommandOutput(status, text.getvalue(), "")
+    attempt.answer = offload.read_claim_answer(answer)
+    _ = controller.accept_claim_reply(answer)
     actions.append("claim:" + str(status))
     after = mac_test.read_claims(mac_test.state_paths(parsed.target))
     adopted_claim_ids.extend(claim.record["claim_id"] for claim in after if claim.record["pid"] == os.getpid())

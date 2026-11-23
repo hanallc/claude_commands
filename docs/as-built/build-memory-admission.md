@@ -537,7 +537,28 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The provider keeps its existing repository scopes and cleanup policy.
+The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
+The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
+Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
+The Mac resolves the repository before it takes the claim lock.
+The key follows local clone origins to the upstream repository. Git alternates supply objects only.
+The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
+The Mac runner uses the shared origin to find the mirror and set the claim key.
+Each new work claim saves its claim key, history key, claim file, mirror name, and start fence directory.
+The key determines the file name for a new claim. The mirror name identifies the directory the runner uses.
+The runner, release, cleanup, and execution observer use the saved identity. Handoff retains the reservation file and its start fence.
+A handoff can adopt an exact cleanup claim after the checkout is gone.
+A legacy Mac claim with no key blocks all repositories. Any Mac caller can take the exact claim for cleanup after the saved owner ends.
+A claim without a proven mirror or history key authorizes cleanup only.
+The runner takes the execution lease before it replaces an incomplete local reservation.
+The claim child publishes the replacement and removes the old reservation under one provider lock.
+The runner keeps the execution lease through the run.
+Cleanup uses the saved mirror lease when the claim identifies the mirror. Otherwise, it takes the host lease and counts processes in all mirrors.
+The idle watcher reads an expired remote claim again under its cleanup lease before release.
+If a cleanup lease cannot open or its mirror root is invalid, the watcher skips that claim for the current pass.
+Shell and Python runners take a shared host lease before they take a mirror lease.
+The host-wide count sends no process signals. Unrelated mirror work can keep the claim pending.
+The Mac build log and the queue use the same Git root key for history when a repository has no origin.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
@@ -1350,10 +1371,19 @@ Status derives `draining (N runs left)` or `held` from matching live keep entrie
 Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
-Legacy CI cargo requests use the same hold and lineage check before memory admission.
-CI requests outside the keep list remain queued until release.
-A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
-Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+On natedev, each admission pass applies the same hold and lineage check to every local step waiter (`AdmitRequest`), CI requests included.
+App launches (`LaunchRequest`) are not held; the enforcer does not stop them either.
+The check uses the waiter's process lineage and the session that owns its run, so the holder's own steps and kept runs still start.
+The client sends that owning session (`owning_session()`) in `AdmitRequest.session`; a worker in the holder's run is not held.
+A request from an older client has `SessionNotSent` and falls back to the session in its queue row.
+The service finds the own hold key once for each session in a pass.
+An unreadable staff record gives no own hold key for that pass, so the step waits.
+A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
+A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
+A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.
+View and explain replies between passes show the holds of the last pass.
+Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
+Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.
 The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 `snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
 GPU slot waits use the same shape with a `_gpu_slot` field.
