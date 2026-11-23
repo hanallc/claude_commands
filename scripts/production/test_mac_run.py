@@ -23,7 +23,7 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import shell_functions
@@ -387,7 +387,7 @@ class MacRunTests(unittest.TestCase):
         # The runner's session must not own the fixture's Mac block.
         seed_interpreter_cache(self.root / "cache")
         self.environment = {
-            **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
+            **{name: value for name, value in memory_gate_shell_environment().items() if name not in SESSION_SELECTORS},
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             "__ETC_ZSHENV_SOURCED": "1",

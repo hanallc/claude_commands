@@ -1436,7 +1436,8 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
     return MirrorBusyRefusal(holder)
 
 
-def write_backoff(until: float, target: str = "mac") -> None:
+def write_backoff(until: float, target: str = "mac", *, strict: bool = False) -> None:
+    """Write the backoff record. A strict write reports file errors."""
     path = eligibility.backoff_path(target)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1455,7 +1456,8 @@ def write_backoff(until: float, target: str = "mac") -> None:
             finally:
                 temporary_path.unlink(missing_ok=True)
     except OSError:
-        return
+        if strict:
+            raise
 
 
 def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
