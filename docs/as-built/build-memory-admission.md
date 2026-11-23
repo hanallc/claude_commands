@@ -468,6 +468,12 @@ A running AWS gate box shows `box running · no link or load reading`, because i
 A probe that cannot start shows `facts unreadable`.
 A missing or invalid file reads as `machine_facts.FactsUnread.VALUE` and shows `facts not sampled`.
 Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
+
+A Mac claim without a repository row shows under the Mac heading as `1 in use`, with a run mark.
+A kept claim (`mac_test.run_is_kept()`: the leftovers of a stopped run) shows as `1 kept (leftover of a stopped run)`, and two or more show as `2 kept (leftovers of stopped runs)`. Both kinds show as `1 in use · 1 kept (leftover of a stopped run)`.
+A kept claim has the kept mark, a filled square (`.build-limit-mark.kept`), in place of the run mark, under the heading and in a repository cell. The legend names it `A place kept by a stopped run`.
+`limits_view.read_mac()` carries the kind as `MacClaimUse`. A kept claim still counts in the limit. A repository cell counts it in `used` and in `kept`, and its hover names it under `Places`.
+
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
 `can run on` is one line that names the targets that can take the step now.

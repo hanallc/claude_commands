@@ -228,18 +228,27 @@ class Arguments(argparse.Namespace):
         return self.kind == "run" and Path(self.lifecycle_script).name == MAC_RUN_SCRIPT.name
 
 
+@dataclass(frozen=True)
+class UnreadableMacBlock:
+    """The block record cannot be read, so the run waits until it reads again."""
+
+    path: Path
+
+
+MacRunBlock = claim_state.PendingMacBlock | claim_state.ActiveMacBlock | UnreadableMacBlock
+
+
 def blocking_run(
     args: Arguments, owner: OwningSession | NoOwningSession,
-) -> claim_state.MacBlockState | mac_test.ClaimDenied:
-    if args.kind != "run":
-        return mac_test.NO_MAC_BLOCK
+) -> claim_state.NoMacBlock | MacRunBlock | mac_test.ClaimDenied:
+    """Check the Mac block for every run kind: shot, install, probe and run."""
     paths = claim_state.state_paths()
     try:
         block = mac_test.blocking_claim_block(paths, owner)
     except (OSError, claim_state.StateReadError):
         if args.is_mac_run:
             return mac_test.unreadable_claim(paths.block)
-        raise
+        return UnreadableMacBlock(paths.block)
     if not args.is_mac_run:
         return block
     if not isinstance(block, claim_state.NoMacBlock):
@@ -255,38 +264,47 @@ def wait_to_retry() -> None:
     time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
 
 
+def shell_session() -> OwningSession | NoOwningSession:
+    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return OwningSession(session) if session else NoOwningSession()
+
+
 def run(args: Arguments) -> int:
     since = time.time()
-    owner = owning_session() if args.kind == "run" else NoOwningSession()
-    if isinstance(owner, NoOwningSession):
-        session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        if session:
-            owner = OwningSession(session)
+    # A block admits its holding unit's workers, so each kind checks the block as the unit's session.
+    block_owner = owning_session()
+    if isinstance(block_owner, NoOwningSession):
+        block_owner = shell_session()
+    placement_owner = block_owner if args.kind == "run" else shell_session()
     announced = False
-    reported_block = False
+    reported = ""
     try:
         while True:
-            block = blocking_run(args, owner)
+            block = blocking_run(args, block_owner)
             if isinstance(block, claim_state.NoMacBlock):
                 if not announced:
                     print(f"Mac queue: {args.what}", file=sys.stderr)
                     announced = True
-                result = run_attempt(args, since, owner)
+                result = run_attempt(args, since, placement_owner, block_owner)
                 if isinstance(result, int):
                     return result
                 block = result
             if isinstance(block, mac_test.ClaimDenied):
                 print(block.reason)
                 return MAC_RUN_REFUSED_STATUS
-            block = mac_test.lift_expired_claim_block(claim_state.state_paths(), owner, block)
-            if isinstance(block, claim_state.NoMacBlock):
-                continue
-            if not reported_block:
+            if isinstance(block, UnreadableMacBlock):
+                message = ("Mac block record unreadable" if args.no_wait
+                           else "Waiting for a readable Mac block record") + f": {block.path}"
+            else:
+                block = mac_test.lift_expired_claim_block(claim_state.state_paths(), block_owner, block)
+                if isinstance(block, claim_state.NoMacBlock):
+                    continue
                 holder = mac_test.holder_name(block.holder)
                 reason = " ".join(block.reason.splitlines())
-                message = "Mac blocked" if args.no_wait else "Waiting for the Mac block"
-                print(f"{message} held by {holder}: {reason}", flush=True)
-                reported_block = True
+                message = ("Mac blocked" if args.no_wait else "Waiting for the Mac block") + f" held by {holder}: {reason}"
+            if message != reported:
+                print(message, flush=True)
+                reported = message
             if args.no_wait:
                 return MAC_BUSY_STATUS
             wait_to_retry()
@@ -296,8 +314,9 @@ def run(args: Arguments) -> int:
 
 
 def run_attempt(
-    args: Arguments, since: float, owner: OwningSession | NoOwningSession,
-) -> int | claim_state.PendingMacBlock | claim_state.ActiveMacBlock:
+    args: Arguments, since: float, placement_owner: OwningSession | NoOwningSession,
+    block_owner: OwningSession | NoOwningSession,
+) -> int | MacRunBlock:
     episode, pid = uuid.uuid4().hex, os.getpid()
     source = subprocess.run(["git", "-C", str(args.worktree), "rev-parse", "HEAD"],
                             capture_output=True, text=True)
@@ -305,7 +324,7 @@ def run_attempt(
     command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
     original_command = command.copy()
     status = 1
-    block: claim_state.MacBlockState | mac_test.ClaimDenied = mac_test.NO_MAC_BLOCK
+    block: claim_state.NoMacBlock | MacRunBlock | mac_test.ClaimDenied = mac_test.NO_MAC_BLOCK
     remote = RemoteRun()
     placement = MacPlacement("", episode, "")
     receipts = Path.home() / RECEIPTS
@@ -322,10 +341,10 @@ def run_attempt(
         try:
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
-                    args.worktree, args.package, args.kind, source_key, claim_state.session_id(owner),
+                    args.worktree, args.package, args.kind, source_key, claim_state.session_id(placement_owner),
                     assignment_file, command, wait_events=not mac_run), capture_stderr=mac_run)
                 if code in (0, MAC_BUSY_STATUS):
-                    block = blocking_run(args, owner)
+                    block = blocking_run(args, block_owner)
                 if errors and (code != MAC_BUSY_STATUS or isinstance(block, claim_state.NoMacBlock)):
                     print(errors, end="", file=sys.stderr, flush=True)
                 refusal = (mac_placement_refusal(output)
@@ -351,7 +370,7 @@ def run_attempt(
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
                 clean_ended_runs(callback_environment)
-                block = blocking_run(args, owner)
+                block = blocking_run(args, block_owner)
                 on_close = ""
                 if isinstance(block, claim_state.NoMacBlock) and args.lifecycle_script:
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
@@ -377,7 +396,7 @@ def run_attempt(
                 else:
                     status = 0
                 if status == 0 and isinstance(block, claim_state.NoMacBlock):
-                    block = blocking_run(args, owner)
+                    block = blocking_run(args, block_owner)
                     if isinstance(block, claim_state.NoMacBlock):
                         # Record failure until the Mac reports an exit status.
                         status = 1
@@ -437,7 +456,7 @@ def run_attempt(
             if not released:
                 print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1
-    if status == 0 and isinstance(block, (claim_state.PendingMacBlock, claim_state.ActiveMacBlock)):
+    if status == 0 and not isinstance(block, (claim_state.NoMacBlock, mac_test.ClaimDenied)):
         return block
     return status
 

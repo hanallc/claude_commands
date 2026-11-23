@@ -78,6 +78,7 @@ from scripts.agents import remote
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
@@ -99,7 +100,7 @@ from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
-from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
+from scripts.lib.release_waiter import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -121,7 +122,6 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
-TEST_HERDR_BIN = "/nonexistent/herdr"
 GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
@@ -208,16 +208,9 @@ class HoldExemptNamedModuleMachine:
 
 
 @dataclass(frozen=True)
-class ConfiguredGateParent:
-    """Use the gate parent from build_folders.conf."""
-
-
-@dataclass(frozen=True)
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
-    gate_parent: ConfiguredGateParent | build_folders.ExplicitBuildParent = field(
-        default_factory=ConfiguredGateParent, kw_only=True)
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1223,7 +1216,7 @@ raise SystemExit(99)
     return {**environment, **owner, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
             "MERGE_GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
-            "HERDR_BIN": TEST_HERDR_BIN,
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
@@ -1658,13 +1651,6 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
-def gate_work_parent(machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine) -> Path:
-    """Select the folder for gate recovery, state, and tests."""
-    if isinstance(machine, WholeMachine) and isinstance(machine.gate_parent, build_folders.ExplicitBuildParent):
-        return machine.gate_parent.path
-    return _gate_job_parent()
-
-
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1698,7 +1684,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     runner = module_runner(repo)
-    gate_parent = gate_work_parent(machine)
+    gate_parent = _gate_job_parent()
     if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
     report_retained_gate_test_folders(gate_parent)
@@ -2457,7 +2443,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
-        refused = MacLinuxNoAnswer if isinstance(error, MacLinuxNoAnswer) else GateRefused
+        refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
         raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
@@ -3181,7 +3167,7 @@ class MacLinuxGateRefused(GateRefused):
     """The assigned Mac Linux guest could not complete the gate."""
 
 
-class MacLinuxNoAnswer(GateRefused):
+class MacLinuxTookNoRun(GateRefused):
     """The assigned Mac Linux guest took no run. The caller can place the gate again."""
 
 
@@ -3199,13 +3185,13 @@ class MacLinuxGateRoute(Protocol):
               type_dirs: Sequence[str]) -> GateRun | GuestNotStartedOutcome | str: ...
 
 
-def report_mac_linux_no_answer(reason: str) -> MacLinuxNoAnswer:
+def report_mac_linux_took_no_run(reason: str) -> MacLinuxTookNoRun:
     """Write the claim failure next to the placement file for the caller that owns the placement."""
     path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
     assignment = admission_wire.read_assignment(path).assignment
     failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
     write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
-    return MacLinuxNoAnswer(f"Mac Linux guest took no run: {reason}")
+    return MacLinuxTookNoRun(f"Mac Linux guest took no run: {reason}")
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -3246,7 +3232,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            raise report_mac_linux_no_answer(outcome.reason)
+            raise report_mac_linux_took_no_run(outcome.reason)
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
             if outcome.time_limit_report:
@@ -3469,8 +3455,8 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
-    except MacLinuxNoAnswer as error:
-        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+    except MacLinuxTookNoRun as error:
+        print(error, file=sys.stderr, flush=True)
         return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
@@ -3588,8 +3574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             with gate_recovery(checkout):
                 return merge_checkpoint(args)
-    except MacLinuxNoAnswer as error:
-        print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+    except MacLinuxTookNoRun as error:
+        print(error, file=sys.stderr, flush=True)
         return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

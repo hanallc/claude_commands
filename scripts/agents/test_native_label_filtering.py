@@ -7,6 +7,7 @@ from unittest.mock import patch
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.herdr import pane_launch
 from scripts.agents import pane_record
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 class NativeLabelFilteringTests(StaffTestCase):
@@ -32,7 +33,7 @@ class NativeLabelFilteringTests(StaffTestCase):
         }
         before = old["environment"].copy()
         expected = {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session, "ENABLE_TOOL_SEARCH": "true"}
-        with (patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+        with (patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}),
               patch.object(pane_record, "RECORD_DIR", self.root / "filtered-records")):
             pane_record.save("agents", {old["pane_id"]: old})
             self.assertEqual(pane_record.read("agents")[old["pane_id"]]["environment"], expected)

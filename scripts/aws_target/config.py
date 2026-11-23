@@ -14,6 +14,45 @@ from scripts.lib import conf
 from scripts.build_targets import target_config
 
 
+@dataclass(frozen=True)
+class AwsOn:
+    """A named machine has enabled=on."""
+
+
+@dataclass(frozen=True)
+class AwsOff:
+    """Each named machine has enabled=off."""
+
+
+@dataclass(frozen=True)
+class AwsSwitchUnusable:
+    """No named machine is on, and the enabled value of one is not usable, which counts as off."""
+    reason: str
+
+
+type AwsSwitch = AwsOn | AwsOff | AwsSwitchUnusable
+
+
+def aws_switch(*machines: conf.ConfigRead) -> AwsSwitch:
+    """Answer whether this process may call AWS for any machine whose settings it names.
+
+    The enabled key of cloud_gate.conf switches the cloud gate box, and that of hana_aws.conf switches the Hana box.
+    An invalid live value counts as off, and a missing key or a missing live file takes the committed value."""
+    unusable: list[str] = []
+    for settings in machines:
+        try:
+            if settings.value('enabled', conf.on_off, recover_invalid=False):
+                return AwsOn()
+        except conf.Unusable as error:
+            unusable.append(str(error))
+    return AwsSwitchUnusable('; '.join(unusable)) if unusable else AwsOff()
+
+
+def cloud_gate_off_reason(switch: AwsOff | AwsSwitchUnusable) -> str:
+    """Name why the cloud gate routes make no AWS call."""
+    return switch.reason if isinstance(switch, AwsSwitchUnusable) else 'cloud gates are off (cloud_gate.conf enabled=off)'
+
+
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
     """Read the ordered regions permitted by the account policy."""
     values = configuration if configuration is not None else conf.read_or_repository('cloud_gate')
