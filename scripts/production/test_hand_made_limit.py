@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
+from scripts.buildlog import store
 from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import Program, Refused
 from scripts.production.test_hand_made import FakePlace, clear_build_variables, namespace_members
@@ -174,7 +175,11 @@ class LimitTests(unittest.TestCase):
         status, output, _ = self.limited(["sh", "-c", "echo ${SSH_AUTH_SOCK:-none}"])
         self.assertEqual((status, output), (0, "none\n"))
 
-    @unittest.skipUnless(shutil.which("sccache", path=program_path()), "sccache is not on PATH")
+    # The natedev route is the only one that starts the private sccache server, so natedev must run this test.
+    # Another host without sccache, such as the Mac Linux guest, skips it.
+    @unittest.skipIf(store.host_name() != hand_made.LOCAL_MACHINE
+                     and shutil.which("sccache", path=program_path()) is None,
+                     "sccache is not on PATH, and this host is not natedev")
     def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
         # A C compile: the merge gate fails a module that starts cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
