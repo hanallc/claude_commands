@@ -1550,9 +1550,9 @@ COST_EXPLORER_USAGE = 'USE1-APIRequest'
 
 
 def _run_related_usage(usage_type: str, *, priced_volumes: bool) -> bool:
-    """Name the bill rows that a day with no run does not have."""
+    """Name the bill rows that come from runs, or from volumes the ledger prices: an idle day skips them."""
     usage = usage_type.lower()
-    return (spend_group(usage_type) == 'data transfer' or usage_type == COST_EXPLORER_USAGE
+    return (spend_group(usage_type) == 'data transfer'
             or (priced_volumes and 'ebs:volume' in usage) or any(marker in usage for marker in (
                 'spotusage:', 'boxusage:', 'publicipv4:inuseaddress', 'requests-tier')))
 
@@ -1563,10 +1563,10 @@ def _priced_volumes(state: LedgerEvidence) -> bool:
 
 
 def _carried_bill_groups(bill: ChargeRead, *, idle: bool, priced_volumes: bool) -> tuple[SpendGroupCost, ...]:
-    """Carry saved usage amounts and retain unknown usage."""
+    """Carry saved usage amounts and retain unknown usage. The scheduled read counts the Cost Explorer fees."""
     groups: dict[str, Decimal] = dict.fromkeys(SPEND_GROUPS, Decimal(0))
     for row in bill.usage_types:
-        if 'SpotUsage:' not in row.usage_type and not (
+        if 'SpotUsage:' not in row.usage_type and row.usage_type != COST_EXPLORER_USAGE and not (
                 idle and _run_related_usage(row.usage_type, priced_volumes=priced_volumes)):
             groups[spend_group(row.usage_type)] += row.usd
     groups['other'] += bill.actual_usd - sum((row.usd for row in bill.usage_types), Decimal(0))

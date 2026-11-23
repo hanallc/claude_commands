@@ -87,7 +87,8 @@ class LedgerTests(CostFixture):
         legacy = spend.read_spend(self.settings, self.state, now, '2026-11-20')
         assert isinstance(legacy, spend.Spend)
         # Base 740aae528 counts every dispatch without evidence of refusal.
-        self.assertEqual(legacy.days[0].usd, Decimal('2.01288'))
+        # The run day carries the bill rows except USE1-APIRequest: the scheduled read counts that fee.
+        self.assertEqual(legacy.days[0].usd, Decimal('1.99288'))
         legacy_guard = self.book.accrued_cost(self.settings, now, window='day')
         disk_so_far = Decimal('34.80') * 7200 / (30 * 86400)
         self.assertEqual(legacy_guard.cost, Decimal('.28288') + disk_so_far)
@@ -169,8 +170,9 @@ class LedgerTests(CostFixture):
 
     def test_run_day_carries_the_run_rows_of_the_bill(self) -> None:
         run = {row.group: row.usd for row in self.real_bill_days()['2026-01-16'].groups}
+        # The scheduled read counts the Cost Explorer fees, so the USE1-APIRequest row of .02 is not in other.
         self.assertEqual((run['storage'], run['public IPv4'], run['data transfer'], run['other']),
-                         (Decimal('1.31'), Decimal('.2'), Decimal('.05'), Decimal('.17')))
+                         (Decimal('1.31'), Decimal('.2'), Decimal('.05'), Decimal('.15')))
 
     def test_dispatch_and_observed_acceptance_keep_the_original_hana_hours(self) -> None:
         self.inventory(self.start)

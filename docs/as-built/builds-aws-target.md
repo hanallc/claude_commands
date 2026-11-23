@@ -979,8 +979,9 @@ An unbilled day is idle only if every run exposure that starts before its end ha
 An expired permit or reservation still counts until the ledger confirms closure.
 The page, spending guard, and admission use the usual prices and bill carry on run days.
 After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
-It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
-The bill row for Cost Explorer requests is `USE1-APIRequest`; the scheduled read interval counts these fees once.
+It skips usage linked to runs.
+The bill row for Cost Explorer requests is `USE1-APIRequest`.
+The bill carry skips this row on every day, because the scheduled read interval counts these fees once.
 After the builder removal, the idle day also skips every `EBS:Volume` row.
 The ledger prices the Hana disk from its `hana_storage` rate for the whole day instead.
 Before the builder removal, the idle day keeps the volume rows, because the builder disk stays with no run.
