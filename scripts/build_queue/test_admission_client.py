@@ -1150,7 +1150,8 @@ class ClientTests(unittest.TestCase):
             with mock.patch.object(mac_queue_run, "admission_command", return_value=["true"]), \
                  mock.patch.object(mac_queue_run, "capture_command", side_effect=queue), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(mac_queue_run.run_attempt(args, time.time(), NoOwningSession()), 78, errors.getvalue())
+                result = mac_queue_run.run_attempt(args, time.time(), NoOwningSession(), NoOwningSession())
+                self.assertEqual(result, 78, errors.getvalue())
 
         real_socket = socket.socket
         with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \

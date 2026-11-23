@@ -75,7 +75,8 @@ class StepNameTests(unittest.TestCase):
 
     def test_the_wait_line_and_the_row_pick_the_same_owner(self) -> None:
         from scripts.build_queue import admission_records as records
-        from scripts.build_queue.queue_lines import blocking_step_name, wait_line_name
+        from scripts.build_queue.queue_lines import blocking_step_name
+        from scripts.build_queue.snapshot_codec import wait_line_name
         from scripts.lib.build_steps import StepNames
         from scripts.message.unit_labels import UnitLabels
 

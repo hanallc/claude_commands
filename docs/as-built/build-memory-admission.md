@@ -395,7 +395,7 @@ Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
-`queue_lines.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
+`snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
 1. The recorded unit, then the staff unit.
 2. The staff showrunner, or the session name for a session with no production.
 3. The stored caller name, then the repository or package.
@@ -1070,7 +1070,8 @@ It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads tha
 A hold that stops the run sends a restart notice to that staff member when the hold ends.
 The default owner did not start the run, so it must not get that notice.
 It does nothing when an owner variable is already set, and it puts back the earlier values at the end.
-`queue_lines.wait_line_name` names a waiting step for the client wait line, the service head label, and the Builds page "behind" text.
+`snapshot_codec.wait_line_name` names a waiting step for the client wait line, the service head label, and the Builds page "behind" text.
+`owner_name`, `row_what` and `wait_line_name` are in `snapshot_codec`, because the admission client loads it at start and the AWS guest ships it.
 It takes the owner from `owner_name`, with the staff labels when the caller has them, so a wait line and a row show the same owner.
 It uses the folder name, and then the head name, only when `owner_name` finds no usable name.
 When the stored name is empty, the Builds page shows the staff name or `unregistered session`.

@@ -15,6 +15,7 @@ from types import UnionType
 from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 
 if TYPE_CHECKING:
+    from scripts.message.unit_labels import UnitLabels
     from scripts.production.staff import StaffId, StaffSnapshot
 
 # Literal unions use typing.Union on Python 3.13.
@@ -92,6 +93,10 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         return {**record, "source_key": source}
     if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
         del record["verify"]
+    if (writing and schema.__module__ == "scripts.build_queue.admission_wire" and schema.__name__ == "Identity"
+            and record.get("what") == ""):
+        # An identity with no caller text keeps the wire shape of the clients from before the what field.
+        del record["what"]
     if writing and schema.__name__ == "KnownPlacementStatus":
         # A status reply carries the launch facts only when the caller asks for them.
         if record.get("permission") == {"kind": "LaunchPermissionNotReported"}:
@@ -181,6 +186,30 @@ def row_text(owner: object, what: object) -> str:
     An unusable owner shows the unknown caller label; an unusable or repeated what shows the owner alone."""
     shown_owner, shown_what = select_queue_name(owner), public_queue_text(what)
     return shown_owner + ROW_SEPARATOR + shown_what if shown_what and shown_what != shown_owner else shown_owner
+
+
+def owner_name(identity: UnitLabels | None, unit: str, *later: str) -> str:
+    """Name who started the work: a unit, the staff showrunner or session, then each later name in order."""
+    showrunner = public_queue_text(identity.showrunner) if identity is not None else ""
+    for candidate in (unit, identity.unit if identity is not None else ""):
+        shown = public_queue_text(candidate)
+        if showrunner:
+            shown = public_queue_text(shown.removeprefix(showrunner + "-"))
+        if shown:
+            return shown
+    staff_owner = public_queue_text(identity.owner_text) if identity is not None else ""
+    return staff_owner or next((shown for name in later if (shown := public_queue_text(name))), "")
+
+
+def row_what(what: str, step: str) -> str:
+    """What the work does: the caller's own usable text, such as the mac_queue_run --what text, or else the step."""
+    return public_queue_text(what) or step
+
+
+def wait_line_name(unit: str, caller: str, folder: str, step: str, *, identity: UnitLabels | None = None,
+                   fallback_name: str = "") -> str:
+    """Name a waiting step `<owner>: <step>`; owner_name picks the owner, then the folder name, then the fallback."""
+    return row_text(owner_name(identity, unit, caller, Path(folder).name, fallback_name), step)
 
 
 def ci_label(template: str, runner: str, job: str) -> str:

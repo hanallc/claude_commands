@@ -52,8 +52,8 @@ from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
-from scripts.build_queue.queue_lines import (age, blocking_step_name, owner_name, plain, row_what, step_owner_name,
-                                             step_text)
+from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
+from scripts.build_queue.snapshot_codec import owner_name, row_what
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,

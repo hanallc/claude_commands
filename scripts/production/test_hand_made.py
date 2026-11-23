@@ -1047,8 +1047,8 @@ class BuildsPageTests(unittest.TestCase):
         self.assertEqual(names.shown(build_steps.HAND_MADE.step), "hand made")
         self.assertEqual(names.queue_name(build_steps.HAND_MADE.step), "hand made")
         self.assertTrue(build_steps.is_recorded_step("hand-made"))
-        step = mock.Mock(spec=["session_id", "session_name", "unit", "project", "step"], session_id="",
-                         session_name="", unit="aws-unit", project="claude", step="hand-made")
+        step = admission_records.WaitingStep(123, "", "", "hand-made", "", 0, 1, admission_records.ReadyForAdmission(),
+                                             unit="aws-unit", project="claude")
         self.assertEqual(queue_lines.step_text(step, names), "aws-unit: hand made")
 
     def test_a_hand_made_run_counts_in_the_run_limit_of_its_repository(self) -> None:

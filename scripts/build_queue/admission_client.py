@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
 from scripts.build_queue import execution_identity
-from scripts.build_queue import admission_code, placement, queue_lines, snapshot_codec
+from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import assignment_what
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
@@ -1810,8 +1810,8 @@ class WaitOutput:
         order = snapshot.decision.order_hold
         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead):
             blocker = order.waiter
-            what = queue_lines.row_what(blocker.get("what", ""), blocker.get("step", ""))
-            label = queue_lines.wait_line_name(blocker.get("unit", ""), blocker.get("session_name", ""),
+            what = snapshot_codec.row_what(blocker.get("what", ""), blocker.get("step", ""))
+            label = snapshot_codec.wait_line_name(blocker.get("unit", ""), blocker.get("session_name", ""),
                 blocker.get("folder", ""), what, fallback_name=cause.head_name)
             reasons = (blocking_waiter_text(reply.text, label, blocker["need"] / records.GIB),)
         else:

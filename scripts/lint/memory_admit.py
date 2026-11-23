@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
-from scripts.build_queue import admission_records as records, placement, progress_profile as progress, queue_lines, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -1716,7 +1716,7 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
 
 
 def waiter_unit_name(identity: WaiterIdentity) -> str:
-    return queue_lines.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
+    return codec.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
 
 
 class QueueIdentityReader:

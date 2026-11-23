@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.build_queue import queue_lines, snapshot_codec as codec
+from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.lib import conf, inotify
 from scripts.lib.boot_identity import boot_identity
@@ -1693,8 +1693,8 @@ class ServiceEstimatedAdmission(wire.AdmitRequest):
 def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
-    what = queue_lines.row_what(row.get("what", ""), row.get("step", ""))
-    return queue_lines.wait_line_name(row.get("unit", ""), row.get("session_name", ""), row.get("folder", ""), what)
+    what = codec.row_what(row.get("what", ""), row.get("step", ""))
+    return codec.wait_line_name(row.get("unit", ""), row.get("session_name", ""), row.get("folder", ""), what)
 
 
 @cache

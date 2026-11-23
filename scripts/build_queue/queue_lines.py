@@ -3,11 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 from types import MappingProxyType
 
-from scripts.build_queue.snapshot_codec import public_queue_text, row_text
+from scripts.build_queue.snapshot_codec import owner_name, row_text, row_what, wait_line_name
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import RunningStep, WaitingStep
@@ -24,33 +23,9 @@ class Span:
 Line = tuple[Span, ...]
 
 
-def owner_name(identity: UnitLabels | None, unit: str, *later: str) -> str:
-    """Name who started the work: a unit, the staff showrunner or session, then each later name in order."""
-    showrunner = public_queue_text(identity.showrunner) if identity is not None else ""
-    for candidate in (unit, identity.unit if identity is not None else ""):
-        shown = public_queue_text(candidate)
-        if showrunner:
-            shown = public_queue_text(shown.removeprefix(showrunner + "-"))
-        if shown:
-            return shown
-    staff_owner = public_queue_text(identity.owner_text) if identity is not None else ""
-    return staff_owner or next((shown for name in later if (shown := public_queue_text(name))), "")
-
-
 def step_owner_name(step: WaitingStep | RunningStep, labels: Mapping[str, UnitLabels]) -> str:
     """Name who started the step: a unit, the staff owner, the stored caller, or else the repository."""
     return owner_name(labels.get(step.session_id), step.unit, step.session_name, step.project)
-
-
-def row_what(what: str, step: str) -> str:
-    """What the work does: the caller's own usable text, such as the mac_queue_run --what text, or else the step."""
-    return public_queue_text(what) or step
-
-
-def wait_line_name(unit: str, caller: str, folder: str, step: str, *, identity: UnitLabels | None = None,
-                   fallback_name: str = "") -> str:
-    """Name a waiting step `<owner>: <step>`; owner_name picks the owner, then the folder name, then the fallback."""
-    return row_text(owner_name(identity, unit, caller, Path(folder).name, fallback_name), step)
 
 
 def blocking_step_name(step: WaitingStep, *, labels: Mapping[str, UnitLabels] = NO_UNIT_LABELS,
