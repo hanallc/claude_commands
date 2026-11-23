@@ -66,7 +66,8 @@ source = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2]
 if command == "constraints" and os.environ.get("TEST_ELIGIBLE_MAC"):
     Path(os.environ["CONF_DIR"], "build_targets.conf").write_text(
         "targets=mac,natedev\\nkind.natedev=local\\nplatform.natedev=linux\\n"
-        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n")
+        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n"
+        + "# whole: 1..86400\\nunreachable_wait_seconds=45\\n")
 runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
 '''
 

@@ -18,6 +18,7 @@ from scripts.buildlog import machine_facts
 from scripts.buildlog.machine_facts import CommandMissing, FactsUnread, Machine, MachineFacts, ProbeFailed, Probes
 from scripts.buildlog.test_index import use_test_log
 from scripts.lib import conf
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.mac_test import eligibility, offload
 
 
@@ -29,7 +30,8 @@ MAC_ON_BATTERY = ("{ 19.56 14.16 13.85 }\n12\nNow drawing from 'Battery Power'\n
                   " -InternalBattery-0 (id=23920739)\t85%; discharging; 2:16 remaining present: true\n")
 MAC_DESKTOP = "{ 2.50 2.00 1.00 }\n24\nNow drawing from 'AC Power'\n"
 SETTINGS = eligibility.SshProbeSettings(conf.ConfigRead("mac_test", Path("mac_test.conf"), conf.settings(
-    "host=mac\n# range: 5e-324..\nconnect_timeout_s=6\n# range: 5e-324..\nprobe_timeout_s=15\n"), False))
+    "host=mac\n# range: 5e-324..\nconnect_timeout_s=6\n# range: 5e-324..\nprobe_timeout_s=15\n"), False),
+    UNREACHABLE_WAIT_FIXTURE_SECONDS)
 
 
 def no_box(_now: float) -> str:
