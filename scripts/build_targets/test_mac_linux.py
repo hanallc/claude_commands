@@ -8,6 +8,7 @@ from datetime import timedelta
 import errno
 import fcntl
 import io
+import json
 import os
 from pathlib import Path
 import pwd
@@ -19,7 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Event, Timer
+from threading import Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -30,6 +31,7 @@ from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement, progress_profile
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
+from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store
 from scripts.lib import conf, process_group, process_start
 from scripts.lint.memory_test_support import write_config_fixture
@@ -217,8 +219,11 @@ def checked_git(repo, *args):
     return subprocess.check_output(['git', *args], cwd=repo, text=True).strip()
 
 
-def WholeMachine():
-    return 'configured gate root'
+class WholeMachine:
+    module_progress = None
+
+    def __init__(self, module_progress=None):
+        self.module_progress = module_progress
 
 
 def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
@@ -227,7 +232,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
     assert Path.home().is_relative_to(repo / 'target')
     assert Path(os.environ['XDG_RUNTIME_DIR']).is_relative_to(repo / 'target')
-    assert machine == 'configured gate root'
+    assert isinstance(machine, WholeMachine)
     assert (Path.home() / '.claude/config').resolve() == repo / 'config'
     assert os.environ['CARGO_TARGET_DIR'] == str(repo / 'target')
     assert Path(os.environ['RUSTUP_HOME']).is_relative_to(repo / 'target')
@@ -273,9 +278,9 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     timing = dict(wall_s=1.3, cpu_s=1.0, tests_s=0.7, tests_run=3, failures=0, errors=0, tests=[])
     paths = [(suite, path) for suite, path in discover_test_modules(repo)
              if not isinstance(selected, SelectedModules) or str(path.relative_to(repo)) in selected.paths]
-    print('Runner: 3 modules, whole machine, 2 CPUs', flush=True)
+    machine.module_progress('Runner: 3 modules, whole machine, 2 CPUs')
     for suite, path in paths:
-        print(f'{suite}/{path.name} exit=0 seconds=1.3', flush=True)
+        machine.module_progress(f'{suite}/{path.name} exit=0 seconds=1.3')
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
@@ -707,7 +712,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             return wire.FirstAuthorization(request.assignment, request.claim)
 
         _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
-        _ = self.enterContext(patch.object(admission_client, 'report_execution', return_value=wire.DispatchStatus(
+        _ = self.enterContext(patch.object(mac_linux, 'send_guest_execution', return_value=wire.DispatchStatus(
             self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
@@ -795,17 +800,14 @@ fi
         self.assert_guest_clean()
 
     def test_started_guest_reports_once_for_its_placement(self) -> None:
-        reported = Event()
         reports: list[wire.ExecutionReport] = []
 
         def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
             reports.append(request)
-            reported.set()
             return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 
-        with patch.object(admission_client, 'report_execution', report):
+        with patch.object(mac_linux, 'send_guest_execution', report):
             result = self.route()
-            self.assertTrue(reported.wait(2), 'The queue did not receive the start report.')
         self.assertIsInstance(result, GateRun)
         report_row, = reports
         self.assertEqual((report_row.assignment, report_row.claim), (self.placed, self.consumed[0][0].claim))
@@ -815,24 +817,15 @@ fi
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
 
     def test_guest_without_a_start_line_reports_no_execution(self) -> None:
-        with patch.object(admission_client, 'report_execution') as report:
+        with patch.object(mac_linux, 'send_guest_execution') as report:
             result = self.route('disconnect-before-copy')
         self.assertIsInstance(result, mac_linux.GuestNotStarted)
         report.assert_not_called()
 
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
-        finished = Event()
-        report_guest_start = mac_linux.report_guest_start
-
-        def report(armed: mac_linux.ArmedGuestAttempt, dispatch: mac_linux.GuestGateDispatch) -> None:
-            report_guest_start(armed, dispatch)
-            finished.set()
-
         with (redirect_stderr(io.StringIO()) as errors,
-              patch.object(mac_linux, 'report_guest_start', report),
-              patch.object(admission_client, 'report_execution', side_effect=wire.AdmissionUnavailable('fixture refusal'))):
+              patch.object(mac_linux, 'send_guest_execution', side_effect=wire.AdmissionUnavailable('fixture refusal'))):
             result = self.route()
-            self.assertTrue(finished.wait(2), 'The queue report did not finish.')
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed: fixture refusal'), 1)
@@ -841,17 +834,20 @@ fi
         sidecar = self.root / 'placement.cgroup'
         response = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
         with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
-              patch.object(admission_client, 'report_execution', return_value=response)):
+              patch.object(mac_linux, 'send_guest_execution', return_value=response)):
             result = self.route()
         self.assertIsInstance(result, GateRun)
         self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 3))
 
-    def test_stream_reports_start_and_progress_before_the_guest_exits(self) -> None:
-        armed = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture/checkout')
+    def guest_dispatch(self) -> mac_linux.GuestGateDispatch:
         destination = self.placed.destination
         claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
                                                  FIXTURE_CLAIM.claim_id, self.placed.episode, self.placed.attempt)
-        dispatch = mac_linux.GuestGateDispatch(self.placed, claim)
+        return mac_linux.GuestGateDispatch(self.placed, claim)
+
+    def test_stream_reports_start_and_progress_before_the_guest_exits(self) -> None:
+        armed = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture/checkout')
+        dispatch = self.guest_dispatch()
         sidecar = self.root / 'placement.cgroup'
         publish_counter = progress_profile.publish_counter
         reports: list[wire.ExecutionReport] = []
@@ -869,23 +865,95 @@ fi
                     caller.sendall(b'd')
 
             start = mac_linux.run_start_line(armed.attempt)
+            records = '\n'.join(mac_linux.GUEST_PROGRESS + json.dumps(line) for line in (
+                'Runner: 3 modules, whole machine, 2 CPUs', 'first exit=0 seconds=0.1', 'second exit=0 seconds=0.1'))
             program = ('import os, sys; fd = int(sys.argv[1]); '
                        + 'print("mac-linux run start wrong-attempt", file=sys.stderr, flush=True); '
                        + f'print({start!r}, file=sys.stderr, flush=True); '
                        + 'assert os.read(fd, 1) == b"s"; '
                        + f'print({start!r}, file=sys.stderr, flush=True); '
-                       + 'print("Runner: 3 modules, whole machine, 2 CPUs", file=sys.stderr); '
-                       + 'print("first exit=0 seconds=0.1", file=sys.stderr); '
-                       + 'print("second exit=0 seconds=0.1", file=sys.stderr, flush=True); '
+                       + f'print({records!r}, flush=True); '
                        + 'assert os.read(fd, 1) == b"d"; print("reply")')
             command = [sys.executable, '-c', program, str(guest.fileno())]
             with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
-                  patch.object(admission_client, 'report_execution', report),
+                  patch.object(mac_linux, 'send_guest_execution', report),
                   patch.object(progress_profile, 'publish_counter', publish)):
                 result = mac_linux.stream_guest_bundle(self.repo, command, b'', 5, guest.fileno(), armed, dispatch)
         self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
         self.assertEqual(len(reports), 1)
         self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 3))
+
+    def test_guest_ignores_progress_lines_in_module_stderr(self) -> None:
+        sidecar = self.root / 'placement.cgroup'
+        start = mac_linux.run_start_line('stream-attempt')
+        diagnostics = (start + '\nRunner: 1 modules, whole machine, 2 CPUs\nfake exit=0 seconds=0.1\n'
+                       + 'Runner: ' + '9' * 5000 + ' modules, whole machine, 2 CPUs\n').encode()
+        record = mac_linux.GUEST_PROGRESS + json.dumps('Runner: 3 modules, whole machine, 2 CPUs')
+        program = f'import sys; sys.stderr.buffer.write({diagnostics!r}); print({record!r}); print("reply")'
+        result = self.run_guest_stream(program, sidecar)
+        self.assertEqual((result.stdout, result.stderr), (b'reply\n', diagnostics))
+        self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 0, 3))
+
+    def test_guest_progress_parses_each_record_once(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        sidecar = self.root / 'placement.cgroup'
+        records = ('Runner: 4 modules, whole machine, 2 CPUs', 'first exit=0 seconds=0.1',
+                   'second exit=0 seconds=0.1', 'first exit=0 seconds=0.1')
+        stream = '\n'.join(mac_linux.GUEST_PROGRESS + json.dumps(record) for record in records)
+        start = mac_linux.run_start_line('stream-attempt')
+        program = f'import sys; print({start!r}, file=sys.stderr); print({stream!r}); print("reply")'
+        observe = cloud_gate.ModuleProgress.observe
+        observed: list[str] = []
+
+        def record_progress(progress: cloud_gate.ModuleProgress, line: str) -> None:
+            observed.append(line)
+            observe(progress, line)
+
+        with patch.object(cloud_gate.ModuleProgress, 'observe', record_progress):
+            result = self.run_guest_stream(program, sidecar)
+        self.assertEqual(result.stdout, b'reply\n')
+        self.assertEqual(observed, list(records))
+        self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 4))
+
+    def test_stream_collects_the_report_timeout_before_returning(self) -> None:
+        timeout = 0.2
+        _ = (self.root / 'config/build_admission.conf').write_text(
+            f'# range: 0.01..\nquery_timeout_seconds={timeout}\n', encoding='utf-8')
+        start = mac_linux.run_start_line('stream-attempt')
+        program = f'import sys; print({start!r}, file=sys.stderr); print("reply")'
+        address = str(self.root / 'report.sock')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as queue:
+            queue.bind(address)
+            queue.listen()
+            queue.settimeout(1)
+            with (patch.dict(os.environ, {'ADMISSION_SOCKET': address}),
+                  patch.object(mac_linux, 'send_guest_execution', side_effect=send_guest_execution),
+                  redirect_stderr(io.StringIO()) as errors):
+                result = self.run_guest_stream(program, self.root / 'placement.cgroup')
+            warning = f'Mac Linux guest queue report failed: no answer in {timeout:g} s'
+            self.assertEqual(errors.getvalue().count(warning), 1, errors.getvalue())
+            connection = queue.accept()[0]
+            with connection, connection.makefile('rb') as request_file:
+                report = wire.parse_request(request_file.readline())
+        self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
+        self.assertIsInstance(report, wire.ExecutionReport)
+
+    def test_stream_timeout_preserves_stderr_already_read(self) -> None:
+        diagnostic = b'diagnostic: \xff\r\n'
+        program = f'import signal, sys; sys.stderr.buffer.write({diagnostic!r}); sys.stderr.flush(); signal.pause()'
+        with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'diagnostic:') as caught:
+            _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=2)
+        reason = caught.exception.__cause__
+        assert isinstance(reason, subprocess.TimeoutExpired)
+        self.assertEqual(reason.stderr, diagnostic)
+
+    def run_guest_stream(self, program: str, sidecar: Path, timeout: int = 5) -> subprocess.CompletedProcess[bytes]:
+        armed = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture/checkout')
+        with (mac_linux.guest_link() as link,
+              patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)})):
+            return mac_linux.stream_guest_bundle(self.repo, [sys.executable, '-c', program], b'', timeout,
+                                                 link, armed, self.guest_dispatch())
 
     def test_stream_preserves_stdout_and_all_stderr_bytes(self) -> None:
         output = b'reply\n' * 16000
@@ -895,10 +963,7 @@ fi
                    + 'sys.stderr.buffer.write(b"first\\r\\ninvalid byte: \\xff\\n" * 5000 + b"last"); '
                    + 'assert sys.stdin.buffer.read() == b"x" * 100000')
         armed = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture/checkout')
-        destination = self.placed.destination
-        claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
-                                                 FIXTURE_CLAIM.claim_id, self.placed.episode, self.placed.attempt)
-        dispatch = mac_linux.GuestGateDispatch(self.placed, claim)
+        dispatch = self.guest_dispatch()
         with mac_linux.guest_link() as link:
             result = mac_linux.stream_guest_bundle(self.repo, [sys.executable, '-c', program], bootstrap, 5,
                                                    link, armed, dispatch)

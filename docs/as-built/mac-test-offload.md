@@ -36,13 +36,19 @@ The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
 The caller reads guest standard error while the run is active and keeps all its bytes for the result.
 The start line for the current guest attempt triggers one execution report for its queue assignment.
-A report failure prints a warning and leaves the guest run active.
+The report uses the queue query timeout.
+The caller collects the report before it returns.
+A report failure or timeout prints one warning and leaves the guest run active.
 If the placement caller supplies `BUILDLOG_PLACEMENT_SIDECAR`, it names the placement request's progress sidecar.
-The route publishes the module count there when the guest log shows a change.
+The guest sends runner records on the reply descriptor.
+The route publishes each change to the module count.
+The count excludes type checks.
+Older guest gate code can return its result without sending progress records.
 If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
 The queue can then give the gate to the next named target.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
-Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
+A stream failure reports its status and up to 1200 characters from standard error.
+A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 

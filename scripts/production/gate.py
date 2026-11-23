@@ -211,6 +211,7 @@ class HoldExemptNamedModuleMachine:
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    module_progress: Callable[[str], None] | None = None
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1138,7 +1139,7 @@ def _gate_program_source() -> BinaryIO:
 
 
 # The placement belongs to this gate. A test child can run gate code, so it must not read the placement.
-_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE")
+_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR")
 
 
 def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
@@ -1739,10 +1740,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    module_progress = machine.module_progress if isinstance(machine, WholeMachine) else None
+
+    def print_module_record(line: str) -> None:
+        print(line, flush=True)
+        if module_progress is not None:
+            module_progress(line)
+
     if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
-        print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
+        print_module_record(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs")
     if isinstance(time_limit, gate_record.ReadGateTimeLimit):
         try:
             time_limit = read_time_limit(
@@ -1874,8 +1882,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         print(f"--- {result.suite}/{result.module} exit={result.returncode} ---\n"
                               + failure_log_tail(result.output) + "\n--- end module failure ---", flush=True)
                     if not shared:
-                        print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
-                              + (" stopped" if result.killed_for else ""), flush=True)
+                        print_module_record(f"{result.suite}/{result.module} exit={result.returncode}"
+                                            + f" seconds={result.seconds:.2f}"
+                                            + (" stopped" if result.killed_for else ""))
                     cpu_key = f"{job.suite}/{result.module}"
                     run_cpu[cpu_key] = run_cpu.get(cpu_key, 0.0) + result.cpu_seconds
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and hold is not None and not hold.admits():
