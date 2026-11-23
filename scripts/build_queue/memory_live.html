@@ -246,6 +246,8 @@ td small { color: var(--ink-3); }
 .target-head .machine { font-weight: 600; }
 .target-state { padding: 0 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.82rem; font-weight: 600; color: var(--block); }
 .target-state.unavailable { color: var(--cap); }
+/* A kept claim is a leftover, not a block, so it takes the kept mark gray. */
+.target-state.kept { color: var(--ink-3); }
 .target-reason { grid-area: reason; overflow-wrap: anywhere; }
 .target-owner { grid-area: owner; }
 .target-until { grid-area: until; }

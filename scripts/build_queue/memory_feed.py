@@ -898,8 +898,10 @@ def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | Cl
     # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
                 row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
-    if guest := row.get("guest_run"):
-        identity.append(guest["attempt"])
+    if row.get("guest_run") or row.get("guest_unconfirmed"):
+        # The consume time names the guest run. The pid and attempt come with the confirmation,
+        # so they stay out of the key, and an open hover stays when the queue confirms the run.
+        identity = [MAC_LINUX_TARGET, row.get("started_at", 0)]
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 

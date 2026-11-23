@@ -294,7 +294,11 @@ A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launc
 The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
 The page (`guestRow` in `memory_live.html`) shows both in the running table.
-The Machine cell of a guest row shows the bright `mac-linux` icon. The hover of an unconfirmed row shows `Guest attempt  not confirmed`.
+The Machine cell of a guest row shows the bright `mac-linux` icon.
+The hover of an unconfirmed row shows `Guest attempt  not confirmed`.
+`memory_feed.step_key` builds the row key from `mac-linux` and the consume time.
+The key stays the same when the queue confirms the attempt, so the hover stays open.
+The `mac-linux` icon uses the Mac color in light and dark modes.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.
