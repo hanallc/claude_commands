@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
-from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
@@ -105,6 +105,7 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -154,7 +155,8 @@ class GpuTestSlots:
 # These steps run test binaries; a GPU repository's tests open render apps.
 GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
-REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected"})
+# A hand made run counts in the run limit of its machine and repository, as a gate does.
+REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected", HAND_MADE.step})
 RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
 
 
@@ -1164,8 +1166,16 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
+
+
+class ConfirmedGuestRun(TypedDict):
+    """Identify a confirmed Mac Linux attempt in a queue reading."""
+
+    target: Literal["mac-linux"]
+    attempt: str
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1194,9 @@ class RunningStep:
     project: str = ""
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    assignment_target: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1399,6 +1412,8 @@ class QueueInputs:
     run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
     verify_run_owners: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]], kw_only=True)
     verify_slot_requests: Mapping[str, str] = field(default_factory=dict[str, str], kw_only=True)
+    placement_candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = field(
+        default_factory=dict[str, tuple[placement.CandidateEligibility, ...]], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
