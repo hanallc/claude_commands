@@ -1709,10 +1709,19 @@ class LocateTests(HanaShotTest):
         self.assertNotIn("has no tooltip controller", result.stderr)
         self.assertEqual(self.fake.methods("brp_extras/move_mouse")[-1]["position"], [320.0, 180.0])
 
+    def test_hover_shows_an_error_reply_that_comes_after_the_deadline(self) -> None:
+        self.fake.pointer_on_target = True
+        self.fake.tooltips_error_on_target = True
+        deadline = hana_shot.HoverDeadline("name:Tool body", 0.5, time.monotonic() + 0.5)
+        brp = hana_shot.Brp(self.port, hover_deadline=deadline)
+        # The deadline passes while the error reply is on its way.
+        with mock.patch.object(hana_shot.HoverDeadline, "remaining", side_effect=[0.5, deadline.expired()]):
+            with self.assertRaisesRegex(hana_shot.BrpCallError, "tooltips read failed"):
+                _ = brp.components(101, [hana_shot.TOOLTIPS])
+
     def test_hover_deadline_stops_a_pointer_step_when_frames_stall(self) -> None:
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
-        for has_help, code, error in ((True, 1, "help for name:Tool body did not become ready"),
-                                      (False, 2, "has no tooltip controller on the target or its ancestors within 0.5 s")):
+        for has_help in (True, False):
             with self.subTest(has_help=has_help):
                 self.fake.calls.clear()
                 self.fake.tooltip_read_frames.clear()
@@ -1727,8 +1736,9 @@ class LocateTests(HanaShotTest):
 
                 result = self.shot("--mode", "home", "--hover", "name:Tool body")
 
-                self.assertEqual(result.returncode, code, result.stderr)
-                self.assertIn(error, result.stderr)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("help for name:Tool body did not become ready", result.stderr)
+                self.assertNotIn("has no tooltip controller", result.stderr)
                 self.assertEqual(len(self.fake.methods("brp_extras/move_mouse")), 1)
                 self.assertEqual(self.fake.tooltip_read_frames, [])
                 self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])

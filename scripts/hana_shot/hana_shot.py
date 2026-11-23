@@ -1618,8 +1618,9 @@ def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> 
     owner = tooltip_owner(hover_session, target, parents)
     bounds = finish_bounds(bounds_reads, include_outside_fit=(owner.entity,))
     location = locate_target(hover_session, target, state, bounds)
+    # A deadline before the pointer arrives is not a missing help: Hana had no hover to spawn it.
+    move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
     try:
-        move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
         while True:
             # Some help, such as a rear jack's, spawns only while its target is hovered.
             if not owner.controllers:
