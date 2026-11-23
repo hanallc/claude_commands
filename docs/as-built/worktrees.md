@@ -13,6 +13,16 @@ Worktree creation releases its source lease before it prepares the target link a
 
 `worktrees.py remove <path>` reports the checkout and its assigned output.
 Agent shutdown uses the same review helper for a unit checkout.
+
+A change review row's try folder is the worktree `worktrees.py make <repo> <team> try-C<n>`.
+The row's verdict or withdraw calls `remove_named(<team>, "try-C<n>")`.
+An empty Producer cell names the list's showrunner. Only a filled cell reads staff, through `change_routing.producer_row`.
+It finds the try folder through the worktree records on the local machine and sends it to the same review helper.
+A try folder on another machine stays, and its team removes it there.
+It keeps a checkout with uncommitted changes or with commits that are on no remote.
+For a kept checkout it returns one line with the path, the reason and the `worktrees.py remove` command.
+For an error it returns `<path> not removed: <first line of the error>`.
+The removal by hand of a try folder also deletes its branch `<team>-try-C<n>`.
 `worktrees.py retire <unit>` reports each build folder for the unit.
 
 The removal helper releases the source pair after the checkout is absent.

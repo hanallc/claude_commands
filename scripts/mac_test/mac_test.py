@@ -944,6 +944,11 @@ class MacClaimKind(Enum):
     GUEST = "guest"
 
 
+def claim_kind(record: RunRecord) -> MacClaimKind:
+    """Read the claim kind from the claim id. Only a mac-linux guest claim id has the guest prefix."""
+    return MacClaimKind.GUEST if record["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX) else MacClaimKind.MIRROR
+
+
 @dataclass(frozen=True)
 class MacClaimSlotsBusy:
     holders: tuple[HeldClaim, ...]
@@ -1744,7 +1749,7 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     if paths.platform == "macos":
         # The Mac activity probe cannot see guest work. The guest holder releases its claim.
         claims = tuple(claim for claim in claims
-                       if "remote_host" in claim.record or not claim.record["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX))
+                       if "remote_host" in claim.record or claim_kind(claim.record) is MacClaimKind.MIRROR)
     if not claims:
         return False
     if paths.platform == "linux":

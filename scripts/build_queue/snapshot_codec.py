@@ -297,7 +297,9 @@ NATEDEV_HOLD_SUFFIX = "_natedev_hold"
 CARGO_FOLDER_SUFFIX = "_cargo_folder"
 BUILD_SPACE_SUFFIX = "_build_space"
 RUN_LIMIT_SUFFIX = "_run_limit"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, BUILD_SPACE_SUFFIX, RUN_LIMIT_SUFFIX)
+MACHINE_CHOICE_SUFFIX = "_machine_choice"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, BUILD_SPACE_SUFFIX, RUN_LIMIT_SUFFIX,
+                        MACHINE_CHOICE_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -311,7 +313,7 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
     """Write each newer wait as a wait behind the head, with the newer wait beside it.
 
     Clients at 7fdfd9a6a have no GPU slot wait. The CI client pinned at bbc8803f4 has no natedev hold wait,
-    and it refuses its step on a wait that it cannot read.
+    and it refuses its step on a wait that it cannot read. No pinned client has the machine choice wait of a queue row.
     """
     shaped = dict(record)
     for key in wait_reason_fields(schema):
@@ -330,6 +332,8 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
         elif wait.get("kind") in ("BuildSpaceLow", "BuildSpaceUnreadable"):
             head, suffix = "the build space floor", BUILD_SPACE_SUFFIX
+        elif wait.get("kind") == "MachineChoiceWait":
+            head, suffix = "a machine choice", MACHINE_CHOICE_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

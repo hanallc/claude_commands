@@ -13,7 +13,6 @@ import math
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -793,6 +792,7 @@ class AgentsCommand(Protocol):
 class MemberLifecycle(Protocol):
     def detach(self, arguments: list[str], task: str, *, program: Path, log: Path | None = None,
                log_fd: int | None = None) -> Path: ...
+    def notify_ready(self, ready_fd: int | None, *, systemd: bool) -> None: ...
     def stop(self, session: str, *, deadline: float,
              codex: herdr.CodexConversations | None = None) -> StopResult: ...
     def stop_unit_workers(self, unit: staff.StaffId, record: staff.StaffSnapshot, *,
@@ -2361,22 +2361,6 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     return exit_code
 
 
-def _notify_log_claim(ready_fd: int | None, *, systemd: bool) -> None:
-    if ready_fd is not None:
-        try:
-            with suppress(BrokenPipeError):
-                _ = os.write(ready_fd, b"1")
-        finally:
-            os.close(ready_fd)
-    if systemd:
-        address = os.environ.pop("NOTIFY_SOCKET", "")
-        if not address:
-            raise OSError("The systemd readiness socket is unavailable because NOTIFY_SOCKET is missing")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
-            notifier.connect("\0" + address[1:] if address.startswith("@") else address)
-            _ = notifier.send(b"READY=1")
-
-
 def _save_detached_report(log: io.FileIO, result: str) -> None:
     _write_log(log, result)
     os.fsync(log.fileno())
@@ -2521,7 +2505,7 @@ def main() -> int:
 
     def action() -> int:
         try:
-            _notify_log_claim(cast(int | None, options.ready_fd), systemd=cast(bool, options.notify_systemd))
+            stop_resume.notify_ready(cast(int | None, options.ready_fd), systemd=cast(bool, options.notify_systemd))
         except (OSError, ValueError) as error:
             detail = error.strerror if isinstance(error, OSError) else None
             raise DetachedReadinessFailed(

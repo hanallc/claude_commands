@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, tzinfo
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, overload
@@ -504,6 +505,8 @@ class RowQueueNotes(CallNotes):
     mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
     guest_run: NotRequired[ConfirmedGuestRun]
+    # A guest run whose gate consumed its launch permission before the queue confirmed the guest attempt.
+    guest_unconfirmed: NotRequired[Literal[True]]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
@@ -606,13 +609,15 @@ NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
 
 
 def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
-    """Use the placement candidates for a route that names the Mac Linux guest."""
+    """Use the placement candidates for a route that can place the step in the Mac Linux guest."""
     # Older queue readings have no placement candidates.
     recorded: object = getattr(step, "placement_candidates", ())
     if not isinstance(recorded, tuple):
         return None
+    # The service never places a step on a fixed exclusion, so the page does not name it.
     candidates = tuple(row for row in cast(tuple[object, ...], recorded)
-                       if isinstance(row, placement.CandidateEligibility))
+                       if isinstance(row, placement.CandidateEligibility)
+                       and not isinstance(row.eligibility, placement.FixedExclusion))
     guest = tuple(candidate.eligibility for candidate in candidates if candidate.destination.target == MAC_LINUX_TARGET)
     if not guest:
         return None
@@ -639,6 +644,14 @@ def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRu
     if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
         return {"target": MAC_LINUX_TARGET, "attempt": attempt}
     return None
+
+
+def unconfirmed_guest_run(step: admission_records.RunningStep) -> bool:
+    """Tell whether a guest gate holds its consumed launch permission and the queue has not confirmed the attempt.
+
+    The queue sets started_at of a remote step from the consume time, so a consumed permission gives a start time.
+    """
+    return step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0 and confirmed_guest_run(step) is None
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -880,8 +893,10 @@ def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | Cl
     # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
                 row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
-    if guest := row.get("guest_run"):
-        identity.append(guest["attempt"])
+    if row.get("guest_run") or row.get("guest_unconfirmed"):
+        # The consume time names the guest run. The pid and attempt come with the confirmation,
+        # so they stay out of the key, and an open hover stays when the queue confirms the run.
+        identity = [MAC_LINUX_TARGET, row.get("started_at", 0)]
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
@@ -1006,6 +1021,7 @@ class MemoryWaitRow(WaitRow):
     place: int
     move: NotRequired[admission_records.QueueMoveMember]
     order_note: NotRequired[str]
+    job_start: NotRequired[str]
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -1268,6 +1284,12 @@ def job_age(started_at: float, now: float) -> str:
         return f"{minutes} min"
     hours = minutes // 60
     return f"{hours} h {minutes % 60} min" if hours < 48 else f"{hours // 24} days"
+
+
+def job_start_text(job_start: admission_records.JobStart, now: float, zone: tzinfo) -> str:
+    """Show when the GitHub job of a CI step started, in the user zone, and its age."""
+    started = targets.clock(datetime.fromtimestamp(job_start.started_at, UTC), zone)
+    return f"{started} · {job_age(job_start.started_at, now)} ago"
 
 
 def ci_amount(value: float) -> str:
@@ -1587,9 +1609,11 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-def wait_why(reason: admission_records.WaitReason) -> str:
+def wait_why(reason: admission_records.WaitingStepReason) -> str:
     """Name the resource or queue action that a waiter needs."""
     match reason:
+        case admission_records.MachineChoiceWait():
+            return "machine choice"
         case admission_records.NeedsMemory():
             return "memory"
         case admission_records.BehindHead():
@@ -2935,6 +2959,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
+            unconfirmed = unconfirmed_guest_run(step)
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
@@ -2957,7 +2982,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": guest["target"] if guest else admission_records.execution_host(step, machine),
+                "machine": MAC_LINUX_TARGET if guest or unconfirmed else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(local_job(step), names, step=step.step, verify=step.verify,
@@ -2972,6 +2997,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 remote_row["guest_run"] = guest
                 if step.mac_placement:
                     guest_placements.add(step.mac_placement)
+            elif unconfirmed:
+                remote_row["guest_unconfirmed"] = True
             walk.append(remote_row)
             continue
         service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -3117,6 +3144,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                     ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
+        if isinstance(waiter.ci_job_start, admission_records.JobStart):
+            waiters[place]["job_start"] = job_start_text(waiter.ci_job_start, explanation.now, zone)
         if member is not None:
             waiters[place]["move"] = member
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
