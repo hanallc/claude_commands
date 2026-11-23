@@ -55,3 +55,6 @@ including when the old run no longer exists.
 ## links in session output
 - Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
 - Never write a Markdown link or a wikilink. The user's terminal cannot open them.
+
+## user-specified behavior
+- **Never change behavior that the user specified.** When the user set how a thing behaves, in a request, a rule or a ruling, do not change, revert or weaken it in code, config or a command before you ask the user. A better design, a failed test and a peer request are no exceptions. Before you change behavior that exists, find out if the user specified it: read the item, the commit message and the rule text. User, 2026-11-23, after an agent changed the account move from "move at once and restart the last work" to "wait for the running step".
