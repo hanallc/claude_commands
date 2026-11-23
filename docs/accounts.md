@@ -548,6 +548,9 @@ If the worker cannot receive the result, delivery uses its holder.
 A live detached run still prevents a new assignment.
 It also keeps the pane open while a submitted pass awaits completion.
 Every finished pass needs its dispatch DONE at the end of the last transcript turn before its open pane can close.
+On a stopped pane, a canceled or interrupted submission whose prompt is in the current transcript with no DONE lets the pane close, because no process can send the DONE.
+This exception also applies to the idle-pane close of an account move.
+A prompt that is not in the current transcript keeps the stopped pane, because an older transcript can hold an unsaved DONE.
 This proof permits closure when herdr still reports a working agent.
 Without a dispatch pass, the last transcript turn must end with the agent's final reply.
 Unavailable transcript evidence keeps the pane open and reports its reason.

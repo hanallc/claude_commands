@@ -414,6 +414,10 @@ class PaneReadUnavailable:
     reason: str
 
 
+class PaneReadAtUse(Enum):
+    READ = "read the panes inside the close"
+
+
 def _client() -> herdr.Herdr:
     return herdr.Herdr(herdr.shared_session())
 
@@ -639,6 +643,17 @@ def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnap
         return WorkerNotObserved.CURRENT
     states = observe_selected(parent, record, [WorkerName.parse(current.name)], server=server)
     return next((state for state in states if state.row.id == current.id), WorkerNotObserved.CURRENT)
+
+
+def read_panes(record: staff.StaffSnapshot) -> PaneRead | PaneReadUnavailable:
+    """Read all pane identities once for `observe_in_read` and `close_with_read`."""
+    return _read_panes(record, _client())
+
+
+def observe_in_read(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot, read: PaneRead) -> WorkerPane:
+    """Judge the selected worker from a pane read the caller made."""
+    evidence = _parent_evidence(parent, record, read, _client(), selection=SelectedWorkers(frozenset({row.name})))
+    return next((state for state in evidence.states if state.row.id == row.id), ClosedWorker(row))
 
 
 def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
@@ -936,13 +951,30 @@ class DispatchAwaitsDone:
     """A delivered pass waits on its DONE reply; dispatch still refuses the worker.
 
     `instance_id` is always set: a pass with no instance id is a `DispatchHoldsWorker`.
+    `run` is the launcher run that records the pass.
     """
 
     blocker: str
     instance_id: str
+    run: Path
 
 
 NO_INSTANCE_ID = "the pass has no instance id"
+LAUNCHER_IS_LIVE = "launcher is live"
+
+
+@dataclass(frozen=True)
+class HeldByOtherCheck:
+    """A check other than a DONE wait holds the worker."""
+
+    hold: DispatchHoldsWorker
+
+
+@dataclass(frozen=True)
+class DoneWaits:
+    """No other check holds the worker; `passes` are the open passes that wait on DONE, possibly none."""
+
+    passes: tuple[DispatchAwaitsDone, ...]
 
 
 @dataclass(frozen=True)
@@ -1023,15 +1055,15 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
 def done_wait_passes(row: staff.StaffRow, run: Path, lock: WorkerLockHold, *, detached: RunningDetachedWorkers,
                      record: staff.StaffSnapshot, related_runs: Sequence[Path] = (),
-                     ) -> tuple[DispatchAwaitsDone, ...]:
-    """Return each open pass that waits on DONE; return none when another check holds the worker."""
+                     ) -> HeldByOtherCheck | DoneWaits:
+    """Read every pass check, then give the first other hold or each open pass that waits on DONE."""
     waits: list[DispatchAwaitsDone] = []
     for state in _dispatch_states(row, run, lock, detached, record, related_runs, run_state):
         if isinstance(state, DispatchHoldsWorker):
-            return ()
+            return HeldByOtherCheck(state)
         if isinstance(state, DispatchAwaitsDone):
             waits.append(state)
-    return tuple(waits)
+    return DoneWaits(tuple(waits))
 
 
 def _dispatch_states(row: staff.StaffRow, run: Path, lock: WorkerLockHold | WorkerLockAtUse,
@@ -1102,8 +1134,10 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, AwaitsDone):
+            if _launcher_live(passed):
+                return DispatchHoldsWorker(LAUNCHER_IS_LIVE)
             if isinstance(dispatch, str) and dispatch:
-                return DispatchAwaitsDone(hold.blocker, dispatch)
+                return DispatchAwaitsDone(hold.blocker, dispatch, run)
             return DispatchHoldsWorker(NO_INSTANCE_ID)
         if isinstance(hold, Kept):
             return DispatchHoldsWorker(hold.blocker)
@@ -1114,20 +1148,24 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             return ReleasedWorkerPass.ENDED
         return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "active":
-        pid, command = passed.get("launcher_pid"), passed.get("launcher_command")
-        if isinstance(pid, int) and isinstance(command, list):
-            parts = cast(list[object], command)
-            if len(parts) > 1 and all(isinstance(part, str) for part in parts):
-                saved = cast(list[str], parts)
-                launcher = [str(Path(saved[1]).with_suffix(".py")), *saved[2:]]
-                if detached_run_process.runs_command(pid, launcher):
-                    return DispatchHoldsWorker("launcher is live")
-        return ReleasedWorkerPass.STALE_ACTIVE
+        return DispatchHoldsWorker(LAUNCHER_IS_LIVE) if _launcher_live(passed) else ReleasedWorkerPass.STALE_ACTIVE
     if status in ("", "error", "refused"):
         return ReleasedWorkerPass.NO_PROMPT_DELIVERED
     if status in ("canceled", "interrupted"):
         return ReleasedWorkerPass.ENDED
     return DispatchHoldsWorker("launcher has not recorded a completed pass")
+
+
+def _launcher_live(passed: dict[str, object]) -> bool:
+    """Tell whether the saved launcher process of the pass still runs its saved command."""
+    pid, command = passed.get("launcher_pid"), passed.get("launcher_command")
+    if not isinstance(pid, int) or not isinstance(command, list):
+        return False
+    parts = cast(list[object], command)
+    if len(parts) < 2 or not all(isinstance(part, str) for part in parts):
+        return False
+    saved = cast(list[str], parts)
+    return detached_run_process.runs_command(pid, [str(Path(saved[1]).with_suffix(".py")), *saved[2:]])
 
 
 def _idle_checks(row: staff.StaffRow, run: Path,
@@ -1858,9 +1896,20 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
-@herdr.pane_evidence_run()
 def close(parent: StaffId, name: WorkerName, *,
           lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
+    return _close(parent, name, lock, PaneReadAtUse.READ)
+
+
+def close_with_read(parent: StaffId, name: WorkerName, read: PaneRead | PaneReadUnavailable, *,
+                    lock: WorkerLockHold) -> Closed | Kept | UncertainWorker:
+    """Close with a pane read the caller made under this worker lock, so the close reads no pane again."""
+    return _close(parent, name, lock, read)
+
+
+@herdr.pane_evidence_run()
+def _close(parent: StaffId, name: WorkerName, lock: WorkerLockHold | WorkerLockAtUse,
+           panes: PaneRead | PaneReadUnavailable | PaneReadAtUse) -> Closed | Kept | UncertainWorker:
     with ExitStack() as operations:
         held = operations.enter_context(worker_lock(parent, name, blocking=True)) if isinstance(lock, WorkerLockAtUse) else lock
         if isinstance(held, Kept):
@@ -1869,10 +1918,11 @@ def close(parent: StaffId, name: WorkerName, *,
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         if row is None:
-            _layout(parent, _evidence(parent, record, client))
+            read = _read_panes(record, client) if isinstance(panes, PaneReadAtUse) else panes
+            _layout(parent, _parent_evidence(parent, record, read, client))
             return Closed()
         with staff.row_operation(str(row.id)):
-            read = _read_panes(record, client)
+            read = _read_panes(record, client) if isinstance(panes, PaneReadAtUse) else panes
             if isinstance(read, PaneReadUnavailable):
                 return _uncertain(row, read.reason)
             evidence = _parent_evidence(parent, record, read, client,

@@ -5052,27 +5052,114 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.pass_status(name), "active")
         self.assertEqual(staff.by_id(row.id), row)
 
-    def test_end_cancels_no_pass_when_an_older_pass_in_another_run_holds(self) -> None:
-        name = "impl-two-runs"
-        row = self.submitted_without_done(name, "stopped")
-        other_run = self.fixture.root / "private" / "older-pass"
+    def older_pass_in_other_run(self, row: staff.StaffRow, name: str, *, delivered: bool) -> Path:
+        """Record an older active pass of the worker in another launcher run and return that run's state file.
+
+        With `delivered`, the older pass has the delivery of the newest pass, so it waits on the same DONE.
+        """
+        other_run = self.fixture.root / "private" / f"older-{name}"
         saved = cast(dict[str, object], json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))
         saved.update({"pass": {}, "history_file": str(other_run / "history.jsonl")})
         atomic_file.write_text_atomic(other_run / unit_runs.STATE_FILE, json.dumps(saved))
         _ = progress_history.begin_dispatch(other_run, slot="older-slot", phase="8", role="impl", worker_name=row.name,
             worker_id=row.id, launcher_command=["assign.sh", "impl"], prompt=self.prompt, kind="impl", lens="")
-        newer = cast(dict[str, dict[str, dict[str, object]]],
-                     json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))["pass"][name]["started_at"]
-        assert isinstance(newer, (int, float))
+        newest = cast(dict[str, dict[str, dict[str, object]]],
+                      json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))["pass"][name]
+        started_at = newest["started_at"]
+        assert isinstance(started_at, (int, float))
         older_path = other_run / unit_runs.STATE_FILE
         fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(older_path.read_text()))
-        fields["pass"]["older-slot"]["started_at"] = newer - 60
+        fields["pass"]["older-slot"]["started_at"] = started_at - 60
+        if delivered:
+            fields["pass"]["older-slot"]["delivery"] = newest["delivery"]
         atomic_file.write_text_atomic(older_path, json.dumps(fields))
+        return older_path
+
+    @staticmethod
+    def older_status(older_path: Path) -> object:
+        return cast(dict[str, dict[str, dict[str, object]]], json.loads(older_path.read_text()))["pass"]["older-slot"]["status"]
+
+    def set_pass_status(self, name: str, status: str) -> None:
+        path = self.run_dir / unit_runs.STATE_FILE
+        fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+        fields["pass"][name]["status"] = status
+        atomic_file.write_text_atomic(path, json.dumps(fields))
+
+    def test_end_cancels_no_pass_when_an_older_pass_in_another_run_holds(self) -> None:
+        name = "impl-two-runs"
+        row = self.submitted_without_done(name, "stopped")
+        older_path = self.older_pass_in_other_run(row, name, delivered=False)
         with patch.object(detached_run_process, "runs_command", return_value=True):
             _ = self.end_kept(name)
-        older = cast(dict[str, dict[str, dict[str, object]]], json.loads(older_path.read_text()))
-        self.assertEqual((self.pass_status(name), older["pass"]["older-slot"]["status"]), ("active", "active"))
+        self.assertEqual((self.pass_status(name), self.older_status(older_path)), ("active", "active"))
         self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_cancels_done_waits_in_two_launcher_runs_and_retires_the_row(self) -> None:
+        name = "impl-two-waits"
+        row = self.submitted_without_done(name, "stopped")
+        older_path = self.older_pass_in_other_run(row, name, delivered=True)
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual((self.pass_status(name), self.older_status(older_path)), ("canceled", "canceled"))
+
+    def test_end_cancels_an_older_done_wait_behind_a_completed_newest_pass(self) -> None:
+        name = "impl-older-wait"
+        row = self.submitted_without_done(name, "closed")
+        older_path = self.older_pass_in_other_run(row, name, delivered=True)
+        self.set_pass_status(name, "completed")
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual((self.pass_status(name), self.older_status(older_path)), ("completed", "canceled"))
+
+    def test_end_keeps_a_stopped_worker_whose_done_wait_has_a_live_launcher(self) -> None:
+        name = "impl-live-launcher"
+        row = self.submitted_without_done(name, "stopped")
+        path = self.run_dir / unit_runs.STATE_FILE
+        fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+        fields["pass"][name].update(launcher_pid=os.getpid(), launcher_command=["assign.sh", "impl"])
+        atomic_file.write_text_atomic(path, json.dumps(fields))
+        with patch.object(detached_run_process, "runs_command", return_value=True):
+            self.assertIn(worker_panes.LAUNCHER_IS_LIVE, self.end_kept(name))
+        self.assertEqual(self.pass_status(name), "active")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_names_each_canceled_pass_when_the_close_is_uncertain(self) -> None:
+        name = "impl-uncertain-close"
+        row = self.submitted_without_done(name, "stopped")
+        fields = cast(dict[str, dict[str, dict[str, object]]],
+                      json.loads((self.run_dir / unit_runs.STATE_FILE).read_text()))
+        instance = fields["pass"][name]["instance_id"]
+        assert isinstance(instance, str) and instance
+        with (patch.object(worker_panes, "close_with_read",
+                           return_value=worker_panes.UncertainWorker(row, "pane close is incomplete")),
+              redirect_stderr(io.StringIO()) as errors):
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        self.assertIs(code, worker.ExitCode.UNCERTAIN)
+        anomaly = [line for line in errors.getvalue().splitlines() if "canceled the passes that waited on DONE" in line]
+        self.assertEqual(len(anomaly), 1, errors.getvalue())
+        self.assertIn(instance, anomaly[0])
+        self.assertIn(self.run_dir.name, anomaly[0])
+        self.assertEqual(self.pass_status(name), "canceled")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_end_retires_a_closed_worker_with_an_old_shape_run_state_and_reports_it(self) -> None:
+        name = "impl-old-shape"
+        row = self.submitted_without_done(name, "closed")
+        path = self.run_dir / unit_runs.STATE_FILE
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["phase_last_percent"] = {}
+        atomic_file.write_text_atomic(path, json.dumps(fields))
+        with redirect_stderr(io.StringIO()) as errors:
+            code = worker.end(self.fixture.parent.id, staff.WorkerName.parse(name))
+        self.assertIs(code, worker.ExitCode.OK, errors.getvalue())
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertIn("anomaly:", errors.getvalue())
+        self.assertIn("old shape", errors.getvalue())
+        self.assertEqual(self.pass_status(name), "active")
 
     def test_end_retires_a_closed_worker_with_a_live_detached_run_and_keeps_its_pass(self) -> None:
         name = "impl-closed-detached"

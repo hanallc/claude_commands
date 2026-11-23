@@ -978,16 +978,20 @@ Daemon sessions retain their `codex:<thread>` route.
 Unit retirement stops workers through the pane worker path.
 DONE closure preserves worker rows and conversations.
 Run cleanup selects workers from its dispatch records and calls `worker.py end` for each selected member.
-`worker.py end` first observes the worker pane.
-For a stopped or closed worker, it reads the worker lock, the live detached runs, the newest pass and every older open pass in the worker's launcher runs.
-A pass waits on DONE when the current transcript shows its delivered prompt with no DONE, the pass has an instance id and no detached result is pending.
-When every hold is such a DONE wait, `end` cancels exactly those passes with `progress_history.cancel_worker_pass_instances`.
-When any other check holds the worker, `end` cancels no pass.
+`worker.py end` reads the panes once and observes the worker pane from that read.
+The close in `end` uses the same read through `worker_panes.close_with_read`.
+For a stopped or closed worker, it reads the worker lock, the live detached runs, the newest pass and every older active pass in the worker's launcher runs.
+A pass waits on DONE when the current transcript shows its delivered prompt with no DONE, the pass has an instance id, its launcher is not live and no detached result is pending.
+`worker_panes.done_wait_passes` reads every pass check before `end` writes.
+It gives `HeldByOtherCheck` for the first other hold, else `DoneWaits` with each pass that waits on DONE.
+For `DoneWaits`, `end` cancels each of those passes in its own run with `progress_history.cancel_worker_pass_instances`.
+For `HeldByOtherCheck`, `end` cancels no pass.
+A failed read prints one anomaly line, cancels no pass, and `end` continues to the close.
 Any other hold keeps the pass, for example:
 - the worker lock;
 - a live launcher, or a launcher with no completed pass;
 - a live or unreadable detached run, or a pending detached result;
-- unavailable completion evidence, or a dispatch-state read anomaly;
+- unavailable completion evidence, a dispatch-state read anomaly, or an old-shape run state;
 - a prompt that is not in the current transcript, because an older transcript can hold an unsaved DONE;
 - a pass with no instance id, with the blocker "the pass has no instance id";
 - a DONE with an unsaved reply.
@@ -995,6 +999,8 @@ Any other hold keeps the pass, for example:
 `end` then closes the pane and retires the row, as for any other worker.
 For a stopped worker, the close check refuses each remaining hold: `end` prints the blocker, exits 7 and leaves the pass active.
 A closed worker has no pane to close, so `end` runs no close check: it exits 0 and retires the row, and a remaining pass stays active.
+When `end` cancels a pass and then does not exit 0, it prints one anomaly line that names each canceled instance id and its run.
+A later restore does not resume a canceled pass, so this line is the only record of that lost work.
 `remove_workers.py` resolves the selected staff member before it calls the worker command.
 Shutdown keeps saved Claude child launcher commands in `ClaudeChildResume`.
 Pane worker resume messages keep the fixed staff id and dispatch id.

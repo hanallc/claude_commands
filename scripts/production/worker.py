@@ -1105,7 +1105,8 @@ def _worker_dispatch_state(row: staff.StaffRow, record: staff.StaffSnapshot, det
         return worker_panes.DispatchHoldsWorker(_dispatch_anomaly(row, error))
 
 
-def _dispatch_anomaly(row: staff.StaffRow, error: OSError | ValueError) -> str:
+def _dispatch_anomaly(row: staff.StaffRow, error: OSError | ValueError | SystemExit | recorder_state.OldRecorderState
+                      ) -> str:
     """Report an unreadable dispatch state once and return its one-line detail."""
     detail = " ".join(str(error).splitlines())
     unit_runs.report_anomaly(f"anomaly: {row.name}: {detail}")
@@ -1373,40 +1374,63 @@ def end(parent: StaffId, name: WorkerName, *,
         row = worker_admission.find_worker(record, parent, name.value)
         if row is None:
             return ExitCode.OK
-        _cancel_passes_without_done(parent, row, record, hold)
-        result = worker_panes.close(parent, name, lock=hold)
-        if isinstance(result, worker_panes.Kept):
-            print(result.blocker, file=sys.stderr)
-            return ExitCode.KEPT
-        if isinstance(result, worker_panes.UncertainWorker):
-            return ExitCode.UNCERTAIN
-        if retire:
-            _ = staff.retire(row.id)
-        return ExitCode.OK
+        panes = worker_panes.read_panes(record)
+        canceled = _cancel_passes_without_done(parent, row, record, hold, panes)
+        code = _close_and_retire(parent, name, row, hold, panes, retire=retire)
+        if canceled and code is not ExitCode.OK:
+            # A later restore does not resume a canceled pass, so name each one.
+            passes = "; ".join(f"{wait.instance_id} in {wait.run}" for wait in canceled)
+            unit_runs.report_anomaly(f"anomaly: {row.name}: end canceled the passes that waited on DONE "
+                                     + f"and kept the worker: {passes}")
+        return code
+
+
+def _close_and_retire(parent: StaffId, name: WorkerName, row: staff.StaffRow, hold: worker_panes.WorkerLockHold,
+                      panes: worker_panes.PaneRead | worker_panes.PaneReadUnavailable, *, retire: bool) -> ExitCode:
+    result = worker_panes.close_with_read(parent, name, panes, lock=hold)
+    if isinstance(result, worker_panes.Kept):
+        print(result.blocker, file=sys.stderr)
+        return ExitCode.KEPT
+    if isinstance(result, worker_panes.UncertainWorker):
+        return ExitCode.UNCERTAIN
+    if retire:
+        _ = staff.retire(row.id)
+    return ExitCode.OK
 
 
 def _cancel_passes_without_done(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnapshot,
-                                lock: worker_panes.WorkerLockHold) -> None:
+                                lock: worker_panes.WorkerLockHold,
+                                panes: worker_panes.PaneRead | worker_panes.PaneReadUnavailable,
+                                ) -> tuple[worker_panes.DispatchAwaitsDone, ...]:
     """Cancel the passes of a stopped or closed worker that wait on a DONE no process can send.
 
-    Cancel no pass when another check holds any open pass of the worker.
+    Read every pass check before the first write. Cancel no pass when another check holds the worker
+    or when a read fails. Return the canceled passes.
     """
-    observed = worker_panes.observe_worker(parent, row, record)
+    if isinstance(panes, worker_panes.PaneReadUnavailable):
+        return ()
+    with worker_panes.defer_worker_anomalies():
+        # The close judges the same read and reports its anomalies.
+        observed = worker_panes.observe_in_read(parent, row, record, panes)
     if not isinstance(observed, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
-        return
-    rows = tuple(item for item in record.rows if item.kind != "worker" or item.reports_to(parent))
-    directories = worker_panes.worker_run_directories(replace(record, rows=rows))
-    detached = _worker_detached_work(record, directories, (row.id,))
-    runs = detached.launcher_runs.by_worker[row.id]
+        return ()
+    canceled: list[worker_panes.DispatchAwaitsDone] = []
     try:
-        waits = worker_panes.done_wait_passes(row, runs[0], lock, detached=detached, record=record, related_runs=runs[1:])
-    except (OSError, ValueError) as error:
+        rows = tuple(item for item in record.rows if item.kind != "worker" or item.reports_to(parent))
+        directories = worker_panes.worker_run_directories(replace(record, rows=rows))
+        detached = _worker_detached_work(record, directories, (row.id,))
+        runs = detached.launcher_runs.by_worker[row.id]
+        waits = worker_panes.done_wait_passes(row, runs[0], lock, detached=detached, record=record,
+                                              related_runs=runs[1:])
+        if isinstance(waits, worker_panes.DoneWaits):
+            for run in dict.fromkeys(wait.run for wait in waits.passes):
+                in_run = tuple(wait for wait in waits.passes if wait.run == run)
+                _ = progress_history.cancel_worker_pass_instances(
+                    run, row.id, frozenset(wait.instance_id for wait in in_run))
+                canceled.extend(in_run)
+    except (OSError, ValueError, SystemExit, recorder_state.OldRecorderState) as error:
         _ = _dispatch_anomaly(row, error)
-        return
-    instances = frozenset(wait.instance_id for wait in waits)
-    if instances:
-        for run in runs:
-            _ = progress_history.cancel_worker_pass_instances(run, row.id, instances)
+    return tuple(canceled)
 
 
 def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
