@@ -749,10 +749,23 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(copy)],
                            env=self.environment, check=True)
         _ = subprocess.run(["git", "-C", str(copy), "remote", "set-url", "origin", origin], env=self.environment, check=True)
+        # copies.clone makes a task clone as a shared clone too, so a copy of it borrows twice.
+        task = self.root / "scratch" / "clone-task.hana"
+        task_copy = self.root / "task-tmp" / "copies-source" / "source"
+        _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(source), str(task)],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(task), "remote", "set-url", "origin", origin], env=self.environment, check=True)
+        _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(task), str(task_copy)],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(task_copy), "remote", "set-url", "origin", origin],
+                           env=self.environment, check=True)
         expected = claim_state.mac_repository_identity(str(source))
-        mirror = claim_state.mac_repository_identity(str(copy))
-        assert isinstance(expected, claim_state.MacMirrorIdentity) and isinstance(mirror, claim_state.MacMirrorIdentity)
-        self.assertEqual((mirror.mirror_name, mirror.key), ("hana", expected.key))
+        assert isinstance(expected, claim_state.MacMirrorIdentity)
+        for checkout in (copy, task, task_copy):
+            with self.subTest(checkout=checkout.relative_to(self.root)):
+                mirror = claim_state.mac_repository_identity(str(checkout))
+                assert isinstance(mirror, claim_state.MacMirrorIdentity)
+                self.assertEqual((mirror.mirror_name, mirror.key), ("hana", expected.key))
 
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)
