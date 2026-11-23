@@ -162,7 +162,9 @@ class RecordTests(unittest.TestCase):
         self.repo = self.base / "hana"
         _ = shutil.copytree(cls.repository_seed, self.repo)
         _ = self.admission
-        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+        # The admission thread reads os.environ from now on. A patch.dict exit empties os.environ for a moment,
+        # and the thread then reads the live builds.slice. The first patch.dict above restores this value.
+        os.environ["USER_ZONE"] = "America/Los_Angeles"
 
     @cached_property
     def admission(self) -> AdmissionFixture:
