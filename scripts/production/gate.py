@@ -3130,7 +3130,7 @@ class MacLinuxAssignment:
     assignment: placement.PlacementAssignment
 
 
-# The target name of a checked placement. A guest placement keeps its assignment.
+# The checked target of a gate: a target name, the checked guest assignment, or no assignment.
 GateTarget = str | MacLinuxAssignment | NoGateAssignment
 
 

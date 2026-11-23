@@ -1533,6 +1533,33 @@ class PlacementTests(unittest.TestCase):
             granted, = consume_guest_permission(fixture, assignment, gate_process)
             self.assertIsInstance(granted, wire.FirstAuthorization)
 
+    def test_a_holder_the_fresh_read_does_not_confirm_keeps_the_guest_permission(self) -> None:
+        # The last system reading shows the holder pid with the start time of an earlier process.
+        # The fresh read then refuses a holder that is not a descendant or that states a start that is not live.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        cases = (("not a descendant", False, None), ("not the live start", True, "not-the-live-start"))
+        for case, descendant, stated_start in cases:
+            with self.subTest(case), PlacementFixture() as fixture:
+                request = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                gate_process = guest_gate(fixture, assignment)
+                write_process(fixture.proc.path, gate_process.pid, parent=1, start="earlier-process")
+                _ = fixture.run_pass()
+                reading = fixture.server.system_evidence
+                assert isinstance(reading, service.SystemEvidence)
+                self.assertEqual(reading.processes[gate_process.pid].start, "earlier-process")
+                parent = assignment.owner.pid if descendant else 1
+                write_process(fixture.proc.path, gate_process.pid, parent=parent, start=gate_process.start_time)
+                fixture.server.system_reader = FixedSystemReader(reading)
+                holder = wire.Owner(gate_process.pid, stated_start or gate_process.start_time)
+                refused, = consume_guest_permission(fixture, assignment, holder)
+                assert isinstance(refused, wire.DispatchStatus), refused
+                self.assertEqual(refused.reason, "claim holder is not a live coordinator descendant")
+                self.assertEqual(refused.state, placement.CurrentAssignment())
+                self.assertEqual(refused.permission, placement.PermissionAvailable())
+
     def test_a_guest_consume_without_the_held_claim_keeps_the_permission(self) -> None:
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)

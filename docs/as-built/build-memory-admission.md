@@ -213,7 +213,7 @@ The coordinator remains separate from its offload child.
 The service checks the local process tree before it accepts that child as the holder.
 When the last system reading does not show the holder, the service reads the local processes again for this check.
 It does the same when the reading shows the holder pid with another start time.
-This read of the full process table costs about 16 to 19 ms with about 1300 processes, once for each guest consume.
+This read of the full process table costs about 16 to 19 ms with about 1300 processes, at most once for each consume, when the last reading does not show the holder with its start time.
 For a `mac-linux` assignment, the guest probe reports no claims.
 The service accepts the consume when the holder holds the named claim in the local Mac claim state (`mac_run.claim_held`).
 Cleanup takeover supplies no launch authority.
