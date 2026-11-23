@@ -67,7 +67,10 @@ GIT_IDENTITY = {
 
 
 def vault_fixture_environment(folder: Path) -> dict[str, str]:
-    """The caller's environment without its GIT_* variables, with a private Git configuration."""
+    """Return the caller's environment without its GIT_* variables.
+
+    Add a private Git configuration with merge.ff=only, and the fixture identity.
+    """
     environment = fixture_git_environment(folder)
     # Both live machines set merge.ff=only; the fixture keeps the same rule.
     with Path(environment["GIT_CONFIG_GLOBAL"]).open("a", encoding="utf-8") as config:
@@ -296,11 +299,16 @@ class VaultPullTests(unittest.TestCase):
         folder = self.folder / "caller"
         folder.mkdir()
         caller = {"GIT_INDEX_FILE": str(folder / "index"), "GIT_DIR": str(folder / "repository.git")}
+        probe = VaultPullTests("test_a_mac_with_no_edits_fast_forwards_without_a_merge_commit")
         with mock.patch.dict(os.environ, caller):
-            environment = vault_fixture_environment(folder)
-        self.assertFalse(set(caller) & set(environment))
-        self.assertIn("ff = only", Path(environment["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8"))
-        self.assertFalse(set(caller) & set(os.environ))
+            probe.setUp()
+            try:
+                self.assertFalse(set(caller) & set(os.environ))
+                self.assertIn("ff = only", Path(os.environ["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8"))
+                _ = probe.git(probe.local, "add", "shared.md")
+            finally:
+                probe.doCleanups()
+        self.assertFalse((folder / "index").exists())
 
     def test_a_mac_with_no_edits_fast_forwards_without_a_merge_commit(self) -> None:
         local = self.commit(self.local, {"from-natedev.md": "natedev\n"})
