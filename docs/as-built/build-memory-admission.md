@@ -397,7 +397,7 @@ After a restart, the service restores live run places and removes ended run plac
 Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `nateroids: nextest`.
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
-On the Builds page, `rowOwner` in `memory_live.html` makes the small line under each row name. The line is empty when the row name is the owner or starts with `<owner>: `. It shows only a different fact, such as another session.
+On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit, so the row name text shows only in rows without a unit.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
 1. The recorded unit, then the staff unit.
@@ -2267,7 +2267,31 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 
 `queue_evidence.room_text` supplies the saved cap calculation to the Builds page and the memory report.
 The Builds page shows zero room during a shortfall and records the shortfall in the cap explanation.
-The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+On 2026-11-21, Nate asked to “show the showrunner (in its color)” at 19:13.
+At 19:17 he changed the row start to “only show the unit (and the showrunner in small text under)”.
+The Builds page uses the same staff colors in the row and its hover.
+Rows without a unit show their plain name and leave the small text and `Step` empty.
+This includes Build tools, unowned Mac builds, compiler cache, unowned processes, and CI.
+The small text is empty when the showrunner is the same name as the unit.
+`queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
+For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Target`, `vCPU`, and `Tokens`.
+The waiting table uses `#` and `Waiting`, and omits `Tokens`.
+The table has no `Unit` column and no `Slot` column.
+On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
+At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
+On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
+A running row's `Target` cell shows only the machine that runs the step, such as `natedev`, `mac`, `mac-linux`, or `aws`, in the machine's color.
+The feed's `machine` field is the one source for that machine.
+The row hover lists the other machines that the step named, under `Named targets`.
+A waiting row's `Target` cell lists each machine that can take the step, joined by `or`.
+The waiting lists size the `Target` column too, so each list shows on one line; a new list can move the `vCPU` and `Tokens` columns.
+In a tight pane only running rows size the column, and a waiting list breaks between machines, never inside a machine name.
+The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. With no room, the heading ends in an ellipsis and its hover gives the full text.
+`Verify` shows the Rust verify verb when the feed records a Verify call.
+`Step` shows the feed's `title.step`, which uses the build step names from `config/build_steps.conf`.
+The hover shows the starting session under `Caller` and the running row's detail under `Detail`.
+The first line of the name, the progress bar, and the first line of each column share one center line.
+The showrunner and memory amounts stay below that line.
 The first column shows `building` or `testing` from the recorded progress counter.
 A natedev row shows the stage `waiting` while its nextest step waits for test tokens; its `Done` cell shows `—`.
 The row tooltip gives the full reason, `Waiting for jobserver tokens`.
@@ -2284,10 +2308,10 @@ Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
-In a narrow pane the table cuts long unit names to 6rem and narrows its column gaps.
+In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
-The label column is as wide as the widest running label.
-A longer queued name wraps at a space, so only its widest word counts.
+The label column is as wide as the widest running label or the Free row.
+A longer queued name wraps inside that width.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage cell is cut, or the label column is wider than its labels.
@@ -2304,7 +2328,7 @@ The recorded project directory identifies the run; a compiler's crate directory 
 The step name uses the command's package, then the repository when the command has no package.
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
-The Mac row shows the repository on its second label line.
+A Mac row without a unit shows only its name, which starts with the repository. A Mac row with a unit starts with the unit, with the showrunner under it.
 A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
 A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.

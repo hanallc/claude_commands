@@ -566,9 +566,10 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertNotIn("targets", unrelated)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
-        self.assertIn("mac-linux: not enabled", "\n".join(tips["walk"][page["walk"].index(row)]))
-        self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
-            + '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
+        text = "\n".join(tips["walk"][page["walk"].index(row)])
+        self.assertIn("mac-linux: not enabled", text)
+        self.assertIn("Named targets  Mac or natedev or mac-linux or hana-aws", text)
+        self.assertIn('<td class="machine" data-machine="mac">mac</td>', table)
 
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
@@ -610,14 +611,17 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("Guest attempt  guest-attempt", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
 
-    def test_running_gate_table_lists_named_targets_and_marks_the_selected_target(self) -> None:
+    def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
+        # The user, 11-23: a running row shows where it runs; the named targets go in the tooltip.
         page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-        _tips, table = self.render_assignment_table(payload)
-        self.assertIn('<td class="machine" data-machine="natedev or mac-linux or hana-aws">'
-            + '<span class="machine" data-machine="natedev">natedev</span> or '
-            + '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
-            + '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
+        tips, table = self.render_assignment_table(payload)
+        cells = dict(cast(list[tuple[str, str]],
+            re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(re.findall(r'<td class="machine"[^>]*>.*?</td>', cells[str(row.get("key"))], flags=re.S),
+                         ['<td class="machine" data-machine="mac-linux">mac-linux</td>'])
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", "\n".join(tips["walk"][page["walk"].index(row)]))
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
@@ -702,8 +706,9 @@ process.stdout.write(JSON.stringify({
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
-                    unit = str(row["unit"])
-                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
+                    title = cast(memory_feed.QueueRowTitle, row["title"])
+                    step = title["step"] if row["unit"] not in ("", "—") else ""
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":
                         self.assertNotIn("Uses  ", text)
@@ -4573,7 +4578,12 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page = fixture.verify_call_page()
         builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
                                  current_session=staff.StaffId("builder"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
+                                     current_session=staff.StaffId(name))
+                      for name in ("queue", "natest"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit

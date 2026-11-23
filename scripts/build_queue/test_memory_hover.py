@@ -117,37 +117,97 @@ class MemoryHoverTests(unittest.TestCase):
             f"(renderWalk(data), [$('walk').innerHTML, ...{json.dumps(keys)}.map(key => tooltipHtml(key, data))])",
             cast(object, json.loads(memory_feed.page_json(page))), walk=True))
         table = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
-        for (pid, name, caller, title), key, hover in zip(expected, keys, rendered[1:], strict=True):
+        for (pid, name, caller, title), key, hover, row in zip(expected, keys, rendered[1:],
+                (*page["walk"], *page["waiters"]), strict=True):
             with self.subTest(pid=pid):
                 cell = table.find(f".//tr[@data-tip='{key}']/th[@class='step']")
                 chart = table.find(f".//div[@data-tip='{key}']")
                 assert cell is not None and chart is not None
-                self.assertEqual("".join(cell.itertext()), name)
-                self.assertEqual(chart.findtext(".//span[@class='name']"), name)
+                unit = row["unit"] if row["unit"] != "—" and not row.get("ci_label") else ""
+                self.assertEqual("".join(cell.itertext()), row["title"]["step"] if unit else "")
+                self.assertEqual(chart.findtext(".//span[@class='name']"), unit or name)
                 owner = chart.find(".//span[@class='owner']")
                 assert owner is not None
-                self.assertEqual("".join(owner.itertext()), caller)
-                self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+                self.assertEqual("".join(owner.itertext()), row.get("showrunner", "") if unit else "")
+                tip = ElementTree.fromstring(hover)
+                self.assertEqual("".join(tip[0].itertext()), title)
+                if caller:
+                    self.assertEqual(next(tip[index + 1].text for index, field in enumerate(tip)
+                                          if field.text == "Caller"), caller)
 
-    def test_the_second_line_shows_no_owner_that_the_row_name_shows(self) -> None:
-        walk = [{"name": "aws-unit: test affected", "caller": "aws-unit", "queued": True},
-                {"name": "hana CI: nextest", "ci_label": "hana CI · hana-mac-1"},
-                {"kind": "mac-build", "name": "hana: nextest", "showrunner": "hana"},
-                {"kind": "cloud", "name": "held caller", "caller": "held caller"},
-                {"kind": "cloud", "name": "research: nextest", "showrunner": "hana"}]
-        waiters = [{"name": "devtools: cargo check", "caller": "fixture"}]
-        lines = self.page_expression(
-            "[...data.walk.map(row => rowOwner(row)), ...data.waiters.map(row => rowOwner(row, true))]",
-            {"walk": walk, "waiters": waiters})
-        self.assertEqual(lines, ["", "", "", "", "hana", "fixture"])
+    def test_the_small_text_shows_only_a_showrunner_that_differs_from_the_unit(self) -> None:
+        walk = [{"name": "aws-unit: test affected", "unit": "aws-unit", "showrunner": "aws", "caller": "aws-unit",
+                 "queued": True},
+                {"name": "builds: gate", "unit": "builds", "showrunner": "builds", "queued": True},
+                {"name": "hana CI: nextest", "unit": "hana", "showrunner": "hana", "ci_label": "hana CI · hana-mac-1"},
+                {"kind": "mac-build", "name": "hana: nextest", "unit": "—", "showrunner": "hana"},
+                {"kind": "cloud", "name": "held caller", "caller": "held caller"}]
+        lines = self.page_expression("data.walk.map(row => queueRowLabels(row).owner)", {"walk": walk})
+        self.assertEqual(lines, ["aws", "", "", "", ""])
 
-    def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
+    def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
+        # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,
+        # Step comes after Verify, no Unit or Slot column, and a running row's Target is only its machine.
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
-        names = staff_names.StaffNames(staff.StaffSnapshot((unit,)))
+        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        names = staff_names.StaffNames(staff.StaffSnapshot((unit, runner)))
         setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
-        body = str(self.page_expression("(()=>{" + setup + "return rowLabel('Compile', 'builder')+rowLabel('Compile', 'nate');})()", {}, walk=True))
-        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder</span>')
-        self.assertIn('<span class="owner">nate</span>', body)
+        row = {"name": "builder: nextest hana", "unit": "builder", "showrunner": "builds", "caller": "impl3",
+               "queued": True, "started_at": 100, "used": 1, "reserved": 0, "counted": 1, "machine": "natedev",
+               "title": {"unit": "builder", "step": "nextest hana"}, "detail": "building tests",
+               "verify": {"verb": "test", "call": "verify test hana", "step": "nextest", "total": 1, "position": 1}}
+        ci = {"name": "hana CI", "unit": "", "showrunner": "builds", "ci": True, "admitted": True,
+              "ci_label": "hana CI · runner", "ci_runners": [{"state": "busy", "job": "doctests"}],
+              "started_at": 100, "used": 1, "reserved": 0, "counted": 1}
+        guest = {"name": "builder: gate", "unit": "builder", "showrunner": "builds", "queued": True,
+                 "started_at": 100, "used": 1, "reserved": 0, "counted": 1, "machine": "mac-linux",
+                 "guest_run": {"target": "mac-linux", "attempt": "guest-attempt"},
+                 "targets": ["natedev", "mac-linux", "hana-aws"], "runs_on": "natedev or mac-linux or hana-aws",
+                 "title": {"unit": "builder", "step": "gate"}}
+        native = {**guest, "name": "builder: mac gate", "machine": "mac", "guest_run": None,
+                  "targets": ["mac", "natedev", "mac-linux", "hana-aws"], "runs_on": "Mac or natedev or mac-linux or hana-aws"}
+        waiting = {"name": "builder: gate", "unit": "builder", "showrunner": "builds", "caller": "test",
+                   "since": 100, "need": 1, "title": {"unit": "builder", "step": "test affected"},
+                   "targets": ["natedev", "mac-linux", "hana-aws"]}
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [row, ci, guest, native], "waiters": [waiting]}
+        rendered = cast(list[str], self.page_expression("(()=>{" + setup + "renderWalk(data);"
+            + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
+        root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
+        self.assertEqual([cell.text for cell in root.findall(".//thead/tr/th")],
+                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Target", "vCPU", "Tokens"])
+        self.assertEqual([cell.text for cell in root.findall(".//tr[@class='queue-head']/th")],
+                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Target", "vCPU"])
+        self.assertEqual(root.findall(".//*[@class='unit']") + root.findall(".//*[@class='slot']"), [])
+        for key, verify, step in (("row:fixture-run-0", "test", "nextest hana"), ("row:fixture-run-2", "", "gate"),
+                                  ("wait:fixture-wait-0", "", "test affected")):
+            with self.subTest(key=key):
+                chart = root.find(f".//div[@data-tip='{key}']")
+                table = root.find(f".//tr[@data-tip='{key}']")
+                assert chart is not None and table is not None
+                self.assertEqual(chart.findtext(".//span[@class='name']/span[@data-color-text='role.unit-director']"), "builder")
+                self.assertEqual(chart.findtext(".//span[@class='owner']/span[@data-color-text='role.showrunner']"), "builds")
+                self.assertEqual(table.findtext("td[@class='verify']"), verify)
+                self.assertEqual(table.findtext("th[@class='step']/span"), step)
+        for key, machine in (("row:fixture-run-0", "natedev"), ("row:fixture-run-2", "mac-linux"),
+                             ("row:fixture-run-3", "mac")):
+            with self.subTest(key=key):
+                cell = root.find(f".//tr[@data-tip='{key}']/td[@class='machine']")
+                assert cell is not None
+                self.assertEqual((cell.get("data-machine"), "".join(cell.itertext()), list(cell)), (machine, machine, []))
+        waiting_target = root.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
+        assert waiting_target is not None
+        self.assertEqual("".join(waiting_target.itertext()), "natedev or mac-linux or hana-aws")
+        self.assertIn("<dt>Named targets</dt><dd>natedev or mac-linux or hana-aws</dd>", rendered[3])
+        self.assertIn("<dt>Named targets</dt><dd>Mac or natedev or mac-linux or hana-aws</dd>", rendered[4])
+        self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='name']"), "hana CI")
+        self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='owner']"), "")
+        self.assertEqual(root.findtext(".//tr[@data-tip='row:fixture-run-1']/th[@class='step']/span"), "")
+        self.assertNotIn("impl3", rendered[0])
+        self.assertNotIn("building tests", rendered[0])
+        self.assertIn("<dt>Caller</dt><dd>impl3</dd>", rendered[1])
+        self.assertIn("<dt>Detail</dt><dd>building tests</dd>", rendered[1])
+        self.assertIn("<dt>Detail</dt><dd>doctests</dd>", rendered[2])
 
     def role_setup(self) -> str:
         members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
@@ -274,7 +334,8 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual([row.get("class") for row in table_rows],
                                  ["tools", "", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
-                self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "first")
+                self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']//span[@class='name']"), "first")
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "")
 
     def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
         data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
@@ -324,7 +385,7 @@ class MemoryHoverTests(unittest.TestCase):
             row = root.find(f".//tr[@data-tip='{key}']")
             assert row is not None
             self.assertEqual(row.findtext("th[@class='step']/span"), name)
-            self.assertEqual(row.findtext("td[@class='unit']/span"), "builder")
+            self.assertEqual(root.findtext(f".//div[@data-tip='{key}']//span[@class='name']"), "builder")
 
     def test_cargo_and_gate_tooltips_show_a_call_without_verify(self) -> None:
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
@@ -562,7 +623,7 @@ class MemoryHoverTests(unittest.TestCase):
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
         hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", data))
         self.assertEqual(hover[0], "hana CI · runner-1  running")
-        self.assertEqual(hover[1], "Runs on  natedev")
+        self.assertEqual(hover[1], "Detail  idle\nRuns on  natedev")
 
     def test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence(self) -> None:
         for keep_text, queued in (("need 11.3 GiB\nfull need: no matching anonymous profile", True),
@@ -627,11 +688,11 @@ class MemoryHoverTests(unittest.TestCase):
         for waiting in (False, True):
             with self.subTest(waiting=waiting):
                 running: list[dict[str, object]] = [
-                    {"name": "local build", "queued": True, "slot": 2,
+                    {"name": "local build", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                     {"name": "merge gate", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
-                    {"name": "Mac builds", "kind": "cloud", "machine": "mac", "slot": 3,
+                    {"name": "Mac builds", "kind": "cloud", "machine": "mac",
                      "progress": {"kind": "NoProgress"}},
                     {"name": "cloud test", "kind": "cloud", "machine": "aws",
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
@@ -657,32 +718,30 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Verify", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
+                                 ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Target", "vCPU", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
                     assert row is not None
                     self.assertEqual(row[0].get("class"), "place")
                     self.assertEqual(row[0].text, expected)
-                    self.assertEqual(row.findtext("td[@class='slot']"), "2" if index == 0 else "3" if index == 2 else "—")
                     self.assertEqual(row[-1].get("class"), "tokens")
-                    self.assertEqual(row[-2].get("class"), "slot")
-                    self.assertEqual(row[-3].get("class"), "vcpus")
+                    self.assertEqual(row[-2].get("class"), "vcpus")
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
                 self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Step", "Waiting", "Verify", "Unit", "Pid", "Target", "vCPU"])
+                                     ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Target", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")
                         assert row is not None
                         self.assertEqual(row[0].text, expected)
-                        self.assertIsNone(row.find("td[@class='slot']"))
+                        self.assertIsNone(row.find("td[@class='tokens']"))
                 for row in table.findall("./tbody/tr"):
-                    self.assertEqual(len(row), len(headers) - 2 * int(row.get("class", "").startswith(("wait", "queue-head"))))
+                    self.assertEqual(len(row), len(headers) - int(row.get("class", "").startswith(("wait", "queue-head"))))
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
@@ -707,9 +766,8 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(result[1:], ["4.1 of 48.0 GiB taken", 0.125, 3])
                 if rows:
                     self.assertEqual(rows[0][0].text, "—")
-                    ci_unit = rows[0].find("td[@class='unit']/span")
-                    assert ci_unit is not None
-                    self.assertEqual(ci_unit.text, "CI")
+                    self.assertEqual(rows[0].findtext("th[@class='step']/span"), "")
+                    self.assertEqual(chart_rows[0].findtext(".//span[@class='name']"), "hana CI")
 
     def test_mac_row_uses_its_stage_unit_memory_and_aligned_tooltip(self) -> None:
         for stage, expected in (("MacBuilding", "building"), ("MacTesting", "testing"),
@@ -726,10 +784,10 @@ class MemoryHoverTests(unittest.TestCase):
                 metadata = table.find(".//tr[@data-tip='row:fixture-run-0']")
                 assert metadata is not None
                 self.assertEqual(metadata[0].text, expected)
-                unit = metadata.find("td[@class='unit']")
                 vcpus = metadata.find("td[@class='vcpus']")
-                assert unit is not None and vcpus is not None
-                self.assertEqual(unit[0].text, "trunk")
+                assert vcpus is not None
+                self.assertEqual(metadata.findtext("th[@class='step']/span"), "hana nextest")
+                self.assertEqual(table.findtext(".//div[@data-run='fixture-run-0']//span[@class='name']"), "trunk")
                 self.assertEqual(vcpus.text, "12")
                 owner = table.find(".//div[@data-run='fixture-run-0']/span/span[@class='owner']")
                 assert owner is not None
@@ -752,7 +810,7 @@ class MemoryHoverTests(unittest.TestCase):
         assert row is not None
         for column in ("place", "duration", "pid", "vcpus"):
             self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
-        self.assertEqual(row.findtext("td[@class='unit']/span"), "—")
+        self.assertEqual(row.findtext("th[@class='step']/span"), "")
         self.assertEqual(result[1].count("unavailable"), 1)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:

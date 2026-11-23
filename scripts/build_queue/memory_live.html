@@ -278,19 +278,19 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-tokens dl { display: grid; grid-template-columns: repeat(2, max-content); gap: 0 6px; margin: 0; }
 .walk-tokens dt { text-align: left; }
 .walk-tokens dd { margin: 0; text-align: right; }
-.walk { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.walk { --row-line: 20px; --row-inset: 3px; --track-height: 18px; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .walk-chart { margin-right: var(--details); }
 .walk-chart { min-width: 0; position: relative; }
 .walk-chart-head { height: 30px; }
 .walk-bud { position: absolute; top: 30px; bottom: 22px; width: 0; margin-left: -1px; border-left: 3px solid transparent; pointer-events: none; z-index: 1; }
 .walk-bud .cap-part { position: absolute; left: -3px; border-left: 3px solid var(--cap); }
 .wrow, .walk-axis { display: grid; grid-template-columns: var(--amt) minmax(0, 1fr); gap: var(--gap); position: relative; align-items: center; font-size: 0.88rem; text-align: left; }
-.wrow { min-height: 44px; }
+.wrow { min-height: 44px; align-items: start; padding-block: var(--row-inset); }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
-.row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
+.row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; line-height: var(--row-line); }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
-.wrow.wait .row-label .name { white-space: normal; }
+.wrow.wait .row-label .name { white-space: normal; overflow-wrap: anywhere; }
 .wrow:has(.queue-grip) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
@@ -321,7 +321,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
 .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
-.wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
 .queue-title { display: flex; min-width: 0; white-space: nowrap; }
@@ -333,21 +332,23 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
 .walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
 .walk-table tbody tr { height: 44px; }
-.walk-table .step { display: none; }
 .walk-table th, .walk-table td { padding: 3px 12px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
+.walk-table tbody tr:not(.queue-head) > * { vertical-align: top; padding-block: var(--row-inset); line-height: var(--row-line); }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { text-align: right; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
-.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot, .walk-table th.tokens { text-align: left; }
+.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
-/* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
+.walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; }
+/* A waiting step's targets size the Target column (fitWalkDetails). In a tight pane they wrap inside it,
+   and a line breaks only between machines, never inside a name such as hana-aws. */
 .walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
-.walk-table .unit .cell-text { max-width: none; }
+.walk-table .wait-target .machine { white-space: nowrap; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -362,16 +363,12 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-scroll { overflow-x: auto; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
-.walk.measuring .walk-table .unit .cell-text { max-width: none; }
-.walk.measuring .step { display: none; }
-.walk.measuring .walk-table .cell-text { max-width: 8rem; }
-/* A narrow pane cuts long unit names and narrows the column gaps, so the chart keeps its room beside the table. */
-.walk.tight .walk-table .unit .cell-text { max-width: 6rem; }
+/* Narrow the column gaps to keep the chart beside the table. */
 .walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
-.track { position: relative; height: 18px; cursor: help; overflow: hidden; }
+.track { position: relative; height: var(--track-height); margin-top: calc((var(--row-line) - var(--track-height)) / 2); cursor: help; overflow: hidden; }
 .track .bud { position: absolute; top: -5px; bottom: -5px; margin-left: -1px; border-left: 2px dashed var(--cap); pointer-events: none; }
 .track .b { position: absolute; top: 0; bottom: 0; border-radius: 3px; overflow: hidden; display: flex; z-index: 1; transition: left 0.6s ease, width 0.6s ease; }
 .progress-track { position: absolute; left: 0; top: calc(50% - 1px); height: 2px; background: color-mix(in srgb, var(--ink) 20%, transparent); z-index: 0; pointer-events: none; }
@@ -401,7 +398,7 @@ body.queue-unavailable .card { display: none; }
   .gauge .gt { grid-column: 1 / -1; grid-row: 2; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
-  .walk-table table { font-size: 0.78rem; }
+  .wrow, .walk-table table { font-size: 0.78rem; }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
@@ -918,7 +915,12 @@ function stepTooltip(key, data) {
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (unavailable) return [...rows, ...stepFields, ...guestFields, ...namedTargets,
+  const detail = waiting ? '' : visibleDetail(row);
+  const detailFields = detail && detail !== ownerText(row.unit) ? [field('Detail', detail)] : [];
+  if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
+    detailFields.push(field('Mac build', row.gate_label));
+  }
+  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...guestFields, ...namedTargets,
     ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
@@ -927,7 +929,7 @@ function stepTooltip(key, data) {
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
-  rows.push(...ownerFields(row), ...stepFields);
+  rows.push(...ownerFields(row), ...detailFields, ...stepFields);
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
@@ -1081,21 +1083,17 @@ function publicParts(parts) {
   }
   return shown;
 }
-function rowUnit(row) {
-  return ciRow(row) ? "CI" : row.unit;
+// One function gives the row start, its small text and the Step and Verify cells, so any console page can use them.
+// A row with a unit starts with the unit; its showrunner is the small text. Other rows show their own name only.
+function queueRowLabels(row) {
+  const unit = ciRow(row) ? "" : ownerText(row.unit);
+  const showrunner = unit ? ownerText(row.showrunner) : "";
+  return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
+    step: unit ? row.title?.step || "" : "", verify: row.verify?.verb || ""};
 }
-function rowOwner(row, waiting = false) {
-  const owner = row.caller ? row.caller
-    : ciRow(row) ? (row.ci_label || "").split(" · ")[0]
-    : macRow(row) ? publicText(row.showrunner || "")
-    : row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps) ? visibleDetail(row)
-    : publicText(row.showrunner || "");
-  // One place names the owner: a row name `<owner>: <what>` or `<owner>` already shows it.
-  return row.name === owner || row.name?.startsWith(owner + ": ") ? "" : owner;
-}
-function rowLabel(name, owner = "", note = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${roleName(owner)}</span>` +
+function rowLabel({name, unit = "", owner = ""}, note = "") {
+  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? staffName(unit) : esc(name)}</span></span>` +
+    `<span class="owner">${staffName(owner)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, bars = "") {
@@ -1820,45 +1818,42 @@ function renderWalk(d) {
       title="Drag to move. Press Space, then an arrow key. Press Enter to drop.">
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
   };
-  const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
-    (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
+  const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="duration">${duration}</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
+  // A step that runs shows only its machine; the row tooltip names the other targets. A step that waits lists them all.
   const targetCell = (machine, named) => {
-    if (!named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
-    const targets = machine && !named.includes(machine) ? [...named, machine] : named;
-    const labels = targets.map(target => target === machine
-      ? `<strong class="machine" data-machine="${esc(target)}">${esc(target)} (running)</strong>`
-      : `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ");
-    const content = machine ? labels : `<span class="wait-target">${labels || "—"}</span>`;
-    return `<td class="machine" data-machine="${esc(targets.join(" or "))}">${content}</td>`;
+    if (machine || !named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
+    const labels = named.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ");
+    return `<td class="machine" data-machine="${esc(named.join(" or "))}"><span class="wait-target">${labels || "—"}</span></td>`;
   };
-  const cells = (place, name, duration, unit, pid, target, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+  const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${esc(labels.step)}</span></th><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
-        `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
+      (className.startsWith("wait") ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.guest_run || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", "", null, targetCell(""), null, "tools", "", "tools");
-    rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
+    const labels = queueRowLabels({name: "Build tools"});
+    cells("", labels, "", null, targetCell(""), null, "tools", "tools");
+    rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel(labels)}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
+    const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    const target = targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined);
-    cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, target, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
-    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
+    cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
+      r.pid, targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined), r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
+    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "verify", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
+  const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
-  rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
+  rows.push(`<div class="wrow room">${rowLabel({name: "Free"})}` + rowMemory("room") + `</div>`);
   const waitingCount = d.waiters.length;
   if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
@@ -1877,9 +1872,10 @@ function renderWalk(d) {
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
     const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
-    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, target, null, tip, w.verify?.verb, rowClass);
+    const labels = queueRowLabels(w);
+    cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass);
     const note = w.order_note || (["build hold", "build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "");
-    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(w.name, rowOwner(w, true), note)}` +
+    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
@@ -1933,6 +1929,8 @@ function canvasFont(element) {
 
 const MIN_TRACK_WIDTH = 160;
 const TABLE_CAP_GAP = 12;
+// The space between the queued heading and the table; the heading's CSS max-width uses the same 16px.
+const QUEUE_HEADING_GAP = 16;
 function fitWalkDetails() {
   const walk = $("walk");
   const table = walk.querySelector(".walk-table");
@@ -1957,8 +1955,9 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    // Waiting targets wrap inside the column and do not size it.
-    const widths = [...table.querySelectorAll(name === "machine" ? "tr:not(.wait) > .machine" : `.${name}`)].map(cell => {
+    // Waiting targets size the column, so each list stays on one line. In a tight pane they wrap between machines.
+    const machines = walk.classList.contains("tight") ? "tr:not(.wait) > .machine" : "tr > .machine";
+    const widths = [...table.querySelectorAll(name === "machine" ? machines : `.${name}`)].map(cell => {
       context.font = canvasFont(cell);
       return context.measureText(cell.textContent).width + parseFloat(getComputedStyle(cell).paddingRight);
     });
@@ -1986,15 +1985,14 @@ function fitWalkDetails() {
       context.measureText(words.slice(index).join(" ")).width)));
   }));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
-  // Running rows set the label column. A longer queued name wraps at a space, so only its widest word counts.
-  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")].flatMap(label =>
-    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
+  // Waiting names wrap within the width set by running rows and Free.
+  const labels = [...walk.querySelectorAll(".wrow:not(.wait) .row-label :is(.name, .owner)")];
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
-  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
     context.font = canvasFont(label);
-    return context.measureText(text).width;
+    return context.measureText(label.textContent).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
@@ -2005,6 +2003,7 @@ function fitWalkDetails() {
   }
   if (fit.remainingWidth < minimumTrackWidth) {
     walk.classList.add("tight");
+    measureColumn("machine");
     fit = measure(labelWidth);
   }
   root.classList.remove("layout-measuring");
@@ -2027,9 +2026,16 @@ function fitWalkDetails() {
   measureColumn("machine");
   // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
   const range = track.getBoundingClientRect();
-  const tableLeft = !hasCap(latest)
-    ? walk.getBoundingClientRect().right - naturalWidth
-    : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  const tableRight = walk.getBoundingClientRect().right - naturalWidth;
+  // The queued heading row has no bar. When the walk has room to spare, the table moves right until the heading fits.
+  const heading = walk.querySelector(".walk-chart .queue-title");
+  let headingRight = 0;
+  if (heading) {
+    context.font = canvasFont(heading);
+    headingRight = heading.getBoundingClientRect().left + Math.ceil(context.measureText(heading.textContent).width) + QUEUE_HEADING_GAP;
+  }
+  const capLeft = range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  const tableLeft = !hasCap(latest) ? tableRight : Math.max(capLeft, Math.min(tableRight, headingRight));
   walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
     const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
