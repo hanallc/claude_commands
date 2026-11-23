@@ -63,6 +63,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
@@ -6946,6 +6947,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    prepared = replace(prepared, env={**prepared.env, "PYTHONPATH": startup_pythonpath(prepared.env.get("PYTHONPATH", ""))},
+                       unset_environment=prepared.unset_environment - {"PYTHONPATH"})
     with reboot_lock():
         return _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
                                       agent=agent, reported_unknown=reported_unknown, agent_name=agent_name,
