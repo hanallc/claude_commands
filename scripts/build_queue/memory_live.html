@@ -1088,14 +1088,13 @@ function rowUnit(row) {
   return ciRow(row) ? "CI" : row.unit;
 }
 function rowOwner(row, waiting = false) {
-  if (row.caller) return row.caller;
-  if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
-  if (macRow(row)) return publicText(row.showrunner || "");
-  if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
-    return visibleDetail(row);
-  }
-  const owner = publicText(row.showrunner || "");
-  return owner;
+  const owner = row.caller ? row.caller
+    : ciRow(row) ? (row.ci_label || "").split(" · ")[0]
+    : macRow(row) ? publicText(row.showrunner || "")
+    : row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps) ? visibleDetail(row)
+    : publicText(row.showrunner || "");
+  // One place names the owner: a row name `<owner>: <what>` or `<owner>` already shows it.
+  return row.name === owner || row.name?.startsWith(owner + ": ") ? "" : owner;
 }
 function rowLabel(name, owner = "", note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +

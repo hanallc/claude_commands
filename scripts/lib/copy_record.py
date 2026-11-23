@@ -19,6 +19,9 @@ FORMER_COPIES_ROOT = Path("/tmp/claude/copies")
 COPIES_ENV = "SCRATCH_COPIES_ROOT"
 RECORD = ".scratch.json"
 TEMPORARY_GATE_RECORD = ".gate-copy.json"
+SNAPSHOT_ORIGIN = "snapshot-origin.json"
+"""The binding that `copies.py run` writes beside the snapshot checkout of a request."""
+FULL_COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 TASK = re.compile(r"(?P<kind>run|phase|row|gate|until|landed):(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_./-]+)?)")
 
 
@@ -157,19 +160,36 @@ def record_path(folder: Path) -> Path | None:
     return None
 
 
+def _private_folder(path: Path) -> bool:
+    """Whether a real folder belongs to this user and no one else can write in it."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        status = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return status.st_uid == os.getuid() and not status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def _read_regular_json(path: Path) -> object:
+    """Read JSON from a regular file without following a symbolic link."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("expected a regular file")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as source:
+            try:
+                return cast(object, json.load(source))
+            except RecursionError as error:
+                raise ValueError("JSON nesting is too deep") from error
+    finally:
+        os.close(descriptor)
+
+
 def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
     try:
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except FileNotFoundError:
-            return NotRegistered()
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                return UnreadableRecord(f"repair record {path}: expected a regular file")
-            with os.fdopen(descriptor, encoding="utf-8", closefd=False) as record:
-                raw = cast(object, json.load(record))
-        finally:
-            os.close(descriptor)
+        raw = _read_regular_json(path)
+    except FileNotFoundError:
+        return NotRegistered()
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableRecord(f"repair record {path}: {error}")
     fields = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
@@ -217,7 +237,28 @@ def source_of(folder: Path) -> RecordedCopySource | NoRecordedCopySource | Unrea
             if isinstance(checkout, str) and checkout and isinstance(commit, str) and commit:
                 return RecordedCopySource(Path(checkout), commit)
             return UnreadableRecord(f"{path}: copy record has no source checkout or commit")
-    return NoRecordedCopySource()
+        return NoRecordedCopySource()
+    return snapshot_source(folder)
+
+
+def snapshot_source(folder: Path) -> RecordedCopySource | NoRecordedCopySource:
+    """Read the repository and commit that a `copies.py run` snapshot comes from.
+
+    The binding counts only in a private folder of this user, as the run's tool folder is.
+    It names its own checkout and a full commit id, so it proves only that folder and commit.
+    """
+    try:
+        if not _private_folder(folder.parent):
+            return NoRecordedCopySource()
+        raw = _read_regular_json(folder.parent / SNAPSHOT_ORIGIN)
+    except (OSError, UnicodeError, ValueError):
+        return NoRecordedCopySource()
+    binding = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+    repository, commit = binding.get("repository"), binding.get("source_commit")
+    if (binding.get("checkout") != str(folder) or not isinstance(repository, str) or not repository
+            or not isinstance(commit, str) or not FULL_COMMIT.fullmatch(commit)):
+        return NoRecordedCopySource()
+    return RecordedCopySource(Path(repository), commit)
 
 
 @dataclass(frozen=True)

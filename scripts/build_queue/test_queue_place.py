@@ -507,7 +507,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 assert "queue_waiter" in row
                 waiter = row["queue_waiter"]
                 self.assertEqual(waiter.get("unit"), "queue-unit")
-                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "")["session_id"])
+                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "", records.request_owner(""))["session_id"])
 
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
