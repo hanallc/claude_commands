@@ -214,9 +214,10 @@ def run_gate_with_placement(
         try:
             refusal = read_gate_claim_failure(assignment_file, request)
             settled = client.claim_failure(refusal)
+            # The guest gate can consume the launch permission before it takes no run.
             if (settled.assignment != refusal.assignment
                     or settled.state != placement.ClosedAssignment(refusal.reason)
-                    or not isinstance(settled.permission, placement.PermissionAvailable)
+                    or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                     or not isinstance(settled.retry, placement.RetryAt)):
                 raise wire.AdmissionUnavailable('the queue has not settled the Mac guest attempt')
             destination = refusal.assignment.destination

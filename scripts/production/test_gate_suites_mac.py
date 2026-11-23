@@ -139,7 +139,7 @@ def queue_cancel(queue: placement_fixture.PlacementFixture, request: admission_w
     return cancelled
 
 
-def checked_target(mode: SuiteMode, gate_job: StepJob) -> str | gate.NoGateAssignment:
+def checked_target(mode: SuiteMode, gate_job: StepJob) -> gate.GateTarget:
     """Return the target of the placement that the gate checks. The check changes no queue state."""
     return gate.placement_target(gate.current_gate_placement(mode, gate_job))
 
@@ -481,7 +481,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                                        target=checked_target(SuiteMode.GATE, job))
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.GATE, full=True, module_time_limit_s=30,
-                                     selected=gate.ALL_MODULES, gate_job=job, type_dirs=("scripts",))
+                                     selected=gate.ALL_MODULES, gate_job=job, type_dirs=("scripts",),
+                                     assignment=assignment)
         self.placement_status.assert_called_once_with("episode", "attempt")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
@@ -505,7 +506,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
-                                     selected=TreeSelection((), tree), gate_job=job, type_dirs=("scripts",))
+                                     selected=TreeSelection((), tree), gate_job=job, type_dirs=("scripts",),
+                                     assignment=assignment)
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
@@ -678,8 +680,7 @@ class MacGateSuitesTests(GateSuitesFixture):
               mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
               redirect_stderr(io.StringIO()) as errors):
             placed = gate.current_gate_placement(SuiteMode.GATE, StepJob("integrate", unit="fixture"))
-        target = gate.placement_target(placed)
-        self.assertEqual(target, "mac-linux")
+        self.assertEqual(gate.placement_target(placed), gate.MacLinuxAssignment(assignment))
         self.assertGreater(clock.monotonic(), admission_records.read_memory_config().query_timeout_seconds)
         self.assertIn("admission service not answering", errors.getvalue())
         self.assertEqual(len(transport.requests), 1)
