@@ -993,6 +993,9 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
 
     def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_and_is_refused(self) -> None:
+        # The limit binds no checkout that holds the home folder. A guest test copy holds its run home, so the
+        # test gives a home outside the checker.
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": "/nonexistent-home"})))
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
         _ = self.next_cargo()
         checker = hand_made_limit.CHECKER
