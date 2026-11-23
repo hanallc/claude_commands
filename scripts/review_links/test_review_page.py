@@ -89,6 +89,50 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
 }
 """
 
+SNAPSHOT_FETCH_SCRIPT = r"""<script>
+const snapshots=SNAPSHOTS;
+let shown='initial';
+const realFetch=fetch;
+window.fetch=async(url,options={})=>{
+ if(options.method==='POST') return new Promise(()=>{});
+ const params=new URL(url,location.href).searchParams,current=snapshots[shown];
+ if(params.has('body'))
+  return new Response(current.bodies[params.get('body')],{headers:{'X-Review-Version':current.version}});
+ if(params.has('index')) return new Response(current.index);
+ if(params.get('version')==='1') return new Response(JSON.stringify({version:current.version,facts:current.facts}));
+ return realFetch(url,options);
+};
+</script>"""
+
+SNAPSHOT_PROBE = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const until=async (predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');await frame();}
+ };
+ const row=number=>document.querySelector('[data-list-item][data-key="change-'+number+'"]');
+ const summary=number=>row(number)?.querySelector('.list-row');
+ const refresh=()=>{
+  shown='fresh';
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ };
+ try{
+STEPS
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+
+
+def snapshot_probe_page(page: str, snapshots: dict[str, dict[str, object]], steps: str) -> bytes:
+    """Serve the snapshots to the page, then run the probe steps against change-N rows."""
+    setup = SNAPSHOT_FETCH_SCRIPT.replace('SNAPSHOTS', json.dumps(snapshots).replace('</', '<\\/'))
+    return (page.replace('<head>', '<head>'+setup, 1)
+            .replace('<script>', '<script>'+BODY_READY_SCRIPT+'</script><script>', 1)
+            .replace('</body>', SNAPSHOT_PROBE.replace('STEPS', steps)+'</body>')).encode()
+
+
 def browser_markup(root: Path, *, show: str = 'open') -> str:
     """Adapt the existing fake refresh responses to the snapshot protocol."""
     snapshot = review_page.build_snapshot(root)
@@ -1462,146 +1506,6 @@ window.fetch=(url,options)=>{
         self.assertIn('"review_id": "Q1"', path.read_text())
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_browser_review_dialog_keeps_its_body_and_scroll_across_refreshes(self) -> None:
-        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
-        entry = review_items.ReviewLog(change.times.filed, 'nate', 'Read this log entry.')
-        change = replace(change, log=(*change.log, entry))
-        records = [replace(change, key=f'page-owner/C{number}', id=f'page-owner/C{number}',
-                           state=review_items.ReviewState.OPEN) for number in range(1, 46)]
-        with patch.object(review_items, 'read', return_value=records):
-            markup = browser_markup(self.root)
-        newest = review_items.ReviewLog(entry.time+timedelta(minutes=1), 'nate', 'A new log entry.')
-        current = replace(records[0], log=(*change.log, newest))
-        with patch.object(review_items, 'read', return_value=[current]):
-            with_new_log = review_page.build_snapshot(self.root).body(current.key).decode()
-        probe = r'''<script>
-(async()=>{
- const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- const fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog'),body=dialog.querySelector('.console-dialog-body');
- const detail=dialog.querySelector('[data-record-dialog-detail]'),close=dialog.querySelector('[data-close]');
- const key='page-owner/C1',row=()=>content.querySelector('[data-key="'+key+'"]');
- const toggle=()=>row().querySelector('.list-toggle');
- const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
- const kept=index.r.find(entry=>entry[0]===key),shorter={...index,r:[kept]};
- const pending=dialog.querySelector('[data-record-updates]');
- const showUpdates=dialog.querySelector('[data-show-record-updates]');
- let payload,bodyVersion=0,bodyRead=0,posts=0,failBody=false;
- window.fetch=async(url,options)=>{
-  const query=new URL(url,location.href).searchParams;
-  if(options?.method==='POST'){posts++;return Response.json({reason:'Fixture refuses the action'},{status:400});}
-  if(query.has('body')){
-   bodyRead=bodyVersion;
-   if(failBody) return new Response('',{status:503});
-   const result=await fetchPage(url,options);
-   const text=bodyVersion===2 ? WITH_NEW_LOG : await result.text();
-   const version=query.get('version');
-   const template=document.createElement('template');
-   template.innerHTML=text;
-   const reviewBody=template.content.querySelector('[data-review-body]');
-   reviewBody.style.paddingBottom='48px';
-   reviewBody.insertAdjacentHTML('afterbegin','<p>Repeated words.</p><p>Repeated words.</p><p>'+(
-    bodyVersion ? 'An edited block with a new line of text for the reader.' : 'The original block.')+'</p>');
-   const revision=template.content.querySelector('[name="revision"]');
-   if(revision) revision.value='revision-'+bodyVersion;
-   return new Response(template.innerHTML+'<div style="height:'+(bodyVersion===2 ? 20 : 1000)+'px">Body fixture '+bodyVersion+'</div>',
-    {headers:{'X-Review-Version':version}});
-  }
-  if(payload && query.has('version')) return Response.json(payload);
-  if(payload && query.has('index')) return Response.json(payload);
-  return fetchPage(url,options);
- };
- const refresh=async fresh=>{
-  payload={index:fresh,version:'dialog-fixture-'+(++bodyVersion),facts:pageRefreshFacts()};
-  const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await refreshed;
- };
- const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
- const until=async(test,message)=>{
-  const end=performance.now()+8000;
-  while(!test()){
-   if(performance.now()>end) throw new Error(message);
-   await frame();
-  }
- };
- try{
-  toggle().click();await readyReviewCard(row());
-  check(dialog.open && toggle().getAttribute('aria-expanded')==='true' && row().querySelector('[data-detail]').hidden &&
-   Boolean(detail.querySelector('[data-review-form]')),'The Review row opens its form in the dialog.');
-  dialog.dispatchEvent(new Event('cancel',{cancelable:true}));
-  check(!dialog.open && document.activeElement===toggle(),'Esc closes the dialog and returns focus to the item.');
-  toggle().click();await readyReviewCard(row());
-  close.click();
-  check(!dialog.open && document.activeElement===toggle(),'Close returns focus to the item.');
-  const linked=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  location.hash=new URLSearchParams({show:'open',item:key}).toString();
-  await linked;await readyReviewCard(row());
-  check(dialog.open && new URLSearchParams(location.hash.slice(1)).get('item')===key,
-   'The Review link opens the item dialog.');
-  dialog.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
-  dialog.dispatchEvent(new MouseEvent('click',{bubbles:true}));
-  check(!dialog.open && !new URLSearchParams(location.hash.slice(1)).has('item'),
-   'Clicking outside closes the Review dialog and removes the item from the address.');
-  toggle().click();await readyReviewCard(row());
-  const words=detail.querySelector('textarea');words.value='Keep these words.';
-  words.dispatchEvent(new Event('input',{bubbles:true}));
-  const block=detail.querySelector('[data-review-body] p');
-  const bounds=()=>[block.getBoundingClientRect().x,block.getBoundingClientRect().y,body.scrollTop].join();
-  body.scrollTop=block.getBoundingClientRect().top-body.getBoundingClientRect().top-12;
-  const position=bounds(),shown=detail.firstElementChild,form=detail.querySelector('form');
-  const shownText=detail.textContent;
-  await refresh(index);
-  await until(()=>!showUpdates.hidden,'The first update did not become available.');
-  await refresh(shorter);
-  await until(()=>bodyRead===2,'The new body was not requested.');
-  await frame();await frame();
-  check(dialog.open && pending.textContent==='Updates available' && detail.firstElementChild===shown &&
-   detail.textContent===shownText && bounds()===position && words.value==='Keep these words.',
-   'The latest update leaves the repeated text, the reading position and the draft in place.');
-  check(form.elements.revision.value==='revision-0' && !words.disabled,
-   'The shown body keeps its editable draft and original signature.');
-  form.requestSubmit(form.querySelector('[value="works"]'));
-  check(posts===0,'An action on the changed record waits for Show updates.');
-  words.value+=' Keep the new words too.';words.dispatchEvent(new Event('input',{bubbles:true}));
-  showUpdates.click();
-  const latest=detail.querySelector('form');
-  check(detail.firstElementChild!==shown && showUpdates.hidden && detail.textContent.includes('Body fixture 2') &&
-   detail.textContent.includes('An edited block') && detail.textContent.includes('A new log entry.') &&
-   latest.elements.revision.value==='revision-2' &&
-   latest.elements.feedback.value==='Keep these words. Keep the new words too.',
-   'Show updates applies the latest shorter body and its signed form with the draft.');
-  failBody=true;
-  await refresh(shorter);
-  const error=dialog.querySelector('[data-record-error]');
-  await until(()=>!error.hidden,'The refresh error did not appear.');
-  check(!detail.contains(error) && error.textContent.includes('503') &&
-   detail.querySelector('form')===latest && latest.elements.feedback.value==='Keep these words. Keep the new words too.' &&
-   !latest.elements.feedback.disabled,
-   'A failed refresh shows the error outside the retained body and leaves the draft editable.');
-  failBody=false;
-  await refresh(shorter);
-  await until(()=>!showUpdates.hidden,'The next successful refresh did not offer an update.');
-  close.click();toggle().click();
-  await readyReviewCard(row());
-  check(showUpdates.hidden && detail.textContent.includes('Body fixture 4') &&
-   detail.querySelector('textarea').value==='Keep these words. Keep the new words too.',
-   'Reopening the item shows the latest body and its draft.');
-  await refresh({...shorter,r:[]});
-  check(!row() && dialog.open && detail.textContent.includes('Body fixture 4') &&
-   detail.querySelector('textarea').value==='Keep these words. Keep the new words too.',
-   'A removed Review item keeps its last detail in the dialog.');
-  const status=dialog.querySelector('[data-record-missing]');
-  check(!status.hidden && status.textContent==='This item is no longer in the list.' &&
-   [...detail.querySelectorAll('form button')].every(button=>button.disabled),
-   'The removed item shows one status and disables its actions.');
- }catch(error){failures.push(String(error));}
- await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
-})();</script>'''
-        probe = probe.replace('WITH_NEW_LOG', json.dumps(with_new_log).replace('</', '<\\/'))
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe + '</body>').encode()), [[]])
-
-    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_ask_keeps_later_edits_and_ignores_a_response_after_reopen(self) -> None:
         change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
         validating = replace(change, state=review_items.ReviewState.VALIDATING, actions=('question',))
@@ -1614,10 +1518,9 @@ window.fetch=(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog');
  const row=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
  const toggle=()=>row().querySelector('.list-toggle');
- const close=dialog.querySelector('[data-close]'),error=dialog.querySelector('[data-record-error]');
+ const close=()=>toggle().click(),error=()=>row()?.querySelector('[data-record-error]');
  let finishPost;
  window.fetch=(url,options)=>{
   if(options?.method==='POST') return new Promise(resolve=>{finishPost=resolve;});
@@ -1648,14 +1551,14 @@ window.fetch=(url,options)=>{
    check(words.value==='Which check passed?' && document.activeElement===words &&
     words.selectionStart===3 && words.selectionEnd===7,
     'A saved Ask preserves words edited during the save and keeps their selection.');
-   ask(first);close.click();toggle().click();
+   ask(first);close();toggle().click();
    const reopened=await readyReviewCard(row());
    finishPost(Response.json({reason:'An earlier refusal.'},{status:400}));await settled(first);
-   check(dialog.open && !reopened.querySelector('[data-send-status]').textContent.includes('Not saved:'),
+   check(recordIsOpen(row()) && !reopened.querySelector('[data-send-status]').textContent.includes('Not saved:'),
     'A refusal from before Close stays out of the reopened item.');
   }
   const sent=await readyReviewCard(row());
-  ask(sent);close.click();
+  ask(sent);close();
   if(!VALIDATING){
    scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});
    const departure=content.querySelector('[data-record-motion-key="page-owner/C1"]');
@@ -1669,17 +1572,17 @@ window.fetch=(url,options)=>{
   const reopened=await readyReviewCard(row());
   edit(reopened.elements.feedback,'Keep these later words.');
   finishPost(Response.json({answer:'question saved'}));await settled(sent);
-  check(dialog.open && reopened.elements.feedback.value==='Keep these later words.' &&
+  check(recordIsOpen(row()) && reopened.elements.feedback.value==='Keep these later words.' &&
    !reopened.querySelector('[data-send-status]').textContent.includes('Saved:'),
    'A response from before Close leaves the reopened item and its draft in place.');
   if(VALIDATING){
    ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
    finishPost(new Response('Unreadable result'));await settled(reopened);
-   check(!error.hidden && error.textContent==='Saved; the item could not refresh.' &&
+   check(!error().hidden && error().textContent==='Saved; the item could not refresh.' &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
     'An unreadable successful response reports a display error and keeps the draft.');
    ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);
-   check(error.hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
+   check(error().hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
     'A failed save reports a save error and keeps the draft.');
   }
@@ -1701,10 +1604,9 @@ window.fetch=(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog');
- const detail=dialog.querySelector('[data-record-dialog-detail]');
- const error=dialog.querySelector('[data-record-error]');
- const updates=dialog.querySelector('[data-show-record-updates]');
+ const open=()=>content.querySelector('[data-record-inline-view]');
+ const detail=()=>open()?.querySelector('[data-record-inline-detail]');
+ const error=()=>open()?.querySelector('[data-record-error]');
  const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
  const firstLoad=FIRST_LOAD;
  let version=content.dataset.version,unavailable=firstLoad,recovered=false,bodyReads=0;
@@ -1739,33 +1641,29 @@ window.fetch=(url,options)=>{
   const row=content.querySelector('[data-list-item]');
   row.querySelector('.list-toggle').click();
   if(firstLoad){
-   await until(()=>!error.hidden,'The first load did not report the unavailable body.');
-   check(error.textContent.includes('The item body is unavailable.') && updates.hidden &&
-    !detail.querySelector('[data-review-card-unavailable]') && !detail.querySelector('form'),
+   await until(()=>!error()?.hidden,'The first load did not report the unavailable body.');
+   check(error().textContent.includes('The item body is unavailable.') &&
+    !detail()?.querySelector('[data-review-card-unavailable]') && !detail()?.querySelector('form'),
     'The first load reports the error without installing the HTTP 200 error body.');
   }else{
    const form=await readyReviewCard(row);
    form.elements.feedback.value='Which check passed?';
    form.elements.feedback.dispatchEvent(new Event('input'));
    form.requestSubmit(form.querySelector('[value="question"]'));
-   await until(()=>!form.dataset.sending && !error.hidden,'The confirmed save did not report the display error.');
+   await until(()=>!form.dataset.sending && !error()?.hidden,'The confirmed save did not report the display error.');
    unavailable=true;version='unavailable';
    await refresh();
    await until(()=>bodyReads>=2,'The refresh did not request the unavailable body.');
    await frame();
-   check(detail.querySelector('form')===form && !detail.querySelector('[data-review-card-unavailable]') &&
-    updates.hidden && error.textContent==='Saved; the item could not refresh.',
+   check(detail()?.querySelector('form')===form && !detail()?.querySelector('[data-review-card-unavailable]') &&
+    error().textContent==='Saved; the item could not refresh.',
     'The HTTP 200 error body leaves the shown form and saved message in place.');
   }
   const reads=bodyReads;
   unavailable=false;recovered=true;
   await refresh();
-  if(firstLoad) await until(()=>detail.querySelector('form'),'The first load did not recover.');
-  else{
-   await until(()=>!updates.hidden,'The successful retry did not offer an update.');
-   updates.click();
-  }
-  check(bodyReads===reads+1 && error.hidden && detail.textContent.includes('The saved question is now available.'),
+  await until(()=>detail()?.textContent.includes('The saved question is now available.'),'The body did not recover.');
+  check(bodyReads===reads+1 && error()?.hidden && detail().textContent.includes('The saved question is now available.'),
    'A refresh of the same version requests and displays the recovered body.');
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -1786,8 +1684,8 @@ window.fetch=(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog'),row=()=>content.querySelector('[data-list-item]');
- const detail=()=>dialog.querySelector('[data-record-dialog-detail]'),pending=dialog.querySelector('[data-record-updates]');
+ const row=()=>content.querySelector('[data-list-item]');
+ const detail=()=>recordDetails(row());
  const [key]=Object.keys(fixtureBodies);
  const body=(revision,words)=>{
   const copy=document.createElement('template');copy.innerHTML=fixtureBodies[key];
@@ -1840,30 +1738,25 @@ window.fetch=(url,options)=>{
   form.elements.feedback.dispatchEvent(new Event('input'));
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   await until(()=>detail().textContent.includes('The saved words.'),'The saved body did not appear.');
-  check(pending.hidden && (action!=='question' || bodyReads>0),
-   'The saved result appears without Show updates.');
+  check(action!=='question' || bodyReads>0,'Ask requests the saved body.');
   const refresh=version=>{
    pageVersion=version;
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   };
   await until(()=>content.dataset.version==='own','The saved index did not refresh.');
   if(completed){
-   check(dialog.open && detail().textContent.includes('The saved words.') && !detail().querySelector('form'),
-    'Proposal Tell keeps the completed result in the dialog.');
+   check(recordIsOpen(row()) && detail().textContent.includes('The saved words.') && !detail().querySelector('form'),
+    'Proposal Tell keeps the completed result in the row.');
    await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
    return;
   }
   refresh('during');
   await until(()=>detail().textContent.includes('Delivery in progress.'),'The pending delivery did not refresh.');
-  check(pending.hidden,'A pending delivery refresh shows immediately.');
   pendingDelivery=false;
   refresh('settled');
   await until(()=>detail().textContent.includes('Delivery ended.'),'The settled delivery did not refresh.');
-  check(pending.hidden,'The settled delivery shows immediately.');
   refresh('foreign');
-  await until(()=>!pending.hidden,'The owner update did not become available.');
-  check(detail().textContent.includes('Delivery ended.') && !detail().textContent.includes('A new owner update.'),
-   'The owner update waits for Show updates.');
+  await until(()=>detail().textContent.includes('A new owner update.'),'The owner update did not refresh.');
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -1884,7 +1777,7 @@ window.fetch=(url,options)=>{
         probe = r'''<script>
 (async()=>{
  const failures=[],fetchPage=window.fetch,content=document.querySelector('[data-review]');
- const dialog=document.querySelector('#record-item-dialog');
+ const opened=()=>content.querySelector('[data-record-inline-view]');
  window.fetch=(url,options)=>{
   if(options?.method==='POST')
    return Promise.resolve(Response.json({answer:'parked',detail_unavailable:true,delivery_pending:false}));
@@ -1902,10 +1795,10 @@ window.fetch=(url,options)=>{
    form.querySelector('[data-later-preset]').click();
   }else form.requestSubmit(form.querySelector('[value="'+ACTION+'"]'));
   const end=performance.now()+8000;
-  while(dialog.open && performance.now()<end) await new Promise(resolve=>requestAnimationFrame(resolve));
+  while(opened() && performance.now()<end) await new Promise(resolve=>requestAnimationFrame(resolve));
   const error=content.querySelector('[data-hidden-action-status]');
-  if(dialog.open || error.hidden || !error.textContent.includes('Saved; the item could not refresh.'))
-   failures.push('The confirmed closing action closes the dialog and reports the display failure.');
+  if(opened() || error.hidden || !error.textContent.includes('Saved; the item could not refresh.'))
+   failures.push('The confirmed closing action collapses the row and reports the display failure.');
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -1926,7 +1819,7 @@ window.fetch=(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  const realFetch=window.fetch,source='page-owner/C1',target='page-owner/C2';
- const dialog=document.querySelector('#record-item-dialog'),findForm=()=>dialog.querySelector('[data-review-form]');
+ const findForm=()=>document.querySelector('[data-record-inline-detail] [data-review-form]');
  const row=key=>document.querySelector('[data-list-item][data-key="'+key+'"]');
  const shown=()=>new URLSearchParams(location.hash.slice(1));
  const changed=()=>new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
@@ -1965,12 +1858,12 @@ window.fetch=(url,options)=>{
    '#'+new URLSearchParams({show:'open',q:'Source task',item:target}));
   history.pushState(sourceState,'',sourceURL);
   const back=changed();history.back();await back;
-  check(dialog.open && !row(target) && shown().get('q')==='Source task' &&
+  check(recordIsOpen(row(target)) && shown().get('q')==='Source task' &&
    document.querySelector('#list-search').value==='Source task' && !findForm(),
    'Back opens the filtered target with its filters and waits for its form.');
   send(first);
   check(requests.length===0,'The previous form cannot submit while the target body loads.');
-  await until(()=>!findForm() && dialog.querySelector('h2').textContent===target);
+  await until(()=>!findForm() && recordIsOpen(row(target)));
   await requested;releaseBody();
   await until(()=>findForm()?.elements.row.value===target);
   const second=findForm(),token=second.elements.token.value,revision=second.elements.revision.value;
@@ -2024,8 +1917,8 @@ window.fetch=(url,options)=>{
   while(!predicate()){if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');await frame();}
  };
  const row=key=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
- const dialog=document.querySelector('#record-item-dialog');
- const close=()=>dialog.querySelector('[data-close]').click();
+ const inline=()=>document.querySelector('[data-record-inline-view]');
+ const close=()=>inline().closest('[data-list-item]').querySelector('.list-toggle').click();
  const form=key=>recordDetails(row(key))?.querySelector('[data-review-form]');
  const open=async key=>{
   if(!recordIsOpen(row(key))){
@@ -2063,7 +1956,7 @@ window.fetch=(url,options)=>{
   check(document.querySelectorAll('[data-list-item]').length<=100 &&
     [...document.querySelectorAll('[data-list-item]')].some(node=>!first.includes(node.dataset.key)),
     'Scrolling loads distant summaries and removes old summaries.');
-  check(!row(DRAFT_KEY) && !dialog.open,'The closed card leaves the window during distant scrolling.');
+  check(!row(DRAFT_KEY) && !inline(),'The closed card leaves the window during distant scrolling.');
   await open(DRAFT_KEY);
   check(form(DRAFT_KEY).elements.feedback.value==='Keep these draft words.' &&
    form(DRAFT_KEY).elements.later.value==='2030-12-01T18:30' &&
@@ -2075,13 +1968,11 @@ window.fetch=(url,options)=>{
   check(document.activeElement===feedback && feedback.isConnected,'F013: scrolling keeps the focused row mounted.');
   await open(DRAFT_KEY);
   form(DRAFT_KEY).elements.feedback.focus();
-  const oldVersion=document.querySelector('[data-review]').dataset.version;
   await fetch('/advance');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await until(()=>document.querySelector('[data-review]').dataset.version!==oldVersion &&
-   !dialog.querySelector('[data-show-record-updates]').hidden,'a refreshed version and a pending update');
-  dialog.querySelector('[data-show-record-updates]').click();
-  check(document.activeElement===form(DRAFT_KEY).elements.feedback,'F007: refresh retains focus in the dialog.');
+  await until(()=>form(DRAFT_KEY)?.elements.token.value===EXPECTED_TOKEN,'the refreshed form');
+  check(!inline().querySelector('[data-show-record-updates]'),'The inline row has no update control.');
+  check(document.activeElement===form(DRAFT_KEY).elements.feedback,'F007: refresh retains focus in the row.');
   check(form(DRAFT_KEY).elements.feedback.value==='Keep these draft words.' &&
    form(DRAFT_KEY).elements.later.value==='2030-12-01T18:30' &&
    recordDetails(row(DRAFT_KEY)).querySelector('input[name=choice]:checked')?.value===choiceValue,
@@ -2133,14 +2024,14 @@ window.fetch=(url,options)=>{
   await until(()=>row('page-owner/C2')?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the delayed card');
   const top=scrollY;
   scrollTo(0,document.documentElement.scrollHeight);await frame();
-  check(dialog.open && recordIsOpen(row('page-owner/C2')),'The delayed dialog stays open after background scroll.');
+  check(recordIsOpen(row('page-owner/C2')),'The delayed row stays open after background scroll.');
   scrollTo(0,top);releaseBody();
   const ready=async key=>{
    const end=performance.now()+1500;
    while(!form(key) && performance.now()<end) await frame();
    return form(key);
   };
-  check(await ready('page-owner/C2'),'F003: the delayed response fills the open dialog.');
+  check(await ready('page-owner/C2'),'F003: the delayed response fills the open row.');
   const pending=form('page-owner/C2');
   pending.elements.later.value='2030-12-02T18:30';
   pending.requestSubmit(pending.querySelector('button[value=later]'));
@@ -2151,7 +2042,7 @@ window.fetch=(url,options)=>{
   pending.elements.later.dispatchEvent(new Event('input'));
   pending.elements.later.blur();
   scrollTo(0,document.documentElement.scrollHeight);await frame();
-  check(dialog.open,'The dialog stays open during the save.');
+  check(new URLSearchParams(location.hash.slice(1)).get('item')==='page-owner/C2','The open row keeps its address during the save.');
   scrollTo(0,top);await until(()=>form('page-owner/C2'),'the pending form');
   const replacement=form('page-owner/C2');
   const laterButton=replacement.querySelector('button[value=later]');
@@ -2191,12 +2082,6 @@ window.fetch=(url,options)=>{
   check(recordDetails(row(DRAFT_KEY)).querySelector('input[name=choice]:checked')?.value===choiceValue,
    'The question has a selected choice before the save.');
   oldQuestion.requestSubmit(oldQuestion.querySelector('button[value=answer]'));
-  const showPending=async()=>{
-   const button=dialog.querySelector('[data-show-record-updates]');
-   await until(()=>!button.hidden,'the available update');
-   button.click();
-  };
-  await showPending();
   await until(()=>form(DRAFT_KEY)?.elements.revision.value===REVISED_QUESTION &&
    !form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the revised question form');
   const newQuestion=form(DRAFT_KEY);
@@ -2211,7 +2096,6 @@ window.fetch=(url,options)=>{
   newQuestion.requestSubmit(newQuestion.querySelector('button[value=answer]'));
   await until(()=>releaseVersion,'the first recovery reload');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await showPending();
   await until(()=>form(DRAFT_KEY)?.elements.revision.value===REVISED_AGAIN,'the revision from the second refresh');
   const latestQuestion=form(DRAFT_KEY);
   check(!latestQuestion.querySelector('button[value=answer]').disabled,
@@ -2252,8 +2136,7 @@ window.fetch=(url,options)=>{
    staleQuestion.requestSubmit(staleQuestion.querySelector('button[value=answer]'));
    await until(()=>releaseVersion,'the held recovery reload');
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-   await showPending();
-   await until(()=>form(DRAFT_KEY)?.elements.revision.value===revision,'the newer question form');
+    await until(()=>form(DRAFT_KEY)?.elements.revision.value===revision,'the newer question form');
    const edited=words ? await remountDraft() : form(DRAFT_KEY);
    edited.elements.feedback.focus();
    edited.elements.feedback.value=words;
@@ -2410,6 +2293,428 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             {'page-owner/C399', 'page-owner/C381', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
             'Only opened keys request a body.',
         )
+
+    def browser_snapshot(self, records: list[review_items.ReviewItem]) -> tuple[str, dict[str, object]]:
+        """Render the page for these records, with the data its fetches read."""
+        with patch.object(review_items, 'read', return_value=records):
+            built = review_page.build_snapshot(self.root)
+        return built.render(show='all').decode(), {
+            'version': built.version, 'facts': built.facts(), 'index': built.index_response().decode(),
+            'bodies': {key: built.body(key).decode() for key in built.records}}
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        assert isinstance(change.source, review_items.ChangeSource)
+        source = change.source
+
+        def record(number: int, title: str, proof: str = 'The short proof.',
+                   level: str = urgency.NORMAL) -> review_items.ReviewItem:
+            return replace(change, key=f'change-{number}', id=f'C{number}', title=title, source_unit=change.owner,
+                           state=review_items.ReviewState.OPEN, urgency=urgency.Urgency(level),
+                           source=replace(source, row={**source.row, 'What you see': proof}))
+
+        # The row above loses its urgency line; the open row takes a new title and a longer proof.
+        initial_records = [record(number, f'Review change {number}') for number in range(1, 31)]
+        initial_records[13] = record(14, 'The row above blocks work', level=urgency.BLOCKS)
+        fresh_records = [*initial_records]
+        fresh_records[13] = record(14, 'Short title')
+        fresh_records[14] = record(15, 'The refreshed open title',
+                                   'The refreshed proof. ' + 'The producer reports another completed check. ' * 20)
+
+        (page, initial), (_, fresh) = self.browser_snapshot(initial_records), self.browser_snapshot(fresh_records)
+        self.assertNotEqual(initial['version'], fresh['version'])
+        steps = r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  row(15).querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row(15));
+  const words=form.elements.feedback;
+  words.value='Keep these words.';words.dispatchEvent(new Event('input',{bubbles:true}));
+  words.focus({preventScroll:true});words.setSelectionRange(2,5);
+  const currentTop=()=>summary(15).getBoundingClientRect().top;
+  scrollBy({top:currentTop()-180,behavior:'instant'});
+  await frame();
+  const top=currentTop(),scrolled=scrollY,heightAbove=summary(14).getBoundingClientRect().height;
+  const heightOpen=row(15).getBoundingClientRect().height;
+  check(scrolled>0 && summary(14).getBoundingClientRect().top<top && top>0 && top<innerHeight,
+   'The open row is below the top and below the changed row.');
+  refresh();
+  await until(()=>recordDetails(row(15))?.textContent.includes('The refreshed proof.'),'the refreshed open row');
+  await frame();
+  check(summary(14).getBoundingClientRect().top<top,'The changed row stays above the open row.');
+  // Firefox lays out in 1/60 px units, so a match is closer than 0.1 px.
+  const checkTop=label=>check(recordIsOpen(row(15)) && Math.abs(currentTop()-top)<0.1,
+   label+' Expected '+top+' px. Found '+currentTop()+' px.');
+  checkTop('The open row keeps its position after the refresh.');
+  for(let count=0;count<5;count++) await frame();
+  checkTop('The open row keeps its position after the window redraws.');
+  check(summary(14).getBoundingClientRect().height<heightAbove && summary(14).textContent.includes('Short title'),
+   'The row above shows its new title and is shorter. Before '+heightAbove+' px. After '+
+   summary(14).getBoundingClientRect().height+' px.');
+  check(row(15).getBoundingClientRect().height>heightOpen && summary(15).textContent.includes('The refreshed open title'),
+   'The open row shows its new title and new proof and is taller.');
+  const field=recordDetails(row(15)).querySelector('[data-review-form]')?.elements.feedback;
+  check(field?.value==='Keep these words.' && document.activeElement===field &&
+   field.selectionStart===2 && field.selectionEnd===5,'The draft, its focus and its selection stay.');
+"""
+        page_bytes = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+        self.assertEqual(firefox_probe_results(page_bytes), [[]])
+
+    def long_log_records(self, extra: int = 0) -> list[review_items.ReviewItem]:
+        """Return three change rows; change-2 has a log of 40 entries plus extra newer entries."""
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        start = datetime(2026, 11, 1, 9, tzinfo=ZoneInfo('UTC'))
+        log = tuple(review_events.ReviewLog(start + timedelta(minutes=index), change.owner,
+                                            f'Log entry {index}. The producer reports a completed check.')
+                    for index in range(40 + extra))
+        return [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                        source_unit=change.owner, state=review_items.ReviewState.OPEN,
+                        log=log if number == 2 else change.log)
+                for number in range(1, 4)]
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_log_scrolls_in_its_own_area(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'list_log_max_height_rem=9\n')
+        page, initial = self.browser_snapshot(self.long_log_records())
+        self.assertIn('style="--list-log-max-height:9rem"', page)
+        steps = r"""
+  frameElement.style.width='1440px';frameElement.style.height='900px';
+  await frame();
+  row(2).querySelector('.list-toggle').click();
+  await readyReviewCard(row(2));
+  const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
+  for(const width of [1440,600]){
+   frameElement.style.width=width+'px';
+   await frame();
+   const panel=recordDetails(row(2)).querySelector('.list-panel'),left=panel.firstElementChild.getBoundingClientRect();
+   const log=panel.querySelector('.list-log-scroll'),box=log.getBoundingClientRect();
+   check(getComputedStyle(log).overflowY==='auto' && log.scrollHeight>log.clientHeight,
+    width+' px: The log scrolls in its own area.');
+   if(width>960) check(box.left>=left.right && box.bottom<=left.bottom+1,
+    width+' px: The log sits beside the details and ends with them. Log bottom '+box.bottom+' px. Details bottom '+
+    left.bottom+' px.');
+   else check(Math.abs(log.clientHeight-9*rem)<1,
+    width+' px: The log is 9rem tall from the config. Found '+log.clientHeight+' px.');
+  }
+"""
+        self.assertEqual(firefox_probe_results(snapshot_probe_page(page, {'initial': initial}, steps)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_refresh_keeps_the_open_log_position(self) -> None:
+        (page, initial), (_, fresh) = (self.browser_snapshot(self.long_log_records()),
+                                       self.browser_snapshot(self.long_log_records(extra=1)))
+        self.assertNotEqual(initial['version'], fresh['version'])
+        for width in (1440, 600):
+            with self.subTest(width=width):
+                steps = r"""
+  frameElement.style.width='WIDTHpx';frameElement.style.height='800px';
+  await frame();
+  row(2).querySelector('.list-toggle').click();
+  await readyReviewCard(row(2));
+  const openLog=()=>recordDetails(row(2))?.querySelector('.list-log-scroll');
+  const log=openLog(),entries=log.querySelectorAll('[data-log-index]').length;
+  log.scrollTop=Math.round(log.scrollHeight/2);
+  await frame();
+  const logTop=log.getBoundingClientRect().top;
+  const first=[...log.querySelectorAll('[data-log-index]')].find(entry=>entry.getBoundingClientRect().bottom>logTop);
+  const index=first.dataset.logIndex,offset=first.getBoundingClientRect().top-logTop;
+  check(log.scrollTop>0,'The log scrolls before the refresh.');
+  refresh();
+  await until(()=>openLog()?.querySelectorAll('[data-log-index]').length>entries,'the new log entry');
+  await frame();
+  const freshLog=openLog(),entry=freshLog.querySelector('[data-log-index="'+index+'"]');
+  const found=entry.getBoundingClientRect().top-freshLog.getBoundingClientRect().top;
+  check(freshLog.scrollTop>0 && Math.abs(found-offset)<1,
+   'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
+""".replace('WIDTH', str(width))
+                markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+                self.assertEqual(firefox_probe_results(markup), [[]])
+
+    def assert_saved_detail_keeps_the_open_log_position(self, reply: str) -> None:
+        """Save feedback on the open row with a scrolled log; the new detail has one more log entry."""
+        (page, initial), (_, fresh) = (self.browser_snapshot(self.long_log_records()),
+                                       self.browser_snapshot(self.long_log_records(extra=1)))
+        steps = r"""
+  frameElement.style.width='1440px';frameElement.style.height='800px';
+  await frame();
+  const pageFetch=window.fetch;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   shown='fresh';
+   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',REPLY});
+  };
+  row(2).querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row(2));
+  const openLog=()=>recordDetails(row(2))?.querySelector('.list-log-scroll');
+  const log=openLog(),entries=log.querySelectorAll('[data-log-index]').length;
+  log.scrollTop=Math.round(log.scrollHeight/2);
+  await frame();
+  const logTop=log.getBoundingClientRect().top;
+  const first=[...log.querySelectorAll('[data-log-index]')].find(entry=>entry.getBoundingClientRect().bottom>logTop);
+  const index=first.dataset.logIndex,offset=first.getBoundingClientRect().top-logTop;
+  check(log.scrollTop>0,'The log scrolls before the save.');
+  form.elements.feedback.value='Check the log.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  await until(()=>openLog()?.querySelectorAll('[data-log-index]').length>entries,'the saved log entry');
+  await frame();
+  const savedLog=openLog(),entry=savedLog.querySelector('[data-log-index="'+index+'"]');
+  const found=entry.getBoundingClientRect().top-savedLog.getBoundingClientRect().top;
+  check(savedLog!==log,'The saved detail replaces the log.');
+  check(savedLog.scrollTop>0 && Math.abs(found-offset)<1,
+   'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
+""".replace('REPLY', reply)
+        markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_save_keeps_the_open_log_position(self) -> None:
+        self.assert_saved_detail_keeps_the_open_log_position("detail_html:snapshots.fresh.bodies['change-2']")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_detail_load_keeps_the_open_log_position(self) -> None:
+        # The save response has no detail, so the page loads the saved detail.
+        self.assert_saved_detail_keeps_the_open_log_position("detail_revision:'saved'")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_saved_change_feedback_shows_its_state_and_keeps_its_detail(self) -> None:
+        # 120 rows let the window drop the rows near the top while row 15 stays open.
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 121)]
+        # The feedback hands the change back, so the next server index shows it Waiting.
+        waiting = [replace(record, state=review_items.ReviewState.WAITING) if record.key == 'change-15' else record
+                   for record in records]
+        (page, initial), (_, fresh) = self.browser_snapshot(records), self.browser_snapshot(waiting)
+        steps = r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  const pageFetch=window.fetch;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
+   saved.content.querySelector('form').remove();
+   saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
+   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+    detail_html:saved.innerHTML});
+  };
+  row(15).querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row(15));
+  form.elements.feedback.value='Check the header.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  const loaded=()=>Boolean(recordDetails(row(15))?.querySelector('[data-review-body]')) &&
+   !recordDetails(row(15)).querySelector('[data-record-loading]:not([hidden])');
+  const shows=()=>loaded() && recordDetails(row(15)).textContent.includes('The saved words.');
+  await until(shows,'the saved detail');
+  check(recordIsOpen(row(15)),'The row stays open through the save.');
+  const content=document.querySelector('[data-review]');
+  // A refresh waits for the save to end, so ask again until the new snapshot shows.
+  await until(()=>{refresh();return content.dataset.version===snapshots.fresh.version;},'the refresh');
+  await frame();
+  const state=()=>summary(15)?.querySelector('.list-state')?.textContent;
+  check(recordIsOpen(row(15)) && loaded(),'The open row shows its detail after the refresh.');
+  check(state()==='Waiting','The open row shows its saved state after the refresh. Found '+state()+'.');
+  // Scroll to the page end farther from the open row; the saved row can sort to either end.
+  const pageEnd=document.documentElement.scrollHeight;
+  const far=row(15).getBoundingClientRect().top+scrollY>pageEnd/2 ? 0 : pageEnd;
+  const mountedKeys=()=>[...document.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key);
+  const near=mountedKeys();
+  scrollTo({top:far,behavior:'instant'});
+  for(let count=0;count<3;count++) await frame();
+  // The window drops the rows near the open row, but the open row stays mounted, so its detail never reloads.
+  const box=row(15)?.getBoundingClientRect();
+  check(near.some(key=>!mountedKeys().includes(key)),'The window drops the rows near the open row when the page scrolls away.');
+  check(box && (box.bottom<0 || box.top>innerHeight) && recordIsOpen(row(15)) && loaded(),
+   'The open row stays mounted with its detail outside the viewport.');
+  scrollTo({top:pageEnd-far,behavior:'instant'});
+  for(let count=0;count<3;count++) await frame();
+  row(15).scrollIntoView({block:'center',behavior:'instant'});
+  for(let count=0;count<3;count++) await frame();
+  check(recordIsOpen(row(15)) && loaded(),'The open row shows its detail after the page scrolls away and back.');
+  check(state()==='Waiting','The open row keeps its saved state after the page scrolls away and back. Found '+state()+'.');
+"""
+        markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    def assert_own_save_keeps_the_open_row(self, opener: str) -> None:
+        """Open change-15 with the opener, save feedback, and check the row stays open at the same pixel."""
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 31)]
+        waiting = [replace(record, state=review_items.ReviewState.WAITING) if record.key == 'change-15' else record
+                   for record in records]
+        (page, initial), (_, fresh) = self.browser_snapshot(records), self.browser_snapshot(waiting)
+        steps = r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  const pageFetch=window.fetch;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
+   saved.content.querySelector('form').remove();
+   saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
+   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+    detail_html:saved.innerHTML});
+  };
+  OPENER
+  await until(()=>row(15) && recordIsOpen(row(15)),'the open row');
+  const form=await readyReviewCard(row(15));
+  form.elements.feedback.value='Check the header.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  const top=row(15).getBoundingClientRect().top;
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  const shows=()=>row(15) && recordDetails(row(15))?.textContent.includes('The saved words.');
+  await until(()=>shows() || !row(15),'the saved detail or a removed row');
+  for(let count=0;count<5;count++) await frame();
+  check(Boolean(row(15)) && recordIsOpen(row(15)),'After the save, the open row is still on the page.');
+  check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the save, the open row stays at the same pixel.');
+""".replace('OPENER', opener)
+        markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_keeps_a_row_opened_by_an_item_link(self) -> None:
+        self.assert_own_save_keeps_the_open_row("location.hash=new URLSearchParams({item:'change-15'});")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_keeps_a_row_opened_by_a_click(self) -> None:
+        self.assert_own_save_keeps_the_open_row("row(15).querySelector('.list-toggle').click();")
+
+    def handed_change_page(self, *, stale: bool = False) -> bytes:
+        """Return a probe page whose change-15 feedback save waits for finishSave().
+
+        With stale, the page also serves a 'stale' snapshot: a new version that still shows change-15 Open.
+        """
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}', title=f'Review change {number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 31)]
+        waiting = [replace(record, state=review_items.ReviewState.WAITING) if record.key == 'change-15' else record
+                   for record in records]
+        (page, initial), (_, fresh) = self.browser_snapshot(records), self.browser_snapshot(waiting)
+        snapshots = {'initial': initial, 'fresh': fresh}
+        if stale:
+            renamed = [replace(record, title='Renamed change 3') if record.key == 'change-3' else record
+                       for record in records]
+            snapshots['stale'] = self.browser_snapshot(renamed)[1]
+        return snapshot_probe_page(page, snapshots, r"""
+  frameElement.style.width='1100px';frameElement.style.height='700px';
+  await frame();
+  const pageFetch=window.fetch;
+  let finishSave;
+  window.fetch=async(url,options={})=>{
+   if(options.method!=='POST') return pageFetch(url,options);
+   const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
+   saved.content.querySelector('form').remove();
+   saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
+   const reply=Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+    detail_html:saved.innerHTML});
+   return new Promise(resolve=>{finishSave=()=>resolve(reply);});
+  };
+  const follow=async key=>{
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   location.hash=new URLSearchParams({item:key});
+   await changed;
+   for(let count=0;count<10;count++) await frame();
+  };
+  const open15=()=>Boolean(row(15)) && recordIsOpen(row(15));
+  await follow('change-15');
+  await until(open15,'the open row');
+  const form=await readyReviewCard(row(15));
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.elements.feedback.value='Check the header.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  form.requestSubmit(form.querySelector('[value="feedback"]'));
+  AFTER_SUBMIT
+""")
+
+    def assert_relink_after_own_save_hides_the_row(self, leave: str) -> None:
+        """Save feedback on a linked change, leave its row, then link to it again before the next snapshot."""
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  LEAVE
+  for(let count=0;count<10;count++) await frame();
+  check(!row(15),'The handed change leaves the page after its row closes.');
+  await follow('change-15');
+  check(!row(15),'A new link to the handed change shows no row before the next snapshot.');
+""".replace('LEAVE', leave)
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_relink_after_closing_an_own_save_row_hides_the_handed_change(self) -> None:
+        self.assert_relink_after_own_save_hides_the_row("row(15).querySelector('.list-toggle').click();")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_relink_after_following_another_item_hides_the_handed_change(self) -> None:
+        self.assert_relink_after_own_save_hides_the_row("await follow('change-3');")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_row_stays_open_through_a_stale_snapshot(self) -> None:
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  const top=row(15).getBoundingClientRect().top;
+  const content=document.querySelector('[data-review]');
+  const shownMessage=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  const stays=label=>{
+   check(open15(),'After '+label+', the own row is still open.');
+   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After '+label+', the own row stays at the same pixel.');
+  };
+  shown='stale';shownMessage();
+  await until(()=>content.dataset.version===snapshots.stale.version,'the stale refresh');
+  for(let count=0;count<10;count++) await frame();
+  stays('a snapshot that still shows the old change');
+  shownMessage();
+  for(let count=0;count<30;count++) await frame();
+  stays('a second refresh of the same snapshot');
+  // The All chip keeps the Waiting row listed; a chip that hides the row closes it by the filter rule.
+  document.getElementById('review-show-all').click();
+  for(let count=0;count<10;count++) await frame();
+  stays('a chip click');
+"""
+        markup = self.handed_change_page(stale=True).decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_own_save_row_stays_open_after_a_link_to_the_same_item(self) -> None:
+        steps = r"""
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'The own save keeps the linked row open.');
+  const top=row(15).getBoundingClientRect().top;
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({item:'change-15',show:'all'});
+  await changed;
+  for(let count=0;count<10;count++) await frame();
+  check(open15(),'After a link to the same open item, the own row is still open.');
+  check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the same-item link, the own row stays at the same pixel.');
+"""
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_deferred_link_after_change_feedback_waits_for_the_snapshot(self) -> None:
+        steps = r"""
+  await follow('change-3');
+  await follow('change-15');
+  finishSave();await saved;
+  for(let count=0;count<10;count++) await frame();
+  check(!row(15),'The deferred link keeps the handed change hidden until the next snapshot.');
+  const content=document.querySelector('[data-review]');
+  await until(()=>{refresh();return content.dataset.version===snapshots.fresh.version;},'the refresh');
+  await until(()=>Boolean(row(15)),'the handed change after the snapshot');
+  check(row(15).dataset.state==='Waiting','The snapshot shows the handed change as Waiting.');
+"""
+        markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
@@ -5081,7 +5386,6 @@ window.fetch=async(url,options={})=>{
  const failures=[];
  const check=(ok,message)=>{if(!ok) failures.push(message);};
  const row=()=>[...document.querySelectorAll('[data-list-item]')].find(node=>node.dataset.key===KEY);
- const updates=document.querySelector('[data-show-record-updates]');
  let revision=0;
  window.transformFixtureBody=(text,key)=>{
   if(key!==KEY) return text;
@@ -5103,26 +5407,20 @@ window.fetch=async(url,options={})=>{
         'Assign starts with the card owner.');
   assignee.value=ASSIGNEE;
   assignee.dispatchEvent(new Event('change',{bubbles:true}));
-  const refresh=async shown=>{
+  const refresh=async()=>{
    revision++;
-   const offered=new Promise(resolve=>{
-    const observer=new MutationObserver(()=>{
-     if(!updates.hidden){observer.disconnect();resolve();}
-    });
-    observer.observe(updates,{attributes:true,attributeFilter:['hidden']});
-   });
-   const refreshed=new Promise(resolve=>document.querySelector('[data-review]')
-     .addEventListener('review-refreshed',resolve,{once:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-   await Promise.all([refreshed,offered]);
-   check(await readyReviewCard(row())===shown,'The form stays in place until Show updates.');
-   updates.click();
+   const end=performance.now()+8000;
+   while(recordDetails(row())?.querySelector('[name="revision"]')?.value!=='fixture-'+revision){
+    if(performance.now()>end) throw new Error('The refreshed form did not load the assignment.');
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   }
    return readyReviewCard(row());
   };
-  const form=await refresh(original);
-  check(form!==original && form.elements.assignee.value===ASSIGNEE,'Show updates keeps the assignment.');
+  const form=await refresh();
+  check(form!==original && form.elements.assignee.value===ASSIGNEE,'Refresh keeps the assignment.');
   const name=form.elements.assignee.selectedOptions[0].textContent;
-  const refreshed=await refresh(form);
+  const refreshed=await refresh();
   const unavailable=refreshed.elements.assignee.selectedOptions[0];
   check(refreshed!==form && unavailable.value===ASSIGNEE && unavailable.textContent===name+' — not available',
         'Refresh keeps the unavailable assignee selected.');
@@ -5666,6 +5964,11 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
    form.querySelector('[data-later-toggle]').click();
    form.querySelector('[data-later-preset="soon"]').click();
   }else form.requestSubmit(form.querySelector('button[value="'+action+'"]'));
+  if(action==='question' || action==='feedback'){
+   check(posts[0]===action && row.isConnected && recordIsOpen(row),'The action posts and keeps the row open for the reply.');
+   await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+   return;
+  }
   check(posts[0]===action && !row.isConnected,'The action posts and removes the record.');
   const motion=()=>document.querySelector('[data-record-motion]');
   if(REDUCED){
@@ -5673,7 +5976,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
   }else{
    const clip=motion()?.querySelector('.record-motion-clip'),exit=clip?.getAnimations()[0];
    if(!exit) throw new Error('The shared exit animation is missing.');
-   check(!motion().querySelector('[data-detail]:not([hidden])'),'Only the summary fades behind the open dialog.');
+   check(motion().querySelector('[data-detail]:not([hidden])'),'The expanded row fades with its summary.');
    check(exit.effect.getTiming().duration===Number(document.querySelector('[data-review]').dataset.cardFadeOutMs),
     'The card uses the configured fade time.');
    exit.pause();exit.currentTime=0;
@@ -5711,16 +6014,13 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const row=rows().find(node=>top(node)>120 && top(node)<420);
  if(!row) throw new Error('A card must be in the viewport.');
  const panel=motionKey(row),next=row.nextElementSibling;
- const before=top(row),following=top(next);
+ const before=top(row);
  row.querySelector('.list-toggle').click();
  const form=await readyReviewCard(row);
- const detail=recordDetails(row),scroll=detail.closest('.console-dialog-body');
- detail.style.height='1600px';
  await frame();
- scroll.scrollTop=220;
- await frame();
- check(scroll.scrollTop===220 && near(top(row),before) && near(top(next),following),
-  'Scrolling the dialog leaves the table in place.');
+ const following=top(next);
+ check(near(top(row),before) && following>before+recordDetails(row).getBoundingClientRect().height,
+  'The row opens below its summary and leaves the summary in place.');
  send(form);
  const clip=copy(panel);
  check(clip && near(top(clip),before),'The summary copy starts at the original position.');
@@ -5816,9 +6116,11 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  form.requestSubmit(form.querySelector('[value="'+action.outcome+'"]'));
  const clip=copy(motionKey(row));
  const motion=clip?.getAnimations()[0];
- if(!motion || !posts.has(row.dataset.key)) throw new Error('The save must start the fade.');
+ const staysOpen=['feedback','question'].includes(action.outcome);
+ if(!posts.has(row.dataset.key) || (staysOpen ? !recordIsOpen(row) : !motion))
+  throw new Error('The save did not start with the expected row state.');
  posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
- motion.finish();await frame();
+ motion?.finish();await frame();
  if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
   'The completed item leaves Review.');
  const place=new URLSearchParams(location.hash.slice(1));
@@ -6629,11 +6931,15 @@ window.fetch=async(_url,options={})=>{
   const picked=recordDetails(question).querySelector('input[name=choice]');picked.click();
   const draft=recordDetails(question).querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
   draft.focus();draft.setSelectionRange(2,7,'backward');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   let fresh=rows().find(row=>row.dataset.type==='question');
-  check(recordIsOpen(fresh) && recordDetails(fresh).querySelector('textarea').value==='Keep this draft','refresh keeps the card and draft');
-  document.querySelector('[data-show-record-updates]').click();
+  const updateDeadline=performance.now()+8000;
+  while(!recordDetails(fresh)?.querySelector('[name="token"]')?.value.endsWith('-refreshed')){
+   if(performance.now()>updateDeadline) throw new Error('The revised question did not load.');
+   await flush();fresh=rows().find(row=>row.dataset.type==='question');
+  }
   const refreshedDraft=recordDetails(fresh).querySelector('textarea');
+  check(recordIsOpen(fresh) && refreshedDraft.value==='Keep this draft','Refresh keeps the card and draft.');
   check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
     refreshedDraft.selectionEnd===7 && refreshedDraft.selectionDirection==='backward','refresh keeps focus and selection');
   check(recordDetails(fresh).querySelector('[name="later"]').value==='2098-12-31T16:30','F018: refresh keeps the picked Later date and time');
@@ -6678,7 +6984,14 @@ window.fetch=async(_url,options={})=>{
   rejected=holdPost();works().click();
   refreshed=afterRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
   check(!visibleStatus('Not saved: Fixture older refusal'),'A later refusal replaces the previous reason.');
-  const target=liveRow(initialTarget.dataset.key);target.querySelector('.list-toggle').click();await readyReviewCard(target);
+  const targetKey=initialTarget.dataset.key;
+  liveRow(targetKey).querySelector('.list-toggle').click();
+  const targetDeadline=performance.now()+8000;
+  while(!recordDetails(liveRow(targetKey))?.querySelector('[data-review-form]')){
+   if(performance.now()>targetDeadline) throw new Error('The target Change body did not load.');
+   await flush();
+  }
+  const target=liveRow(targetKey);
   const form=recordDetails(target).querySelector('form'),savedResponse=holdPost();
   form.requestSubmit(form.querySelector('[value="works"]'));
   check(leavingNow(target),'A save starts the departure before the response.');
@@ -6824,11 +7137,13 @@ window.fetch=async(_url,options={})=>{
   const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
   const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
-  check(window.posts.at(-1).get('outcome')==='question' && leavingNow(pending) &&
+  check(window.posts.at(-1).get('outcome')==='question' && recordIsOpen(pending) &&
     Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-1,
-    'Ask question starts the departure and updates the count before the response');
+    'Ask question keeps the row open and updates the count before the response');
   questionResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
+  const sent=liveRow(pendingKey);
+  if(recordIsOpen(sent)) sent.querySelector('.list-toggle').click();
   const revision=pending.dataset.updated;
   for(const [state,updated,revealed] of [
     ['Open',revision,false],['Validating',revision,false],
@@ -7131,7 +7446,11 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
    const original=row(),wall=recordDetails(original).querySelector('[name="later"]');
    wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-   await new Promise(resolve=>setTimeout(resolve,60));
+   const end=performance.now()+8000;
+   while(recordDetails(row()).querySelector('[data-review-form]')===wall.form){
+    if(performance.now()>end) throw new Error('The new form did not load.');
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   }
    const current=row(),form=await readyReviewCard(current);
    check(current!==original && form.elements.later.value===draft,'Refresh restores '+draft);
    const toggle=form.querySelector('[data-later-toggle]'),chooser=form.querySelector('[data-later-custom]');

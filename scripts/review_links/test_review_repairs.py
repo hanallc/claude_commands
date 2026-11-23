@@ -725,7 +725,11 @@ window.fetch=async(url,options={})=>{
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
    asked().querySelector('.list-toggle').click();
    const asking=await readyReviewCard(asked());asking.elements.feedback.value='Check the next case.';
+   const openBeforeAsk=count('open');
    await save(asking,'question');
+   check(count('open')===openBeforeAsk-1,'F021: Ask question reduces the Open count for '+key);
+   // A change or proposal Ask keeps its row open; any other row that stays open fails below.
+   if(STAYS_OPEN.includes(key)) asked().querySelector('.list-toggle').click();
    check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
@@ -736,26 +740,17 @@ window.fetch=async(url,options={})=>{
   }
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
+  const investigation=()=>document.querySelector('[data-key="'+keys.at(-1)+'"]');
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
-  investigation.querySelector('.list-toggle').click();
-  await readyReviewCard(investigation);
-  const dialog=document.querySelector('#record-item-dialog');
-  const updates=dialog.querySelector('[data-show-record-updates]');
-  const latest=()=>recordDetails(investigation).textContent.includes('The owner checked the next case.');
-  const ready=()=>latest() || !updates.hidden;
-  if(!ready()) await new Promise((resolve,reject)=>{
-   const observer=new MutationObserver(()=>{
-    if(ready()){observer.disconnect();clearTimeout(deadline);resolve();}
-   });
-   const deadline=setTimeout(()=>{observer.disconnect();reject(new Error('The answer did not load.'));},8000);
-   observer.observe(dialog,{childList:true,subtree:true,attributes:true});
-  });
-  if(!latest()) updates.click();
-  check(latest(),'The dialog shows the current answer before marking it read.');
-  await save(await readyReviewCard(investigation),'read');
+  investigation().querySelector('.list-toggle').click();
+  await readyReviewCard(investigation());
+  const latest=()=>recordDetails(investigation())?.textContent.includes('The owner checked the next case.');
+  const deadline=performance.now()+8000;
+  while(!latest() && performance.now()<deadline) await new Promise(resolve=>requestAnimationFrame(resolve));
+  check(latest(),'The row shows the current answer before marking it read.');
+  await save(await readyReviewCard(investigation()),'read');
   await refresh();
   check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
     ownerChip('').textContent==='All 0' && counts()[0]===0,
@@ -769,6 +764,7 @@ window.fetch=async(url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',*decisions,f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('STAYS_OPEN', json.dumps(['page-owner/C1', decisions[0]]))
         probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
             'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
@@ -817,9 +813,11 @@ window.fetch=async(url,options={})=>{
     !page.querySelector('[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
    if(entry.item){
-    const summary=page.querySelector('[data-key="'+entry.item+'"] .list-toggle');
-    const dialog=page.getElementById(summary?.getAttribute('aria-controls'));
-    check(summary?.getAttribute('aria-expanded')==='true' && dialog?.open,'F012: the legacy row opens its dialog.');
+    const item=page.querySelector('[data-list-item][data-key="'+entry.item+'"]');
+    const summary=item?.querySelector('.list-toggle'),detail=item?.querySelector('[data-detail]');
+    const owner=page.querySelector('[data-owner-chip][aria-pressed="true"]');
+    check(summary?.getAttribute('aria-expanded')==='true' && detail && !detail.hidden &&
+     owner?.dataset.ownerChip===item.dataset.owner,'F012: the legacy row opens in its row with the review owner kept.');
    }
    legacy.remove();
   }

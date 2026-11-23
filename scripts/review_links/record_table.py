@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from scripts.lib import conf
-from scripts.review_links import page_frame
 
 
-DIALOG_ID = 'record-item-dialog'
 DELIVERY_WINDOW_SECONDS = 30
 
 
@@ -20,29 +18,27 @@ def delivery_window_seconds(settings: conf.ConfigRead) -> int:
     return settings.value('page_delivery_window_seconds', conf.positive_whole, default=DELIVERY_WINDOW_SECONDS)
 
 
+def log_max_height_rem(settings: conf.ConfigRead) -> int:
+    """Read the log height limit on a narrow page."""
+    return settings.whole('list_log_max_height_rem')
+
+
+def log_panel(log_id: str, entries: str) -> str:
+    """Render a log that scrolls in its own area."""
+    return ('<section class="list-log-panel"><h3>Log · newest first</h3>'
+            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
+            + '<ol class="list-log">' + entries + '</ol></div></section>')
+
+
 RECORD_MISSING = '<span data-record-missing role="status" hidden>This item is no longer in the list.</span>'
-RECORD_UPDATE_STATUS = (
-    RECORD_MISSING + '<span data-record-updates role="status" hidden>Updates available</span>'
-    + '<button type="button" data-show-record-updates hidden>Show updates</button>'
-)
 RECORD_DETAIL_ERROR = '<div data-record-error role="status" hidden></div>'
 RECORD_LINK_NOTICE = '<div data-record-link-notice role="status" hidden></div>'
 
 
-def render_dialog() -> str:
-    """Render the Review record dialog."""
-    return page_frame.console_dialog(
-        DIALOG_ID, 'record-item-title', 'Item',
-        '<div data-record-dialog-detail></div>',
-        before_body='<div class="record-dialog-status">' + RECORD_UPDATE_STATUS + '</div>',
-        footer='<footer>' + RECORD_DETAIL_ERROR + RECORD_LINK_NOTICE + '</footer>',
-    )
-
-
 def render_inline_detail() -> str:
-    """Render the template for the open List row."""
+    """Render the template for the open row."""
     return ('<template id="record-inline-view"><div data-record-inline-view>'
-            + '<div class="record-dialog-status">' + RECORD_MISSING + RECORD_LINK_NOTICE + '</div>'
+            + '<div class="record-row-status">' + RECORD_MISSING + RECORD_LINK_NOTICE + '</div>'
             + '<div data-record-inline-detail></div>' + RECORD_DETAIL_ERROR + '</div></template>')
 
 
@@ -237,21 +233,18 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-window-before],[data-window-after],[data-window-gap]{border:0!important;margin:0!important;border-radius:0!important}
-#record-item-dialog{margin:16px auto auto}
-#record-item-dialog .console-dialog-frame{grid-template-rows:auto auto minmax(0,1fr) 70px}
-#record-item-dialog .console-dialog-body{scrollbar-gutter:stable}
-#record-item-dialog .console-dialog-frame>footer{overflow-y:auto;overscroll-behavior:contain}
-.record-dialog-status{height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
-.record-dialog-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
+:is(.record-row-status,.review-card-status){height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
+.review-card-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
 border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink)}
-.record-dialog-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-@media(max-width:480px){.record-dialog-status{padding-inline:16px}}
+.review-card-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+@media(max-width:480px){:is(.record-row-status,.review-card-status){padding-inline:16px}}
+[data-record-inline-view] .record-row-status{border-inline-start:3px solid var(--accent);text-align:left}
+[data-record-inline-view] .record-row-status:not(:has(> :not([hidden]))){display:none}
+[data-record-inline-view] [data-record-error]{padding-inline:24px;text-align:left}
+[data-record-inline-view] [data-record-link-notice]{padding:0;border:0}
 :is([data-record-missing],[data-record-error],[data-record-link-notice]){color:var(--warning)}
 :is([data-record-error],[data-record-link-notice]){padding-block:12px;border-top:1px solid var(--line);overflow-wrap:anywhere}
-:is([data-record-dialog-detail],[data-review-card]) button[aria-disabled="true"]{opacity:.5;cursor:default}
-[data-record-dialog-detail] :is(.list-panel,.review-panel){grid-template-columns:minmax(0,1fr);padding:0;border:0}
-[data-record-dialog-detail] .review-actions{display:grid;gap:16px}
-[data-record-dialog-detail] .review-action-group+.review-action-group{padding:0;border:0}
+[data-review-card] button[aria-disabled="true"]{opacity:.5;cursor:default}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
 [data-missing-keys]{white-space:pre-line}
 [data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
@@ -318,7 +311,7 @@ DETAIL_SCRIPT = r'''
 function recordDetails(item){return item?.openDetails ?? item?.querySelector('[data-detail]>td');}
 function recordIsOpen(item){return item?.querySelector('.list-toggle')?.getAttribute('aria-expanded')==='true';}
 function recordFromDetail(element){
- return element?.closest('[data-record-dialog-detail]')?.recordItem ?? element?.closest('[data-list-item]');
+ return element?.closest('[data-list-item]');
 }
 '''
 
@@ -391,8 +384,13 @@ function alignRecordRowTop(row,top,remainingShrink){
   return;
  }
  const hadSpaceAbove=Boolean(recordSpaceAbove),hadSpaceBelow=Boolean(recordSpaceBelow);
+ const scroller=document.scrollingElement;
+ // Scroll anchoring would move the page when the top space changes.
+ const anchor=scroller.style.overflowAnchor;
+ scroller.style.overflowAnchor='none';
  const desired=window.scrollY+difference-recordSpaceHeight(recordSpaceAbove);
- const target=Math.max(0,Math.ceil(desired)),above=target-desired;
+ // Firefox scrolls by whole pixels from a fractional position, so the target keeps the current fraction.
+ const target=Math.max(0,window.scrollY+Math.ceil(desired-window.scrollY)),above=target-desired;
  if(above>0 && !recordSpaceAbove) recordSpaceAbove=createRecordSpace(frame,true);
  recordSpaceAbove=setRecordSpace(recordSpaceAbove,above);
  const {scrollHeight,clientHeight}=document.scrollingElement;
@@ -403,6 +401,7 @@ function alignRecordRowTop(row,top,remainingShrink){
  if(below>0 && !recordSpaceBelow) recordSpaceBelow=createRecordSpace(frame,false);
  recordSpaceBelow=setRecordSpace(recordSpaceBelow,below);
  window.scrollTo({top:target,behavior:'instant'});
+ scroller.style.overflowAnchor=anchor;
  recordScrollTop=window.scrollY;
  if(hadSpaceAbove!==Boolean(recordSpaceAbove) || hadSpaceBelow!==Boolean(recordSpaceBelow)) bindRecordScroll();
 }
@@ -526,20 +525,17 @@ let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 let windowEntries=[],pendingFrame=0,revealKey='';
-const dialog=document.getElementById('record-item-dialog'),dialogBody=dialog?.querySelector('.console-dialog-body');
 const inlineView=document.getElementById('record-inline-view')?.content.firstElementChild.cloneNode(true);
-const detailView=dialog ?? inlineView;
-const viewDetail=detailView?.querySelector('[data-record-dialog-detail],[data-record-inline-detail]');
-const detailFocus=()=>dialog?.querySelector('[data-close]') ?? openItem?.querySelector('.list-toggle');
-const dialogTitle=dialog?.querySelector('h2'),detailMissing=detailView?.querySelector('[data-record-missing]');
-const detailError=detailView?.querySelector('[data-record-error]');
-const detailUpdates=detailView?.querySelector('[data-record-updates]');
-const showUpdates=detailView?.querySelector('[data-show-record-updates]');
-const detailLinkNotice=detailView?.querySelector('[data-record-link-notice]');
-let openItem=null,dialogNeedsRecord=false;
+const viewDetail=inlineView?.querySelector('[data-record-inline-detail]');
+const detailFocus=()=>openItem?.querySelector('.list-toggle');
+const detailMissing=inlineView?.querySelector('[data-record-missing]');
+const detailError=inlineView?.querySelector('[data-record-error]');
+const detailLinkNotice=inlineView?.querySelector('[data-record-link-notice]');
+let openItem=null,openNeedsRecord=false;
+// Changes when a row opens or closes; never on a remount, a snapshot or a link to the open row.
+let openSession=0;
 let shownRevision,statusError='',savedDisplayFailed=false;
 let itemRequest=null;
-const pendingDetail=new Map();
 const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
 function preserveRecordRowTop(update){
@@ -550,6 +546,26 @@ function preserveRecordRowTop(update){
  if(top!==undefined && after && key===openItem.dataset.key)
   trackRecordRowDuringMotion(after,top,rowMotion);
  return result;
+}
+/** @typedef {{key: string, index: string, offset: number}} LogPosition */
+/** @type {LogPosition | null} */
+let heldLog=null;
+const openLog=()=>recordDetails(openItem)?.querySelector('.list-log-scroll');
+// Moving or replacing the open row resets its log scroll, so hold the first visible entry for this task.
+function holdLog(){
+ const log=openLog();
+ if(heldLog || !log?.clientHeight || !log.scrollTop) return;
+ const top=log.getBoundingClientRect().top;
+ const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
+ if(!entry) return;
+ heldLog={key:openItem.dataset.key,index:entry.dataset.logIndex,offset:entry.getBoundingClientRect().top-top};
+ queueMicrotask(()=>{heldLog=null;});
+}
+function restoreLog(){
+ const log=openLog();
+ if(!heldLog || openItem?.dataset.key!==heldLog.key) return;
+ const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
+ if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
 }
 function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
 function spacer(node,height){
@@ -571,6 +587,7 @@ function mergeRanges(ranges){
 }
 function drawWindow(){
  if(!options.mount) return;
+ holdLog();
  const table=content.querySelector('table'),before=table.querySelector('[data-window-before]'),after=table.querySelector('[data-window-after]');
  for(const [key,node] of mounted){const height=node.getBoundingClientRect().height;if(height>0) measured.set(key,height);}
  const motions=motionsByKey();
@@ -634,52 +651,41 @@ function drawWindow(){
   cursor=node;
  }
  syncOpenItem();
+ restoreLog();
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
 }
 function updateItemDetail(item,update){
  const detail=recordDetails(item);
- if(detail!==viewDetail || (dialog && !dialog.open)){update(detail);return;}
- const top=dialogBody?.scrollTop,field=document.activeElement;
+ if(detail!==viewDetail){update(detail);return;}
+ const field=document.activeElement;
  const selector=detail.contains(field) && (field.id ? '#'+CSS.escape(field.id) :
   field.localName+['name','value','href'].map(name=>field.hasAttribute(name) ?
    '['+name+'="'+CSS.escape(field.getAttribute(name))+'"]' : '').join(''));
  const at=selector ? [...detail.querySelectorAll(selector)].indexOf(field) : -1;
  const start=field?.selectionStart,end=field?.selectionEnd,direction=field?.selectionDirection;
+ holdLog();
  update(detail);
+ restoreLog();
  if(at>=0 && !field.isConnected){
   const next=detail.querySelectorAll(selector)[at];
   (next ?? detailFocus()).focus({preventScroll:true});
   if(typeof start==='number' && next?.setSelectionRange) next.setSelectionRange(start,end,direction);
  }
- if(dialogBody) dialogBody.scrollTop=top;
 }
 function drawDetailStatus(){
- if(!detailView) return;
+ if(!inlineView) return;
  const error=savedDisplayFailed ? 'Saved; the item could not refresh.' : statusError;
  detailError.hidden=!error || !detailMissing.hidden;
  detailError.textContent=error;
- if(dialog) showUpdates.hidden=detailUpdates.hidden=!pendingDetail.size || !detailMissing.hidden;
- const blocked=itemUpdateRequired();
- for(const button of viewDetail.querySelectorAll('form button:is([type="submit"],:not([type]))')){
-  if(blocked) button.setAttribute('aria-disabled','true');
-  else button.removeAttribute('aria-disabled');
- }
 }
-function itemUpdateRequired(){return [...pendingDetail.values()].some(update=>update.blocks);}
 function itemError(message){statusError=message;drawDetailStatus();}
-function queueItemUpdate(item,slot,update,blocks=true){
+function queueItemUpdate(item,update){
  if(item!==openItem){update?.(item,recordDetails(item));return;}
- if(!dialog || deliveryRequest()){
-  pendingDetail.delete(slot);
-  if(update){
-   options.rememberItem?.(item);
-   updateItemDetail(item,detail=>update(item,detail));
-  }
-  drawDetailStatus();
-  return;
+ if(update){
+  options.rememberItem?.(item);
+  updateItemDetail(item,detail=>update(item,detail));
  }
- if(update) pendingDetail.set(slot,{update,blocks});else pendingDetail.delete(slot);
  drawDetailStatus();
 }
 function installItemRevision(revision,render){
@@ -696,13 +702,12 @@ function presentItemRevision(item,revision,render,{initial=false,force=false}={}
   drawDetailStatus();
   return;
  }
- queueItemUpdate(item,'body',force || revision!==shownRevision ? install : null);
+ queueItemUpdate(item,force || revision!==shownRevision ? install : null);
 }
 function installOwnItemResult(request,revision,render){
  if(!currentItemRequest(request)) return;
  const item=openItem;
  options.rememberItem?.(item);
- pendingDetail.clear();
  const install=installItemRevision(revision,render);
  updateItemDetail(item,detail=>install(item,detail));
  drawDetailStatus();
@@ -740,55 +745,27 @@ function showDraftCopy(words,editable){
  field.value=words;field.readOnly=true;field.dataset.reviewDraft='';
  label.append(field);viewDetail.append(label);
 }
-function applyItemUpdates(){
- const item=openItem;
- if(!item || !pendingDetail.size) return;
- options.rememberItem?.(item);
- const full=pendingDetail.get('body');
- const updates=[...pendingDetail.values()].filter(update=>update!==full);
- pendingDetail.clear();
- updateItemDetail(item,detail=>{
-  full?.update(item,detail);
-  for(const {update} of updates) update(item,detail);
- });
- drawDetailStatus();
- return true;
-}
-showUpdates?.addEventListener('click',()=>{
- const focused=document.activeElement===showUpdates;
- applyItemUpdates();
- drawDetailStatus();
- if(focused) detailFocus()?.focus({preventScroll:true});
-});
-function setDialogTitle(item){
- if(dialogTitle)
-  dialogTitle.textContent=options.itemTitle?.(item) ?? item.querySelector('.list-toggle').textContent.replace(/^›/,'').trim();
-}
 function returnItemDetail(){
  if(!openItem) return;
- if(!detailMissing.hidden || !applyItemUpdates()) options.rememberItem?.(openItem);
- pendingDetail.clear();
+ options.rememberItem?.(openItem);
  itemRequest=null;
  savedDisplayFailed=false;
  statusError='';
  delete openItem.openDetails;
  recordDetails(openItem).replaceChildren(...viewDetail.childNodes);
- delete viewDetail.recordItem;
- if(inlineView){
-  inlineView.remove();
-  clearRecordSpace();
- }
+ inlineView.remove();
+ clearRecordSpace();
  openItem=null;
 }
 function syncOpenItem(){
- if(!detailView) return;
+ if(!inlineView) return;
  const key=opened.values().next().value;
  if(!key){
   if(!openItem) return;
   const previous=openItem.dataset.key;
   const focused=document.activeElement;
-  const restoreFocus=(dialog || inlineView.contains(focused)) && options.ownsFocus?.()!==false;
-  returnItemDetail();dialog?.close();
+  const restoreFocus=inlineView.contains(focused) && options.ownsFocus?.()!==false;
+  returnItemDetail();
   if(restoreFocus){
    const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
    (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
@@ -796,7 +773,7 @@ function syncOpenItem(){
   return;
  }
  const sameItem=openItem?.dataset.key===key;
- let item=options.mount ? mounted.get(key) ?? (sameItem && !dialogNeedsRecord ? openItem : null) : itemWithKey(key);
+ let item=options.mount ? mounted.get(key) ?? (sameItem && !openNeedsRecord ? openItem : null) : itemWithKey(key);
  if(options.mount && !item && options.hasKey(key)){
   item=options.mount(itemWithKey(key).dataset);
   item.hidden=true;setExpanded(item,true);
@@ -804,12 +781,12 @@ function syncOpenItem(){
  if(!item || (options.hasKey && !options.hasKey(key))){
   if(sameItem){
    detailMissing.hidden=false;
-   pendingDetail.clear();drawDetailStatus();
+   drawDetailStatus();
    viewDetail.querySelectorAll('form button').forEach(control=>control.disabled=true);
   }
   return;
  }
- dialogNeedsRecord=false;
+ openNeedsRecord=false;
  if(item===openItem) return;
  const wasMissing=!detailMissing.hidden;
  const keepBody=sameItem && !viewDetail.querySelector('[data-record-loading]');
@@ -821,19 +798,13 @@ function syncOpenItem(){
   if(openItem) returnItemDetail();
   viewDetail.replaceChildren(...children);
   shownRevision=options.itemRevision?.(item);
-  setDialogTitle(item);
  }
- if(inlineView) incoming.replaceChildren(inlineView);
- openItem=item;viewDetail.recordItem=item;item.openDetails=viewDetail;
+ incoming.replaceChildren(inlineView);
+ openItem=item;item.openDetails=viewDetail;
  detailMissing.hidden=true;
  if(options.itemRevision && keepBody) presentNewDetail(item,children,wasMissing);
  else if(!keepBody) options.detailInstalled?.(item);
  drawDetailStatus();
- if(dialog && !dialog.open) dialog.showModal();
- if(dialog && !sameItem){
-  detailFocus().focus({preventScroll:true});
-  dialogBody.scrollTop=0;
- }
 }
 function presentNewDetail(item,children,wasMissing){
  presentItemRevision(item,options.itemRevision(item),(row,detail)=>{
@@ -841,7 +812,6 @@ function presentNewDetail(item,children,wasMissing){
   const retained=slot && detail.querySelector(slot);
   detail.replaceChildren(...children);
   if(retained) detail.querySelector(slot)?.replaceWith(retained.cloneNode(true));
-  setDialogTitle(row);
   options.detailInstalled?.(row);
  },{force:wasMissing});
 }
@@ -858,16 +828,11 @@ function keepOpenRow(){
  detailMissing.hidden=true;
  presentNewDetail(item,children,wasMissing);
 }
-if(dialog) bindConsoleDialog(dialog,()=>{
- if(!dialog.open) return;
- closeCard(openItem.dataset.key,false);
- apply(true);
-});
 function mount(data){
  const key=data.key;
  let node=mounted.get(key);
  if(!node){
-  node=!dialogNeedsRecord && options.pinOpenRow?.(key)!==false && openItem?.dataset.key===key
+  node=!openNeedsRecord && options.pinOpenRow?.(key)!==false && openItem?.dataset.key===key
    ? openItem : options.mount(data);
   mounted.set(key,node);resize?.observe(node);
  }
@@ -951,17 +916,16 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');
  const saved=followingItemLink ? null : history.state?.recordTable;
  if(saved){
-  opened.clear();
   const key=saved.opened.includes(item) ? item : saved.opened[0];
-  if(key) openCard(key);
+  if(key) openCard(key);else opened.clear();
  }else if(!followingItemLink && item){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
   if(itemWithKey(item)){openCard(item);revealKey=item;}
-  else if(dialog && !options.keepItemOnMissingLink) opened.clear();
- }else if(detailView && !followingItemLink) opened.clear();
+  else if(inlineView && !options.keepItemOnMissingLink) opened.clear();
+ }else if(inlineView && !followingItemLink) opened.clear();
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
@@ -1021,9 +985,8 @@ function stopMotion(item){
 function setExpanded(item,expanded){
  const detail=item.querySelector('[data-detail]'),toggle=item.querySelector('.list-toggle');
  const changed=recordIsOpen(item)!==expanded;
- detail.hidden=Boolean(dialog) || !expanded;
+ detail.hidden=!expanded;
  toggle.setAttribute('aria-expanded',String(expanded));
- if(dialog){toggle.setAttribute('aria-controls',dialog.id);toggle.setAttribute('aria-haspopup','dialog');}
  item.querySelector('.list-row').classList.toggle('open',expanded);
  return changed;
 }
@@ -1122,7 +1085,7 @@ function currentSelection(overrides={}){
  return {owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...overrides};
 }
 function apply(write=true,layout={}){
- options.beforeApply?.();
+ holdLog();
  applyRows(write,layout);
 }
 function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=false,pushPlace=false,top}={}){
@@ -1170,6 +1133,11 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(options.mount){
   const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
+  const openKey=opened.values().next().value;
+  if(inlineView && hasKey(openKey) && !visibleKeys.has(openKey)){
+   if(dismissMissingItem) closeCard(openKey,false);
+   else if(options.pinOpenRow?.(openKey)!==false) visibleKeys.add(openKey);
+  }
   for(const [key,node] of mounted){
    if(visibleKeys.has(key)) continue;
    if(motion) animateRow(table,node,false);
@@ -1257,6 +1225,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
+ restoreLog();
  options.applied?.(selection,active,{rows,matches,count});
  const reset=options.emptyFilters && noResults ? resetSelection(active.now) : null;
  const canResetToResults=reset!==null && rows.some(item=>matches(item,reset));
@@ -1332,16 +1301,15 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
- if(dialog && !target && !keepItemOnMissing) opened.clear();
+ // A link to a missing item closes the open row, so the page shows the missing item notice.
+ if(!target && !keepItemOnMissing) opened.clear();
  if(options.mount && target) revealKey=key;
  apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
-  if(!dialog?.open){
-   const notice=inlineView?.isConnected && !detailLinkNotice.hidden ? detailLinkNotice :
-    content.querySelector('[data-missing-item]');
-   notice?.scrollIntoView({block:'nearest',behavior:'instant'});
-  }
+  const notice=inlineView?.isConnected && !detailLinkNotice.hidden ? detailLinkNotice :
+   content.querySelector('[data-missing-item]');
+  notice?.scrollIntoView({block:'nearest',behavior:'instant'});
   return;
  }
  const row=mountedTarget.querySelector('.list-row');
@@ -1353,19 +1321,21 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
   banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
  row.style.scrollMarginTop=(inset+16)+'px';
- if(!dialog) row.querySelector('.list-toggle').focus({preventScroll:true});
+ row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
 }
 function openCard(key){
+ if(!opened.has(key)) openSession++;
  opened.clear();
  opened.add(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
 function closeCard(key,write=true){
  const wasOpen=opened.delete(key);
+ if(wasOpen) openSession++;
  if(!wasOpen && linkedItem!==key) return;
  linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
@@ -1381,7 +1351,6 @@ function followRecordLink(event){
  event.preventDefault();
  jump(key,{keepItemOnMissing:true});
 }
-dialog?.querySelector('[data-record-dialog-detail]')?.addEventListener('click',followRecordLink);
 function clearSearch(){
  query='';
  if(sharedWords()) filterControl.setWords(words(),query);
@@ -1437,12 +1406,11 @@ function bind(){
  }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
- preserveRecordRowTop,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,get openItem(){return openItem;},get dialogItem(){return openItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ preserveRecordRowTop,holdLog,restoreLog,
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,showDraftCopy,get openItem(){return openItem;},get openSession(){return openSession;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
-  return (dialog ? dialog.open : openItem && !openItem.hidden) && location.hash===placeHash && openItem?.dataset.key===key &&
-   opened.has(key) && detailMissing.hidden && viewDetail.contains(form) &&
-   !itemUpdateRequired();
+  return openItem && !openItem.hidden && location.hash===placeHash && openItem.dataset.key===key &&
+   opened.has(key) && detailMissing.hidden && viewDetail.contains(form);
  },
  revealMatchingItem(key){
   const target=itemWithKey(key);
@@ -1480,7 +1448,8 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=currentWords(),previousQuery=query;
-  dialogNeedsRecord=Boolean(openItem && options.mount);
+  holdLog();
+  openNeedsRecord=Boolean(openItem && options.mount);
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
