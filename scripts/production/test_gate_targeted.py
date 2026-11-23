@@ -31,8 +31,9 @@ class TargetedTestTests(MergeGateFixture):
     def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
         allocated: list[Path] = []
 
-        def run(args: gate.GateArguments, mode: gate.SuiteMode) -> int:
+        def run(args: gate.GateArguments, mode: gate.SuiteMode, target: str | gate.NoGateAssignment) -> int:
             self.assertIs(mode, gate.SuiteMode.TARGETED)
+            self.assertIsInstance(target, gate.NoGateAssignment)
             self.assertEqual(args.gate_job, StepJob("test-affected"))
             path = Path(os.environ["TMPDIR"])
             allocated.append(path)

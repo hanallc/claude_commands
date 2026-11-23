@@ -7,7 +7,7 @@ Use this command for a long build or test command that you run by hand, and for 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/hand_made.py --why '<why>' --machine <natedev|mac|mac-linux> [--machine ...] [--repo <checkout>] -- <command...>`.
 
 - `--why` is required. It goes into the record.
-- `--machine` is required. Give it once for each machine that can take the run. This phase accepts `natedev`, `mac` and `mac-linux` (the Mac Linux guest); another name is refused.
+- `--machine` is required. Give it once for each machine that can take the run. This phase accepts `natedev`, `mac` and `mac-linux` (the Mac Linux guest); another name is refused. For now, the command refuses `mac-linux`, because the guest has no read limit (see the guest part below).
 - `--repo` is the checkout that runs the command. It must be the top folder of a git work tree. The default is the current folder.
 
 The command does four steps:
@@ -89,6 +89,7 @@ On the Mac:
 
 On the Mac Linux guest:
 
+- The guest takes no hand made run until it has its own read limit. The command refuses `mac-linux` with "the guest has no read limit yet", before each other check below. The rest of this part applies when the guest has its read limit.
 - The run comes to the guest through the `mac-linux` queue line, the line of a gate run on the guest. The guest takes one run at a time.
 - A guest that is off (`enabled.mac-linux=off` in `build_targets.conf`) cannot take the run.
 - A guest in retry backoff can take the run. Its line waits for the backoff end, and another named machine can take the run in that time.

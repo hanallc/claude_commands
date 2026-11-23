@@ -25,6 +25,8 @@ from scripts.production.hand_made_route import (Line, MachineFailed, MachineRun,
 MACHINE = mac_linux.TARGET
 # The queue ends a place when its holder ends, so a place with live guest work stays until then.
 STILL_LIVE = "the guest run may still be live; the queue ends the place when this run ends"
+# The guest has no read limit like the natedev one in hand_made_limit.py, so it takes no hand made run yet.
+NO_READ_LIMIT = "the guest has no read limit yet"
 
 
 class GuestFailed(MachineFailed):
@@ -68,6 +70,8 @@ def guest_refusal(program: Program) -> str:
     file of the checkout that the copy holds at the same path. A guest that is off takes no run; a guest in
     retry backoff is no refusal, and the queue line waits for the backoff end.
     """
+    if NO_READ_LIMIT:
+        return NO_READ_LIMIT
     try:
         settings = mac_linux.new_run_settings()
     except mac_linux.route_errors() as error:

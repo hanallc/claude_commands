@@ -591,6 +591,21 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(row["refusal"], "queue place: admission service unavailable")
         self.assertEqual(row["verdict"], "yes")
 
+    def test_the_guest_takes_no_run_until_it_has_a_read_limit(self) -> None:
+        cause = "mac-linux cannot take the run: the guest has no read limit yet"
+        status, errors = self.attempt(machines=("mac-linux",))
+        self.assertIn(cause, errors)
+        row = self.assert_no_run(status, cause)
+        self.assertEqual(row["refusal"], cause)
+        # The attempt ends at once: no model call and no queue line.
+        self.assertEqual((self.calls, self.line.requests), ([], []))
+        status, errors = self.attempt(machines=("natedev", "mac-linux"))
+        self.assertEqual(status, 0, errors)
+        self.assertIn(f"{cause}; the run stands only in the lines of the other machines", errors)
+        self.assertEqual([request.machines for request in self.line.requests], [("natedev",)])
+        self.assertEqual(self.line.entered, ["natedev-reservation"])
+        self.assertEqual(self.rows()[-1]["machine"], "natedev")
+
     def test_failed_program_status_is_the_attempt_status(self) -> None:
         status, _ = self.attempt((sys.executable, "-c", "import sys; print('out'); sys.exit(3)"))
         self.assertEqual(status, 3)
