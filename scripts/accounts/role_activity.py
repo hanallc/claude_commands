@@ -12,6 +12,8 @@ from typing import TypedDict, cast
 from scripts.lib import atomic_file, file_lock
 
 WINDOW = timedelta(hours=24)
+# The agent-notes job takes a sample about every two minutes. A longer gap is a pause in sampling, so the line breaks there.
+SAMPLE_GAP = timedelta(minutes=10)
 
 
 class _SampleDocument(TypedDict):

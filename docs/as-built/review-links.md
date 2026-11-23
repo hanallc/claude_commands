@@ -937,6 +937,18 @@ The move button leaves the sort order as it was.
 The button exposes its menu state through ARIA attributes.
 A selected Codex workers line shows its first target, or gray `auto`, without a button.
 The `auto` title explains that Codex workers move between Codex accounts by themselves.
+While that line shows `auto`, each spare Codex account line also shows `auto`.
+Two or more Codex lines with `auto` are the codex pair.
+Each pair row has the `auto-pair` class, so its tint moves with the row in every sort.
+`background.codex-pair` in `config/statusline.conf` sets the tint: a color name or `#RRGGBB`, drawn at 12% over the card.
+An absent or invalid value gives no tint.
+When two pair rows are next to each other, the row line between them is hidden.
+In a pair row, `auto` takes focus and shows a tooltip on hover and focus.
+The tooltip reads, for example, **codex1 and codex2 alternate when available. codex2 is working right now. We are in working workers mode.**
+It reads **No account has availability.** only when every pair account has a known 0% left.
+Otherwise it names the selected workers account. An unknown percent makes no claim.
+The mode is **self-actualizing** while `quota_state.no_worker_mode()` is on, and **working workers** otherwise.
+The mode and the quota are separate facts.
 Other lines show a gray Lucide minus icon; the total cell stays empty.
 An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
 The page uses the first targets from the status read.
@@ -959,6 +971,28 @@ The cell then shows the next queued target, or `none`.
 Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 
+The Roles table columns are role, swatch, **busy, last 24 h**, account, next, busy, idle and total.
+The busy line column has no sort control.
+Each role row draws its busy count from `role_activity.read()` as an inline SVG line in the role color.
+The page reads the samples once for each render, at the reading's check time.
+The x axis is the 24-hour window. The y axis scales to the largest count of that role in the window, at least 1.
+The line has one point for each pixel column at most: 288 columns of 5 minutes each.
+Each point sits at the end of its column and keeps the largest count in it, so peaks stay.
+A sample without the role breaks the line into separate segments; a lone point shows as a dot.
+Two samples more than `role_activity.SAMPLE_GAP` (10 minutes) apart also break the line.
+Under the line, the hours in the user's zone show as numbers every 3 hours and as small ticks between them.
+With no samples, the cell shows only the base line and the hour marks.
+The summary row has an empty cell in this column.
+The Roles table has no paused or exited column.
+A Lucide `triangle-alert` icon in `--warning` follows a role total when that role has paused or exited sessions.
+The icon takes focus and shows a tooltip on hover and focus, for example **2 not running: 1 paused (tile), 1 exited (fix2)**.
+The icon is an image named **not running**.
+The names come from local sessions. A peer count without names shows `names unknown` for the rest.
+The summary total shows one icon for all roles.
+Each tooltip target (the icon and the pair `auto`) has `data-tip` and `aria-describedby`.
+`aria-describedby` points to a hidden element next to the target that holds the tooltip text.
+A refresh keeps the focus and the open tooltip on the same target id.
+A fixed slot after each total keeps the totals aligned when no icon shows.
 The Roles table has a `next` column after **account**.
 It shows the same target, `none`, `auto` or `unavailable` as text, without a button.
 A role with no selected account shows a dash.
