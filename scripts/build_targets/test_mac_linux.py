@@ -561,10 +561,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.test',
             'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.test',
-            'BUILDLOG_PLACEMENT_FILE': str(self.root / 'assignment.json'),
             'ADMISSION_SOCKET': str(self.root / 'no-queue.sock'),
         })))
-        admission_client.write_assignment(self.root / 'assignment.json', wire.Assignment(self.placed))
         self.consumed = ()
 
         def consume(request: wire.ConsumePermission) -> wire.FirstAuthorization:
@@ -630,7 +628,8 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
+                                     module_time_limit_s=3, gate_job=gate_job, assignment=self.placed,
+                                     type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
@@ -715,6 +714,20 @@ fi
                 consume.assert_called_once()
                 self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
                 self.assert_guest_clean()
+
+    def test_the_route_consumes_the_assignment_it_got_and_reads_no_placement_file(self) -> None:
+        # The gate checked its assignment at its start. The route reads no placement file again.
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
+        self.placed = replace(self.placed, attempt='checked-attempt')
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(placement_file)}),
+              patch.object(admission_client, 'read_assignment',
+                           side_effect=AssertionError('the route read the placement file'))):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, _, _), = self.consumed
+        self.assertEqual(request.assignment, self.placed)
 
     def test_busy_mac_claim_refuses_the_route_before_ssh(self) -> None:
         paths = claim_state.state_paths('mac')
@@ -879,14 +892,18 @@ fi
             'from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED',
             'from scripts.build_targets import mac_linux',
             'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
-            'mac_linux.consume_launch_permission = lambda claim: None',
+            'from scripts.build_queue import admission_wire',
+            'mac_linux.consume_launch_permission = lambda claim, assignment: None',
             'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
-            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)'))
+            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED,',
+            '                assignment=admission_wire.read_assignment(Path(sys.argv[2])).assignment)'))
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
         environment = {**os.environ, 'FIXTURE_GUEST_RESULT': 'hang',
                        'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}
         group_record = self.root / 'run.group'
         with (self.root / 'natedev.log').open('wb') as log, subprocess.Popen(
-                [sys.executable, '-c', program, str(self.repo)], cwd=Path(__file__).resolve().parents[2],
+                [sys.executable, '-c', program, str(self.repo), str(placement_file)], cwd=Path(__file__).resolve().parents[2],
                 env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log) as natedev:
             try:
                 started = time.monotonic() + 30
@@ -1103,7 +1120,7 @@ fi
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0),
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
                 result = mac_linux.route(self.repo, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
-                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)
+                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
                 first, = attempts
                 failure, = unproven
                 assert isinstance(failure, mac_linux.GuestEndUnproven), failure

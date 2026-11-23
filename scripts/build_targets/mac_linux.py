@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tarfile
 from time import monotonic, sleep, time
-from typing import Literal, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -40,6 +40,9 @@ from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
+if TYPE_CHECKING:
+    from scripts.build_queue.placement import PlacementAssignment
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -150,7 +153,7 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity) -> None:
+def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
@@ -163,12 +166,11 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity) -> None:
     start = process_start.process_start(os.getpid())
     if not isinstance(start, process_start.Started):
         raise GuestTookNoRun('the gate process has no start time to hold the launch permission')
+    destination = assignment.destination
+    reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 claim.claim_id, assignment.episode, assignment.attempt)
+    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
     try:
-        assignment = admission_client.read_assignment(Path(os.environ['BUILDLOG_PLACEMENT_FILE'])).assignment
-        destination = assignment.destination
-        reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
-                                                     claim.claim_id, assignment.episode, assignment.attempt)
-        holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
         permission = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
     except wire.AdmissionUnavailable as error:
@@ -1303,8 +1305,11 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
-          type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
-    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed."""
+          assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
+    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed.
+
+    The assignment is the one the gate checked at its start. The route consumes its launch permission.
+    """
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run
     from scripts.build_queue.admission_client import step_identity
@@ -1332,7 +1337,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                jobs=settings.jobs, unit=unit)
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
-                consume_launch_permission(claim)
+                consume_launch_permission(claim, assignment)
                 reply = transfer_source(repo, settings, source, request)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:

@@ -51,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 import fcntl
-from functools import cache
+from functools import cache, partial
 import hashlib
 import inspect
 from importlib import import_module
@@ -2358,7 +2358,7 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
         print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
 
 
-def merge_checkpoint(args: GateArguments, target: str | NoGateAssignment) -> int:
+def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     hold = BuildHoldWait()
     hold.wait_until_free()
     repo = Path(str(args.repo)).resolve()
@@ -3124,11 +3124,21 @@ class NoGateAssignment:
 NO_GATE_ASSIGNMENT = NoGateAssignment()
 
 
+@dataclass(frozen=True)
+class MacLinuxAssignment:
+    """A checked Mac Linux guest assignment. The guest route consumes its launch permission."""
+    assignment: placement.PlacementAssignment
+
+
+# The target name of a checked placement. A guest placement keeps its assignment.
+GateTarget = str | MacLinuxAssignment | NoGateAssignment
+
+
 class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_start_target(args: GateArguments) -> str | NoGateAssignment:
+def gate_start_target(args: GateArguments) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
@@ -3138,8 +3148,9 @@ def gate_start_target(args: GateArguments) -> str | NoGateAssignment:
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
     flag = natedev_only_flag(args)
-    if flag is not None and not (isinstance(target, NoGateAssignment) or target == "natedev"):
-        raise GateAssignmentRefused(f"gate.py {flag} runs only on natedev and cannot take the {target} assignment")
+    if flag is not None and not isinstance(placed, NoGateAssignment) and target != "natedev":
+        raise GateAssignmentRefused(
+            f"gate.py {flag} runs only on natedev and cannot take the {placed.assignment.destination.target} assignment")
     if isinstance(placed, admission_wire.LocalPlacementGranted):
         try:
             ended = release_place(placed.grant.reservation, 0, placed.grant.cleanup_timing)
@@ -3163,9 +3174,13 @@ def natedev_only_flag(args: GateArguments) -> str | None:
 
 def placement_target(
         placed: admission_wire.Assignment | admission_wire.LocalPlacementGranted | NoGateAssignment,
-) -> str | NoGateAssignment:
+) -> GateTarget:
     """Return the target of a checked placement."""
-    return placed if isinstance(placed, NoGateAssignment) else placed.assignment.destination.target
+    if isinstance(placed, NoGateAssignment):
+        return placed
+    if placed.assignment.destination.target == "mac-linux":
+        return MacLinuxAssignment(placed.assignment)
+    return placed.assignment.destination.target
 
 
 def current_gate_placement(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded
@@ -3224,14 +3239,13 @@ class MacLinuxGateRoute(Protocol):
 
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
               module_time_limit_s: float, selected: AllModules | TreeSelection,
-              gate_job: StepJob | GateJobNotRecorded,
-              type_dirs: Sequence[str]) -> GateRun | GuestNotStartedOutcome | str: ...
+              gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str],
+              assignment: placement.PlacementAssignment) -> GateRun | GuestNotStartedOutcome | str: ...
 
 
-def report_mac_linux_took_no_run(reason: str) -> MacLinuxTookNoRun:
+def report_mac_linux_took_no_run(reason: str, assignment: placement.PlacementAssignment) -> MacLinuxTookNoRun:
     """Write the claim failure next to the placement file for the caller that owns the placement."""
     path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
-    assignment = admission_wire.read_assignment(path).assignment
     failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
     write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
     return MacLinuxTookNoRun(f"Mac Linux guest took no run: {reason}")
@@ -3242,7 +3256,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
-                    target: str | NoGateAssignment) -> GateRun:
+                    target: GateTarget) -> GateRun:
     """Route the whole test selection to the target that gate_start_target checked: the Mac Linux guest, AWS, or natedev."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
@@ -3269,14 +3283,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return run_local(type_dirs)
         return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
 
-    def run_guest(selection: AllModules | TreeSelection) -> GateRun:
+    def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
         outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job, type_dirs=type_dirs)
+                              selected=selection, gate_job=gate_job, type_dirs=type_dirs, assignment=assignment)
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            raise report_mac_linux_took_no_run(outcome.reason)
+            raise report_mac_linux_took_no_run(outcome.reason, assignment)
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
             if outcome.time_limit_report:
@@ -3306,7 +3320,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         case "natedev":
             # A gate assigned to natedev checks its checkout at the end, like every other gate.
             return run_routed(lambda _routed, _dirty: run_local(type_dirs))
-        case "mac-linux":
+        case MacLinuxAssignment(assignment=guest_assignment):
             key = "enabled.mac-linux"
             try:
                 enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
@@ -3314,7 +3328,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
             if not enabled:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
-            run_selected = run_guest
+            run_selected = partial(run_guest, guest_assignment)
         case "aws":
             if type_dirs:
                 raise GateRefused("The AWS gate route does not support type checks")
@@ -3483,7 +3497,7 @@ def unwind_tests_only_on_sigterm() -> Generator[None]:
             signal.raise_signal(signal.SIGTERM)
 
 
-def run_tests_only(args: GateArguments, mode: SuiteMode, target: str | NoGateAssignment) -> int:
+def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()

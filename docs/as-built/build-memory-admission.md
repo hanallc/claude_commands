@@ -212,6 +212,8 @@ An unavailable key permits placement and sends no source key with the copy.
 The coordinator remains separate from its offload child.
 The service checks the local process tree before it accepts that child as the holder.
 When the last system reading does not show the holder, the service reads the local processes again for this check.
+It does the same when the reading shows the holder pid with another start time.
+This read of the full process table costs about 16 to 19 ms with about 1300 processes, once for each guest consume.
 For a `mac-linux` assignment, the guest probe reports no claims.
 The service accepts the consume when the holder holds the named claim in the local Mac claim state (`mac_run.claim_held`).
 Cleanup takeover supplies no launch authority.
@@ -239,15 +241,16 @@ A Mac that `free_now` reports busy is a busy exclusion in placement evidence, ev
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
 Before this rule, a waiting Mac step made one refused attempt each second.
 A kept Mac claim is not busy, because the next claim takes it over.
-A current `mac-linux` assignment of another episode makes the guest busy.
-The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
-A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
-While `copies.py` lives, a pass that reads the ended gate does not close the attempt, because the guest evidence reads no claims.
-So the claim failure finds the attempt current, and the queue places the episode only once.
-When the gate ran and ended, the attempt stays current until `copies.py` ends. Then the next pass closes it as lost with `RetryAt(now)`.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
+A current `mac-linux` assignment of another episode makes the guest busy.
+The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
+A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
+While `copies.py` lives, a pass that reads the ended gate does not close the attempt.
+Only `copies.py` knows if the gate took a run, so its claim failure or its end closes the attempt.
+So the claim failure finds the attempt current, and the queue places the episode only once.
+When the gate ran and ended, the attempt stays current until `copies.py` ends. Then the next pass closes it as lost with `RetryAt(now)`.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
 Each retry receives a new attempt identity.

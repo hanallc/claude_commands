@@ -4102,7 +4102,8 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        # The guest evidence reads no claims. While copies.py lives, its claim failure or its end closes a guest attempt.
+        # Only copies.py knows if the guest gate took a run.
+        # While it lives, its claim failure or its end closes the guest attempt.
         guest_owner_live = (assignment.destination.target == "mac-linux"
                             and self._placement_owner_live(assignment.owner))
         return ((self._ended_claim_holder(saved) and not guest_owner_live or self._unconfirmed_holder_owner_ended(saved))
@@ -4970,8 +4971,10 @@ done
             return False
         processes = (dict(self.system_reader.latest.processes) if not isinstance(self.system_reader, NoSystemReader)
                      else self.proc.processes())
-        if holder.pid not in processes:
-            # A holder that started after the last system reading is not in it, so read the processes now.
+        listed = processes.get(holder.pid)
+        if listed is None or listed.start != holder.start_time:
+            # A holder that started after the last system reading is not in it, or its pid then named
+            # another process. So read the processes now.
             processes = self.proc.processes()
             if self.proc.owner_start(holder.pid) != LiveOwnerIdentity(holder.start_time):
                 return False

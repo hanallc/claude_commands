@@ -188,13 +188,14 @@ def guest_gate(fixture: PlacementFixture, assignment: placement.PlacementAssignm
 
 
 def consume_guest_permission(fixture: PlacementFixture, assignment: placement.PlacementAssignment,
-                             gate_process: wire.Owner) -> list[wire.Reply]:
-    """Send the guest gate's consume while the gate holds its Mac claim."""
+                             gate_process: wire.Owner, *, held: bool | Exception = True) -> list[wire.Reply]:
+    """Send the guest gate's consume. The local Mac claim state gives `held` for the gate's claim."""
     destination = assignment.destination
     claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
         mac_test.MAC_LINUX_CLAIM_ID_PREFIX + "fixture", assignment.episode, assignment.attempt)
     holder = placement.ClaimHolderIdentity(assignment.owner.host, gate_process.pid, gate_process.start_time)
-    with mock.patch.object(mac_run, "claim_held", return_value=True):
+    with mock.patch.object(mac_run, "claim_held", return_value=held,
+                           side_effect=held if isinstance(held, Exception) else None):
         return fixture.server.handle_request(wire.ConsumePermission("guest-launch", assignment, claim, holder))
 
 
@@ -1512,6 +1513,48 @@ class PlacementTests(unittest.TestCase):
             self.assertNotIn(gate_process.pid, reading.processes)
             granted, = consume_guest_permission(fixture, assignment, gate_process)
             self.assertIsInstance(granted, wire.FirstAuthorization)
+
+    def test_a_gate_whose_pid_named_another_process_in_the_reading_consumes_its_guest_permission(self) -> None:
+        # The last system reading shows the gate pid with the start time of an earlier process.
+        from scripts.build_queue.test_admission_service import FixedSystemReader
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            gate_process = guest_gate(fixture, assignment)
+            write_process(fixture.proc.path, gate_process.pid, parent=1, start="earlier-process")
+            _ = fixture.run_pass()
+            reading = fixture.server.system_evidence
+            assert isinstance(reading, service.SystemEvidence)
+            self.assertEqual(reading.processes[gate_process.pid].start, "earlier-process")
+            write_process(fixture.proc.path, gate_process.pid, parent=assignment.owner.pid, start=gate_process.start_time)
+            fixture.server.system_reader = FixedSystemReader(reading)
+            granted, = consume_guest_permission(fixture, assignment, gate_process)
+            self.assertIsInstance(granted, wire.FirstAuthorization)
+
+    def test_a_guest_consume_without_the_held_claim_keeps_the_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            refused, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment), held=False)
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.reason, "the exact claim is not adopted")
+            self.assertEqual(refused.state, placement.CurrentAssignment())
+            self.assertEqual(refused.permission, placement.PermissionAvailable())
+
+    def test_a_guest_consume_with_unreadable_claim_state_keeps_the_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            unreadable = claim_state.ClaimStateUnreadable(fixture.root / "claims", OSError("fixture read error"))
+            refused, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment), held=unreadable)
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.reason, f"adoption evidence is unavailable: {unreadable}")
+            self.assertEqual(refused.state, placement.CurrentAssignment())
+            self.assertEqual(refused.permission, placement.PermissionAvailable())
 
     def test_a_second_decline_ends_the_guest_for_the_run(self) -> None:
         # A cause that does not clear must not repeat on the same guest: the second decline ends the guest for the run.
