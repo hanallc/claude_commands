@@ -5009,8 +5009,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((response.status, response.body), (200, footer.encode()))
             counts.assert_called_once()
 
-    def add_list_filter_items(self) -> None:
-        keeper = staff.StaffId("pa")
+    def add_list_filter_items(self) -> staff.StaffId:
+        keeper = fixture_member("producer", name="morty").id
         for number, producer, parked, unread in (
                 (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
                 (4, "pa", False, True), (5, "pb", False, True)):
@@ -5020,6 +5020,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
             if not unread:
                 _ = the_list.mark_read(keeper, item.id, source="nate")
+        return keeper
 
     def list_filter_markup(self, query: str = "") -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
         with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
@@ -5035,7 +5036,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         return visible, chips
 
     def test_list_applies_address_filters_before_javascript_runs(self) -> None:
-        self.add_list_filter_items()
+        _ = self.add_list_filter_items()
         visible, chips = self.list_filter_markup("?show=parked&producer=pa&unread=1&q=parked")
         self.assertEqual(visible, ["1"])
         self.assertEqual(chips["show", "all"], ("false", "1"))
@@ -5067,10 +5068,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(chips["show", "parked"], ("false", "0"))
 
     def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
-        self.add_list_filter_items()
-        missing = "pa/L99"
+        keeper = self.add_list_filter_items()
+        missing = f"{keeper}/L99"
         for keys, expected, all_count in (
-                ([missing], ["4", "5"], "5"), ([missing, "pa/L4"], ["4"], "1")):
+                ([missing], ["4", "5"], "5"), ([missing, f"{keeper}/L4"], ["4"], "1")):
             with self.subTest(keys=keys):
                 query = urlencode({"show": "working", "key": keys, "item": missing}, doseq=True)
                 visible, chips = self.list_filter_markup("?" + query)
@@ -5079,7 +5080,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(chips["show", "working"], ("true", str(len(expected))))
 
     def test_list_without_a_query_keeps_the_plain_rows_and_counts(self) -> None:
-        self.add_list_filter_items()
+        _ = self.add_list_filter_items()
         visible, chips = self.list_filter_markup()
         self.assertCountEqual(visible, ["1", "2", "3", "4", "5"])
         for group in ("owner", "producer", "show"):

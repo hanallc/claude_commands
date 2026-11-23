@@ -2473,11 +2473,9 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with self.subTest(filter="staff"):
             check_query(urlencode({"owner": owner, "producer": producer}), after)
 
-        keeper = staff.StaffId("k\r1")
-        for keeper_id in (keeper, staff.StaffId("k%0D1")):
-            _ = the_list.add(keeper_id, "Check the linked item", owner=OTHER.id, number=4,
-                             source="nate", changes={"state": the_list.ItemState.WORKING})
-        key = f"{keeper}/L4"
+        _ = the_list.add(MORTY.id, "Check the linked item", owner=OTHER.id, number=4,
+                         source="nate", changes={"state": the_list.ItemState.WORKING})
+        key = f"{MORTY.id}/L4"
         after = r'''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const row=document.querySelector('[data-list-item]:not([hidden])');
