@@ -3865,6 +3865,13 @@ done
         destination = saved.assignment.destination
         if destination.provider != "ssh":
             return destination.provider != "local"
+        transport = self._ssh_transport(saved)
+        return transport is not None and not isinstance(
+            transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
+
+    def _ssh_transport(self, saved: records.SavedPlacementAssignment) -> ExecutionTransport | None:
+        """The transport of an ssh assignment's target; None when the target is not ssh or cannot be read."""
+        destination = saved.assignment.destination
         submitted = self.placement_requests.get(saved.assignment.episode)
         settings = (placement.ConfiguredProviderSettings() if submitted is None
                     else self._placement_settings(submitted, destination))
@@ -3872,12 +3879,9 @@ done
             with conf.report_key_changes():
                 configuration = _provider_configuration()
                 target = configuration.target(destination.target, settings)
-                if not isinstance(target, target_config.SshTarget):
-                    return False
-                transport = configuration.transport(target)
+                return configuration.transport(target) if isinstance(target, target_config.SshTarget) else None
         except (OSError, ValueError):
-            return False
-        return not isinstance(transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
+            return None
 
     def _lost_report(self) -> placement.TerminalAttemptReport:
         return placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), placement.DispatchPathSettled(),
@@ -3892,14 +3896,9 @@ done
             try:
                 destination = saved.assignment.destination
                 submitted = self.placement_requests.get(saved.assignment.episode)
-                settings = (placement.ConfiguredProviderSettings() if submitted is None
-                            else self._placement_settings(submitted, destination))
-                with conf.report_key_changes():
-                    configuration = _provider_configuration()
-                    target = configuration.target(destination.target, settings)
-                    if not isinstance(target, target_config.SshTarget):
-                        return True
-                    transport = configuration.transport(target)
+                transport = self._ssh_transport(saved)
+                if transport is None:
+                    return True
                 if isinstance(transport, HanaGpuNextestTransport):
                     from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
 
