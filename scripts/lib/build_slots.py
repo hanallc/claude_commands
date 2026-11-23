@@ -414,7 +414,8 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 index.with_name("index.lock").unlink(missing_ok=True)
                 if not os.path.lexists(index):
                     _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=target/")
+                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "--exclude-standard", "-z",
+                        "--exclude=target/")
                 rescued = False
                 try:
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
