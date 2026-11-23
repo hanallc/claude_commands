@@ -283,6 +283,10 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         _ = self.working_dir.rename(main)
         with patch.dict(os.environ, self.model_environment), isolated_staff_file(root / "staff.json", {}):
             self.working_dir: Path = make_fixture_worktree(main, "fixture", "project")
+            # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
+            with patch.dict(os.environ, config_environment(self.root)):
+                _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
+                    unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
             parent = unit_membership("fixture", "fixture")
             parent = staff.set_worktree(parent.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=parent.worktree)
         return parent.id
@@ -307,10 +311,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                 ), CLAUDE_REGISTRY,
             )
             _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
-            with patch.dict(os.environ, config_environment(self.root)):
-                _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
-                    unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
-            # The worktree model and a phase launch need HEAD; Git ignores .unit.toml, so the base commit is empty.
+            # The worktree model and a phase launch need HEAD; the base commit is empty.
             _ = commit_repository(self.working_dir, "base", allow_empty=True)
         (self.root / "codex").symlink_to(sys.executable)
         _ = (self.root / "paths").write_text("src/\n")
