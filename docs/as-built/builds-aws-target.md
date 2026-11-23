@@ -393,6 +393,13 @@ The new rate therefore belongs to the Hana configuration.
 `aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
 Each child attempts Hana lifecycle recovery before account charge refresh.
 Either operation can fail without suppressing the other operation.
+A refused key is the one exception.
+When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
+While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
+The record clears only after one child sees every AWS machine off and a later child sees one on.
+So a person turns both `enabled` keys off, then turns one on.
+An unreadable record holds the calls, as a refusal does.
+`scripts/aws_target/key_refusal.py` owns the record.
 The supervisor continues after a failed or timed-out child.
 It releases all child-owned locks when the child exits.
 

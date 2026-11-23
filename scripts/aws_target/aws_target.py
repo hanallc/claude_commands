@@ -24,8 +24,8 @@ import time
 from time import monotonic
 from typing import cast, final
 
-from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
-from scripts.aws_target.aws_cli import aws_error_code
+from scripts.aws_target import hana_spend, key_refusal, ledger, measurement, price_days, quota_requests, run_cost
+from scripts.aws_target.aws_cli import KEY_REFUSED_CODES, aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
@@ -615,11 +615,40 @@ class AccountRefresh:
         return measurement.read_charges(self.settings_path, self.directory, now, fetch)
 
 
+def refused_key_code(error: Exception) -> str:
+    """Name the AWS code when AWS refused the key itself; empty for every other failure."""
+    from scripts.aws_target.hana_provider import ProviderKeyRefused
+    if isinstance(error, ProviderKeyRefused):
+        return error.code
+    code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+    return code if code in KEY_REFUSED_CODES else ''
+
+
+def key_refusal_holds(directory: Path) -> bool:
+    """Hold every AWS call after a refused key until a tick sees all AWS machines off and a later tick sees one on."""
+    refusal = key_refusal.read(directory)
+    if isinstance(refusal, key_refusal.NoKeyRefusal):
+        return False
+    machines_on = isinstance(aws_switch(*machine_settings()), AwsOn)
+    if not machines_on:
+        if not refusal.off_seen:
+            key_refusal.write(directory, replace(refusal, off_seen=True))
+        return True
+    if not refusal.off_seen:
+        return True
+    key_refusal.clear(directory)
+    print('aws_target: an AWS machine is on again after a refused key; AWS calls start again', file=sys.stderr)
+    return False
+
+
 def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *,
-                    lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None) -> int:
-    """Recover lifecycle state before an independent account refresh attempt."""
+                    lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None,
+                    clock: Callable[[], float] = time.time) -> int:
+    """Recover lifecycle state before an independent account refresh attempt; make no call after a refused key."""
     from scripts.aws_target.hana_box import HanaController
     from scripts.aws_target.hana_provider import AwsHanaProvider
+    if key_refusal_holds(directory):
+        return 0
     status = 0
     controller = HanaController(directory, settings_path, workload_path,
         AwsHanaProvider.from_settings(settings_path, directory, workload_path))
@@ -630,6 +659,12 @@ def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *
         except (OSError, ValueError, RuntimeError, ArithmeticError, subprocess.SubprocessError) as error:
             detail = f'{type(error).__name__}: {error}' if name == 'Hana lifecycle' else type(error).__name__
             print(f'aws_target: {name} unavailable: {detail}', file=sys.stderr)
+            code = refused_key_code(error)
+            if code:
+                key_refusal.write(directory, key_refusal.KeyRefused(code, int(clock()), off_seen=False))
+                print(f'aws_target: AWS refused the key ({code}); no AWS call until a person turns '
+                      + 'every AWS machine off and then one on again', file=sys.stderr)
+                return 1
             status = 1
     return status
 

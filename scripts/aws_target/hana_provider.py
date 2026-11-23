@@ -17,7 +17,8 @@ import time
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import admin_secrets, hana_box as box, hana_guest, ledger, remote, s3_presign
-from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, aws_error_code, execute_command
+from scripts.aws_target.aws_cli import (KEY_REFUSED_CODES, AwsCli, AwsExecutor, AwsUnavailable, aws_error_code,
+                                       execute_command)
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -56,6 +57,14 @@ class ProviderStartRefused(ProviderPending):
     def __init__(self, code: str) -> None:
         self.code: str = code
         super().__init__(f'Hana provider call failed: ec2:StartInstances ({code})')
+
+
+class ProviderKeyRefused(ProviderPending):
+    """AWS refused the key, so no later call can pass until a person acts."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code: str = code
+        super().__init__(message)
 
 
 class ProviderTimedOut(ProviderPending):
@@ -125,6 +134,8 @@ class AwsHanaProvider:
                 code = aws_error_code(error)
                 if code:
                     message += f' ({code})'
+                if code in KEY_REFUSED_CODES:
+                    raise ProviderKeyRefused(code, message) from None
             raise ProviderPending(message) from None
 
     def signing_key(self) -> s3_presign.SigningKey:
