@@ -2473,9 +2473,17 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with self.subTest(filter="staff"):
             check_query(urlencode({"owner": owner, "producer": producer}), after)
 
-        _ = the_list.add(MORTY.id, "Check the linked item", owner=OTHER.id, number=4,
-                         source="nate", changes={"state": the_list.ItemState.WORKING})
-        key = f"{MORTY.id}/L4"
+        keeper = staff.StaffId("k\r1")
+        item = the_list.add(MORTY.id, "Check the linked item", owner=OTHER.id, number=4,
+                            source="nate", changes={"state": the_list.ItemState.WORKING})
+        record = (the_list.folder(MORTY.id) / f"{item.id}.md").read_bytes()
+        # Only morty's folder allocates numbers, so give each legacy keeper its own copy of L4.
+        for keeper_id in (keeper, staff.StaffId("k%0D1")):
+            folder = the_list.folder(keeper_id)
+            folder.mkdir(parents=True, exist_ok=True)
+            _ = (folder / f"{item.id}.md").write_bytes(record)
+        (the_list.folder(MORTY.id) / f"{item.id}.md").unlink()
+        key = f"{keeper}/L4"
         after = r'''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const row=document.querySelector('[data-list-item]:not([hidden])');
