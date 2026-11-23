@@ -32,6 +32,8 @@ TEMP = Path("/tmp")
 SCCACHE_SOCKET = TEMP / "sccache.sock"
 # The folder of the build-hold cargo wrapper; it runs files from its sibling lib folder.
 BUILD_HOLD = "build_hold"
+# The repository of the tools that check the run: the repository of this code.
+CHECKER = Path(__file__).resolve().parents[2]
 # The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
 CARGO_LOCKS = (".package-cache", ".package-cache-mutate", ".global-cache")
 # The key of the bwrap status line that gives the exit status of the program.
@@ -104,7 +106,7 @@ def bindable(path: Path, home: Path, *, read: bool) -> bool:
 
 def python_cache_folder() -> Path:
     """The folder of the python path cache that scripts/lib/py reads and runs, from scripts/lib/py itself."""
-    launcher = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "py"
+    launcher = CHECKER / "scripts" / "lib" / "py"
     result = subprocess.run([str(launcher), "--cache-folder"], stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, check=True)
     return Path(result.stdout.strip())
@@ -114,8 +116,7 @@ def tool_folders(environment: Mapping[str, str]) -> list[Path]:
     """The real folders of the tools that check the run: the repository of this code, the build-hold cargo
     wrapper folder and its lib folder, the config folder, and the python path cache folder."""
     return [Path(os.path.realpath(folder)) for folder in (
-        Path(__file__).resolve().parents[2], *wrapper_folders(environment.get("PATH", "")), conf.directory(),
-        python_cache_folder())]
+        CHECKER, *wrapper_folders(environment.get("PATH", "")), conf.directory(), python_cache_folder())]
 
 
 def tools_refusal(checkout: Path, environment: Mapping[str, str]) -> str:
@@ -246,7 +247,7 @@ def limit_argv(bwrap: str, program: Program, temp: Path, environment: Mapping[st
     kept = [temp, checkout]
     read = [Path(environment.get("RUSTUP_HOME") or home / ".rustup"), cargo_home / "bin",
             cargo_home / "config.toml", *(folder for folder in folders if shown(folder, kept)),
-            *wrapper_folders(path), *(file for file in files if not in_checkout(file, checkout))]
+            *(file for file in files if not in_checkout(file, checkout))]
     write = list(write_binds(checkout, environment))
     words = [bwrap, "--json-status-fd", str(status_fd), "--die-with-parent", "--unshare-pid", "--unshare-net",
              "--dev", "/dev",

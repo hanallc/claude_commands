@@ -220,17 +220,19 @@ class LimitTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertTrue((build / "built").exists())
 
-    def test_the_build_hold_cargo_wrapper_folder_and_its_lib_are_read_only(self) -> None:
-        hold, path = self.root / "scripts" / "build_hold", self.root / "bin"
-        for folder in (hold, self.root / "scripts" / "lib", path):
+    def test_the_build_hold_cargo_wrapper_folder_and_its_lib_are_not_bound(self) -> None:
+        hold, lib, path = self.root / "scripts" / "build_hold", self.root / "scripts" / "lib", self.root / "bin"
+        for folder in (hold, lib, path):
             folder.mkdir(parents=True)
         _ = (hold / "cargo").write_text("#!/bin/sh\n")
         (hold / "cargo").chmod(0o755)
         (path / "cargo").symlink_to(hold / "cargo")
-        words = " ".join(hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
-                                                    {"HOME": os.environ["HOME"], "PATH": str(path)}, 3))
-        for folder in (path, hold, self.root / "scripts" / "lib"):
-            self.assertIn(f"--ro-bind {folder} {folder}", words)
+        words = hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
+                                           {"HOME": os.environ["HOME"], "PATH": str(path)}, 3)
+        bound = [words[index + 1] for index, word in enumerate(words) if word == "--ro-bind"]
+        self.assertIn(str(path), bound)
+        self.assertNotIn(str(hold), bound)
+        self.assertNotIn(str(lib), bound)
 
     def test_a_bind_with_a_link_in_its_path_or_that_holds_the_home_folder_is_not_bound(self) -> None:
         home = Path(os.environ["HOME"])
