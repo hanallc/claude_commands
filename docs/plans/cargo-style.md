@@ -228,7 +228,7 @@ Code with no consumer cannot land, so each S3 phase extends `finding`, its consu
 
 S4 has seven phases, from the S4 scope read (style-unit, 2026-11-22). Phase 1 runs first. Phases 2, 3 and 4 run side by side after it. Phase 5 follows them. Phase 6 builds its ledger projection beside them. Phase 7 adds the B and D cells after phase 5 (style-unit, 2026-11-23). The full suite and Python parity run once, on the final S4 tree. The Python membership adapter moves to S5, with the publication adapter.
 
-1. `s4-sites-regex` (started 2026-11-22, branch `style-s4-sites-regex`): `sites` with the shared envelope, catalog input, schema 47 and 51 reads, typed `Unavailable`, and regex sites.
+1. `s4-sites-regex` (checkpoint 88a4d1f58 on `style-s4-sites-regex`, 2026-11-23): `sites` with the shared envelope, catalog input, schema 47 and 51 reads, typed `Unavailable`, and regex sites. One difference from Python is intended: `sites` lists only the requested rule. Python `_refresh_candidate_sites` lists every tier B and D rule, so one bad rule fails the request for all rules. In Rust, an invalid rule fails only its own request (style-unit, 2026-11-23, review finding F003).
 2. `s4-sites-types`: field affixes, variant stutter, field type stutter, struct fields and single-impl traits.
 3. `s4-sites-source`: allows, test allows, observer guards, literals and test literals.
 4. `s4-sites-structure`: module roots, submodule names, workspace dependencies and Bevy Kana; candidate D membership.
