@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import stat
 import select
+import shutil
 import signal
 import socket
 import sys
@@ -5202,6 +5203,10 @@ class ServiceTests(unittest.TestCase):
             probing = threading.Event()
             probed = threading.Event()
             loop_reads: list[Path] = []
+            child_prints: list[str] = []
+            # An empty PATH cannot find printenv; the child reads only the variable under test.
+            printenv = shutil.which("printenv")
+            assert printenv is not None
             serve_once = fixture.server.run_once
 
             def probe_or_serve(timeout: float) -> None:
@@ -5209,12 +5214,18 @@ class ServiceTests(unittest.TestCase):
                 if not probing.is_set():
                     serve_once(timeout)
                 elif not probed.is_set():
-                    loop_reads.append(gate.builds_slice_cgroup())
-                    # The loop starts its own threads too, for example the reading alert and the roster.
-                    started = threading.Thread(target=lambda: loop_reads.append(gate.builds_slice_cgroup()))
-                    started.start()
-                    started.join(test_hang_guard.TEST_HANG_GUARD_SECS)
-                    probed.set()
+                    try:
+                        loop_reads.append(gate.builds_slice_cgroup())
+                        # The loop starts its own threads too, for example the reading alert and the roster.
+                        started = threading.Thread(target=lambda: loop_reads.append(gate.builds_slice_cgroup()))
+                        started.start()
+                        started.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                        # The loop starts child processes with env=None, for example session_send and systemctl.
+                        child = subprocess.run([printenv, "BUILDLOG_BUILDS_CGROUP"], capture_output=True, text=True,
+                                               check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                        child_prints.append(child.stdout)
+                    finally:
+                        probed.set()
 
             with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
                 # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
@@ -5228,6 +5239,7 @@ class ServiceTests(unittest.TestCase):
                 probing.clear()
             self.assertTrue(loop_read)
             self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
+            self.assertEqual(child_prints, [f"{fixture_cgroup}\n"])
 
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:

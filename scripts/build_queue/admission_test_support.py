@@ -7,7 +7,7 @@ from scripts.lib import cancellation, test_phase
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
@@ -28,10 +28,7 @@ import time
 import unittest
 import uuid
 from unittest import mock
-from typing import TYPE_CHECKING, ClassVar, Self, cast, overload, override
-
-if TYPE_CHECKING:
-    from _typeshed import SupportsKeysAndGetItem
+from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
@@ -361,86 +358,27 @@ class SocketPeer:
         self.socket.close()
 
 
-class LoopEnvironment(MutableMapping[str, str]):
-    """os.environ for the test; each thread reads a snapshot that changes only after a whole change.
+class RefillMark(threading.local):
+    pending: bool = False
 
-    A patch.dict exit empties os.environ with clear() and then fills it again with update().
-    Only the thread that calls clear() reads the live mapping until its update(); other threads read the old snapshot.
-    Limit: a child process started with env=None gets the C environment, which is empty in that moment.
-    Limit: a default argument bound to os.environ at import reads the old object, not this one.
-    """
-    def __init__(self, live: MutableMapping[str, str]) -> None:
-        self.live: MutableMapping[str, str] = live
-        self.lock: threading.Lock = threading.Lock()
-        self.snapshot: dict[str, str] = dict(live)
-        self.refilling: int | None = None
 
-    def view(self) -> Mapping[str, str]:
-        return self.live if threading.get_ident() == self.refilling else self.snapshot
+class GaplessRefill:
+    """A patch.dict exit calls clear() and then update(); the clear waits for that update, so no reader sees an empty environment."""
+    def __init__(self, environ: MutableMapping[str, str]) -> None:
+        self.environ: MutableMapping[str, str] = environ
+        self.mark: RefillMark = RefillMark()
 
-    def publish(self) -> None:
-        """Replace the snapshot; the caller holds the lock. A reader keeps the old dict while it reads it."""
-        if self.refilling is None:
-            self.snapshot = dict(self.live)
-
-    @override
-    def __getitem__(self, key: str) -> str:
-        return self.view()[key]
-
-    @override
-    def __setitem__(self, key: str, value: str) -> None:
-        with self.lock:
-            self.live[key] = value
-            self.publish()
-
-    @override
-    def __delitem__(self, key: str) -> None:
-        with self.lock:
-            del self.live[key]
-            self.publish()
-
-    @override
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.view())
-
-    @override
-    def __len__(self) -> int:
-        return len(self.view())
-
-    @override
     def clear(self) -> None:
-        # The snapshot does not change until this thread calls update(), which patch.dict always does next.
-        with self.lock:
-            self.refilling = threading.get_ident()
-            self.live.clear()
+        self.mark.pending = True
 
-    @overload
-    def update(self, values: SupportsKeysAndGetItem[str, str], /, **keywords: str) -> None: ...
-    @overload
-    def update(self, values: Iterable[tuple[str, str]], /, **keywords: str) -> None: ...
-    @overload
-    def update(self, /, **keywords: str) -> None: ...
-    @override
-    def update(self, values: SupportsKeysAndGetItem[str, str] | Iterable[tuple[str, str]] = (), /,
-               **keywords: str) -> None:
-        with self.lock:
-            self.live.update(values, **keywords)
-            if self.refilling == threading.get_ident():
-                self.refilling = None
-            self.publish()
-
-    def copy(self) -> dict[str, str]:
-        return dict(self.view())
-
-    def __or__(self, other: Mapping[str, str]) -> dict[str, str]:
-        return {**self.view(), **other}
-
-    def __ror__(self, other: Mapping[str, str]) -> dict[str, str]:
-        return {**other, **self.view()}
-
-    def __ior__(self, other: Mapping[str, str]) -> Self:
-        self.update(other)
-        return self
+    def update(self, values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+        target = dict(values, **keywords)
+        cleared, self.mark.pending = self.mark.pending, False
+        for key, value in target.items():
+            self.environ[key] = value
+        if cleared:
+            for key in [key for key in self.environ if key not in target]:
+                del self.environ[key]
 
 
 class AdmissionFixture(ExitStack):
@@ -487,9 +425,10 @@ class AdmissionFixture(ExitStack):
                 "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
                 "HOME": str(self.root), "TMPDIR": str(self.temporary),
                 **interpreter_cache_environment(self.root / "cache")}
+            refill = GaplessRefill(os.environ)
+            _ = self.enter_context(mock.patch.object(os.environ, "clear", refill.clear))
+            _ = self.enter_context(mock.patch.object(os.environ, "update", refill.update))
             self.enter_context(mock.patch.dict(os.environ, environment))
-            self.environment: LoopEnvironment = LoopEnvironment(os.environ)
-            _ = self.enter_context(mock.patch.object(os, "environ", self.environment))
             if not (self.root / "build_admission.conf").exists():
                 write_memory_config(self.root / "build_admission.conf")
             self.readings: PrivateReadings = PrivateReadings(self.root)
