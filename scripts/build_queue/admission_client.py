@@ -31,6 +31,7 @@ import uuid
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import assignment_what
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
 from scripts.build_hold import owning_session
@@ -1809,8 +1810,9 @@ class WaitOutput:
         order = snapshot.decision.order_hold
         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead):
             blocker = order.waiter
+            what = snapshot_codec.row_what(blocker.get("what", ""), blocker.get("step", ""))
             label = snapshot_codec.wait_line_name(blocker.get("unit", ""), blocker.get("session_name", ""),
-                blocker.get("folder", ""), blocker.get("step", ""), fallback_name=cause.head_name)
+                blocker.get("folder", ""), what, fallback_name=cause.head_name)
             reasons = (blocking_waiter_text(reply.text, label, blocker["need"] / records.GIB),)
         else:
             reasons = wait_reasons(snapshot)
@@ -1890,9 +1892,28 @@ INFER_PROFILE_AT_USE = InferProfileAtUse()
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
 
-    identity = records.waiter_identity(step, worktree)
+    return owned_identity(step, worktree, records.request_owner(worktree or os.getcwd()))
+
+
+def owned_identity(step: str, worktree: str, owner: records.QueueCaller | records.OwnerNotGiven) -> wire.Identity:
+    from scripts.build_queue import admission_records as records
+
+    identity = records.waiter_identity(step, worktree, owner)
     return wire.Identity(identity["session_id"], identity["session_name"], identity["step"],
                          identity["folder"], identity.get("unit", ""))
+
+
+OWNER_REFUSAL = ("build queue refused the step: it does not say who started it ({program}). "
+                 "Set BUILDLOG_OWNER_STAFF_ID to the owner's staff id, or CLAUDE_SESSION_NAME to a name "
+                 "when no staff member owns the work.")
+
+
+def refuse_unowned(owner: records.QueueCaller | records.OwnerNotGiven) -> None:
+    """Refuse a request that does not say who started it, before it enters the queue."""
+    from scripts.build_queue import admission_records as records
+
+    if isinstance(owner, records.OwnerNotGiven):
+        raise CheckerFailure(OWNER_REFUSAL.format(program=owner.program))
 
 
 def verify_call() -> records.VerifyStep:
@@ -1933,7 +1954,9 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = replace(step_identity(estimate.profile.step, estimate.profile.worktree), verify=verify_call())
+    caller = records.request_owner(estimate.profile.worktree or os.getcwd())
+    refuse_unowned(caller)
+    identity = replace(owned_identity(estimate.profile.step, estimate.profile.worktree, caller), verify=verify_call())
     if isinstance(estimate.profile, records.ProgramProfile):
         identity = replace(identity, folder=estimate.profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
@@ -2152,6 +2175,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             cargo_folder = placement.CargoFolder(args.cargo_folder.resolve())
 
         local = refresh_local()
+        # Read the caller's own text before a placement replaces the assignment file.
+        identity = replace(local.identity, what=assignment_what(args.assignment_file))
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
@@ -2178,7 +2203,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                         token_prerequisite(args.token) if args.token in TOKEN_REQUIRED_CHOICES else
                         placement.TokenHeld() if args.token == "held" else placement.TokenNotRequired())
         request = wire.PlacementRequest(episode, owner, args.since, local.profile, constraints,
-            identity=local.identity, run=local.run,
+            identity=identity, run=local.run,
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
