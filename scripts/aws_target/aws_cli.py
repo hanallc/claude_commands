@@ -29,7 +29,8 @@ class AwsUnavailable(RuntimeError):
 
 # AWS gives these codes when it refuses the key itself, not one action.
 KEY_REFUSED_CODES = frozenset(('AuthFailure', 'InvalidClientTokenId', 'UnrecognizedClientException',
-                               'SignatureDoesNotMatch', 'ExpiredToken', 'ExpiredTokenException'))
+                               'SignatureDoesNotMatch', 'ExpiredToken', 'ExpiredTokenException',
+                               'InvalidAccessKeyId'))
 
 
 def aws_error_code(error: AwsUnavailable, *, first_attempt_of: str = '', allow_status: bool = False,

@@ -27,7 +27,7 @@ from typing import cast, final
 from scripts.aws_target import hana_spend, key_refusal, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import KEY_REFUSED_CODES, aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
-from scripts.aws_target.config import AwsOn, aws_switch, read_settings
+from scripts.aws_target.config import AwsOff, AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
@@ -617,9 +617,11 @@ class AccountRefresh:
 
 def refused_key_code(error: Exception) -> str:
     """Name the AWS code when AWS refused the key itself; empty for every other failure."""
-    from scripts.aws_target.hana_provider import ProviderKeyRefused
+    from scripts.aws_target.hana_provider import ProviderKeyRefused, ProviderStartRefused
     if isinstance(error, ProviderKeyRefused):
         return error.code
+    if isinstance(error, ProviderStartRefused):
+        return error.code if error.code in KEY_REFUSED_CODES else ''
     code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
     return code if code in KEY_REFUSED_CODES else ''
 
@@ -629,9 +631,10 @@ def key_refusal_holds(directory: Path) -> bool:
     refusal = key_refusal.read(directory)
     if isinstance(refusal, key_refusal.NoKeyRefusal):
         return False
-    machines_on = isinstance(aws_switch(*machine_settings()), AwsOn)
-    if not machines_on:
-        if not refusal.off_seen:
+    switch = aws_switch(*machine_settings())
+    if not isinstance(switch, AwsOn):
+        # An unusable value is no proof that a person turned the machines off.
+        if isinstance(switch, AwsOff) and not refusal.off_seen:
             key_refusal.write(directory, replace(refusal, off_seen=True))
         return True
     if not refusal.off_seen:
@@ -691,6 +694,9 @@ def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool 
     cloud_gate_settings, hana_settings = machine_settings()
     # With AWS off, no charge refresh runs, so a provisional bill would give false hours-gap notices.
     if not isinstance(aws_switch(cloud_gate_settings, hana_settings), AwsOn):
+        return 0
+    # After a refused key, each call is refused too; only the controller tick clears the record.
+    if isinstance(key_refusal.read(directory), key_refusal.KeyRefused):
         return 0
     status = 0
     read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot

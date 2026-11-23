@@ -276,6 +276,8 @@ class AwsHanaProvider:
                 if (report.get('deployment') == identity.deployment and report.get('start_token') == start.token
                         and report.get('boot_id') and ledger.instant(report, 'at') >= start.at):
                     boot = box.VerifiedBoot(ledger.text(report, 'boot_id'), start.token)
+            except ProviderKeyRefused:
+                raise
             except ProviderPending:
                 pass
         return box.BoxObservation(identity, int(self.clock()), cast(ledger.InstanceState, state), boot, cause)

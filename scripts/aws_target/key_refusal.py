@@ -2,6 +2,7 @@
 
 A refused key refuses every later call too, so each tick would only repeat the refusal.
 The record holds the calls until a tick sees every AWS machine off and a later tick sees one on.
+The hourly job reads the record too, so it also makes no call while the record exists.
 """
 from __future__ import annotations
 
@@ -46,6 +47,7 @@ def read(directory: Path) -> KeyRefused | NoKeyRefusal:
 
 
 def write(directory: Path, refusal: KeyRefused) -> None:
+    """Replace the record with this refusal."""
     write_text_atomic(directory / RECORD_NAME, json.dumps(
         {'code': refusal.code, 'at': refusal.at, 'off_seen': refusal.off_seen}, sort_keys=True) + '\n')
 
