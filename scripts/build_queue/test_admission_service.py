@@ -11,10 +11,10 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import io
 import json
 import math
@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import stat
 import select
+import shutil
 import signal
 import shlex
 import socket
@@ -1024,6 +1025,11 @@ class MacBackoffTestFixture:
 
 
 class LocalHoldPlacementTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The service applies natedev holds only on natedev; the guest has another host name.
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
+
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
         from scripts.build_queue import placement
@@ -1554,6 +1560,46 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 self.assertEqual(evidence.eligibility, expected)
                 self.assertEqual(free_now.call_args.args[1], target.settings)
                 self.assertEqual(free_now.call_args.kwargs["mac_scope"], destination.scope)
+
+    def test_a_mac_run_placed_before_a_mac_block_gets_no_mac_after_it(self) -> None:
+        from scripts.build_hold.owning_session import OwningSession
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import target_config
+        from scripts.mac_test import claim_state, mac_test
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "mac_test.conf"
+            _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
+            target = target_config.SshTarget("mac", "macos", settings)
+            paths = claim_state.StatePaths(fixture.root / "claims")
+            paths.directory.mkdir()
+
+            def install(session: OwningSession) -> placement.HostEvidenceKey:
+                request = placement_request(fixture, session=session)
+                request = replace(request, constraints=replace(request.constraints, command_kind="install"))
+                key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+                fixture.server.host_requests[key] = request
+                return key
+
+            def eligibility(key: placement.HostEvidenceKey) -> placement.HostEligibility:
+                evidence = fixture.server.read_provider_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                return evidence.eligibility
+
+            with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                 mock.patch.object(claim_state, "state_paths", return_value=paths):
+                waiting = install(OwningSession("waiting-session"))
+                self.assertEqual(eligibility(waiting), placement.AllowedHost())
+                since = datetime.now(UTC)
+                mac_test.write_block(paths.block, claim_state.ActiveMacBlock(
+                    "nate", "release work", since, since + timedelta(hours=1),
+                    claim_state.RecordedSession("holder-session", "nate"), mac_test.NO_SHOWRUNNER,
+                    "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                self.assertEqual(eligibility(waiting), placement.TemporaryExclusion("blocked"))
+                self.assertEqual(eligibility(install(OwningSession("holder-session"))), placement.AllowedHost())
+                _ = paths.block.write_text("{", encoding="utf-8")
+                self.assertEqual(eligibility(waiting), placement.TemporaryExclusion("state"))
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement
@@ -5523,6 +5569,58 @@ class ServiceTests(unittest.TestCase):
                     self.assertEqual(os.environ["USER_ZONE"], "UTC")
                 self.assertEqual(os.environ.get("USER_ZONE", ""), zone)
                 self.assertEqual("USER_ZONE" in os.environ, bool(zone))
+
+    def test_serving_loop_never_reads_the_empty_environment_inside_a_patch_dict_exit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture_cgroup = gate.builds_slice_cgroup()
+            probing = threading.Event()
+            probed = threading.Event()
+            probe_finished: list[bool] = []
+            loop_reads: list[Path] = []
+            child_prints: list[str] = []
+            # An empty PATH cannot find printenv; the child reads only the variable under test.
+            printenv = shutil.which("printenv")
+            assert printenv is not None
+            serve_once = fixture.server.run_once
+
+            def probe_or_serve(timeout: float) -> None:
+                # The probe turn reads the environment and does no other work.
+                if probing.is_set() and not probed.is_set():
+                    try:
+                        loop_reads.append(gate.builds_slice_cgroup())
+                        # The loop starts its own threads too, for example the reading alert and the roster.
+                        started = threading.Thread(target=lambda: loop_reads.append(gate.builds_slice_cgroup()))
+                        started.start()
+                        started.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                        # The loop starts child processes with env=None, for example session_send and systemctl.
+                        child = subprocess.run([printenv, "BUILDLOG_BUILDS_CGROUP"], capture_output=True, text=True,
+                                               check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                        child_prints.append(child.stdout)
+                    finally:
+                        probed.set()
+                else:
+                    serve_once(timeout)
+
+            refill_update = os.environ.update
+
+            def probe_update(values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+                # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
+                probing.set()
+                probe_finished.append(probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                refill_update(values, **keywords)
+
+            with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
+                update_probe = mock.patch.object(os.environ, "update", probe_update)
+                try:
+                    with mock.patch.dict(os.environ, {"ADMISSION_PATCH_DICT_PROBE": "1"}):
+                        # The probe wraps only the update of this exit; the patch.dict entry already ran.
+                        _ = update_probe.start()
+                finally:
+                    _ = update_probe.stop()
+                self.assertNotIn("ADMISSION_PATCH_DICT_PROBE", os.environ)
+            self.assertEqual(probe_finished, [True])
+            self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
+            self.assertEqual(child_prints, [f"{fixture_cgroup}\n"])
 
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:

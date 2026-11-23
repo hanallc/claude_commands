@@ -187,7 +187,8 @@ class PushTextTests(unittest.TestCase):
                         self.assertLess(len(text), 1024)
                     else:
                         self.assertLess(len(text), 500)
-                    self.assertLess(len(push.title), 45)
+                    # A one-line text posts no title; its line is the message.
+                    self.assertLess(len(push.posted_title), 45)
 
     def test_decision_argv_carries_the_question_record_path(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
@@ -490,6 +491,32 @@ class PushTextTests(unittest.TestCase):
         for hidden in (self.entry(), replace(entry, session=SessionTemplate("{version}"))):
             module = SimpleNamespace(ENTRIES=(replace(hidden, header=False),))
             with (self.subTest(hidden=hidden), mock.patch.object(importlib, "import_module", return_value=module),
+                  self.assertRaises(ValueError)):
+                _ = push_texts.catalog()
+
+    def one_line_entry(self) -> PushText:
+        return PushText("test", "test", "note", "codex1 has {left} left; units work alone next", push_texts.NoActionNeeded(),
+                        "", (PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+
+    def test_one_line_text_posts_its_line_as_the_message_with_no_title(self) -> None:
+        push = push_texts.render_entry(self.one_line_entry(), {"left": "1%"})
+        self.assertEqual(push.title, "codex1 has 1% left; units work alone next")
+        self.assertEqual(push.posted_title, "")
+        self.assertEqual(push.message, "codex1 has 1% left; units work alone next")
+        self.assertNotIn("No action needed", push.message)
+        self.assertIn("Title: none (the phone shows the app name)\ncodex1 has 1% left",
+                      push_texts.shown(self.one_line_entry()))
+
+    def test_one_line_is_fingerprinted_and_cannot_hold_an_action_session_or_body(self) -> None:
+        entry = self.one_line_entry()
+        with mock.patch.object(importlib, "import_module", return_value=SimpleNamespace(ENTRIES=(entry,))):
+            self.assertEqual(push_texts.catalog(), (entry,))
+        self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, one_line=False)))
+        for label, invalid in (("action", replace(entry, action=ActionTemplate("Reply go."))),
+                               ("session", replace(entry, session=SessionTemplate("{left}"))),
+                               ("body", replace(entry, body="Left: {left}."))):
+            module = SimpleNamespace(ENTRIES=(invalid,))
+            with (self.subTest(label=label), mock.patch.object(importlib, "import_module", return_value=module),
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 

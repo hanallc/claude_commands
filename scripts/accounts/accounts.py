@@ -1790,7 +1790,11 @@ def role_account(role: str) -> AccountSelection:
         home = _workers_home()
         label = agent_accounts.codex_home_role_label(home)
         return CodexWorkersAccount(label, home)
-    group: ClaudeGroup = "units" if role == "unit" else "producers" if role == "producer" else "showrunners"
+    return group_account("units" if role == "unit" else "producers" if role == "producer" else "showrunners")
+
+
+def group_account(group: ClaudeGroup) -> ClaudeLaunchAccount:
+    """Resolve a Claude group to the numbered account selected for it."""
     selected = group_label(group_accounts(), group)
     if isinstance(selected, GroupNotConfigured):
         raise AccountsError("accounts: " + group_configuration_line(group))
@@ -3180,7 +3184,8 @@ def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.S
     try:
         if row.kind == "producer":
             batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
-            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
+            result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={},
+                           intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT)[0]
             if isinstance(result, stop_results.SessionNotFound):
                 return SessionMoveRefused(row.current_session, "no saved session was found")
             if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
@@ -3666,8 +3671,8 @@ def _workers_move_lock(purpose: Literal["run", "schedule"]) -> Generator[None]:
 
 def _pending_workers_requests(
     journal: Sequence[moves.MoveEntry] | moves.ReadCurrentMoveJournal = moves.READ_CURRENT_MOVE_JOURNAL,
-) -> dict[str, moves.RequestedMove]:
-    pending: dict[str, moves.RequestedMove] = {}
+) -> dict[str, moves.RecordedMoveRequest]:
+    pending: dict[str, moves.RecordedMoveRequest] = {}
     entries = moves.read_moves() if isinstance(journal, moves.ReadCurrentMoveJournal) else journal
     for entry in entries:
         if entry["subject"] != "workers":
@@ -4489,6 +4494,14 @@ class AccountSessionDocument(TypedDict):
     state: session_state.SessionState
 
 
+@dataclass(frozen=True)
+class NamedSession:
+    """One local session of a role by its staff name; the Accounts page names paused and exited ones."""
+
+    name: str
+    state: session_state.SessionState
+
+
 MODEL_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MODEL_ROLES = ("producers", "showrunners", "units", "workers")
 
@@ -4583,6 +4596,8 @@ class StatusRow:
     models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
     inherited_roles: tuple[ClaudeGroup, ...] = ()
     model_names_by_role: dict[str, dict[SessionModel, ModelSessionNames]] = field(default_factory=dict)
+    # Filled only for local sessions, and only when the read uses include_models=True; a peer sends counts without names.
+    named_sessions_by_role: dict[str, tuple[NamedSession, ...]] = field(default_factory=dict)
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -6917,8 +6932,10 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         members: dict[str, session_state.SessionState] = {}
         models: dict[str, Counter[ObservedSessionModel]] = {}
         model_names: dict[str, dict[SessionModel, ModelSessionNames]] = {}
+        named: dict[str, tuple[NamedSession, ...]] = {}
         for role in roles:
             role_models: Counter[ObservedSessionModel] = Counter()
+            role_named: list[NamedSession] = []
             for identity, state in observed.counts.get((directory, role), {}).items():
                 members[identity] = state
                 key = (directory, identity)
@@ -6927,12 +6944,16 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
                     role_models[model] += 1
                 if name := observed.model_session_names.get(key):
                     model_names.setdefault(role, {}).setdefault(model, ModelSessionNames()).names.append(name)
+                    role_named.append(NamedSession(name, state))
             models[role] = role_models
+            if role_named:
+                named[role] = tuple(role_named)
         counted.append(replace(row, roles=roles,
             sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
             selected_roles=tuple(role for role in row.roles if role != "spare"),
             models_by_role=models,
             model_names_by_role=model_names,
+            named_sessions_by_role=named,
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -7352,6 +7373,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="action")
     _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
     _ = commands.add_parser("role-map-read")
+    _ = commands.add_parser("completion-plan-read")
     _ = commands.add_parser("session-counts-read")
     counts_fetch = commands.add_parser("session-counts-fetch")
     _ = counts_fetch.add_argument("--counts-lock", type=int, required=True)
@@ -7526,6 +7548,14 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 print(next_moves.update_next_move_hold(options.group, options.next_position, options.hold_mode, expected))
             else:
                 print(next_moves.list_next_moves())
+            return 0
+        if options.action == "completion-plan-read":
+            if not role_map.is_role_map_host():
+                raise AccountsError(f"accounts: the completion plan belongs on {role_map.ROLE_MAP_HOST}")
+            try:
+                print(role_map.completion_plan_file().read_text(encoding="utf-8"), end="")
+            except OSError as error:
+                raise AccountsError(f"accounts: no completion plan: {error.strerror or error}") from error
             return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():
