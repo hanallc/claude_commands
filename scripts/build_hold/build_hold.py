@@ -114,6 +114,11 @@ class NoCycle:
     pass
 
 
+@dataclass(frozen=True)
+class NoStaffRead:
+    """Status has not read the staff snapshot yet."""
+
+
 class CycleReleaseNotices(TypedDict):
     kind: Literal["cycle"]
     cycle_id: str
@@ -165,6 +170,8 @@ class CycleNoticesToSend:
     cycle: HoldCycle
     entries: list[ReleaseEntry]
     unresolved_stops: int
+    # Queued notices arrive when their session returns. A release does not send them again.
+    queued: list[ReleaseEntry]
 
 
 class ReleaseNoticeReadError(ReleaseRecordReadError):
@@ -1437,10 +1444,10 @@ def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
 
 
 def release_notice_pending(entry: ReleaseEntry) -> bool:
+    """A queued notice arrives later. A gone Claude session has no route later; a Codex thread can open again."""
     delivery = entry["delivery"]
-    # An absent Claude session can skip a generic notice before the sender runs.
-    return (delivery in ("NotAttempted", "DeliveryFailed", "QueuedUnconfirmed", "WorkerClosed")
-            or (delivery == "RecipientGone" and ("run" in entry or entry["session_id"].startswith("codex:"))))
+    return (delivery in ("NotAttempted", "DeliveryFailed", "WorkerClosed")
+            or delivery == "RecipientGone" and entry["session_id"].startswith("codex:"))
 
 
 def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
@@ -1465,24 +1472,39 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
                 unresolved += 1
             case "not_stopped":
                 pass
-    entries = [entry for entry in release_entries(cycle, notices["recipients"], runs)
-               if release_notice_pending(entry)]
-    return CycleNoticesToSend(cycle, entries, unresolved)
+    entries = release_entries(cycle, notices["recipients"], runs)
+    return CycleNoticesToSend(cycle, [entry for entry in entries if release_notice_pending(entry)], unresolved,
+                              [entry for entry in entries if entry["delivery"] == "QueuedUnconfirmed"])
 
 
-def unsent_text(entries: Sequence[ReleaseEntry], recipients: Mapping[str, str]) -> str:
-    """Name each unsent recipient once, with the count of its stopped runs."""
-    runs: dict[str, int] = {}
+def entry_name(entry: ReleaseEntry, recipients: Mapping[str, str], membership: staff.StaffSnapshot | None) -> str:
+    """Use the staff name when a staff row matches. Otherwise use the recorded name."""
+    run = entry.get("run")
+    if membership is not None:
+        row = (run_worker(entry, run, membership) if run is not None
+               else membership.by_member_reference(entry["session_id"].removeprefix("codex:")))
+        if row is not None:
+            return row.name
+    return entry["name"] if run is not None else recipients.get(entry["session_id"], entry["name"])
+
+
+def recipients_text(entries: Sequence[ReleaseEntry], recipients: Mapping[str, str],
+                    membership: staff.StaffSnapshot | None) -> str:
+    """Name each recipient session once, with the count of its stopped runs."""
+    sessions: dict[str, tuple[str, int]] = {}
     for entry in entries:
-        name = entry["name"] if "run" in entry else recipients[entry["session_id"]]
-        runs[name] = runs.get(name, 0) + int("run" in entry)
-    return ", ".join(f"{name} ({count} stopped run{'s' if count > 1 else ''})" if count else name
-                     for name, count in runs.items()) or "none"
+        name, runs = sessions.get(entry["session_id"]) or (entry_name(entry, recipients, membership), 0)
+        sessions[entry["session_id"]] = (name, runs + int("run" in entry))
+    return ", ".join(f"{name} ({runs} stopped run{'s' if runs > 1 else ''})" if runs else name
+                     for name, runs in sessions.values()) or "none"
 
 
 def pending_release_status_lines() -> list[str]:
     """Name unfinished notices without locking, migrating or changing release state."""
+    from scripts.production import staff
+
     lines: list[str] = []
+    membership: staff.StaffSnapshot | None | NoStaffRead = NoStaffRead()
     for path in pending_release_paths():
         try:
             intent = read_release_intent(path)
@@ -1490,9 +1512,17 @@ def pending_release_status_lines() -> list[str]:
                 continue
             pending = release_notices(intent)
             notices = intent["notices"]
-            unsent = (unsent_text(pending.entries, notices["recipients"])
-                      if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
-                      else "every session (broadcast)")
+            if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle":
+                if isinstance(membership, NoStaffRead):
+                    try:
+                        membership = staff.initial_snapshot()
+                    except staff.StaffUnreadable:
+                        membership = None
+                unsent = recipients_text(pending.entries, notices["recipients"], membership)
+                if pending.queued:
+                    unsent += "; queued: " + recipients_text(pending.queued, notices["recipients"], membership)
+            else:
+                unsent = "every session (broadcast)"
             if isinstance(pending, CycleNoticesToSend) and pending.unresolved_stops:
                 unsent += f". Pending stop confirmations: {pending.unresolved_stops}"
         except (OSError, ValueError) as error:
@@ -1906,8 +1936,7 @@ def stopped_runs_text(entries: Sequence[ReleaseEntry], membership: staff.StaffSn
     for entry in entries:
         run = entry.get("run")
         assert run is not None
-        worker = run_worker(entry, run, membership)
-        owners.setdefault(worker.name if worker is not None else entry["name"], []).append(run)
+        owners.setdefault(entry_name(entry, {}, membership), []).append(run)
     if len(entries) == 1:
         (name, (run,)), = owners.items()
         return f" Restart the stopped run {run['label']} for {name}. Run ID {run['id']}."
@@ -1993,9 +2022,10 @@ def cycle_status_lines(cycle: HoldCycle) -> list[str]:
 
 def not_reached_detail(cycle: HoldCycle) -> str:
     entries = release_entries(cycle, cycle["recipients"])
-    missing = [f"{entry['name']} (session gone)" for entry in entries
-               if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)]
-    pending = [entry["name"] for entry in entries if release_notice_pending(entry)]
+    # Name each session once, however many of its runs are listed.
+    missing = list({entry["session_id"]: f"{entry['name']} (session gone)" for entry in entries
+                    if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)}.values())
+    pending = list({entry["session_id"]: entry["name"] for entry in entries if release_notice_pending(entry)}.values())
     failed = " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
     if not pending:
         return failed

@@ -1773,19 +1773,41 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         with build_hold.release_lock() as held:
             self.assertFalse(any(record.state == "pending" for record in build_hold.recorded_releases(held)))
 
-    def test_status_counts_the_unsent_stopped_runs_of_each_recipient(self) -> None:
+    def test_status_names_each_recipient_session_once_with_its_staff_name_and_run_count(self) -> None:
         director = fixture_member("showrunner", name="director")
         phases = fixture_member("worker", name="phases", parent=director.id)
-        self.leave_release_pending("builds", [(phases.name, f"codex:{phases.current_session}"), ("waiting", "one")])
-        runs = self.stopped_runs(phases, 4)
-        self.pending_runs(runs)
+        address = f"codex:{phases.current_session}"
+        # A real cycle records a Claude recipient under its session ID.
+        self.leave_release_pending("builds", [(address, address), ("twin", "one"), ("twin", "two")])
+        runs: list[build_hold.ReleaseEntry] = [{**entry, "name": address} for entry in self.stopped_runs(phases, 4)]
+        twins: list[build_hold.ReleaseEntry] = [{"session_id": session, "name": "twin", "delivery": "NotAttempted",
+                                                 "run": {"id": f"{session}-run", "label": "cargo test",
+                                                         "staff_id": "", "director_dir": ""}}
+                                                for session in ("one", "two")]
+        self.pending_runs([*runs, *twins])
         cycle = self.cycle()
         cycle["entries"].append({**runs[0], "delivery": "Delivered"})
         build_hold.save_cycle(cycle)
         result = invoke_hold(["status"], dict(os.environ))
         self.assertEqual(result.returncode, 0, result.stderr)
         line, = [line for line in result.stdout.splitlines() if line.startswith("release pending:")]
-        self.assertIn(" - unsent: phases (3 stopped runs), waiting; run /build:hold release to finish it", line)
+        self.assertIn(" - unsent: phases (3 stopped runs), twin (1 stopped run), twin (1 stopped run);", line)
+
+    def test_gone_claude_session_run_with_no_route_is_not_reached_and_not_pending(self) -> None:
+        self.leave_release_pending("builds", [("gone session", "gone")])
+        self.pending_runs([{"session_id": "gone", "name": "gone session", "delivery": "NotAttempted",
+                            "run": {"id": f"run-{index}", "label": "python3.13 unittest", "staff_id": "",
+                                    "director_dir": ""}} for index in range(3)])
+        with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientGone()) as lookup,
+              mock.patch.object(build_hold, "send_release_to") as send):
+            result = invoke_hold(["release", "--holder", "builds"], dict(os.environ))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (
+            0, "released, builds may resume. Not reached, tell them yourself: gone session (session gone)\n", ""))
+        lookup.assert_called_once_with("gone")
+        send.assert_not_called()
+        self.assertEqual(self.run_deliveries(), ["RecipientGone"] * 3)
+        with build_hold.release_lock() as held:
+            self.assertFalse(any(record.state == "pending" for record in build_hold.recorded_releases(held)))
 
     def test_closed_codex_result_stays_pending_until_the_worker_can_receive_it(self) -> None:
         parent = fixture_member("showrunner", name="runner")
@@ -1956,7 +1978,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         pending, = [line for line in result.stdout.splitlines() if line.startswith("release pending:")]
         self.assertTrue(pending.endswith(
-            " - unsent: missing entry, not attempted, failed, queued; run /build:hold release to finish it"), pending)
+            " - unsent: missing entry, not attempted, failed; queued: queued; run /build:hold release to finish it"),
+            pending)
 
     def test_status_names_current_and_retained_releases_beside_a_live_holder(self) -> None:
         self.leave_release_pending("earlier", [("earlier waiter", "one")])
@@ -2620,7 +2643,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(sent, ["one", "two"])
         self.assertEqual([row["event"] for row in recorded_hold_events(self.scratch / "buildlog", 2)], ["began", "ended"])
 
-    def test_resume_retries_failed_queued_and_lookup_notices(self) -> None:
+    def test_resume_retries_failed_and_lookup_notices_but_never_a_queued_one(self) -> None:
         self.begin()
         member = fixture_member("showrunner", name="gone")
         build_hold.record_recipients([
@@ -2638,7 +2661,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(lookup.call_count, 5)
         self.assertEqual(send.call_count, 3)
         self.assertIn("Not reached, tell them yourself: gone (session gone)", result)
-        self.assertIn("Release notices still pending for failed, queued, lookup.", result)
+        # A queued notice arrives when its session returns, so a release never queues a second copy.
+        self.assertIn("Release notices still pending for failed, lookup.", result)
         with build_hold.release_lock() as held:
             record, = build_hold.recorded_releases(held)
         self.assertEqual(record.state, "pending")
@@ -2648,8 +2672,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             resumed = build_hold.release_cycle(folder, "holder", resume=True)
             self.assertNotIn("Release notices still pending", resumed)
             self.assertEqual(build_hold.release_cycle(folder, "holder", resume=True), "hold is already released.")
-        self.assertEqual(lookup.call_args_list, [mock.call("a"), mock.call("b"), mock.call("d")])
-        self.assertEqual([attempt.args[0]["session_id"] for attempt in send.call_args_list], ["a", "b", "d"])
+        self.assertEqual(lookup.call_args_list, [mock.call("a"), mock.call("d")])
+        self.assertEqual([attempt.args[0]["session_id"] for attempt in send.call_args_list], ["a", "d"])
         with build_hold.release_lock() as held:
             record, = build_hold.recorded_releases(held)
         self.assertEqual(record.state, "completed")
