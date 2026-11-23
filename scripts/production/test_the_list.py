@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -1134,7 +1135,11 @@ class TheListTests(unittest.TestCase):
 
     def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
         first = self.add(number=1)
-        second = the_list.add(OTHER.id, "Check the second item", owner=RUNNER.id, source="nate", number=1, changes={})
+        # Only morty's folder allocates numbers, so a legacy keeper's L1 is a copy of morty's record.
+        legacy = the_list.folder(OTHER.id)
+        legacy.mkdir(parents=True)
+        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{first.id}.md", legacy / f"{first.id}.md")
+        second = the_list.load(OTHER.id, first.id)
         status = change_page.DeliveryStatus(self.root / "reviews")
         for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
             _ = the_list.ask_question(keeper, item.id,

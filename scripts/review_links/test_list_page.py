@@ -3176,9 +3176,10 @@ window.fetch=(url,options)=>{
         self.assertEqual(saved.state, the_list.ItemState.CLOSED)
         self.assertEqual(saved.log[:-2], removed.log)
         self.assertEqual([entry.item.id for entry in list_page.records()], [first.id])
-        # The removed number stays used: the List's record writer continues the one sequence.
-        self.assertEqual([self.add(f"Add item {number}").number for number in (208, 209)], [208, 209])
         self.assertEqual(the_list.load(MORTY.id, removed.id), saved)
+        # The counter keeps the removed number used even when its file is gone.
+        (the_list.folder(MORTY.id) / f"{removed.id}.md").unlink()
+        self.assertEqual([self.add(f"Add item {number}").number for number in (208, 209)], [208, 209])
 
     def test_park_writes_the_date_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Park this item now")
@@ -6777,7 +6778,11 @@ window.fetch=async(path,options={})=>{
         root = self.root / "reviews"
         for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):
             with self.subTest(keeper=keeper):
-                item = the_list.add(keeper, "Read the legacy List item", owner=keeper, source="nate", changes={})
+                # Only morty's folder allocates numbers, so move the new record into the legacy keeper's folder.
+                item = the_list.add(MORTY.id, "Read the legacy List item", owner=keeper, source="nate", changes={})
+                legacy = the_list.folder(keeper)
+                legacy.mkdir(parents=True, exist_ok=True)
+                _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
                 markup = list_page.render(root, include_counts=False).decode()
                 self.assertIn(f'data-key="{keeper}/{item.id}"', markup)
                 member = staff.local_snapshot().by_id(keeper)
