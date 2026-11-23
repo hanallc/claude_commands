@@ -1,7 +1,7 @@
 # Standing gate checkouts
 
 `scripts/copies/copies.py` prepares gate, review, merge, and landing checkouts.
-`copies.standing` leases a reusable repository slot through `build_slots.take_slot()`.
+`copies.standing` takes a numbered copy under `roots.build` through `take_copy`.
 
 ## Configuration, place, and names
 
