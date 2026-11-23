@@ -51,6 +51,10 @@ def _no_test_width() -> records.NoTestWidth:
     return records.NoTestWidth()
 
 
+def _no_job_start() -> records.NoJobStart:
+    return records.NO_JOB_START
+
+
 class AdmissionUnavailable(RuntimeError):
     """A bounded queue query has no answer."""
 
@@ -261,6 +265,8 @@ class ServiceEstimateRequest(CallerCode):
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    # An older client sends no job start, and the service reads that as NoJobStart.
+    job_start: records.CiJobStart = field(default_factory=_no_job_start, kw_only=True)
 
 
 @dataclass(frozen=True)
