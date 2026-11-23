@@ -72,9 +72,9 @@ def aws_cost_fixture() -> dict[str, object]:
              ("test affected", 58, 91), ("test nightly", 1, 2)] if number == 19 else
             [(None, count, work_cost)] if count else [])
         hana: dict[str, object] | None = {
-            "runs": 7, "cost_usd": "0.78", "per_run_usd": "0.07", "idle_usd": "0.30",
+            "runs": 7, "cost_usd": "0.78", "per_run_usd": "0.07", "idle_usd": "0.30", "idle_seconds": 8575,
         } if number == 19 else {
-            "runs": 0, "cost_usd": "1.03", "per_run_usd": "0.00", "idle_usd": "1.03",
+            "runs": 0, "cost_usd": "1.03", "per_run_usd": "0.00", "idle_usd": "1.03", "idle_seconds": None,
         } if number == 7 else None
         runs: list[dict[str, object]] = []
         hana_work: list[tuple[str | None, int, int]] = [(None, 7, 48)] if number == 19 else []
@@ -1718,18 +1718,18 @@ process.stdout.write(JSON.stringify(steps));
         self.assertIn("<td class=\"num\">~$1.52</td><td class=\"num\">~$0.018</td>", estimate)
         self.assertIn('Hana check and lint</button></td><td class="num">7</td><td class="num">21 s</td>'
                       + '<td class="num">~$0.78</td><td class="num">—</td>', estimate)
-        self.assertRegex(estimate, r'Hana machine with no run</td>.*<td class="num">no record</td>.*~\$0\.30</td>')
+        self.assertRegex(estimate, r'Hana machine with no run</td>.*<td class="num">2 h 22 min 55 s</td>.*~\$0\.30</td>')
         self.assertRegex(estimate, r'Total</td><td class="num">193</td><td class="num">29 h 39 min 45 s</td>')
         self.assertIn('Unit not recorded</button><span class="aws-dim aws-hint">Run records before this release have no unit.',
                       units)
-        self.assertRegex(units, r'Hana machine with no run</td>.*<td class="num">no record</td>.*~\$0\.30</td>')
+        self.assertRegex(units, r'Hana machine with no run</td>.*<td class="num">2 h 22 min 55 s</td>.*~\$0\.30</td>')
         self.assertRegex(units, r'Costs with no run.*<td class="num">~\$1\.27</td>')
         self.assertIn("Job not recorded", billed)
         self.assertNotIn("Our estimate before the AWS amount", billed)
         self.assertNotIn("Start (Eastern)", billed)
         self.assertIn('Hana check and lint</button></td><td class="num">—</td><td class="num">no record</td>',
                       no_attempt)
-        self.assertRegex(no_attempt, r'Hana machine with no run</td>.*<td class="num">no record</td>.*\$1\.03</td>')
+        self.assertRegex(no_attempt, r'Hana machine with no run</td>.*<td class="num">—</td>.*\$1\.03</td>')
         self.assertRegex(no_attempt, r'Compute with no run record</td>.*\$4\.24</td>')
         self.assertRegex(no_attempt, r'Costs with no run.*<td class="num">\$1\.60</td>')
         self.assertNotIn("with no run", zero)
@@ -1745,6 +1745,12 @@ process.stdout.write(JSON.stringify(steps));
             + " awsDayDetail(data.days[0], data.price_day, {groupBy:'none', openGroups:new Set()}, '2026-11-19'),"
             + " awsDayDetail(data.days[2], data.price_day, undefined, null)]",
             aws_cost_fixture(), walk=True))
+        hana_only, no_run, no_run_no_first = cast(list[str], self.page_expression(
+            "[awsDayDetail({...data.days[0], day:'2026-11-20', runs_list:data.days[0].runs_list.filter(run => run.kind === 'hana')},"
+            + " data.price_day, undefined, '2026-11-19'),"
+            + " awsDayDetail({...data.days[2], day:'2026-11-21', runs:0, runs_list:[]}, data.price_day, undefined, '2026-11-19'),"
+            + " awsDayDetail({...data.days[2], runs:0, runs_list:[]}, data.price_day, undefined, null)]",
+            aws_cost_fixture(), walk=True))
         self.assertEqual((first, no_first), ("2026-11-19", None))
         for detail in (no_unit, no_unit_job):
             self.assertNotIn(">Unit</th>", detail)
@@ -1759,6 +1765,19 @@ process.stdout.write(JSON.stringify(steps));
         self.assertIn('data-aws-group-by="unit"', unit_day)
         self.assertNotIn("no unit record", unit_day)
         self.assertIn('<p class="aws-note aws-unit-note">Runs have no unit record.</p>', no_record)
+        # A Hana-only day and a day with no run have no unit line.
+        for detail in (hana_only, no_run, no_run_no_first):
+            self.assertNotIn("aws-unit-note", detail)
+
+    def test_aws_cost_hana_idle_row_shows_the_machine_time_with_no_run(self) -> None:
+        details = cast(list[str], self.page_expression(
+            """[data.days[0], data.days[12]].map(day => awsDayRuns(day, {groupBy:'job', openGroups:new Set(['["hana"]'])}))""",
+            aws_cost_fixture(), walk=True))
+        idle_rows = [re.search(r"<td>Hana machine with no run</td>((?:<td[^>]*>[^<]*</td>)+)</tr>", detail)
+                     for detail in details]
+        # The cell before the cost is the Time on AWS cell.
+        times = [re.findall(r"<td[^>]*>([^<]*)</td>", row[1])[-2] if row else None for row in idle_rows]
+        self.assertEqual(times, ["2 h 22 min 55 s", "—"])
 
     def test_aws_cost_times_use_the_user_zone(self) -> None:
         for zone, rule, start, header in (
@@ -1792,13 +1811,14 @@ process.stdout.write(JSON.stringify(steps));
 
     def test_aws_cost_history_shows_zero_runs_as_a_count(self) -> None:
         days: list[dict[str, object]] = [{"day": "2026-11-21", "state": "estimate", "amount_usd": "1.21", "runs": 0, "runs_list": []},
-                {"day": "2026-11-20", "state": "none", "amount_usd": None, "runs": 0, "runs_list": []}]
+                {"day": "2026-11-20", "state": "none", "amount_usd": None, "runs": 0, "runs_list": []},
+                {"day": "2026-11-19", "state": "none", "amount_usd": None, "runs": 5, "runs_list": []}]
         cells = cast(list[str], self.page_expression(
             "awsPeriods('day', data.days).map(row => awsHistoryRow(row, 0, data, {day:121}, new Map(), new Map())"
             + ".match(/<td class=\"num[^\"]*\">([^<]*)<\\/td>/)[1])",
-            {"zone": "America/New_York", "today": "2026-11-21", "records_start": "2026-11-20", "price_day": None,
+            {"zone": "America/New_York", "today": "2026-11-21", "records_start": "2026-11-19", "price_day": None,
              "days": days}, history=True))
-        self.assertEqual(cells, ["0", "no record"])
+        self.assertEqual(cells, ["0", "no record", "5"])
 
     def test_aws_cost_csv_joins_run_parts_across_bill_days(self) -> None:
         fixture = aws_cost_fixture()

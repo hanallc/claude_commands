@@ -926,7 +926,10 @@ const AWS_UNIT_COLUMN = 2;
 const awsDayHasUnits = day => day.runs_list.some(run => run.unit);
 // The first UTC bill day where a run has a unit, or null when no run has a unit.
 const awsFirstUnitDay = days => days.filter(awsDayHasUnits).map(day => day.day).sort()[0] ?? null;
-function awsUnitNote(unitStart) {
+// The unit line shows only on a day with a gate run, before the first unit day or when no unit day exists.
+function awsUnitNote(day, unitStart) {
+  const gate = day.runs_list.some(run => run.kind === "gate");
+  if (!gate || awsDayHasUnits(day) || (unitStart != null && day.day >= unitStart)) return "";
   const before = unitStart == null ? "" : ` before ${awsDayName(awsDate(unitStart))}`;
   return `<p class="aws-note aws-unit-note">Runs${before} have no unit record.</p>`;
 }
@@ -988,7 +991,8 @@ function awsDayRuns(day, view) {
   const hanaIdle = awsCents(day.hana?.idle_usd ?? (day.hana?.runs === 0 ? day.hana.cost_usd : "0.00"));
   const {groupBy, openGroups} = view;
   const units = awsDayHasUnits(day);
-  const idleCharge = {name:AWS_HANA_IDLE, cents:hanaIdle, time:"no record"};
+  const idleSeconds = day.hana?.idle_seconds;
+  const idleCharge = {name:AWS_HANA_IDLE, cents:hanaIdle, time:idleSeconds == null ? "—" : awsRunTime(idleSeconds)};
   const charges = [
     ...(groupBy === "job" ? [] : [idleCharge]),
     {name:"Compute with no run record", cents:awsCents(day.unrecorded_compute_usd ?? "0.00"), time:"no record"},
@@ -1036,7 +1040,7 @@ function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
     <div class="aws-run-controls"><span class="aws-dim">Group by</span>
       <div class="filter" role="group" aria-label="Group by">${controls}</div>
       <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
-    <div class="aws-run-content">${awsDayRuns(day, view)}</div>${units ? "" : awsUnitNote(unitStart)}</div>`;
+    <div class="aws-run-content">${awsDayRuns(day, view)}</div>${awsUnitNote(day, unitStart)}</div>`;
 }
 
 function awsRunsCsv(days) {
@@ -1920,7 +1924,7 @@ function awsHistoryRow(row, depth, costs, largest, openPeriods, tips) {
   return `<tr data-period="${row.id}">
     <td class="aws-period" style="padding-left:${indent}px"><button type="button" class="aws-toggle" aria-expanded="${open}"
       data-tip="aws-cost:${row.id}"><span class="aws-chev" aria-hidden="true"></span><span class="aws-point">${name}</span></button>${note ? `<small class="aws-dim">${note}</small>` : ""}</td>
-    <td class="num${row.runs ? "" : " aws-dim"}">${row.cents == null ? "no record" : awsCount(row.runs)}</td>
+    <td class="num${row.runs ? "" : " aws-dim"}">${row.runs || row.cents != null ? awsCount(row.runs) : "no record"}</td>
     <td class="num"><strong>${awsAmount(row)}</strong></td>
     <td class="aws-bar-cell"><span class="aws-bar" aria-hidden="true">${segments}</span></td>
     <td class="aws-states">${states}</td></tr>${children}`;

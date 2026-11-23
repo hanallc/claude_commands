@@ -3631,7 +3631,7 @@ process.stdout.write(JSON.stringify({
 
         billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
         self.assertEqual(billed["hana"], {
-            "runs": 0, "cost_usd": "2.00", "per_run_usd": "0.00", "idle_usd": "2.00"})
+            "runs": 0, "cost_usd": "2.00", "per_run_usd": "0.00", "idle_usd": "2.00", "idle_seconds": 3600})
         self.assertEqual(billed["units"][-1], {"unit": None, "runs": 1, "cost_usd": "4.00"})
         self.assertEqual(billed["no_run_usd"], "4.00")
 
@@ -3643,7 +3643,7 @@ process.stdout.write(JSON.stringify({
                 start + begin, start + end, ("hana_compute:1",)))
         billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
         self.assertEqual(billed["hana"], {
-            "runs": 3, "cost_usd": "2.00", "per_run_usd": "0.01", "idle_usd": "1.97"})
+            "runs": 3, "cost_usd": "2.00", "per_run_usd": "0.01", "idle_usd": "1.97", "idle_seconds": 3540})
         self.assertEqual(billed["units"][-1], {"unit": None, "runs": 4, "cost_usd": "4.00"})
         self.assertEqual([(row["id"], row["seconds"], row["cost_usd"])
                           for row in billed["runs_list"] if row["kind"] == "hana"],
@@ -3653,6 +3653,23 @@ process.stdout.write(JSON.stringify({
             "region": "us-east-2", "zone": None,
             "machine": "m7a.4xlarge", "mode": "Spot", "seconds": 40, "cost_usd": "0.02",
         })
+
+    def test_aws_cost_feed_counts_hana_idle_seconds_in_each_bill_day(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        midnight = bill.period_end
+        with book.transaction() as state:
+            state.hana_compute.append(ledger.HanaComputeExposure(midnight - 1800, midnight + 3600, 1, Decimal(2),
+                ledger.HanaExposureClosed(midnight + 600), "m7a.4xlarge", region="us-east-2"))
+        book.record_hana_attempt(hana_result.HanaAttemptCharge(
+            hana_result.HanaAttemptKey("episode", "crossing", "claim", HanaHostGeneration("fixture", "token", "boot")),
+            hana_result.LogicalStepLink("call", "episode"), 0, 0, 0, midnight - 100, midnight + 50, ("hana_compute:1",)))
+
+        today, billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][:2]
+        # The machine has 1800 s before midnight and 600 s after it. The run has 100 s and 50 s.
+        self.assertEqual((billed["day"], billed["hana"] and billed["hana"]["idle_seconds"]), (bill.day, 1700))
+        self.assertEqual(today["hana"] and today["hana"]["idle_seconds"], 550)
+        self.assertIsNone(aws_costs.hana_idle_seconds({}, []))
 
     def test_aws_cost_feed_does_not_copy_private_fields_or_unit_identifiers(self) -> None:
         joined = "research" + PRIVATE_AWS_FIELDS["instance_id"] + "report"

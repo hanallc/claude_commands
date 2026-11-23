@@ -17,8 +17,8 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.snapshot_codec import parse_snapshot_value
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
-from scripts.lib.user_zone import user_zone_name
 from scripts.lib.build_steps import RAW_ID, read_step_names
+from scripts.lib.user_zone import user_zone_name
 from scripts.production import unit_names
 
 
@@ -34,6 +34,7 @@ class JobCost(AmountPerRun):
 
 class HanaCost(AmountPerRun):
     idle_usd: str
+    idle_seconds: int | None
 
 
 class UnitCost(TypedDict):
@@ -232,9 +233,8 @@ def runs_by_day(state: ledger.LedgerEvidence, rows: Sequence[dict[str, object]],
                      or (zone_region[1] if zone_region is not None else home))
         mode = str(launch.get("mode") or (reservation.mode if reservation is not None else ""))
         identity = recorded_job(launch.get("gate_job"))
-        step = identity.step if identity is not None else None
-        if "gate_job" not in launch:
-            step = MODE_STEPS.get(str(launch.get("mode") or ""))
+        step = (MODE_STEPS.get(str(launch.get("mode") or "")) if "gate_job" not in launch
+                else identity.step if identity is not None else None)
         job = names.get(step) if step is not None else None
         unit = recorded_unit(launch.get("unit")) or recorded_unit(identity.unit if identity else None) or None
         first = date.fromisoformat(bill_day(start))
@@ -382,13 +382,21 @@ def hana_attempt_costs(runs: Sequence[HanaRun], compute: HanaCompute, priced: di
     return costs
 
 
+def hana_idle_seconds(compute: HanaCompute, runs: Sequence[HanaRun]) -> int | None:
+    """Count the machine time of the day that the day's runs do not use."""
+    if not compute:
+        return None
+    machine = sum(charge.end - charge.start for intervals in compute.values() for _, charge in intervals)
+    return max(0, machine - sum(run.seconds for run in runs))
+
+
 def per_run(cost: Decimal, count: int) -> AmountPerRun:
     return {"runs": count, "cost_usd": usd(cost), "per_run_usd": usd(cost / count if count else Decimal(0))}
 
 
 def day_row(day: str, amount: Decimal | None, compute: Decimal, bill: ledger.ChargeRead | None, runs: list[Run],
             costs: dict[str, Decimal], names: dict[str, str], hana_cost: Decimal,
-            hana_runs: Sequence[HanaRun], hana_costs: dict[str, Decimal]) -> Day:
+            hana_runs: Sequence[HanaRun], hana_costs: dict[str, Decimal], hana_idle: int | None) -> Day:
     by_job: dict[str | None, list[Decimal]] = defaultdict(list)
     by_unit: dict[str | None, list[Decimal]] = defaultdict(list)
     details: list[RunCost] = []
@@ -418,7 +426,8 @@ def day_row(day: str, amount: Decimal | None, compute: Decimal, bill: ledger.Cha
     idle = rounded_total - previous
     hana: HanaCost | None = None
     if has_hana:
-        hana = {**per_run(hana_total - idle, len(hana_runs)), "cost_usd": usd(hana_total), "idle_usd": usd(idle)}
+        hana = {**per_run(hana_total - idle, len(hana_runs)), "cost_usd": usd(hana_total), "idle_usd": usd(idle),
+                "idle_seconds": hana_idle}
     if idle:
         _ = by_unit[None]
     jobs: list[JobCost] = [{"job": job, **per_run(sum(by_job[job], Decimal(0)), len(by_job[job]))}
@@ -493,7 +502,7 @@ def day_rows(state: ledger.LedgerEvidence, days: Sequence[ledger.DailySpend], re
         attempts = hana_runs.get(day, [])
         hana_costs = hana_attempt_costs(attempts, compute, hana_spot, hana_paid)
         result.append(day_row(day, amount, compute_total, bill, active, costs, names, sum(hana_paid.values(), Decimal(0)),
-                              attempts, hana_costs))
+                              attempts, hana_costs, hana_idle_seconds(compute, attempts)))
     return result
 
 

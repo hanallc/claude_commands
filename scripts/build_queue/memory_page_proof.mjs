@@ -517,6 +517,7 @@ try {
             pane.scrollIntoView({block:'start'});
             return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
               groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[row.cells.length - 2].textContent),
+              expectedIdleTime:day.hana.idle_seconds == null ? '—' : awsRunTime(day.hana.idle_seconds),
               idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
               csvHeader:csv[0], csvRows:csv.length - 2,
               recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
@@ -525,7 +526,7 @@ try {
           const reconciled = Object.values(result.totals).every(({sum, displayed}) =>
             sum === result.dayCents && displayed === result.dayCents);
           if (!reconciled || !result.fits || result.runs !== result.expectedRuns || result.idleRows !== result.expectedIdleRows ||
-              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== 'no record') ||
+              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== result.expectedIdleTime) ||
               !result.hasRunIds || result.csvRows !== result.recordedRuns) {
             throw new Error('The live Day image or CSV is incomplete. ' + JSON.stringify(result));
           }
@@ -672,8 +673,8 @@ try {
         assert.equal(result.hanaTime, '21 s');
         assert.equal(result.hanaPerRun, '—');
         assert.equal(result.totalTime, '29 h 39 min 45 s');
-        assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','no record']);
-        assert.deepEqual(result.idleTimes, ['no record','no record','no record']);
+        assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','2 h 22 min 55 s']);
+        assert.deepEqual(result.idleTimes, Array(3).fill('2 h 22 min 55 s'));
         assert.deepEqual(result.regions, ['us-east-1','us-west-2']);
         assert.deepEqual(result.machines, ['c7i.8xlarge','m7a.8xlarge']);
         assert.deepEqual(result.units, ['report','Unit not recorded']);
