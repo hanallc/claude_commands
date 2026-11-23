@@ -37,7 +37,6 @@ VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
 
 class FailedProbeTests(OffloadCommandFixture):
     linux_settings: Path = Path()
-    identity: eligibility.KnownRepository = eligibility.KnownRepository("hana")
 
     @override
     def setUp(self) -> None:
@@ -54,6 +53,13 @@ class FailedProbeTests(OffloadCommandFixture):
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+
+    @property
+    def identity(self) -> eligibility.KnownRepository:
+        identity = eligibility.repository_identity(self.repository)
+        if not isinstance(identity, eligibility.KnownRepository):
+            self.fail(f"The fixture repository has no identity: {self.repository}")
+        return identity
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
@@ -285,7 +291,10 @@ class FailedProbeTests(OffloadCommandFixture):
             + 'source = Path(sys.argv[1])\n'
             + 'destination = Path.home() / shlex.split(sys.argv[2].split(":", 1)[1])[0]\n'
             + 'destination.mkdir(parents=True, exist_ok=True)\n'
-            + 'subprocess.run(["cp", "-a", str(source) + "/.", str(destination)], check=True)\n'
+            # The real copy excludes /.git, and the fixture's Git objects are read-only.
+            + 'for entry in source.iterdir():\n'
+            + '    if entry.name != ".git":\n'
+            + '        subprocess.run(["cp", "-a", str(entry), str(destination)], check=True)\n'
             + 'copies.mark_mirror(destination, "verify", "hana", "fixture")\n')
         source = source.replace('    exit "$rsync_status"',
             '    if [[ " $* " != *" --files-from="* ]]; then\n'
