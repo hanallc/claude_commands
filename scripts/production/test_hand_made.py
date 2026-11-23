@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -30,7 +29,7 @@ from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
-from scripts.production import hand_made
+from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -55,6 +54,33 @@ class FakePlace:
         self.started.append(list(argv))
         self.processes.append(subprocess.Popen(list(argv), **popen_arguments))
         return self.processes[-1]
+
+    def programs(self) -> list[list[str]]:
+        """The program words of each start, after the words of the read limit."""
+        return [argv[argv.index("--") + 1:] for argv in self.started]
+
+
+# The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
+BUILD_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR")
+
+
+def clear_build_variables(case: unittest.TestCase) -> None:
+    """Remove the build variables of the caller from os.environ until the test ends."""
+    _ = cast(object, case.enterContext(mock.patch.dict(os.environ)))
+    for name in BUILD_VARIABLES:
+        _ = os.environ.pop(name, None)
+
+
+def namespace_members(namespace: str) -> list[str]:
+    """The pid of each process of this user in the pid namespace, such as pid:[4026532000]."""
+    members: list[str] = []
+    for entry in Path("/proc").iterdir():
+        try:
+            if entry.name.isdigit() and os.readlink(entry / "ns" / "pid") == namespace:
+                members.append(entry.name)
+        except OSError:
+            continue
+    return members
 
 
 PROVIDERS: dict[str, Literal["local", "mac", "ssh"]] = {"natedev": "local", "mac-linux": "ssh"}
@@ -155,6 +181,7 @@ class AttemptCase(unittest.TestCase):
                         ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                          "commit", "-q", "-m", "fixture"]):
             _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+        clear_build_variables(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_TARGET": "natedev"})))
         _ = self.enterContext(mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")))
@@ -222,7 +249,7 @@ class HandMadeTests(AttemptCase):
         self.assertIn("check yes: The script only prints a line.", errors)
         self.assertEqual(self.output.getvalue(), b"hand made ran\n")
         self.assertEqual(self.line.entered, ["natedev-reservation"])
-        self.assertEqual(self.line.place.started, [[sys.executable, "check.py"]])
+        self.assertEqual(self.line.place.programs(), [[sys.executable, "check.py"]])
         self.assertEqual(self.line.closed, [("natedev", 0, "")])
         command = self.calls[0]
         self.assertEqual(command[:2], [str(self.root / "claude"), "-p"])
@@ -332,11 +359,12 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(self.line.place.started, [])
 
     def test_a_child_that_keeps_the_output_open_does_not_hold_the_run(self) -> None:
-        child = "import subprocess, sys; print(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']).pid)"
+        child = ("import os, subprocess, sys; _ = subprocess.Popen([sys.executable, '-c', 'import time; "
+                 + "time.sleep(30)']); print(os.readlink('/proc/self/ns/pid'))")
         started = time.monotonic()
         status, _ = self.attempt((sys.executable, "-c", child))
-        held = int(self.output.getvalue())
-        self.addCleanup(os.kill, held, signal.SIGKILL)
+        # The child is in the pid namespace of the read limit, so it ends with the program.
+        self.assertEqual(namespace_members(self.output.getvalue().decode().strip()), [])
         self.assertEqual(status, 0)
         self.assertLess(time.monotonic() - started, 10)
         row = self.only_row()
@@ -378,8 +406,11 @@ class HandMadeTests(AttemptCase):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
-        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES)
-        self.assertEqual((program["HOME"], program["PATH"]), (os.environ["HOME"], os.environ["PATH"]))
+        # The read limit adds the socket of the private sccache server and the cargo offline mode, and bwrap sets
+        # PWD to the checkout.
+        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES | {"SCCACHE_SERVER_UDS", "CARGO_NET_OFFLINE", "PWD"})
+        self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"], program["SCCACHE_SERVER_UDS"]),
+                         (os.environ["HOME"], os.environ["PATH"], "/tmp", "/tmp/sccache.sock"))
         self.assertLessEqual(shown.items(), program.items())
         prefix = "Variables that the program gets and that can change the code it runs (JSON): "
         lines = [line for line in self.calls[0][-1].splitlines() if line.startswith(prefix)]
@@ -397,10 +428,12 @@ class HandMadeTests(AttemptCase):
             _ = helper.write_text(script)
             helper.chmod(0o755)
         # A #! line with a missing interpreter fails the start; execvp then goes on to the next PATH folder.
-        with mock.patch.dict(os.environ, {"PATH": f"{first}:{second}:{os.environ['PATH']}"}), \
-                self.assertRaises(FileNotFoundError):
-            _ = self.attempt(("helper",))
-        self.assertEqual(self.line.place.started, [[str(first / "helper")]])
+        with mock.patch.dict(os.environ, {"PATH": f"{first}:{second}:{os.environ['PATH']}"}):
+            status, errors = self.attempt(("helper",))
+        # bwrap starts the program by its path, so the failed start ends the attempt with no run.
+        self.assertEqual(status, hand_made.REFUSED_EXIT)
+        self.assertIn(hand_made_limit.BWRAP_FAILED.format(status=1), errors)
+        self.assertEqual(self.line.place.programs(), [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 
     def test_the_check_runs_no_program_that_the_checkout_names(self) -> None:
@@ -424,9 +457,9 @@ class HandMadeTests(AttemptCase):
         # A new mtime makes git status compare the file content, which runs a clean filter.
         os.utime(self.repo / "check.py", (1, 1))
         # A folder word makes the check ask git if it ignores the folder.
-        (self.repo / "sub").mkdir()
+        (self.repo / "target").mkdir()
         self.reply = self.answer(NO)
-        status, _ = self.attempt(("cargo", "build", "--target-dir=sub"))
+        status, _ = self.attempt(("cargo", "build", "--target-dir=target"))
         _ = self.assert_no_run(status, "the check said no")
         self.assertEqual(sorted(path.name for path in marks.iterdir()), [])
         self.assertIsNotNone(self.only_row()["tree_key"])

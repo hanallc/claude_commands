@@ -378,9 +378,9 @@ class GuestCommandParityTests(unittest.TestCase):
             for argv, word in ((('bash', 'target/run.sh'), 'target/run.sh'), (('bash', 'helper'), 'helper')):
                 with self.subTest(word=word):
                     self.assertEqual(self.refusal(*argv),
-                                     f'The guest refuses the command word {word}: the guest cannot read '
-                                     + f'{self.copy / Path(word).parts[0]}: Permission denied, and natedev read no '
-                                     + 'file there.')
+                                     f'The guest refuses the command word {word}: '
+                                     + f'{self.copy / Path(word).parts[0]} cannot be checked (Permission denied), '
+                                     + 'and natedev read no file there.')
 
     def test_a_later_bare_word_with_an_unread_file_in_the_copy_is_refused(self) -> None:
         # The copy keeps the stamp that an earlier run wrote, and bash opens a later word from the copy.
@@ -445,6 +445,10 @@ class GuestCommandParityTests(unittest.TestCase):
         # A link to itself makes os.stat fail with ELOOP: the check cannot tell what the word names.
         (self.copy / 'loop').symlink_to('loop')
         self.assertTrue(mac_linux.main_folder(str(self.copy / 'loop')))
+        # The refusal names the stat error, not a __main__ file.
+        self.assertEqual(self.refusal('python3', 'loop'),
+                         f'The guest refuses the command word loop: {self.copy / "loop"} cannot be checked '
+                         + '(Too many levels of symbolic links), and natedev read no file there.')
         self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing')))
         self.assertFalse(mac_linux.main_folder(str(self.copy / 'missing' / 'below')))
 

@@ -62,7 +62,8 @@ def _workspace(argv: list[str], cwd: Path) -> CargoWorkspace:
     return CargoWorkspace(cwd, home, manifest.parent, checkout)
 
 
-def _output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
+def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
+    """The build output folder that the build folder model gives for the checkout."""
     layout = worktrees.worktree_output(checkout)
     if isinstance(layout, worktrees.RecordedWorktreeOutput):
         return LinkedOutput(worktrees.checked_output(layout))
@@ -153,7 +154,7 @@ def check_step(argv: list[str], cwd: Path, locks: ExitStack, *,
         workspace = _workspace(argv, cwd)
     except (OSError, ValueError) as error:
         raise OutsideBuildFolders(str(error)) from error
-    output = _output(workspace.checkout)
+    output = assigned_output(workspace.checkout)
     if isinstance(output, UnassignedWorkspace):
         raise OutsideBuildFolders(output.reason)
     if isinstance(output, LinkedOutput):
@@ -181,7 +182,7 @@ def clean_output(argv: list[str], cwd: Path) -> CleanExit:
         workspace = _workspace(argv, cwd)
     except (OSError, ValueError):
         return CleanExit.USE_CARGO
-    output = _output(workspace.checkout)
+    output = assigned_output(workspace.checkout)
     if not isinstance(output, LinkedOutput):
         return CleanExit.USE_CARGO
     _check_paths(workspace, argv, output.path)

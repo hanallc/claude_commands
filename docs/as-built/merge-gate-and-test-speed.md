@@ -99,11 +99,23 @@ A targeted gate can reuse a certified test pass. The guest runs any requested ty
 When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
 If AWS refuses that unassigned run, natedev runs the selection.
 
+On natedev, a hand made run starts its program under `bwrap` with a read limit (`scripts/production/hand_made_limit.py`).
+The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
+A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
+The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
+The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
+The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
+natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
+The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
+When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
+When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
+
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
 It holds one argv, the work name and the owner unit, in place of the test selection.
 A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
 A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
 After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
+`GuestRefusedCommand` ends the attempt as a refusal and gives nothing back, as a refused word on the Mac does.
 `GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
 Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
 The request also holds the checkout path of each file that natedev read for an argv word.
