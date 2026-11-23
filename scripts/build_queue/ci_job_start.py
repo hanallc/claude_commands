@@ -16,20 +16,27 @@ def job_start(pid: int, proc_root: Path, *, start_time: str | None = None) -> fl
     A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
     start_time, when given, is the stat start of pid; pid with another start is a reused pid.
     A parent that started after the process below it is a reused pid, so the walk ends without a job start.
+    After each parent read, the walk reads the process below again. The kernel moves a child away from a
+    parent that exits, so the same parent link and start prove that the parent read was not a reused pid.
     """
     seen: set[int] = set()
     expected = start_time
-    below: int | None = None
+    below: tuple[int, str] | None = None
     while pid > 0 and pid not in seen:
         seen.add(pid)
         try:
             name, fields = process_stat.name_and_fields(pid, proc_root)
-            started = int(fields[19])
-            if (expected is not None and fields[19] != expected) or (below is not None and started > below):
+            started = fields[19]
+            if expected is not None and started != expected:
                 return None
+            if below is not None:
+                child, child_start = below
+                _, again = process_stat.name_and_fields(child, proc_root)
+                if int(started) > int(child_start) or int(again[1]) != pid or again[19] != child_start:
+                    return None
             if name == "Runner.Worker":
-                return started / os.sysconf("SC_CLK_TCK")
-            pid, expected, below = int(fields[1]), None, started
+                return int(started) / os.sysconf("SC_CLK_TCK")
+            below, pid, expected = (pid, started), int(fields[1]), None
         except (OSError, IndexError, ValueError):
             return None
     return None

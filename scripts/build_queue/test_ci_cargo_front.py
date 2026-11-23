@@ -25,6 +25,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front, ci_job_start
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.lib import process_stat
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -429,6 +430,25 @@ class JobStartTests(unittest.TestCase):
             # A Runner.Worker that started after the process below it took a reused parent pid.
             write_process(proc, 100, parent=1, start="12600", name="Runner.Worker")
             self.assertIsNone(ci_job_start.job_start(300, proc))
+
+    def test_a_parent_link_that_changes_between_reads_gives_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 100, parent=1, start="12500", name="Runner.Worker")
+            write_process(proc, 300, parent=100, start="12500", name="python3")
+            real = process_stat.name_and_fields
+
+            def reparent_after_parent_read(pid: int, root: Path) -> tuple[str, list[str]]:
+                # pid 100 exits in the start tick of pid 300 and a new Runner.Worker takes pid 100.
+                read = real(pid, root)
+                if pid == 100:
+                    write_process(proc, 300, parent=1, start="12500", name="python3")
+                return read
+
+            with mock.patch.object(process_stat, "name_and_fields", reparent_after_parent_read):
+                self.assertIsNone(ci_job_start.job_start(300, proc))
+            write_process(proc, 300, parent=100, start="12500", name="python3")
+            self.assertEqual(ci_job_start.job_start(300, proc), 12500 / os.sysconf("SC_CLK_TCK"))
 
     def test_a_ci_step_reads_its_job_start_once_and_sends_it_on_the_queue_clock(self) -> None:
         class FixedClock:
