@@ -2693,6 +2693,7 @@ class WorkerCommandTests(unittest.TestCase):
         previous = state.read_bytes()
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(state.read_bytes(), previous)
+        self.assertEqual(self.agent.submitted, [])
 
         with self.subTest(cause="busy assignment preserves the submitted pass"):
             self.fixture.world.first_turn_timeout = False

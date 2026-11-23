@@ -33,7 +33,7 @@ from typing import Literal, Protocol, cast, final
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
-from scripts.direct import progress_history, recorder_state
+from scripts.direct import phase_reservation, progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
@@ -661,37 +661,112 @@ def _completion_notices() -> CompletionNotices:
     return cast(CompletionNotices, cast(object, import_module("scripts.herdr.turn_end")))
 
 
+@dataclass(frozen=True)
+class NewPrompt:
+    path: Path
+
+
+@dataclass(frozen=True)
+class SavedPrompt:
+    path: Path
+    request: Path
+    digest: str
+    match: pass_recorder.MatchedDispatch
+
+    def restore(self) -> None:
+        try:
+            if sha256(self.path.read_bytes()).hexdigest() == self.digest:
+                return
+        except FileNotFoundError:
+            pass
+        content = self.request.read_bytes()
+        if sha256(content).hexdigest() != self.digest:
+            raise pass_recorder.DispatchSelectionChanged(f"Request for pass {self.match.instance_id} changed")
+        atomic_file.write_bytes_atomic(self.path, content)
+
+
 def _assignment_prompt(run: Path, slot: str, phase: str, role: WorkerRole, prompt: Path,
-                       instance: uuid.UUID | None, *, restore_completed: bool = False
-                       ) -> Path | pass_recorder.ActiveDispatchPromptConflict:
-    """Compare the proposed prompt with the same phase and prompt purpose."""
+                       instance: uuid.UUID | None, launcher: list[str], work: progress_history.DispatchWork,
+                       ) -> NewPrompt | SavedPrompt | pass_recorder.ActiveDispatchPromptConflict:
+    """Match the request bytes to the saved digest, even if the saved file changed."""
+    proposed = NewPrompt(prompt)
     if not instance or not prompt.name.endswith(f".{instance}.txt") or not pass_recorder.state_path(run).is_file():
-        return prompt
+        return proposed
     state = pass_recorder.read_state(run)
     saved = pass_recorder.pass_slots(state).get(slot, {})
     previous = Path(pass_recorder.string(saved.get("prompt_file")))
     pass_id = pass_recorder.string(saved.get("instance_id"))
     stamp = pass_recorder.object_dict(saved.get("phase")) or {}
-    opened = pass_recorder.open_phase_named(state, phase)
-    if (saved.get("kind") != role or stamp.get("id") != phase
-            or opened is not None and opened.get("instance_id") != stamp.get("instance_id")
-            or previous.parent != prompt.parent
+    if (stamp.get("id") != phase or previous.parent != prompt.parent
             or previous.stem.removesuffix(f".{pass_id}") != prompt.stem.removesuffix(f".{instance}")):
-        return prompt
-    content = prompt.read_bytes()
-    if sha256(content).hexdigest() != saved.get("prompt_digest"):
-        if saved.get("status") == "active":
-            return pass_recorder.ActiveDispatchPromptConflict(slot, pass_id)
-        return prompt
-    if restore_completed and not previous.is_file():
-        if saved.get("status") != "completed":
-            raise FileNotFoundError(f"Open pass prompt is missing: {previous}")
-        atomic_file.write_bytes_atomic(previous, content)
-    return previous
+        return proposed
+    opened = pass_recorder.open_phase_named(state, phase)
+    fields: dict[str, object] = {"kind": role, "prompt_file": str(prompt), "dispatch_kind": work.kind,
+                                 "lens": work.lens, "fix_pass": work.fix_pass}
+    # Check the request file against the recorded digest and dispatch fields.
+    match = pass_recorder.dispatch_match({**saved, "prompt_file": str(prompt)}, opened or stamp,
+                                        fields, launcher, dispatch_owned=True)
+    if isinstance(match, pass_recorder.ActiveDispatchPromptConflict):
+        return match
+    if isinstance(match, pass_recorder.MatchedDispatch):
+        return SavedPrompt(previous, prompt, pass_recorder.string(saved.get("prompt_digest")), match)
+    return proposed
+
+
+class PassNotAdmitted(Enum):
+    NOT_RECORDED = "the recorder has no start event for this pass"
+
+
+def admitted_pass_number(state: dict[str, object], instance: str) -> int | PassNotAdmitted:
+    """Count pass starts in recorder order through this pass."""
+    history = pass_recorder.string(state.get("history_file"))
+    if history:
+        number = 0
+        with Path(history).open(encoding="utf-8") as events:
+            for line in events:
+                event = pass_recorder.json_object(line)
+                if event is not None and event.get("event_type") == "pass_started":
+                    number += 1
+                    if event.get("pass_instance_id") == instance:
+                        return number
+    return PassNotAdmitted.NOT_RECORDED
+
+
+@dataclass(frozen=True)
+class AssignmentPaths:
+    paths: list[str]
+
+
+class NoAssignmentManifest(Enum):
+    NONE = "this dispatch has no assignment paths manifest"
+
+
+def _publish_assignment(run: Path, phase: str, slot: str, role: WorkerRole, instance: str,
+                        status: str, assignment: AssignmentPaths) -> None:
+    state = pass_recorder.read_state(run, resolve_staff=False)
+    number = admitted_pass_number(state, instance)
+    if isinstance(number, PassNotAdmitted):
+        raise ValueError(f"Pass {instance} has no recorded start")
+    manifest = phase_reservation.phase_directory(run, phase) / f"dispatch_{number}_paths.json"
+    if manifest.is_file():
+        return
+    scripts = Path(__file__).resolve().parents[1]
+    posted = subprocess.run(["bash", str(scripts / "direct/board.sh"), "post", str(run), slot, "register",
+                             f"role={role}; status in {status}"], check=False)
+    if posted.returncode:
+        raise OSError(f"{slot}: unable to register the assignment on the board")
+    _ = subprocess.run(["bash", str(scripts / "agents/heartbeat.sh"), str(run / "heartbeat.log"),
+                        "header", slot, role], check=False)
+    atomic_file.write_text_atomic(manifest, json.dumps({"worker": slot, "round": number, "paths": assignment.paths}))
 
 
 class StatusMoveAtUse(Enum):
     KEEP = "keep the existing status file"
+
+
+@dataclass(frozen=True)
+class ReadyToSend:
+    worker: worker_panes.OpenWorker
 
 
 class DispatchReadinessAtUse(Enum):
@@ -710,6 +785,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
              new_pass_instance_id: uuid.UUID | None = None,
              status_source: Path | StatusMoveAtUse = StatusMoveAtUse.KEEP,
+             assignment_paths: AssignmentPaths | NoAssignmentManifest = NoAssignmentManifest.NONE,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
@@ -719,17 +795,25 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
-        candidate = _assignment_prompt(session_dir, slot, phase, role, prompt, new_pass_instance_id, restore_completed=True)
+        work = progress_history.DispatchWork(kind, lens, fix_pass)
+        candidate = _assignment_prompt(session_dir, slot, phase, role, prompt, new_pass_instance_id,
+                                       launcher_command, work)
         if isinstance(candidate, pass_recorder.ActiveDispatchPromptConflict):
             return _prompt_conflict(candidate)
         selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            prompt=candidate, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
-            target=name)
+            prompt=prompt, launcher_command=launcher_command, work=work, target=name)
         if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
             return _prompt_conflict(selection)
+        if isinstance(candidate, SavedPrompt):
+            predecessor = selection.predecessor
+            if (not isinstance(predecessor, pass_recorder.DispatchPredecessor)
+                    or predecessor.instance_id != candidate.match.instance_id
+                    or selection.phase_instance_id not in ("", predecessor.phase_instance_id)
+                    or candidate.match.worker_name != name.value):
+                return _selection_changed(pass_recorder.DispatchSelectionChanged(f"Slot {slot} changed during dispatch"))
+            selection = replace(selection, action=candidate.match)
+            prompt = candidate.path
         matched = selection.action
-        if isinstance(matched, pass_recorder.MatchedDispatch):
-            prompt = candidate
         completion_notices = _completion_notices()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
@@ -769,6 +853,11 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                     return _selection_changed(error)
                 delivery = pass_recorder.dispatch_delivery(passed)
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
+                if isinstance(candidate, SavedPrompt):
+                    try:
+                        candidate.restore()
+                    except pass_recorder.DispatchSelectionChanged as error:
+                        return _selection_changed(error)
                 if isinstance(receipt, DispatchComplete):
                     save_reply(Path(delivery.reply_file), receipt.reply)
                 _ = notice_delivery.callback(completion_notices.retry_completed_notice(
@@ -788,26 +877,25 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return startup_result(name, current_start)
         started = current_start
         prior = pass_recorder.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
-        retry = isinstance(matched, pass_recorder.MatchedDispatch) and bool(prior.line)
-        if retry:
-            ready = _dispatch_turn_ready(parent, started, _client(), prior.line, prior.completion_id, run=session_dir)
-            if isinstance(ready, ExitCode):
-                return ready
+        client = _client()
+        if isinstance(matched, pass_recorder.MatchedDispatch) and prior.line:
+            ready = _dispatch_turn_ready(parent, started, client, prior.line, prior.completion_id, run=session_dir)
         else:
-            ready = _dispatch_ready(parent, started, _client())
-            if not isinstance(ready, worker_panes.OpenWorker):
-                return ready
-            if ready.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-                print(f"{ready.row.name}: agent is {ready.status.value}", file=sys.stderr)
-                return ExitCode.BUSY
-        if isinstance(ready, worker_panes.OpenWorker):
-            started = ready
+            idle = _dispatch_ready(parent, started, client)
+            ready = _ready_to_send(idle) if isinstance(idle, worker_panes.OpenWorker) else idle
+        if isinstance(ready, ExitCode):
+            return ready
+        if isinstance(ready, ReadyToSend):
+            started = ready.worker
 
         def submitted() -> None:
             _ = cleanup.pop_all()
             _ = on_submission()
 
         try:
+            if isinstance(candidate, SavedPrompt):
+                progress_history.validate_dispatch_selection(session_dir, selection)
+                candidate.restore()
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
@@ -827,6 +915,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 _ = status_source.replace(completion_actions.status_file)
         saved = pass_recorder.dispatch_delivery(passed)
         if not saved.line:
+            if isinstance(assignment_paths, AssignmentPaths):
+                _publish_assignment(session_dir, phase, slot, role, instance,
+                                    pass_recorder.string(passed.get("assign_status_file")), assignment_paths)
             dispatch_id = dispatch_id or instance
             line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. " + _done_instruction(dispatch_id)
             handoff = worker_admission.dispatch_record(session_dir, name.value)
@@ -847,9 +938,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
 
         result = ready if ready is DispatchSubmission.SUBMITTED else dispatch_turn(
-            parent, started, _client(), saved.line, saved.completion_id, run=session_dir,
-            on_submission=submitted, defer_compaction=defer_compaction,
-            readiness=started if retry else DispatchReadinessAtUse.CHECK)
+            parent, started, client, saved.line, saved.completion_id, run=session_dir,
+            on_submission=submitted, defer_compaction=defer_compaction, readiness=ready)
         if result is DispatchSubmission.SUBMITTED:
             submitted()
         if result is DispatchSubmission.SUBMITTED and not deferred:
@@ -888,7 +978,7 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
 
 def _dispatch_turn_ready(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                          line: str, dispatch_id: str, *, run: Path,
-                         ) -> worker_panes.OpenWorker | DispatchSubmission | ExitCode:
+                         ) -> ReadyToSend | DispatchSubmission | ExitCode:
     if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
         return _blocked_question(client, started)
     receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
@@ -908,24 +998,28 @@ def _dispatch_turn_ready(parent: StaffId, started: worker_panes.OpenWorker, clie
             return ExitCode.UNCERTAIN
         if not isinstance(receipt, DispatchNotSubmitted):
             return DispatchSubmission.SUBMITTED
+    return _ready_to_send(current)
+
+
+def _ready_to_send(current: worker_panes.OpenWorker) -> ReadyToSend | ExitCode:
     if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
         return ExitCode.BUSY
-    return current
+    return ReadyToSend(current)
 
 
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                    line: str, dispatch_id: str, *, run: Path,
                    on_submission: Callable[[], object] = lambda: None,
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
-                   readiness: worker_panes.OpenWorker | DispatchReadinessAtUse = DispatchReadinessAtUse.CHECK,
+                   readiness: ReadyToSend | DispatchReadinessAtUse = DispatchReadinessAtUse.CHECK,
                    ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
-    ready = (readiness if isinstance(readiness, worker_panes.OpenWorker) else
+    ready = (readiness if isinstance(readiness, ReadyToSend) else
              _dispatch_turn_ready(parent, started, client, line, dispatch_id, run=run))
-    if not isinstance(ready, worker_panes.OpenWorker):
+    if not isinstance(ready, ReadyToSend):
         return ready
-    current = ready
+    current = ready.worker
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
     try:
         if callable(defer_compaction) and isinstance(_compaction_plan(current.row), CompactionRequired):
@@ -1200,22 +1294,23 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
            completion_actions: pass_recorder.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
-           new_pass_instance_id: uuid.UUID | None = None) -> DispatchSubmission | ExitCode:
+           new_pass_instance_id: uuid.UUID | None = None,
+           assignment_paths: AssignmentPaths | NoAssignmentManifest = NoAssignmentManifest.NONE,
+           ) -> DispatchSubmission | ExitCode:
     with ExitStack() as cleanup, ExitStack() as notices, ExitStack() as operations:
         if not name:
             saved_slot = progress_history.launch_slot(session_dir, slot, launcher_command)
-            candidate = _assignment_prompt(session_dir, saved_slot, phase, role, prompt.resolve(), new_pass_instance_id)
-            if isinstance(candidate, pass_recorder.ActiveDispatchPromptConflict):
-                return _prompt_conflict(candidate)
-            matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-                prompt=candidate, launcher_command=launcher_command,
-                work=progress_history.DispatchWork(kind, lens, fix_pass))
-            if isinstance(matched, pass_recorder.ActiveDispatchPromptConflict):
-                return _prompt_conflict(matched)
-            if isinstance(matched, pass_recorder.MatchedDispatch):
-                name = matched.worker_name
-            elif candidate != prompt.resolve() and not candidate.is_file():
-                name = saved_slot
+            work = progress_history.DispatchWork(kind, lens, fix_pass)
+            candidate = _assignment_prompt(session_dir, saved_slot, phase, role, prompt.resolve(), new_pass_instance_id,
+                                           launcher_command, work)
+            if isinstance(candidate, NewPrompt):
+                matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
+                    prompt=candidate.path, launcher_command=launcher_command, work=work)
+            else:
+                matched = candidate.match if isinstance(candidate, SavedPrompt) else candidate
+            # Use this match to find the worker. Select the pass again under its lock.
+            if isinstance(matched, (pass_recorder.MatchedDispatch, pass_recorder.ActiveDispatchPromptConflict)):
+                name = matched.worker_name or saved_slot
         record = staff.snapshot()
         rows = record.find(kind="worker", parent=parent)
         needs_team = False
@@ -1291,7 +1386,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
             completion_actions=completion_actions, on_submission=cleanup.pop_all, lock=hold,
-            new_pass_instance_id=new_pass_instance_id, status_source=status_source,
+            new_pass_instance_id=new_pass_instance_id, status_source=status_source, assignment_paths=assignment_paths,
             notices=notices if isinstance(hold, worker_panes.WorkerLockHold) else SEND_NOTICES_AFTER_DISPATCH)
         if result is DispatchSubmission.SUBMITTED:
             _ = cleanup.pop_all()
@@ -2160,6 +2255,7 @@ class Arguments(argparse.Namespace):
     json: bool = False
     all_parents: bool = False
     new_pass_instance_id: uuid.UUID | None = None
+    assignment_paths: str = ""
     selection: WorkerFilter = WorkerFilter.OPEN
 
 
@@ -2197,6 +2293,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--launcher-command", required=True, help="JSON list of launcher arguments")
     _ = assignment.add_argument("--completion-actions", default="{}")
     _ = assignment.add_argument("--new-pass-instance-id", type=uuid.UUID, help=argparse.SUPPRESS)
+    _ = assignment.add_argument("--assignment-paths", default="", help=argparse.SUPPRESS)
     finishing = commands.add_parser("finish-dispatch", help=argparse.SUPPRESS)
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id", "completion-id"):
         _ = finishing.add_argument("--" + flag, required=True)
@@ -2253,7 +2350,9 @@ def main(arguments: list[str] | None = None) -> int:
                 fix_pass=args.fix_pass, activity=args.activity,
                 early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW, policy=policy,
                 completion_actions=pass_recorder.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
-                new_pass_instance_id=args.new_pass_instance_id)
+                new_pass_instance_id=args.new_pass_instance_id,
+                assignment_paths=AssignmentPaths(pass_recorder.string_list(cast(object, json.loads(args.assignment_paths))))
+                if args.assignment_paths else NoAssignmentManifest.NONE)
         if isinstance(code, DispatchSubmission):
             print("submitted")
         elif code == ExitCode.OK:

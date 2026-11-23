@@ -497,24 +497,43 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     """Send the assignment through the shared worker command."""
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
-    launcher = launcher_command()
     slot = args.to or args.new_worker or role
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
-    summary = directory / f"{slot}_summary{suffix}.txt"
-    status = directory / f"{slot}_status{suffix}"
     instance = uuid.uuid4()
     message = directory / f"{slot}_prompt{suffix}.{instance}.txt"
-    reply = directory / f"{slot}_reply{suffix}.txt"
-    log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
     write_text_atomic(message, content)
+    try:
+        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message)
+    finally:
+        if message.is_file() and not _prompt_adopted(run, instance):
+            message.unlink(missing_ok=True)
+
+
+def _prompt_adopted(run: Path, instance: uuid.UUID) -> bool:
+    if not pass_recorder.state_path(run).is_file():
+        return False
+    state = pass_recorder.read_state(run, resolve_staff=False)
+    return (any(passed.get("instance_id") == str(instance) for passed in pass_recorder.pass_slots(state).values())
+            or isinstance(staff_worker.admitted_pass_number(state, str(instance)), int))
+
+
+def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: list[str], env: dict[str, str],
+                    slot: str, suffix: str, instance: uuid.UUID, message: Path) -> int:
+    directory = message.parent
+    launcher = launcher_command()
+    summary = directory / f"{slot}_summary{suffix}.txt"
+    status = directory / f"{slot}_status{suffix}"
+    reply = directory / f"{slot}_reply{suffix}.txt"
+    log = directory / f"{slot}_agent{suffix}.log"
     end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
     style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
     if args.style_since:
         style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
+        message.unlink()
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
@@ -532,19 +551,12 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         command += ["--model", selection[1], "--effort", selection[2]]
     if args.early_ready:
         command += ["--early-ready", str(Path(args.early_ready).resolve())]
-    number = sum(entry.get("event_type") == "pass_started" for entry in recorded_passes(run)) + 1
-    write_text_atomic(directory / f"dispatch_{number}_paths.json",
-                      json.dumps({"worker": slot, "round": number, "paths": paths}))
     actions = pass_recorder.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
         style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
-                "--new-pass-instance-id", str(instance)]
+                "--new-pass-instance-id", str(instance), "--assignment-paths", json.dumps(paths)]
     worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
-    _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
-              f"role={role}; status in {status}"], env)
-    _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
-              "header", slot, role], env, check=False)
     with log.open("a") as output:
         offset = output.tell()
         result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
@@ -570,8 +582,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     if selected != slot:
         target_log = progress_history.worker_artifact(log, slot, selected)
         _ = log.replace(target_log)
-        write_text_atomic(directory / f"dispatch_{number}_paths.json",
-                          json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
         if (failure_recorded and outcome is progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS
                 and role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1"):
@@ -795,19 +805,6 @@ def execute_astra_review(args: Arguments, cwd: Path, prompt: Path, env: dict[str
     """Publish, hold, review, and close one managed Astra worker."""
     run = Path(args.session_dir).expanduser().resolve()
     return execute_astra_review_herdr(args, run, cwd, prompt, env)
-
-
-def recorded_passes(run: Path) -> list[dict[str, object]]:
-    state = read_object(run / unit_runs.STATE_FILE)
-    passes = [{**object_map(value), "team_slot": slot}
-              for slot, value in object_map(state.get("pass")).items()]
-    history = text(state.get("history_file"))
-    if history:
-        for line in Path(history).read_text().splitlines():
-            entry = object_map(cast(object, json.loads(line)))
-            if entry.get("event_type") in ("pass_started", "pass_finished"):
-                passes.append(entry)
-    return passes
 
 
 def submission_result(result: int) -> int:
