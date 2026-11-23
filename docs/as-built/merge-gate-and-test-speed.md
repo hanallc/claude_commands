@@ -1053,8 +1053,8 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 
 **`scripts/direct/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
-  - It patches `DEFAULT_CONFIG_PATH`, `DEFAULT_MODELS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
-  - It clears `_config_digest`'s cache before and after the call.
+  - It sets `CONF_DIR` and patches `models_registry.DEFAULT_PATH`, `pass_recorder.DEFAULT_MODELS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
+  - `config_digest` has no cache, so each call reads the fixture files.
   - `check=True` raises `CalledProcessError`.
   - The module imports `progress_history` and `user_zone` at load time, before any HOME swap.
 - `communicate_launcher(process, timeout=TEST_HANG_GUARD_SECS) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
@@ -1164,7 +1164,7 @@ The status line reads assignments from staff rows instead of these environment n
 
 - **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the app-server fixture or HOME.
 
-- **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals. Cache-holding functions (`_config_digest`) are cleared around each case.
+- **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals.
 
 - **The gate kills only what it started:** its own process groups, never by pattern.
 

@@ -234,18 +234,14 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
         recorder.main()
         return 0
 
-    pass_recorder.config_digest.cache_clear()
-    try:
-        with (
-            patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
-            patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
-            patch.object(pass_recorder, "DEFAULT_MODELS_CONFIG_PATH", home / ".claude/config/models.conf"),
-            patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
-                                               str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
-        ):
-            result = invoke_cli(recorder, main, list(arguments), environment, cwd)
-    finally:
-        pass_recorder.config_digest.cache_clear()
+    with (
+        patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
+        patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
+        patch.object(pass_recorder, "DEFAULT_MODELS_CONFIG_PATH", home / ".claude/config/models.conf"),
+        patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
+                                           str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
+    ):
+        result = invoke_cli(recorder, main, list(arguments), environment, cwd)
     if check:
         result.check_returncode()
     return result
