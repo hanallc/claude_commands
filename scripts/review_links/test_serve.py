@@ -451,7 +451,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         aws = fixture_member("unit", name="aws", parent=builds.id)
         config = conf.path("console")
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\npage.aws_machines.owner={aws.id}\n"
-                                 + f"page.list.owner={other.id}\n")
+                                 + f"page.list.owner={other.id}\npage.review.label=Review\n"
+                                 + "page.aws_machines.label=AWS Machines\npage.list.label=List\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
             review = self.request(review_page.PAGE_PATH)
@@ -467,12 +468,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         expected = [{"id": owner.id, "name": owner.name, "proposal": True},
                     {"id": builds.id, "name": builds.name, "proposal": False},
                     {"id": other.id, "name": other.name, "proposal": False}]
-        for page, default in (("review", owner), ("aws_machines", builds), ("list", other)):
+        for page, default, reason in (
+                ("review", owner, f"{owner.name} owns the Review page."),
+                ("aws_machines", builds, "aws owns the AWS Machines page. Its showrunner builds gets new items."),
+                ("list", other, f"{other.name} owns the List page.")):
             with self.subTest(page=page):
                 options = self.new_item_http(query=f"?page={page}")
                 fields = cast(dict[str, object], json.loads(options.body))
                 self.assertEqual(options.status, 200)
-                self.assertEqual(fields["page_owner"], default.id)
+                self.assertEqual((fields["page_owner"], fields["page_owner_reason"]), (default.id, reason))
                 self.assertCountEqual(cast(list[dict[str, object]], fields["recipients"]), expected)
         self.assertEqual(self.new_item_http(query="?page=other").status, 400)
         self.assertEqual(review.status, 200)
@@ -495,7 +499,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(options.status, 200)
         fields = cast(dict[str, object], json.loads(options.body))
-        self.assertEqual(fields["page_owner"], "")
+        self.assertEqual((fields["page_owner"], fields["page_owner_reason"]), ("", ""))
         self.assertEqual(fields["recipients"], [{"id": other.id, "name": other.name, "proposal": True}])
 
     def test_page_proposal_refuses_the_named_recipient_without_a_native_folder(self) -> None:
@@ -2923,6 +2927,40 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(details.page, page)
                     send.assert_called_once_with(f"session:{morty.current_session}", change_page.SENDER, ANY)
 
+    def test_new_item_sends_each_type_to_each_name_in_the_to_row(self) -> None:
+        case = self.review_fixture()
+        showrunner = case.ready_submission_recipient()
+        document = self.root.parent / "producer.md"
+        _ = document.write_text(f"# Producer\n- **Proposals:** {self.root.parent / 'producer-proposals'}\n")
+        producer = fixture_member("producer", name="producer", doc=staff.LiveDoc(local_machine(), document))
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={showrunner.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        # The dialog sends Feedback as an Investigation.
+        kinds = [new_item_dialog.SubmissionKind(kind if kind != "feedback" else "investigation")
+                 for kind, _, _ in new_item_dialog.KINDS]
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message")):
+            for page in sorted(page_frame.OWNER_PAGES):
+                options = self.new_item_http(query=f"?page={page}")
+                self.assertEqual(options.status, 200, options.body)
+                recipients = cast(list[dict[str, object]], cast(dict[str, object], json.loads(options.body))["recipients"])
+                self.assertCountEqual([row["id"] for row in recipients], [showrunner.id, producer.id, morty.id])
+                # A Send to a selected chip reads the page only to choose the List draft path or the standard path.
+                if page not in ("list", "review"):
+                    continue
+                for kind in kinds:
+                    for row in recipients:
+                        if kind == new_item_dialog.SubmissionKind.PROPOSAL and not row["proposal"]:
+                            continue
+                        with self.subTest(page=page, kind=kind, name=row["name"]):
+                            request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
+                                              page_recipient=new_item_dialog.PageRecipient.SELECTED,
+                                              request_id="r6-" + uuid4().hex)
+                            response = self.new_item_http(self.new_item_body(request), finished=True)
+                            self.assertEqual(response.status, 200, response.body)
+
     def test_standard_new_item_refuses_the_list_producer_with_an_unreadable_document(self) -> None:
         case = self.review_fixture()
         document = self.root.parent / "unreadable.md"
@@ -2953,7 +2991,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(request_id=request.request_id):
                     reply = self.new_item_http(self.new_item_body(request), finished=True)
                     self.assertEqual(reply.status, 400, reply.body)
-                    self.assertEqual(json.loads(reply.body), {"error": "Cannot read the production document for morty."})
+                    self.assertEqual(json.loads(reply.body), {"error": f"morty's production document {document} cannot be read. You must fix morty's staff row."})
             self.assertEqual(update_registration.question_records_for_owner(producer.id), [])
             send.assert_not_called()
 

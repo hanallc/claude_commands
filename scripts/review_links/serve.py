@@ -117,8 +117,8 @@ def owned_document(content: bytes, page: str) -> bytes:
     try:
         members = staff.local_snapshot()
         owners = review_submissions.page_owners(page, conf.read_or_repository("console"), members)
-        if isinstance(owners.route, staff.StaffRow):
-            recipient = owners.route.name
+        if isinstance(owners.route, review_submissions.PageOwnerRoute):
+            recipient = owners.route.row.name
         elif review_submissions.has_recipient_choice(members):
             recipient = page_frame.OwnerNewItem.CHOOSE_RECIPIENT
         elif isinstance(owners.shown, staff.StaffRow):
@@ -1527,9 +1527,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access(), server.staff_read_scope():
                 members = staff.snapshot()
                 if selected:
-                    owner = review_submissions.page_owner(selected[0], conf.read_or_repository("console"), members)
-                    fields["page_owner"] = owner.id if isinstance(owner, staff.StaffRow) else ""
-                    recipients = review_submissions.recipient_options(members, owner=owner)
+                    route = review_submissions.page_owners(selected[0], conf.read_or_repository("console"), members).route
+                    if isinstance(route, review_submissions.PageOwnerRoute):
+                        fields.update(page_owner=route.row.id, page_owner_reason=route.reason)
+                        recipients = review_submissions.recipient_options(members, owner=route.row)
+                    else:
+                        fields.update(page_owner="", page_owner_reason="")
+                        recipients = review_submissions.recipient_options(members, owner=route)
                 else:
                     recipients = review_submissions.recipient_options(members)
         except (OSError, ValueError) as error:

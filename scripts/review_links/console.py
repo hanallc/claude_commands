@@ -275,8 +275,8 @@ def _unavailable_owner_controls(pages: tuple[str, ...]) -> str:
         if page not in page_frame.OWNER_PAGES:
             continue
         owners = review_submissions.page_owners(page, settings, members)
-        if isinstance(owners.route, staff.StaffRow):
-            recipient = owners.route.name
+        if isinstance(owners.route, review_submissions.PageOwnerRoute):
+            recipient = owners.route.row.name
         elif review_submissions.has_recipient_choice(members):
             recipient = page_frame.OwnerNewItem.CHOOSE_RECIPIENT
         elif isinstance(owners.shown, staff.StaffRow):

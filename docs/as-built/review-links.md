@@ -109,9 +109,11 @@ The dialog offers Bug, Question, Feedback, Proposal, and Investigation.
 The **To** row offers chips for all eligible producers and showrunners in the staff record.
 For a new draft, **To** selects the page owner or the showrunner who receives items for that unit.
 On an unavailable AWS Machines page owned by the AWS unit, **To** selects its showrunner, builds.
+A muted line under **To** says why the server chose that recipient; it shows only while that chip is selected.
 The active List producer appears in the row when `page.list.owner` names its staff ID.
 The row can show that producer when its production document is unavailable.
 Send checks the selected recipient again.
+If the recipient's production document is missing, Send names its path and the parent showrunner, or you, who must fix the staff row.
 If the page has no default recipient, the button opens the dialog with no recipient selected.
 Select a recipient to enable Send.
 Select any other chip to change the recipient.

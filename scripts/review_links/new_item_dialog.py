@@ -731,7 +731,9 @@ def render() -> str:
                          "pageUrlLength": MAX_PAGE_URL_LENGTH})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
-   <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
+   <fieldset data-recipient-group><legend>To</legend>
+    <p id="review-new-item-owner-reason" data-owner-reason hidden></p>
+    <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
@@ -825,6 +827,7 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+#review-new-item [data-owner-reason] { margin: 0 0 8px; font-size: 13px; color: var(--ink-3, #9a988f); }
 #review-new-item textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
@@ -897,6 +900,8 @@ SCRIPT = r'''(() => {
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientGroup = dialog.querySelector('[data-recipient-group]');
+ const ownerReason = dialog.querySelector('[data-owner-reason]');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
@@ -917,6 +922,7 @@ SCRIPT = r'''(() => {
  let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
+ let pageOwner = '';
  let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
 
  function node(tag, text = '', css = '') {
@@ -960,6 +966,15 @@ SCRIPT = r'''(() => {
    ? 'The recipient you chose is not available. Choose a recipient.'
    : available.length ? '' : 'No recipients are available.';
   recipientStatus.hidden = !recipientStatus.textContent;
+  showOwnerReason();
+ }
+
+ function showOwnerReason() {
+  const shown = !!pageOwner && selectedRecipient === pageOwner && !!ownerReason.textContent
+   && !!recipientChips.querySelector('input:checked');
+  ownerReason.hidden = !shown;
+  if (shown) recipientGroup.setAttribute('aria-describedby', ownerReason.id);
+  else recipientGroup.removeAttribute('aria-describedby');
  }
 
  function editDraft(event) {
@@ -973,6 +988,7 @@ SCRIPT = r'''(() => {
    selectedRecipient = event.target.value;
    storeListDraft();
    recipientStatus.hidden = true;
+   showOwnerReason();
   }
   if (event?.target === includePage && !pendingItem) startCapture();
   showSentDetails();
@@ -1068,6 +1084,8 @@ SCRIPT = r'''(() => {
   sendNotice.hidden = !data.send_disabled;
   includePage.closest('label').hidden = !sendNotice.hidden;
   recipients = data.recipients;
+  pageOwner = data.page_owner || '';
+  ownerReason.textContent = data.page_owner_reason || '';
   showRecipients();
  }
 
@@ -1411,6 +1429,8 @@ SCRIPT = r'''(() => {
   includePage.closest('label').hidden = false;
   recipients = null;
   recipientChips.replaceChildren();
+  pageOwner = '';
+  showOwnerReason();
   if (!keepDraft) {
    form.reset();
    setError('');
