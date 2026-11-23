@@ -1007,6 +1007,20 @@ It patches loaded modules and passes the same paths to fixture children.
 Checkpoint tests use this shared helper instead of live registries.
 `fixture_unit_location` publishes the staff location required by a test.
 Configuration fixtures supply `CONF_DIR` and the real key limit comments.
+`test_config/` holds a test-owned copy of each `config/*.conf`.
+The shared fixture helpers below and the runner's `CONF_DIR` copy take their values from it.
+Some single test modules still copy the repository `config/` with their own code.
+`/tune` and the other live tools write only `config/` and `~/.claude/config`, so a tune does not change a test value.
+`conf.test_config_path(stem)` is the one path to a test-owned file.
+`memory_test_support` templates use it.
+Under `CONF_DIR`, the `conf.read_or_repository` and `conf.known_host_names` fallbacks also use it.
+`conf.copy_for_test(source, destination)` is the one copy of a config folder for a test.
+It keeps links and gives each top-level `.conf` file its `test_config/` values.
+It keeps a file that the destination already holds.
+The runner, `copy_runtime`, `copy_config_fixture`, `copy_helpers` and the verify-mac and removal fixtures call it.
+A change to `test_config/<stem>.conf` selects the same modules as a change to `config/<stem>.conf`.
+`test_conf` fails when a `config/*.conf` file has no twin, or when a twin has other keys or other limit comments.
+Values can differ.
 Git-recovery tests use their own committed repositories.
 `test_end_session` removes inherited `CODEX_THREAD_ID` and every `PLAN_DELEGATE_*` value before it supplies its test identity.
 The shared hang guard protects expected events without shortening production waits.
@@ -1322,18 +1336,30 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 The merge gate owns each module folder through a `tool_folder` context.
 The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
 The runner puts its config-read log, scratch root, and review root inside that folder.
-Before test discovery, the runner guards the real home’s `.claude/config` against Python writes.
+When the environment has no `CONF_DIR`, the runner copies the checkout's `config/` there, keeps its links, and gives each `.conf` file its `test_config/` values.
+`CONF_DIR` names that copy for the test process and its children. A `CONF_DIR` that is already set stays.
+The supervisor restores the environment after it removes the folders.
+Before test discovery, the runner guards the real user's `.claude/config` against Python reads and writes.
+The `pwd` entry gives the home, so a test that sets `HOME` does not move the guarded folder.
 Python child processes inherit the guard through a temporary startup hook.
 The runner removes the hook at the end of the run. A child checks that the hook still exists before it records a violation.
 The guard records a violation in the module folder even when a test catches the error.
 The gate reads that record as a tripwire and fails the module without a rerun.
+The failure line says `a test attempted to read or write live configuration at` and the path.
 For directory entry changes, the guard resolves symlinks in the parent path.
 For file content writes, it also resolves the final symlink.
+A read runs on each open, so the guard first compares the spelled path with the live folder.
+Then one `lstat` of the file and one `stat` of its parent find a link into the folder without a full `realpath`.
+The cost is a few µs for each open outside the folder.
+When the live folder is the tested checkout's own `config/`, the guard refuses only writes.
+This occurs on the AWS guest, which links `~/.claude/config` to the checkout's `config/`, and in a run inside `~/.claude`.
 
 The guard covers Python file operations that emit audit events. Non-Python programs run outside the guard.
 Python children can bypass the hook by replacing `PYTHONPATH` or disabling Python startup hooks.
 Writes through an already open file descriptor also fall outside the guard.
-The Python open audit event omits the directory descriptor. The guard skips relative paths in this event.
+The Python open audit event omits the directory descriptor.
+For a relative path, the guard joins the path with the working directory and refuses only an entry that exists there.
+This applies to reads and to writes. A relative write that creates a new file passes.
 
 The runner supervisor removes these folders after it reaps the test processes, including after gate death on Linux.
 The gate repairs permissions if necessary when it removes the module folder.

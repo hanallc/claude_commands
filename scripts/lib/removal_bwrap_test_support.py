@@ -113,7 +113,7 @@ class RemovalSandbox:
         for path in (self.build, self.temporary, self.home / ".claude" / "sessions"):
             self.host_path(path).mkdir(parents=True, exist_ok=True)
         config = self.host_path(self.home / "config")
-        _ = shutil.copytree(self.checkout / "config", config)
+        _ = conf.copy_for_test(self.checkout / "config", config)
         if sys.platform == "darwin":
             self.configure_mac(config)
         else:

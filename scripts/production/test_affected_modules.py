@@ -610,6 +610,21 @@ class AffectedModulesTests(unittest.TestCase):
         result = self.selection()
         self.assertEqual(result.modules, (self.repo / "scripts/checks/test_limits.py",))
 
+    def test_test_owned_configuration_changes_select_the_same_readers(self) -> None:
+        self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n')
+        self.add_test("checks/test_limits.py", "from scripts.component import reader\n")
+        reader = (self.repo / "scripts/checks/test_limits.py",)
+        rows = (("config", "limits", reader), ("config", "unrelated", ()),
+                ("test_config", "limits", reader), ("test_config", "unrelated", ()))
+        for folder, stem, expected in rows:
+            with self.subTest(folder=folder, stem=stem):
+                self.write(f"{folder}/{stem}.conf", "amount=1\n")
+                self.certify()
+                self.record_configs({"test_limits.py": ["limits"]})
+                self.write(f"{folder}/{stem}.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, expected)
+
     def test_configuration_changes_select_recorded_readers(self) -> None:
         readers = (
             ("module", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n'),
@@ -643,6 +658,7 @@ class AffectedModulesTests(unittest.TestCase):
             'from pathlib import Path\nVALUE = (Path(__file__).parents[2] / "config/limits.conf").read_text()\n',
             'from scripts.lib import conf\nVALUE = conf.read("limits")\n',
             'from pathlib import Path\nimport shutil\nshutil.copytree(Path(__file__).parents[2] / "config", "fixture")\n',
+            'from pathlib import Path\nfrom scripts.lib import conf\nconf.copy_for_test(Path(__file__).parents[2] / "config", Path("fixture"))\n',
             'from pathlib import Path\nNAME = "limits"\nVALUE = (Path(__file__).parents[2] / "config" / f"{NAME}.conf").read_text()\n',
         )
         for fixture in fixtures:

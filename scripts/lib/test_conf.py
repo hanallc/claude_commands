@@ -787,5 +787,93 @@ class HanaConfigurationTests(unittest.TestCase):
             for line in self.source.read_text().splitlines()), 1)
 
 
+LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:")
+
+
+def twin_faults(config: Path, twin: Callable[[str], Path]) -> list[str]:
+    """Return one line for each file or key where a test-owned twin differs in shape from config."""
+    def keys(path: Path) -> dict[str, str]:
+        return {key: setting.limit if setting.limit.startswith(LIMIT_PREFIXES) else ""
+                for key, setting in conf.settings(path.read_text(encoding="utf-8")).items()}
+
+    stems = sorted(path.stem for path in config.glob("*.conf"))
+    faults: list[str] = []
+    for stem in stems:
+        source, owned = config / f"{stem}.conf", twin(stem)
+        name = owned.name
+        if not owned.is_file():
+            faults.append(f"{name}: no twin: add the file to test_config/{name}")
+            continue
+        expected, actual = keys(source), keys(owned)
+        for key in sorted(expected.keys() | actual.keys()):
+            if key not in actual:
+                faults.append(f"{name}: {key}: add the key to test_config/{name}")
+            elif key not in expected:
+                faults.append(f"{name}: {key}: remove the key from test_config/{name}")
+            elif expected[key] != actual[key]:
+                faults.append(f"{name}: {key}: copy the limit comment to test_config/{name}")
+    faults.extend(f"{path.name}: no config/ file: remove test_config/{path.name}"
+                  for path in sorted(twin("").parent.glob("*.conf")) if path.stem not in stems)
+    return faults
+
+
+class TestOwnedConfigTests(unittest.TestCase):
+    def test_each_config_file_has_a_test_owned_twin_with_the_same_keys(self) -> None:
+        faults = twin_faults(Path(conf.__file__).resolve().parents[2] / "config", conf.test_config_path)
+        self.assertEqual(faults, [], "\n".join(faults))
+
+    def test_twin_check_names_each_file_and_key(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config, owned = root / "config", root / "test_config"
+        config.mkdir()
+        owned.mkdir()
+        rows: tuple[tuple[str, str | None, list[str]], ...] = (
+            ("same keys, other values", "a=1\n# whole: 1 to 9\nb=2\n", []),
+            ("missing key", "a=1\n", ["case.conf: b: add the key to test_config/case.conf"]),
+            ("host key", "a=1\n# whole: 1 to 9\nb=2\nb.natedev=3\n",
+             ["case.conf: b.natedev: remove the key from test_config/case.conf"]),
+            ("limit", "a=1\n# whole: 1 to 8\nb=2\n", ["case.conf: b: copy the limit comment to test_config/case.conf"]),
+            ("no twin", None, ["case.conf: no twin: add the file to test_config/case.conf"]),
+        )
+        _ = (config / "case.conf").write_text("a=0\n# whole: 1 to 9\nb=5\n", encoding="utf-8")
+        for label, text, expected in rows:
+            with self.subTest(label):
+                twin = owned / "case.conf"
+                twin.unlink(missing_ok=True)
+                if text is not None:
+                    _ = twin.write_text(text, encoding="utf-8")
+                self.assertEqual(twin_faults(config, lambda stem: owned / f"{stem}.conf"), expected)
+        _ = (owned / "extra.conf").write_text("a=1\n", encoding="utf-8")
+        self.assertIn("extra.conf: no config/ file: remove test_config/extra.conf",
+                      twin_faults(config, lambda stem: owned / f"{stem}.conf"))
+
+    def test_fixture_helpers_take_values_from_the_test_owned_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owned = root / "test_config"
+        owned.mkdir()
+        _ = (owned / "example.conf").write_text("value=test-owned\n", encoding="utf-8")
+        fixture = root / "fixture"
+        fixture.mkdir()
+
+        def owned_path(stem: str) -> Path:
+            return owned / f"{stem}.conf"
+
+        _ = self.enterContext(mock.patch.object(conf, "test_config_path", side_effect=owned_path))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(fixture)}))
+
+        def written() -> str:
+            _ = write_config_fixture(fixture / "example.conf")
+            return conf.read("example").text("value")
+
+        rows: tuple[tuple[str, Callable[[], str]], ...] = (
+            ("read_or_repository", lambda: conf.read_or_repository("example").text("value")),
+            ("write_config_fixture", written),
+        )
+        for label, read in rows:
+            with self.subTest(label):
+                (fixture / "example.conf").unlink(missing_ok=True)
+                self.assertEqual(read(), "test-owned")
+
+
 if __name__ == "__main__":
     _ = unittest.main()

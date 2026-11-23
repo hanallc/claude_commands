@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lib import conf
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -35,7 +36,7 @@ def admission_policy_fixture() -> AdmissionPolicy:
 def _template(name: str) -> Path:
     if name == ADMISSION_CONFIG_FIXTURE.name:
         return ADMISSION_CONFIG_FIXTURE
-    return Path(__file__).resolve().parents[2] / "config" / name
+    return conf.test_config_path(name.removesuffix(".conf"))
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
@@ -73,11 +74,8 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
 
 
 def copy_config_fixture(source: Path, destination: Path) -> Path:
-    """Copy a configuration folder into a private fixture."""
-    import shutil
-
-    _ = shutil.copytree(source, destination)
-    return destination
+    """Copy a configuration folder into a private fixture with the test-owned values."""
+    return conf.copy_for_test(source, destination)
 
 
 def write_config_fault(path: Path, source: str) -> int:

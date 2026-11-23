@@ -351,10 +351,41 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
 
 
 def read_or_repository(stem: str) -> ConfigRead:
-    """Use the repository file when the fixture has no copy."""
+    """Use the test-owned file when the fixture has no copy."""
     if "CONF_DIR" in os.environ and not path(stem).exists():
-        return read(_repository_path(stem))
+        return read(test_config_path(stem))
     return read(stem)
+
+
+_TEST_CONFIG = Path(__file__).resolve().parents[2] / "test_config"
+
+
+def test_config_path(stem: str) -> Path:
+    """Return the test-owned copy of a repository config file. /tune never changes it."""
+    return _TEST_CONFIG / f"{stem}.conf"
+
+
+def copy_for_test(source: Path, destination: Path) -> Path:
+    """Copy a checkout config folder for a test and keep its links.
+
+    Each top-level .conf file takes the values of its test-owned twin.
+    A file or link that the destination already holds stays.
+    """
+    import shutil
+
+    def present(folder: str, names: list[str]) -> set[str]:
+        target = destination / Path(folder).relative_to(source)
+        return {name for name in names if os.path.lexists(target / name) and not os.path.isdir(target / name)}
+
+    def copy(path: str, target: str) -> str:
+        file = Path(path)
+        owned = test_config_path(file.stem) if file.parent == source and file.suffix == ".conf" else file
+        return shutil.copyfile(owned if owned.is_file() else file, target)
+
+    # A new destination holds nothing to keep, so it skips the per-entry check.
+    keep = present if destination.exists() else None
+    return Path(shutil.copytree(source, destination, symlinks=True, ignore=keep, copy_function=copy,
+                                dirs_exist_ok=True))
 
 
 def directory() -> Path:
@@ -520,7 +551,8 @@ def known_host_names() -> frozenset[str]:
     try:
         machines = _parse(source.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
+        fallback = test_config_path("machines") if "CONF_DIR" in os.environ else _repository_path("machines")
+        machines = _parse(fallback.read_text(encoding="utf-8"))
     aliases = machines.get("aliases")
     hosts = {_local_host_name().casefold()}
     if aliases is not None:
