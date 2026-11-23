@@ -7,10 +7,10 @@ import io
 import json
 from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import target_availability
@@ -71,6 +71,21 @@ NATEDEV_HOLDS = (held("report", "first-session", end=targets.ReleaseEstimated(LA
 
 
 class AvailabilityRowTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # A kept claim shows only its time on the day it started.
+        _ = self.enterContext(mock.patch.object(targets, "utc_now", return_value=LATER))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})))
+
+    def test_a_kept_claim_from_an_earlier_day_shows_its_date(self) -> None:
+        kept = targets.KeptClaim("doc workspace", "cargo-liner", SINCE - timedelta(days=1))
+        rows = target_availability.availability_rows((snapshot(MAC, targets.Free((kept,))),), {}, UTC)
+        self.assertEqual([row["since"] for row in rows], ["since Nov 12, 2026, 13:50"])
+        self.assertEqual(targets.kept_claim_text(kept, "", UTC),
+                         "kept for cleanup: cargo-liner doc workspace since Nov 12, 2026, 13:50")
+        self.assertEqual(targets.kept_claim_text(replace(kept, since=SINCE), "", UTC),
+                         "kept for cleanup: cargo-liner doc workspace since 13:50 UTC")
+
     def test_mac_block_and_two_natedev_holds_name_owner_reason_and_times(self) -> None:
         snapshots = (snapshot(MAC, MAC_BLOCK), snapshot(NATEDEV, *NATEDEV_HOLDS))
         rows = target_availability.availability_rows(snapshots, LABELS, UTC)
@@ -90,6 +105,32 @@ class AvailabilityRowTests(unittest.TestCase):
         job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
         snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
         self.assertEqual(target_availability.availability_rows(snapshots, LABELS, UTC), [])
+
+    def test_each_kept_claim_shows_a_row_with_its_owner_and_start_while_other_runs_run(self) -> None:
+        job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
+        known = targets.KeptClaim("doc workspace", "cargo-liner", SINCE, targets.HolderSession("mac-session"))
+        unknown = targets.KeptClaim("nextest", "hana", LATER, targets.HolderSession("ended-session"))
+        snapshots = (snapshot(MAC, targets.Running((job,), (known,))), snapshot(NATEDEV, targets.Free()),
+                     snapshot(SshTarget("spare", "macos", Path("/fixture/spare.conf")), targets.Free((unknown,))))
+        rows = target_availability.availability_rows(snapshots, LABELS, UTC)
+        self.assertEqual(rows, [
+            {"target": "mac", "state": "Kept", "reason": "Kept for cleanup: cargo-liner doc workspace",
+             "holder": "research-director", "unit": "research", "showrunner": "hana", "since": "since 13:50 UTC",
+             "until": ""},
+            # No session name is known, so the repository in the reason names the owner.
+            {"target": "spare", "state": "Kept", "reason": "Kept for cleanup: hana nextest", "holder": "", "unit": "",
+             "showrunner": "", "since": "since 15:10 UTC", "until": ""},
+        ])
+        self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "ended-session"])
+
+    def test_a_blocked_mac_shows_its_kept_claims_after_the_block_row(self) -> None:
+        kept = targets.KeptClaim("doc workspace", "cargo-liner", LATER, targets.HolderSession("first-session"))
+        snapshots = (snapshot(MAC, replace(MAC_BLOCK, kept_claims=(kept,))),)
+        rows = target_availability.availability_rows(snapshots, LABELS, UTC)
+        self.assertEqual([(row["state"], row["reason"], row["holder"], row["since"]) for row in rows], [
+            ("Blocked", "Mac CI restore", "research", "since 13:50 UTC"),
+            ("Kept", "Kept for cleanup: cargo-liner doc workspace", "report-director", "since 15:10 UTC")])
+        self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "first-session"])
 
     def test_unreachable_and_unreadable_targets_show_as_unavailable(self) -> None:
         snapshots = (snapshot(MAC, targets.Unreachable("retry backoff")),
@@ -159,6 +200,23 @@ class MacRouteTests(unittest.TestCase):
             self.assertEqual(routes.holds("/fixture/cargo-liner-tile"), "busy with check cargo-handler")
             self.assertEqual(routes.holds("/fixture/organon"), "")
         self.assertEqual(scope.call_count, 2)
+
+    def test_a_guest_claim_keeps_its_repository_off_a_free_mac_and_names_its_step(self) -> None:
+        self.use_target_config()
+        hana = claim_state.RepositoryScope("hana", "github.com/hanallc/hana")
+        organon = claim_state.RepositoryScope("organon", "github.com/natepiano/organon")
+        # The Mac state leaves out a guest claim, but the claim folder still holds it.
+        guest = claim(hana, "mac-linux test-affected")
+        routes = target_availability.MacRoutes(
+            (snapshot(MAC, targets.Free(), claims=(guest,)), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
+        scopes = {"/fixture/hana": hana, "/fixture/organon": organon}
+        with mock.patch.object(mac_test, "run_is_live", return_value=True), \
+             mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)), \
+             mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana", "/r")):
+            self.assertEqual(routes.holds("/fixture/hana"), "busy with mac-linux test-affected")
+            self.assertEqual(routes.holds("/fixture/organon"), "")
+            self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"),
+                             target_availability.Allowed("busy with mac-linux test-affected"))
 
     def test_a_kept_claim_does_not_hold_its_repository_while_another_runs(self) -> None:
         self.use_target_config()

@@ -293,6 +293,8 @@ The service sets the remote `started_at` from the consume time, so `memory_feed.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
 The page (`guestRow` in `memory_live.html`) shows both in the running table.
 The target cell of an unconfirmed row shows `mac-linux (not confirmed)`, and its hover shows `Guest attempt  not confirmed`.
+The row key (`memory_feed.step_key`) is `mac-linux` and the consume time, so an open hover stays when the queue confirms the attempt.
+The `mac-linux` machine name has the Mac color in light and dark, because the guest runs on the Mac.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.
