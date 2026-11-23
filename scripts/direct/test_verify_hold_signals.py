@@ -159,7 +159,7 @@ placement_once
         harness = shell_functions(INVOKE, "close_verify_exit_stderr") + shell_functions(
             VERIFY, "save_verify_exit_stderr", "finish_exit_diagnostics",
             "run_log_tee", "start_run_log", "stop_interrupted_run_log",
-            "verify_exit", "verify_interrupted",
+            "report_stop", "verify_exit", "verify_interrupted",
         ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
 RUN_STEP_PID=""
@@ -269,7 +269,7 @@ verify_exit 23 'exit 23'
 
     def test_stderr_closes_while_a_step_child_is_still_running(self) -> None:
         cargo = self.fixture.bin_directory / "cargo"
-        cargo.rename(cargo.with_name("cargo-original"))
+        _ = cargo.rename(cargo.with_name("cargo-original"))
         release = self.fixture.runner_state / "detached-release"
         started = self.fixture.runner_state / "detached-pid"
         os.mkfifo(release)

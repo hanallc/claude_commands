@@ -17,7 +17,7 @@ description: Read agent message rules and delivery.
   Staff names take precedence over registry names without regard to case.
   Without a staff match, a unique registry name selects a live freestanding Claude session.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
-- When `review_hold=on`, a local Claude session receives held messages when the review ends. Do not send kept messages again.
+- When `review_hold=on`, a local Claude session receives a held messages file when the review ends, with a short notice that names it. Do not send kept messages again.
 - A hold ends when the review ends, or after `review_hold_idle_minutes` (`config/send.conf`) without a user prompt.
 - Use `send.py --urgent` for urgent messages. It delivers during an open review.
   Use it when Nate must act before a merge, a loss of data, or a stall.
@@ -56,7 +56,7 @@ Filing a question alone never sends a push.
 ### Outcomes and recovery
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
-- `KEPT: <target> is in a review; delivered at its end` (exit 0) confirms storage.
+- `KEPT: <target> is in a review; held in <file>, delivered at its end` (exit 0) confirms storage.
 - `SENT: to the user, rewritten:` (exit 0) shows exactly what the user received on the following lines.
 - `HELD: not sent, failed review: <rules>` (exit 4): revise and resend. No other phone path is allowed; this push never goes out on expiry. Emergency blocked pushes and registered script pushes are sent despite review failure, named in `SENT` and the review log.
 - `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. Use no other phone path.

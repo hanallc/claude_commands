@@ -578,6 +578,68 @@ def read_claim_block(paths: StatePaths) -> MacBlockState:
     return read_block(paths.block)
 
 
+@dataclass(frozen=True)
+class OffOnPurpose:
+    """The user turned the machine off. No watcher sends an outage push for it."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class MachineInUse:
+    """No block or setting turns the machine off, so an outage push goes to the user."""
+
+
+MACHINE_IN_USE = MachineInUse()
+
+
+@dataclass(frozen=True)
+class AskingSession:
+    """The session that asks. A Mac block that it holds does not turn the Mac off for it."""
+
+    name: str
+
+
+class NoAskingSession:
+    """No session asks, so every Mac block counts."""
+
+
+NO_ASKING_SESSION = NoAskingSession()
+
+
+def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAskingSession = NO_ASKING_SESSION
+                           ) -> OffOnPurpose | MachineInUse:
+    """The one rule for every outage push: the user turned the named target off.
+
+    Each target reads enabled.<target>=off. The Mac also reads its block and offload=off. A block is a lease that
+    a showrunner gives to one session, so it does not count when its holder asks. An unreadable record or setting
+    proves nothing, so the target counts as in use and a real outage still pushes.
+    """
+    enabled = f"enabled.{target}"
+    try:
+        # The gate refuses an unknown guest, but a missing key here counts as in use: an alert must not hide an outage.
+        if not conf.read("build_targets").value(enabled, conf.on_off, default=True, recover_invalid=False):
+            return OffOnPurpose(f"{enabled}=off")
+    except ConfigError:
+        pass
+    if target != "mac":
+        return MACHINE_IN_USE
+    try:
+        block = read_block(state_paths().block)
+        if not isinstance(block, NoMacBlock) and asking_session != AskingSession(block.holder):
+            return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
+    except StateReadError:
+        pass
+    try:
+        settings = conf.read("mac_test")
+        # A missing key reads the committed file, as the router does. A bad value counts as in use.
+        if not settings.value("offload", conf.on_off, recover_invalid=False):
+            return OffOnPurpose("offload=off")
+    except ConfigError:
+        pass
+    return MACHINE_IN_USE
+
+
 def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBlockState:
     """Return the block that prevents this session from starting new work."""
     block = read_claim_block(paths)

@@ -4,9 +4,22 @@ Natedev's agent-notes job checks Claude and Codex weekly readings. Its notes and
 
 ## Claude: what happens next
 
-`/account_moves` manages an ordered one-shot log on natedev. Say “when units reach 1% switch to claude2”, “what's set up” or “drop the units one”. A hold may be requested in minutes. The Mac reads and edits the same log through natedev. See `docs/accounts.md` for the CLI, hold semantics and chains.
+Use the Accounts page's `next` control to set the next move for a Claude group.
+The page uses the ordered move log on natedev.
+See `docs/accounts.md` for the CLI, holds, and groups with more than one move.
 
-At 2% weekly or below, an in-use Claude account with any uncovered group sends one phone reminder per episode. Its title is “Claude work on claude3 may stop”, its body is “claude3 has 2% of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.” and its action is “In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2.” Only entries targeting another account and backed by readable role history count as coverage; entries covering every group on the account suppress it; accounts used only by ungrouped sessions send nothing. A failed delivery retries at the next check; success never repeats within the episode. Missing readings preserve the episode; known recovery or reset closes it silently.
+At 2% weekly or below, an in-use Claude account with an uncovered group sends one phone reminder per episode.
+For example, the title is “claude3 has 2% left with no move”.
+Both next-move reminders use the full account labels and show positive quota below 1% as `<1%`.
+The action is “Set a move on the Accounts page”.
+The reminder has no body.
+Only entries that target another account and have readable role history count as coverage.
+Entries that cover every group on the account suppress the reminder.
+Accounts with only ungrouped sessions send no reminder.
+A failed delivery retries at the next check.
+A successful delivery ends retries for the episode.
+Missing readings preserve the episode.
+A known recovery or reset closes it silently.
 
 Natedev sends both Claude quota pushes.
 The quota check forecasts when each in-use Claude account will run out of weekly usage.
@@ -59,9 +72,26 @@ Each template requires current approval.
 
 ## Codex notices
 
-Workers use the same one-shot log: “when workers reach 1% switch to codex2” or “when workers reach 1% switch to claude”. Workers entries have no minute hold. A move to Claude holds there until the source account's weekly reset, even if Codex has room earlier. Entries run once in log order and leave the log after a recorded move; refused swaps keep them.
+The Accounts page shows the next move for Codex workers.
+Use `accounts.py next` to edit the workers queue.
+Workers entries have no hold in minutes.
+A move to Claude holds until the source account's weekly reset, even if Codex has room earlier.
+Entries run once in log order and leave the log after a recorded move.
+A refused move keeps its entry.
 
-Above 0% and at or below 2%, Codex sends one phone reminder per episode when there is no workers entry targeting another account and no scheduled Claude hold is open. At 0%, the default move is handled in the same pass and no reminder is sent. A delivered reminder stays delivered across zero and subsequent readings until the weekly reset. An unreadable move journal makes coverage empty. The reminder names the default destination picked now, excluding the low account, and mentions paid credits only when that account allows them. It offers a concrete `/account_moves` command to choose that destination explicitly; leaving the default needs no action. The title names the Codex account with room. It names paid credits only when credits are allowed and no other Codex account has room.
+Above 0% and at or below 2%, Codex can send one phone reminder per episode.
+The first pending workers entry suppresses this reminder, even when it targets the current account.
+An open scheduled Claude hold also suppresses this reminder.
+At 0%, the pass runs the zero-quota check and sends no low-quota reminder.
+A pending workers entry or an open Claude hold can stop the default move.
+A delivered reminder stays delivered across zero and later readings until the weekly reset.
+If the move journal is unreadable, the first workers entry still suppresses this reminder.
+The line gives the remaining quota and the default outcome.
+For example, “codex2 has 2% left; codex1 next” means workers move to codex1.
+It names paid credits only when the account allows them and no other Codex account has room.
+With no paid credits and no Codex account with room, the line ends “units work alone next”: no-worker mode starts at 0%.
+The reminder is one line (`one_line`): the phone shows the app name as the title and the line as the whole message.
+It has no “No action needed.” line and no body.
 
 A pane worker's proved quota refusal marks its pass refused and keeps it open for redispatch after the account move.
 The move preserves its native conversation, pane, and terminal.
@@ -154,8 +184,15 @@ The notice names that choice.
 The pane move stops the live agent before it resumes the conversation.
 The request records `cause: credits off`, separately from provider refusal.
 Without room, or after a failed move, that pass routes Codex assignments to Claude.
+A failed move counts as no room. It writes its `failed` record and no `no room` record.
 Assignment changes are live in the same pass, even while a landing holds main. Main gets them at the next notes pass that finds main free.
-The notice names the earliest refill and any failure.
+The notice `quota.codex_workers_stay` is one line: `<account> is empty; we're in self-actualize mode; worker work moves to <units>`.
+`<units>` is the Claude account of the units group in the role map.
+When the role map cannot be read or has no units account, the line says `the units account`.
+With credits off and a workers entry queued, the line is `<account> is empty; workers wait for their queued move`.
+When the switch to Claude fails, the notice is `quota.codex_refused`.
+An episode saved with the older values (`reset`, `reason`, `fallback`) renders with only its account and outcome.
+Old outcome words change to the new ones: “work moves to Claude” becomes the self-actualize line, “workers wait for their next entry” becomes “workers wait for their queued move”, and “work could not move” sends `quota.codex_refused`.
 The fallback remains until that refill or the selected account recovers.
 Turning credits on permits recovery when the selected account can work.
 An account with credits off cannot buy room from its credit balance.
@@ -171,9 +208,10 @@ Old saved notices are rebuilt from the current account reading.
 Both notices give the action to remove the account from `codex_credit_accounts`.
 An episode rereads this setting on every pass.
 The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
-No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits.
+No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits, except at weekly zero with credits off, where a failed move counts as no room.
 Unknown capacity cannot confirm exhaustion.
-A failed move alone does not start the mode.
+At weekly zero with credits off, a failed move counts as no room, so it can start the mode.
+On the refusal path, a failed move alone does not start the mode.
 Starting the mode sends the no-capacity notice and stops the Codex workers once.
 Capacity recovery ends the mode without a timer or delay.
 An off-to-on change is recorded in the episode, so a later on-to-off change acts again.
