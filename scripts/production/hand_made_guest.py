@@ -95,7 +95,7 @@ def run_settings() -> mac_linux.GuestSettings:
     except mac_linux.route_errors() as error:
         raise GuestFailed(f"{MACHINE}: {error}") from error
     if isinstance(settings, mac_linux.GuestNotStarted):
-        raise GuestFailed(settings.reason)
+        raise GuestFailed(f"{MACHINE}: {settings.reason}")
     if isinstance(settings, str):
         raise GuestFailed(settings)
     return settings

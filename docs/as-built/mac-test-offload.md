@@ -34,7 +34,7 @@ For a run with type checks, the guest checks for `basedpyright` and `uv` before 
 If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
-If the guest run fails before that line, the route reports `not started` and the queue gives the gate to the next named target, for example natedev.
+If the guest run fails before that line, the route returns `GuestNotStarted` with the cause, and the queue gives the gate to the next named target, for example natedev.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
 A reply that the route cannot read also names its first 200 characters.
@@ -77,7 +77,7 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
 A Mac block or a busy repository slot can refuse the claim.
-The route reports `not started` with the refusal reason before any upload or retry backoff.
+The route returns `GuestNotStarted` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
@@ -85,8 +85,10 @@ Item 191 B3 will keep the Mac claim until proof and bind the claim identity to t
 
 The Mac Linux route runs the suite in a numbered copy.
 The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
-Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy`.
-During the run, the runner points descriptor 1 at standard error. Only the JSON reply line goes to the stream standard output.
+Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
+The reply descriptor is a copy of the stream standard output.
+The runner starts the sandbox, and `dbus-run-session` if the guest has it, with standard output on standard error.
+Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
 It makes a per-run tool folder under the copy's `target` directory.
 Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
 The guest removes the tool folder when the suite returns.

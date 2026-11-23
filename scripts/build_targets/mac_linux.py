@@ -56,6 +56,9 @@ MISSING_PREREQUISITE_MESSAGE = 'Repository lacks these prerequisite commits:'
 GUEST_END_PENDING_STATUS = 76
 RUN_LOCK_PATH = '.git/mac-linux-run.lock'
 RUN_LOCK_FD = 9
+# The argv word after the request that makes the runner run the gate in the numbered copy. The reply descriptor
+# number comes after it.
+RUN_COPY = '--run-copy'
 ARM_RECORD_PREFIX = 'mac-linux-armed'
 # The guest prints this line, with the attempt, before it starts the argv of a command request.
 RUN_START = 'mac-linux run start'
@@ -192,7 +195,7 @@ def new_run_settings() -> GuestSettings | GuestNotStarted | str:
         return f'{TARGET} is off (build_targets.conf enabled.{TARGET}=off)'
     settings = read_settings(registry)
     if isinstance(eligibility.read_backoff(time(), TARGET), eligibility.ActiveBackoff):
-        return GuestNotStarted(f'{TARGET}: guest unreachable during retry backoff')
+        return GuestNotStarted('guest unreachable during retry backoff')
     return settings
 
 
@@ -387,7 +390,10 @@ class GuestTookNoRun(GuestUnavailable):
 
 @dataclass(frozen=True)
 class GuestNotStarted:
-    """The guest took no run: the Mac refused the claim, the guest did not arm, or no test started."""
+    """The guest took no run: the Mac refused the claim, the guest did not arm, or no test started.
+
+    The reason names only the cause; the gate says that the guest took no run.
+    """
 
     reason: str
 
@@ -963,20 +969,25 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
+    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail)
+
+
+def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, bootstrap_bytes: int, send: BundleSend,
+                 cleanup_detail: str) -> GuestReply:
+    """The reply line and the bundle size from the output of a guest stream that ended, or the guest failure."""
     diagnostics = stream.stderr.decode(errors='replace')
-    tests_started = run_start_line(request['attempt']) in diagnostics
+    tests_started = run_start_line(attempt) in diagnostics
     if stream.returncode:
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
         raise guest_failure(tests_started, f'{stream_report(stream)}. {cleanup_detail}')
-    result, _, count = stream.stdout.rstrip().rpartition(b'\n')
+    result, _, count = stream.stdout.decode(errors='replace').rstrip().rpartition('\n')
     try:
-        bundle_bytes = int(count) - len(bootstrap)
+        bundle_bytes = int(count) - bootstrap_bytes
     except ValueError:
         raise guest_failure(tests_started, f'the guest stream gave no byte count ({count[-200:]!r}); '
                             + f'{stream_report(stream)}. {cleanup_detail}') from None
-    return GuestReply(result.decode('utf-8', errors='replace'), bundle_bytes, send.form, send.reason,
-                      stream_report(stream), tests_started)
+    return GuestReply(result, bundle_bytes, send.form, send.reason, stream_report(stream), tests_started)
 
 
 def stream_report(stream: subprocess.CompletedProcess[bytes]) -> str:
@@ -987,9 +998,7 @@ def stream_report(stream: subprocess.CompletedProcess[bytes]) -> str:
 
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
-    if tests_started:
-        return GuestUnavailable(reason)
-    return GuestTookNoRun(f'the guest stopped before a test started: {reason}')
+    return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1252,10 +1261,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
     except mac_run.MacRunRefused as error:
-        return GuestNotStarted(f'{TARGET}: not started: {error}')
+        return GuestNotStarted(str(error))
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return GuestNotStarted(f'{TARGET}: not started: ' + ' '.join((str(error), *notes)))
+        return GuestNotStarted(' '.join((str(error), *notes)))
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
@@ -1429,42 +1438,55 @@ def run_guest(request_path: Path) -> int:
                     print(refusal, file=sys.stderr, flush=True)
                     print(run_refused_line(request['attempt']), flush=True)
                     return 1
-            else:
-                if request['type_dirs']:
-                    environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
-                # The -c entry selects the numbered copy as the Python checkout.
-                command = gate_entry_command(request['jobs'], Path(__file__).resolve(), request_path)
-            if shutil.which('dbus-run-session'):
-                command[:0] = ['dbus-run-session', '--']
-            if 'argv' in request:
                 print(run_start_line(request['attempt']), flush=True)
-            return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy.path, env=environment,
-                                  stdin=subprocess.DEVNULL, check=False,
-                                  pass_fds=build_folders.held_build_folder_descriptors()).returncode
+                return run_sandboxed(tmp, command, copy.path, environment)
+            if request['type_dirs']:
+                environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
+            reply = os.dup(1)
+            try:
+                # The -c entry selects the numbered copy as the Python checkout.
+                return run_sandboxed(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
+                                                             request_path, reply),
+                                     copy.path, environment, reply=reply)
+            finally:
+                os.close(reply)
 
 
-def gate_entry_command(jobs: int, runner: Path, request_path: Path) -> list[str]:
-    """Run the runner in the numbered copy with the argv [runner, request, --run-copy].
+def run_sandboxed(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str], *,
+                  reply: int | None = None) -> int:
+    """Run the command in the sandbox, under dbus-run-session if the guest has it.
+
+    With a reply descriptor, the standard output of the run goes to standard error, so only the gate writes
+    to the stream standard output, through the reply descriptor. Output of dbus-run-session or of a service
+    that it starts cannot come before the reply.
+    """
+    if shutil.which('dbus-run-session'):
+        command = ['dbus-run-session', '--', *command]
+    held = build_folders.held_build_folder_descriptors()
+    return subprocess.run(sandboxed_suite_command(tmp, command), cwd=copy, env=environment,
+                          stdin=subprocess.DEVNULL, stdout=None if reply is None else sys.stderr.fileno(),
+                          check=False, pass_fds=held if reply is None else (*held, reply)).returncode
+
+
+def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
+    """Run the runner in the numbered copy with the argv [runner, request, --run-copy, reply descriptor].
 
     Python gives a -c entry the argv ['-c', *arguments], so the entry removes '-c' before it runs the runner.
     """
     return ['./scripts/lib/py', '-X', f'cpu_count={jobs}',
             '-c', 'import runpy, sys; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")',
-            str(runner), str(request_path), '--run-copy']
+            str(runner), str(request_path), RUN_COPY, str(reply)]
 
 
 def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
     return cast(GuestRequest | GuestCommandRequest, json.loads(path.read_text(encoding='utf-8')))
 
 
-def run_copy(request_path: Path) -> None:
-    """Run the candidate's gate and write one JSON result to standard output.
+def run_copy(request_path: Path, reply: int) -> None:
+    """Run the candidate's gate and write one JSON result to the reply descriptor.
 
-    Descriptor 1 points at standard error during the run, so text from this process or a child cannot
-    come before the JSON line.
+    run_guest points standard output at standard error, so only the reply descriptor reaches the stream.
     """
-    reply = os.fdopen(os.dup(1), 'w', encoding='utf-8')
-    _ = os.dup2(2, 1)
     from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.production import gate
@@ -1507,13 +1529,14 @@ def run_copy(request_path: Path) -> None:
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
     finally:
         copies.COMMAND_LOCKS.reset(token)
-    print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
-                      'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
-          file=reply, flush=True)
+    with os.fdopen(reply, 'w', encoding='utf-8') as output:
+        print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
+                          'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
+              file=output)
 
 
 if __name__ == '__main__':
-    if sys.argv[2:] == ['--run-copy']:
-        run_copy(Path(sys.argv[1]))
+    if sys.argv[2:3] == [RUN_COPY]:
+        run_copy(Path(sys.argv[1]), int(sys.argv[3]))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))

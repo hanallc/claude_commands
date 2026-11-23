@@ -84,7 +84,7 @@ The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
-The gate then prints `Mac Linux guest took no run (<reason>)`, writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
+The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
