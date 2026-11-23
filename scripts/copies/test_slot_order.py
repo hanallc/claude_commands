@@ -160,6 +160,7 @@ class SlotOrderTests(unittest.TestCase):
             self.replies.append(reply)
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
+            if isinstance(reply, (wire.Wait, wire.PlacementWait, wire.LocalPlacementGranted)):
                 # Wake a file waiter that also ends when its process exits.
                 (self.root / "queue-wait").touch()
             return reply
@@ -352,7 +353,6 @@ class SlotOrderTests(unittest.TestCase):
         path = self.root / "bump.json"
         checkpoint_gate.save_record(path, record)
         self.queue.hold_starts()
-        write_pressure_reading(Path(environment["BUILDLOG_MEMORY_PRESSURE"]), full_avg10=99)
         with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(CHECKOUT / "scripts/direct/verify.sh")}),
               mock.patch.object(bump_gate, "run_checkpoint_test_steps",
                   side_effect=AssertionError("the bump command started before admission")),
@@ -631,7 +631,14 @@ placement_once
             self.queue.hold_starts()
             self.waiting.clear()
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
-            self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+            wait_until(lambda: self.waiting.is_set() or step.poll() is not None
+                       or any(isinstance(reply, wire.LocalPlacementGranted) for reply in self.replies),
+                       self.root, processes=(step,))
+            if not self.waiting.is_set():
+                step.kill()
+                replies = ", ".join(type(reply).__name__ for reply in self.replies)
+                self.fail(f"verify did not wait for memory; replies: {replies}; output: "
+                          + "".join(step.communicate(timeout=TEST_HANG_GUARD_SECS)))
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
             self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_slots.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
@@ -713,7 +720,9 @@ placement_once
     def verify_run_environment(self, tools: VerifyMacOffloadFixture) -> dict[str, str]:
         environment = {**tools.environment, **{key: os.environ[key] for key in (
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
-            "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
+            "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE",
+            # The in-process queue reads these while the verify environment is live.
+            "BUILDLOG_MEMINFO", "BUILDLOG_MEMORY_PRESSURE")},
             "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "LINT_SKIP_SWEEP": "1"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
