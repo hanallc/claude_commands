@@ -288,13 +288,20 @@ def read_blobs(vault: Path, blobs: list[str], env: dict[str, str]) -> list[bytes
     output = checked_bytes(vault, "cat-file", "--batch", input_data="".join(f"{blob}\n" for blob in blobs).encode(),
                            env=env)
     contents: list[bytes] = []
+    position = 0
     for blob in blobs:
-        header, output = output.split(b"\n", 1)
-        name, kind, size = header.decode("ascii").split()
-        if name != blob or kind != "blob":
+        end = output.find(b"\n", position)
+        fields = output[position:end].decode("ascii").split() if end >= 0 else []
+        if len(fields) != 3 or fields[0] != blob or fields[1] != "blob":
             raise SaveError(f"Git did not return the blob {blob}.")
-        contents.append(output[:int(size)])
-        output = output[int(size) + 1:]
+        start = end + 1
+        position = start + int(fields[2])
+        if output[position:position + 1] != b"\n":
+            raise SaveError(f"Git did not return the blob {blob}.")
+        contents.append(output[start:position])
+        position += 1
+    if position != len(output):
+        raise SaveError("Git returned more output than the requested blobs.")
     return contents
 
 
@@ -382,12 +389,12 @@ def verify_sources(vault: Path, review: Review, env: dict[str, str]) -> None:
             raise SaveError(f"The mode or deletion for {entry.name!r} differs from the manifest. Scan again.")
 
 
-def update_index(vault: Path, review: Review, *, env: dict[str, str] | None = None) -> None:
+def update_index(vault: Path, review: Review) -> None:
     entries = b"".join(
         f"{entry.mode} {entry.blob}\t".encode("ascii") + os.fsencode(entry.name) + b"\0"
         for entry in review.files
     )
-    _ = checked_bytes(vault, "update-index", "-z", "--index-info", input_data=entries, env=env)
+    _ = checked_bytes(vault, "update-index", "-z", "--index-info", input_data=entries)
 
 
 def create_reviewed_commit(vault: Path, review: Review) -> str:
@@ -401,7 +408,7 @@ def create_reviewed_commit(vault: Path, review: Review) -> str:
         reviewed = review.staged_blobs()
         for name in sorted(staged.keys() | reviewed.keys()):
             if staged.get(name) != reviewed.get(name):
-                raise SaveError(f"The filtered blob for {name!r} differs from the manifest. Scan again.")
+                raise SaveError(f"The staged entry for {name!r} differs from the manifest. Scan again.")
         present = sorted({blob for mode, blob in reviewed.values() if mode != "000000"})
         if present:
             # Import only the checked blobs.
