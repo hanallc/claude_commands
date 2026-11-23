@@ -60,6 +60,7 @@ from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.agents.test_pane_record_recovery import FakeClient, fixture_launch_transcript
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account
@@ -6632,7 +6633,7 @@ class BuildWaitTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN="/nonexistent/herdr")
+        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN=MISSING_HERDR_BIN)
         _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))

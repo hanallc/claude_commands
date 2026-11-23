@@ -25,11 +25,12 @@ fsmonitor hook, or a clean filter that git status runs on a changed file.
 With checkout_programs=False, git runs none of them: the fsmonitor and each
 filter driver are turned off, submodule work trees are not read (git status
 in a submodule reads the submodule config), and git fetches no missing object.
+ignored_paths asks git in the same form.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import hashlib
 import os
 import subprocess
@@ -42,10 +43,11 @@ GIT_TIMEOUT_S = 10
 NO_FETCH_ENVIRONMENT = {"GIT_NO_LAZY_FETCH": "1"}
 
 
-def git(directory: str, *args: str, environment: Mapping[str, str] | None = None) -> subprocess.Popen[bytes]:
+def git(directory: str, *args: str, environment: Mapping[str, str] | None = None,
+        stdin: int = subprocess.DEVNULL) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         ["git", "--no-optional-locks", "-C", directory, *args],
-        stdin=subprocess.DEVNULL,
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=environment,
@@ -72,16 +74,23 @@ def no_program_environment(directory: str, environment: Mapping[str, str]) -> di
     return result
 
 
-def finish(processes: list[subprocess.Popen[bytes]], *, missing_ok: bool = False) -> list[bytes] | None:
+def no_program_git_environment(directory: str) -> dict[str, str] | None:
+    """The environment of a git call that runs no program that the checkout names, or None when git fails."""
+    return no_program_environment(directory, {**os.environ, **NO_FETCH_ENVIRONMENT})
+
+
+def finish(processes: list[subprocess.Popen[bytes]], *, missing_ok: bool = False,
+           stdin_bytes: bytes = b"") -> list[bytes] | None:
     """Each process's stdout, or None when any fails or the shared deadline passes.
 
-    With missing_ok, exit 1 is no failure: git config gives it when it finds no name.
+    With missing_ok, exit 1 is no failure: git config and git check-ignore give it when they find no name.
+    A process started with a stdin pipe gets stdin_bytes.
     """
     deadline = time.monotonic() + GIT_TIMEOUT_S
     outputs: list[bytes] = []
     try:
         for process in processes:
-            stdout, _ = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
+            stdout, _ = process.communicate(stdin_bytes or None, timeout=max(0.0, deadline - time.monotonic()))
             if process.returncode not in ((0, 1) if missing_ok else (0,)):
                 return None
             outputs.append(stdout)
@@ -92,9 +101,24 @@ def finish(processes: list[subprocess.Popen[bytes]], *, missing_ok: bool = False
             if process.poll() is None:
                 process.kill()
                 _ = process.wait()
-            if process.stdout is not None:
-                process.stdout.close()
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None:
+                    pipe.close()
     return outputs
+
+
+def ignored_paths(directory: str, paths: Sequence[str]) -> set[str] | None:
+    """The paths, relative to directory, that git ignores; None when git fails. git runs no program that the
+    checkout names."""
+    try:
+        environment = no_program_git_environment(directory)
+        if environment is None:
+            return None
+        process = git(directory, "check-ignore", "--stdin", "-z", environment=environment, stdin=subprocess.PIPE)
+    except OSError:
+        return None
+    outputs = finish([process], missing_ok=True, stdin_bytes=b"".join(os.fsencode(path) + b"\0" for path in paths))
+    return None if outputs is None else {os.fsdecode(name) for name in outputs[0].split(b"\0") if name}
 
 
 def content(path: bytes) -> bytes:
@@ -114,10 +138,10 @@ def committed_tree_key(tree_id: bytes) -> str:
 def tree_key(directory: str, *, checkout_programs: bool = True) -> str | None:
     """The key of the worktree; with checkout_programs=False, git runs no program that the checkout names."""
     submodules: list[str] = []
-    environment = None if checkout_programs else {**os.environ, **NO_FETCH_ENVIRONMENT}
+    environment = None
     try:
-        if environment is not None:
-            environment = no_program_environment(directory, environment)
+        if not checkout_programs:
+            environment = no_program_git_environment(directory)
             if environment is None:
                 return None
             submodules = ["--ignore-submodules=dirty"]

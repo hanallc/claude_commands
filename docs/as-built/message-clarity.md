@@ -47,7 +47,17 @@ These fields do not change the recipient, reply name, or message key.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
-`send.py` keeps local messages during an open review and returns `KEPT`.
+`send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
+Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
+Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
+The session then gets one short notice: `N held messages from the review in <path>, under "Released at HH:MM:SS <zone>". Read them at your own pace.` (`Read it` for one message.)
+A send that ends a hold puts the notice above the new message.
+A failed append keeps the messages held. A send that carries a new message fails; other paths print one stderr line.
+When an urgent message replaces every held message by its key, nothing is filed and the urgent message goes plain.
+An unconfirmed delivery cuts the file back to its size before the append and keeps the messages held.
+If the file changed after the append, the file stays as it is and stderr gets one line.
+No code deletes the file; the agent reads it.
 The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
 It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
 It ignores case and differences in spacing when it compares names.

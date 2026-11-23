@@ -6,6 +6,7 @@ from scripts.build_queue import admission_records
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
 import fcntl
@@ -16,6 +17,8 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import tempfile
+import time
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
@@ -225,7 +228,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     if fails:
                         raise RuntimeError("module preparation failed")
                     prepared = prepare(root, {**environment, "HERDR_BIN": "/host/herdr"})
-                    self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
+                    self.assertEqual(prepared["HERDR_BIN"], MISSING_HERDR_BIN)
                     return prepared
 
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
@@ -675,6 +678,26 @@ class GateRecoveryTests(MergeGateFixture):
         self.assertEqual(finished.path.read_text(), saved)
         self.assertEqual(canary.read_text(), "fixture data")
         self.assertNotIn(str(folder), result.stderr)
+
+
+class LiveConfigTripwireTests(unittest.TestCase):
+    def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        job_root = root / "job"
+        job_root.mkdir()
+        marker = job_root / "live-config-writes"
+        _ = marker.write_text("/fixture/config/console.conf\n")
+        log = job_root / "output.log"
+        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
+        job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
+                                  time.time(), log.open("w+"), log, "test_fixture.py")
+        self.addCleanup(job.output.close)
+        with mock.patch.object(gate, "kill_job_group"):
+            result = gate.finish_gate_job(job, 0)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a test attempted to write live configuration at /fixture/config/console.conf", result.output)
+        self.assertFalse(job_root.exists())
 
 
 if __name__ == "__main__":

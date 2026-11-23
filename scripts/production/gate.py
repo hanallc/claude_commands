@@ -78,6 +78,7 @@ from scripts.agents import remote
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
@@ -121,7 +122,6 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
-TEST_HERDR_BIN = "/nonexistent/herdr"
 GATE_MODULE_TEMP_DIR = "GATE_MODULE_TEMP_DIR"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
@@ -1218,7 +1218,7 @@ raise SystemExit(99)
     return {**environment, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
             "MERGE_GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
-            "HERDR_BIN": TEST_HERDR_BIN,
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             GATE_MODULE_TEMP_DIR: str(root),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
@@ -1254,6 +1254,11 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         except ValueError:
             detail = f"(unreadable record): {line}"
         captured += f"\n{job.module}: a test read live memory {detail}\n"
+    config_marker = job.log.parent / "live-config-writes"
+    config_violation = config_marker.is_file()
+    if config_violation:
+        path = config_marker.read_text(encoding="utf-8", errors="replace").partition("\n")[0]
+        captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     try:
@@ -1269,7 +1274,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     if (job.memory_stopped or job.killed_for.startswith("time limit")) and status == 0:
         status = 1
-    tripwire_tripped = bool(calls or readings)
+    tripwire_tripped = bool(calls or readings or config_violation)
     if tripwire_tripped:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,

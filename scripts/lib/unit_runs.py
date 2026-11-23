@@ -18,9 +18,10 @@ import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache, lru_cache
+from functools import lru_cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, cast
@@ -210,10 +211,17 @@ def run_archive() -> Path:
     return moved_folder(state_dir() / RUN_ARCHIVE_NAME, state_dir() / FORMER_RUN_ARCHIVE_NAME)
 
 
-@cache
+# The anomalies this command printed. A CLI process runs one command in one context, and
+# verify_helper.py runs each call in a copy of its context, so the set lives for one command.
+_reported_anomalies: ContextVar[frozenset[str]] = ContextVar("reported_anomalies", default=frozenset())
+
+
 def report_anomaly(message: str) -> None:
-    """Print each run anomaly once per process."""
-    print(message, file=sys.stderr)
+    """Print each run anomaly once per command."""
+    reported = _reported_anomalies.get()
+    if message not in reported:
+        _ = _reported_anomalies.set(reported | {message})
+        print(message, file=sys.stderr)
 
 
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,
