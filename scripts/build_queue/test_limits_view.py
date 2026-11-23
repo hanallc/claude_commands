@@ -584,14 +584,11 @@ class BuildLimitsTests(unittest.TestCase):
                          (1, "", normal.mac.waits))
         keyless_cells = {row.name: row.mac for row in keyless.repositories}
         self.assertEqual((keyless_cells["project"].used, keyless_cells["cleanup"].used), (None, 1))
-        for shown, project_count in ((unresolved, 2),):
-            with self.subTest(mac_claims=project_count):
-                self.assertEqual(shown.mac.unattributed, 0)
-                self.assertEqual(shown.mac.waits, normal.mac.waits)
-                mac_cells = {row.name: row.mac for row in shown.repositories}
-                self.assertEqual(mac_cells["project"].used, project_count)
-                self.assertEqual(mac_cells["cleanup"].used, 1)
-                self.assertNotIn("other", mac_cells)
+        self.assertEqual(unresolved.mac.unattributed, 0)
+        self.assertEqual(unresolved.mac.waits, normal.mac.waits)
+        unresolved_cells = {row.name: row.mac for row in unresolved.repositories}
+        self.assertEqual((unresolved_cells["project"].used, unresolved_cells["cleanup"].used), (2, 1))
+        self.assertNotIn("other", unresolved_cells)
         self.assertTrue(mac_test.run_holds_work(cleanup))
         self.assertEqual(full_mac.mac.unattributed, 1)
         self.assertEqual(full_mac.mac.unattributed_note, "")
