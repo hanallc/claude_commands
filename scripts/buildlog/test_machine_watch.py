@@ -61,6 +61,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
         self.image_current = True
         self.gpu: tuple[str, ...] | hana_placement.HanaStepRefused = ("g6.xlarge",)
         self.ssh_state: targets.TargetState = targets.Free()
+        self.refused: set[str] = set()
 
     @override
     def setUp(self) -> None:
@@ -76,6 +77,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
             "MACHINE_WATCH_STATE_DIR": str(self.root / "watch"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.root / "holds"),
         }))
         _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\n")
         _ = write_config_fixture(config / "mac_test.conf", "offload=on\n")
@@ -99,11 +101,13 @@ class MachineWatchTests(NotificationGuardedTestCase):
         return self.ssh_state
 
     def fake_run(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        """Record each send.py call. No push or message leaves the test."""
+        """Record each send.py call. No push or message leaves the test. A receiver in `refused` gets no message."""
         if not any(word.endswith("send.py") for word in command):
             return subprocess.CompletedProcess(command, 1, "", "")
         self.commands.append(command)
         self.texts.append(str(kwargs.get("input", "")))
+        if "--to" in command and command[command.index("--to") + 1] in self.refused:
+            return subprocess.CompletedProcess(command, 1, "", "")
         return subprocess.CompletedProcess(command, 0, "SENT\n", "")
 
     def target(self, name: str) -> Target:
@@ -193,8 +197,11 @@ class MachineWatchTests(NotificationGuardedTestCase):
                              ("hana-gpu", HOUR)):
             with self.subTest(machine=name):
                 self.commands.clear()
+                if name == "natedev":
+                    self.step("waiting", step_record.StepState.WAITING_HOLD, (name,))
+                elif name != "mac":
+                    self.step("waiting", step_record.StepState.WAITING_SSH, (name,), selected=name)
                 if name != "mac":
-                    self.step("waiting", step_record.StepState.WAITING_SSH, (name,))
                     self.step("running", step_record.StepState.ON_SSH, ("other",), selected="other")
                 for now in (START, START + notice - 1):
                     self.waiting_pass(name, now)
@@ -251,17 +258,99 @@ class MachineWatchTests(NotificationGuardedTestCase):
         self.assertIs(mac_test.machine_off_on_purpose("hana-aws", mac_test.AskingSession("research")),
                       mac_test.MACHINE_IN_USE)
 
-    def test_a_refused_cloud_gate_credential_makes_the_gpu_route_unusable(self) -> None:
+    def write_launches(self, *rows: dict[str, object]) -> None:
         log = target_config.ssh_target_state_directory("aws") / "cloud-gate-launches.jsonl"
-        log.parent.mkdir(parents=True)
-        rows = [{"time": START - 60, "result": "launched"},
-                {"time": START, "result": "refused", "error_code": "AuthFailure"}]
-        _ = log.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        self.assertEqual(machine_watch.refused_credential(START - HOUR),
-                         machine_watch.Unusable("AWS could not authenticate the launch credentials."))
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
-            _ = stream.write(json.dumps({"time": START + 60, "result": "launched"}) + "\n")
-        self.assertIsNone(machine_watch.refused_credential(START - HOUR))
+            _ = stream.write("".join(json.dumps(row) + "\n" for row in rows))
+
+    def test_a_refused_cloud_gate_credential_makes_the_gpu_route_unusable(self) -> None:
+        """The newest row decides, and the outage starts at the first refusal of the current run."""
+        refused = {"result": "refused", "error_code": "AuthFailure"}
+        self.write_launches({"time": START - 10 * HOUR, "result": "launched"}, {"time": START - 9 * HOUR, **refused},
+                            {"time": START - 8 * HOUR, "result": "launched"}, {"time": START - 2 * HOUR, **refused},
+                            {"time": START, "result": "finished"}, {"time": START, **refused})
+        self.assertEqual(machine_watch.refused_credential(), machine_watch.Outage(
+            machine_watch.Unusable("AWS could not authenticate the launch credentials."), START - 2 * HOUR))
+        self.write_launches({"time": START + 60, "result": "launched"})
+        self.assertIs(machine_watch.refused_credential(), machine_watch.USABLE)
+
+    def test_an_old_credential_refusal_sends_at_the_first_pass(self) -> None:
+        self.write_launches({"time": START - HOUR, "result": "refused", "error_code": "AuthFailure"})
+        self.watch("hana-gpu", START)
+        self.write_launches({"time": START + 60, "result": "refused", "error_code": "AuthFailure"})
+        self.watch("hana-gpu", START + 120)
+        self.assertEqual(self.receivers(), ["bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-hana-gpu-{int(START - HOUR)}")
+        self.assertIn("AWS could not authenticate the launch credentials.", self.texts[-1])
+
+    def test_a_change_of_notice_kind_starts_a_new_outage(self) -> None:
+        """mac-linux goes from no answer (push) to waiting steps (message) and back; each kind sends once."""
+        self.make_unusable("mac-linux")
+        self.step("waiting", step_record.StepState.WAITING_SSH, ("mac-linux",), selected="mac-linux")
+        for now in (START, START + HOUR):
+            self.watch("mac-linux", now)
+        self.assertEqual(self.receivers(), ["nate"])
+        self.ssh_state = targets.Free()
+        answered = START + HOUR + 60
+        self.watch("mac-linux", answered)
+        self.assertTrue(machine_watch.cleared("mac-linux", START))
+        for now in (answered + HOUR - 1, answered + HOUR, answered + HOUR + 60):
+            self.watch("mac-linux", now)
+        self.assertEqual(self.receivers(), ["nate", "bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-linux-{int(answered)}")
+        self.make_unusable("mac-linux")
+        lost = answered + 2 * HOUR
+        for now in (lost, lost + HOUR, lost + HOUR + 60):
+            self.watch("mac-linux", now)
+        self.assertEqual(self.receivers(), ["nate", "bob", "builds", "nate"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-linux-{int(lost)}")
+        self.assertFalse(machine_watch.cleared("mac-linux", lost))
+
+    def test_a_change_of_notice_kind_on_the_mac_starts_a_new_outage(self) -> None:
+        self.mac_pass(START + MAC_NOTICE)
+        self.assertEqual(self.receivers(), ["nate"])
+        free = START + MAC_NOTICE + 60
+        for now in (free, free + MAC_NOTICE - 1, free + MAC_NOTICE, free + MAC_NOTICE + 60):
+            self.mac_pass(now, "idle", "free", 3)
+        self.assertEqual(self.receivers(), ["nate", "bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-{int(free)}")
+        self.mac_pass(free + MAC_NOTICE + 120)
+        self.assertEqual(self.receivers(), ["nate", "bob", "builds", "nate"])
+
+    def test_a_disk_exclusion_with_waiting_steps_is_one_outage(self) -> None:
+        """A free, disk and free Mac with waiting steps is one outage and sends one message."""
+        for now, cause in ((START, "free"), (START + 60, "disk"), (START + 120, "free"),
+                           (START + MAC_NOTICE, "disk"), (START + MAC_NOTICE + 60, "free")):
+            self.mac_pass(now, "idle", cause, 3)
+        self.assertEqual(self.receivers(), ["bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-{int(START)}")
+
+    def test_each_wait_state_counts_only_for_the_machine_it_waits_for(self) -> None:
+        states = step_record.StepState
+        for state, selected, counted in ((states.WAITING_HOLD, "", {"natedev"}),
+                                         (states.WAITING_MAC, "", {"mac"}),
+                                         (states.WAITING_SSH, "mac-linux", {"mac-linux"}),
+                                         (states.WAITING_SSH, "", set[str]())):
+            with self.subTest(state=state, selected=selected):
+                self.step("waiting", state, ("natedev", "mac", "mac-linux", "hana-aws"), selected=selected)
+                self.assertEqual({name for name in ("natedev", "mac", "mac-linux", "hana-aws")
+                                  if machine_watch.waiting_steps(self.target(name))}, counted)
+
+    def test_a_natedev_hold_in_force_is_off_on_purpose(self) -> None:
+        holds = self.root / "holds"
+        holds.mkdir()
+        _ = (holds / "nate").write_text("2026-11-23T00:00:00Z kernel update\n")
+        self.assertEqual(mac_test.machine_off_on_purpose("natedev"), mac_test.OffOnPurpose("nate holds it: kernel update"))
+        self.step("waiting", step_record.StepState.WAITING_HOLD, ("natedev",))
+        for now in (START, START + 2 * HOUR):
+            self.watch("natedev", now)
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.paths.state / "natedev.json").exists())
+        (holds / "nate").unlink()
+        holds.rmdir()
+        _ = holds.write_text("not a folder\n")
+        self.assertIs(mac_test.machine_off_on_purpose("natedev"), mac_test.MACHINE_IN_USE)
 
     def test_a_lost_outage_ends_the_push_and_a_live_one_keeps_it(self) -> None:
         self.make_unusable("mac-linux")
@@ -275,8 +364,8 @@ class MachineWatchTests(NotificationGuardedTestCase):
         self.assertTrue(machine_watch.cleared("mac-linux", START))
         self.assertEqual(machine_watch.main(["cleared", "--machine", "mac-linux", "--since", str(START)]), 0)
 
-    def idle_block(self, reason: str, showrunner: mac_test.Showrunner) -> None:
-        since = datetime.fromtimestamp(START, timezone.utc)
+    def idle_block(self, reason: str, showrunner: mac_test.Showrunner, start: float = START) -> None:
+        since = datetime.fromtimestamp(start, timezone.utc)
         mac_test.write_block(self.root / "mac-state/block.json", mac_test.ActiveMacBlock(
             "research", reason, since, since + timedelta(hours=4), mac_test.RecordedSession("research", "research"),
             showrunner, "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
@@ -292,6 +381,42 @@ class MachineWatchTests(NotificationGuardedTestCase):
         self.assertEqual({self.option("--key", index) for index in (0, 1)},
                          {f"machine-watch-mac-block-{int(START)}"})
         self.assertIn("research has blocked the Mac for 10 min", self.texts[0])
+
+    def test_an_idle_block_counts_from_the_later_of_the_idle_start_and_the_block_start(self) -> None:
+        placed = START + 300
+        self.idle_block("P15 F11 L0 run", mac_test.NamedShowrunner("builds"), placed)
+        self.mac_pass(START + MAC_NOTICE, "idle", "blocked", 0)
+        self.assertEqual(self.commands, [])
+        self.mac_pass(placed + MAC_NOTICE, "idle", "blocked", 0)
+        self.assertEqual(self.receivers(), ["bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-block-{int(placed)}")
+
+    def test_a_new_idle_block_sends_again(self) -> None:
+        self.idle_block("P15 F11 L0 run", mac_test.NamedShowrunner("builds"))
+        self.mac_pass(START + MAC_NOTICE, "idle", "blocked", 0)
+        renewed = START + 2 * MAC_NOTICE
+        self.idle_block("P16 F2 L0 run", mac_test.NamedShowrunner("builds"), renewed)
+        for now in (renewed + MAC_NOTICE - 1, renewed + MAC_NOTICE, renewed + MAC_NOTICE + 60):
+            self.mac_pass(now, "idle", "blocked", 0)
+        self.assertEqual(self.receivers(), ["bob", "builds", "bob", "builds"])
+        self.assertEqual(self.option("--key"), f"machine-watch-mac-block-{int(renewed)}")
+
+    def test_a_partial_block_send_retries_only_the_failed_receiver(self) -> None:
+        self.idle_block("P15 F11 L0 run", mac_test.NamedShowrunner("builds"))
+        self.refused = {"builds"}
+        with redirect_stderr(io.StringIO()):
+            self.mac_pass(START + MAC_NOTICE, "idle", "blocked", 0)
+        self.refused = set()
+        for now in (START + MAC_NOTICE + 60, START + MAC_NOTICE + 120):
+            self.mac_pass(now, "idle", "blocked", 0)
+        self.assertEqual(self.receivers(), ["bob", "builds", "builds"])
+
+    def test_a_failed_block_check_does_not_stop_the_mac_push(self) -> None:
+        with mock.patch.object(machine_watch, "watch_idle_block", side_effect=OSError("fixture")), \
+             redirect_stderr(io.StringIO()) as errors:
+            self.mac_pass(START + MAC_NOTICE)
+        self.assertIn("mac block check failed: fixture", errors.getvalue())
+        self.assertEqual(self.receivers(), ["nate"])
 
     def test_an_idle_block_finds_the_showrunner_through_the_holder_labels(self) -> None:
         from scripts.message.unit_labels import UnitLabels
@@ -314,13 +439,17 @@ class MachineWatchTests(NotificationGuardedTestCase):
     def test_a_failed_machine_check_does_not_stop_the_other_machines(self) -> None:
         self.make_unusable("mac-linux")
         self.make_unusable("hana-aws")
-        with mock.patch.object(machine_watch, "unusable", side_effect=[OSError("fixture"), machine_watch.Unusable("x"),
-                                                                       None, machine_watch.Unusable("y")]), \
+        broken = [OSError("fixture"), machine_watch.Outage(machine_watch.Unusable("x"), machine_watch.FIRST_SEEN),
+                  machine_watch.USABLE, machine_watch.Outage(machine_watch.Unusable("y"), machine_watch.FIRST_SEEN)]
+        # The Mac has its own reading, so the four results go to hana-aws, mac-linux, natedev and hana-gpu.
+        self.assertEqual([target.name for target in machine_watch.machines() if target.name != "mac"],
+                         ["hana-aws", "mac-linux", "natedev", "hana-gpu"])
+        with mock.patch.object(machine_watch, "unusable", side_effect=broken), \
              mock.patch.object(mac_idle, "watch_once"), redirect_stderr(io.StringIO()) as errors:
             machine_watch.watch_once(self.paths, START)
-        self.assertIn("check failed: fixture", errors.getvalue())
-        saved = sorted(path.name for path in self.paths.state.glob("*.json"))
-        self.assertEqual(len(saved), 2)
+        self.assertIn("hana-aws check failed: fixture", errors.getvalue())
+        saved = sorted(path.stem for path in self.paths.state.glob("*.json"))
+        self.assertEqual(saved, ["hana-gpu", "mac-linux"])
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \

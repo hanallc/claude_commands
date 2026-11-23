@@ -611,11 +611,12 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
                            ) -> OffOnPurpose | MachineInUse:
     """The one rule for every machine notice and outage push: the user turned the named target off.
 
-    Each target reads enabled.<target>=off. An SSH target also reads the block in its own state folder and one
-    switch in its settings file: offload=off for a macOS target, and enabled=off for another target. Hana and the
-    cloud gate keep their enabled key in their settings files. A block is a lease that a showrunner gives to one
-    session, so it does not count when its holder asks. An unreadable record or setting proves nothing, so the
-    target counts as in use and a real outage still sends its notice.
+    Each target reads enabled.<target>=off. The local target also reads the /build:hold holds in force. An SSH
+    target also reads the block in its own state folder and one switch in its settings file: offload=off for a
+    macOS target, and enabled=off for another target. Hana and the cloud gate keep their enabled key in their
+    settings files. A Hana GPU target also reads hana_gpu_route_enabled=off. A block is a lease that a showrunner
+    gives to one session, so it does not count when its holder asks. An unreadable record or setting proves
+    nothing, so the target counts as in use and a real outage still sends its notice.
     """
     enabled = f"enabled.{target}"
     try:
@@ -627,8 +628,8 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
     try:
         configured = target_config.configured_ssh_target(target)
     except ConfigError:
-        # The local target has no block and no settings switch.
-        return MACHINE_IN_USE
+        # The local target has no block and no settings switch. A hold in force turns it off.
+        return local_hold(target)
     try:
         block = read_claim_block(StatePaths(target_config.ssh_target_state_directory(target), target))
         if not isinstance(block, NoMacBlock) and asking_session != AskingSession(block.holder):
@@ -643,6 +644,22 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
     except ConfigError:
         pass
     return gpu_route_off(configured)
+
+
+def local_hold(target: str) -> OffOnPurpose | MachineInUse:
+    """A /build:hold hold in force turns the local target off. An unreadable hold state counts as in use."""
+    from scripts.build_hold import build_hold
+
+    try:
+        if not any(isinstance(found, target_config.LocalTarget) for found in target_config.read_targets(
+                selected=target, purpose=target_config.RegistryRead.PLACEMENT)):
+            return MACHINE_IN_USE
+        holds = build_hold.natedev_holds(build_hold.holder_directory())
+    except (ConfigError, OSError, UnicodeError, ValueError):
+        return MACHINE_IN_USE
+    if not holds.in_force:
+        return MACHINE_IN_USE
+    return OffOnPurpose("; ".join(f"{holder.name} holds it: {holder.purpose}" for holder in holds.in_force))
 
 
 def gpu_route_off(configured: target_config.SshTarget) -> OffOnPurpose | MachineInUse:

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from scripts.buildlog import mac_idle_alert
     from zoneinfo import ZoneInfo
     from scripts.message.unit_labels import UnitLabels
+    from scripts.notify.push_texts import RenderedPush
 else:
     from scripts.direct import step_record
     from scripts.buildlog import mac_idle_alert
@@ -380,24 +381,33 @@ def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
     """Send the unreachable phone push. The machine watch decides when it goes."""
     from scripts.notify import push_texts
     from scripts.notify.push_catalog import waiting_tests
-    from scripts.lib.process_failure import failure_detail
 
     rendered = push_texts.render("mac_idle.unreachable",
         minutes=str(int((now - saved["since"]) // 60)), tests=waiting_tests(saved["waiting"]))
     since = str(int(saved["since"]))
-    command = push_texts.user_send_argv(rendered, sender="Mac idle watch", key=f"mac-idle-{since}")
-    command.extend(["--clears-when", f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}"])
-    settings = mac_idle_alert.read_idle_config()
-    window = outage_repeat_minutes(saved["since"], now, settings)
-    command.extend(["--repeat-minutes", f"{window:g}", "--recipient-key", "user"])
+    window = outage_repeat_minutes(saved["since"], now, mac_idle_alert.read_idle_config())
+    return send_user_push(rendered, sender="Mac idle watch", key=f"mac-idle-{since}",
+                          clears_when=f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}",
+                          options=("--repeat-minutes", f"{window:g}"))
+
+
+def send_user_push(rendered: RenderedPush, *, sender: str, key: str, clears_when: str,
+                   options: tuple[str, ...] = ()) -> bool:
+    """Send one outage phone push to the user, with its clear check. Print the reason when send.py refuses it."""
+    from scripts.notify import push_texts
+    from scripts.lib.process_failure import failure_detail
+
+    command = push_texts.user_send_argv(rendered, sender=sender, key=key)
+    command.extend(["--clears-when", clears_when, *options, "--recipient-key", "user"])
     try:
-        sent = subprocess.run(command, capture_output=True, text=True, timeout=settings.send_timeout_s, check=False)
-        if sent.returncode != push_texts.SEND_RETRY_EXIT and sent.returncode == 0:
+        sent = subprocess.run(command, capture_output=True, text=True,
+                              timeout=mac_idle_alert.read_idle_config().send_timeout_s, check=False)
+        if sent.returncode == 0:
             return True
         reason = failure_detail(sent)
     except (OSError, subprocess.SubprocessError) as error:
         reason = str(error)
-    print(f"Mac idle watch: phone push failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
+    print(f"{sender}: phone push {key} failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
     return False
 
 

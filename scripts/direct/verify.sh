@@ -2346,7 +2346,7 @@ try_mac_test() {
     LAST_TARGET_OUTCOME="" LAST_TARGET_REASON=""
     selected_target=$(target_for_settings "$1")
     if [[ "$(target_platform "$selected_target")" == macos ]]; then selected_is_mac=1; fi
-    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
     MAC_PASSED=0
     local caller_traps
     caller_traps="$(trap -p INT TERM HUP)"
@@ -2512,7 +2512,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
         if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else
             BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
-            step_state waiting_ssh
+            step_state waiting_ssh "$selected_target"
         fi
         return
     fi
@@ -2540,7 +2540,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
-            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
             return
             ;;
         failed|prelaunch_failed)

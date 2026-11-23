@@ -481,9 +481,16 @@ def write_spot_prices(directory: Path, prices: Sequence[RegionalSpotPrice]) -> N
     write_text_atomic(directory / 'spot-prices.json', json.dumps(document, sort_keys=True) + '\n')
 
 
-def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, object], ...]:
-    """Read backwards in 64 KiB blocks until the first row before the window."""
-    selected: list[dict[str, object]] = []
+@dataclass(frozen=True)
+class GateLaunch:
+    """One cloud gate launch row and its time."""
+
+    at: float
+    row: dict[str, object]
+
+
+def gate_launches_newest_first(directory: Path) -> Iterator[GateLaunch]:
+    """Read backwards in 64 KiB blocks. The caller stops the read when it has the rows it needs."""
     try:
         with (directory / 'cloud-gate-launches.jsonl').open('rb') as stream:
             position = stream.seek(0, 2)
@@ -502,11 +509,18 @@ def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, objec
                         at = float(str(row['time']))
                     except (ValueError, KeyError, TypeError, UnicodeError):
                         continue
-                    if at < since:
-                        return tuple(selected)
-                    selected.append(row)
+                    yield GateLaunch(at, row)
     except FileNotFoundError:
-        pass
+        return
+
+
+def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, object], ...]:
+    """Read newest first until the first row before the window."""
+    selected: list[dict[str, object]] = []
+    for launch in gate_launches_newest_first(directory):
+        if launch.at < since:
+            break
+        selected.append(launch.row)
     return tuple(selected)
 
 

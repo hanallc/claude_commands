@@ -13,7 +13,6 @@ except FileNotFoundError:
     pass
 
 import fcntl
-import json
 import math
 import os
 import re
@@ -21,6 +20,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -30,7 +30,8 @@ from scripts.lib import conf
 if TYPE_CHECKING:
     from scripts.build_targets.execution_transport import ExecutionTransport
     from scripts.build_targets.target_config import Target
-    from scripts.mac_test.claim_state import ActiveMacBlock, PendingMacBlock
+    from scripts.direct.step_record import StepRecord
+    from scripts.mac_test.claim_state import ActiveMacBlock, PendingMacBlock, Showrunner
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 SENDER = "Machine watch"
@@ -107,9 +108,33 @@ NO_CHANGE = NoChange()
 Reading = Outage | NoOutage | NoChange
 
 
+@dataclass(frozen=True)
+class Usable:
+    """No fixed cause stops builds from using the machine."""
+
+
+USABLE = Usable()
+
+
+@dataclass(frozen=True)
+class LocalMachine:
+    """The watch runs on the machine, so no transport reaches it."""
+
+
+LOCAL_MACHINE = LocalMachine()
+
+
+class NoticeKind(StrEnum):
+    """How a notice goes. A change of kind starts a new outage, so its receivers get their own notice."""
+
+    PUSH = "push"
+    MESSAGE = "message"
+
+
 class SavedNotice(TypedDict):
     since: float
     sent: bool
+    kind: NoticeKind
 
 
 class SavedBlockNotice(TypedDict):
@@ -117,39 +142,41 @@ class SavedBlockNotice(TypedDict):
     sent: list[str]
 
 
-def read_json(path: Path) -> dict[str, object] | None:
-    """An unreadable file reads as missing. One more notice can then go for the same outage."""
-    try:
-        value = cast(object, json.loads(path.read_text()))
-    except (OSError, ValueError):
-        return None
-    return cast(dict[str, object], value) if isinstance(value, dict) else None
+@dataclass(frozen=True)
+class NoSavedNotice:
+    """The file is missing or unreadable. One more notice can then go for the same outage."""
 
 
-def read_notice(path: Path) -> SavedNotice | None:
-    row = read_json(path)
-    if row is None or not mac_idle_alert.nonnegative_time(row.get("since")) or type(row.get("sent")) is not bool:
-        return None
-    return cast(SavedNotice, cast(object, row))
+NO_SAVED_NOTICE = NoSavedNotice()
 
 
-def read_block_notice(path: Path) -> SavedBlockNotice | None:
-    row = read_json(path)
-    sent = row.get("sent") if row is not None else None
-    if (row is None or not mac_idle_alert.nonnegative_time(row.get("since")) or not isinstance(sent, list)
+def read_notice(path: Path) -> SavedNotice | NoSavedNotice:
+    row = mac_idle.read_record(path)
+    since, sent, kind = row.get("since"), row.get("sent"), row.get("kind")
+    if not mac_idle_alert.nonnegative_time(since) or type(sent) is not bool or kind not in list(NoticeKind):
+        return NO_SAVED_NOTICE
+    return {"since": float(cast(float, since)), "sent": sent, "kind": NoticeKind(cast(str, kind))}
+
+
+def read_block_notice(path: Path) -> SavedBlockNotice | NoSavedNotice:
+    row = mac_idle.read_record(path)
+    since, sent = row.get("since"), row.get("sent")
+    if (not mac_idle_alert.nonnegative_time(since) or not isinstance(sent, list)
             or not all(isinstance(name, str) for name in cast(list[object], sent))):
-        return None
-    return cast(SavedBlockNotice, cast(object, row))
+        return NO_SAVED_NOTICE
+    return {"since": float(cast(float, since)), "sent": cast(list[str], sent)}
 
 
 def notice_seconds(machine: str, settings: conf.ConfigRead) -> float:
     """Read the machine key, else the key for all machines.
 
-    The conf host level selects a key by the host that reads the file, not by the watched machine, so it does not
-    fit here.
+    The last part of the key names the watched machine, not the host that reads the file, so the reads skip the
+    conf host level.
     """
-    every_machine = settings.value("excluded_notice_seconds", conf.positive_whole_seconds)
-    return settings.value(f"excluded_notice_seconds.{machine}", conf.positive_whole_seconds, default=every_machine)
+    ignored = conf.HostOverride.IGNORED
+    every_machine = settings.value("excluded_notice_seconds", conf.positive_whole_seconds, host_override=ignored)
+    return settings.value(f"excluded_notice_seconds.{machine}", conf.positive_whole_seconds, default=every_machine,
+                          host_override=ignored)
 
 
 def machines() -> tuple[Target, ...]:
@@ -165,36 +192,45 @@ def machines() -> tuple[Target, ...]:
     return tuple(found)
 
 
-def transport_for(target: Target) -> ExecutionTransport | None:
+def transport_for(target: Target) -> ExecutionTransport | LocalMachine:
     from scripts.aws_target import hana_placement
     from scripts.build_targets.target_config import SshTarget
 
-    return hana_placement.read_execution_transport(target) if isinstance(target, SshTarget) else None
+    return hana_placement.read_execution_transport(target) if isinstance(target, SshTarget) else LOCAL_MACHINE
 
 
-def nate_repairs(transport: ExecutionTransport | None) -> bool:
+def nate_repairs(transport: ExecutionTransport | LocalMachine) -> bool:
     """Nate repairs a local or plain SSH machine that does not answer. Bob repairs a Hana machine."""
     from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 
     return not isinstance(transport, HanaControlTransport | HanaGpuNextestTransport)
 
 
-def refused_credential(since: float) -> Unusable | None:
-    """Read the newest cloud gate launch row in the window. A credential refusal makes the GPU route unusable."""
+def refused_credential() -> Outage | Usable:
+    """The newest cloud gate launch row decides. A credential refusal makes the GPU route unusable.
+
+    The outage starts at the first refusal of the current run of refusals, so a run that is older than the notice
+    time sends its notice at once.
+    """
     from scripts.aws_target import aws_page, ledger
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    for row in ledger.recent_gate_launches(ssh_target_state_directory("aws"), since):
-        evidence = aws_page.classify_launch_row(row, frozenset())
+    refusals: list[tuple[float, str]] = []
+    for launch in ledger.gate_launches_newest_first(ssh_target_state_directory("aws")):
+        evidence = aws_page.classify_launch_row(launch.row, frozenset())
         if evidence is aws_page.LaunchRowEvidence.NO_ATTEMPT:
             continue
-        if isinstance(evidence, aws_page.OtherLaunchRefusal) and evidence in aws_page.LAUNCH_REFUSAL_REASONS:
-            return Unusable(aws_page.LAUNCH_REFUSAL_REASONS[evidence])
-        return None
-    return None
+        if not (isinstance(evidence, aws_page.OtherLaunchRefusal) and evidence in aws_page.LAUNCH_REFUSAL_REASONS):
+            break
+        refusals.append((launch.at, aws_page.LAUNCH_REFUSAL_REASONS[evidence]))
+    if not refusals:
+        return USABLE
+    newest_reason = refusals[0][1]
+    first_refusal_at = refusals[-1][0]
+    return Outage(Unusable(newest_reason), first_refusal_at)
 
 
-def unusable(target: Target, transport: ExecutionTransport | None, now: float, notice: float) -> Unusable | None:
+def unusable(target: Target, transport: ExecutionTransport | LocalMachine) -> Outage | Usable:
     """Only a fixed cause counts. A busy, starting or unprovisioned Hana box is a temporary state."""
     from scripts.aws_target import hana_box, hana_placement
     from scripts.build_targets import targets
@@ -202,41 +238,55 @@ def unusable(target: Target, transport: ExecutionTransport | None, now: float, n
     from scripts.build_targets.target_config import SshTarget
 
     if not isinstance(target, SshTarget):
-        return None
+        return USABLE
     if isinstance(transport, HanaControlTransport):
         controller = hana_placement.controller_for(transport, read_only=True)
         snapshot = controller.inspect()
         if isinstance(snapshot, hana_box.HanaLifecycleEvidence) and not controller.image_is_current(snapshot.deployment):
-            return Unusable(hana_box.HANA_IMAGE_STALE)
-        return None
+            return Outage(Unusable(hana_box.HANA_IMAGE_STALE), FIRST_SEEN)
+        return USABLE
     if isinstance(transport, HanaGpuNextestTransport):
         setup = hana_placement.gpu_setup(transport)
         if isinstance(setup, hana_placement.HanaStepRefused):
-            return Unusable(setup.reason)
-        refused = refused_credential(now - notice)
-        if refused is not None:
+            return Outage(Unusable(setup.reason), FIRST_SEEN)
+        refused = refused_credential()
+        if isinstance(refused, Outage):
             return refused
     state = targets.ssh_target_state(target)
-    return Unusable(f"Builds could not connect to it ({state.reason})") if isinstance(state, targets.Unreachable) else None
+    if isinstance(state, targets.Unreachable):
+        return Outage(Unusable(f"Builds could not connect to it ({state.reason})"), FIRST_SEEN)
+    return USABLE
 
 
-def waiting_steps(target: Target) -> int:
-    """Count the steps that wait for the target. A target that runs a step has no waiting work."""
+def waits_for(record: StepRecord, target: Target) -> bool:
+    """Each wait state names the machine that the step waits for."""
     from scripts.direct import step_record
     from scripts.direct.step_selection import Pinned
     from scripts.build_targets.target_config import LocalTarget
 
     states = step_record.StepState
+    if record.state is states.WAITING_HOLD:
+        return isinstance(target, LocalTarget)
+    if record.state is states.WAITING_MAC:
+        return target.platform == "macos" and (target.name in record.eligible_targets
+                                               or record.selection == Pinned(target.name))
+    # verify.sh writes the selected target with each waiting_ssh state.
+    return record.state is states.WAITING_SSH and record.selected_target == target.name
+
+
+def waiting_steps(target: Target) -> int:
+    """Count the steps that wait for the target. A target that runs a step has no waiting work."""
+    from scripts.direct import step_record
+    from scripts.build_targets.target_config import LocalTarget
+
+    states = step_record.StepState
     local = (states.ON_NATEDEV, states.LOCAL_NONCOMPILING)
-    waiting = (states.WAITING_HOLD, states.WAITING_MAC, states.WAITING_SSH)
     records = step_record.live_records()
     for record in records:
         if (record.state in local and isinstance(target, LocalTarget)
                 or record.state in (states.ON_SSH, states.ON_MAC) and record.selected_target == target.name):
             return 0
-    return sum(record.state in waiting
-               and (target.name in record.eligible_targets or record.selection == Pinned(target.name))
-               for record in records)
+    return sum(waits_for(record, target) for record in records)
 
 
 def fresh_alert(paths: WatchPaths, now: float) -> mac_idle_alert.SavedAlert | None:
@@ -254,20 +304,20 @@ def mac_reading(paths: WatchPaths, now: float) -> Reading:
     if saved["state"] == "unreachable":
         # The Mac reads unreachable only after a failed probe. While no step waits, its clear check ends the push.
         return Outage(UnreachableMacAlert(saved), saved["since"]) if saved["waiting"] else NO_CHANGE
-    if saved["state"] == "idle" and saved["cause"] in ("free", "claim_idle") and saved["waiting"]:
+    if saved["state"] == "idle" and saved["cause"] in ("free", "claim_idle", "disk") and saved["waiting"]:
         return Outage(StepsWait(saved["waiting"]), FIRST_SEEN)
     return NO_OUTAGE
 
 
-def read_machine(target: Target, transport: ExecutionTransport | None, paths: WatchPaths, now: float,
-                 notice: float) -> Reading:
+def read_machine(target: Target, transport: ExecutionTransport | LocalMachine, paths: WatchPaths,
+                 now: float) -> Reading:
     from scripts.build_targets.target_config import SshTarget, uses_legacy_mac_layout
 
     if isinstance(target, SshTarget) and uses_legacy_mac_layout(target.platform):
         return mac_reading(paths, now)
-    broken = unusable(target, transport, now, notice)
-    if broken is not None:
-        return Outage(broken, FIRST_SEEN)
+    broken = unusable(target, transport)
+    if isinstance(broken, Outage):
+        return broken
     count = waiting_steps(target)
     return Outage(StepsWait(count), FIRST_SEEN) if count else NO_OUTAGE
 
@@ -304,32 +354,27 @@ def send_session(to: str, text: str, key: str) -> bool:
 def push_to_nate(machine: str, since: float, now: float) -> bool:
     """A machine that nate repairs is a plain SSH or local machine, so its only unusable cause is no connection."""
     from scripts.notify import push_texts
-    from scripts.lib.process_failure import failure_detail
 
     rendered = push_texts.render(UNREACHABLE_TEXT, machine=machine, minutes=str(int((now - since) // 60)))
     start = str(int(since))
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=f"machine-watch-{machine}-{start}")
-    command.extend(["--clears-when",
-                    f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/machine_watch.py cleared --machine {machine} --since {start}",
-                    "--recipient-key", "user"])
-    try:
-        sent = subprocess.run(command, capture_output=True, text=True,
-                              timeout=mac_idle_alert.read_idle_config().send_timeout_s, check=False)
-        if sent.returncode == 0:
-            return True
-        reason = failure_detail(sent)
-    except (OSError, subprocess.SubprocessError) as error:
-        reason = str(error)
-    print(f"Machine watch: phone push for {machine} failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
-    return False
+    return mac_idle.send_user_push(
+        rendered, sender=SENDER, key=f"machine-watch-{machine}-{start}",
+        clears_when=f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/machine_watch.py cleared --machine {machine} --since {start}")
 
 
-def send_notice(machine: str, transport: ExecutionTransport | None, cause: Unusable | StepsWait | UnreachableMacAlert,
-                since: float, now: float) -> bool:
+def notice_kind(transport: ExecutionTransport | LocalMachine,
+                cause: Unusable | StepsWait | UnreachableMacAlert) -> NoticeKind:
     """A push goes only for an action that only nate can take. A machine that takes no work is ours to repair."""
+    if isinstance(cause, UnreachableMacAlert) or isinstance(cause, Unusable) and nate_repairs(transport):
+        return NoticeKind.PUSH
+    return NoticeKind.MESSAGE
+
+
+def send_notice(machine: str, kind: NoticeKind, cause: Unusable | StepsWait | UnreachableMacAlert,
+                since: float, now: float) -> bool:
     if isinstance(cause, UnreachableMacAlert):
         return mac_idle.push_outage(cause.alert, now)
-    if isinstance(cause, Unusable) and nate_repairs(transport):
+    if kind is NoticeKind.PUSH:
         return push_to_nate(machine, since, now)
     text = (f"Machine watch: {machine} has run no work for {int((now - since) // 60)} min. {cause_text(cause)}\n"
             + f"Check {machine}. This message goes once for this outage.")
@@ -347,16 +392,17 @@ def nate_ordered(block: PendingMacBlock | ActiveMacBlock, machine: str) -> bool:
                           mac_test.OffOnPurpose))
 
 
-def holder_showrunner(block: PendingMacBlock | ActiveMacBlock) -> str | None:
+def holder_showrunner(block: PendingMacBlock | ActiveMacBlock) -> Showrunner:
+    """The block's showrunner, else the showrunner in the holder's unit labels."""
     from scripts.mac_test import mac_test
 
     if isinstance(block.showrunner, mac_test.NamedShowrunner):
-        return block.showrunner.name
+        return block.showrunner
     if isinstance(block.delivery, mac_test.RecordedSession):
         label = mac_idle.unit_labels_for([block.delivery.name], os.environ).get(block.delivery.name)
         if label is not None and label.showrunner != "—":
-            return label.showrunner
-    return None
+            return mac_test.NamedShowrunner(label.showrunner)
+    return mac_test.NO_SHOWRUNNER
 
 
 def watch_idle_block(machine: str, paths: WatchPaths, now: float, notice: float) -> None:
@@ -383,14 +429,15 @@ def watch_idle_block(machine: str, paths: WatchPaths, now: float, notice: float)
         return
     previous = read_block_notice(path)
     notice_row: SavedBlockNotice = {"since": since, "sent": []}
-    if previous is not None and int(previous["since"]) == int(since):
+    if not isinstance(previous, NoSavedNotice) and int(previous["since"]) == int(since):
         notice_row["sent"] = previous["sent"]
     showrunner = holder_showrunner(block)
+    recipients = ("bob", showrunner.name) if isinstance(showrunner, mac_test.NamedShowrunner) else ("bob",)
     holder = mac_idle_alert.display_field(block.holder)
     text = (f"Machine watch: {holder} has blocked the Mac for {int((now - since) // 60)} min, and the Mac ran no "
             + f"work in that time. Block reason: {mac_idle_alert.display_field(block.reason)}.\n"
             + f"Ask {holder} to use the Mac or to remove the block with /build:mac unblock.")
-    for recipient in ("bob", showrunner) if showrunner is not None else ("bob",):
+    for recipient in recipients:
         if recipient in notice_row["sent"]:
             continue
         if send_session(recipient, text, f"machine-watch-{machine}-block-{int(since)}"):
@@ -405,30 +452,36 @@ def watch_machine(target: Target, paths: WatchPaths, now: float, settings: conf.
 
     notice = notice_seconds(target.name, settings)
     if isinstance(target, SshTarget) and uses_legacy_mac_layout(target.platform):
-        watch_idle_block(target.name, paths, now, notice)
+        try:
+            watch_idle_block(target.name, paths, now, notice)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            # A failed block check must not stop the outage notice below.
+            print(f"Machine watch: {target.name} block check failed: {error}", file=sys.stderr)
     path = paths.state / f"{target.name}.json"
     if isinstance(mac_test.machine_off_on_purpose(target.name), mac_test.OffOnPurpose):
         # A machine that the user turned off ends a sent notice, so a new outage sends again when it is in use.
         path.unlink(missing_ok=True)
         return
     transport = transport_for(target)
-    reading = read_machine(target, transport, paths, now, notice)
+    reading = read_machine(target, transport, paths, now)
     if isinstance(reading, NoChange):
         return
     if isinstance(reading, NoOutage):
         path.unlink(missing_ok=True)
         return
-    # One outage sends one notice. Only the end of the outage, or a machine that is off on purpose, clears "sent".
-    # A lost or unreadable state file can send one more notice for the same outage.
+    # One outage sends one notice. Only the end of the outage, a change of notice kind, or a machine that is off on
+    # purpose clears "sent". A lost or unreadable state file can send one more notice for the same outage.
+    kind = notice_kind(transport, reading.cause)
     saved = read_notice(path)
-    if isinstance(reading.since, float):
-        since = reading.since
+    kept = saved if not isinstance(saved, NoSavedNotice) and saved["kind"] is kind else NO_SAVED_NOTICE
+    if isinstance(reading.since, FirstSeen):
+        since = now if isinstance(kept, NoSavedNotice) else kept["since"]
     else:
-        since = saved["since"] if saved is not None else now
-    sent = saved is not None and int(saved["since"]) == int(since) and saved["sent"]
+        since = reading.since
+    sent = not isinstance(kept, NoSavedNotice) and int(kept["since"]) == int(since) and kept["sent"]
     if not sent and now - since >= notice:
-        sent = send_notice(target.name, transport, reading.cause, since, now)
-    mac_idle.write_record(path, SavedNotice(since=since, sent=sent))
+        sent = send_notice(target.name, kind, reading.cause, since, now)
+    mac_idle.write_record(path, SavedNotice(since=since, sent=sent, kind=kind))
 
 
 def watch_once(paths: WatchPaths, now: float) -> None:
@@ -452,7 +505,7 @@ def watch_once(paths: WatchPaths, now: float) -> None:
 
 
 def cleared(machine: str, since: float) -> bool:
-    """The clear check of a phone push: the machine is off on purpose, or the saved outage ended."""
+    """The clear check of a phone push: the machine is off on purpose, or the saved push outage ended."""
     from scripts.mac_test import mac_test
 
     if isinstance(mac_test.machine_off_on_purpose(machine), mac_test.OffOnPurpose):
@@ -461,7 +514,8 @@ def cleared(machine: str, since: float) -> bool:
     if not path.exists():
         return True
     saved = read_notice(path)
-    return saved is not None and int(saved["since"]) != int(since)
+    return not isinstance(saved, NoSavedNotice) and (saved["kind"] is not NoticeKind.PUSH
+                                                    or int(saved["since"]) != int(since))
 
 
 def main(args: list[str]) -> int:

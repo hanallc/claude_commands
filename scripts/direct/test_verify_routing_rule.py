@@ -203,6 +203,31 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
 
+def add_peer_target(root: Path) -> None:
+    """Register a linux SSH target named peer, with its settings file."""
+    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
+                             template="mac_test")
+    targets_file = root / "build_targets.conf"
+    _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
+        + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+
+
+class RemoteWaitStateTests(VerifyMacOffloadFixture):
+    def test_a_declined_ssh_step_names_its_target_in_each_wait_state(self) -> None:
+        """The machine watch counts a waiting_ssh step only for the target that the state names."""
+        add_peer_target(self.root)
+        states = self.root / "step-states"
+        assigned = self.assigned_remote("peer", "nextest")
+        result = self.call_mac_functions('step_state() { printf "%s\\n" "$*" >> "$TEST_STEP_STATES"; }\n'
+            + 'PLACEMENT_ASSIGNMENT_FILE="$TEST_DIRECT_ASSIGNMENT"\n'
+            + 'STEP_ASSIGNED_TARGET=peer STEP_ASSIGNED_PLATFORM=linux\n'
+            + 'try_mac_test "$MAC_TEST_CONFIG" || true\n',
+            extra={"MAC_TEST_CONFIG": str(self.root / "linux.conf"), "TEST_DIRECT_ASSIGNMENT": str(assigned),
+                   "TEST_STEP_STATES": str(states), "TEST_RUNNER_MAC": "declined", "TEST_RUNNER_REASON": "busy"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(states.read_text().splitlines(), ["waiting_ssh peer", "on_ssh peer", "waiting_ssh peer"])
+
+
 class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
@@ -225,11 +250,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         self.environment.update({"NO_COLOR": "1", "RUST_LOG": "sample=trace",
                                  **{name: "caller" for name in FIXED_ENVIRONMENT},
                                  "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
-                                 template="mac_test")
-        targets_file = self.root / "build_targets.conf"
-        _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
-            + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+        add_peer_target(self.root)
 
     def assert_remote_environment(self, *, copied: bool) -> None:
         rows = [cast(dict[str, object], json.loads(line))

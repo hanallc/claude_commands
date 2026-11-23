@@ -142,7 +142,7 @@ class MacIdleTests(NotificationGuardedTestCase):
 
     def pushed(self) -> bool:
         saved = machine_watch.read_notice(self.root / "machine-watch/mac.json")
-        return saved is not None and saved["sent"]
+        return not isinstance(saved, machine_watch.NoSavedNotice) and saved["sent"]
 
     def mark(self, name: str) -> bool:
         """Read the builds message mark from the idle reading and the push mark from the machine watch."""
@@ -763,7 +763,8 @@ done
             self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
             self.assertEqual(command[command.index("--key") + 1], "mac-idle-1000")
 
-    def test_one_outage_sends_one_push_across_no_waiting_steps_and_a_free_mac_reading(self) -> None:
+    def test_one_push_goes_across_no_waiting_steps_and_a_free_mac_reading_starts_a_new_outage(self) -> None:
+        """A free Mac with waiting steps is a message outage, so a later unreachable reading pushes again."""
         def saved() -> tuple[str, str, int, bool]:
             alert = mac_idle.read_record(self.paths.state / "alert.json")
             return (str(alert["state"]), str(alert["cause"]), cast(int, alert["waiting"]), self.pushed())
@@ -779,12 +780,13 @@ done
             self.assertEqual(saved(), ("unreachable", "", 0, True))
             self.step()
             (self.paths.mac_state / "unreachable_until").unlink()
+            push.assert_called_once()
             self.watch(1720)
-            self.assertEqual(saved(), ("idle", "free", 1, True))
+            self.assertEqual(saved(), ("idle", "free", 1, False))
             self.unreachable()
             self.watch(1780)
             self.assertEqual(saved(), ("unreachable", "", 1, True))
-        push.assert_called_once()
+        self.assertEqual(push.call_count, 2)
 
     def test_parked_app_claim_alert_names_holder_and_never_repairs(self) -> None:
         self.waiting_steps(7)

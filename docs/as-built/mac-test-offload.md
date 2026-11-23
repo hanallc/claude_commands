@@ -207,12 +207,15 @@ The unreadable state sends no message or phone push.
 The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
 It reads the saved alert of the same pass.
 The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
-A free Mac or an idle claim with waiting steps sends no phone push. After 600 s of waiting, the machine watch sends one message to bob and the builds showrunner.
-A block or a disk exclusion sends no phone push.
+A free Mac, an idle claim or a disk exclusion with waiting steps sends no phone push.
+`mac_idle` counts a waiting step only after `alert_seconds`.
+The machine watch sends one message to bob and the builds showrunner 600 s after it first sees the waiting steps.
+A block sends no phone push.
 These states keep the message to builds.
 A Mac that the user turned off sends no phone push: a Mac block, `offload=off` or `enabled.mac=off`.
 `mac_test.machine_off_on_purpose` holds this one rule for every outage notice and takes any target name.
 Each target reads `enabled.<machine>` in `build_targets.conf`.
+The local target also reads the `/build:hold` holds in force. An unreadable hold state counts as in use.
 An SSH target also reads its block and one switch in its settings file: `offload` for a macOS target, `enabled` for another target.
 Only an explicit `off` counts. A missing `enabled.<machine>` key, an unusable value or an unreadable record counts as in use.
 A missing live settings file or a missing switch key reads the committed file, as the router does, so the committed `offload` value counts.
@@ -228,8 +231,9 @@ The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
 `mac_idle.push_retired` is the clear-check rule: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
 `mac_idle.py cleared` exits 0 on this rule, and the push stops its repeats.
-The machine watch removes its saved `sent` mark only for a Mac that is off on purpose or an outage that ended.
-Otherwise one outage sends one phone push, also across a pass with no waiting steps or a short free-Mac reading.
+The machine watch removes its saved `sent` mark only for a Mac that is off on purpose, an outage that ended, or a change of notice kind.
+Otherwise one outage sends one phone push, also across a pass with no waiting steps.
+A free-Mac reading with waiting steps is a message outage, so a later unreachable reading starts a new push outage.
 The machine watch reads the off-on-purpose state once per pass.
 The clear check retires the key, so the same `mac-idle-<since>` key pushes again when the Mac is in use again.
 The title is "Mac tests stopped".

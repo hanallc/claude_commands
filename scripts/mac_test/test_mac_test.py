@@ -3836,7 +3836,7 @@ class MachineOffOnPurposeTests(unittest.TestCase):
         state.mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root), "MAC_TEST_STATE_DIR": str(state),
-            "BUILD_TARGETS_STATE_DIR": str(self.root / "targets")})))
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "targets"), "BUILD_HOLD_DIR": str(self.root / "holds")})))
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         _ = write_config_fixture(self.root / "build_targets.conf")
         _ = write_config_fixture(self.root / "hana_aws.conf")
@@ -3853,6 +3853,20 @@ class MachineOffOnPurposeTests(unittest.TestCase):
                 _ = write_config_fixture(self.root / "build_targets.conf", f"enabled.{target}=off\n")
                 self.assertEqual(mac_test.machine_off_on_purpose(target),
                                  mac_test.OffOnPurpose(f"enabled.{target}=off"))
+
+    def test_a_natedev_hold_in_force_turns_off_only_the_local_target(self) -> None:
+        holds = self.root / "holds"
+        holds.mkdir()
+        _ = (holds / "research").write_text("2026-11-23T00:00:00Z image work\n")
+        self.assertEqual(mac_test.machine_off_on_purpose("natedev"),
+                         mac_test.OffOnPurpose("research holds it: image work"))
+        self.assertIs(mac_test.machine_off_on_purpose("hana-aws"), mac_test.MACHINE_IN_USE)
+        (holds / "research").unlink()
+        self.assertIs(mac_test.machine_off_on_purpose("natedev"), mac_test.MACHINE_IN_USE)
+        holds.rmdir()
+        _ = holds.write_text("not a folder\n")
+        # An unreadable hold state counts as in use.
+        self.assertIs(mac_test.machine_off_on_purpose("natedev"), mac_test.MACHINE_IN_USE)
 
     def test_the_gpu_route_switch_turns_off_only_the_gpu_target(self) -> None:
         cloud_gate_conf = self.root / "cloud_gate.conf"
