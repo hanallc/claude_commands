@@ -933,14 +933,21 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.read("cargo", "build"), [])
         self.assertEqual(self.start("cargo", "build"), system)
 
-    def test_the_installed_wrapper_stays_the_start_file_with_no_next_match_or_a_clean_word(self) -> None:
+    def test_the_installed_wrapper_stays_the_start_file_with_no_next_match(self) -> None:
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
         self.assertEqual(self.read("cargo", "build"), [self.bin / "cargo"])
-        _ = self.next_cargo()
-        for argv in (("cargo", "clean"), ("cargo", "+nightly", "clean", "-p", "x")):
-            with self.subTest(argv=argv):
-                self.assertEqual(self.read(*argv), [self.bin / "cargo"])
-                self.assertEqual(self.start(*argv), self.bin / "cargo")
+
+    def test_a_clean_word_keeps_the_installed_wrapper_and_is_refused_before_the_model_call(self) -> None:
+        self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
+        for next_match in (False, True):
+            if next_match:
+                _ = self.next_cargo()
+            for argv in (("cargo", "clean"), ("cargo", "+nightly", "clean", "-p", "x")):
+                with self.subTest(argv=argv, next_match=next_match):
+                    self.assertEqual(self.start(*argv), self.bin / "cargo")
+                    with self.assertRaisesRegex(Refused, re.escape(hand_made.CLEAN_REFUSAL)):
+                        _ = self.read(*argv)
 
     def test_each_link_to_the_installed_wrapper_and_a_match_with_no_execute_bit_are_skipped(self) -> None:
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
@@ -960,13 +967,15 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.read("cargo", "build"), [self.bin / "cargo"])
         self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
 
-    def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_as_a_program_file(self) -> None:
+    def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_and_is_refused(self) -> None:
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
         _ = self.next_cargo()
         checker = hand_made_limit.CHECKER
         start = self.start("cargo", "build", repo=checker)
         self.assertEqual(start, self.bin / "cargo")
-        self.assertEqual(hand_made.program_files(("cargo", "build"), checker, start), (self.bin / "cargo",))
+        written = f"the real path of {start} is in {checker}, which the run writes"
+        with self.assertRaisesRegex(Refused, re.escape(written)):
+            _ = hand_made.checked_files(("cargo", "build"), checker, start, 65536)
 
     def test_a_later_cargo_word_reads_the_installed_wrapper_and_each_next_match(self) -> None:
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
@@ -1011,7 +1020,7 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(hand_made.run_start_change(request, start, files, fields), "")
         self.cargo_on_path(self.unit_wrapper())
         self.assertEqual(hand_made.run_start_change(request, start, files, fields),
-                         f"the start file changed after the check: {self.bin / 'cargo'}")
+                         f"the start file changed after the check: {script} -> {self.bin / 'cargo'}")
 
     def test_a_start_file_that_changes_after_the_check_refuses_the_run(self) -> None:
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
@@ -1027,7 +1036,18 @@ class ProgramFileTests(unittest.TestCase):
         (other / "cargo").symlink_to(os.path.realpath(shutil.which("git") or "git"))
         os.environ["PATH"] = os.pathsep.join(map(str, (self.bin, other, system.parent)))
         self.assertEqual(hand_made.run_start_change(request, start, files, hand_made.new_fields(request)),
-                         f"the start file changed after the check: {other / 'cargo'}")
+                         f"the start file changed after the check: {system} -> {other / 'cargo'}")
+
+    def test_a_slash_start_file_or_a_later_path_match_in_a_path_that_the_run_writes_is_refused(self) -> None:
+        output = self.root / "build"
+        tool = self.compiled(output / "release" / "tool")
+        os.environ["CARGO_TARGET_DIR"] = str(output)
+        written = f"is in {output}, which the run writes"
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {tool} {written}")):
+            _ = self.read(str(tool), "--version")
+        (self.bin / "helper").symlink_to(tool)
+        with self.assertRaisesRegex(Refused, re.escape(f"the real path of {self.bin / 'helper'} {written}")):
+            _ = self.read("timeout", "60", "helper")
 
     def test_python_module_runs_are_refused(self) -> None:
         for argv in (("python3", "-m", "scripts.x"), ("env", "python3", "-Bm", "x"), ("uv", "run", "python", "-m", "x"),

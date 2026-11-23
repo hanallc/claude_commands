@@ -78,6 +78,10 @@ INSTALLED_WRAPPER = hand_made_limit.CHECKER / "scripts" / hand_made_limit.BUILD_
 WRITE_REFUSAL = ("the real path of {path} is in {bind}, which the run writes, so a run can change a program that a "
                  + "later run starts; use a program and a PATH folder outside the checkout, the build output folder, "
                  + "SCCACHE_DIR and the cargo registry and git folders")
+# The cargo word that keeps the installed wrapper as the start file; its clean rule needs files that the limit hides.
+CLEAN = "clean"
+CLEAN_REFUSAL = ("a hand made run cannot clean the build output: the build-hold cargo wrapper cleans it with files "
+                 + "that the read limit hides; run a normal cargo clean outside hand made")
 MAIN_FOLDER_REFUSAL = ("a word names a folder with a __main__ file, such as __main__.py or __main__.pyc: python runs "
                        + "that file, and the check cannot read it; run the program file by its path")
 RESPONSE_REFUSAL = ("the word {word} names the response file {path}; it gives the tool words that the check does not "
@@ -191,14 +195,14 @@ def exec_path(argv: Sequence[str], repo: Path) -> Path | None:
 
     For cargo, when the first match is the installed build-hold wrapper, the file is the next match that is
     not the wrapper, as the wrapper starts it in a builds.slice scope. With no next match, it is the wrapper.
-    A later word clean keeps the wrapper: its clean rule runs before the scope check and keeps the assigned
-    build folder.
+    A later word clean keeps the wrapper, so that the real cargo clean does not remove the assigned build
+    folder; checked_files then refuses the run with CLEAN_REFUSAL.
     """
     name = argv[0]
     if "/" in name:
         return repo / name
     matches = path_programs(name)
-    if (name == INSTALLED_WRAPPER.name and "clean" not in argv[1:] and matches
+    if (name == INSTALLED_WRAPPER.name and CLEAN not in argv[1:] and matches
             and installed_wrapper(matches[0], repo)):
         matches = [path for path in matches if not installed_wrapper(path, repo)] or matches
     return next(iter(matches), None)
@@ -274,17 +278,21 @@ def checkout_file(path: Path, repo: Path) -> bool:
     return in_checkout(path, repo) or in_checkout(Path(os.path.realpath(path)), repo)
 
 
-def write_refusal(path: Path, repo: Path) -> str | None:
-    """The refusal of a path whose real path is in a path that the run writes, or None. A later run can start a
-    compiled file there that the check does not read. The limit binds only a bindable path, so only such a path
-    is a path that the run writes."""
-    real = Path(os.path.realpath(path))
+def written_paths(repo: Path) -> list[Path]:
+    """The paths that the run writes on natedev. The limit binds only a bindable path, so only such a path is
+    one."""
     environment = program_environment()
     home = hand_made_limit.home_folder(environment)
-    for bind in hand_made_limit.write_binds(repo, environment):
-        if hand_made_limit.bindable(bind, home, read=False) and real.is_relative_to(os.path.normpath(bind)):
-            return WRITE_REFUSAL.format(path=path, bind=bind)
-    return None
+    return [Path(os.path.normpath(bind)) for bind in hand_made_limit.write_binds(repo, environment)
+            if hand_made_limit.bindable(bind, home, read=False)]
+
+
+def write_refusal(path: Path, written: Sequence[Path]) -> str | None:
+    """The refusal of a path whose real path is in a path that the run writes, or None. A later run can start a
+    compiled file there that the check does not read."""
+    real = Path(os.path.realpath(path))
+    bind = next((bind for bind in written if real.is_relative_to(bind)), None)
+    return None if bind is None else WRITE_REFUSAL.format(path=path, bind=bind)
 
 
 def option_names(words: Sequence[str], value_letters: str,
@@ -504,8 +512,11 @@ def folder_refusal(argv: Sequence[str], repo: Path) -> str | None:
 
 def checked_files(argv: Sequence[str], repo: Path, start: Path | None, max_bytes: int) -> tuple[CheckedFile, ...]:
     """Read each program file of the command, with the start file of the first word; max_bytes limits the sum
-    of all files. A PATH entry, or a start file from PATH, whose real path is in a path that the run writes is
-    refused."""
+    of all files.
+
+    A PATH entry, a start file from PATH, a start file with a slash that is not a checkout file, or a PATH match
+    of a later word, whose real path is in a path that the run writes, is refused. The installed wrapper as the
+    start file with a later word clean is refused too."""
     if runs_module(argv):
         raise Refused("python -m and uv run -m run a module file that the check cannot read; run the module file "
                       + "by its path, and put -- before a uv run command that follows a uv option")
@@ -523,11 +534,15 @@ def checked_files(argv: Sequence[str], repo: Path, start: Path | None, max_bytes
             if not entry or not os.path.isabs(entry) or in_checkout(Path(entry).resolve(), repo):
                 raise Refused(f"{name} has the entry {entry!r}: an empty, relative or checkout entry makes tools "
                               + "load files from the checkout that the check does not read; remove the entry")
-    from_path = [] if start is None or "/" in argv[0] else [start]
-    for path in [*map(Path, os.get_exec_path()), *from_path]:
-        refusal = write_refusal(path, repo)
+    starts = [] if start is None or ("/" in argv[0] and checkout_file(start, repo)) else [start]
+    later = [match for word in argv[1:] if "/" not in word for match in path_programs(word, executable=False)]
+    written = written_paths(repo)
+    for path in [*map(Path, os.get_exec_path()), *starts, *later]:
+        refusal = write_refusal(path, written)
         if refusal is not None:
             raise Refused(refusal)
+    if start is not None and installed_wrapper(start, repo) and CLEAN in argv[1:]:
+        raise Refused(CLEAN_REFUSAL)
     files: list[CheckedFile] = []
     left = max_bytes
     paths = program_files(argv, repo, start)
@@ -830,7 +845,8 @@ def run_start_change(request: Request, start: Path | None, files: Sequence[Check
     """Find the start file again, read each checked file again, find the program files again and check the
     folder words again; name the first change."""
     found_start = exec_path(request.argv, request.repo)
-    changed = "" if found_start == start else f"the start file changed after the check: {found_start or 'none'}"
+    changed = ("" if found_start == start
+               else f"the start file changed after the check: {start or 'none'} -> {found_start or 'none'}")
     for item, row in zip(files, fields["files"]):
         try:
             row["sha256_run"] = file_sha256(item.path)
