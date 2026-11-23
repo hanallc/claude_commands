@@ -1166,11 +1166,12 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                         lookup.assert_called_once_with(recipient)
                     with build_hold.release_lock() as held:
                         record, = build_hold.recorded_releases(held)
-                    self.assertEqual(record.state, "completed" if code == 0 else "pending")
+                    pending = code > 1
+                    self.assertEqual(record.state, "pending" if pending else "completed")
                     notices = record.intent["notices"]
                     assert notices["kind"] == "cycle"
                     self.assertEqual(notices["recipients"], {recipient: "worker"})
-                    if code != 0:
+                    if pending:
                         with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/worker/socket")),
                               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""))):
                             _ = build_hold.release_cycle(folder, "holder", resume=True)
