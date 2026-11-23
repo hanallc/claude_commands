@@ -517,6 +517,8 @@ class RowQueueNotes(CallNotes):
     mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
     guest_run: NotRequired[ConfirmedGuestRun]
+    # A guest run whose gate consumed its launch permission before the queue confirmed the guest attempt.
+    guest_unconfirmed: NotRequired[Literal[True]]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
@@ -532,7 +534,7 @@ class PageOwnerLabels(TypedDict):
     worker: str
 
 
-# The machine names that rows show in the Target column, and the words for them in "can run on" text.
+# The machine names that rows show in the Machine column, and the words for them in "can run on" text.
 LOCAL_TARGET = "natedev"
 MAC_TARGET = "mac"
 TARGET_WORDS = {MAC_TARGET: "Mac"}
@@ -618,6 +620,12 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
 NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
 
 
+def ci_target_notes(machine: str) -> TargetNotes:
+    """Give a waiting CI step the host as its one target: the CI runners run there, as the running CI row shows."""
+    named = RunsOn((machine,))
+    return {"runs_on": named.text(), "targets": list(named.targets), "mac_text": ""}
+
+
 def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
     """Use the placement candidates for a route that can place the step in the Mac Linux guest."""
     # Older queue readings have no placement candidates.
@@ -654,6 +662,14 @@ def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRu
     if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
         return {"target": MAC_LINUX_TARGET, "attempt": attempt}
     return None
+
+
+def unconfirmed_guest_run(step: admission_records.RunningStep) -> bool:
+    """Tell whether a guest gate holds its consumed launch permission and the queue has not confirmed the attempt.
+
+    The queue sets started_at of a remote step from the consume time, so a consumed permission gives a start time.
+    """
+    return step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0 and confirmed_guest_run(step) is None
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -805,7 +821,6 @@ class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
-    slot: NotRequired[int | Literal["—"]]
     tokens: NotRequired[int]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
@@ -970,6 +985,11 @@ class FeedStaff:
             member = self.worktree_owner(machine, folder)
         return self.labels.get(member.current_session) if member is not None else None
 
+    def member_name(self, reference: str) -> str:
+        """The staff name of a fixed member id or its current conversation, or "" for an unknown session."""
+        member = self.members.by_member_reference(reference) if reference else None
+        return member.name if member is not None else ""
+
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
         member = self.members.by_id(staff_id) if staff_id else None
         return self.labels.get(member.current_session) if member is not None else None
@@ -1024,6 +1044,13 @@ class MemoryWaitRow(WaitRow):
     job_start: NotRequired[str]
 
 
+class MacStarter(TypedDict):
+    """Who started a Mac build with no unit, and its step. The page shows them as a unit row shows its unit."""
+
+    name: str
+    step: str
+
+
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     kind: Literal["mac-build"]
     repository: str
@@ -1038,9 +1065,9 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     stage: queue_view.MacBuildStage
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
-    slot: int | Literal["—"]
     slot_folder: NotRequired[str]
     slot_machine: NotRequired[str]
+    started_by: NotRequired[MacStarter]
 
 
 class MacReadingUnavailableRow(RowQueueNotes, NamedQueueRow):
@@ -1145,6 +1172,7 @@ class SwapTotals(TypedDict):
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
+    unit_open: NotRequired[str]
     ok: bool
     read_at: float
     render_seconds: float
@@ -1517,10 +1545,6 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
         return "—"
 
 
-class SlotNotes(SlotPlace):
-    slot: int | Literal["—"]
-
-
 def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
     """The slot folder and machine of a step in slot number; empty for a step in no slot."""
     if number == "—":
@@ -1529,16 +1553,32 @@ def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotP
     return {"slot_folder": key, "slot_machine": machine}
 
 
-def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
-    """A run's slot number, and the slot folder and machine when the run is in a slot."""
-    number = build_slot_number(folder, machine, roots, home=home)
-    return {"slot": number, **slot_place(number, folder, machine)}
+def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotPlace:
+    """The slot folder and machine when the run is in a slot; the Disks page finds the run by them."""
+    return slot_place(build_slot_number(folder, machine, roots, home=home), folder, machine)
+
+
+def mac_launcher_name(build: queue_view.MacBuild, members: FeedStaff) -> str:
+    """Name who started a Mac build: hana CI, a Claude session's staff name, or the launcher; "" for an old reading."""
+    if build.origin is queue_view.MacBuildOrigin.CI:
+        return QueueKind.CI.value
+    match build.launcher:
+        case queue_view.MacLauncher.CLAUDE:
+            return members.member_name(build.launcher_session) or "Claude session"
+        case queue_view.MacLauncher.CI:
+            return QueueKind.CI.value
+        case queue_view.MacLauncher.RUST_ANALYZER | queue_view.MacLauncher.TERMINAL:
+            return build.launcher.value
+        case queue_view.MacLauncher.UNKNOWN:
+            return ""
+        case _:
+            assert_never(build.launcher)
 
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
                  slot_roots: Mapping[str, str], slot_machine: str,
-                 placed_step: admission_records.RunningStep | None = None) -> MacBuildRow:
+                 placed_step: admission_records.RunningStep | None = None, launcher: str = "") -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
@@ -1555,7 +1595,8 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
         public_owner_name(identity.session, build.session))
     # A placed run keeps the owner that its queue request stored.
     stored_unit, stored_name = (placed_step.unit, placed_step.session_name) if placed_step is not None else ("", "")
-    who = QueueKind.CI.value if ci else owner_name(identity, stored_unit, stored_name, caller, package or build.repository)
+    who = QueueKind.CI.value if ci else owner_name(identity, stored_unit, stored_name, caller, launcher,
+                                                   package or build.repository)
     name = QueueRowName.owned(who, shown_step) if isinstance(shown_step, QueueRowName) else title_step
     display_name = name.with_mac_status(shown_gate)
     parts = (staff_names.row_parts(who, shown_step, identity.unit) if isinstance(shown_step, QueueRowName)
@@ -1583,6 +1624,9 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
                          if isinstance(build.counter, progress.ProgressCounter) else
                          {"kind": "NoProgress", "reason": build.counter.reason})}
+    # A row with no unit starts with who started it, as a unit row starts with its unit.
+    if launcher and not isinstance(unit, StaffUnitName) and not stored_unit:
+        row["started_by"] = {"name": who, "step": shown_step if isinstance(shown_step, QueueRowName) else ""}
     if placement_notes is not None:
         row["runs_on"] = placement_notes["runs_on"]
         row["targets"] = placement_notes["targets"]
@@ -2938,7 +2982,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "state": "", "pid": pid, **run_notes(step_run), "detail": detail, "used": use,
                      **(build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                         home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))
-                        if step is not None else SlotNotes(slot="—")),
+                        if step is not None else SlotPlace()),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": step.started_at if step is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
@@ -2967,6 +3011,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
+            unconfirmed = unconfirmed_guest_run(step)
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
@@ -2989,7 +3034,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": guest["target"] if guest else admission_records.execution_host(step, machine),
+                "machine": MAC_LINUX_TARGET if guest or unconfirmed else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(local_job(step), names, step=step.step, verify=step.verify,
@@ -3004,6 +3049,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 remote_row["guest_run"] = guest
                 if step.mac_placement:
                     guest_placements.add(step.mac_placement)
+            elif unconfirmed:
+                remote_row["guest_unconfirmed"] = True
             walk.append(remote_row)
             continue
         service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -3127,7 +3174,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(named, NoNamedStep):
             continue
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
-            NO_TARGET_NOTES if ci_label else step_target_notes(waiter, routes))
+            ci_target_notes(machine) if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
@@ -3175,8 +3222,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
                 claim or current or unit_labels.UnitLabels(""))
             placed = mac_steps.get(build.gate_placement) if build.gate_label is queue_view.MacGateLabel.PLACEMENT else None
-            mac_row = mac_work_row(build, mac_reading, identity,
-                                   names=names, slot_roots=slot_roots, slot_machine=mac_machine, placed_step=placed)
+            mac_row = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
+                                   slot_machine=mac_machine, placed_step=placed,
+                                   launcher=mac_launcher_name(build, members))
             work_rows.append(mac_row)
     work_rows.sort(key=lambda row: row["started_at"])
     model = queue_view.QueueModel(parsed, labels, names=names)
@@ -3296,7 +3344,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = "unavailable: " + pressure.reason
     page: MemoryPage = {
         "colors": configuration.colors,
-        "staff_names": staff_display.registry(),
+        "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
         "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,

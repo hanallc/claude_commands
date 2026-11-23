@@ -21,6 +21,7 @@ from unittest import mock
 from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
 from scripts.build_queue.queue_place import PopenArguments
+from scripts.build_targets import mac_linux
 from scripts.buildlog import store
 from scripts.lib import build_folder_lock, build_folders
 from scripts.production import hand_made, hand_made_limit
@@ -103,7 +104,7 @@ class LimitTests(unittest.TestCase):
                 os.close(status_write)
             output, _ = process.communicate(timeout=300)
             status = process.returncode
-            return status, output.decode(errors="replace"), not hand_made_limit.setup_failed(status, status_read)
+            return status, output.decode(errors="replace"), not mac_linux.setup_failed(status, status_read)
         finally:
             os.close(status_read)
 
@@ -257,11 +258,11 @@ class LimitTests(unittest.TestCase):
                                                    {"HOME": str(home), "SCCACHE_DIR": str(folder)}, 3)
                 self.assertNotIn(str(folder), [words[index + 1] for index, word in enumerate(words) if word == "--bind"])
         # A read only bind can have a link into /nix/store, as ~/.cargo/config.toml has.
-        self.assertTrue(hand_made_limit.bindable(Path("/run/current-system/sw/bin/sh"), home, read=True))
-        self.assertFalse(hand_made_limit.bindable(Path("/run/current-system/sw/bin/sh"), home, read=False))
+        self.assertTrue(mac_linux.bindable(Path("/run/current-system/sw/bin/sh"), home, read=True))
+        self.assertFalse(mac_linux.bindable(Path("/run/current-system/sw/bin/sh"), home, read=False))
 
     def test_an_entry_of_a_system_folder_that_root_does_not_own_is_hidden(self) -> None:
-        entry = next(hand_made_limit.unowned(Path("/etc")), None)
+        entry = next(mac_linux.unowned(Path("/etc")), None)
         if entry is None:
             self.skipTest("each entry of /etc is owned by root")
         status, output, _ = self.limited(["sh", "-c", f"ls -A {entry}; cat {entry} 2>/dev/null; echo end"])
@@ -318,7 +319,7 @@ class NatedevRunTests(unittest.TestCase):
         run = hand_made.NatedevRun(place, self.program, self.root / "tmp")
         with mock.patch.object(shutil, "which", return_value=None), self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(io.BytesIO(), None))
-        self.assertEqual(str(caught.exception), hand_made_limit.BWRAP_MISSING)
+        self.assertEqual(str(caught.exception), mac_linux.BWRAP_MISSING)
         self.assertEqual((place.started, run.started_at), ([], None))
 
     def test_a_limit_that_bwrap_cannot_set_up_starts_nothing_and_names_bwrap(self) -> None:
@@ -334,7 +335,7 @@ class NatedevRunTests(unittest.TestCase):
         run = hand_made.NatedevRun(place, self.program, self.root / "tmp")
         with mock.patch.object(hand_made_limit, "limit_argv", broken), self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(output, None))
-        self.assertEqual(str(caught.exception), hand_made_limit.BWRAP_FAILED.format(status=1))
+        self.assertEqual(str(caught.exception), mac_linux.BWRAP_FAILED.format(status=1))
         self.assertIn(b"bwrap", output.getvalue())
         self.assertIsNone(run.started_at)
         self.assertFalse((self.program.repo / "ran").exists())
