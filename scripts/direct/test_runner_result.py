@@ -54,6 +54,14 @@ class RunnerResultTests(unittest.TestCase):
                 self.write(text)
                 self.assertEqual(read_result(self.path, 75, True), expected)
 
+    def test_mac_prelaunch_failure_requires_the_exact_history_refusal(self) -> None:
+        for reason, status in (("busy", 1), ("busy", 11), ("busy", 15), ("history_key_unavailable", 1)):
+            with self.subTest(reason=reason, status=status):
+                self.write(f"mac=prelaunch_failed\nreason={reason}\n")
+                self.assertIsInstance(read_result(self.path, status, True), UnusableRunnerResult)
+        self.write("mac=prelaunch_failed\nreason=history_key_unavailable\n")
+        self.assertEqual(read_result(self.path, 15, True), UsableRunnerResult("prelaunch_failed", "history_key_unavailable"))
+
     def test_invalid_text_is_unusable(self) -> None:
         self.write("invalid\n")
         self.assertIsInstance(read_result(self.path, 75, True), UnusableRunnerResult)

@@ -18,7 +18,7 @@ Staff records a worker's current role through `KnownWorkerRole` and `set_worker_
 The agents log keeps dated attribution for usage reports, not the current role.
 An addressed reviewer's lens comes from dispatch evidence.
 
-**Names that can change.** `config/names.toml` has `[jobs]` and `[audiences]`. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit. `scripts/lib/names.py` is the one loader: `load_names(path)` returns `Names` or a `NamesError`, and `runtime_names()` loads once per process. Record keys, addresses, session names and pane labels keep the key.
+**Names that can change.** `config/names.toml` has `[jobs]` and `[audiences]`. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit. `scripts/lib/names.py` is the one loader: `load_names(path)` returns `Names` or a `NamesError`, and `runtime_names()` loads again only when the `config/names.toml` file stamp changes. It reports a load error once per command. Record keys, addresses, session names and pane labels keep the key.
 
 **Shown names.** `ShownName` renders `production · unit · job` in roster output, broadcast lines and Codex thread titles. `send.py` resolves the shown sender once, on the sending machine. A herdr tab title is the session name, with no role word and no production.
 

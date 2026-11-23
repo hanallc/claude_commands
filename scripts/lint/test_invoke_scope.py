@@ -18,7 +18,7 @@ from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
 from scripts.buildlog.cgroup_test_support import write_cgroup
@@ -38,8 +38,9 @@ COPY_LEASE_DESCRIPTOR_VARIABLES = (
 
 
 def invoke_test_environment() -> dict[str, str]:
-    """Omit the caller's lease numbers because the fixture opens its own descriptors."""
-    return {name: value for name, value in os.environ.items() if name not in COPY_LEASE_DESCRIPTOR_VARIABLES}
+    """Omit the parent reservation and lease numbers because the fixture opens its own descriptors."""
+    return {name: value for name, value in memory_gate_shell_environment().items()
+            if name not in COPY_LEASE_DESCRIPTOR_VARIABLES}
 
 
 class VerifyTemporaryParentTests(NixFixture):
@@ -486,7 +487,7 @@ buildlog_sample_anon "$1" "$2" "$$"
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ,
+                env={**invoke_test_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "STAFF_FILE": str(root / "staff.json"),
@@ -581,7 +582,8 @@ sweep_after_step test-step
             with patch.dict(os.environ, dict.fromkeys(stale_lease_variables, str(writer))):
                 caller_environment = invoke_test_environment()
             process = subprocess.Popen(
-                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
+                ["bash", "-c", 'source "$1"; exec 74>&2; VERIFY_EXIT_STDERR_FD=74; '
+                 + SWEEP_STAND_IN + "; sweep_after_step test-step", "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**caller_environment, **environment, "HOME": directory, "TMPDIR": directory,

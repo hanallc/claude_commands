@@ -308,7 +308,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step: nextest needs 0.4 GiB", output.getvalue())
         self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
@@ -562,7 +562,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
 
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
-            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -56,6 +57,7 @@ from scripts.agents.test_support import write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -389,11 +391,11 @@ class AccountsTests(unittest.TestCase):
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex3",
-            "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
+            "why": "weekly refusal", "scope": "group", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
         moves.append_move(request)
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-a", run="run-one"))
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-b", run="run-one"))
-        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
+        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude", "scope": "session"}
         moves.append_move(failed)
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
             kind="failed", reason="still on claude1"))
@@ -1198,7 +1200,7 @@ class AccountsTests(unittest.TestCase):
                      agent_session=herdr.ReportedAgentSession("idle-thread")),
                   herdr.AgentOccupant(pane_id="w1:p3", agent="codex", agent_status=herdr.AgentStatus.STARTING,
                      agent_session=herdr.ReportedAgentSession("starting-thread"))]
-        with (patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"),
+        with (patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN),
               patch.object(herdr.Herdr, "agents", return_value=agents) as activity,
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({
                   "busy-thread": (990,), "idle-thread": (991,), "starting-thread": (992,)}, ())) as conversations):
@@ -7630,9 +7632,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 journal_snapshot: list[moves.MoveEntry] = []
 
                 def request(identity: str, target_label: str) -> moves.RequestedMove:
-                    entry = moves.RequestedMove(kind="requested", at="2026-11-10T22:00:00Z",
-                        tool="codex", subject="workers", move_id=identity, cause="auto", why="auto: " + identity,
-                        **{"from": "codex2", "to": target_label}, window="weekly")
+                    entry: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": "2026-11-10T22:00:00Z",
+                        "tool": "codex", "subject": "workers", "move_id": identity, "cause": "auto", "why": "auto: " + identity,
+                        "from": "codex2", "to": target_label, "window": "weekly"}
                     moves.append_move(entry)
                     return entry
 
@@ -7699,9 +7701,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 reading = refusals.FreshReading(refusals.ReadingWindow(weekly_left, refusals.KnownReset(now + timedelta(days=2)), now),
                                                 refusals.NoWindow(), "200")
                 _ = accounts.accounts_config_file().write_text('{"workers": "codex2"}\n')
-                moves.append_move(moves.RequestedMove(kind="requested", at=now.isoformat(), tool="codex", subject="workers",
-                    move_id="request-" + case, cause="refusal", why="codex2 refused",
-                    **{"from": "codex2", "to": "codex1"}, window="weekly"))
+                moves.append_move({"kind": "requested", "scope": "group", "at": now.isoformat(), "tool": "codex",
+                    "subject": "workers", "move_id": "request-" + case, "cause": "refusal", "why": "codex2 refused",
+                    "from": "codex2", "to": "codex1", "window": "weekly"})
                 calls: list[staff.StaffId] = []
 
                 def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
@@ -7908,6 +7910,48 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
+    def test_workers_swap_records_producer_group_scope_and_retry_keeps_target(self) -> None:
+        source, _ = self.workers_fixture()
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
+            doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+            worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+        identity = str(producer.current_session)
+
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(stop_resume, "_read_move_source", return_value=stop_resume.StoppedMoveSource()),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(identity)),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_alert_pending_moves"),
+              patch.object(stop_resume, "_resume_move", side_effect=[
+                  stop_results.ResumeFailed(identity, "fixture resume failed"),
+                  stop_results.ClaudeUp(identity, "w1:p1", "codex1"),
+              ]) as resume,
+              redirect_stdout(io.StringIO())):
+            swapped = accounts.swap("workers", "codex1")
+            assert isinstance(swapped, accounts.WorkersSwapStarted)
+            self.assertEqual(swapped.outcomes, (stop_results.ResumePending(identity, "codex1", "fixture resume failed"),))
+            requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+            self.assertEqual([(entry["subject"], entry["to"], entry.get("scope")) for entry in requests],
+                             [(f"{identity}: {producer.name}", "codex1", "group")])
+            pending = moves.read_latest_request(identity)
+            assert isinstance(pending, moves.LatestMoveRequest)
+            self.assertEqual(pending.target, "codex1")
+
+            role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture swap", datetime.now(timezone.utc).isoformat()))
+            with stop_resume.detached_moves(), patch.object(stop_resume, "_detach") as detach:
+                self.assertEqual(stop_resume.main(["retry", pending.request_id]), 0)
+            detach.assert_called_once()
+            command = cast(list[str], detach.call_args.args[0])
+            self.assertEqual(stop_resume.main([command[0], "--log", str(self.root / "producer-move.log"), *command[1:]]), 0)
+
+        self.assertEqual([entry.args[1] for entry in resume.call_args_list], ["codex1", "codex1"])
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([(entry["to"], entry.get("scope")) for entry in requests], [("codex1", "group"), ("codex1", "group")])
+        self.assertEqual(moves.pending_move_requests(), ())
+
     def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         for missing_settings in (False, True):
             with self.subTest(missing_settings=missing_settings):
@@ -7964,7 +8008,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in stopped.call_args_list}, {failed.id, pending.id})
                 self.assertEqual(stopped.call_count, 2)
                 producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="by hand",
-                                                     cause="by hand", source_accounts={})
+                                                     cause="by hand", source_accounts={},
+                                                     intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT)
                 self.assertEqual(observed, [target, target])
                 self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
                 lines = output.splitlines()
@@ -8341,9 +8386,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def setUp(self) -> None:
         from scripts.production.staff_test_support import StaffTestCase
 
-        self.fixture = StaffTestCase()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.agents import restart
@@ -8788,6 +8831,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         with live_detached_run(self.run_dir, kept):
             moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
         self.assertIsInstance(moved, stop_results.ClaudeUp)
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested" and entry["subject"] == kept.id]
+        self.assertEqual([entry.get("scope") for entry in requests], ["group"])
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
         self.assertEqual(self.world.stops, [kept.current_session])
@@ -9286,7 +9331,7 @@ class PickerTests(unittest.TestCase):
         self.codex("default", "worker@example.invalid")
         common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="workers", move_id="account-move")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex2",
-            "why": "manual", "window": "unknown", "cause": "by hand"}
+            "why": "manual", "scope": "group", "window": "unknown", "cause": "by hand"}
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",

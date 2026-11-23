@@ -545,6 +545,16 @@ class AwsReportTests(MeasurementFixture):
         self.assertNotIn("AWS report data synchronized at", output)
         self.assertNotIn("AWS report data never synchronized", output)
 
+    def test_natedev_day_report_names_no_peer_for_the_mac_linux_guest(self) -> None:
+        path = self.root / 'build_targets.conf'
+        _ = path.write_text(path.read_text().replace('targets=natedev,mac', 'targets=natedev,mac,mac-linux')
+            + 'kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n')
+        _ = (self.root / 'mac_linux.conf').write_text('ssh.hops=mac linux-guest\nguest.user=gate-runner\n')
+        self.exchange("mac", ok=True, at=NOW - 60)
+        output = self.render()
+        self.assertIn("current", self.peer_line(output, "mac"))
+        self.assertNotIn("mac-linux (", output)
+
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
         self.add_spare_peer()
         self.exchange("spare", ok=True, at=NOW - 120)

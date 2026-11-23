@@ -15,8 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
+from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
@@ -115,12 +117,21 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
 
 
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
+    locks = copies.COMMAND_LOCKS.get()
+    submitted = command
+    targets = gate_targets(command)
+    if targets:
+        scripts = Path(__file__).resolve().parents[1]
+        submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
+                     "--repo", str(folder.resolve()), "--targets", ",".join(targets),
+                     *(word for fd in locks for word in ("--lease-fd", str(fd))), "--", *command]
     try:
-        return subprocess.run(command, cwd=folder, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
+        return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:
         if raise_start_errors:
             raise
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
+
 
 # A nextest failure row: `FAIL [  12.2s] (1012/1067) <binary> <test>`.
 NEXTEST_FAIL = re.compile(r"^\s+FAIL \[[^]]*\] \([^)]*\) \S+ (\S+)\s*$", re.MULTILINE)
@@ -196,7 +207,7 @@ def split_base_red(red: RedCheckpointTests, base_steps: Sequence[CheckpointTestS
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_BASE_EXIT={result.returncode}\n")
             output.flush()
-            stop_cancelled_test(step.label, result, log)
+            stop_test_without_result(step, result, log)
             if test_passed(result):
                 unit.append(red_step)
             elif not red_step.names:
@@ -214,10 +225,13 @@ def red_labels(red: Sequence[RedStep]) -> str:
     return ", ".join(item.step.label + (f" ({', '.join(sorted(item.names))})" if item.names else "") for item in red)
 
 
-def stop_cancelled_test(name: str, result: subprocess.CompletedProcess[str], log: Path) -> None:
+def stop_test_without_result(step: CheckpointTestStep, result: subprocess.CompletedProcess[str], log: Path) -> None:
     if result.returncode == TREE_CHANGED_STATUS:
-        raise Stop("test", "cancelled", f"{name} cancelled because the tree changed; log {log}",
+        raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
+    if result.returncode == MAC_LINUX_PRELAUNCH_REFUSED_STATUS and command_program(step.command) in GATE_SCRIPTS:
+        raise Stop("test", "blocked", f"{step.label} could not complete placement. Log {log}",
+                   f"Check the gate placement in {log}.")
 
 
 def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, ...],
@@ -239,7 +253,7 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
-            stop_cancelled_test(step.label, result, log)
+            stop_test_without_result(step, result, log)
             if not test_passed(result):
                 output_text = result.stdout + result.stderr
                 names = red_names(step.command, output_text)
@@ -256,7 +270,7 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
             result = run_test_command(only_tests(command, tests) if alone else command, folder)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
-        stop_cancelled_test(name, result, log)
+        stop_test_without_result(step, result, log)
         package = name.removeprefix("package ")
         if test_passed(result) and (alone or package in flakes):
             note = (f"known flaky tests {', '.join(sorted(tests))}: red in {name}, green alone" if alone
