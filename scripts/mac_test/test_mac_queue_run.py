@@ -229,6 +229,30 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
             self.assertTrue(block.is_file())
 
+    def test_shot_of_the_block_holding_units_worker_starts_with_its_own_placement_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            named_run = root / "unit-run"
+            holder = fixture_runtime_id("queue-shot-holder")
+            environment = {**queue_fixture(root), "UNIT_RUN_DIR": str(named_run),
+                           "CLAUDE_CODE_SESSION_ID": "worker-session", "CODEX_THREAD_ID": "worker-thread"}
+            director = staff.StaffId(fixture_runtime_id("queue-shot-director"))
+            parent = staff.StaffRow(director, "showrunner", "fixture-director", staff.StaffRoot(),
+                                    current_session=director)
+            row = staff.StaffRow(staff.StaffId(fixture_runtime_id("queue-shot-unit")), "unit", "fixture-holder",
+                                 staff.ReportsTo(director), current_session=staff.StaffId(holder),
+                                 run=staff.OpenRun(named_run), unit_type=staff.UnitDetails("direct"))
+            _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot((parent, row)).encode())
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, session=holder)
+            with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "shot")[3:]]), 0)
+            placed = self.events(root)[0]
+            self.assertEqual(placed[placed.index("--session-id") + 1], "worker-thread")
+            self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+
     def test_block_during_recovery_prevents_prepare_and_removes_retry_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -306,6 +330,50 @@ if sys.argv[1] == "prepare":
                 self.assertFalse((root / "remote").exists())
                 self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
                 self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+
+    def check_kind_waits_for_a_block_after_its_placement(self, kind: str) -> None:
+        """A block or an unreadable block record that appears at placement keeps the kind waiting."""
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                pending = root / "block-on-placement.json"
+                if unreadable:
+                    _ = pending.write_text("damaged\n")
+                    expected = f"Waiting for a readable Mac block record: {block}"
+                else:
+                    self.write_block(pending)
+                    expected = "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac"
+                waits = 0
+
+                def release_block() -> None:
+                    nonlocal waits
+                    waits += 1
+                    self.assertTrue(block.is_file())
+                    self.assertFalse((root / "remote").exists())
+                    self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                    block.unlink()
+
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_block),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(self.command(root, kind)[3:]), 0)
+                self.assertEqual(waits, 1)
+                self.assertEqual(output.getvalue().splitlines(), [expected, "Mac output", "mac_exit=0"])
+                self.assertTrue((root / "remote").is_file())
+                self.assertEqual([event[0] for event in self.events(root)],
+                                 ["place-step", "cancel-placement", "place-step", "cancel-placement"])
+
+    def test_shot_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("shot")
+
+    def test_install_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("install")
+
+    def test_probe_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("probe")
 
     def test_expired_block_lifts_without_the_watcher_and_preserves_a_failed_ci_restore(self) -> None:
         for restore_fails in (False, True):

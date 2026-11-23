@@ -59,6 +59,7 @@ from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import pass_record, progress_history
 from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
 from scripts.lib.script_envelope import script_prompt
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
@@ -94,7 +95,7 @@ class RestartTestCase(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(home), "CODEX_HOME": str(home / ".codex"),
             "HERDR_PROC": str(home / "proc"), "ROSTER_RUN_ROOT": str(home / "runs"),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "UNIT_RUN_DIR": str(home / "run"), "PLAN_DELEGATE_BOARD_DIR": "",
             "XDG_STATE_HOME": str(home / "state"), "SHUTDOWN_STATE_DIR": str(home / "shutdown"),
         })))
@@ -770,6 +771,8 @@ class MixedRestartTests(ShutdownTestCase):
         from scripts.herdr.test_worker_panes import PaneWorld
 
         root = Path(fixture.enter_context(tempfile.TemporaryDirectory(prefix="mixed-", dir="/tmp")))
+        # The fixture files are disposable; on a loaded disk each fsync waits for seconds.
+        _ = cast(object, fixture.enter_context(patch.object(os, "fsync")))
         write_text_atomic(root / "staff.json", '{"schema": 2, "rows": []}\n')
         environment = {"HOME": str(root), "STAFF_FILE": str(root / "staff.json"), "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"), "SHUTDOWN_STATE_DIR": str(root / "shutdown"),
@@ -962,7 +965,8 @@ class MixedRestartTests(ShutdownTestCase):
         endpoint = root / "config/herdr/sessions/agents/herdr.sock"
         endpoint.parent.mkdir(parents=True)
         server = socketserver.ThreadingUnixStreamServer(str(endpoint), Handler)
-        thread = Thread(target=server.serve_forever, daemon=True)
+        # A short poll makes shutdown return at once, not after the default half second.
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         _ = fixture.callback(server.server_close)
         _ = fixture.callback(server.shutdown)

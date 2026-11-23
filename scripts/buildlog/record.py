@@ -1636,7 +1636,6 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         if command == "step":
-            detach()
             step(rest)
         elif command == "test-phase-context":
             print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
@@ -1659,4 +1658,8 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     _ = sys.modules.setdefault("scripts.buildlog.record", sys.modules[__name__])
+    # A detach changes the whole process, so only the process of a step may do it.
+    # A caller that runs main in its own process (verify_helper.py) keeps its session and pipes.
+    if sys.argv[1:2] == ["step"]:
+        detach()
     sys.exit(main(sys.argv[1:]))
