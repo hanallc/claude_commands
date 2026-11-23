@@ -9,9 +9,12 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
+TEST_STEPS = ("nextest", "test", "t")
+
+
 @dataclass(frozen=True)
 class NoTestPhaseRecord:
-    pass
+    """The step has no test phase record."""
 
 
 NO_TEST_PHASE_RECORD = NoTestPhaseRecord()
@@ -19,11 +22,12 @@ NO_TEST_PHASE_RECORD = NoTestPhaseRecord()
 
 @dataclass(frozen=True)
 class UnobservedTestPhase:
-    pass
+    """The test phase has no observed start or peak."""
 
 
 @dataclass(frozen=True)
 class ObservedTestPhase:
+    """The test phase holds its observed memory peak and start time."""
     peak_bytes: int
     started_at: float
 
@@ -41,12 +45,14 @@ class TestPhaseContext(TypedDict):
 
 @dataclass(frozen=True)
 class TestPhaseRecord:
+    """The test phase record pairs its observation with the command context."""
     window: ObservedTestPhase | UnobservedTestPhase
     context: TestPhaseContext
 
 
 @dataclass(frozen=True)
 class UnreadableTestPhaseRecord:
+    """The reason explains why the test phase record cannot be read."""
     reason: str
 
 
@@ -61,17 +67,18 @@ class TestPhaseChargeUse(TypedDict):
 
 @dataclass(frozen=True)
 class NoTestPhaseChargeUse:
-    pass
+    """The test phase has no recorded memory charge use."""
 
 
 @dataclass(frozen=True)
 class CallRecord:
+    """The identifier links the step to its call record."""
     call_id: str
 
 
 @dataclass(frozen=True)
 class NoCallRecord:
-    pass
+    """The step has no linked call record."""
 
 
 def parse_test_phase_charge_use(fields: Mapping[str, object]) -> TestPhaseChargeUse:

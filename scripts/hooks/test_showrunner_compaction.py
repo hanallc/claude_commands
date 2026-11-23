@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Check the showrunner resume text and the absence of PreCompact writes."""
 
 from __future__ import annotations
 
-import importlib.util
+from scripts.agents import remote
+
 import io
 import json
 import os
@@ -14,6 +15,8 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, final, override
 from unittest.mock import patch
+from scripts.hooks import context_usage
+from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.production import staff
@@ -48,7 +51,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
         timer = self.root / "notifier" / "showrunner-example"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+            f"TARGET=session:{SESSION}\nCHECK=zsh /x/production_check.sh example\n", encoding="utf-8")
         self.fake = self.root / "update_registration.py"
         _ = self.fake.write_text(FAKE_LOG, encoding="utf-8")
         self.calls = self.root / "calls.jsonl"
@@ -58,7 +61,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         _ = fixture_member("showrunner", name="example", runtime_id=SESSION,
-                           doc=staff.LiveDoc("natedev", self.doc))
+                           doc=staff.LiveDoc(remote.local_machine(), self.doc))
 
     def run_hook(self, payload: dict[str, str], **env: str) -> str:
         result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
@@ -98,12 +101,16 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
 
 class ContextNoticeTests(unittest.TestCase):
+    def test_parse_window_refuses_non_finite_values(self) -> None:
+        for value in ("inf", "1e308m"):
+            with self.subTest(value=value):
+                self.assertIsNone(context_usage.parse_window(value))
+
     def test_a_showrunner_is_told_to_fill_next_and_not_to_write_a_handoff(self) -> None:
-        spec = importlib.util.spec_from_file_location(
+        module = load_file_module(
             "post_tool_use_context_usage", Path(__file__).resolve().parent / "post-tool-use-context-usage.py")
+        spec = module.__spec__
         assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         state = Path("/state/example/session/showrunner_state.json")
         notice = cast(str, module.build_context(249_000, 283_800, False, state))  # pyright: ignore[reportAny]
         self.assertIn("write no handoff doc", notice)
@@ -124,10 +131,9 @@ class ContextMessageSwitchTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        spec = importlib.util.spec_from_file_location("context_message_switch", HOOK.with_name("post-tool-use-context-usage.py"))
+        module = load_file_module("context_message_switch", HOOK.with_name("post-tool-use-context-usage.py"))
+        spec = module.__spec__
         assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         self.hook: ContextMessageHook = cast(ContextMessageHook, cast(object, module))
 
     @override

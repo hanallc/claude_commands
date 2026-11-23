@@ -13,12 +13,18 @@ from typing import cast, override
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(self.config.with_name('direct.conf'),
+            'VERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI TZ LANG LC_ALL LC_COLLATE '
+            + 'LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME LC_ADDRESS LC_IDENTIFICATION LC_MEASUREMENT '
+            + 'LC_NAME LC_PAPER LC_TELEPHONE\nVERIFY_RESULT_ENV_PREFIXES=HANA_ WGPU_ BEVY_ INSTA_ TRACE_\n'
+            + 'VERIFY_TEST_FIXED_ENV=TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=verify COLUMNS=80 LINES=24\n')
         (self.root / "bin/git").unlink()
         (self.root / ".git").rmdir()
         self.environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
@@ -41,7 +47,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         return result.stdout.strip()
 
     def calculate_build_keys(self, *arguments: str, extra_environment: dict[str, str] | None = None,
-                        target: str = "") -> tuple[str, str, str]:
+                        target: str = "", command: str = "test") -> tuple[str, str, str]:
         """Run the shared production calculator without starting Cargo work."""
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         packages = cast(list[dict[str, object]], metadata["packages"])
@@ -52,7 +58,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         result = subprocess.run(
             [sys.executable, str(support.VERIFY.with_name("tree_watch.py")), "--key",
              "--package", "sample", str(support.VERIFY),
-             str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", "test", "sample", *arguments],
+             str(support.SCRIPTS / "lint/invoke.sh"), str(self.config), "--", command, "sample", *arguments],
             input=json.dumps(metadata), cwd=self.root,
             env={**self.environment, "TEST_METADATA": json.dumps(metadata), "VERIFY_COMPUTE_TEST_BUILD": "1",
                  "VERIFY_TEST_BUILD_INPUTS_FILE": str(output), **(extra_environment or {})},
@@ -87,6 +93,11 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
             "--filter", "render", "--filter", "audio", "--features", "a")
         self.assertNotEqual(verdict, other_verdict)
         self.assertEqual(build, other_build)
+        for selection in (("--run-ignored", "only"),):
+            with self.subTest(selection=selection):
+                ignored_verdict = self.calculate_build_keys(
+                    "--filter", "native_rate", "--features", "a", *selection)[0]
+                self.assertNotEqual(verdict, ignored_verdict)
         for name, value in (("NEXTEST_TEST_THREADS", "1"), ("NEXTEST_RETRIES", "3"),
                             ("NEXTEST_STATUS_LEVEL", "all")):
             with self.subTest(input=name):
@@ -94,6 +105,47 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
                     "--filter", "native_rate", "--features", "a", extra_environment={name: value})
                 self.assertNotEqual(verdict, changed_verdict)
                 self.assertEqual(build, same_build)
+
+    def test_result_environment_changes_verdicts_without_rebuilding(self) -> None:
+        _ = self.environment.pop("NO_COLOR", None)
+        verdict, build, _ = self.calculate_build_keys()
+        for name in ("NO_COLOR", "CLICOLOR", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+                     "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION",
+                     "LC_MEASUREMENT", "LC_NAME", "LC_PAPER", "LC_TELEPHONE", "HANA_TEST_MODE", "WGPU_BACKEND",
+                     "BEVY_TEST_MODE", "INSTA_UPDATE", "TRACE_MODE"):
+            with self.subTest(name=name):
+                changed, same_build, _ = self.calculate_build_keys(extra_environment={name: "fixture-value"})
+                self.assertNotEqual(verdict, changed)
+                self.assertEqual(build, same_build)
+        empty, same_build, _ = self.calculate_build_keys(extra_environment={"NO_COLOR": ""})
+        self.assertNotEqual(verdict, empty)
+        self.assertEqual(build, same_build)
+        forwarded, forwarded_build, _ = self.calculate_build_keys("--env", "SNAPSHOT", extra_environment={"SNAPSHOT": "one"})
+        changed, changed_build, _ = self.calculate_build_keys("--env", "SNAPSHOT", extra_environment={"SNAPSHOT": "two"})
+        self.assertNotEqual(forwarded, changed)
+        self.assertEqual(forwarded_build, changed_build)
+        self.assertEqual(build, forwarded_build)
+
+    def test_check_key_ignores_test_result_environment(self) -> None:
+        _ = self.environment.pop("NO_COLOR", None)
+        verdict, build, _ = self.calculate_build_keys(command="check")
+        unchanged, same_build, _ = self.calculate_build_keys(command="check", extra_environment={"NO_COLOR": "1"})
+        self.assertEqual(verdict, unchanged)
+        self.assertEqual(build, same_build)
+
+    def test_fixed_terminal_configuration_changes_only_the_verdict_key(self) -> None:
+        verdict, build, _ = self.calculate_build_keys()
+        unchanged, same_build, _ = self.calculate_build_keys(extra_environment={
+            "TERM": "other", "COLORTERM": "other", "TERM_PROGRAM": "other", "COLUMNS": "123", "LINES": "77",
+            "LC_TERMINAL": "other", "LC_TERMINAL_VERSION": "other",
+        })
+        self.assertEqual(verdict, unchanged)
+        self.assertEqual(build, same_build)
+        configuration = self.config.parent / "direct.conf"
+        _ = configuration.write_text(configuration.read_text().replace("TERM_PROGRAM=verify", "TERM_PROGRAM=fixture"))
+        changed, same_build, _ = self.calculate_build_keys()
+        self.assertNotEqual(verdict, changed)
+        self.assertEqual(build, same_build)
 
     def test_build_input_key_uses_metadata_target_and_package_source(self) -> None:
         _, build, target = self.calculate_build_keys("--filter", "native_rate")
@@ -114,7 +166,7 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         # ordering relative to invoke.sh's run_once and buildlog_begin.
         hold_wrapper = "# A build hold stops every natedev build," + source.split(
             "# A build hold stops every natedev build,", 1)[1].split(
-                "# Again with the token held:", 1)[0]
+                "# Again before the first step:", 1)[0]
         key_setup = source.split('TOKEN_WAIT_FILE="$(mktemp)"\n', 1)[1].split(
             'if [[ -n "${CACHE_DIR}" ]]', 1)[0]
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
@@ -124,15 +176,16 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         target.mkdir()
         metadata["target_directory"] = str(target)
         probe = self.root / "probe-freshness.py"
-        _ = probe.write_text(f"""import json, os, sys
+        _ = probe.write_text(f"""import json, os
 from datetime import UTC, datetime
 from pathlib import Path
-sys.path.insert(0, {str(support.SCRIPTS / 'lint')!r})
-import memory_admit as gate
+with open({str(support.SCRIPTS / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
+from scripts.build_queue import step_estimator
+from scripts.buildlog import store
 from scripts.lib.cargo_output import CargoOutputRoots
 output_roots = CargoOutputRoots(Path.cwd(), Path(os.environ['BUILDLOG_TEST_TARGET_DIR']),
     Path(os.environ['BUILDLOG_TEST_BUILD_DIR']))
-fresh = gate.is_fresh_test(Path(os.environ['BUILDLOG_DIR']), gate.store.host_name(),
+fresh = step_estimator.is_fresh_test(Path(os.environ['BUILDLOG_DIR']), store.host_name(),
     os.getcwd(), 'sample', 'filtered', os.environ['BUILDLOG_TEST_BUILD_KEY'],
     datetime.now(UTC), output_roots)
 Path('admission.json').write_text(json.dumps({{'fresh': fresh,
@@ -171,7 +224,6 @@ buildlog_wait_for_memory() {
 }
 build_hold_check_local() { return 0; }
 buildlog_exec() { :; }
-nextest_share_end() { :; }
 buildlog_release_memory() { :; }
 sweep_after_step() { :; }
 run_once cargo nextest run -E "package(sample) & test(native_rate)"

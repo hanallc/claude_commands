@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Add a Claude or Codex account and wire it into everything that names accounts.
 
 `new_account.py claude claude4 [login]` or `new_account.py codex codex3 [login]`.
@@ -10,6 +10,10 @@ Everything else that lists accounts discovers them: account folders by
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fnmatch
@@ -24,7 +28,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
 from scripts.lib import conf  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -226,32 +229,31 @@ def statusline_color_step(account: NewAccount) -> Step:
     path = accounts.main_config_dir() / "config" / "statusline.conf"
     try:
         text = path.read_bytes().decode("utf-8")
+        entries = conf.read(path).values()
     except FileNotFoundError:
         return Step(True, f"{account.label} stays uncolored (no status line config {path})")
-    except (OSError, UnicodeError) as error:
+    except (OSError, UnicodeError, conf.Unusable) as error:
         return Step(False, f"could not update {path}: {error}")
 
     lines = text.splitlines(keepends=True)
-    entries: dict[str, str] = {}
-    insertion = len(lines)
-    for index, line in enumerate(lines):
-        content = line.split("#", 1)[0].strip()
-        if "=" not in content:
-            continue
-        key, value = (part.strip() for part in content.split("=", 1))
-        entries[key] = value
-        if key.startswith("account."):
-            insertion = index + 1
+    insertion = max((setting.line + 1 for key, setting in conf.settings(text).items()
+                     if key.startswith("account.")), default=len(lines))
     key = f"account.{account.label}"
     if key in entries:
         return Step(True, f"status line color {entries[key]} for {account.label}")
 
-    palette = [color for color in STATUSLINE_PALETTE if color not in STATUSLINE_EXCLUDED_COLORS]
-    account_colors = {value for key, value in entries.items() if key.startswith("account.")}
-    role_colors = {value for key, value in entries.items() if key.startswith("role.")}
-    color = next((color for color in palette if color not in account_colors | role_colors), "")
+    def visible_colors(prefix: str) -> set[str]:
+        return {color.css.lower() for key, value in entries.items() if key.startswith(prefix)
+                if isinstance(color := accounts.account_color(value), accounts.AccountColor)}
+
+    palette = {name: color.css.lower() for name in STATUSLINE_PALETTE
+               if name not in STATUSLINE_EXCLUDED_COLORS
+               if isinstance(color := accounts.account_color(name), accounts.AccountColor)}
+    account_colors = visible_colors("account.")
+    role_colors = visible_colors("role.")
+    color = next((name for name, visible in palette.items() if visible not in account_colors | role_colors), "")
     if not color:
-        color = next((color for color in palette if color not in account_colors), "")
+        color = next((name for name, visible in palette.items() if visible not in account_colors), "")
     if not color:
         return Step(True, f"{account.label} stays uncolored (no unused status line color)")
 
@@ -354,7 +356,7 @@ def main(argv: list[str]) -> int:
     for step in steps:
         print(f"{'done' if step.done else 'for you'}: {step.text}")
     if all(step.done for step in steps):
-        print(f"{account.name} is ready; /showrunner:accounts shows its row.")
+        print(f"{account.name} is ready; Hana console, Accounts shows its row.")
         return 0
     print(f"Then run /new_account {account.tool} {account.name} again.")
     return 1

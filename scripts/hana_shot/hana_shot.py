@@ -1,27 +1,31 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Frame Hana's camera on a known view over BRP and save a timed screenshot."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from functools import partial
 
 import argparse
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
-from functools import cache
+from functools import cache, cached_property
 import http.client
-import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import socket
@@ -31,32 +35,11 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import FrameType, ModuleType
-from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
-def _load_library(name: str) -> ModuleType:
-    """Load a shared library without changing the command's import path."""
-    path = Path(__file__).resolve().parents[1] / "lib" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"_hana_shot_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load library at {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-if TYPE_CHECKING:
-    from scripts.lib import conf, process_group
-    from scripts.lib.conf import UseConfiguredValue
-else:
-    if __package__:
-        from scripts.lib import conf
-        from scripts.lib.conf import UseConfiguredValue
-    else:
-        conf = _load_library("conf")
-        UseConfiguredValue = conf.UseConfiguredValue
-    process_group = _load_library("process_group")
+from scripts.lib import build_folders
+from scripts.lib import conf, process_group, scratch
+from scripts.lib.conf import UseConfiguredValue
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
@@ -66,10 +49,15 @@ EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
 GLOBAL_TRANSFORM = "bevy_transform::components::global_transform::GlobalTransform"
 CAMERA = "bevy_camera::camera::Camera"
 AABB = "bevy_camera::primitives::Aabb"
+PICKABLE = "bevy_picking::Pickable"
+RAY_CAST_BACKFACES = "bevy_picking::mesh_picking::ray_cast::RayCastBackfaces"
 CHILD_OF = "bevy_ecs::hierarchy::ChildOf"
+DRAWN_BY_SHOW = "hana_mimesis_tools::show::DrawnByShow"
 NAME = "bevy_ecs::name::Name"
 VIEW_VISIBILITY = "bevy_camera::visibility::ViewVisibility"
 INHERITED_VISIBILITY = "bevy_camera::visibility::InheritedVisibility"
+VISIBILITY = "bevy_camera::visibility::Visibility"
+TOOLTIPS = "hana_diegetic::widgets::tooltip::controller::Tooltips"
 OUTSIDE_FIT_BOUNDS = "hana_lagrange::fit::target::OutsideFitBounds"
 SWITCH_SLIDER = "hana_catalyst::switch::SwitchSlider"
 TOOL_PREFIX = "hana_catalyst::identity::Tool<"
@@ -86,7 +74,8 @@ MODES = ("fit", "pose", "hana-frame", "home")
 FACES = ("+x", "-x", "+y", "-y", "+z", "-z")
 CROPS = ("entity", "none")
 SELECTOR = re.compile(r"(name|marker|tool|entity):(.+)")
-TOOL_INDEX = re.compile(r"(.+)#([1-9][0-9]*)")
+SELECTOR_SCOPE = re.compile(r"/(?=(?:name|marker|tool|entity):)")
+TOOL_INDEX = re.compile(r"(.+)#(-?[1-9][0-9]*)")
 WINDOW_SIZE = re.compile(r"([1-9][0-9]{1,4})x([1-9][0-9]{1,4})")
 VIEW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -97,7 +86,7 @@ VIEW_KEYS = (
 VIEWS_HEADER = """\
 # Known Hana camera views for hana_shot (~/.claude/scripts/hana_shot/hana_shot.py).
 # `hana_shot.py views add` writes a view; `views check` stamps `verified` on a pass.
-# Prefer fit views: they follow their target. Selectors: name:, marker:, tool:<Kind>[#n].
+# Prefer fit views: they follow their target. Selectors: name:, marker:, tool:<Kind>[#n or #-n].
 # face = "+z" faces the target's local +z side; replaces world yaw/pitch in fit or pose.
 """
 
@@ -118,75 +107,6 @@ class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
 
 
-class ExitSignal(BaseException):
-    """A catchable process signal that should unwind the active shot."""
-
-    def __init__(self, number: int) -> None:
-        super().__init__(number)
-        self.number: int = number
-
-
-@dataclass(frozen=True)
-class ExitSignalsEnabled:
-    """The first exit signal may unwind the active operation."""
-
-
-@dataclass(frozen=True)
-class ExitSignalsDeferred:
-    """Cleanup must finish before an exit signal unwinds the operation."""
-
-
-@dataclass(frozen=True)
-class DeferredExitSignal:
-    """The first exit signal received while cleanup was protected."""
-
-    number: int
-
-
-@dataclass(frozen=True)
-class ExitSignalsLatched:
-    """An unwind or final cleanup has begun; later exit signals do nothing."""
-
-
-class ExitSignalLatch:
-    """Make the first exit signal unwind once, after any cleanup in progress."""
-
-    def __init__(self) -> None:
-        self.state: ExitSignalsEnabled | ExitSignalsDeferred | DeferredExitSignal | ExitSignalsLatched
-        self.state = ExitSignalsEnabled()
-
-    def reset(self) -> None:
-        self.state = ExitSignalsEnabled()
-
-    def latch(self) -> None:
-        self.state = ExitSignalsLatched()
-
-    def interrupt(self, number: int) -> None:
-        if isinstance(self.state, ExitSignalsEnabled):
-            self.state = ExitSignalsLatched()
-            raise ExitSignal(number)
-        if isinstance(self.state, ExitSignalsDeferred):
-            self.state = DeferredExitSignal(number)
-
-    @contextmanager
-    def defer_during_cleanup(self) -> Generator[None, None, None]:
-        deferring = isinstance(self.state, ExitSignalsEnabled)
-        if deferring:
-            self.state = ExitSignalsDeferred()
-        try:
-            yield
-        finally:
-            if deferring and isinstance(self.state, ExitSignalsDeferred):
-                self.state = ExitSignalsEnabled()
-            elif deferring and isinstance(self.state, DeferredExitSignal):
-                deferred = self.state
-                self.state = ExitSignalsLatched()
-                raise ExitSignal(deferred.number)
-
-
-EXIT_SIGNAL_LATCH = ExitSignalLatch()
-
-
 class BrpCallError(Failure):
     """A JSON-RPC error answer from Hana."""
 
@@ -194,6 +114,10 @@ class BrpCallError(Failure):
         super().__init__(f"{method} failed ({code}): {message}")
         self.code: int = code
         self.message: str = message
+
+
+class HoverDeadlineExpired(Failure):
+    """The one --hover deadline passed before the help was ready."""
 
 
 class RpcError(TypedDict):
@@ -486,6 +410,11 @@ class AbsentLaunchRecord:
 
 
 @dataclass(frozen=True)
+class IncompleteLaunchRecord:
+    reason: str
+
+
+@dataclass(frozen=True)
 class UnreadableLaunchRecord:
     reason: str
 
@@ -495,7 +424,7 @@ class WholeLaunchRecord:
     state: LaunchState
 
 
-LaunchRecord = AbsentLaunchRecord | UnreadableLaunchRecord | WholeLaunchRecord
+LaunchRecord = AbsentLaunchRecord | IncompleteLaunchRecord | UnreadableLaunchRecord | WholeLaunchRecord
 
 
 Vec3 = tuple[float, float, float]
@@ -520,6 +449,7 @@ class CameraState(NamedTuple):
     size: tuple[int, int]
     viewport_set: bool
     orbit_cam: OrbitCamValue
+    scale_factor: float
 
 
 class Sample(NamedTuple):
@@ -554,10 +484,57 @@ class RemoteFile(NamedTuple):
 
 
 class Bounds(NamedTuple):
-    """The hierarchy data a crop needs: parents by child, and visible boxes by entity."""
+    """The visible hierarchy and its mesh picking rules."""
 
     parents: dict[int, int]
     boxes: dict[int, tuple[list[float], AabbValue]]
+    pass_through: frozenset[int] = frozenset()
+    backfaces: frozenset[int] = frozenset()
+
+
+class ProjectedBounds(NamedTuple):
+    left: float
+    top: float
+    right: float
+    bottom: float
+    behind_camera: bool
+    has_boxes: bool
+
+
+class RayHit(NamedTuple):
+    entity: int
+    distance: float
+
+
+@dataclass(frozen=True)
+class RayMiss:
+    """The ray hits no visible box."""
+
+
+class LogicalPoint(TypedDict):
+    x: float
+    y: float
+
+
+class LogicalRect(LogicalPoint):
+    width: float
+    height: float
+
+
+class LogicalWindow(TypedDict):
+    width: float
+    height: float
+
+
+class LocateReply(TypedDict):
+    selector: str
+    entity: int
+    rect: LogicalRect
+    click: LogicalPoint
+    scale_factor: float
+    window: LogicalWindow
+    clipped: bool
+    occluded: bool
 
 
 @dataclass(frozen=True)
@@ -583,6 +560,28 @@ class ResolvedTargetFace(NamedTuple):
 
 
 @dataclass(frozen=True)
+class NoHover:
+    """Capture without moving the pointer."""
+
+
+NO_HOVER = NoHover()
+
+
+class HoverTarget(NamedTuple):
+    selector: str
+
+
+class TooltipOwner(NamedTuple):
+    entity: int
+    controllers: tuple[int, ...]
+
+
+class ShownHoverHelp(NamedTuple):
+    target: int
+    controllers: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Shot:
     """One normalized shot request, from a stored view or from the command line."""
 
@@ -599,6 +598,7 @@ class Shot:
     window: str | None = None
     setup: str | None = None
     settle: int = 0
+    hover: NoHover | HoverTarget = NO_HOVER
 
     @property
     def yaw(self) -> float:
@@ -639,6 +639,22 @@ class ConfiguredCallTimeout:
 
 
 CONFIGURED_CALL_TIMEOUT = ConfiguredCallTimeout()
+
+
+@dataclass(frozen=True)
+class HoverDeadline:
+    selector: str
+    limit: float
+    expires: float
+
+    def expired(self) -> HoverDeadlineExpired:
+        return HoverDeadlineExpired(f"help for {self.selector} did not become ready to capture within {self.limit:g} s")
+
+    def remaining(self) -> float:
+        seconds = self.expires - time.monotonic()
+        if seconds <= 0:
+            raise self.expired()
+        return seconds
 
 
 # ---------------------------------------------------------------------------
@@ -684,17 +700,25 @@ class TargetEvidence:
 class Brp:
     """JSON-RPC over HTTP to one Hana instance; each call uses its own connection."""
 
-    def __init__(self, port: int, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    def __init__(self, port: int, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                 hover_deadline: HoverDeadline | NoHover = NO_HOVER) -> None:
         self.settings: conf.ConfigRead = conf.read("hana_shot") if isinstance(settings, UseConfiguredValue) else settings
         self.port: int = port
         self.host: str = self.settings.text("host")
         self.call_timeout: float = self.settings.number("call_timeout_seconds")
         self.target_evidence: TargetEvidence = TargetEvidence()
+        self.hover_deadline: HoverDeadline | NoHover = hover_deadline
 
     def call(self, method: str, params: object = None,
              timeout: float | ConfiguredCallTimeout = CONFIGURED_CALL_TIMEOUT) -> object:
         if isinstance(timeout, ConfiguredCallTimeout):
             timeout = self.call_timeout
+        hover_deadline = self.hover_deadline
+        deadline_limits_call = False
+        if isinstance(hover_deadline, HoverDeadline):
+            remaining = hover_deadline.remaining()
+            deadline_limits_call = remaining <= timeout
+            timeout = min(timeout, remaining)
         body: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
         if params is not None:
             body["params"] = params
@@ -703,6 +727,8 @@ class Brp:
             connection.request("POST", "/", json.dumps(body), {"content-type": "application/json"})
             raw = connection.getresponse().read()
         except TimeoutError as exc:
+            if deadline_limits_call and isinstance(hover_deadline, HoverDeadline):
+                raise hover_deadline.expired() from exc
             if method == "brp_extras/screenshot":
                 raise CaptureTimeout(
                     f"screenshot gave no answer in {timeout:.0f} s; stopped without resending "
@@ -717,6 +743,8 @@ class Brp:
         error = reply.get("error")
         if error is not None:
             raise BrpCallError(method, error["code"], error["message"])
+        if isinstance(hover_deadline, HoverDeadline):
+            _ = hover_deadline.remaining()
         return reply.get("result")
 
     def query(self, params: dict[str, object]) -> list[QueryRow]:
@@ -793,6 +821,7 @@ def camera_state(components: dict[str, object]) -> CameraState:
         (width, height),
         camera["viewport"] is not None,
         orbit_cam,
+        target_info["scale_factor"],
     )
 
 
@@ -809,11 +838,14 @@ class Session:
         self.keep_awake: subprocess.Popen[bytes] | None = None
         self.camera: int = 0
         self.frame_ms: float | None = None
-        self.tool_types: list[str] | None = None
         self.rect_support: bool | None = None
         self.last_move: tuple[object, ...] | None = None
         self.last_state: CameraState | None = None
         self.window_level: WindowLevelPending | WindowLeftAlone | WindowRaised = WindowLevelPending()
+
+    @cached_property
+    def registered_components(self) -> list[str]:
+        return cast(list[str], self.brp.call("world.list_components"))
 
     def start(self) -> CameraState:
         system = None if self.remote is None else worker_pool().submit(remote_system, self.remote, hana_shot_settings=self.settings)
@@ -832,8 +864,7 @@ class Session:
         return camera_state(rows[0]["components"])
 
     def close(self) -> None:
-        """Latch exit signals, restore the window, then end the keep-awake."""
-        EXIT_SIGNAL_LATCH.latch()
+        """Restore the window and end the keep-awake."""
         self.restore_window_and_end_keep_awake()
 
     def restore_window_and_end_keep_awake(self) -> None:
@@ -1025,9 +1056,13 @@ class Selector(NamedTuple):
 
 
 def parse_selector(text: str) -> Selector:
+    parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        _ = parse_selector(parts[0])
+        return parse_selector(parts[1])
     match = SELECTOR.fullmatch(text)
     if match is None:
-        raise Refused(f"selector {text!r} must be name:<Name>, marker:<type path>, tool:<Kind>[#n] or entity:<id>")
+        raise Refused(f"selector {text!r} must be name:<Name>, marker:<type path>, tool:<Kind>[#n or #-n] or entity:<id>")
     kind, value = match.group(1), match.group(2)
     ordinal: int | None = None
     if kind == "tool":
@@ -1053,11 +1088,9 @@ class ToolRow(NamedTuple):
 
 
 def tool_rows(session: Session) -> list[ToolRow]:
-    if session.tool_types is None:
-        registered = cast(list[str], session.brp.call("world.list_components"))
-        session.tool_types = [path for path in registered if path.startswith(TOOL_PREFIX)]
+    tool_types = [path for path in session.registered_components if path.startswith(TOOL_PREFIX)]
     rows = session.brp.query({
-        "data": {"option": [*session.tool_types, NAME, CHILD_OF], "has": [AABB]},
+        "data": {"option": [*tool_types, NAME, CHILD_OF], "has": [AABB]},
         "filter": {"with": [SWITCH_SLIDER]},
     })
     tools: list[ToolRow] = []
@@ -1073,6 +1106,23 @@ def tool_rows(session: Session) -> list[ToolRow]:
 
 def resolve(session: Session, text: str) -> list[Target]:
     """Every entity the selector names right now; ids change on every launch."""
+    parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        outer, inner = parts
+        roots = resolve(session, outer)
+        if not roots:
+            return []
+        try:
+            root = require_one(session, outer, roots)
+        except Failure as exc:
+            raise Failure(f"{text}: outer {exc}") from exc
+        parents = read_parents(session.brp)
+        scope = descendants(parents, root.entity)
+        if DRAWN_BY_SHOW in session.registered_components:
+            for row in session.brp.query({"data": {"components": [DRAWN_BY_SHOW]}}):
+                if row["components"][DRAWN_BY_SHOW] == root.entity:
+                    scope.update(descendants(parents, row["entity"]))
+        return [Target(target.entity, text, target.has_aabb) for target in resolve(session, inner) if target.entity in scope]
     selector = parse_selector(text)
     evidence = session.brp.target_evidence
     evidence.selector_candidates = []
@@ -1108,9 +1158,9 @@ def resolve(session: Session, text: str) -> list[Target]:
         if tool.kind.lower() == wanted or tool.definition.lower() == wanted
     ]
     if selector.ordinal is not None:
-        if selector.ordinal > len(matches):
+        if abs(selector.ordinal) > len(matches):
             return []
-        matches = [matches[selector.ordinal - 1]]
+        matches = [matches[selector.ordinal - 1 if selector.ordinal > 0 else selector.ordinal]]
     return [Target(tool.entity, text, tool.has_aabb) for tool in matches]
 
 
@@ -1129,12 +1179,15 @@ def closest_target_hint(evidence: TargetEvidence, text: str, *,
 
 
 def resolve_one(session: Session, shot: Shot) -> Target | None:
-    hana_shot_settings = session.settings
     if shot.target is None:
         return None
     targets = resolve(session, shot.target)
     if not targets and shot.setup is not None:
         targets = run_setup(session, shot)
+    return require_one(session, shot.target, targets)
+
+
+def require_one(session: Session, text: str, targets: list[Target]) -> Target:
     if len(targets) != 1:
         evidence = session.brp.target_evidence
         found = ", ".join(
@@ -1142,12 +1195,21 @@ def resolve_one(session: Session, shot: Shot) -> Target | None:
         ) or "nothing"
         hint = ""
         if not targets:
-            selector = parse_selector(shot.target)
+            selector = parse_selector(text)
             if selector.kind == "entity":
                 hint = "; entity ids change when Hana restarts; select by name:, tool: or marker: instead"
             else:
-                hint = closest_target_hint(evidence, shot.target, hana_shot_settings=hana_shot_settings)
-        raise Failure(f"{shot.target} must name exactly one entity; found {found}{hint}")
+                hint = closest_target_hint(evidence, text, hana_shot_settings=session.settings)
+            parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+            if len(parts) == 2:
+                roots = resolve(session, parts[0])
+                if not roots:
+                    hint += f"; {text}: outer {parts[0]} found nothing"
+                elif DRAWN_BY_SHOW not in session.registered_components and any(
+                    tool.entity == roots[0].entity and tool.kind == "Show" for tool in tool_rows(session)
+                ):
+                    hint += "; this Hana does not reflect DrawnByShow, so a Show scope reaches only its children"
+        raise Failure(f"{text} must name exactly one entity; found {found}{hint}")
     return targets[0]
 
 
@@ -1177,31 +1239,45 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
 # Hierarchy crop
 
 
-def start_bounds(session: Session) -> tuple[Future[list[QueryRow]], Future[list[QueryRow]]]:
-    parents = worker_pool().submit(session.brp.query, {"data": {"components": [CHILD_OF]}})
+def read_parents(brp: Brp) -> dict[int, int]:
+    return {row["entity"]: cast(int, row["components"][CHILD_OF])
+            for row in brp.query({"data": {"components": [CHILD_OF]}})}
+
+
+def start_bounds(session: Session) -> tuple[Future[dict[int, int]], Future[list[QueryRow]]]:
+    has = [OUTSIDE_FIT_BOUNDS]
+    if RAY_CAST_BACKFACES in session.registered_components:
+        has.append(RAY_CAST_BACKFACES)
+    parents = worker_pool().submit(read_parents, session.brp)
     boxes = worker_pool().submit(session.brp.query, {
         "data": {
             "components": [AABB, GLOBAL_TRANSFORM],
-            "option": [VIEW_VISIBILITY, INHERITED_VISIBILITY],
-            "has": [OUTSIDE_FIT_BOUNDS],
+            "option": [VIEW_VISIBILITY, INHERITED_VISIBILITY, PICKABLE],
+            "has": has,
         },
     })
     return parents, boxes
 
 
-def finish_bounds(futures: tuple[Future[list[QueryRow]], Future[list[QueryRow]]]) -> Bounds:
-    parents: dict[int, int] = {}
-    for row in futures[0].result():
-        parents[row["entity"]] = cast(int, row["components"][CHILD_OF])
+def finish_bounds(futures: tuple[Future[dict[int, int]], Future[list[QueryRow]]], *,
+                  include_outside_fit: tuple[int, ...] = ()) -> Bounds:
+    parents = futures[0].result()
+    outside_fit_members = {entity for root in include_outside_fit for entity in descendants(parents, root)}
     boxes: dict[int, tuple[list[float], AabbValue]] = {}
+    pass_through: set[int] = set()
+    backfaces: set[int] = set()
     for row in futures[1].result():
         components = row["components"]
-        if row.get("has", {}).get(OUTSIDE_FIT_BOUNDS, False):
+        if row.get("has", {}).get(OUTSIDE_FIT_BOUNDS, False) and row["entity"] not in outside_fit_members:
             continue
         if not visible(components.get(VIEW_VISIBILITY), components.get(INHERITED_VISIBILITY)):
             continue
         boxes[row["entity"]] = (cast(list[float], components[GLOBAL_TRANSFORM]), cast(AabbValue, components[AABB]))
-    return Bounds(parents, boxes)
+        if cast(dict[str, object], components.get(PICKABLE, {})).get("should_block_lower") is False:
+            pass_through.add(row["entity"])
+        if row.get("has", {}).get(RAY_CAST_BACKFACES, False):
+            backfaces.add(row["entity"])
+    return Bounds(parents, boxes, frozenset(pass_through), frozenset(backfaces))
 
 
 def visible(view: object, inherited: object) -> bool:
@@ -1290,7 +1366,7 @@ def inverse_affine_point(matrix: list[float], point: Vec3) -> Vec3:
     )
 
 
-def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | None:
+def project(clip_from_view: list[float], view: Vec3, *, check_depth: bool = False) -> tuple[float, float] | None:
     """Normalized device x and y of a view-space point, or None behind the camera."""
     x, y, z = view
     m = clip_from_view
@@ -1299,17 +1375,18 @@ def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | No
     clip_w = m[3] * x + m[7] * y + m[11] * z + m[15]
     if clip_w <= 1e-6:
         return None
+    if check_depth and not 0 <= m[2] * x + m[6] * y + m[10] * z + m[14] <= clip_w:
+        return None
     return clip_x / clip_w, clip_y / clip_w
 
 
-def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence) -> Rect:
-    """Pixel rectangle around the visible boxes under root, as the fit measures them."""
-    if state.viewport_set:
-        raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
+def project_bounds(bounds: Bounds, root: int, state: CameraState, *, own_aabb: bool = False) -> ProjectedBounds:
+    """Project front-facing corners of visible boxes under the target."""
     width, height = state.size
     left, top, right, bottom = math.inf, math.inf, -math.inf, -math.inf
     any_box = False
-    for entity in descendants(bounds.parents, root):
+    behind = False
+    for entity in (root,) if own_aabb else descendants(bounds.parents, root):
         entry = bounds.boxes.get(entity)
         if entry is None:
             continue
@@ -1320,27 +1397,245 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, 
             for sy in (-1.0, 1.0):
                 for sz in (-1.0, 1.0):
                     local = (center[0] + sx * half[0], center[1] + sy * half[1], center[2] + sz * half[2])
-                    ndc = project(state.clip_from_view, inverse_affine_point(state.transform, affine_point(transform, local)))
+                    ndc = project(state.clip_from_view, inverse_affine_point(state.transform, affine_point(transform, local)),
+                                  check_depth=own_aabb)
                     if ndc is None:
-                        left, top, right, bottom = 0.0, 0.0, float(width), float(height)
+                        behind = True
                         continue
                     px = (ndc[0] + 1) * 0.5 * width
                     py = (1 - ndc[1]) * 0.5 * height
                     left, right = min(left, px), max(right, px)
                     top, bottom = min(top, py), max(bottom, py)
-    if not any_box:
+    return ProjectedBounds(left, top, right, bottom, behind, any_box)
+
+
+def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence, *,
+                   tooltips: tuple[int, ...] = (), own_aabb: bool = False) -> Rect:
+    """Measure the crop target and include the visible help."""
+    if state.viewport_set:
+        raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
+    width, height = state.size
+    projected = project_bounds(bounds, root, state, own_aabb=own_aabb)
+    if not projected.has_boxes:
         raise Failure(
             "the target has no visible mesh bounds to crop to"
             + evidence.parent_fit_hint(root)
             + next_step("rerun with --crop none to shoot without a crop")
         )
+    left, top, right, bottom = projected[:4]
+    help_bounds = [project_bounds(bounds, controller, state) for controller in tooltips]
+    if projected.behind_camera or any(not help.has_boxes or help.behind_camera for help in help_bounds):
+        # Screen help can render without world boxes.
+        left, top, right, bottom = 0.0, 0.0, float(width), float(height)
+    else:
+        for help in help_bounds:
+            left, top = min(left, help.left), min(top, help.top)
+            right, bottom = max(right, help.right), max(bottom, help.bottom)
     x0 = max(0, math.floor(left) - padding)
     y0 = max(0, math.floor(top) - padding)
     x1 = min(width, math.ceil(right) + padding)
     y1 = min(height, math.ceil(bottom) + padding)
-    if x1 - x0 < 2 or y1 - y0 < 2:
+    minimum = 1 if own_aabb else 2
+    if x1 - x0 < minimum or y1 - y0 < minimum:
         raise Failure("the crop is empty: the target is off screen")
     return Rect(x0, y0, x1 - x0, y1 - y0)
+
+
+def inverse_projection(matrix: list[float]) -> list[list[float]]:
+    """Invert the column-major projection into rows for unprojection."""
+    rows = [[matrix[column * 4 + row] for column in range(4)]
+            + [float(row == column) for column in range(4)] for row in range(4)]
+    for column in range(4):
+        pivot = max(range(column, 4), key=lambda row: abs(rows[row][column]))
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        divisor = rows[column][column]
+        if divisor == 0:
+            raise Failure("the camera projection cannot be inverted")
+        rows[column] = [value / divisor for value in rows[column]]
+        for row in range(4):
+            if row != column:
+                factor = rows[row][column]
+                rows[row] = [value - factor * pivot_value for value, pivot_value in zip(rows[row], rows[column])]
+    return [row[4:] for row in rows]
+
+
+def window_ray(state: CameraState, inverse: list[list[float]], px: float, py: float) -> tuple[Vec3, Vec3]:
+    points: list[Vec3] = []
+    for depth in (1.0, 1e-3):
+        ndc = (2 * px / state.size[0] - 1, 1 - 2 * py / state.size[1], depth, 1.0)
+        view = [sum(value * coordinate for value, coordinate in zip(row, ndc)) for row in inverse]
+        points.append(affine_point(state.transform, (view[0] / view[3], view[1] / view[3], view[2] / view[3])))
+    if state.clip_from_view[15] == 0:
+        points[0] = (state.transform[9], state.transform[10], state.transform[11])
+    return points[0], points[1]
+
+
+def box_hit_distance(origin: Vec3, through: Vec3, transform: list[float], aabb: AabbValue, backfaces: bool) -> float:
+    """Return the ray's entry distance, or infinity when it misses the box."""
+    local_origin = inverse_affine_point(transform, origin)
+    local_through = inverse_affine_point(transform, through)
+    entry, exit_at = 0.0, math.inf
+    inside = True
+    for axis in range(3):
+        low = aabb["center"][axis] - aabb["half_extents"][axis]
+        high = aabb["center"][axis] + aabb["half_extents"][axis]
+        inside = inside and low <= local_origin[axis] <= high
+        direction = local_through[axis] - local_origin[axis]
+        if direction == 0:
+            if not low <= local_origin[axis] <= high:
+                return math.inf
+            continue
+        first, last = sorted(((low - local_origin[axis]) / direction, (high - local_origin[axis]) / direction))
+        entry, exit_at = max(entry, first), min(exit_at, last)
+        if entry > exit_at:
+            return math.inf
+    if inside and not backfaces:
+        return math.inf
+    local_hit = [local_origin[axis] + entry * (local_through[axis] - local_origin[axis]) for axis in range(3)]
+    hit = affine_point(transform, (local_hit[0], local_hit[1], local_hit[2]))
+    return math.dist(origin, hit)
+
+
+def ray_owner(bounds: Bounds, state: CameraState, inverse: list[list[float]], members: set[int], px: float, py: float) -> RayHit | RayMiss:
+    origin, through = window_ray(state, inverse, px, py)
+    nearest: RayHit | RayMiss = RayMiss()
+    for entity, (transform, aabb) in bounds.boxes.items():
+        if entity in bounds.pass_through and entity not in members:
+            continue
+        try:
+            distance = box_hit_distance(origin, through, transform, aabb, entity in bounds.backfaces)
+        except Failure:
+            continue
+        if math.isfinite(distance) and (isinstance(nearest, RayMiss) or distance < nearest.distance):
+            nearest = RayHit(entity, distance)
+    return nearest
+
+
+def locate_target(session: Session, target: Target, state: CameraState, bounds: Bounds) -> LocateReply:
+    if state.viewport_set:
+        raise Refused("the camera has a viewport; locate covers full-window cameras only")
+    projected = project_bounds(bounds, target.entity, state)
+    if not projected.has_boxes:
+        raise Failure("the target has no visible mesh bounds" + session.brp.target_evidence.parent_fit_hint(target.entity))
+    if projected.left == math.inf:
+        raise Failure("behind the camera" if projected.behind_camera else "off screen")
+    width, height = state.size
+    left, top = max(0.0, projected.left), max(0.0, projected.top)
+    right, bottom = min(float(width), projected.right), min(float(height), projected.bottom)
+    if right <= left or bottom <= top:
+        raise Failure("off screen")
+    center = ((left + right) / 2, (top + bottom) / 2)
+    inverse = inverse_projection(state.clip_from_view)
+    members = descendants(bounds.parents, target.entity)
+    owner = ray_owner(bounds, state, inverse, members, *center)
+    candidates: list[tuple[float, float]] = []
+    covered: dict[int, int] = {}
+    if isinstance(owner, RayHit) and owner.entity in members:
+        candidates.append(center)
+    occluded = isinstance(owner, RayHit) and owner.entity not in members
+    grid = session.settings.whole("locate_grid")
+    for column in range(grid):
+        for row in range(grid):
+            point = (left + (column + 0.5) * (right - left) / grid, top + (row + 0.5) * (bottom - top) / grid)
+            hit = ray_owner(bounds, state, inverse, members, *point)
+            if isinstance(hit, RayHit):
+                if hit.entity in members:
+                    candidates.append(point)
+                else:
+                    covered[hit.entity] = covered.get(hit.entity, 0) + 1
+    if not candidates:
+        if not covered:
+            raise Failure(f"no clear click point on {target.label}")
+        entity = max(covered, key=lambda item: covered[item])
+        evidence = session.brp.target_evidence
+        if entity not in evidence.names:
+            _ = session.brp.query({"data": {"components": [NAME]}})
+        raise Failure(f"covered by {evidence.names.get(entity, f'entity:{entity}')}")
+    click = min(candidates, key=lambda point: math.dist(point, center))
+    scale = state.scale_factor
+    return {
+        "selector": target.label, "entity": target.entity,
+        "rect": {"x": left / scale, "y": top / scale, "width": (right - left) / scale, "height": (bottom - top) / scale},
+        "click": {"x": click[0] / scale, "y": click[1] / scale},
+        "scale_factor": scale, "window": {"width": width / scale, "height": height / scale},
+        "clipped": projected.behind_camera or (left, top, right, bottom) != projected[:4], "occluded": occluded,
+    }
+
+
+def tooltip_owner(session: Session, target: Target, parents: dict[int, int]) -> TooltipOwner:
+    """The nearest entity on the target's chain with tooltip controllers, else the target with none yet."""
+    entity = target.entity
+    visited: set[int] = set()
+    while entity not in visited:
+        visited.add(entity)
+        components = session.brp.components(entity, [TOOLTIPS])
+        controllers = cast(list[int], components.get(TOOLTIPS, []))
+        if controllers:
+            return TooltipOwner(entity, tuple(controllers))
+        if entity not in parents:
+            break
+        entity = parents[entity]
+    return TooltipOwner(target.entity, ())
+
+
+def wait_hover_frame(session: Session, deadline: HoverDeadline) -> None:
+    frame = frame_number(session.brp.diagnostics())
+    interval = session.frame_seconds()
+    while True:
+        time.sleep(min(interval, deadline.remaining()))
+        if frame_number(session.brp.diagnostics()) > frame:
+            return
+
+
+def move_pointer_to_target(session: Session, location: LocateReply, owner: ProjectedBounds,
+                           deadline: HoverDeadline) -> None:
+    click, window = location["click"], location["window"]
+    scale = location["scale_factor"]
+    last_x, last_y = window["width"] - 1 / scale, window["height"] - 1 / scale
+    x, y = click["x"], click["y"]
+    # Start at the edge with the most space outside the owner.
+    gap, start_x, start_y = max((
+        (owner.left / scale, 0.0, y), (owner.top / scale, x, 0.0),
+        (last_x - owner.right / scale, last_x, y), (last_y - owner.bottom / scale, x, last_y),
+    ), key=lambda approach: approach[0])
+    if gap <= 0 or owner.behind_camera:
+        start_x, start_y = max(((0.0, y), (x, 0.0), (last_x, y), (x, last_y)),
+                               key=lambda point: math.dist(point, (x, y)))
+    for step in (0.0, 1 / 3, 2 / 3, 1.0):
+        position = [start_x + step * (x - start_x), start_y + step * (y - start_y)]
+        _ = session.brp.call("brp_extras/move_mouse", {"position": position})
+        wait_hover_frame(session, deadline)
+
+
+def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> ShownHoverHelp:
+    limit = session.settings.number("settle_seconds")
+    deadline = HoverDeadline(hover.selector, limit, time.monotonic() + limit)
+    hover_session = Session(Brp(session.brp.port, settings=session.settings, hover_deadline=deadline))
+    hover_session.frame_ms = session.frame_ms
+    target = require_one(hover_session, hover.selector, resolve(hover_session, hover.selector))
+    bounds_reads = start_bounds(hover_session)
+    parents = bounds_reads[0].result()
+    owner = tooltip_owner(hover_session, target, parents)
+    bounds = finish_bounds(bounds_reads, include_outside_fit=(owner.entity,))
+    location = locate_target(hover_session, target, state, bounds)
+    # A deadline before the pointer arrives is not a missing help: Hana had no hover to spawn it.
+    move_pointer_to_target(hover_session, location, project_bounds(bounds, owner.entity, state), deadline)
+    try:
+        while True:
+            # Some help, such as a rear jack's, spawns only while its target is hovered.
+            if not owner.controllers:
+                owner = tooltip_owner(hover_session, target, parents)
+            shown = tuple(
+                controller for controller in owner.controllers
+                if hover_session.brp.components(controller, [VISIBILITY]).get(VISIBILITY) in ("Inherited", "Visible")
+            )
+            wait_hover_frame(hover_session, deadline)
+            if shown:
+                return ShownHoverHelp(target.entity, shown)
+    except HoverDeadlineExpired:
+        if owner.controllers:
+            raise
+        raise Refused(f"{target.label} has no tooltip controller on the target or its ancestors within {limit:g} s") from None
 
 
 # ---------------------------------------------------------------------------
@@ -1521,21 +1816,27 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
     session.last_move = move_key
     session.last_state = settled.state
 
+    hover_help = hover_for_shot(session, shot.hover, settled.state) if isinstance(shot.hover, HoverTarget) else shot.hover
     staging = staging_path(final)
     remote = remote_file(session)
     params: dict[str, object] = {"path": str(staging) if remote is None else remote.path, "camera": session.camera}
     crop_kind = "none"
     rect: Rect | None = None
     if shot.crop == "entity" and target is not None:
-        if target.has_aabb:
+        if target.has_aabb and isinstance(hover_help, NoHover):
             params["entity"] = target.entity
             params["padding"] = shot.padding
             crop_kind = "entity"
         else:
-            # Visibility is read after the move: parts culled from the old pose show in the new one.
+            # Read the mesh bounds after the camera and tooltip change.
+            tooltips = hover_help.controllers if isinstance(hover_help, ShownHoverHelp) else ()
+            outside_fit = (hover_help.target, *tooltips) if isinstance(hover_help, ShownHoverHelp) else ()
+            if target.has_aabb:
+                outside_fit = (*outside_fit, target.entity)
             rect = hierarchy_rect(
-                finish_bounds(start_bounds(session)), target.entity, settled.state, shot.padding,
-                session.brp.target_evidence,
+                finish_bounds(start_bounds(session), include_outside_fit=outside_fit),
+                target.entity, settled.state, shot.padding,
+                session.brp.target_evidence, tooltips=tooltips, own_aabb=target.has_aabb,
             )
             crop_kind = "rect"
 
@@ -1631,8 +1932,7 @@ def keep_visible(session: Session) -> None:
         session.wait_frames(hana_shot_settings.whole("window_frames"))
         session.window_level = prepared_window
     except BaseException:
-        with EXIT_SIGNAL_LATCH.defer_during_cleanup():
-            session.restore_window_and_end_keep_awake()
+        session.restore_window_and_end_keep_awake()
         raise
 
 
@@ -2086,27 +2386,27 @@ def _write_launch_state(state_path: Path, state: LaunchState) -> None:
 
 
 def _read_launch_state(state_path: Path) -> LaunchRecord:
-    """Distinguish absent, unreadable and whole shutdown metadata."""
+    """Read the launch record for shutdown."""
     try:
         value = cast(object, json.loads(state_path.read_text()))
     except FileNotFoundError:
         return AbsentLaunchRecord()
-    except json.JSONDecodeError as error:
-        return UnreadableLaunchRecord(f"invalid JSON: {error}")
-    except (OSError, ValueError) as error:
+    except ValueError as error:
+        return IncompleteLaunchRecord(f"invalid JSON: {error}")
+    except OSError as error:
         return UnreadableLaunchRecord(str(error))
     if not isinstance(value, dict):
-        return UnreadableLaunchRecord("expected a JSON object")
+        return IncompleteLaunchRecord("expected a JSON object")
     fields = cast(dict[str, object], value)
     missing = [key for key in ("pid", "binary", "log", "scratch") if key not in fields]
     if missing:
-        return UnreadableLaunchRecord(f"missing {', '.join(missing)}")
+        return IncompleteLaunchRecord(f"missing {', '.join(missing)}")
     pid = fields["pid"]
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return UnreadableLaunchRecord("pid must be a positive integer")
+        return IncompleteLaunchRecord("pid must be a positive integer")
     for key in ("binary", "log", "scratch"):
         if not isinstance(fields[key], str) or not fields[key]:
-            return UnreadableLaunchRecord(f"{key} must be a nonempty string")
+            return IncompleteLaunchRecord(f"{key} must be a nonempty string")
     return WholeLaunchRecord(cast(LaunchState, cast(object, fields)))
 
 
@@ -2223,80 +2523,64 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
         )
     owner = owner.strip()
     if not owner:
-        if not __package__:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from scripts.production import staff
         try:
             current = staff.runtime_id()
             if current:
                 record = staff.local_snapshot()
-                row = record.by_current_session(current)
-                if row is not None and row.kind == "worker":
-                    row = record.parent_of(row)
+                row = record.owner_of(current)
                 if row is not None:
                     owner = row.name
         except staff.StaffUnreadable:
             pass
-    scratch = Path(tempfile.mkdtemp(prefix=f"hana-shot-{port}-"))
-    config = scratch / "config"
-    config.mkdir()
-    log = scratch / "hana.log"
-    command = [
-        "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
-        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
-        f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
-    ]
-    direnv = shutil.which("direnv")
-    if direnv is not None and (root / ".envrc").exists():
-        command = [direnv, "exec", str(root), *command]
-    if sys.platform == "darwin":
-        print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
-    with log.open("wb") as handle:
-        process = subprocess.Popen(
-            command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    state: LaunchState = {
-        "pid": process.pid,
-        "port": port,
-        "scratch": str(scratch),
-        "log": str(log),
-        "binary": str(executable),
-        "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    if uncommitted_paths:
-        state["uncommitted_paths"] = uncommitted_paths
-    state_path = launch_state_path(port)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_launch_state(state_path, state)
-    start = time.monotonic()
-    try:
-        recorder_path = Path(__file__).resolve().parents[1] / "buildlog" / "record.py"
-        recorder = sys.modules.get("record")
-        if recorder is None or getattr(recorder, "__file__", "") != str(recorder_path):
-            module_name = "_hana_shot_buildlog_record"
-            recorder = sys.modules.get(module_name)
-            if recorder is None:
-                spec = importlib.util.spec_from_file_location(
-                    module_name, recorder_path, submodule_search_locations=[str(recorder_path.parent)],
+    with ExitStack() as cleanup:
+        # Keep the folder after a successful launch. Hana still reads it.
+        launch_folder = scratch.new(word=f"hana-shot-{port}")
+        _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
+        config = launch_folder / "config"
+        config.mkdir()
+        log = launch_folder / "hana.log"
+        command = [
+            "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
+            f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner}",
+            f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
+        ]
+        direnv = shutil.which("direnv")
+        if direnv is not None and (root / ".envrc").exists():
+            command = [direnv, "exec", str(root), *command]
+        if sys.platform == "darwin":
+            print("hana_shot: macOS ignores XDG_CONFIG_HOME; this Hana reads your real config", file=sys.stderr)
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            with log.open("wb") as handle:
+                process = subprocess.Popen(
+                    command, cwd=root, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+                    start_new_session=True,
                 )
-                if spec is None or spec.loader is None:
-                    raise ImportError(f"cannot load launch recorder at {recorder_path}")
-                recorder = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = recorder
-                try:
-                    spec.loader.exec_module(recorder)
-                except BaseException:
-                    del sys.modules[module_name]
-                    raise
-        record_launch = cast(Callable[[Path, Path], bool], recorder.launch)
-        _ = record_launch(state_path, root)
-        wait_ready(Brp(port, settings=hana_shot_settings), process, log)
-    except BaseException:
-        shutdown(port, process, hana_shot_settings=hana_shot_settings)
-        raise
-    print(f"hana_shot: Hana pid {process.pid} ready on port {port} in {time.monotonic() - start:.1f} s (log {log})", file=sys.stderr)
-    return state, process
+            state: LaunchState = {
+                "pid": process.pid,
+                "port": port,
+                "scratch": str(launch_folder),
+                "log": str(log),
+                "binary": str(executable),
+                "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            if uncommitted_paths:
+                state["uncommitted_paths"] = uncommitted_paths
+            state_path = launch_state_path(port)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_launch_state(state_path, state)
+            start = time.monotonic()
+            from scripts.buildlog import record
+            _ = record.launch(state_path, root)
+            wait_ready(Brp(port, settings=hana_shot_settings), process, log)
+            print(f"hana_shot: Hana pid {process.pid} ready on port {port} in {time.monotonic() - start:.1f} s (log {log})", file=sys.stderr)
+            _ = cleanup.pop_all()
+            return state, process
+        except BaseException:
+            if process is not None:
+                shutdown(port, process, owned_folder=launch_folder, hana_shot_settings=hana_shot_settings)
+            raise
 
 
 def wait_ready(brp: Brp, process: subprocess.Popen[bytes], log: Path) -> None:
@@ -2337,16 +2621,61 @@ def process_alive(pid: int) -> bool:
 
 
 def same_binary(pid: int, binary: str) -> bool:
-    cmdline = Path(f"/proc/{pid}/cmdline")
-    if not cmdline.exists():
-        return sys.platform == "darwin"
-    return binary.encode() in cmdline.read_bytes()
+    """Whether one argument of pid is the recorded binary; a process that exits during the read does not count.
+
+    A wrapper (direnv, env) counts: its arguments name the binary before it execs into it.
+    """
+    if sys.platform == "darwin":
+        listing = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False,
+        )
+        return listing.returncode == 0 and f" {binary} " in f" {listing.stdout.strip()} "
+    try:
+        return binary.encode() in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def report_retained_launch_folder(path: Path, reason: str) -> None:
+    print(f"kept for a manual removal list: {path} (hana_shot, {reason})", file=sys.stderr)
+
+
+def retained_launch_path(state_path: Path) -> Path:
+    """Choose a record path outside the active launch lookup."""
+    retained = state_path.parent / "retained"
+    retained.mkdir(mode=0o700, exist_ok=True)
+    return retained / f"{state_path.stem}-{secrets.token_hex(8)}.json"
+
+
+def clean_temporary_launch_records(state_path: Path, launch_record: LaunchRecord) -> None:
+    """Retire temporary records after shutdown."""
+    reported: set[Path] = set()
+    expired: list[Path] = []
+    for path in sorted(state_path.parent.glob(f".{state_path.name}.*.tmp")):
+        candidate = _read_launch_state(path)
+        if isinstance(candidate, IncompleteLaunchRecord):
+            expired.append(path)
+        elif isinstance(candidate, WholeLaunchRecord):
+            folder = Path(candidate.state["scratch"])
+            if isinstance(launch_record, WholeLaunchRecord) and folder == Path(launch_record.state["scratch"]):
+                expired.append(path)
+            else:
+                _ = path.rename(retained_launch_path(state_path))
+                if folder not in reported:
+                    report_retained_launch_folder(folder, "temporary launch record kept")
+                    reported.add(folder)
+        elif isinstance(candidate, UnreadableLaunchRecord):
+            print(f"hana_shot: kept unreadable temporary launch record {path}: {candidate.reason}", file=sys.stderr)
+    # Keep the active fallback until every other complete record is archived.
+    for path in expired:
+        path.unlink(missing_ok=True)
 
 
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
+    owned_folder: Path | Literal["saved_launch"] = "saved_launch",
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
-    """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
+    """Stop Hana and show any panic lines. Keep folders from saved launch records."""
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
@@ -2374,9 +2703,24 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
         shutdown_answered = True
     except Failure:
         pass
+    if not isinstance(launch_record, WholeLaunchRecord) and process is not None:
+        # A state-write failure can leave only the process owned by this launch.
+        try:
+            _ = process.wait(timeout=shutdown_seconds)
+        except subprocess.TimeoutExpired:
+            for signal_number in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    process_group.send_process_group(process.pid, signal_number)
+                except ProcessLookupError:
+                    break
+                time.sleep(signal_grace_seconds)
+            try:
+                _ = process.wait(timeout=signal_grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
     if isinstance(launch_record, WholeLaunchRecord):
         state = launch_record.state
-        pid = state["pid"]
+        pid = process.pid if process is not None else state["pid"]
         deadline = time.monotonic() + shutdown_seconds
         while time.monotonic() < deadline:
             if process is not None:
@@ -2386,7 +2730,7 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
                 break
             time.sleep(poll_seconds)
         else:
-            if same_binary(pid, state["binary"]):
+            if process is not None or same_binary(pid, state["binary"]):
                 for signal_number in (signal.SIGTERM, signal.SIGKILL):
                     try:
                         process_group.send_process_group(pid, signal_number)
@@ -2398,7 +2742,10 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
             print(f"hana_shot: Hana on port {port} logged a panic:", file=sys.stderr)
             for line in lines:
                 print(f"  {line}", file=sys.stderr)
-        shutil.rmtree(state["scratch"], ignore_errors=True)
+        folder = Path(state["scratch"])
+        if folder != owned_folder:
+            _write_launch_state(retained_launch_path(state_path), state)
+            report_retained_launch_folder(folder, "Hana shut down")
     else:
         deadline = time.monotonic() + shutdown_seconds
         while port_answers(port, hana_shot_settings=hana_shot_settings):
@@ -2408,14 +2755,13 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
                     + next_step(f"run shutdown again on port {port} after the launch finishes starting"),
                 )
             time.sleep(poll_seconds)
+    clean_temporary_launch_records(state_path, launch_record)
     state_path.unlink(missing_ok=True)
-    for temporary_path in state_path.parent.glob(f".{state_path.name}.*.tmp"):
-        temporary_path.unlink(missing_ok=True)
-    if isinstance(record, UnreadableLaunchRecord):
+    if isinstance(record, (IncompleteLaunchRecord, UnreadableLaunchRecord)):
         print(
             f"hana_shot: launch record {state_path} is unreadable ({record.reason}); "
             + f"asked Hana on port {port} to stop and removed the record; "
-            + f"check scratch parent {tempfile.gettempdir()} for hana-shot-{port}-* folders",
+            + f"check scratch.py list for new folders, or scratch parent {tempfile.gettempdir()} for old hana-shot-{port}-* folders",
             file=sys.stderr,
         )
     if shutdown_answered or isinstance(launch_record, WholeLaunchRecord):
@@ -2435,14 +2781,19 @@ def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str 
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
-    process: subprocess.Popen[bytes] | None = None
-    if launch_first:
-        _, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
-    try:
-        yield Brp(port, settings=hana_shot_settings)
-    finally:
-        if shutdown_after:
-            shutdown(port, process, hana_shot_settings=hana_shot_settings)
+    with ExitStack() as cleanup:
+        process: subprocess.Popen[bytes] | None = None
+        owned_folder: Path | Literal["saved_launch"] = "saved_launch"
+        if launch_first:
+            state, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
+            if shutdown_after:
+                owned_folder = Path(state["scratch"])
+                _ = cleanup.callback(shutil.rmtree, owned_folder, ignore_errors=True)
+        try:
+            yield Brp(port, settings=hana_shot_settings)
+        finally:
+            if shutdown_after:
+                shutdown(port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -2455,6 +2806,7 @@ class Arguments(argparse.Namespace):
     port: int = 0
     view: list[str] | None = None
     target: str | None = None
+    hover: str | None = None
     mode: str | None = None
     face: str | None = None
     yaw: float | None = None
@@ -2481,6 +2833,7 @@ class Arguments(argparse.Namespace):
     from_current: bool = False
     replace: bool = False
     since: str | None = None
+    json: bool = False
 
 
 def parse_focus(text: str) -> Vec3:
@@ -2593,6 +2946,9 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation, *,
             raise Refused(f"no views to shoot in {path}")
     else:
         shots = [shot_from_arguments(args, hana_shot_settings=hana_shot_settings)]
+    if args.hover is not None:
+        _ = parse_selector(args.hover)
+        shots = [replace(shot, hover=HoverTarget(args.hover)) for shot in shots]
     invocation.orientation = shots[0].orientation
     invocation.shot = shots[0]
     with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp:
@@ -2629,6 +2985,31 @@ def command_pose(args: Arguments, *,
     return 0
 
 
+def command_locate(args: Arguments, *,
+    hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> int:
+    assert args.target is not None
+    _ = parse_selector(args.target)
+    with instance(args.port, False, False, None, None, hana_shot_settings=hana_shot_settings) as brp:
+        session = Session(brp)
+        state = session.start()
+        orbit = state.orbit_cam
+        if (state.update_request != "None" or orbit["orbit"]["current"] != orbit["orbit"]["target"]
+                or orbit["pan"]["current"] != orbit["pan"]["target"] or orbit["zoom"]["current"] != orbit["zoom"]["target"]):
+            state = session.settle(state, 0).state
+        target = require_one(session, args.target, resolve(session, args.target))
+        reply = locate_target(session, target, state, finish_bounds(start_bounds(session)))
+        if args.json:
+            print(json.dumps(reply))
+        else:
+            rect, click = reply["rect"], reply["click"]
+            values = (rect["x"], rect["y"], rect["width"], rect["height"], click["x"], click["y"])
+            flags = (" clipped" if reply["clipped"] else "") + (" occluded" if reply["occluded"] else "")
+            print(f"{args.target} " + " ".join(f"{value:.1f}" for value in values)
+                  + f" scale {reply['scale_factor']}{flags}")
+    return 0
+
+
 def command_targets(args: Arguments, *,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
@@ -2638,7 +3019,7 @@ def command_targets(args: Arguments, *,
         print(f"camera  entity:{session.camera}")
         for tool in tool_rows(session):
             print(f"tool:{tool.kind}  {tool.definition}  id {tool.tool_id}  entity {tool.entity}")
-        registered = cast(list[str], brp.call("world.list_components"))
+        registered = session.registered_components
         for path in sorted(item for item in registered if item.endswith("Shield") and "<" not in item):
             if len(brp.query({"data": {}, "filter": {"with": [path]}})) == 1:
                 print(f"marker:{path}")
@@ -2858,66 +3239,67 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         raise Refused(f"no view named {', '.join(missing)} in {path}")
     invocation.shot = with_overrides(shot_from_view(names[0], views[names[0]], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
     invocation.orientation = invocation.shot.orientation
-    out = args.out or tempfile.mkdtemp(prefix="hana-shot-check-")
     failures: list[str] = []
     passed: list[str] = []
     with (
-        instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
-        closing(Session(brp, args.remote)) as session,
-    ):
-        _ = session.start()
-        sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
-        today = datetime.now().strftime("%Y-%m-%d")
-        for name, final in zip(names, output_paths(out, names, hana_shot_settings=hana_shot_settings), strict=True):
-            shot = with_overrides(shot_from_view(name, views[name], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
-            invocation.shot = shot
-            invocation.orientation = shot.orientation
-            started_ns = time.time_ns()
-            try:
-                result = take(session, shot, final)
-            except (Refused, Failure, CaptureTimeout) as exc:
-                reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
-                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
-                failures.append(f"FAIL {name}: {exc}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            window = session.last_state.size if session.last_state else (0, 0)
-            try:
-                peak = brightest(result.path)
-            except Failure as exc:
-                reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns, str(exc)))
-                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
-                failures.append(f"FAIL {name}: {exc}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            if peak < hana_shot_settings.number("black_maximum"):
-                error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
-                invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
-                failures.append(f"FAIL {name}: {error}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            if result.width < 2 or result.height < 2:
-                error = f"the crop is empty ({result.width}x{result.height})"
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns, error))
-                invocation.failures.append(CaptureFailure(FailureReason.EMPTY_CROP, f"{name}: {error}"))
-                failures.append(f"FAIL {name}: {error}")
-                print(failures[-1], file=sys.stderr)
-                continue
-            timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
-            invocation.successful_timings.append(timing)
-            invocation.attempts.append({
-                **timing, "status": "success", "image_paths": [str(result.path)],
-            })
-            views[name]["verified"] = {"sha": sha, "date": today}
-            passed.append(name)
-            print(f"PASS {name} {result.width}x{result.height} {result.phases['total_ms']:.0f} ms {result.path}")
-    if passed:
-        write_views(path, views)
-    if args.out is None:
-        shutil.rmtree(out, ignore_errors=True)
+        nullcontext(args.out) if args.out is not None
+        else build_folders.tool_folder("hana-shot-check")
+    ) as out:
+        with (
+            instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
+            closing(Session(brp, args.remote)) as session,
+        ):
+            _ = session.start()
+            sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
+            today = datetime.now().strftime("%Y-%m-%d")
+            for name, final in zip(names, output_paths(str(out), names, hana_shot_settings=hana_shot_settings), strict=True):
+                shot = with_overrides(shot_from_view(name, views[name], hana_shot_settings=hana_shot_settings), args, hana_shot_settings=hana_shot_settings)
+                invocation.shot = shot
+                invocation.orientation = shot.orientation
+                started_ns = time.time_ns()
+                try:
+                    result = take(session, shot, final)
+                except (Refused, Failure, CaptureTimeout) as exc:
+                    reason = failure_reason(exc)
+                    invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
+                    invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
+                    failures.append(f"FAIL {name}: {exc}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                window = session.last_state.size if session.last_state else (0, 0)
+                try:
+                    peak = brightest(result.path)
+                except Failure as exc:
+                    reason = failure_reason(exc)
+                    invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns, str(exc)))
+                    invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
+                    failures.append(f"FAIL {name}: {exc}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                if peak < hana_shot_settings.number("black_maximum"):
+                    error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
+                    invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
+                    invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
+                    failures.append(f"FAIL {name}: {error}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                if result.width < 2 or result.height < 2:
+                    error = f"the crop is empty ({result.width}x{result.height})"
+                    invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns, error))
+                    invocation.failures.append(CaptureFailure(FailureReason.EMPTY_CROP, f"{name}: {error}"))
+                    failures.append(f"FAIL {name}: {error}")
+                    print(failures[-1], file=sys.stderr)
+                    continue
+                timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
+                invocation.successful_timings.append(timing)
+                invocation.attempts.append({
+                    **timing, "status": "success", "image_paths": [str(result.path)],
+                })
+                views[name]["verified"] = {"sha": sha, "date": today}
+                passed.append(name)
+                print(f"PASS {name} {result.width}x{result.height} {result.phases['total_ms']:.0f} ms {result.path}")
+        if passed:
+            write_views(path, views)
     print(f"hana_shot: {len(passed)} passed, {len(failures)} failed; stamped {len(passed)} in {path}", file=sys.stderr)
     return 1 if failures else 0
 
@@ -2942,7 +3324,7 @@ def add_shot_flags(parser: argparse.ArgumentParser, *,
 ) -> None:
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
-    _ = parser.add_argument("--target", help="selector: name:<Name>, marker:<type path>, tool:<Kind>[#n], entity:<id>")
+    _ = parser.add_argument("--target", help="selector: name:<Name>, marker:<type path>, tool:<Kind>[#n or #-n], entity:<id>")
     _ = parser.add_argument("--mode", choices=MODES)
     _ = parser.add_argument("--face", choices=FACES, help="target-local side to face in fit or pose; replaces --yaw/--pitch")
     _ = parser.add_argument("--yaw", type=float)
@@ -3001,6 +3383,7 @@ def arguments(argv: list[str], *,
     shot = commands.add_parser("shot", help="frame and capture one or more views")
     add_run_flags(shot)
     _ = shot.add_argument("--view", action="append", help="stored view name (repeat, or 'all')")
+    _ = shot.add_argument("--hover", metavar="SELECTOR", help="show the target's hover help before capture")
     add_shot_flags(shot, hana_shot_settings=hana_shot_settings)
 
     pose = commands.add_parser("pose", help="read or set the orbit camera pose")
@@ -3013,6 +3396,11 @@ def arguments(argv: list[str], *,
 
     targets = commands.add_parser("targets", help="list selectors that resolve right now")
     _ = targets.add_argument("--port", type=int, required=True)
+
+    locate = commands.add_parser("locate", help="print a target rectangle and a clear click point")
+    _ = locate.add_argument("--port", type=int, required=True)
+    _ = locate.add_argument("--target", required=True)
+    _ = locate.add_argument("--json", action="store_true")
 
     views = commands.add_parser("views", help="list, show, add or check stored views")
     _ = views.add_argument("action", choices=("list", "show", "add", "check"))
@@ -3049,10 +3437,6 @@ def arguments(argv: list[str], *,
     return parser.parse_args(normalized, namespace=Arguments())
 
 
-def exit_for_signal(number: int, _frame: FrameType | None) -> None:
-    EXIT_SIGNAL_LATCH.interrupt(number)
-
-
 def main(argv: list[str]) -> int:
     hana_shot_settings = conf.read("hana_shot")
     try:
@@ -3077,6 +3461,7 @@ def main(argv: list[str]) -> int:
     handlers: dict[str, Callable[[Arguments], int]] = {
         "pose": partial(command_pose, hana_shot_settings=hana_shot_settings),
         "targets": partial(command_targets, hana_shot_settings=hana_shot_settings),
+        "locate": partial(command_locate, hana_shot_settings=hana_shot_settings),
         "stats": command_stats,
         "launch": partial(command_launch, hana_shot_settings=hana_shot_settings),
         "shutdown": partial(command_shutdown, hana_shot_settings=hana_shot_settings),
@@ -3085,10 +3470,6 @@ def main(argv: list[str]) -> int:
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
     if invocation is not None and args.face is not None:
         invocation.orientation = TargetFace(args.face)
-    EXIT_SIGNAL_LATCH.reset()
-    _ = signal.signal(signal.SIGINT, exit_for_signal)
-    _ = signal.signal(signal.SIGTERM, exit_for_signal)
-    _ = signal.signal(signal.SIGHUP, exit_for_signal)
     exit_code = 1
     try:
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
@@ -3118,12 +3499,11 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
-    except ExitSignal as exc:
-        exit_code = 128 + exc.number
-        error = f"terminated by {signal.Signals(exc.number).name}"
-        print(f"hana_shot: {error}", file=sys.stderr)
-        if invocation is not None:
-            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, error))
+    except KeyboardInterrupt:
+        exit_code = 130
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, "interrupted (Ctrl-C)"))
+        raise
     except Exception as exc:
         if invocation is not None:
             invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))

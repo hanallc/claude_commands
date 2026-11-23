@@ -8,12 +8,16 @@ import unittest
 from unittest.mock import patch
 
 from scripts.message import send_budget
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def write_configs(directory: Path) -> None:
-    for name in ("send", "postmaster", "codex_daemon"):
-        source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
-        _ = (directory / source.name).write_text(source.read_text())
+    _ = write_config_fixture(directory / "send.conf",
+        "delivery_timeout=40\nkill_grace=10\nremote_transport_seconds=30\ncaller_margin_seconds=15\n"
+        + "waits_review_seconds=30\nuser_cancel_timeout=30\ncheck_timeout=20\n")
+    _ = write_config_fixture(directory / "postmaster.conf",
+                             "wait_seconds=3.0\nclaim_grace_seconds=15.0\n")
+    _ = write_config_fixture(directory / "codex_daemon.conf", "timeout_seconds=5.0\n")
 
 
 class SendBudgetTests(unittest.TestCase):
@@ -34,8 +38,8 @@ class SendBudgetTests(unittest.TestCase):
             config = Path(directory) / "send.conf"
             _ = config.write_text(config.read_text().replace("delivery_timeout=40", "delivery_timeout=120")
                                   .replace("kill_grace=10", "kill_grace=80"))
-            self.assertEqual(send_budget.user_seconds(60), 400)
-            self.assertEqual(send_budget.user_seconds(180), 460)
+            self.assertEqual(send_budget.user_seconds(60), 413)
+            self.assertEqual(send_budget.user_seconds(180), 473)
 
     def test_remote_transport_setting_changes_both_sender_budgets_without_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CONF_DIR": directory}):

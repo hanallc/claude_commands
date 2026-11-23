@@ -23,7 +23,7 @@ PYTHON_SHIM = '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["VERIFY_PYTHON_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+os.execv(os.environ["VERIFY_REAL_PY"], [os.environ["VERIFY_REAL_PY"], *sys.argv[1:]])
 '''
 
 TOOL_SETUP = '''"$CLAUDE_PYTHON" - "$@" <<'PYTHON'
@@ -61,14 +61,17 @@ class VerifyNixShellTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         scripts = self.root / "fixture scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
         self.verify_script = direct / "verify.sh"
         _ = shutil.copy2(VERIFY, self.verify_script)
+        _ = shutil.copy2(VERIFY.with_name("file_lock.sh"), direct / "file_lock.sh")
         self.verify_script.chmod(0o755)
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")
+        (scripts / "lib/conf_record.sh").symlink_to(SCRIPTS / "lib/conf_record.sh")
         (scripts / "lint").mkdir()
         _ = shutil.copy2(SCRIPTS / "lint/invoke.sh", scripts / "lint/invoke.sh")
         _ = shutil.copy2(SCRIPTS / "lib/build_folders.py", scripts / "lib/build_folders.py")
@@ -78,9 +81,14 @@ class VerifyNixShellTests(NixFixture):
         lint = self.home / ".claude/scripts/lint"
         lint.mkdir(parents=True)
         _ = (lint / "invoke.sh").write_text(TOOL_SETUP, encoding="utf-8")
+        prepare = ('if [[ ${1:-} == --prepare-temp ]]; then\n'
+                   + f'    source "{SCRIPTS / "lint/invoke.sh"}" --prepare-temp\n'
+                   + '    return $?\nfi\n')
+        _ = (scripts / "lint/invoke.sh").write_text(prepare + TOOL_SETUP, encoding="utf-8")
         self.setup_log = self.root / "verification.json"
         self.python_log = self.root / "python.jsonl"
         self.env.update({"CLAUDE_PYTHON": sys.executable,
+                         "VERIFY_REAL_PY": str(SCRIPTS / "lib/py"),
                          "VERIFY_SETUP_LOG": str(self.setup_log),
                          "VERIFY_PYTHON_LOG": str(self.python_log),
                          "VERIFY_FIXTURE_EXIT": "37"})

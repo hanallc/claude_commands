@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from scripts.agents import remote
+from scripts.lib import models_registry
+from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+
 import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
+from subprocess import run as run_fixture_zstd
 import tempfile
 import time
 import unittest
@@ -16,36 +21,30 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from scripts.lib.transcript_test_support import compressed_copy
+from typing import BinaryIO, Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import pushover
-import review
-import reply_asks
-import push_texts
-import push_reference
-from push_test_support import registered_send
-from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
+from scripts.notify import pushover
+from scripts.notify import review
+from scripts.notify import reply_asks
+from scripts.notify import push_texts
+from scripts.notify import push_reference, text_asks
+from scripts.notify.push_test_support import registered_send
+from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
+REAL_PROCESS_RUN = subprocess.run
 
-if TYPE_CHECKING:
-    from ..accounts import accounts
-    from ..production import staff
-    from ..production.update_registration_test_support import RegistrationFixture
-    from ..production.cli_fixture import production_paths
-    from ..production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
-else:
-    from scripts.accounts import accounts
-    from scripts.production import staff
-    from scripts.production.update_registration_test_support import RegistrationFixture
-    from scripts.production.cli_fixture import production_paths
-    from scripts.production.staff_test_support import (
-        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
-    )
+from scripts.accounts import accounts
+from scripts.whoami.account_test_support import create_claude_account
+from scripts.production import staff
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+)
 
 
 class VerdictJSON(TypedDict):
@@ -152,17 +151,23 @@ class LocalReviewTests(unittest.TestCase):
         notes.mkdir()
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
-        _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
-        self.assertEqual(accounts.setup("claude2"), [])
-        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
+        create_claude_account("claude2", "reviewer@example.invalid")
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
-        # Calls without an explicit fake must never start a reviewer or notifier.
-        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real process")))
+        _ = self.enterContext(mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
+        registry = write_registry(self.root / "models.conf")
+
+        def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
+                    check: bool, timeout: float = 60, input: str | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[0] != "bash" or env.get("MODELS_CONFIG_FILE") != str(registry):
+                raise AssertionError(f"unexpected process: {argv}")
+            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout,
+                                    input=input)
+
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=process))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
@@ -171,16 +176,20 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
         binary = self.root / "bin/claude"
         binary.parent.mkdir()
-        _ = binary.write_text("fake reviewer\n")
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
         binary.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
+            "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+        })))
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
 
-    def question_record(self, fields: dict[str, str], *, slug: str) -> Path:
-        folder = self.root / "proposals" / slug
+    def question_record(self, fields: dict[str, str], *, name: str) -> Path:
+        folder = self.root / "proposals" / name
         folder.mkdir(parents=True, exist_ok=True)
-        document = self.root / f"{slug}-production.md"
-        _ = document.write_text(f"# Production — {slug}\n\n- **Proposals:** `{folder}`\n")
-        owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", document))
+        document = self.root / f"{name}-production.md"
+        _ = document.write_text(f"# Production — {name}\n\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), document))
         record = folder / "question-fixture.md"
         fields = {**fields, "asked_by": owner.id}
         _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
@@ -527,6 +536,15 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIsNone(entry["sent"])
         self.assertFalse((self.root / "state/held").exists())
         self.assertFalse(pushover.LOG_FILE.exists())
+        since = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        expected = review.transcript_replies(path, since)
+
+        def codec(command: list[str], *, stdout: BinaryIO, stderr: int, check: bool) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(command[0], "zstd")
+            return run_fixture_zstd(command, stdout=stdout, stderr=stderr, check=check)
+
+        with mock.patch.object(subprocess, "run", side_effect=codec):
+            self.assertEqual(review.transcript_replies(compressed_copy(path), since), expected)
 
     def test_sample_limit_selects_recent_non_question_replies_across_transcripts(self) -> None:
         paths = [self.transcript("one.jsonl", [
@@ -563,7 +581,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Would you retry the build?"
         path = self.transcript("question.jsonl", [("2026-10-13T10:00:00Z", question, "end_turn")])
         record = self.question_record({"since": "2026-10-13T10:00", "text": question,
-                                       "question": question}, slug="demo")
+                                       "question": question}, name="demo")
         before = record.read_bytes(), record.stat().st_mtime_ns
         staff_path = Path(os.environ["STAFF_FILE"])
         _ = staff_path.write_text("{invalid")
@@ -666,7 +684,7 @@ class LocalReviewTests(unittest.TestCase):
         question = "Should handler-enh go ahead with phases 1 and 2?"
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
-                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+                  + "the shutdown unit runs the cancel once, then moves dashboard to claude 4.")
         self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
                          reply_asks.ReplyAsks((question, request), True, (choice,)))
 
@@ -752,7 +770,7 @@ class LocalReviewTests(unittest.TestCase):
                 "question": "Retry it?", "reviewed": accepted}
         current = directory / "demo.json"
         _ = current.write_text("[]")
-        record = self.question_record(item, slug="demo")
+        record = self.question_record(item, name="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
             questions = review.registered_questions(cutoff)
             assert isinstance(questions, list)
@@ -800,7 +818,7 @@ class LocalReviewTests(unittest.TestCase):
         registration.parent.mkdir(parents=True)
         item = {"since": "2026-10-13T10:00", "text": "Run check", "question": question, "reviewed": question}
         _ = registration.write_text("[]")
-        record = self.question_record(item, slug="build")
+        record = self.question_record(item, name="build")
         draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
         for closed in (False, True):
             with self.subTest(closed=closed):
@@ -1050,6 +1068,107 @@ class LocalReviewTests(unittest.TestCase):
         self.assertFalse(pushover.LOG_FILE.exists())
         self.assertFalse((self.root / "state/held").exists())
 
+    def test_texts_ask_shows_every_example_and_saves_the_ask(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "Checked {version}.", (push_texts.PushExample("first", {"version": "1"}),
+                                   push_texts.PushExample("second", {"version": "2"})), purpose="Test.")
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+              mock.patch.object(review, "texts", side_effect=AssertionError("review ran")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+        self.assertIn("Checked 1.", output.getvalue())
+        self.assertIn("Checked 2.", output.getvalue())
+        path = self.root / "state/text-asks/w1:p2.json"
+        ask = cast(dict[str, str], json.loads(path.read_text()))
+        self.assertEqual((ask["text_id"], ask["session"], ask["fingerprint"]),
+                         (entry.id, "session-1", push_texts.fingerprint(entry)))
+        self.assertIsNotNone(datetime.fromisoformat(ask["time"]).tzinfo)
+
+    def test_texts_ask_and_approval_review_show_a_one_line_text_as_posted(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "codex1 has {left} left", push_texts.NoActionNeeded(), "",
+            (push_texts.PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+        self.assertEqual(output.getvalue(), "test/typical\nTitle: none (the phone shows the app name)\ncodex1 has 1% left\n")
+        reviewed: list[review.Draft] = []
+
+        def judge(draft: review.Draft, *_args: object, **_kwargs: object) -> review.ReviewOutcome:
+            reviewed.append(draft)
+            return review.Unreviewed("fixture")
+
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(review, "_review", side_effect=judge), redirect_stdout(io.StringIO())):
+            _ = review.texts(["test"], approve=False)
+        self.assertEqual([(draft.title, draft.body) for draft in reviewed], [("", "codex1 has 1% left")])
+
+    def test_texts_ask_clears_the_previous_request_if_the_save_fails(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("example", {}),), purpose="Test.")
+        pane, session = "w1:p2", "session-1"
+        text_asks.open_ask("previous", "previous-digest", session, pane, datetime.now(timezone.utc))
+        path = self.root / "state/text-asks/w1:p2.json"
+        self.assertTrue(path.exists())
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+              mock.patch.object(text_asks, "write_text_atomic", side_effect=OSError("save failed")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("save failed", error.getvalue())
+        self.assertFalse(path.exists())
+
+    def test_texts_ask_requires_a_herdr_pane_and_a_session_id(self) -> None:
+        for pane, session in (("", "session-1"), ("w1:p2", "")):
+            with (self.subTest(pane=pane, session=session),
+                  mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+                  redirect_stderr(io.StringIO()) as output):
+                self.assertEqual(review.main(["texts", "--ask", "--id", "test"]), 2)
+                self.assertIn("requires a herdr pane and a Claude session ID", output.getvalue())
+
+    def test_texts_approves_a_matching_user_prompt_and_reviews_a_changed_text(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("first", {}), push_texts.PushExample("second", {})),
+            purpose="Test.")
+        pane, session, words = "w1:p2", "session-1", "yes i approve it"
+        now = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        digest = push_texts.fingerprint(entry)
+        config = self.root / "ask-config"
+        config.mkdir()
+        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config),
+                                         "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause")}),
+              mock.patch.object(text_asks, "read_pane",
+                                return_value={"focused": True, "agent_session": {"value": session}})):
+            text_asks.open_ask(entry.id, digest, session, pane, now - timedelta(seconds=1))
+            self.assertIsInstance(text_asks.answer(session, pane, words, True, now), text_asks.Approved)
+
+        approvals = self.root / "reviewed.json"
+        changed = replace(entry, title="All checks finished")
+        changed_draft = review.Draft("script", "0", changed.title, NoActionRequired(), changed.body, False)
+        runner = FakeReviewer(verdict(changed_draft))
+        with (mock.patch.object(push_texts, "REVIEWED_FILE", approvals),
+              mock.patch.object(push_texts, "catalog", return_value=(entry,)) as catalog,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+            self.assertFalse(runner.calls)
+            self.assertIn(words, output.getvalue())
+            saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+            self.assertEqual(set(saved[entry.id]), {"first", "second"})
+            for approval in saved[entry.id].values():
+                self.assertEqual(approval, {"sha256": digest, "time": now.isoformat(), "objections": [],
+                    "reviewer": f"user-prompt: {words} ({session}, {now.isoformat()})"})
+
+            catalog.return_value = (changed,)
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+        self.assertEqual(len([item for item in runner.calls if Path(item.argv[0]).name == "claude"]), 2)
+        saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+        for approval in saved[entry.id].values():
+            self.assertEqual(approval["sha256"], push_texts.fingerprint(changed))
+            self.assertFalse(approval["reviewer"].startswith("user-prompt:"))
+
     def test_user_spec_approves_original_text_and_keeps_ask_objections_and_existing_approvals(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner remote-control is off",
             push_texts.ActionTemplate("run /remote-control"), "Reason: Remote control is off.",
@@ -1277,7 +1396,7 @@ class LocalReviewTests(unittest.TestCase):
             {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
 
     def test_a_body_that_gives_a_second_action_fails_push_one_action(self) -> None:
-        action = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+        action = ActionRequired("On natedev, in the tile pane, type: Go: run the refused command")
         draft = review.Draft("writer one", "1", "tile waits for you", action,
                              "Auto mode refused 1 command in tile. Type ! kill -TERM -3137969 in the cargo-liner session.", True)
         result = review.validate(verdict(draft), draft, False)
@@ -1385,6 +1504,28 @@ class LocalReviewTests(unittest.TestCase):
                 assert isinstance(result, review.Unreviewed)
                 self.assertTrue(result.why)
 
+    def test_model_program_and_model_name_errors_keep_the_review_unavailable_text(self) -> None:
+        result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft), failure="missing"))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: claude unavailable")
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft)))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: no model alias")
+
+    def test_structured_call_returns_runner_and_model_name_errors_as_model_unavailable(self) -> None:
+        def broken(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            del argv, timeout, env
+            raise PermissionError("claude is not executable")
+
+        def call(runner: review.ProcessRunner) -> review.StructuredOutcome:
+            return review.structured_call(runner, Path("claude"), {}, model="opus", effort="high", system_prompt="",
+                                          schema={}, prompt="", deadline=time.monotonic() + 60).outcome
+
+        self.assertEqual(call(broken), review.ModelUnavailable("claude is not executable"))
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            self.assertEqual(call(FakeReviewer(verdict(self.draft))), review.ModelUnavailable("no model alias"))
+
     def test_unexpected_review_faults_send_the_original_push(self) -> None:
         keys = self.root / "keys"
         _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
@@ -1459,11 +1600,34 @@ class LocalReviewTests(unittest.TestCase):
         self.assertTrue(all(0 < call.timeout <= 60 for call in runner.calls))
 
     def test_unresolved_registry_uses_opus_medium(self) -> None:
-        runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
-        _ = review.review(self.draft, False, runner=runner)
-        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
-        self.assertEqual(command[command.index("--model") + 1], "opus")
-        self.assertEqual(command[command.index("--effort") + 1], "medium")
+        registry = write_registry(self.root / "models.conf")
+        caller = claude_catalog_environment(self.root / "caller-review", {"opus": "claude-opus-caller-fixture"})
+        binary = self.root / "bin/claude"
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+        catalog = accounts.account_dir("claude2") / "cache/model-catalog/fixture-cc.json"
+        catalog.parent.mkdir(parents=True)
+        for target in ("opus", "claude-opus-fixture"):
+            with self.subTest(target=target), mock.patch.dict(os.environ, {
+                **caller,
+                "MODELS_CONFIG_FILE": str(registry),
+                "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+            }):
+                if target != "opus":
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"opus": {"default": target}},
+                        "models": [{"id": target, "min_claude_code_version": "2.1.319"}],
+                    }}}))
+                runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
+
+                def process(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    if argv[0] == "bash":
+                        return REAL_PROCESS_RUN(argv, timeout=timeout, env=env, capture_output=True, text=True, check=False)
+                    return runner(argv, timeout=timeout, env=env)
+
+                _ = review.review(self.draft, False, runner=process)
+                command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
+                self.assertEqual(command[command.index("--model") + 1], target)
+                self.assertEqual(command[command.index("--effort") + 1], "medium")
 
     def test_setup_and_reviewer_share_one_configured_budget_read_once(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
@@ -1504,14 +1668,12 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
-        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
-        self.assertEqual(accounts.setup("claude3"), [])
+        create_claude_account("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
-        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
+        with (mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)
-        select.assert_called_once_with("unit")
+        select.assert_called_once_with("units")
         self.assertEqual(result.metadata.account, "claude3")
         for call in runner.calls:
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(directory))

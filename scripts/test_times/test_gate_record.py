@@ -4,23 +4,23 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from datetime import UTC, datetime
+import gzip
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
-import sys
 import tempfile
 from typing import cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.test_times import gate_record
-from scripts.buildlog import record, store
+from scripts.buildlog import index, record, store
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
-from scripts.test_times.gate_record_test_support import gate_run, module_times
+from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, module_times
 
 
 class GateRecordTests(unittest.TestCase):
@@ -42,6 +42,81 @@ class GateRecordTests(unittest.TestCase):
         }))
         _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5")
 
+    def test_time_limits_use_passing_history_on_the_same_vcpu_count(self) -> None:
+        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        rows = [("a", 8, 0, 0, "full", 10), ("b", 8, 0, 0, "full", 20),
+                ("c", 8, 0, 0, "full", 30), ("d", 8, 1, 0, "full", 1000),
+                ("e", 16, 0, 0, "full", 1000), ("f", 8, 0, 1, "full", 1000),
+                ("g", 8, 0, 0, "affected", 1000), ("h", 8, 0, 0, "reused", 1000),
+                ("i", 8, 0, 0, "subset", 1)]
+        for identity, vcpus, status, aborted, selection, seconds in rows:
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'gate', ?, ?, ?, ?, ?, 2, 1)""",
+                (identity, identity, vcpus, status, aborted, selection, seconds)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(40))
+        self.assertIsInstance(gate_record.history_time_limit(connection, 4, (), 2, False), gate_record.NoGateTimeLimit)
+        for run, suite, module, seconds, status in (
+                ("a", "lib", "test_a.py", 6, 0), ("b", "lib", "test_a.py", 10, 0),
+                ("c", "lib", "test_a.py", 8, 0), ("c", "lib", "test_b.py", 7, 0),
+                ("c", "lib", "nested/test_c.py", 6, 0), ("e", "lib", "test_b.py", 999, 0),
+                ("d", "lib", "test_b.py", 999, 0), ("c", "lib", "test_bad.py", 999, 1)):
+            connection.execute("""INSERT INTO gate_modules (run_id, suite, module, attempt, wall_s, status, restart)
+                                VALUES (?, ?, ?, 1, ?, ?, '')""", (run, suite, module, seconds, status)).close()
+        modules = ["scripts/lib/test_a.py", "scripts/lib/test_b.py", "scripts/lib/nested/test_c.py"]
+        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 2, True), gate_record.GateTimeLimit(21))
+        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 8, True), gate_record.GateTimeLimit(16))
+        self.assertIsInstance(gate_record.history_time_limit(connection, 8, ["lib/test_bad.py"], 2, True), gate_record.NoGateTimeLimit)
+        for missing in (["lib/test_missing.py"], ["lib/test_missing.py", "lib/test_other.py"]):
+            with self.subTest(missing=missing):
+                self.assertIsInstance(gate_record.history_time_limit(connection, 8, [*modules, *missing], 2, True),
+                                      gate_record.NoGateTimeLimit)
+        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=3")
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
+
+    def test_full_time_limit_uses_only_runs_with_the_same_job_count(self) -> None:
+        """A 16-job run on natedev never takes its limit from 32-job cloud runs on the same vCPU count."""
+        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        for identity, jobs, seconds in (("a", 32, 210), ("b", 32, 212), ("c", 32, 209)):
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, ?, 790)""",
+                (identity, identity, seconds, jobs)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 32, False), gate_record.GateTimeLimit(315))
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+            "no passing full gate history for 32 vCPUs at 16 jobs"))
+        connection.execute("""INSERT INTO gate_runs
+            (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+            VALUES ('d', 'd', 'gate', 32, 0, 0, 'full', 420, 16, 790)""").close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(630))
+
+    def test_full_time_limit_skips_runs_of_the_type_check_alone(self) -> None:
+        """Five passing --full runs of the type check alone set a 175 s limit that cut the 11-15 nightly."""
+        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        for identity, seconds, modules_run in (("a", 600, 790), ("b", 117, 0), ("c", 104, 0), ("d", 127, 0)):
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'gate', 32, 0, 0, 'full', ?, 16, ?)""",
+                (identity, identity, seconds, modules_run)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(900))
+        connection.execute("DELETE FROM gate_runs WHERE id = 'a'").close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+            "no passing full gate history for 32 vCPUs at 16 jobs"))
+
     def write_json(self, value: object) -> None:
         _ = self.timing_path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -51,6 +126,28 @@ class GateRecordTests(unittest.TestCase):
         if not isinstance(result, gate_record.NoModuleTimes):
             self.fail("Invalid timing output must return NoModuleTimes")
         self.assertTrue(result.reason.strip(), "A missing result must explain the failure")
+
+    def test_config_reads_preserve_empty_records_and_missing_records(self) -> None:
+        for field in ("config_reads", "folder_scans", "content_reads"):
+            values = [["z", "a", "z"], [], None]
+            if field == "folder_scans":
+                values.append([".", "/", "scripts/", "docs", "scripts/"])
+            for reads in values:
+                with self.subTest(field=field, reads=reads):
+                    value: dict[str, object] = dict(module_times())
+                    if reads is not None:
+                        value[field] = reads
+                    self.write_json(value)
+                    times = gate_record.read_module_times(self.timing_path)
+                    self.assertNotIsInstance(times, gate_record.NoModuleTimes)
+                    assert not isinstance(times, gate_record.NoModuleTimes)
+                    execution = gate_record.Execution("suite", "test_fixture.py", 1, 1, 1, 0, "", times, "")
+                    row = gate_record.module_runs([execution], 0)[0]
+                    if reads is None:
+                        self.assertNotIn(field, row)
+                    else:
+                        self.assertEqual(times.get(field), sorted(set(reads)))
+                        self.assertEqual(row.get(field), sorted(set(reads)))
 
     def test_valid_module_and_empty_module_preserve_the_runner_data(self) -> None:
         populated = module_times()
@@ -144,23 +241,38 @@ class GateRecordTests(unittest.TestCase):
         times.update(tests_run=7, errors=2, skipped=3)
         executions = [
             gate_record.Execution("hooks", "test_a.py", 4.0, 2.0, 12.0, -15, "hold",
-                                  gate_record.NoModuleTimes("runner stopped")),
-            gate_record.Execution("notify", "test_a.py", 5.0, 3.0, 13.0, 1, "", times),
+                                  gate_record.NoModuleTimes("runner stopped"), "", wall_clock=gate_record.WallClockSpan(1.0, 5.0)),
+            gate_record.Execution("notify", "test_a.py", 5.0, 3.0, 13.0, 1, "", times, "",
+                                  wall_clock=gate_record.WallClockSpan(2.0, 7.0)),
             gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 6.0, 4.0, 14.0, 0, "",
-                                  gate_record.TimingNotApplicable()),
-            gate_record.Execution("hooks", "test_a.py", 7.0, 5.0, 15.0, 0, "", times),
-            gate_record.Execution("notify", "test_b.py", 8.0, 6.0, 16.0, 0, "", times),
-            gate_record.Execution("notify", "test_a.py", 9.0, 7.0, 17.0, 0, "", times),
+                                  gate_record.TimingNotApplicable(), "", wall_clock=gate_record.WallClockSpan(3.0, 9.0)),
+            gate_record.Execution("hooks", "test_a.py", 7.0, 5.0, 15.0, 0, "", times, "",
+                                  wall_clock=gate_record.WallClockSpan(4.0, 11.0)),
+            gate_record.Execution("notify", "test_b.py", 8.0, 6.0, 16.0, 0, "", times, "",
+                                  wall_clock=gate_record.WallClockSpan(5.0, 13.0)),
+            gate_record.Execution("notify", "test_a.py", 9.0, 7.0, 17.0, 0, "", times, "",
+                                  wall_clock=gate_record.WallClockSpan(6.0, 15.0)),
+            gate_record.Execution("notify", "test_legacy.py", 1.0, 0.5, 10.0, 0, "", times, "",
+                                  wall_clock=gate_record.WallClockNotRecorded("not recorded")),
         ]
         modules = gate_record.module_runs(executions, 1.25)
         self.assertEqual(gate_record.module_runs([], 1.25), [])
-        self.assertEqual([row["attempt"] for row in modules], [1, 1, 1, 2, 1, 2])
+        self.assertEqual([row["attempt"] for row in modules], [1, 1, 1, 2, 1, 2, 1])
         self.assertEqual(len(modules), len(executions))
         for execution, row in zip(executions, modules, strict=True):
             self.assertEqual((row["suite"], row["module"], row["wall_s"], row["cpu_s"],
                               row["peak_mib"], row["status"], row["restart"]),
                              (execution.suite, execution.module, execution.wall_s, execution.cpu_s,
                               execution.peak_mib, execution.status, execution.restart))
+        self.assertEqual(
+            [(row.get("started_at"), row.get("ended_at")) for row in modules],
+            [(store.utc_iso(job.wall_clock.started_at), store.utc_iso(job.wall_clock.ended_at))
+             if isinstance(job.wall_clock, gate_record.WallClockSpan) else (None, None) for job in executions],
+        )
+        self.assertEqual(modules[0].get("started_at"), "1970-01-01T00:00:01.000Z")
+        self.assertEqual(modules[0].get("ended_at"), "1970-01-01T00:00:05.000Z")
+        self.assertNotIn("started_at", modules[6])
+        self.assertNotIn("ended_at", modules[6])
         for index in (1, 3, 4, 5):
             row = modules[index]
             self.assertEqual((row["tests_run"], row["failures"], row["errors"], row["skipped"], row["tests_s"]),
@@ -183,8 +295,8 @@ class GateRecordTests(unittest.TestCase):
     def test_gate_write_appends_complete_records_in_the_host_month(self) -> None:
         run = gate_run()
         before = datetime.now(UTC).timestamp()
-        gate_record.write_gate_run(run)
-        gate_record.write_gate_run(run)
+        gate_record.write_gate_run(run, fixture_executions(run))
+        gate_record.write_gate_run(run, fixture_executions(run))
         after = datetime.now(UTC).timestamp()
         paths = list(self.buildlog.glob("*/*.jsonl"))
         self.assertTrue(paths, "The writer must append to the fixture build log")
@@ -223,17 +335,18 @@ class GateRecordTests(unittest.TestCase):
         other["tests_run"] = 7
         run = gate_run()
         run["slow_test_s"] = threshold
-        run["modules"] = gate_record.module_runs([
-            gate_record.Execution("tools", "test_a.py", 3.0, 2.0, 12.0, 143, "hold", first),
-            gate_record.Execution("tools", "test_a.py", 4.0, 3.0, 13.0, 0, "", retry),
-            gate_record.Execution("tools", "test_b.py", 5.0, 4.0, 14.0, 0, "", other),
+        executions = [
+            gate_record.Execution("tools", "test_a.py", 3.0, 2.0, 12.0, 143, "hold", first, "held output"),
+            gate_record.Execution("tools", "test_a.py", 4.0, 3.0, 13.0, 0, "", retry, ""),
+            gate_record.Execution("tools", "test_b.py", 5.0, 4.0, 14.0, 0, "", other, ""),
             gate_record.Execution("tools", "test_missing.py", 1.0, 0.5, 10.0, 1, "",
-                                  gate_record.NoModuleTimes("runner stopped")),
+                                  gate_record.NoModuleTimes("runner stopped"), "runner stopped without timing output"),
             gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 2.0, 1.0, 11.0, 0, "",
-                                  gate_record.TimingNotApplicable()),
-        ], threshold)
+                                  gate_record.TimingNotApplicable(), ""),
+        ]
+        run["modules"] = gate_record.module_runs(executions, threshold)
         _ = write_config_fixture(config, "SLOW_TEST_S=1.25")
-        gate_record.write_gate_run(run)
+        gate_record.write_gate_run(run, executions)
         entries = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
         self.assertEqual(len(entries), 1)
         entry = entries[0]
@@ -242,11 +355,59 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(entry["modules"], run["modules"])
         self.assertEqual([test["test"] for test in run["modules"][0]["tests"]],
                          ["Example.test_pass", "Example.test_fail"])
+        for module in run["modules"]:
+            if module["module"] == "test_missing.py":
+                kept = gzip.decompress((self.buildlog / module["log"]).read_bytes())
+                self.assertEqual(kept, b"Cut 0 bytes from the start of this output.\nrunner stopped without timing output")
+            else:
+                self.assertEqual(module["log"], "")
+
+    def test_failure_log_limit_reads_config_at_each_write_and_keeps_the_tail(self) -> None:
+        output = ("earlier output π\n" * 400) + "last traceback line\n"
+        encoded = output.encode("utf-8")
+        sizes: list[int] = []
+        for kib in (1, 2):
+            with self.subTest(kib=kib):
+                _ = write_config_fixture(self.config / "test_times.conf", f"GATE_FAILURE_LOG_KIB={kib}")
+                executions = [gate_record.Execution("tools", "nested/test_failure.py", 1.0, 0.5, 10.0, 1, "",
+                                                     gate_record.NoModuleTimes("runner stopped"), output)]
+                run = gate_run()
+                run["modules"] = gate_record.module_runs(executions, 0.5)
+                gate_record.write_gate_run(run, executions)
+                kept = gzip.decompress((self.buildlog / run["modules"][0]["log"]).read_bytes())
+                header, tail = kept.split(b"\n", 1)
+                self.assertEqual(header, f"Cut {len(encoded) - len(tail)} bytes from the start of this output.".encode())
+                self.assertEqual(len(tail), kib * 1024)
+                self.assertTrue(encoded.endswith(tail))
+                self.assertTrue(tail.endswith(b"last traceback line\n"))
+                self.assertLessEqual(len(kept), kib * 1024 + len(header) + 1)
+                sizes.append(len(tail))
+        self.assertGreater(sizes[1], sizes[0])
+
+    def test_log_write_failure_keeps_the_gate_record_and_verdict(self) -> None:
+        blocked = self.buildlog / "fixture-host" / store.LOGS_DIR
+        blocked.parent.mkdir(parents=True)
+        _ = blocked.write_text("This file blocks the log directory.\n")
+        executions = [gate_record.Execution("tools", "test_failure.py", 1.0, 0.5, 10.0, 1, "",
+                                             gate_record.NoModuleTimes("runner stopped"), "failed module output")]
+        run = gate_run()
+        run["modules"] = gate_record.module_runs(executions, 0.5)
+        stderr = io.StringIO()
+        with mock.patch.object(store, "host_name", return_value="fixture-host"), redirect_stderr(stderr):
+            gate_record.write_gate_run(run, executions)
+        entries = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], 1)
+        self.assertEqual(entries[0]["modules"], run["modules"])
+        self.assertEqual(run["modules"][0]["log"], "")
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1, stderr.getvalue())
+        self.assertIn("gate run not written:", stderr.getvalue())
 
     def test_gate_write_failure_reports_one_line_and_returns(self) -> None:
         _ = self.buildlog.write_text("This file blocks the output directory.\n", encoding="utf-8")
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            gate_record.write_gate_run(gate_run())
+            run = gate_run()
+            gate_record.write_gate_run(run, fixture_executions(run))
         self.assertEqual(len(stderr.getvalue().splitlines()), 1, stderr.getvalue())
         self.assertTrue(stderr.getvalue().strip())

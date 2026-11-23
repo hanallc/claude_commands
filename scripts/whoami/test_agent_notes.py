@@ -17,30 +17,29 @@ from dataclasses import dataclass, field
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import Self, cast, override
 from unittest.mock import ANY, MagicMock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib import conf
 from scripts.whoami.note_file import note_name
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
-import codex_pacer
-import five_hour
-import quota_alert
+from scripts.whoami import codex_pacer
+from scripts.whoami import five_hour
+from scripts.whoami import quota_alert
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLimits, Quota, Report,
                             codex_credits, reset_credits)
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
+from scripts.whoami.notes_state_test_support import private_notes_state
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
@@ -101,7 +100,7 @@ class AgentNotesTests(unittest.TestCase):
         self.root = Path(directory.name)
         _ = self.enterContext(scratch_accounts_config())
         self.job_config = self.root / "agent_notes.toml"
-        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\n")
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\ncodex_interval_seconds = 1800\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"), "AGENT_NOTES_JOB_CONFIG": str(self.job_config),
@@ -111,10 +110,10 @@ class AgentNotesTests(unittest.TestCase):
         _ = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
-        _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
+        _ = self.enterContext(private_notes_state(self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
-        _ = self.enterContext(patch("sessions.live_sessions", return_value=[]))
+        _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
@@ -379,7 +378,7 @@ class AgentNotesTests(unittest.TestCase):
             clock.set_time(self.now + timedelta(seconds=150))
             agent_notes.usage_only()
             self.assertEqual(http.call_count, 1)
-            _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 30\n")
+            _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 30\ncodex_interval_seconds = 1800\n")
             agent_notes.usage_only()
         self.assertEqual(http.call_count, 2)
 
@@ -407,6 +406,25 @@ class AgentNotesTests(unittest.TestCase):
             clock.set_time(self.now + timedelta(seconds=209.9))
             agent_notes.usage_only()
             self.assertEqual(http.call_count, 2)
+
+    def test_usage_only_reads_a_codex_home_on_its_own_interval_less_the_poll_allowance(self) -> None:
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 120\ncodex_interval_seconds = 600\n")
+        home = self.root / ".codex2"
+        with (self.live_usage_reader() as (clock, http),
+              patch.object(agent_accounts, "codex_homes", return_value=[home]),
+              patch.object(agent_accounts, "codex_live", return_value=Report("Codex", source=CodexHomeSource(home))) as codex):
+            for seconds, claude_reads, codex_reads in (
+                (0, 1, 1),
+                (104.9, 1, 1),
+                (105, 2, 1),
+                (584.9, 3, 1),
+                (585, 3, 2),
+            ):
+                with self.subTest(seconds=seconds):
+                    clock.set_time(self.now + timedelta(seconds=seconds))
+                    agent_notes.usage_only(poll_seconds=30)
+                    self.assertEqual(http.call_count, claude_reads)
+                    self.assertEqual(codex.await_args_list, [call(home)] * codex_reads)
 
     def test_usage_only_selection_failure_does_not_delay_the_next_read(self) -> None:
         directory = self.root / "state/agent-notes/usage-only"
@@ -581,11 +599,14 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(times[str(self.root / ".claude2")], (self.now + timedelta(seconds=179.9)).timestamp())
 
     def test_usage_only_refuses_missing_or_invalid_interval_with_file_and_key(self) -> None:
-        for text in ("", "[mac_usage]\n", "mac_usage = 60", "[mac_usage]\ninterval_seconds = 0",
-                     "[mac_usage]\ninterval_seconds = -1", "[mac_usage]\ninterval_seconds = true",
-                     '[mac_usage]\ninterval_seconds = "60"', "[mac_usage]\ninterval_seconds = nan",
-                     "[mac_usage]\ninterval_seconds = inf", "[mac_usage",
-                     "[mac_usage]\ninterval_seconds = " + "9" * 400):
+        cases = [(text, "interval_seconds") for text in ("", "[mac_usage]\n", "mac_usage = 60", "[mac_usage")]
+        for key, valid in (("interval_seconds", "codex_interval_seconds = 1800"),
+                           ("codex_interval_seconds", "interval_seconds = 120")):
+            base = f"[mac_usage]\n{valid}\n"
+            cases.append((base, key))
+            cases.extend((f"{base}{key} = {value}", key)
+                         for value in ("0", "-1", "true", '"60"', "nan", "inf", "9" * 400))
+        for text, key in cases:
             with self.subTest(config=text):
                 _ = self.job_config.write_text(text)
                 with (patch.object(sys, "argv", ["agent_notes.py", "usage-only"]),
@@ -593,7 +614,7 @@ class AgentNotesTests(unittest.TestCase):
                       self.assertRaises(SystemExit) as refusal):
                     agent_notes.main()
                 self.assertEqual(str(refusal.exception),
-                    f"{self.job_config}: mac_usage.interval_seconds must be a finite positive number")
+                    f"{self.job_config}: mac_usage.{key} must be a finite positive number")
                 read.assert_not_called()
                 self.assertFalse((self.root / "state/agent-notes/usage-only").exists())
         self.job_config.unlink()
@@ -901,8 +922,8 @@ class AgentNotesTests(unittest.TestCase):
         self.rows.return_value = session_table.ReadSessions({"claude1": (row,)}, frozenset())
         _ = self.snapshot([])
         notes = {current.label: current for current in note_file.read_notes()}
-        self.assertEqual(notes["claude1"].get_list("role"), ("showrunner", "unit"))
-        self.assertIn("role:\n  - showrunner\n  - unit\n", note.path.read_text())
+        self.assertEqual(notes["claude1"].get_list("role"), ("showrunner", "unit", "producer"))
+        self.assertIn("role:\n  - showrunner\n  - unit\n  - producer\n", note.path.read_text())
         self.assertEqual(notes["codex2"].get_list("role"), ("worker",))
         self.assertIn("role: []", notes["claude2"].text)
         self.assertTrue(all(current.get("state") is None for current in notes.values()))
@@ -1098,10 +1119,7 @@ class AgentNotesTests(unittest.TestCase):
 
     def test_notes_pass_shares_process_scan_without_changing_outputs_or_decisions(self) -> None:
         from scripts.accounts import unit_watchdog
-        if TYPE_CHECKING:
-            from scripts.herdr import herdr
-        else:
-            import herdr
+        from scripts.herdr import herdr
         proc = self.root / "proc"
         proc.mkdir()
         home = self.root / ".codex"
@@ -1124,7 +1142,7 @@ class AgentNotesTests(unittest.TestCase):
             events.append("refusal")
             return ["fixture refusal decision", *unit_watchdog.run(self.now, dry_run=False)]
         with (patch.object(sys, "argv", ["agent_notes.py"]),
-              patch.object(herdr, "_proc_root", return_value=proc),
+              patch.object(herdr, "proc_root", return_value=proc),
               patch.object(herdr, "_process_sessions", wraps=herdr._process_sessions) as scans,  # pyright: ignore[reportPrivateUsage]
               patch.object(agent_notes, "live_reports", return_value=[report]) as reports,
               patch.object(agent_notes, "resolve_workers_home", return_value=home),
@@ -1354,22 +1372,21 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
-        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
+        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedWorkerUnknown())
 
-    def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
-        command = "codex_mesh follow --to impl --prompt 'finish the patch'"
+    def test_blocked_cli_converts_stopped_worker_at_the_argument_boundary(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
               patch.object(agent_notes, "blocked", return_value=[]) as blocked,
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         blocked.assert_called_once()
         self.assertEqual(blocked.call_args.kwargs["stopped"],
-                         quota_alert.StoppedWorkerCommand("own-director", "impl", command))
+                         quota_alert.StoppedWorker("own-director", "impl"))
 
     def test_blocked_cli_rejects_incomplete_stopped_context_before_reporting(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
-                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director"]),
               patch.object(agent_notes, "blocked") as blocked,
               redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
             agent_notes.main()
@@ -2211,15 +2228,15 @@ class ResetTimeTests(unittest.TestCase):
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc)))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00-07:00"))
         self.assertFalse(agent_notes.still_ahead("2000-01-01T00:00:00-07:00"))
-        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00", now=self.now))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00", now=self.now))
+        self.assertTrue(note_file.ahead("2099-01-01T00:00:00+09:00", now=self.now))
+        self.assertFalse(note_file.ahead("2000-01-01T00:00:00+09:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00-07:00"),
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)))
 
     def test_a_reset_written_before_the_offset_is_read_in_the_machines_zone(self) -> None:
         self.assertEqual(note_file.reset_time("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3).astimezone()))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00"))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00", now=self.now))
+        self.assertFalse(note_file.ahead("2000-01-01T00:00:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3)))
 
     def test_an_absent_or_unreadable_reset_names_the_reason(self) -> None:
@@ -2228,7 +2245,7 @@ class ResetTimeTests(unittest.TestCase):
                 self.assertIsInstance(note_file.reset_time(value),
                                       note_file.InvalidReset if value == "soon" else note_file.NoResetKnown)
                 self.assertFalse(agent_notes.still_ahead(value))
-                self.assertFalse(quota_alert.ahead(value, now=self.now))
+                self.assertFalse(note_file.ahead(value, now=self.now))
 
 
 if __name__ == "__main__":

@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import treekey
-from test_index import use_test_log
+from scripts.buildlog import treekey
+from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
@@ -113,7 +113,7 @@ class TreeKeyTests(unittest.TestCase):
         source = self.repo / "src" / "new.rs"
         _ = source.write_text("pub fn two() {}\n")
         self.assertNotEqual(key(self.repo), self.clean)
-        with patch("treekey.open", side_effect=FileNotFoundError("file removed")) as read:
+        with patch("scripts.buildlog.treekey.open", side_effect=FileNotFoundError("file removed")) as read:
             self.assertIsNone(treekey.tree_key(str(self.repo)))
         read.assert_called_once_with(os.fsencode(source), "rb")
 
@@ -122,7 +122,7 @@ class TreeKeyTests(unittest.TestCase):
         link.unlink()
         link.symlink_to("src/lib.rs")
         self.assertNotEqual(key(self.repo), self.clean)
-        with patch("treekey.os.readlink", side_effect=OSError("link replaced")) as read:
+        with patch("scripts.buildlog.treekey.os.readlink", side_effect=OSError("link replaced")) as read:
             self.assertIsNone(treekey.tree_key(str(self.repo)))
         read.assert_called_once_with(os.fsencode(link))
 
@@ -136,6 +136,42 @@ class TreeKeyTests(unittest.TestCase):
         self.assertEqual(key(self.repo), self.clean)
         self.assertEqual(index.stat().st_mtime_ns, before)
         self.assertFalse((self.repo / ".git" / "index.lock").exists())
+
+    def test_a_key_without_checkout_programs_runs_no_hook_or_filter(self) -> None:
+        marks = self.base / "marks"
+        marks.mkdir()
+        for name, end in (("fsmonitor", "exit 1"), ("filter", "cat")):
+            script = self.base / name
+            _ = script.write_text(f'#!/bin/sh\ntouch "{marks}/{name}"\n{end}\n')
+            script.chmod(0o755)
+        _ = git("config", "core.fsmonitor", str(self.base / "fsmonitor"), cwd=self.repo)
+        _ = git("config", "filter.marker.clean", str(self.base / "filter"), cwd=self.repo)
+        _ = git("config", "filter.marker.required", "true", cwd=self.repo)
+        _ = (self.repo / ".gitattributes").write_text("README filter=marker\n")
+        # A new mtime makes git status compare the file content, which runs the clean filter.
+        os.utime(self.repo / "README", (1, 1))
+        untrusted = treekey.tree_key(str(self.repo), checkout_programs=False)
+        self.assertEqual(list(marks.iterdir()), [])
+        self.assertEqual(untrusted, key(self.repo))
+        self.assertEqual(sorted(path.name for path in marks.iterdir()), ["filter", "fsmonitor"])
+        # A driver name with = no longer stops the key: the environment keeps the key and the value apart.
+        _ = git("config", "filter.a=b.clean", str(self.base / "filter"), cwd=self.repo)
+        self.assertEqual(treekey.tree_key(str(self.repo), checkout_programs=False), untrusted)
+
+    def test_a_key_without_checkout_programs_does_not_read_submodule_work_trees(self) -> None:
+        _ = git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(self.clone), "sub", cwd=self.repo)
+        _ = git("commit", "-q", "-m", "submodule", cwd=self.repo)
+        marks = self.base / "marks"
+        marks.mkdir()
+        script = self.base / "fsmonitor"
+        _ = script.write_text(f'#!/bin/sh\ntouch "{marks}/fsmonitor"\nexit 1\n')
+        script.chmod(0o755)
+        _ = git("config", "core.fsmonitor", str(script), cwd=self.repo / "sub")
+        _ = git("config", "filter.marker.clean", str(script), cwd=self.repo / "sub")
+        _ = (self.repo / "sub" / ".gitattributes").write_text("README filter=marker\n")
+        os.utime(self.repo / "sub" / "README", (1, 1))
+        self.assertIsNotNone(treekey.tree_key(str(self.repo), checkout_programs=False))
+        self.assertEqual(list(marks.iterdir()), [])
 
     def test_no_key_outside_git_or_before_a_commit(self) -> None:
         elsewhere = self.base / "elsewhere"

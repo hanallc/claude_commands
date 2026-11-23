@@ -21,18 +21,22 @@ from datetime import datetime
 from typing import NotRequired, TypedDict, cast
 from urllib.parse import quote
 
-import health
-import record
-import store
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog.transfer_bytes import (
+    TransferBytes as TransferBytes,
+    TransferLedger as TransferLedger,
+    NoRunTransfers as NoRunTransfers,
+    active_transfers as active_transfers,
+    measure_transfers as measure_transfers,
+)
 
-import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
-from atomic_file import write_text_atomic
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-from target_config import SshTarget, read_targets
-import conf
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_targets.target_config import SshTarget, read_targets
+from scripts.lib import conf
 
 REMOTE_ROOT = ".local/state/buildlog/"
 LOCK_NAME = "sync.lock"
@@ -44,30 +48,34 @@ class SyncRecord(TypedDict):
     ok: bool
     last_ok: str | None
     last_failure: NotRequired[str]
+    transfers: NotRequired[list[TransferBytes]]
 
 
 @dataclass(frozen=True)
 class SyncFailure:
+    """The saved failure holds the time of an unsuccessful synchronization."""
     at: str
 
 
 @dataclass(frozen=True)
 class NoSyncFailure:
-    pass
+    """No synchronization failure was recorded."""
 
 
 @dataclass(frozen=True)
 class LastSynced:
+    """The saved success holds the last successful synchronization time."""
     at: str
 
 
 @dataclass(frozen=True)
 class NeverSynced:
-    pass
+    """No successful synchronization was recorded."""
 
 
 @dataclass(frozen=True)
 class SyncStatus:
+    """The status holds the peer, attempt time, outcome, and last success and failure."""
     at: str
     peer: str
     ok: bool
@@ -77,13 +85,14 @@ class SyncStatus:
 
 @dataclass(frozen=True)
 class SyncPaused:
+    """Synchronization is paused with a start time and reason."""
     since: str
     why: str
 
 
 @dataclass(frozen=True)
 class SyncRunning:
-    pass
+    """Synchronization is not paused."""
 
 
 def peer_name() -> str:
@@ -92,6 +101,7 @@ def peer_name() -> str:
 
 @dataclass(frozen=True)
 class SyncPeer:
+    """The peer holds its target, host, and legacy override setting."""
     target: str
     host: str
     legacy_override: bool = False
@@ -99,6 +109,7 @@ class SyncPeer:
 
 @dataclass(frozen=True)
 class PeerExchange:
+    """The exchange pairs a configured peer with its recorded status."""
     peer: SyncPeer
     status: SyncStatus | NeverSynced
 
@@ -112,6 +123,9 @@ def peer_exchanges() -> tuple[PeerExchange, ...]:
 
 
 def configured_peers() -> tuple[SyncPeer, ...]:
+    """Name each SSH target that keeps its own buildlog store behind one SSH host."""
+    from scripts.mac_test.eligibility import MAC_LINUX_TARGET
+
     override = os.environ.get("BUILDLOG_PEER", "")
     if override:
         return (SyncPeer("mac", override, legacy_override=True),)
@@ -119,7 +133,8 @@ def configured_peers() -> tuple[SyncPeer, ...]:
         return ()
     peers: list[SyncPeer] = []
     for target in read_targets():
-        if isinstance(target, SshTarget):
+        # The Mac's Linux guest keeps no buildlog store: each guest gate run has a temporary home.
+        if isinstance(target, SshTarget) and target.name != MAC_LINUX_TARGET:
             host = conf.read(target.settings).values().get("host", "")
             if not host or host.startswith("-") or any(character.isspace() for character in host):
                 raise ValueError(f"invalid sync host for {target.name}")
@@ -177,6 +192,9 @@ def write_status(peer: str, ok: bool, target: str = "mac") -> None:
         "ok": ok,
         "last_ok": now if ok else (previous.last_good.at if isinstance(previous, SyncStatus) and isinstance(previous.last_good, LastSynced) else None),
     }
+    ledger = active_transfers.get()
+    if isinstance(ledger, TransferLedger):
+        status["transfers"] = ledger.transfers
     if not ok:
         status['last_failure'] = now
     elif isinstance(previous, SyncStatus) and isinstance(previous.last_failure, SyncFailure):
@@ -248,8 +266,15 @@ def resume() -> int:
 
 
 def run(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+    if args[0] == "rsync":
+        args = [*args[:2], "--stats", *args[2:]]
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        ledger = active_transfers.get()
+        if isinstance(ledger, TransferLedger):
+            operation = "buildlog_control" if args[0] == "ssh" else "buildlog_push" if ":" in args[-1] else "buildlog_pull"
+            ledger.observe(operation, args, result.stdout, result.stderr)
+        return result
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -278,9 +303,14 @@ def sync_target(target: str) -> None:
                 return
             _ = health.write_snapshot()
             settings = record.sync_config()
-            _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(),
-                          configured_timeout(settings, "sync.reach_timeout_s"),
-                          configured_timeout(settings, "sync.rsync_timeout_s"))
+            ledger = TransferLedger()
+            parent = active_transfers.get()
+            with measure_transfers(ledger):
+                _ = sync_peer(peer, store.root(), store.host_name(), ssh_options(peer.host),
+                              configured_timeout(settings, "sync.reach_timeout_s"),
+                              configured_timeout(settings, "sync.rsync_timeout_s"))
+            if isinstance(parent, TransferLedger):
+                parent.transfers.extend(ledger.transfers)
     except BlockingIOError:
         print(f"buildlog sync: {target}: another sync holds the lock; hourly sync can retry")
     except Exception as error:  # The recorder must preserve the step result.
@@ -302,10 +332,10 @@ def _sync_locked() -> int:
     settings = record.sync_config()
     reach_timeout = configured_timeout(settings, "sync.reach_timeout_s")
     rsync_timeout = configured_timeout(settings, "sync.rsync_timeout_s")
-    options = ssh_options()
     status = 0
     for peer in peers:
-        status = max(status, sync_peer(peer, root, host, options, reach_timeout, rsync_timeout))
+        with measure_transfers(TransferLedger()):
+            status = max(status, sync_peer(peer, root, host, ssh_options(peer.host), reach_timeout, rsync_timeout))
     return status
 
 
@@ -316,7 +346,9 @@ def configured_timeout(settings: dict[str, str], key: str) -> float:
     return value
 
 
-def ssh_options() -> list[str]:
+def ssh_options(host: str) -> list[str]:
+    if any(host in record.target_hosts(target) for target in ("mac", "natedev")):
+        return ["-o", "BatchMode=yes"]
     timeout = configured_timeout(record.sync_config(), "sync.connect_timeout_s")
     return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout:g}"]
 
@@ -338,19 +370,20 @@ def sync_peer(peer: SyncPeer, root: Path, host: str, options: list[str],
         write_status(peer.host, False, peer.target)
         return 1
     shell = shlex.join(["ssh", *options])
-    exclusions = ["--exclude=admission/", "--exclude=pending-steps/", "--exclude=pending-launches/"]
+    exclusions = ["--exclude=admission/", "--exclude=pending-steps/", "--exclude=pending-launches/",
+                  "--exclude=*.lock", "--exclude=*.tmp", "--exclude=*.sqlite*", "--exclude=*.bak*"]
     push_folders = (host, store.CI_DIR) if host == "natedev" else (host,)
     sources = [str(root / name) for name in push_folders if (root / name).is_dir()]
     if sources and failed(
         f"push to {peer.host}",
-        run(["rsync", "-rt", "-e", shell, *exclusions, *sources, f"{peer.host}:{REMOTE_ROOT}"], rsync_timeout),
+        run(["rsync", "-rt", "--compress", "-e", shell, *exclusions, *sources, f"{peer.host}:{REMOTE_ROOT}"], rsync_timeout),
     ):
         write_status(peer.host, False, peer.target)
         return 1
     # Host-owned append files keep their paths across peers. Never replace local files.
     owned_hosts = record.synchronized_hosts() if peer.legacy_override else record.target_hosts(peer.target)
     pull = [
-        "rsync", "-rt", "-e", shell, *exclusions,
+        "rsync", "-rt", "--compress", "-e", shell, *exclusions,
         *(f"--include=/{name}/***" for name in owned_hosts if name != host),
         "--exclude=*", f"{peer.host}:{REMOTE_ROOT}", f"{root}/",
     ]

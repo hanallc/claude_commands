@@ -16,8 +16,11 @@ class Part(str, Enum):
     PACER = "pacer"
     REFUSALS = "refusals"
     WATCHDOG = "watchdog"
+    LOGINS = "logins"
     PRUNE = "prune"
+    FOLDER_SIZE = "folder_size"
     VAULT = "vault"
+    VAULT_SAVE = "vault_save"
 
 
 @dataclass(frozen=True)
@@ -27,9 +30,20 @@ class Schedule:
 
 
 @dataclass(frozen=True)
+class InvalidPartSchedule:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UsageIntervals:
+    claude_seconds: float
+    codex_seconds: float
+
+
+@dataclass(frozen=True)
 class Settings:
     job: Schedule
-    parts: dict[Part, Schedule]
+    parts: dict[Part, Schedule | InvalidPartSchedule]
     vault_git_seconds: float
     vault_named_paths: int
     dispatch_seconds: float
@@ -56,6 +70,16 @@ def schedule(value: object) -> Schedule:
     return Schedule(positive(values, "interval_seconds"), positive(values, "timeout_seconds"))
 
 
+def part_schedule(part: Part, value: object) -> Schedule | InvalidPartSchedule:
+    try:
+        cadence = schedule(value)
+        if part is Part.VAULT_SAVE and not 60 <= cadence.interval_seconds <= 3600:
+            raise ValueError("parts.vault_save.interval_seconds must be from 60 through 3600")
+        return cadence
+    except (ValueError, OverflowError) as error:
+        return InvalidPartSchedule(f"Invalid [parts.{part.value}] schedule. {error}")
+
+
 def configuration_path() -> Path:
     return Path(os.environ.get("AGENT_NOTES_JOB_CONFIG", str(Path(__file__).resolve().parents[2] / "config/agent_notes.toml")))
 
@@ -64,22 +88,31 @@ def configuration() -> dict[str, object]:
     return table(tomllib.loads(configuration_path().read_text(encoding="utf-8")))
 
 
-def usage_only_interval() -> float:
-    """Read the Mac usage cadence at use; absent or invalid config refuses a read."""
+def part_cadence(part: Part) -> Schedule | InvalidPartSchedule:
+    """Read one part's schedule and do not check the other settings."""
+    return part_schedule(part, table(configuration().get("parts", {})).get(part.value))
+
+
+def usage_only_intervals() -> UsageIntervals:
+    """Read both Mac usage intervals from one configuration."""
+    key = "interval_seconds"
     try:
-        return positive(table(configuration().get("mac_usage")), "interval_seconds")
+        values = table(configuration().get("mac_usage"))
+        claude_seconds = positive(values, key)
+        key = "codex_interval_seconds"
+        return UsageIntervals(claude_seconds, positive(values, key))
     except (OSError, ValueError, OverflowError) as error:
-        raise ValueError(f"{configuration_path()}: mac_usage.interval_seconds must be a finite positive number") from error
+        raise ValueError(f"{configuration_path()}: mac_usage.{key} must be a finite positive number") from error
 
 
 def settings() -> Settings:
     values = configuration()
-    parts = table(values.get("parts"))
+    parts = table(values.get("parts", {}))
     vault = table(values.get("vault"))
     named = vault.get("named_paths")
     if isinstance(named, bool) or not isinstance(named, int) or named <= 0:
         raise ValueError("agent-notes config: named_paths must be a positive integer")
-    return Settings(schedule(values.get("job")), {part: schedule(parts.get(part.value)) for part in Part},
+    return Settings(schedule(values.get("job")), {part: part_schedule(part, parts.get(part.value)) for part in Part},
                     positive(vault, "git_seconds"), named, positive(table(values.get("watchdog")), "dispatch_seconds"),
                     positive(table(values.get("watchdog")), "recovery_seconds"),
                     positive(table(values.get("watchdog")), "pass_dispatch_seconds"),

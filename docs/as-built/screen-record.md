@@ -18,7 +18,7 @@
 ### Command line
 
 ```
-python3 ~/.claude/scripts/screen_record/screen_record.py --window <title substring> --seconds <N> [--name <label>]
+~/.claude/scripts/lib/py ~/.claude/scripts/screen_record/screen_record.py --window <title substring> --seconds <N> [--name <label>]
 ```
 
 - `--seconds` is required with no default: a whole number from 1 to 60. Leading zeros are accepted (`007` is 7).
@@ -57,11 +57,23 @@ A file that cannot be inspected or deleted is reported on stderr and skipped. Th
 
 ### Window lookup
 
-`find_window(substring) -> FoundWindow` uses `xprop` alone, since xwininfo, xdotool and wmctrl are not installed on natedev:
+`find_window(substring) -> FoundWindow` reads `xprop -root _NET_CLIENT_LIST` for window ids.
+It reads each title with `xprop -id <id> WM_NAME`.
+It accepts `STRING` and `UTF8_STRING` titles and decodes escaped quotes and backslashes.
+It skips a window without a title.
 
-- `xprop -root _NET_CLIENT_LIST` lists window ids (hex), then `xprop -id <id> WM_NAME` reads each title. `STRING` and `UTF8_STRING` titles are read; escaped quotes and backslashes are unescaped. A window without a title is skipped.
-- The whole lookup has 10 s. It polls every 25 ms, and each `xprop` call gets a subprocess timeout equal to the time left.
-- Exactly one match returns. Several matches fail at once with `<n> windows match '<s>': <titles>; pass a longer substring`. No match after 10 s fails with `no window title contains '<s>' after 10 s; titles seen: <titles>`. A failing `xprop -root` fails at once with its stderr.
+A missing property or empty list selects `xwininfo -root -tree`.
+`TREE_WINDOW` reads each window id and title from that output.
+Tree titles retain literal quotes and backslashes because xwininfo does not escape them.
+The title ends at the last `": (` on its line.
+This path alone requires xwininfo.
+A missing binary gives `screen_record: missing on PATH: xwininfo`.
+
+The lookup has a 10-second limit and polls every 25 milliseconds.
+Each command receives the remaining time as its timeout.
+Exactly one match returns.
+Several matches fail before ffmpeg starts and list the matching titles.
+No match at the limit reports the titles seen.
 
 ### Recording
 
@@ -121,7 +133,7 @@ The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixo
 - **The file cap.** ffmpeg exits 0 when `-fs` stops it, and the file ends slightly over the cap. The script tells a capped clip from a full one by its size alone (`>= MAX_BYTES`).
 - **The outer timeout's kill path.** `timeout` returns 124 when ffmpeg stops on the TERM. If ffmpeg ignores the TERM for 5 s, `--kill-after` sends SIGKILL to `timeout`'s whole process group, `timeout` itself included, so Python reads a return code of −9, not 137. `screen_record.py` treats −9 like 124 and 137: exit 3, clip deleted. A test drives the real `timeout` against a stub ffmpeg that ignores TERM and checks the run matches the 137 case.
 - **Odd window sizes.** libx264 refuses yuv420p at an odd width or height (`width not divisible by 2 (401x301)`, ffmpeg exit 187). The crop trims one column or row: 401×301 records as 400×300.
-- **Overrun after `-t`.** `-t` ends the capture on time, but x264's default lookahead and frame threads hold dozens of frames, and ffmpeg encodes all of them before it exits. On a 3840×2012 window at load average 196, default veryfast had written 0 of 53 frames at the `-t` cutoff and exited 1.56 s later; with `-tune zerolatency` it had written 103 of 112 and exited 0.26 s later. Starved to half a core (`systemd-run --user --scope -p CPUQuota=50%`), the old command hit the outer timeout on a 10 s clip (exit 3 at 31 s); with zerolatency it finished in 12.9 s. FFmpeg 8.1's default fps mode adds no duplicate frames here (`dup=0`), so `-fps_mode` changes nothing.
+- **Overrun after `-t`.** `-t` ends the capture on time, but x264's default lookahead and frame threads hold dozens of frames, and ffmpeg encodes all of them before it exits. On a 3840×2012 window at load average 196, default veryfast had written 0 of 53 frames at the `-t` cutoff and exited 1.56 s later; with `-tune zerolatency` it had written 103 of 112 and exited 0.26 s later. Starved to half a core (`systemd-run --user --scope --collect -p CPUQuota=50%`), the old command hit the outer timeout on a 10 s clip (exit 3 at 31 s); with zerolatency it finished in 12.9 s. FFmpeg 8.1's default fps mode adds no duplicate frames here (`dup=0`), so `-fps_mode` changes nothing.
 - **Prune timing.** The prune runs only when a recording run gets past its refusals and its tool and `DISPLAY` checks. Nothing expires clips between runs, so the 7-day limit takes effect at the next run, and the caller's `rm` is what keeps the directory empty.
 - **Lookup time.** A failed lookup takes the full 10 s; the no-match test waits it by design. A substring that matches more than one title fails at once; pass a longer one.
 - **Window id.** `xprop` reports hex ids; ffmpeg gets the decimal form.

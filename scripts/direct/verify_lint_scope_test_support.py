@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
+from scripts.lib.berth_test_support import write_unconfigured_berth
+from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
+
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
 
@@ -12,23 +17,16 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
 TAPLO_RESULTS_FILE = "taplo-results.jsonl"
-
-
-def workspace_taplo_script(source: str) -> str:
-    """Extract the production formatter for fixtures that run part of verify."""
-    return "workspace_taplo() (" + source.split(
-        "workspace_taplo() (", 1,
-    )[1].split("\n)\n", 1)[0] + "\n)\n"
 
 
 class CargoInvocation(TypedDict):
@@ -63,15 +61,37 @@ class CargoWorkspaceMetadata(TypedDict):
     packages: list[CargoPackageMetadata]
 
 
+def write_fixture_cargo_mend(path: Path, build_id: str = "fixture") -> None:
+    """Install a fixture with a stable version and a selectable build ID."""
+    write_stdlib_tool(path, f'''import os
+import sys
+
+print(os.environ.get("TEST_VERSION_MEND", "cargo-mend 0.23.0-dev"))
+if sys.argv[-1] == "--build-info":
+    print("git_hash: fixture")
+    print({("build_id: " + build_id)!r})
+    print("build_sysroot: fixture")
+''')
+
+
+CARGO_MEND_DISPATCH_SOURCE = '''
+def exec_fixture_cargo_mend(flag: str) -> None:
+    mend = str(Path(__file__).with_name("cargo-mend"))
+    os.execv(mend, [mend, flag])
+'''
+
+
 CARGO_STUB = r'''
 import json
 import os
 from pathlib import Path
 import sys
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 arguments = sys.argv[1:]
 version_tools = {
     ("mend", "--version"): "MEND",
+    ("mend", "--build-info"): "MEND",
     ("+nightly", "fmt", "--version"): "RUSTFMT",
     ("clippy", "--version"): "CLIPPY",
 }
@@ -84,6 +104,8 @@ if version_tool:
     if "TEST_VERSION_EVENTS" in os.environ:
         with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
             output.write(version_tool + "\n")
+    if version_tool == "MEND":
+        exec_fixture_cargo_mend(arguments[-1])
     print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
     raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
@@ -215,8 +237,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
             _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.config = self.root / "lint.conf"
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
@@ -225,28 +247,39 @@ class VerifyLintScopeFixture(unittest.TestCase):
 
     def build_fixture(self) -> None:
         home = self.root / "home"
-        claude = home / ".claude"
-        claude.mkdir(parents=True)
-        (claude / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
-        self.write_executable(bin_directory / "cargo", CARGO_STUB)
-        self.write_executable(bin_directory / "taplo", TAPLO_STUB)
+        write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(bin_directory / "cargo-mend")
+        write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
+        self.write_executable(targets, '''import runpy
+import sys
+from pathlib import Path
+def main():
+    if sys.argv[1] == "eligible":
+        print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")
+    else:
+        if sys.argv[1] == "constraints":
+            sys.argv.extend(("--local", "test target"))
+        runpy.run_path(str(Path.home() / ".claude/scripts/build_targets/build_targets.py"), run_name="__main__")
+
+if __name__ == "__main__":
+    main()
+''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
+        write_unconfigured_berth(bin_directory)
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
-        interpreter_cache = self.root / "cache" / "claude" / cache_file_name()
-        interpreter_cache.parent.mkdir()
-        _ = interpreter_cache.write_text(sys.executable + "\n", encoding="utf-8")
+        seed_interpreter_cache(self.root / "cache")
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
         meminfo = self.root / "meminfo"
@@ -281,11 +314,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
                 ],
             }],
         }
-        self.environment = {
-            name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
-                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
-        }
+        self.environment = verify_test_environment()
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
             # to lint scope, formatting, fix convergence or cache assertions.
@@ -321,8 +350,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         })
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def write_shell(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")
@@ -389,11 +417,15 @@ raise SystemExit(128 + signal if signal else result.returncode)
 
     def invoke_workspace_taplo(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         """Exercise the production formatter without simulating a remote build hold."""
-        formatter = workspace_taplo_script(VERIFY.read_text(encoding="utf-8"))
+        return self.invoke_taplo_at(self.root, *arguments)
+
+    def invoke_taplo_at(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Call the real formatter from the selected directory with the fixture tools."""
+        formatter = shell_functions(VERIFY, "workspace_taplo")
         return subprocess.run(
             ["bash", "-c", 'set -euo pipefail\nrun() { "$@"; }\n' + formatter
              + 'workspace_taplo "$@"', "taplo-fixture", *arguments],
-            cwd=self.root, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
+            cwd=cwd, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
@@ -411,7 +443,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         tools.mkdir()
         hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
-            "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
+            "bash", "python3", "awk", "cat", "cmp", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
             "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
@@ -462,7 +494,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         self.assertEqual(self.calls("clippy"), [[*scope, "--", "-D", "warnings"]] + [
-            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+            ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
              *scope, "--", "-D", "warnings"],
         ] * fix_passes + [[*scope, "--", "-D", "warnings"]])
 

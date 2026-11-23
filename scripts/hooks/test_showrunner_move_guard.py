@@ -1,7 +1,8 @@
-"""A showrunner's hand paths for stopping or moving a session are refused and name /showrunner:move."""
+"""The move guard names agents and preserves its showrunner scope."""
 from __future__ import annotations
 
-import importlib.util
+from scripts.agents import remote
+
 import json
 import os
 import subprocess
@@ -11,11 +12,13 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
 
+from scripts.lib.file_module import load_file_module
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 HOOK = Path(__file__).with_name("pre-tool-use-showrunner-move-guard.py")
-spec = importlib.util.spec_from_file_location("showrunner_move_guard", HOOK)
+module = load_file_module("showrunner_move_guard", HOOK)
+spec = module.__spec__
 assert spec is not None and spec.loader is not None
 
 
@@ -28,11 +31,9 @@ class Guard(Protocol):
     def refusal(self, command: str, proc: Path | None = None) -> str: ...
 
 
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
 guard = cast(Guard, cast(object, module))
 SHOWRUNNER = "11111111-2222-3333-4444-555555555555"
-MOVE = '~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunner_move.py session nightly-review "claude 1"'
+MOVE = 'agents move TEST-nightly-review "claude 1"'
 
 
 class RefusalTest(unittest.TestCase):
@@ -72,8 +73,8 @@ class RefusalTest(unittest.TestCase):
         for command in (MOVE,
                         "tmux send-keys -t merge-gate 'run the gate' Enter",
                         "kill 5151",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py stop sid",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py resume sid --why 'continue now'",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py stop sid",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py resume sid --why 'continue now'",
                         "claude --resume abc",
                         "CLAUDE_CONFIG_DIR=~/.claude1 claude --version"):
             self.assertEqual(self.refused(command), "", command)
@@ -93,11 +94,11 @@ class SessionTest(unittest.TestCase):
         timer = self.state / "showrunner-production"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:{SHOWRUNNER}\nCHECK=~/.claude/scripts/production/production_check.sh {doc}\n", encoding="utf-8")
+            f"TARGET=session:{SHOWRUNNER}\nCHECK=~/.claude/scripts/production/production_check.sh production\n", encoding="utf-8")
 
         _ = self.enterContext(isolated_staff_file(Path(root.name) / "staff.json", {}))
         _ = fixture_member("showrunner", name="production", runtime_id=SHOWRUNNER,
-                           doc=staff.LiveDoc("natedev", doc))
+                           doc=staff.LiveDoc(remote.local_machine(), doc))
 
     def run_hook(self, session_id: str, command: str, tool: str = "Bash") -> str:
         payload = {"session_id": session_id, "tool_name": tool, "tool_input": {"command": command}}
@@ -109,7 +110,7 @@ class SessionTest(unittest.TestCase):
         response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(SHOWRUNNER, "tmux send-keys -t unit /exit Enter")))
         decision = response["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn("/showrunner:move", decision["permissionDecisionReason"])
+        self.assertIn("/agents move", decision["permissionDecisionReason"])
 
     def test_the_skill_path_passes_in_a_showrunner(self) -> None:
         self.assertEqual(self.run_hook(SHOWRUNNER, MOVE), "")

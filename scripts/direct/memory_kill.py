@@ -2,6 +2,10 @@
 """Detect memory kills when sccache hides the rustc signal."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from datetime import datetime
 import json
@@ -12,7 +16,6 @@ import subprocess
 import sys
 from typing import cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
 
 

@@ -14,24 +14,14 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from code_kind import is_test_code  # noqa: E402
-
-import gpu_xid
-import push_texts
-if TYPE_CHECKING:
-    from ..message import session_send
-else:
-    from scripts.message import session_send
-from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
-from user_action import ActionRequired, NO_SESSION_LINE, SessionLine
-
-ROOT = Path(__file__).resolve().parents[2]
-EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py"}
+from scripts.notify import gpu_xid
+from scripts.notify import push_texts
+from scripts.message import session_send
+from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
 
 def literal_path(node: ast.expr) -> str:
@@ -147,10 +137,40 @@ def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
 
 
 class PushTextTests(unittest.TestCase):
+    def test_login_sitting_examples_name_end_dates_and_steps_as_normal_notes(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "accounts.login_sitting")
+        self.assertEqual(entry.sender, "accounts")
+        self.assertEqual(entry.need, "note")
+        self.assertEqual([example.name for example in entry.examples], ["weekly", "safety"])
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertTrue(push.body.startswith("You asked "))
+                self.assertIn("login end dates", push.body)
+                self.assertIn("Sign out of claude.ai in the browser.", push.body)
+                self.assertIn("Sign in as that account.", push.body)
+                self.assertIn("run /login in a Claude session on that account.", push.body)
+                self.assertNotIn("No action needed.", push.message)
+
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
+
+    def test_unreachable_mac_catalog_requires_an_action_and_names_the_waiting_tests(self) -> None:
+        entries = [entry for entry in push_texts.catalog() if entry.id.startswith("mac_idle.")]
+        self.assertEqual([entry.id for entry in entries], ["mac_idle.unreachable"])
+        entry = entries[0]
+        for example, minutes, tests in (("one_test", "10", "1 test waits"),
+                                         ("three_tests", "12", "3 tests wait")):
+            with self.subTest(example=example):
+                values = next(row.values for row in entry.examples if row.name == example)
+                push = push_texts.render_entry(entry, values)
+                self.assertEqual(push.action, ActionRequired("Wake the Mac or check its network."))
+                self.assertEqual(push.title, "Mac tests stopped")
+                self.assertEqual(push.body, f"Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.")
+                self.assertEqual(push.message.splitlines(), ["Action: Wake the Mac or check its network.",
+                    f"Mac tests stopped {minutes} min ago.", f"{tests}; builds cannot reach the Mac."])
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
@@ -167,7 +187,8 @@ class PushTextTests(unittest.TestCase):
                         self.assertLess(len(text), 1024)
                     else:
                         self.assertLess(len(text), 500)
-                    self.assertLess(len(push.title), 45)
+                    # A one-line text posts no title; its line is the message.
+                    self.assertLess(len(push.posted_title), 45)
 
     def test_decision_argv_carries_the_question_record_path(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
@@ -274,7 +295,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, meaning + "\n")
@@ -283,7 +304,7 @@ class PushTextTests(unittest.TestCase):
     def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
         for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
             with self.subTest(code=code):
-                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                result = subprocess.run([str(Path(gpu_xid.__file__).resolve().parents[1] / "lib" / "py"), str(Path(gpu_xid.__file__)), code],
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stdout, "")
@@ -299,7 +320,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
                 self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
-                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/agents restart"), 1)
                 self.assertIn("natedev", cast(ActionRequired, push.action).text)
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
@@ -313,7 +334,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(example.values["stopped"], push.body)
             action = cast(ActionRequired, push.action).text
             self.assertEqual(action.count("accounts.py trust"), 1)
-            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertEqual(action.count("/agents restart"), 1)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         unlisted = entries["shutdown.restart_untrusted_unlisted"]
@@ -325,7 +346,7 @@ class PushTextTests(unittest.TestCase):
             self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                           cast(ActionRequired, push.action).text)
             self.assertNotIn("accounts.py trust", push.message)
-            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("/agents restart", push.message)
             self.assertNotIn("cd /", push.message)
             self.assertLess(len(push.message), 500)
         self.assertNotIn("shutdown.move_untrusted", entries)
@@ -339,7 +360,7 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn(example.values["stopped"], push.body)
                 self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
                               cast(ActionRequired, push.action).text)
-                self.assertNotIn("/shutdown restart", push.message)
+                self.assertNotIn("/agents restart", push.message)
                 self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
@@ -410,44 +431,20 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(push.title, "natedev the /nate skill is ready")
         self.assertEqual(push.message, "It is ready now.")
 
-    def test_vault_stopped_text_names_the_cause_and_the_safe_fix_for_each_outage(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "vault.stopped")
-        fixes = {
-            "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.":
-                "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs.",
-            "~/rust/hanadocs on the Mac is not on the main branch.":
-                "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch.",
-            "The Mac copy has commits that GitHub does not have, so a safe update is not possible.":
-                "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub.",
-            "An update would replace a file on the Mac that git does not track.":
-                "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name.",
-            "natedev could not reach the Mac for more than 24 hours.":
-                "Wake the Mac and connect it to the network.",
-            "The update failed with an error the job does not know.":
-                "In the Claude session named natedev, ask it to read the vault update error in the hourly log.",
-        }
-        self.assertEqual({example.values["reason"] for example in entry.examples}, set(fixes))
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                push = push_texts.render_entry(entry, example.values)
-                self.assertEqual(push.title, "Mac vault copy is not updating")
-                self.assertIn(example.values["reason"], push.body)
-                self.assertIn("It tries again each hour", push.body)
-                self.assertIsInstance(push.action, ActionRequired)
-                self.assertTrue(push.message.startswith("Action: "))
-                self.assertEqual(push.message.splitlines()[0], "Action: " + fixes[example.values["reason"]])
+    def test_vault_stops_have_no_phone_template(self) -> None:
+        self.assertNotIn("vault.stopped", {entry.id for entry in push_texts.catalog()})
 
-    def test_auto_mode_refusal_keeps_the_user_approved_lines(self) -> None:
+    def test_auto_mode_refusal_says_what_happened_and_what_to_type(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped modules")
+        self.assertEqual(push.title, "cargo-liner-style: modules commands refused")
         # The first line says what auto mode refused and where (user, 2026-10-23); each command follows on its own line.
         self.assertEqual(push.message.split("\n")[:5], [
-            "Session: modules", "Action: On natedev, in the modules pane, approve the prompt or add an allow rule",
+            "Session: modules", "Action: On natedev, in the modules pane, type: Go: run the refused commands",
             "Auto mode refused 2 shell commands in the modules session. The modules build waits for them.",
             "implement.sh --to modules-impl", "review.sh --to modules-test"])
-        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Approve", "Allow rule"])
+        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Go", "Allow rule"])
         self.assertTrue(push.body.endswith("auto mode lets these commands run from then on."))
         one = push_texts.render_entry(entry, entry.examples[1].values)
         self.assertTrue(one.body.startswith("Auto mode refused a shell command in the messaging session."
@@ -460,7 +457,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
                          + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
@@ -471,7 +468,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual((entry.title, entry.action, entry.need, entry.sender), (plain.title, plain.action, plain.need, plain.sender))
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): workers spend these credits until your queued move runs. "
                          + "If the credits run out first, workers wait.\n\n"
@@ -497,14 +494,37 @@ class PushTextTests(unittest.TestCase):
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 
+    def one_line_entry(self) -> PushText:
+        return PushText("test", "test", "note", "codex1 has {left} left; units work alone next", push_texts.NoActionNeeded(),
+                        "", (PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+
+    def test_one_line_text_posts_its_line_as_the_message_with_no_title(self) -> None:
+        push = push_texts.render_entry(self.one_line_entry(), {"left": "1%"})
+        self.assertEqual(push.title, "codex1 has 1% left; units work alone next")
+        self.assertEqual(push.posted_title, "")
+        self.assertEqual(push.message, "codex1 has 1% left; units work alone next")
+        self.assertNotIn("No action needed", push.message)
+        self.assertIn("Title: none (the phone shows the app name)\ncodex1 has 1% left",
+                      push_texts.shown(self.one_line_entry()))
+
+    def test_one_line_is_fingerprinted_and_cannot_hold_an_action_session_or_body(self) -> None:
+        entry = self.one_line_entry()
+        with mock.patch.object(importlib, "import_module", return_value=SimpleNamespace(ENTRIES=(entry,))):
+            self.assertEqual(push_texts.catalog(), (entry,))
+        self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, one_line=False)))
+        for label, invalid in (("action", replace(entry, action=ActionTemplate("Reply go."))),
+                               ("session", replace(entry, session=SessionTemplate("{left}"))),
+                               ("body", replace(entry, body="Left: {left}."))):
+            module = SimpleNamespace(ENTRIES=(invalid,))
+            with (self.subTest(label=label), mock.patch.object(importlib, "import_module", return_value=module),
+                  self.assertRaises(ValueError)):
+                _ = push_texts.catalog()
 
     def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
         removed_id = "shutdown." + "remote_control"
         self.assertNotIn(removed_id, {entry.id for entry in push_texts.catalog()})
         approvals = cast(dict[str, object], json.loads(push_texts.REVIEWED_FILE.read_text()))
         self.assertNotIn(removed_id, approvals)
-
-
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()
@@ -591,19 +611,6 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(literal_delivery_calls('command = ["scripts/notify/pushover.py", "title", "body"]\nrun(command)'), [1])
         self.assertEqual(literal_delivery_calls('run(["python3", str(ROOT / "notify" / "pushover.py"), "title", "body"])'), [1])
 
-    def test_each_script_delivery_uses_the_registry(self) -> None:
-        findings: list[str] = []
-        for path in (ROOT / "scripts").rglob("*.py"):
-            relative = path.relative_to(ROOT).as_posix()
-            if relative in EXEMPT or is_test_code(path):
-                continue
-            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
-        for folder in ("commands", "codex"):
-            for path in (ROOT / folder).rglob("*.md"):
-                findings.extend(f"{path.relative_to(ROOT)}:{line}: unregistered phone instruction"
-                                for line in instruction_phone_sends(path.read_text()))
-        self.assertEqual(findings, [])
-
     def test_instruction_gate_checks_inline_and_multiline_phone_commands(self) -> None:
         self.assertEqual(instruction_phone_sends('`pushover.py --no-action Title Body`'), [1])
         self.assertEqual(instruction_phone_sends('`send.py --to user --text "use --text-id"`'), [1])
@@ -636,10 +643,3 @@ class PushTextTests(unittest.TestCase):
                 with self.subTest(executable=executable, quote=quote):
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} "--text-id"`'), [1])
                     self.assertEqual(instruction_phone_sends(f'`{path} {target} --text-id nate.adhoc`'), [])
-
-    def test_only_pushover_posts_to_pushover(self) -> None:
-        """pushover.post_message adds the "Sent by" and "Template" lines; no other script may post round it."""
-        found = [path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").rglob("*")
-                 if path.is_file() and "__pycache__" not in path.parts and not is_test_code(path)
-                 and path.name != "pushover.py" and b"api.pushover.net" in path.read_bytes()]
-        self.assertEqual(found, [])

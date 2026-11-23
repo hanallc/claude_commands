@@ -8,13 +8,15 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Literal, cast
 from pathlib import Path
 
-import index
-import mac_outcome
-import moments
-import store
+from scripts.buildlog import index
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import moments
+from scripts.buildlog import store
+from scripts.lib.intervals import merged_spans
 
 
 type Cause = Literal["Memory wait", "Cold rebuilds", "Reruns after a pass", "Failed runs", "Cancelled CI", "Mac idle while natedev waits"]
@@ -58,22 +60,11 @@ class BuildCosts:
     mac_idle: MacIdleEstimate
 
 
-FOOTER = (
-    "Definitions: phase wall time = finish minus phase_started_at; finishes select the window. Costs can overlap.",
-    f"Memory wait = recorded wait; cold = {moments.COLD_BUILD_MIN_CRATES}+ crates; failed = counted nonzero step status or failed CI.",
-    f"Reruns after a pass = same-worker nextest within {moments.SAME_WORKER_REPEAT_SECONDS // 60} min, same recorded tree, worktree, and build input.",
-    "CI = summed job wall time (run wall time if jobs are absent); cancelled = cancelled workflow attempts.",
-    "Mac idle while natedev waits = candidate wait intervals minus Mac execution and recorded holds; missing records remain unknown.",
-)
-OUTPUT_LINE_LIMIT = 24
-MAX_RANKED_ROWS = OUTPUT_LINE_LIMIT - 4 - len(FOOTER) - 1
-
-
 def machine_name(target: str | None, host: str | None, legacy_hosts: dict[str, str]) -> str:
     if target:
         return target
     if not legacy_hosts:
-        import record
+        from scripts.buildlog import record
 
         values = record.sync_config()
         targets = set(record.configured_targets()) | {
@@ -89,7 +80,7 @@ def finished_phases(start: datetime, end: datetime) -> tuple[moments.ProgressFin
 
 
 def mac_hold_events(connection: sqlite3.Connection, start: datetime, end: datetime) -> MacHoldEvents:
-    import holds
+    from scripts.buildlog import holds
 
     current = holds.CurrentHolds("", holds.NatedevHoldsNow(()), holds.MacHoldsNow(()))
     history = holds.read_hold_history(connection, current, end)
@@ -129,11 +120,38 @@ def idle_seconds(events: list[tuple[float, int, int]]) -> float:
 
 
 @dataclass(frozen=True)
+class StepKind:
+    """A step program in one repository, such as hana nextest."""
+    repo: str
+    step: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.repo} {self.step}" if self.repo else self.step
+
+
+def repository_name(folder: str | None, identity: str | None) -> str:
+    """The repository's name: the last part of its origin URL, else its folder name.
+
+    A verify gate copy has its own folder, such as checkout, and the origin of the repository it copies.
+    """
+    if identity and identity.startswith("https://"):
+        return identity.rsplit("/", 1)[-1]
+    return folder or ""
+
+
+class NoStep(StrEnum):
+    """A CI run or a gate run pays its cost without a build step."""
+    VALUE = "no step"
+
+
+@dataclass(frozen=True)
 class CostContribution:
     at: float
     machine: str
     cause: Cause
     seconds: float | CostUnavailable
+    kind: StepKind | NoStep
 
 
 @dataclass(frozen=True)
@@ -159,8 +177,13 @@ class IndexedMonthlySource:
 
 
 def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMonthlySource, ...]:
-    """Keep nonempty indexed sources, including missing or incomplete files."""
+    """Keep nonempty indexed sources, including missing or incomplete files.
+
+    A file of cloud gate runs is the AWS place, also when an older import named it after its box.
+    """
     rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
+    cloud_gate_files = {path for (path,) in cast(list[tuple[str]], connection.execute(
+        "SELECT DISTINCT src FROM gate_runs WHERE source = ?", (store.CLOUD_GATE_SOURCE,)).fetchall())}
     sources: list[IndexedMonthlySource] = []
     legacy_hosts: dict[str, str] = {}
     for name, offset in rows:
@@ -176,7 +199,8 @@ def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMont
             complete = (store.root()/path).stat().st_size == offset
         except OSError:
             complete = False
-        machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
+        machine = ("CI" if path.parent.name == "ci" else store.CLOUD_GATE_PLACE if name in cloud_gate_files
+                   else machine_name(None, path.parent.name, legacy_hosts))
         sources.append(IndexedMonthlySource(machine, low.timestamp(), high.timestamp(), complete, name))
     return tuple(sources)
 
@@ -207,16 +231,14 @@ def source_coverage(sources: Sequence[IndexedMonthlySource], observations: Seque
     latest: dict[str, float] = {}
     for observation in observations:
         latest[observation.machine] = max(latest.get(observation.machine, 0), observation.at)
-    coverage = [IndexedSourceCoverage(source.machine, source.start, min(source.end, latest.get(source.machine, 0)))
-                for source in sources if source.complete and latest.get(source.machine, 0) > source.start]
-    merged: list[IndexedSourceCoverage] = []
-    for item in sorted(coverage, key=lambda span: (span.machine, span.start)):
-        if merged and item.machine == merged[-1].machine and item.start <= merged[-1].end:
-            previous = merged.pop()
-            merged.append(IndexedSourceCoverage(item.machine, previous.start, max(previous.end, item.end)))
-        else:
-            merged.append(item)
-    return tuple(merged)
+    coverage: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for source in sources:
+        seen = latest.get(source.machine, 0)
+        if source.complete and seen > source.start:
+            coverage[source.machine].append((source.start, min(source.end, seen)))
+    return tuple(IndexedSourceCoverage(machine, start, end)
+                 for machine, spans in sorted(coverage.items())
+                 for start, end in merged_spans(spans))
 
 
 @dataclass(frozen=True)
@@ -293,7 +315,8 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         )
     rows = cast(Sequence[tuple[str | None, str | None, str, float | None, float | None, int | None,
                                int | None, str | None, str | None, str | None, str | None,
-                               str | None, float, int, str | None, str | None, str | None, float | None, str | None]],
+                               str | None, float, int, str | None, str | None, str | None, float | None, str | None,
+                               str | None]],
         connection.execute(
             "WITH window_steps AS MATERIALIZED (SELECT id,target,host,session,step FROM steps WHERE "
             + moments.window_bounds("started_at") + ")" + context_sql
@@ -301,7 +324,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
             + " SELECT target, host, step, duration_s, mem_wait_s, status, crates_compiled, session,"
             + " worktree, repo, build_base, tree_key, unixepoch(started_at, 'subsec'),"
             + " CASE WHEN unixepoch(started_at,'subsec') >= :lower_epoch THEN (" + index.COUNTED_FAILURE + ") ELSE 0 END,"
-            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome"
+            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome,repo_identity"
             + " FROM steps LEFT JOIN"
             + " (SELECT id,mac,mac_reason,local_reason,mac_s,outcome FROM main.calls) c"
             + " ON c.id = steps.call_id AND unixepoch(started_at,'subsec') >= :lower_epoch"
@@ -311,19 +334,20 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     observations: list[SourceObservation] = []
     sessions: dict[tuple[str, str], tuple[moments.PreviousNextest, moments.RecordedBuildTree | moments.UnrecordedIdentity]] = {}
     intervals: list[tuple[float, int, int]] = []
-    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text in rows:
+    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text, identity in rows:
         machine = machine_name(target, host, legacy_hosts)
         seconds, wait_s = max(0.0, duration or 0.0), max(0.0, wait or 0.0)
         selected = lower <= at < upper
+        step_kind = StepKind(repository_name(repo, identity), kind)
         if selected:
             observations.append(SourceObservation(at, machine))
             if kind != "launch":
                 wait_value = CostUnavailable("memory wait not recorded") if wait is None else wait_s
-                contributions.append(CostContribution(at, machine, "Memory wait", wait_value))
+                contributions.append(CostContribution(at, machine, "Memory wait", wait_value, step_kind))
             if crates is not None and crates >= moments.COLD_BUILD_MIN_CRATES:
-                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds))
+                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds, step_kind))
             if failed:
-                contributions.append(CostContribution(at, machine, "Failed runs", seconds))
+                contributions.append(CostContribution(at, machine, "Failed runs", seconds, step_kind))
         if machine == "mac" and seconds and at < upper and at + seconds > lower:
             intervals.extend(((max(lower, at), 0, 1), (min(upper, at + seconds), 0, -1)))
         if machine == "natedev" and wait_s and at > lower and at - wait_s < upper:
@@ -337,7 +361,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         preceding = sessions.get((machine, session))
         if (selected and preceding is not None
                 and moments.passed_tree_rerun(preceding[0], moments.nextest_outcome(status), at - wait_s, preceding[1], key)):
-            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds))
+            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds, step_kind))
         sessions[machine, session] = (moments.previous_nextest(at, duration, moments.nextest_outcome(status)), key)
     timeline = [(at, wait, run, 0, 0) for at, wait, run in intervals]
     if idle_seconds(intervals) > 0:
@@ -352,8 +376,19 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     for conclusion, seconds, at in ci_rows:
         observations.append(SourceObservation(at, "CI"))
         if conclusion in ("cancelled", "failure"):
-            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
+            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds),
+                                                 NoStep.VALUE))
     sources = indexed_monthly_sources(connection)
+    # A gate run is a recorded event of the place that holds its file; AWS records nothing else.
+    source_machines = {source.path: source.machine for source in sources}
+    gate_rows = cast(Sequence[tuple[str, int | None, float | None, float]], connection.execute(
+        "SELECT src, status, wall_s, unixepoch(started_at,'subsec') FROM gate_runs WHERE "
+        + moments.window_bounds("started_at"), parameters).fetchall())
+    for src, status, wall, at in gate_rows:
+        machine = source_machines.get(src) or machine_name(None, Path(src).parent.name, legacy_hosts)
+        observations.append(SourceObservation(at, machine))
+        if status:
+            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0), NoStep.VALUE))
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),
@@ -388,48 +423,3 @@ def aggregate_costs(reading: CostReading, start: datetime, end: datetime) -> Bui
 
 def collect_costs(connection: sqlite3.Connection, start: datetime, end: datetime) -> BuildCosts:
     return aggregate_costs(read_costs(connection, start, end), start, end)
-
-
-def phase_line(label: str, phases: Sequence[moments.ProgressFinish]) -> str:
-    durations = [phase.wall_s for phase in phases if isinstance(phase.wall_s, float)]
-    if not durations:
-        return f"{label}: {len(phases)} finished; median unavailable; p90 unavailable."
-    missing = f"; {len(phases) - len(durations)} without a recorded start" if len(durations) < len(phases) else ""
-    return (f"{label}: {len(phases)} finished; median {moments.nearest_rank(durations, 50):.0f} s/phase; "
-            + f"p90 {moments.nearest_rank(durations, 90):.0f} s/phase{missing}.")
-
-
-def render_costs(build_costs: BuildCosts) -> str:
-    days = (build_costs.end - build_costs.start).total_seconds() / 86400
-    count = len(build_costs.phases)
-    lines = [f"Build costs: {days:g} days ending {build_costs.end.isoformat()}.",
-             phase_line("Hana phases", [phase for phase in build_costs.phases if moments.hana_name(phase.working_dir)]),
-             phase_line("All phases", build_costs.phases), "Cost by machine: hours/day; hours/finished phase."]
-    for row in build_costs.ranked[:MAX_RANKED_ROWS]:
-        per_phase = f"{row.seconds / 3600 / count:.3f} h/phase" if count else "unavailable h/phase (no finished phases)"
-        uncertainty = (f" upper bound; {row.unknown_seconds / 3600 / days:.2f} h/day unknown"
-                       if row.unknown_seconds > 0 else "")
-        if row.missing_waits:
-            uncertainty += f"; subtotal with {row.missing_waits} applicable waits missing"
-        lines.append(f"{row.machine}: {row.cause}: {row.seconds / 3600 / days:.2f} h/day; {per_phase}{uncertainty}.")
-    if len(build_costs.ranked) > MAX_RANKED_ROWS:
-        lines.append(f"{len(build_costs.ranked) - MAX_RANKED_ROWS} smaller machine/cause costs omitted.")
-    if not build_costs.ranked:
-        lines.append("No recorded costs in this window.")
-    lines.extend(FOOTER)
-    return "\n".join(lines)
-
-
-def main(args: list[str]) -> int:
-    from number_option import positive_window
-
-    window = positive_window(args, "--days", 7, "costs", integer=True)
-    if window is None:
-        return 2
-    start, end = window[:2]
-    connection = index.read_only()
-    try:
-        print(render_costs(collect_costs(connection, start, end)))
-    finally:
-        connection.close()
-    return 0

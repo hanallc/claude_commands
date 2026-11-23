@@ -12,10 +12,10 @@ starts from Terminal.
 Test clones on either machine use `copies.py clone <source> --task gate:<id>`
 (or a real `phase:<unit>/<id>` or `--until <when>`). The command records the
 task before Git starts and prints the checkout inside its scratch folder.
-If any Claude account trusts the source, the clone inherits trust in every existing account configuration.
-Removal clears the clone's trust before it deletes the folder.
 `scratch.py end --task gate:<id>` removes the clone. A failed clone remains
 owned by its task, so the same end command removes a partial copy.
+Clones inherit Claude trust when any account trusts the source checkout.
+Task completion, sweeps, and `copies.py mirror-remove` clear that clone trust before deletion.
 `mac_run.sh` uses one gate task per run. On exit, `hana-instances stop-checkout <path>`
 stops its test Hanas through the identity-checked stop path, confirms they
 exited, and checks for surviving builds and examples through the audit's
@@ -80,7 +80,7 @@ Capture limits come from `config/hana_shot.conf` through the same reader.
 The `window_frames` key sets the frame count after a window change.
 They include BRP deadlines, capture deadlines, camera waits, output limits, process waits, and worker count.
 The reader uses `CONF_DIR` for private test settings.
-`scratch.conf` controls the clone folder lifetime, visible root, hold file, and repository scan.
+`scratch.conf` controls the clone folder lifetime, hold file, and repository scan.
 The folder audit reads its other limits from `lint.conf` through the same reader.
 All moved values retain their previous defaults.
 

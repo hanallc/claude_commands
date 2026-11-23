@@ -11,21 +11,27 @@ is skipped and reported. The registry's `production.director` row keeps its mode
 level, through default_models.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import unit_lookup
-from session_pane import HerdrFailure, read_place, type_place
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, read_place, type_place
+from scripts.lib import models_registry
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"
 USAGE = "usage: unit_effort.py <level> [--check]"
-READ_ROW = ('source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" '
-            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
+READ_ROW = ('source "$1" && models_launch_configuration && agents_resolve production.director && printf "%s\\n%s\\n%s\\n%s\\n" '
+            + '"$AGENT_MODEL" "$AGENT_WORD" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_WORD")"')
 # How many lines up from the bottom a form is looked for when no input box is on screen.
 BOTTOM_LINES = 25
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
@@ -37,8 +43,9 @@ RULE = "──"
 
 class DirectorRow(NamedTuple):
     model: str
+    word: str
     effort: str
-    # The efforts the registry lets this model take.
+    # The registry permits these efforts for the family word.
     allowed: list[str]
 
 
@@ -56,22 +63,24 @@ class Cell(NamedTuple):
     inverse: bool
 
 
-def director_row() -> DirectorRow:
+def director_row(base: models_registry.RegistryEditBase) -> DirectorRow:
     """The unit director launch row now. Raises OSError when the registry cannot resolve it."""
     done = subprocess.run(["bash", "-c", READ_ROW, "_", str(AGENTS / "models_config.sh")],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False,
+                          env=models_registry.LaunchModelConfiguration(*base).environment(os.environ))
     values = done.stdout.splitlines()
-    if done.returncode != 0 or len(values) != 3 or not values[0]:
+    if done.returncode != 0 or len(values) != 4 or not values[0]:
         errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
         raise OSError(errors[0] if errors else f"cannot resolve {ROW}")
-    model, effort, allowed = values
-    return DirectorRow(model, effort, [item.strip() for item in allowed.split(",") if item.strip()])
+    model, word, effort, allowed = values
+    return DirectorRow(model, word, effort, [item.strip() for item in allowed.split(",") if item.strip()])
 
 
-def set_row(model: str, level: str) -> str:
-    """Publish the shared launch row at `<model>:<level>`; empty on success, else why not."""
-    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{model}:{level}"],
-                          capture_output=True, text=True, check=False)
+def set_row(word: str, level: str, base: models_registry.RegistryEditBase) -> str:
+    """Publish the family word and effort in the registry. Return an empty string on success."""
+    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{word}:{level}"],
+                          capture_output=True, text=True, check=False,
+                          env=base.environment(os.environ))
     if done.returncode == 0:
         return ""
     errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
@@ -178,9 +187,23 @@ def _director_line(marked: unit_lookup.LabeledSession, level: str, check: bool) 
 
 def director_lines(every: unit_lookup.LabeledProductions, level: str, check: bool) -> list[str]:
     """Return one line per running unit director in every production."""
-    lines = [_director_line(marked, level, check)
-             for slug in sorted(every.units) for _, marked in sorted(every.units[slug].items())
-             if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)]
+    lines: list[str] = []
+    for production in sorted(every.units.keys() | every.members.keys()):
+        names = every.units.get(production, {}).keys() | set(every.members.get(production, ()))
+        for name in sorted(names):
+            match every.checked_unit(production, name):
+                case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession() as pane):
+                    if isinstance(pane.claude, unit_lookup.LiveClaude):
+                        lines.append(_director_line(pane, level, check))
+                    else:
+                        lines.append(f"{name}: skipped — Codex owns the pane")
+                case unit_lookup.ProvedLiveUnit():
+                    lines.append(f"{name}: skipped — the live director has no proved herdr pane")
+                case unit_lookup.ProvedAbsentUnit():
+                    pass
+                case unit_lookup.UnknownUnit(reason=reason):
+                    lines.append(f"{name}: skipped — cannot tell whether Claude runs: {reason}")
+    lines.extend(f"unit directors unknown: {reason}" for reason in every.failures)
     return lines or ["no unit director is running"]
 
 
@@ -195,7 +218,8 @@ def registry_line(row: DirectorRow, level: str, check: bool) -> str:
 def run(level: str, check: bool) -> int:
     """Exit 0 when every director that could take it was sent it, 1 when a send or the registry failed."""
     try:
-        row = director_row()
+        base = models_registry.edit_base({**os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""})
+        row = director_row(base)
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1
@@ -207,7 +231,7 @@ def run(level: str, check: bool) -> int:
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)
         return 1
-    problem = "" if check or row.effort == level else set_row(row.model, level)
+    problem = "" if check or row.effort == level else set_row(row.word, level, base)
     if problem:
         print(f"unit_effort: nothing sent; {ROW} was not changed: {problem}", file=sys.stderr)
         return 1

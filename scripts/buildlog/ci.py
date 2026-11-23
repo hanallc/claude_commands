@@ -26,9 +26,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-import store
+from scripts.buildlog import store
 
-REPOS = ("natepiano/hana",)
+REPOS = ("hanallc/hana",)
 PER_PAGE = 100
 REQUEST_CAP = 1000
 STOP_AGE_S = 3 * 24 * 3600

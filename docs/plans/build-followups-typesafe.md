@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-26.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
 
-> **Production: natedev** — unit `typesafe-unit`; production doc `docs/plans/natedev-production.md`
 
 ## Source
 
@@ -143,7 +142,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
   - `scripts/prioritize/renumber.py` — score formula (lines ~420–436: `4*(alignment-1) + 3*(impact-1) + URGENCY_BONUSES[...] - (effort-1) + goal bonus`); imported by `evaluate.py`, never copied
 - **Test lanes:** `scripts/issue_score/test_*.py`; tests never call the live API, they replay recorded responses from `scripts/issue_score/fixtures/`
 - **Build:** none
-- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`
+- **Test:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/targeted_test.py --repo .`
 - **Lint:** `basedpyright scripts/issue_score` — pass is its `0 errors, 0 warnings` line
 - **Invariants:**
   - The scorer never writes inside `~/rust/hanadocs`.
@@ -424,3 +423,26 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Binds later work:** A value change is a user decision through `/tune`; a move with the same value needs no approval. Code that names `questions.THRESHOLDS` or `questions.BUDGET_USD` now calls `questions.thresholds()` or `questions.budget_usd()`. Scores made before this phase carry the old `content_hash` formula: the current tree misses their cache and `apply_labels.py` refuses their review rows.
 
 **Gotchas:** `basedpyright` exits 3 in this repository because `.venv` is absent; the pass check is the `0 errors, 0 warnings, 0 notes` footer.
+
+### Phase 9 — style scripts stop and time out with no signal handler  · status: done
+
+#### As-built
+
+- `scripts/style` has no signal handler, signal mask or signal disposition, tests included. `LintStopped`, `stop_signals_raise`, `signal_mask`, `STOP_SIGNALS`, `HELD_SIGNALS` and the `SIGALRM` split timer are gone.
+- Lint: `style_sync.py` starts `lint_keeper.py` (`python -m scripts.style.lint_keeper`) in a new session with stdin and stdout pipes. The keeper owns the `style-sync-lint-*` folder and the standing checkout. It runs `verify.sh` with its output in a temporary file, reads the final Git status, and stops what remains of the verifier group when `verify.sh` exits. When the caller pipe closes, it stops the verifier group and adopted children, deletes the folder and releases the checkout. A stopped lint run ends by the default signal action.
+- Split: `split_time_limit` yields a `SplitDeadline` on `time.monotonic()`. `bounded_split_measurement` forks a keeper in a new session; the keeper runs the scan and the ledger path lookup in a worker group, bounded by the deadline and by caller death, and deletes its `style-split-*` folder.
+- `style_ledger.record_split_at(database, unit, split, *, deadline)` sets the busy timeout to the remaining time, opens `BEGIN EXCLUSIVE` (the ledger uses rollback journaling, so the lock covers insert and commit) and checks the deadline before commit. The commit result is the final result. `record_split(repo, unit, split)` writes with `BUSY_TIMEOUT_SECONDS`.
+
+**Files:**
+- `scripts/style/lint_keeper.py` — the lint keeper process.
+- `scripts/style/style_sync.py` — lint caller: starts the keeper, prints and records the result.
+- `scripts/style/style_plan.py` — split deadline, split keeper and worker.
+- `scripts/style/style_ledger.py` — `record_split_at`, `record_split`.
+- `scripts/style/test_style_sync.py`, `scripts/style/test_style_plan_split.py`, `scripts/style/test_style_ledger.py` — stop, cleanup and deadline tests.
+
+**Gotchas:**
+- A stopped lint run has no `128 + signum` exit and no `lint stopped by` text; a shell reads 143, 129 or 130.
+- A deadline check with no time left, or a lock wait that reaches the deadline, raises `SplitTimedOut`; any other SQLite error keeps its own cause, and a commit that ends after the deadline reports success.
+- A SQLite busy timeout given to `connect` applies again to each statement and to commit; bound a write with one absolute deadline.
+
+**Ruled out:** a timeout raised after a durable commit; converting every late SQLite error to a timeout; capturing verifier output through a pipe, which a background child holds open.

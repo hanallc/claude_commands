@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 # Only the fsync test calls a function directly; never initialize it from live config.
 with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
@@ -38,10 +39,19 @@ def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path
     return invoke_cli(module, main, arguments, environment, cwd)
 
 
-# findings.py has no compiled limits, so every run needs a complete config.
-# These are the machine's shipped values; a test that cares about one limit
-# overrides just that key on top of them.
-STANDARD_CONFIG = (SCRIPT.parents[2] / "config/direct.conf").read_text(encoding="utf-8")
+def standard_configuration() -> str:
+    """Copy the config and set the limits that these ledger tests assert."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "direct.conf"
+        _ = write_config_fixture(path,
+            "MIN_REPAIR_BUDGET=3\nREPAIR_ROUNDS_PER_FINDING=0.5\nRUNAWAY_ROUNDS=5\n"
+            + "MAX_FIX_ATTEMPTS=2\nMAX_REOPENS=2\nSTALLED_ROUNDS=2\n"
+            + "MAX_CONSECUTIVE_SAME_KIND_PASSES=3\nMAX_REVIEW_CANCELLATIONS=1\n"
+            + "ROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n")
+        return path.read_text(encoding="utf-8")
+
+
+STANDARD_CONFIG = standard_configuration()
 
 
 class FindingsLedgerFixture(unittest.TestCase):
@@ -70,8 +80,8 @@ class FindingsLedgerFixture(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
-        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.root = self.fixture_root
         self.session_dir = self.root / "session"
         self.history_file = self.root / "history" / "run.jsonl"
@@ -119,10 +129,6 @@ class FindingsLedgerFixture(unittest.TestCase):
         _ = self.config_file.write_text("\n".join(lines) + "\n" + "\n".join(
             key + "=" + value for key, value in changes.items()), encoding="utf-8")
 
-    def write_partial_config(self, text: str) -> None:
-        """Write `text` as the whole file, standard limits omitted."""
-        _ = self.config_file.write_text(text, encoding="utf-8")
-
     @staticmethod
     def dispatch_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:
         # Older ledger cases exercise other rules with a valid accepted-check list.
@@ -134,7 +140,7 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Stand in for progress_history.py: the ledger reads phase identity from it."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": instance_id, "id": phase_id, "title": phase_id},
+            "open_phases": [{"instance_id": instance_id, "id": phase_id, "title": phase_id, "status": "active"}],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"
@@ -207,23 +213,41 @@ class FindingsLedgerFixture(unittest.TestCase):
         ]
 
     def close_round(self, covers: list[str], *, verdict: str = "accepted") -> None:
-        """Dispatch a batch, land it, and record every closure verdict for it.
-
-        `landed` stands in for the launcher, which is what calls it in a real run
-        once the repair worker exits cleanly.
-        """
+        """Dispatch a batch, record its fix pass, land it, and record each closure verdict."""
         _ = self.run_command("dispatch", "--covers", ",".join(covers))
+        self.record_repair_pass()
         _ = self.run_command("landed")
         for finding_id in covers:
             _ = self.run_command("verdict", "--id", finding_id, "--state", verdict)
+
+    def record_repair_pass(self, *, launch: int = 1, status: str = "completed", seconds: int = 10) -> None:
+        """Record a launch of the current batch in the private history."""
+        state = cast(dict[str, object], json.loads(self.ledger()))
+        batches = cast(list[dict[str, object]], state["rounds"])
+        number = cast(int, batches[-1]["round"])
+        started = 1_000 + number * 100 + launch * 20
+        record = {
+            "event_type": "pass_started", "phase_instance_id": state["phase_instance_id"],
+            "pass_instance_id": f"repair-{state['phase_instance_id']}-{number}-{launch}",
+            "pass_kind": "fix", "fix_pass": 1, "team_slot": f"repair-{number}",
+            "launch_check": {"fix_cause": {"round": number}},
+            "pass_started_at": started, "timestamp_epoch": started,
+        }
+        path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(record) + "\n")
+            _ = stream.write(json.dumps({**record, "event_type": "pass_finished", "status": status,
+                                        "timestamp_epoch": started + seconds, "pass_elapsed_seconds": seconds}) + "\n")
 
     def write_two_open_phases(self) -> None:
         """Phase 15 started first and stays open while Phase 16 is the newest."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
-            "open_phases": [{"instance_id": "phase-fifteen", "id": "15", "title": "15",
-                             "status": "active"}],
+            "open_phases": [
+                {"instance_id": "phase-fifteen", "id": "15", "title": "15", "status": "active"},
+                {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
+            ],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"
@@ -240,14 +264,24 @@ class FindingsLedgerFixture(unittest.TestCase):
         return note
 
     def write_repair_intervals(self, count: int, *, instance: str = "instance-a") -> None:
-        """Unledgered fixes use distinct intervals even when fix_pass restarts at one."""
+        """Ledger batches use distinct intervals even when fix_pass restarts at one."""
         path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
+        history = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+        previous = max((cast(int, event["round"]) for event in history
+                        if event.get("event_type") == "finding_batch_dispatched"
+                        and event.get("phase_instance_id") == instance), default=0)
         records: list[dict[str, object]] = []
         for index in range(count):
+            number = previous + index + 1
+            records.append({
+                "event_type": "finding_batch_dispatched", "phase_instance_id": instance,
+                "round": number, "covered": ["F001"], "timestamp_epoch": 90 + index * 20,
+            })
             start: dict[str, object] = {
                 "event_type": "pass_started", "phase_instance_id": instance,
-                "pass_instance_id": f"repair-{instance}-{index}", "pass_kind": "fix",
+                "pass_instance_id": f"repair-{instance}-{number}", "pass_kind": "fix",
+                "launch_check": {"fix_cause": {"round": number}},
                 "fix_pass": 1, "pass_started_at": 100 + index * 20,
                 "timestamp_epoch": 100 + index * 20, "pass_activity": "repair failing tests",
             }
@@ -260,7 +294,7 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def route_finding(self, finding_id: str, *, reason: str = "spec-gap") -> str:
         return self.run_command(
-            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving-unit",
+            "route", "--id", finding_id, "--reason", reason, "--owner", "receiving",
             "--work-order", "docs/follow-up.md — Phase 6 — Specify retry ownership",
             "--due", "Phase 6 checkpoint", "--evidence", "The Work Order has no owner rule",
         )

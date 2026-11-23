@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import os
 import tempfile
 import unittest
@@ -10,7 +9,6 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import note_file
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -31,6 +29,16 @@ class NotesConfigurationTests(unittest.TestCase):
                     self.assertEqual(note_file.note_path("claude1"), notes / "claude1.md")
                     self.assertEqual([note.label for note in note_file.read_notes()], ["claude1"])
                 read.assert_called_once_with("accounts")
+
+    def test_the_notes_folder_follows_an_edit_to_the_configuration(self) -> None:
+        with scratch_accounts_config() as config, patch.dict(os.environ, {"HOME": str(config)}):
+            _ = os.environ.pop("AGENT_NOTES_DIR", None)
+            for folder in ("first-notes", "second-notes"):
+                edit = config / "accounts.conf.edit"
+                _ = edit.write_text(f"notes_directory={config / folder}\n")
+                os.replace(edit, config / "accounts.conf")
+                with self.subTest(folder=folder):
+                    self.assertEqual(config / folder, note_file.notes_dir())
 
 
 @final

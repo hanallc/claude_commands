@@ -35,7 +35,9 @@ else
     echo "Cloning Bevy ${VERSION} to ${BEVY_REPO_DIR}" >&2
     rm -rf "${BEVY_REPO_DIR}"
     mkdir -p "$(dirname "${BEVY_REPO_DIR}")"
-    git clone --depth 1 --branch "v${VERSION}" https://github.com/bevyengine/bevy.git "${BEVY_REPO_DIR}"
+    "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py" editable-repository \
+        --path "${BEVY_REPO_DIR}" --url https://github.com/bevyengine/bevy.git \
+        --ref "v${VERSION}" --depth 1 >&2
 fi
 
 # Resolve the migration-guides directory. The containing dir was renamed from
@@ -45,7 +47,7 @@ GUIDES_DIR=""
 for candidate in \
     "${BEVY_REPO_DIR}/release-content/migration-guides" \
     "${BEVY_REPO_DIR}/_release-content/migration-guides"; do
-    if "${SCRIPT_DIR}/bevy_migration_split_guide.py" --check-dir "${candidate}"; then
+    if "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/bevy_migration_split_guide.py" --check-dir "${candidate}"; then
         GUIDES_DIR="${candidate}"
         break
     fi
@@ -60,13 +62,13 @@ else
     GUIDES_DIR="${BEVY_REPO_DIR}/release-content/migration-guides"
 
     # Use the split script to fetch and split the consolidated guide
-    "${SCRIPT_DIR}/bevy_migration_split_guide.py" \
+    "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/bevy_migration_split_guide.py" \
         --version "${VERSION}" \
         --output-dir "${GUIDES_DIR}" >&2
 
     # Verify guides were created
     GUIDE_COUNT=$(find "${GUIDES_DIR}" -maxdepth 1 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    if ! "${SCRIPT_DIR}/bevy_migration_split_guide.py" --check-dir "${GUIDES_DIR}"; then
+    if ! "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/bevy_migration_split_guide.py" --check-dir "${GUIDES_DIR}"; then
         echo "Error: Failed to fetch migration guides from bevy-website" >&2
         exit 1
     fi

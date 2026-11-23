@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,8 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import ClassVar, Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import unit_runs  # noqa: E402
+from scripts.lib import unit_runs
 
 
 type MetricKey = Literal[
@@ -201,12 +199,18 @@ class PhaseStartUnavailable:
 
 
 @dataclass(frozen=True)
+class WaitsNotRecorded:
+    """The finish came before phase_active_seconds, so its wall time can hold waits."""
+
+
+@dataclass(frozen=True)
 class ProgressFinish:
     timestamp_epoch: float
     phase_instance_id: str
     working_dir: str
     host: str
-    wall_s: float | PhaseStartUnavailable
+    # Phase time without waits for the user or a supplier.
+    active_s: float | PhaseStartUnavailable | WaitsNotRecorded
 
 
 def progress_events() -> tuple[ProgressFinish, ...]:
@@ -216,7 +220,7 @@ def progress_events() -> tuple[ProgressFinish, ...]:
     elif os.environ.get("BUILDLOG_DIR"):
         root = Path(os.environ["BUILDLOG_DIR"]) / "progress"
     else:
-        import store
+        from scripts.buildlog import store
 
         if store.host_name() != "natedev":
             return ()
@@ -242,9 +246,11 @@ def progress_events() -> tuple[ProgressFinish, ...]:
                             or isinstance(at, bool) or not isinstance(instance, str)
                             or not isinstance(directory, str) or not isinstance(host, str)):
                         continue
-                    wall = (float(at - started) if isinstance(started, (int, float))
-                            and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
-                    events[instance] = ProgressFinish(float(at), instance, directory, host, wall)
+                    active = event.get("phase_active_seconds")
+                    seconds = (float(active) if isinstance(active, (int, float)) and not isinstance(active, bool) and active >= 0
+                               else WaitsNotRecorded() if isinstance(started, (int, float))
+                               and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
+                    events[instance] = ProgressFinish(float(at), instance, directory, host, seconds)
         except OSError:
             continue
     return tuple(events.values())

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import shlex
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from typing import override
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_lint_diagnostics_test_support import (
@@ -12,13 +18,60 @@ from scripts.direct.verify_lint_diagnostics_test_support import (
     CLIPPY_DENY_WARNINGS,
     RUSTC_DENY_ATTRIBUTE,
 )
-from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS
+from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, VERIFY
+from scripts.lib.checkout_test_support import write_stdlib_tool
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 LINT_FINDING = CLIPPY_DENY_WARNINGS
 
-# Intercept only an explicitly requested first judgment. The ordinary fixture
-# still implements repairs, formatting, subsequent judgments and tool failures.
+
+class FirstJudgmentRepairTests(unittest.TestCase):
+    def repair_decision(
+        self, status: int, diagnostic: str, *, hold_lint: int = 0, killed: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "clippy.log"
+            _ = log.write_text(diagnostic, encoding="utf-8")
+            script = "set -eu\n" + shell_functions(VERIFY, "first_judgment_permits_repair")
+            script += '\nHOLD_LINT=$3\nRUN_LAST_ATTEMPT_KILLED=$4\nfirst_judgment_permits_repair "$1" "$2"\n'
+            return subprocess.run(
+                ["bash", "-c", script, "judgment", str(status), str(log), str(hold_lint), str(killed)],
+                env=verify_test_environment(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+            )
+
+    def test_nonlint_status_never_permits_repair(self) -> None:
+        for status in (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143):
+            with self.subTest(status=status):
+                result = self.repair_decision(status, LINT_FINDING)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_lint_finding_permits_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_compile_error_permits_repair(self) -> None:
+        result = self.repair_decision(101, "error[E0308]: mismatched types\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_lint_hold_prevents_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING, hold_lint=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_killed_attempt_prevents_repair(self) -> None:
+        result = self.repair_decision(101, LINT_FINDING, killed=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_signal_report_prevents_repair(self) -> None:
+        result = self.repair_decision(
+            101, LINT_FINDING + "process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)\n",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+
+# Supply the first tool result when a test requests it.
+# The shared tool fixture supplies all later results.
 FIRST_JUDGMENT = r'''
 import json
 import os
@@ -42,54 +95,138 @@ if arguments[:1] == ["clippy"] and "--fix" not in arguments and "--version" not 
 
 class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
     @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment.update({
+            "ROSTER_RUN_ROOT": str(self.root / "roster-runs"),
+            "UNIT_RUN_ROOT": str(self.root / "unit-runs"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+        })
+
+    @override
     def build_fixture(self) -> None:
         super().build_fixture()
-        self.write_executable(self.root / "bin" / "cargo", FIRST_JUDGMENT + CARGO_STUB)
+        write_stdlib_tool(self.root / "bin" / "cargo", FIRST_JUDGMENT + CARGO_STUB)
         self.environment["TEST_CLIPPY_FIRST_DIAGNOSTIC"] = LINT_FINDING
 
     @override
     def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
         scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
         judgment = [*scope, "--", "-D", "warnings"]
-        fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+        fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
         self.assertEqual(self.calls("clippy"), [judgment, *([fix] * fix_passes), judgment])
-
-    def override_runner_killed_flag(self, flag: int) -> None:
-        # Only this fixture's private policy changes. Each kill veto can then
-        # be exercised independently, with the other source of evidence absent.
-        scripts = self.root / "home" / ".claude" / "scripts"
-        scripts.unlink()
-        scripts.mkdir()
-        for source in SCRIPTS.iterdir():
-            if source.name != "lint":
-                (scripts / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        lint = scripts / "lint"
-        lint.mkdir()
-        for source in (SCRIPTS / "lint").iterdir():
-            if source.name != "invoke.sh":
-                (lint / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        policy = (SCRIPTS / "lint" / "invoke.sh").read_text()
-        policy += r'''
-original_clippy=$(declare -f invoke_clippy)
-eval "${original_clippy/invoke_clippy /test_invoke_clippy }"
-invoke_clippy() {
-    local status=0
-    test_invoke_clippy "$@" || status=$?
-    RUN_LAST_ATTEMPT_KILLED=$TEST_RUNNER_KILLED_FLAG
-    return "$status"
-}
-'''
-        _ = (lint / "invoke.sh").write_text(policy)
-        self.environment["TEST_RUNNER_KILLED_FLAG"] = str(flag)
 
 
 class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
+    def invoke_lint_functions(
+        self, *, killed: int = 0, held_clippy_failure: bool = False, memory_judgment: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the lint sequence with real tools and private state."""
+        self.events.unlink(missing_ok=True)
+        self.taplo_events.unlink(missing_ok=True)
+        functions = shell_functions(
+            VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
+            "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
+            "remove_tool_folder", "remove_tree_watch", "start_tree_watch", "finish_tree_watch",
+            "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
+            "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
+        )
+        functions += shell_functions(SCRIPTS / "lint/invoke.sh", "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend")
+        changed_members = VERIFY.read_text(encoding="utf-8").split("CHANGED_MEMBERS_PY='", 1)[1].split("\n'\n", 1)[0]
+        script = "set -eo pipefail\n" + functions
+        script += "\nCHANGED_MEMBERS_PY=" + shlex.quote(changed_members) + "\n"
+        script += r'''
+source "$HOME/.claude/scripts/lint/lint_config.sh"
+run() {
+    local status=0
+    if [[ -n "${CLIPPY_LOG:-}" ]]; then
+        "$@" 2>&1 | tee "$CLIPPY_LOG"
+        status=${PIPESTATUS[0]}
+    else
+        "$@" || status=$?
+    fi
+    RUN_LAST_ATTEMPT_KILLED=$TEST_RUNNER_KILLED_FLAG
+    return "$status"
+}
+CMD=lint
+ARGS=(sample)
+PKG=sample
+HOLD_LINT=0
+CHECK_LINT=0
+METADATA_READY=0
+CLIPPY_FIX_JOBS=8
+RUN_LAST_ATTEMPT_KILLED=0
+CLIPPY_FIX_LIMIT_REACHED=0
+FEATURE_FLAGS=()
+RUN_LOG=""
+CACHE_DIR=""
+FILTER_RUN=0
+TREE_CHANGED_STATUS=77
+TREE_WATCH_PID=""
+TREE_WATCH_DIR=""
+HOLD_WAIT_DIR="$PACKAGE_ROOT/hold-wait"
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
+VERIFY_METADATA_SCRIPT="$HOME/.claude/scripts/direct/verify_metadata.py"
+TREE_WATCH_SCRIPT="$HOME/.claude/scripts/direct/tree_watch.py"
+FIX_RETURN_SCRIPT="$HOME/.claude/scripts/mac_test/fix_return.py"
+BUILD_FOLDERS_SCRIPT="$HOME/.claude/scripts/lib/build_folders.py"
+GATE_METADATA="$TEST_METADATA"
+trap 'stop_tree_watch' EXIT
+'''
+        if held_clippy_failure:
+            script += f"TEST_LINT_MEMORY_JUDGMENT={int(memory_judgment)}\n"
+            script += r'''
+LINT_LEFT_QUEUE_STATUS=75
+LINT_MEMORY_JUDGMENT=0
+lint_config_enabled() { return 0; }
+fmt_cargo() { :; }
+load_metadata() { :; }
+workspace_taplo() { :; }
+start_tree_watch() { :; }
+finish_tree_watch() { :; }
+stop_tree_watch() { :; }
+mktemp() { : > "$PACKAGE_ROOT/mend.log"; printf '%s\n' "$PACKAGE_ROOT/mend.log"; }
+invoke_mend() {
+    printf 'mend %s\n' "$*" >> "$PACKAGE_ROOT/held-calls"
+    if [[ "$*" == *--fail-on-warn* ]]; then return 0; fi
+    if [[ "$LINT_MEND_WAIT" == 1 ]]; then
+        LINT_MEMORY_JUDGMENT=$TEST_LINT_MEMORY_JUDGMENT
+        touch "$HOLD_WAIT_DIR/lint-held"
+        return "$LINT_LEFT_QUEUE_STATUS"
+    fi
+    return 99
+}
+invoke_clippy() { printf 'clippy\n' >> "$PACKAGE_ROOT/held-calls"; return 101; }
+'''
+        script += "\nrun_lint_sequence\n"
+        return subprocess.run(
+            ["bash", "-c", script], cwd=self.root,
+            env={**self.environment, "PY": sys.executable, "TEST_RUNNER_KILLED_FLAG": str(killed)},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def test_mac_clippy_failure_stops_without_another_local_mend(self) -> None:
+        for memory_judgment in (False, True):
+            with self.subTest(memory_judgment=memory_judgment):
+                (self.root / "held-calls").unlink(missing_ok=True)
+                result = self.invoke_lint_functions(held_clippy_failure=True, memory_judgment=memory_judgment)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual((self.root / "held-calls").read_text().splitlines(), [
+                    "mend --workspace --fix",
+                    "mend --workspace --fail-on-warn",
+                    "clippy",
+                ])
+                self.assertFalse((self.root / "mend.log").exists())
+                self.assertFalse((self.root / "hold-wait" / "lint-held").exists())
+
     def test_explicit_clippy_deny_attribute_repairs(self) -> None:
         self.environment.update({
             "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_CLIPPY_FIRST_DIAGNOSTIC": CLIPPY_DENY_ATTRIBUTE,
         })
-        _ = self.verify("lint", "sample")
+        result = self.invoke_lint_functions()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_fix_and_judgment_calls()
 
     def test_explicit_rustc_deny_attribute_repairs(self) -> None:
@@ -97,7 +234,8 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
             "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_CLIPPY_FIRST_DIAGNOSTIC": RUSTC_DENY_ATTRIBUTE,
         })
-        _ = self.verify("lint", "sample")
+        result = self.invoke_lint_functions()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_fix_and_judgment_calls()
 
     def test_mixed_lint_and_signalled_compiler_never_repairs(self) -> None:
@@ -109,27 +247,25 @@ Caused by:
   process didn't exit successfully: `rustc --crate-name other` (signal: 9, SIGKILL: kill)
 """
         # Prove the signal-text veto independently of run()'s killed flag.
-        self.override_runner_killed_flag(0)
         self.environment.update({
             "TEST_CLIPPY_FIRST_STATUS": "101",
             "TEST_CLIPPY_FIRST_DIAGNOSTIC": diagnostic,
         })
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        result = self.invoke_lint_functions()
         self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
         self.assertEqual(len(self.calls("clippy")), 1)
         self.assertNotIn("--fix", self.calls("clippy")[0])
 
     def test_killed_attempt_flag_without_signal_text_never_repairs(self) -> None:
-        self.override_runner_killed_flag(1)
         self.environment["TEST_CLIPPY_FIRST_STATUS"] = "101"
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        result = self.invoke_lint_functions(killed=1)
         self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
         self.assertEqual(len(self.calls("clippy")), 1)
         self.assertNotIn("--fix", self.calls("clippy")[0])
 
     def test_hold_started_during_judgment_suppresses_repairs(self) -> None:
         self.environment.update({"TEST_CLIPPY_FIRST_STATUS": "101", "TEST_JUDGMENT_HOLD": "1"})
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        result = self.invoke_lint_functions()
         self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
         self.assertEqual(len(self.calls("clippy")), 1)
         self.assertNotIn("--fix", self.calls("clippy")[0])
@@ -143,11 +279,13 @@ Caused by:
                          [["fmt", "-p", "sample"]])
 
     def test_first_judgment_nonlint_status_never_repairs(self) -> None:
-        # Even lint-shaped output cannot turn admission or kill codes into findings.
-        for status in (1, 2, 3, 10, 75, 76, 77, 125, 130, 137, 143):
+        # Lint-shaped output never turns a failed first judgment into a repair.
+        # Status 1 takes the plain failure path; 143 also takes the hold-stop checks in run_step.
+        for status in (1, 143):
             with self.subTest(status=status):
                 self.environment["TEST_CLIPPY_FIRST_STATUS"] = str(status)
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                result = (self.invoke_verify("lint", "sample", cwd=self.root) if status == 143
+                          else self.invoke_lint_functions())
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual(len(self.calls("clippy")), 1)
                 self.assertNotIn("--fix", self.calls("clippy")[0])
@@ -166,7 +304,7 @@ Caused by:
                     "TEST_CLIPPY_FIRST_DIAGNOSTIC": diagnostic,
                     "TEST_CLIPPY_STATUS": str(final_status),
                 })
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                result = self.invoke_lint_functions()
                 self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
                 self.assert_fix_and_judgment_calls()
                 self.assertEqual(self.lint_stages(), [
@@ -183,7 +321,7 @@ Caused by:
         for status in (0, 43, 101):
             with self.subTest(final_status=status):
                 self.environment["TEST_CLIPPY_STATUS"] = str(status)
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                result = self.invoke_lint_functions()
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assert_fix_and_judgment_calls()
                 self.assertEqual(self.lint_stages(), [
@@ -203,7 +341,7 @@ Caused by:
             with self.subTest(limit=limit):
                 self.write_config(clippy="on")
                 _ = write_config_fixture(self.config, f"clippy=on\nclippy_fix_pass_limit={limit}\n")
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                result = self.invoke_lint_functions()
                 self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
                 self.assert_fix_and_judgment_calls(fix_passes=limit)
 

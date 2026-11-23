@@ -5,33 +5,89 @@ import fcntl
 import io
 import json
 import os
+import pwd
+import runpy
+import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
+from subprocess import Popen as start_staff_owner
 from subprocess import run as run_fixture_git
 import sys
 import tempfile
+import time
+import traceback
 import unittest
 from collections.abc import Generator
+from contextvars import ContextVar
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
+from functools import cached_property
 from pathlib import Path
-from typing import Literal, cast, override
+from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
+from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.shutdown import pane_record
+from scripts.agents import pane_record, remote
+from scripts.lint.memory_test_support import write_config_fixture
+
+_LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+_FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
+_PRIVATE_STAFF_FILE: ContextVar[Path | None] = ContextVar("private_staff_file", default=None)
+
+
+@contextmanager
+def foreign_hostname() -> Generator[None]:
+    """Use one foreign hostname in the test and its Python children."""
+    with tempfile.TemporaryDirectory() as directory:
+        startup = Path(directory) / "sitecustomize.py"
+        _ = startup.write_text('import os, socket\nsocket.gethostname = lambda: os.environ.get("GATE_TEST_HOST", "gate-fixture")\n')
+        pythonpath = os.pathsep.join((directory, os.environ.get("PYTHONPATH", "")))
+        from scripts.production import production_lifecycle, update_registration
+        from scripts.agents import shutdown
+
+        with (mock.patch.object(shutdown, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(production_lifecycle, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()),
+              mock.patch.object(socket, "gethostname", return_value="gate-fixture"),
+              mock.patch.dict(os.environ, {"PYTHONPATH": pythonpath})):
+            yield
+
+
+def fixture_account_home(home: Path) -> Path:
+    """Keep fixture sessions outside the login user's real account folders."""
+    for candidate, login in ((Path(os.path.abspath(home)), _LOGIN_HOME), (home.resolve(), _LOGIN_HOME.resolve())):
+        if candidate.parent == login and candidate.name.startswith((".claude", ".codex")):
+            return Path(_FIXTURE_ACCOUNTS.name) / candidate.name
+    return home
+
+
+def _redirect_fixture_accounts() -> None:
+    for variable, folder in (("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")):
+        home = Path(os.environ.get(variable) or Path.home() / folder)
+        private_home = fixture_account_home(home)
+        if private_home != home:
+            os.environ[variable] = str(private_home)
+
+
+_redirect_fixture_accounts()
 
 FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
+STAFF_OWNER_PARENT_CHECK_SECONDS = 1.0
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
@@ -55,26 +111,56 @@ def fixture_runtime_id(label: str) -> str:
     return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
 
 
+def build_fixture_sessions(fallback: str) -> dict[str, str]:
+    """Keep the runner's session in children that build or test."""
+    return {
+        "CLAUDE_CODE_SESSION_ID": (os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+                                   if staff.caller_identity() else fallback),
+        "CODEX_THREAD_ID": os.environ.get("CODEX_THREAD_ID", ""),
+    }
+
+
+def _claude_home() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
 def _fixture_session_path(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
-    home = backend.codex_home if isinstance(backend, staff.CodexBackend) else Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    home = fixture_account_home(backend.codex_home if isinstance(backend, staff.CodexBackend) else _claude_home())
     return home / "sessions" / f"{identity}.jsonl" if isinstance(backend, staff.CodexBackend) else home / "projects/fixture" / f"{identity}.jsonl"
+
+
+def _prepare_fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> Path:
+    if isinstance(backend, staff.ClaudeBackend):
+        home = _claude_home()
+        private_home = fixture_account_home(home)
+        if private_home != home:
+            os.environ["CLAUDE_CONFIG_DIR"] = str(private_home)
+    path = _fixture_session_path(identity, backend)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBackend) -> None:
     """Create the private session file that supplies the worker family."""
-    path = _fixture_session_path(identity, backend)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _prepare_fixture_session(identity, backend)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(backend.codex_home)
+        home = fixture_account_home(backend.codex_home)
+        os.environ["CODEX_HOME"] = str(home)
+        row = staff.initial_snapshot().by_current_session(identity)
+        if row is None:
+            entry = pane_launch.launch("fixture-" + identity, identity, str(home),
+                                       {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / ("fixture-" + identity + ".json"), entry)
+        elif row.home != staff.SessionHome(home):
+            _ = staff.set_home(row.id, staff.SessionHome(home))
 
 
 def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
                        turns: int = 1, malformed: bool = False) -> tuple[Path, tuple[list[str], list[str], list[str]]]:
     """Write source evidence with private tool data between assignments and final replies."""
-    path = _fixture_session_path(row.current_session, backend)
+    path = _prepare_fixture_session(row.current_session, backend)
     family = backend.family
-    path.parent.mkdir(parents=True, exist_ok=True)
     assignments = [f"Assignment {index}: preserve this complete requirement. " + "detail " * 90
                    for index in range(turns)]
     replies = [f"Final {index}: completed the required change. " + "proof " * 90
@@ -118,18 +204,35 @@ def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff
 
 
 def stopped_worker_module(directory: Path) -> Path:
-    """Install a child-process lifecycle stub that records the source row."""
+    """Install a child-process lifecycle stub that records the source row.
+
+    The stub patches `stop_resume` when a child imports it, so other children skip that import.
+    """
     directory.mkdir()
-    _ = (directory / "sitecustomize.py").write_text('''import json, os
+    _ = (directory / "sitecustomize.py").write_text('''import json, os, sys
+from importlib.machinery import PathFinder
 from pathlib import Path
-from scripts.production import staff
-from scripts.shutdown import stop_resume
-def stop(reference):
+def stop(reference, kind=""):
+    from scripts.production import staff
+    from scripts.agents import stop_resume
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
         Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
     return stop_resume.Stopped(row.current_session, 987654)
-stop_resume.stop = stop
+class StopPatch:
+    @classmethod
+    def find_spec(cls, name, path, target=None):
+        if name != "scripts.agents.stop_resume":
+            return None
+        sys.meta_path.remove(cls)
+        spec = PathFinder.find_spec(name, path)
+        load = spec.loader.exec_module
+        def exec_module(module):
+            load(module)
+            module.stop = stop
+        spec.loader.exec_module = exec_module
+        return spec
+sys.meta_path.insert(0, StopPatch)
 ''')
     return directory
 
@@ -141,10 +244,10 @@ from pathlib import Path
 from unittest.mock import patch
 from scripts.production import staff, worker_admission as admission
 from scripts.production.staff_test_support import fixture_runtime_id, fixture_session
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 args = sys.argv[1:]
 run = Path(args[args.index("--session-dir") + 1])
-allowed = admission.admit(args[args.index("--name") + 1], run, role="impl")
+allowed = admission.admit(args[args.index("--name") + 1], run)
 row = allowed.slot.row
 def start(handoff):
     identity = fixture_runtime_id("destination:" + row.id + "codex")
@@ -154,8 +257,26 @@ def dispatch(published):
     assert staff.by_id(row.id) == published.row
     return admission.SwitchState.ASSIGNMENT_ACCEPTED
 with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.current_session, 987654)):
-    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: None)
+    admission.switch_worker(allowed, "codex", start=start, dispatch=dispatch, cleanup=lambda identity: admission.NoDestinationToStop())
 '''
+
+
+def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Seed an old unit name in the private staff file."""
+    configured = os.environ.get("STAFF_FILE") or os.environ.get("STAFF_TEST_OWNER_FILE")
+    if row.kind != "unit" or not configured:
+        raise AssertionError("A saved unit name requires a private staff fixture.")
+    path = Path(configured).resolve()
+    temporary_roots = (Path(tempfile.gettempdir()), Path("/tmp"))
+    if path != _PRIVATE_STAFF_FILE.get() and not any(path.is_relative_to(root.resolve()) for root in temporary_roots):
+        raise AssertionError("The staff fixture must be in a temporary directory.")
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        fields = next(value for value in cast(list[dict[str, object]], document["rows"]) if value["id"] == row.id)
+        fields["name"] = name
+        write_text_atomic(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    return replace(row, name=name)
 
 
 def fixture_member(kind: staff.Kind, *, name: str,
@@ -175,8 +296,17 @@ def fixture_member(kind: staff.Kind, *, name: str,
     if kind == "worker":
         if parent_id is None:
             raise staff.StaffRefused("a fixture worker requires a parent")
+        row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
-        return staff.ensure_worker(staff.native_id(identity), name, parent_id)
+        return staff.by_id(row.id) or row
+    if kind == "unit" and not existing:
+        try:
+            staff.validate_unit_name_for_write(name)
+        except staff.StaffRefused:
+            # Keep legacy test inputs while the real writer refuses new rows with these names.
+            row = staff.ensure(kind, name=f"fixture-{identity}", parent=relationship,
+                               worktree=worktree, doc=doc, runtime_id=identity)
+            return fixture_unit_saved_name(row, name)
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -184,11 +314,7 @@ def fixture_member(kind: staff.Kind, *, name: str,
 def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "",
                    backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the fake worker backend's native identity through the real writer."""
-    existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
-                if row.name == name and row.parent == staff.ReportsTo(parent)]
-    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
-    fixture_session(identity, backend)
-    return staff.ensure_worker(staff.native_id(identity), name, parent)
+    return fixture_member("worker", name=name, parent=parent, runtime_id=runtime_id, backend=backend)
 
 
 def fixture_roster(entries: dict[str, object], parent: staff.StaffId,
@@ -274,7 +400,7 @@ class ClaudeBackendFixture:
     def launch(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str],
                kind: str, agent_arguments: list[str], opening: object, timeout_ms: int, *,
                agent: str) -> object:
-        import herdr
+        from scripts.herdr import herdr
 
         del name, space, title, cwd, kind, timeout_ms, agent
         if not isinstance(opening, herdr.OpeningPrompt):
@@ -289,29 +415,53 @@ class ClaudeBackendFixture:
 
 @contextmanager
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
-    """Use private staff and notifier paths in this process and its fixture children."""
+    """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    if "XDG_CONFIG_HOME" not in environment or environment["XDG_CONFIG_HOME"] == os.environ.get("XDG_CONFIG_HOME"):
+        environment["XDG_CONFIG_HOME"] = str(path.parent / "config")
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
+    for key, folder in (
+        ("SHOWRUNNER_STATE_DIR", "showrunners"),
+        ("NOTIFIER_SESSIONS_DIR", "sessions"),
+        ("HERDR_PANE_RECORD_DIR", "panes"),
+        # Session folders belong to staff members; a fixture member never makes one in the live root.
+        ("SESSION_TEMP_ROOT", "session"),
+    ):
+        _ = environment.setdefault(key, str(path.parent / folder))
+    # A row removal edits the restart record; a fixture never edits the live one.
+    _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
+        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
             "NOTIFIER_STATE_DIR": environment["NOTIFIER_STATE_DIR"],
+            "SHOWRUNNER_STATE_DIR": environment["SHOWRUNNER_STATE_DIR"],
+            "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
+            "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
+            "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
+            "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
+            "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+            "STAFF_CONFIG": environment["STAFF_CONFIG"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
             if module is not None:
+                for key in ("NOTIFIER_STATE_DIR", "SHOWRUNNER_STATE_DIR"):
+                    _ = contexts.enter_context(mock.patch.object(module, key, Path(environment[key])))
+        for name in ("pane_record", "scripts.agents.pane_record"):
+            module = sys.modules.get(name)
+            if module is not None:
                 _ = contexts.enter_context(mock.patch.object(
-                    module, "NOTIFIER_STATE_DIR", Path(environment["NOTIFIER_STATE_DIR"]),
+                    module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
                 ))
-        if "HERDR_PANE_RECORD_DIR" in environment:
-            _ = contexts.enter_context(mock.patch.object(
-                pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
-            ))
+        _ = contexts.callback(_PRIVATE_STAFF_FILE.reset, _PRIVATE_STAFF_FILE.set(path.resolve()))
         yield
 
 
@@ -334,7 +484,8 @@ def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRo
     """Record the document that identifies one private production owner."""
     rows = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == name]
     row = rows[0] if rows and not parent else showrunner_relationship(name, parent)
-    return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
+    location = staff.LiveDoc(remote.local_machine(), doc)
+    return row if row.doc == location else staff.set_doc(row.id, location)
 
 
 def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> staff.StaffRow:
@@ -342,7 +493,7 @@ def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> s
     from scripts.production import unit_names
 
     row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
-    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
+    return staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), location), expected=row.worktree)
 
 
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
@@ -350,7 +501,7 @@ def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
     """Record private unit locations and configuration through the shared fixture writers."""
     _ = recorded_showrunner(showrunner, doc)
     row = unit_membership(showrunner, unit)
-    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
+    row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
@@ -388,32 +539,26 @@ def production_membership(showrunner: str, *units: str) -> None:
         _ = unit_membership(showrunner, unit)
 
 
-def fixture_showrunner_name(slug: str, doc: Path) -> str:
-    """Keep the real doc's workspace name; extra fixture productions use their slugs."""
-    from scripts.production import showrunners
-    from scripts.production.production_doc import read_production
-
-    return showrunners.herdr_space(slug, str(doc)) if slug == read_production(doc).slug else slug
-
-
 def source_environment(source: Path) -> dict[str, str]:
     return {key: str(source / folder) for key, folder in (
         ("NOTIFIER_STATE_DIR", "notifier"), ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("HERDR_PANE_RECORD_DIR", "panes"), ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("XDG_CONFIG_HOME", "config"),
         ("UNIT_WORKERS_STATE", "unit-workers"), ("ROSTER_RUN_ROOT", "runs"),
-        ("ASTRA_ROLES_STATE", "astra-roles"),
+        ("ASTRA_ROLES_STATE", "astra-roles"), ("ASTRA_REVIEW_DIR", "astra-runs"),
         ("DESIGN_ROLES_STATE", "design-roles"), ("DESIGN_OWNERSHIP_STATE", "design-ownership"),
     )}
 
 
 OWNER_CLI = """import os, runpy, sys
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
-from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
+from pathlib import Path
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.production.staff_test_support import STAFF_SCRIPT, isolated_source_readers, observe_operation_lock
 observe_operation_lock()
 # Import platform-dependent Python support before selecting fake Mac transport.
 from scripts.production import staff_sources
-from scripts.shutdown import remote
+from scripts.agents import remote
 from unittest import mock
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
@@ -422,6 +567,9 @@ sys.argv[0] = script
 with isolated_source_readers(), mock.patch.object(
     remote, 'local_machine', return_value='mac' if sys.platform == 'darwin' else 'natedev',
 ):
+    if script == str(STAFF_SCRIPT):
+        from scripts.production import staff
+        raise SystemExit(staff.main())
     runpy.run_path(script, run_name='__main__')
 """
 
@@ -453,9 +601,11 @@ def observe_operation_lock() -> None:
 @contextmanager
 def isolated_source_readers() -> Generator[None]:
     """Redirect import-bound source paths and prevent live session discovery."""
+    from scripts.lib import unit_runs
     from scripts.message import process_table
 
     with ExitStack() as contexts:
+        _ = contexts.enter_context(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", Path(os.environ["ASTRA_REVIEW_DIR"])))
         # Process-evidence cases install their own private snapshot inside this boundary.
         _ = contexts.enter_context(mock.patch.object(process_table, "snapshot", return_value={}))
         for module_name, attributes in (
@@ -465,7 +615,7 @@ def isolated_source_readers() -> Generator[None]:
             }),
             ("pane_record", {"RECORD_DIR": Path(os.environ["HERDR_PANE_RECORD_DIR"])}),
         ):
-            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.shutdown.pane_record"
+            qualified = "scripts.production.showrunners" if module_name == "showrunners" else "scripts.agents.pane_record"
             for name in (module_name, qualified):
                 module = sys.modules.get(name)
                 if module is not None:
@@ -484,9 +634,10 @@ def isolated_source_readers() -> Generator[None]:
 # canned response, so remote reads, writes, and error mapping must all agree.
 FAKE_SSH = """import json, os, runpy, shlex, sys
 from pathlib import Path
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production.staff_test_support import source_environment
 arguments = sys.argv[1:]
 log = Path(os.environ['STAFF_TEST_SSH_LOG'])
 previous = log.read_text() if log.exists() else ''
@@ -496,22 +647,32 @@ if os.environ.get('STAFF_TEST_SSH_FAIL'):
     if reason:
         print(reason, file=sys.stderr)
     raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if (len(arguments) < 6 or arguments[:3] != ['-o', 'BatchMode=yes', '-o']
-        or not arguments[3].startswith('ConnectTimeout=') or arguments[4] != 'natedev'
-        or int(arguments[3].split('=', 1)[1]) <= 0):
+if len(arguments) < 4 or arguments[:3] != ['-o', 'BatchMode=yes', 'natedev']:
     raise SystemExit('unexpected SSH target or options')
-command = arguments[5:]
+command = arguments[3:]
 if len(command) == 1:
     command = shlex.split(command[0])
 if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/staff.py']:
     raise SystemExit('unexpected remote Python or staff script')
 if '--json' not in command[2:]:
     raise SystemExit('remote staff call requires --json')
+if os.environ.get('STAFF_TEST_OWNER_PORT') and not os.environ.get('STAFF_TEST_LOCK_NOTICE'):
+    import socket
+    request = dict(arguments=[os.environ['STAFF_TEST_SCRIPT'], *command[2:]], environment=dict(os.environ),
+                   directory=os.getcwd(), stdin=sys.stdin.read())
+    with socket.create_connection(('127.0.0.1', int(os.environ['STAFF_TEST_OWNER_PORT']))) as connection:
+        with connection.makefile('rwb') as channel:
+            channel.write(json.dumps(request).encode() + b'\\n')
+            channel.flush()
+            result = json.loads(channel.readline())
+    sys.stdout.write(result['stdout'])
+    sys.stderr.write(result['stderr'])
+    raise SystemExit(result['status'])
+from scripts.production.staff_test_support import source_environment
 os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
 source = Path(os.environ['STAFF_TEST_OWNER_SOURCE'])
 os.environ.update(source_environment(source))
 sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 from scripts.production import staff_sources
@@ -530,7 +691,186 @@ class RowProductionFixture:
     worker: staff.StaffRow
     doc: Path
     worktree: Path
-    slug: str
+    name: str
+
+
+class StaffOwnerRequest(TypedDict):
+    arguments: list[str]
+    environment: dict[str, str]
+    directory: str
+    stdin: str
+
+
+def run_staff_owner_request(connection: socket.socket, request: StaffOwnerRequest) -> None:
+    """Run one CLI request in its own child of the warm owner."""
+    environment = request["environment"]
+    environment["STAFF_FILE"] = environment["STAFF_TEST_OWNER_FILE"]
+    environment.update(source_environment(Path(environment["STAFF_TEST_OWNER_SOURCE"])))
+    os.environ.clear()
+    os.environ.update(environment)
+    tempfile.tempdir = None
+    os.chdir(request["directory"])
+    sys.argv = request["arguments"]
+    sys.stdin = io.StringIO(request["stdin"])
+    sys.platform = "linux"
+    output, errors = io.StringIO(), io.StringIO()
+    status = 0
+    with redirect_stdout(output), redirect_stderr(errors), isolated_source_readers():
+        observe_operation_lock()
+        try:
+            _ = runpy.run_path(sys.argv[0], run_name="__main__")
+        except SystemExit as result:
+            status = result.code if isinstance(result.code, int) else 0 if result.code is None else 1
+            if isinstance(result.code, str):
+                print(result.code, file=sys.stderr)
+        except BaseException:
+            traceback.print_exc()
+            status = 1
+    with connection.makefile("wb") as channel:
+        _ = channel.write(json.dumps(dict(status=status, stdout=output.getvalue(), stderr=errors.getvalue())).encode() + b"\n")
+        channel.flush()
+
+
+STAFF_OWNER_SERVER = r'''
+import json
+import os
+import select
+import signal
+import socket
+import sys
+from contextlib import suppress
+from pathlib import Path
+
+parent_pid = int(sys.argv[1])
+if os.getppid() != parent_pid:
+    raise SystemExit
+close_token = os.environ.pop('STAFF_TEST_OWNER_CLOSE_TOKEN')
+with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
+from scripts.production import staff_sources
+
+# Report a matching close request through the request child's exit status.
+STOP_REQUEST_EXIT_STATUS = 75
+
+def fork_request(listener, connection, notices, wake):
+    pid = os.fork()
+    if pid:
+        return pid
+    status = 0
+    try:
+        signal.set_wakeup_fd(-1)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        notices.close()
+        wake.close()
+        listener.close()
+        connection.setblocking(True)
+        with connection.makefile('rb') as channel:
+            line = channel.readline()
+        if line:
+            request = json.loads(line)
+            if request == {'close': close_token}:
+                status = STOP_REQUEST_EXIT_STATUS
+            elif isinstance(request, dict) and 'close' not in request:
+                run_staff_owner_request(connection, request)
+    finally:
+        connection.close()
+        os._exit(status)
+
+children = set()
+notices, wake = socket.socketpair()
+closing = False
+with notices, wake:
+    # Wake select when a request exits, including during a normal close.
+    wake.setblocking(False)
+    signal.signal(signal.SIGCHLD, lambda *_: None)
+    signal.set_wakeup_fd(wake.fileno(), warn_on_full_buffer=False)
+    try:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            listener.setblocking(False)
+            print(listener.getsockname()[1], flush=True)
+            while os.getppid() == parent_pid:
+                for pid in tuple(children):
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if not finished:
+                        continue
+                    children.remove(pid)
+                    if os.waitstatus_to_exitcode(status) == STOP_REQUEST_EXIT_STATUS:
+                        listener.close()
+                        closing = True
+                if closing and not children:
+                    break
+                readers = [notices] if closing else [listener, notices]
+                ready, _, _ = select.select(readers, [], [], STAFF_OWNER_PARENT_CHECK_SECONDS)
+                if notices in ready:
+                    notices.recv(4096)
+                    continue
+                if listener not in ready or os.getppid() != parent_pid:
+                    continue
+                try:
+                    connection, _ = listener.accept()
+                except BlockingIOError:
+                    continue
+                with connection:
+                    children.add(fork_request(listener, connection, notices, wake))
+    finally:
+        signal.set_wakeup_fd(-1)
+        for pid in children:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in children:
+            os.waitpid(pid, 0)
+'''
+
+
+class SharedStaffOwner:
+    """Own one lazy import cache and all request children for a test."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.lifetime: ExitStack = ExitStack()
+        self.pid: int | None = None
+
+    @cached_property
+    def port(self) -> str:
+        close_token = secrets.token_hex()
+        script = self.root / "fake-staff-owner.py"
+        write_text_atomic(script, STAFF_OWNER_SERVER)
+        errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
+        process = self.lifetime.enter_context(start_staff_owner(
+            [sys.executable, str(script), str(os.getpid())], cwd=self.root,
+            env={**os.environ, "TMPDIR": str(self.root), "STAFF_TEST_OWNER_CLOSE_TOKEN": close_token},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
+            start_new_session=True,
+        ))
+        self.pid = process.pid
+        port = ""
+
+        def stop() -> None:
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            try:
+                if port:
+                    with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
+                        connection.settimeout(max(0, deadline - time.monotonic()))
+                        connection.sendall(json.dumps({"close": close_token}).encode() + b"\n")
+                _ = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait()
+
+        _ = self.lifetime.callback(stop)
+        port = cast(TextIO, process.stdout).readline().strip()
+        if not port:
+            raise RuntimeError(f"The staff owner did not report its port. See {errors.name}.")
+        return port
+
+    def close(self) -> None:
+        self.lifetime.close()
 
 
 class StaffTestCase(unittest.TestCase):
@@ -538,6 +878,12 @@ class StaffTestCase(unittest.TestCase):
     staff_file: Path = Path()
     mac_file: Path = Path()
     ssh_log: Path = Path()
+
+    @cached_property
+    def shared_owner(self) -> SharedStaffOwner:
+        owner = SharedStaffOwner(self.root)
+        self.addCleanup(owner.close)
+        return owner
 
     def staff_state(self) -> tuple[bytes, int]:
         return self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -562,12 +908,13 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
             "STAFF_TEST_CHECKOUT": str(CHECKOUT),
             "STAFF_TEST_SCRIPT": str(STAFF_SCRIPT),
-            "STAFF_TEST_SSH_FAIL": "",
+            "STAFF_TEST_SSH_FAIL": "", "STAFF_TEST_OWNER_PORT": "",
             "STAFF_TEST_SSH_EXIT": "255",
             "STAFF_TEST_SSH_REASON": "ssh: connection refused",
             "STAFF_TEST_PLATFORM": "linux",
@@ -576,6 +923,7 @@ class StaffTestCase(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
@@ -595,17 +943,18 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_PLATFORM": "linux" if machine == "natedev" else "darwin",
             "HERDR_SESSION": "agents",
         })
+        if machine == "mac":
+            environment["STAFF_TEST_OWNER_PORT"] = self.shared_owner.port
         with ExitStack() as contexts:
             _ = contexts.enter_context(isolated_staff_file(
                 self.staff_file if machine == "natedev" else self.mac_file, environment,
             ))
             _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
             _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
+                "scripts.agents.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
-            _ = contexts.enter_context(mock.patch(
-                "scripts.shutdown.remote.local_machine", return_value=machine,
-            ))
+            for module in {remote, sys.modules.get("remote", remote)}:
+                _ = contexts.enter_context(mock.patch.object(module, "local_machine", return_value=machine))
             _ = contexts.enter_context(isolated_source_readers())
             if machine == "mac":
                 _ = os.environ.pop("STAFF_FILE", None)
@@ -623,7 +972,7 @@ class StaffTestCase(unittest.TestCase):
 
     def script(self, script: Path, *arguments: str, code: int = 0, input: str | None = None) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments],
             cwd=CHECKOUT, input=input, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS,
         )
@@ -658,44 +1007,46 @@ class StaffTestCase(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
-    def production(self, slug: str, *units: str, workspace: str = "", parent: str = "") -> Path:
+    def production(self, production_name: str, *units: str, workspace: str = "", parent: str = "") -> Path:
         """Write real timer/doc sources; each listed unit has a staff row and a folder."""
-        doc = self.source_root / f"{slug}-production.md"
-        self.write_production_doc(doc, workspace=workspace or slug)
-        self.register_production(slug, doc, name=workspace or slug)
+        doc = self.source_root / f"{production_name}-production.md"
+        self.write_production_doc(doc, workspace=workspace or production_name)
+        self.register_production(production_name, doc, name=workspace or production_name)
         for unit in units:
             _ = self.worktree(unit)
-            owner = fixture_runtime_id("showrunner::" + (workspace or slug))
+            owner = fixture_runtime_id("showrunner::" + (workspace or production_name))
             from scripts.production import unit_names
 
             identity = fixture_runtime_id("unit:" + owner + ":" + unit_names.name(unit))
             # A test can make or rename the row first; keep that row.
             if staff.initial_snapshot().by_id(staff.StaffId(identity)) is None:
-                _ = unit_membership(workspace or slug, unit)
-            self.pane(f"fixture:{slug}/{unit}", session_id=identity,
+                _ = unit_membership(workspace or production_name, unit)
+            self.pane(f"fixture:{production_name}/{unit}", session_id=identity,
                       environment={"CLAUDE_CODE_SESSION_ID": identity},
                       written_at="2026-10-01T00:00:00+00:00")
         if parent:
-            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"
+            parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / production_name / "parent"
             parent_file.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(parent_file, parent + "\n")
         return doc
 
-    def register_production(self, slug: str, doc: Path, *, name: str = "") -> None:
+    def register_production(self, production_name: str, doc: Path, *, name: str = "") -> None:
         """Register an existing fixture document without making a second production."""
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        row = recorded_showrunner(name or production_name, doc)
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{row.id}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        identity = fixture_runtime_id("showrunner::" + (name or slug))
-        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        identity = row.id
+        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {row.id}\n")
 
-    def record_production(self, slug: str, doc: Path) -> staff.StaffRow:
+    def record_production(self, production_name: str, doc: Path) -> staff.StaffRow:
         """Register the timer and record its private owner document."""
-        row = recorded_showrunner(fixture_showrunner_name(slug, doc), doc)
-        self.register_production(slug, doc, name=row.name)
+        row = recorded_showrunner(production_name, doc)
+        self.register_production(production_name, doc, name=row.name)
         return row
 
     def write_production_doc(self, doc: Path, *, workspace: str) -> None:
-        write_text_atomic(doc, f"# Fixture production\n- **Showrunner session:** `{workspace}`\n")
+        del workspace
+        write_text_atomic(doc, "# Fixture production\n")
 
     def worktree(self, unit: str) -> Path:
         folder = self.source_root / "worktrees" / unit
@@ -712,9 +1063,9 @@ class StaffTestCase(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def fill_production(self, slug: str, *units: str) -> Path:
+    def fill_production(self, production_name: str, *units: str) -> Path:
         """Build a timer doc and real linked worktrees for the live fill."""
-        repository = self.source_root / "repositories" / slug
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "main")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -725,14 +1076,14 @@ class StaffTestCase(unittest.TestCase):
             folder.parent.mkdir(parents=True, exist_ok=True)
             _ = self.fixture_git(repository, "worktree", "add", "-b", unit, str(folder))
             write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
-        doc = repository / "docs" / f"{slug}-production.md"
+        doc = repository / "docs" / f"{production_name}-production.md"
         doc.parent.mkdir()
-        self.write_production_doc(doc, workspace=slug)
-        self.register_production(slug, doc)
-        production_membership(slug, *units)
+        self.write_production_doc(doc, workspace=production_name)
+        self.register_production(production_name, doc)
+        production_membership(production_name, *units)
         for unit in units:
-            row = unit_membership(slug, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.source_root / "worktrees" / unit),
+            row = unit_membership(production_name, unit)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees" / unit),
                                    expected=row.worktree)
         # Do not import the checkout's real showrunner registry into the fill.
         registry = self.source_root / "showrunners.json"
@@ -742,8 +1093,8 @@ class StaffTestCase(unittest.TestCase):
 
     def row_production(self) -> RowProductionFixture:
         """Create private git evidence and conflicting legacy metadata."""
-        slug = "timer-alias"
-        repository = self.source_root / "repositories" / slug
+        production_name = "timer-alias"
+        repository = self.source_root / "repositories" / production_name
         repository.mkdir(parents=True)
         _ = self.fixture_git(repository, "init", "-b", "merge-from-git")
         _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
@@ -756,21 +1107,21 @@ class StaffTestCase(unittest.TestCase):
                           + 'port = 4317\nresponsibilities = ["shared-fixture"]\n')
         doc = repository / "docs" / "row-production.md"
         doc.parent.mkdir()
-        write_text_atomic(doc, "# Production\n- **Showrunner session:** `row-owner`\n")
-        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc("natedev", doc))
+        write_text_atomic(doc, "# Production\n")
+        runner = fixture_member("showrunner", name="row-owner", doc=staff.LiveDoc(remote.local_machine(), doc))
         unit = fixture_member("unit", name="member", parent=runner.id,
-                              worktree=staff.PresentWorktree("natedev", folder))
+                              worktree=staff.PresentWorktree(remote.local_machine(), folder))
         worker = fixture_worker("reader", unit.id)
         runner = staff.update_current_session(runner.current_session, staff.native_id(fixture_runtime_id("row-owner-current")))
         unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("row-member-current")))
         current = staff.native_id(fixture_runtime_id("row-worker-current"))
         fixture_session(current, CLAUDE_BACKEND)
         worker = staff.update_current_session(worker.current_session, current)
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.id}" / "conf"
         timer.parent.mkdir(parents=True)
         write_text_atomic(timer, f"TARGET=session:{runner.id}\n"
-                          + f"CHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
-        return RowProductionFixture(runner, unit, worker, doc, folder, slug)
+                          + f"CHECK=zsh /fixture/production_check.sh {runner.id}\n")
+        return RowProductionFixture(runner, unit, worker, doc, folder, runner.name)
 
     def separated_unit_folders(self) -> RowProductionFixture:
         """Give the production doc its checkout fields beside the unit's own folder."""
@@ -815,23 +1166,38 @@ class StaffTestCase(unittest.TestCase):
         })
         return path
 
-    def worker_run(self, slug: str, unit: str, director: str) -> Path:
-        """A unit run with actual state, roster, server and director records."""
-        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{slug}-{unit}"
+    def worker_run(self, production_name: str, unit: str, director: str, *,
+                   passes: tuple[dict[str, object], ...] = (), director_run: bool = False) -> Path:
+        """Create private run evidence for a director and its worker passes."""
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
+        record = staff.local_snapshot()
+        owner = record.by_current_session(director)
+        if owner is None:
+            owner = next(row for row in record.find(kind="unit") if row.name == unit)
+        participants: dict[str, object] = {}
+        for passed in passes:
+            reference = passed.get("worker_id")
+            member = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+                      next((row for row in record.find(kind="worker", parent=owner.id)
+                            if row.name == passed.get("worker_name")), None))
+            if member is not None and member.parent == staff.ReportsTo(owner.id):
+                participants[str(passed.get("team_slot") or member.id)] = {
+                    **{key: value for key, value in passed.items() if key != "worker_name"}, "worker_id": member.id}
         self.write_json(run / "progress_history_state.json", {
-            "production": slug, "unit": unit,
-            "main_agent": {"family": "claude", "session_id": director},
+            "owner_staff_id": owner.id, "pass": participants,
         })
         write_text_atomic(run / "director", director + "\n")
-        self.write_json(run / "mesh_roster.json", {})
-        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "port": 12345, "codex_home": str(self.root / "codex")})
+        if director_run:
+            owner = staff.local_snapshot().by_current_session(director)
+            assert owner is not None
+            _ = staff.set_run(owner.id, staff.OpenRun(run))
         return run
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:
-        path = self.root / "operation-notice.sock"
-        with socket.socket(socket.AF_UNIX) as listener:
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            path = Path(directory) / "operation-notice.sock"
             listener.bind(str(path))
             listener.listen()
             listener.settimeout(TEST_HANG_GUARD_SECS)
@@ -840,7 +1206,7 @@ class StaffTestCase(unittest.TestCase):
 
     def start_script(self, script: Path, *arguments: str) -> subprocess.Popen[str]:
         pending = subprocess.Popen(
-            [sys.executable, "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", OWNER_CLI, str(script), *arguments], cwd=CHECKOUT,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -863,10 +1229,9 @@ class StaffTestCase(unittest.TestCase):
         commands: list[list[str]] = []
         for line in self.ssh_log.read_text().splitlines():
             arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:3], ["-o", "BatchMode=yes", "-o"])
-            self.assertEqual(arguments[4], "natedev")
-            self.assertRegex(arguments[3], r"^ConnectTimeout=[1-9][0-9]*$")
-            command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
+            self.assertEqual(arguments[:2], ["-o", "BatchMode=yes"])
+            self.assertEqual(arguments[2], "natedev")
+            command = shlex.split(arguments[3]) if len(arguments) == 4 else arguments[3:]
             self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
             self.assertIn("--json", command[2:])
             commands.append(command[2:])

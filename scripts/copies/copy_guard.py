@@ -1,40 +1,44 @@
 """Keep repository checkout creation in copies.py and the named original/mirror paths."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import ast
+from collections import deque
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
-import importlib
+from dataclasses import dataclass, field
+from functools import cache
 import io
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 from typing import Protocol, cast, override
 
 
 
 # Reuse the existing scratch policy behind this combined front.
-HOOKS = Path(__file__).resolve().parents[1] / "hooks"
-sys.path.insert(0, str(HOOKS))
-sys.path.insert(0, str(HOOKS.parents[1]))
 
 from scripts.copies import shell_syntax as syntax
+from scripts.lib.file_module import load_file_module
 
 
 class ShellCommands(Protocol):
     def main(self) -> None: ...
 
 
-SHELL = cast(ShellCommands, cast(object, importlib.import_module("pre-tool-use-scratch-guard")))
+SHELL = cast(ShellCommands, cast(object, load_file_module(
+    "scratch_guard", Path(__file__).resolve().parents[1] / "hooks/pre-tool-use-scratch-guard.py")))
 # Fixture repositories are disposable test inputs, never operational gate checkouts.
 TEST_INPUT_REASON = "Tests and fixture/support modules construct isolated disposable repository inputs."
 REFUSAL = (
-    "Repository trees must be made by copies.py run. "
-    + "Example: python3 ~/.claude/scripts/copies/copies.py run --owner verify-unit "
-    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover"
+    "Run a fixed commit with copies.py run. "
+    + "Example: python3 ~/.claude/scripts/copies/copies.py run "
+    + "--repo ~/.claude --commit HEAD -- python3 -m unittest discover. "
+    + "Make an editable worktree with worktrees.py make <repo> <unit> <short-name>."
 )
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"})
 COPY_VALUE_OPTIONS = frozenset({"-t", "--target-directory", "-e", "--rsh", "--exclude", "--include",
@@ -43,6 +47,7 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 REPO_NAME = re.compile(r"(?:^|[_.])(?:repo|repository|checkout|worktree|clone)(?:$|[_.])")
 RUNNERS = frozenset({"run", "Popen", "check_call", "check_output", "call", "system", "command"})
 TREE_COMMAND = re.compile(r"\bgit\b.*\b(?:clone|worktree\s+add)\b|\b(?:cp|rsync)\b.*-[a-zA-Z]*[arR]")
+GIT_MODULES = frozenset({"copies", "scripts.copies.copies"})
 
 
 @dataclass(frozen=True)
@@ -53,7 +58,8 @@ class TreeCreation:
 
     @override
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: {self.operation}; use copies.py run"
+        instruction = "" if self.operation.startswith(("unresolved relevant operation:", "cannot ")) else "; use copies.py run"
+        return f"{self.path}:{self.line}: {self.operation}{instruction}"
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,15 @@ class KnownArgument:
 @dataclass(frozen=True)
 class UnknownArgument:
     description: str
+    text: str = syntax.UNKNOWN_VALUE
+
+
+@dataclass(frozen=True)
+class UnresolvedChoices:
+    """The branch combinations exceed the configured inspection limit."""
+    description: str
+    text: str = syntax.UNKNOWN_VALUE
+    choice_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,7 +116,59 @@ class ArgumentChoices:
     choices: tuple[tuple[Argument, ...], ...]
 
 
-Argument = KnownArgument | UnknownArgument | UnknownArguments | ForwardedArguments | ArgumentChoices
+Argument = KnownArgument | UnknownArgument | UnresolvedChoices | UnknownArguments | ForwardedArguments | ArgumentChoices
+
+
+def _retained_choice_texts(words: tuple[Argument, ...]) -> tuple[str, ...]:
+    """Keep value fragments without constructing combinations across words."""
+    texts: dict[str, None] = {}
+    pending = deque(words)
+    while pending:
+        word = pending.popleft()
+        if isinstance(word, ArgumentChoices):
+            pending.extend(argument for choice in word.choices for argument in choice)
+        elif isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            texts[word.text] = None
+            if isinstance(word, UnresolvedChoices):
+                texts.update(dict.fromkeys(word.choice_texts))
+    return tuple(texts)
+
+
+@cache
+def _choice_limit() -> int:
+    from scripts.copies.copies import guard_choice_limit
+    return guard_choice_limit()
+
+
+def _choice_options(choices: tuple[tuple[Argument, ...], ...], description: str) -> tuple[tuple[Argument, ...], ...]:
+    options: dict[tuple[Argument, ...], None] = {}
+    for choice in choices:
+        for vector in _choice_vectors(choice):
+            options[vector] = None
+            if len(options) > _choice_limit():
+                texts = _retained_choice_texts(tuple(argument for choice in choices for argument in choice))
+                return ((UnresolvedChoices(description, choice_texts=texts),),)
+    return tuple(options)
+
+
+def _choice_vectors(words: tuple[Argument, ...]) -> tuple[tuple[Argument, ...], ...]:
+    """Read a bounded set of combinations and retain unknown values beyond the limit."""
+    vectors: list[list[Argument]] = [[]]
+    for word in words:
+        options = _choice_options(word.choices, "branch choices") if isinstance(word, ArgumentChoices) else ((word,),)
+        if len(vectors) * len(options) > _choice_limit():
+            options = ((UnresolvedChoices("branch choices", choice_texts=_retained_choice_texts((word,))),),)
+        if len(options) == 1:
+            for vector in vectors:
+                vector.extend(options[0])
+        else:
+            vectors = [prefix + list(suffix) for prefix in vectors for suffix in options]
+    return tuple(tuple(vector) for vector in vectors)
+
+
+def _merged_arguments(choices: tuple[tuple[Argument, ...], ...], description: str) -> tuple[Argument, ...]:
+    options = _choice_options(choices, description)
+    return options[0] if len(options) == 1 else (ArgumentChoices(options),)
 
 
 @dataclass(frozen=True)
@@ -110,11 +177,23 @@ class LiteralProgramInput:
 
 
 @dataclass(frozen=True)
+class ExpandedProgramInput:
+    text: str
+
+
+@dataclass(frozen=True)
+class ProgramWithChoiceTexts:
+    """The program retains known text and value fragments above the inspection limit."""
+    text: str
+    choice_texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class UnknownProgramInput:
     reason: str
 
 
-ProgramInput = LiteralProgramInput | UnknownProgramInput
+ProgramInput = LiteralProgramInput | ExpandedProgramInput | ProgramWithChoiceTexts | UnknownProgramInput
 UNAVAILABLE_STDIN = UnknownProgramInput("cannot resolve interpreter stdin")
 
 
@@ -148,8 +227,13 @@ Invocation = CommandProgram | StdinProgram | ScriptProgram | NoProgramInvocation
 
 
 def _program_input(argument: Argument) -> ProgramInput:
-    return (LiteralProgramInput(argument.text) if isinstance(argument, KnownArgument)
-            else UnknownProgramInput("cannot resolve interpreter program"))
+    if isinstance(argument, KnownArgument):
+        return LiteralProgramInput(argument.text)
+    if isinstance(argument, UnknownArgument):
+        return ExpandedProgramInput(argument.text)
+    if isinstance(argument, UnresolvedChoices):
+        return ProgramWithChoiceTexts(argument.text, argument.choice_texts)
+    return UnknownProgramInput("cannot resolve interpreter program")
 
 
 def decode_invocation(words: list[Argument]) -> Invocation:
@@ -158,9 +242,13 @@ def decode_invocation(words: list[Argument]) -> Invocation:
         return OrdinaryInvocation()
     executable = Path(_text(words[0])).name
     if executable == "eval":
-        return CommandProgram("shell", LiteralProgramInput(" ".join(_text(word) for word in words[1:]))) if all(
-            isinstance(word, KnownArgument) for word in words[1:]) else CommandProgram(
-                "shell", UnknownProgramInput("cannot resolve interpreter program"))
+        text = " ".join(word.text if isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)) else syntax.UNKNOWN_VALUE
+                        for word in words[1:])
+        source = (ProgramWithChoiceTexts(text, _retained_choice_texts(tuple(words[1:])))
+                  if any(isinstance(word, UnresolvedChoices) for word in words[1:])
+                  else LiteralProgramInput(text) if all(isinstance(word, KnownArgument) for word in words[1:])
+                  else ExpandedProgramInput(text))
+        return CommandProgram("shell", source)
     python = re.fullmatch(r"python(?:[0-9.]+)?", executable) is not None
     if not python and executable not in {"bash", "sh", "zsh"}:
         return OrdinaryInvocation()
@@ -172,9 +260,8 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
     index = 0
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, KnownArgument):
-            return (ScriptProgram() if isinstance(word, ForwardedArguments) else
-                    CommandProgram("python", UnknownProgramInput("cannot resolve interpreter invocation")))
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            return ScriptProgram()
         text = word.text
         if text == "--":
             return StdinProgram("python") if index + 1 == len(rest) or _text(rest[index + 1]) == "-" else ScriptProgram()
@@ -189,10 +276,14 @@ def _python_invocation(rest: list[Argument]) -> Invocation:
             continue
         flags = text[1:]
         for offset, flag in enumerate(flags):
+            if flags.startswith(syntax.UNKNOWN_VALUE, offset):
+                return ScriptProgram()
             if flag in "?hV":
                 return NoProgramInvocation()
             if flag == "c":
-                source = (LiteralProgramInput(flags[offset + 1:]) if offset + 1 < len(flags)
+                source = ((ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                           else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                           else LiteralProgramInput(flags[offset + 1:])) if offset + 1 < len(flags)
                           else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
                 return CommandProgram("python", source)
@@ -217,9 +308,8 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
     long_options = True
     while index < len(rest):
         word = rest[index]
-        if not isinstance(word, KnownArgument):
-            return (ScriptProgram() if isinstance(word, ForwardedArguments) else
-                    CommandProgram("shell", UnknownProgramInput("cannot resolve interpreter invocation")))
+        if not isinstance(word, (KnownArgument, UnknownArgument, UnresolvedChoices)):
+            return ScriptProgram()
         text = word.text
         if text == "--" or text == "-":
             index += 1
@@ -237,8 +327,12 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
         long_options = False
         flags = text[1:]
         for offset, flag in enumerate(flags):
+            if flags.startswith(syntax.UNKNOWN_VALUE, offset):
+                return ScriptProgram()
             if flag == "c" and text.startswith("-"):
-                source = (_program_input(rest[index + 1]) if index + 1 < len(rest)
+                source = (ProgramWithChoiceTexts(flags[offset + 1:], word.choice_texts) if isinstance(word, UnresolvedChoices)
+                          else ExpandedProgramInput(flags[offset + 1:]) if isinstance(word, UnknownArgument)
+                          else _program_input(rest[index + 1]) if index + 1 < len(rest)
                           else UnknownProgramInput("missing interpreter command"))
                 return CommandProgram("shell", source)
             if flag == "s" and text.startswith("-"):
@@ -251,16 +345,19 @@ def _shell_invocation(executable: str, rest: list[Argument]) -> Invocation:
     return StdinProgram("shell") if stdin or index == len(rest) else ScriptProgram()
 
 
+def _tree_making_text(text: str) -> bool:
+    return (TREE_COMMAND.search(text.replace("\n", " ")) is not None
+            or re.search(r"\b(?:copytree|clone_from|worktree)\b|\bRepo\s*\.\s*clone\b", text) is not None)
+
+
 def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
                        stdin: ProgramInput = UNAVAILABLE_STDIN) -> PolicyOutcome:
     """One decoder for shell commands, tool argv and Python subprocess vectors."""
-    for index, argument in enumerate(words):
-        if isinstance(argument, ArgumentChoices):
-            outcome: PolicyOutcome = NoForbiddenOperation()
-            for choice in argument.choices:
-                outcome = _prefer(outcome, inspect_invocation(words[:index] + list(choice) + words[index + 1:],
-                                                             cwd, static=static, stdin=stdin))
-            return outcome
+    if any(isinstance(argument, ArgumentChoices) for argument in words):
+        outcome: PolicyOutcome = NoForbiddenOperation()
+        for vector in _choice_vectors(tuple(words)):
+            outcome = _prefer(outcome, inspect_invocation(list(vector), cwd, static=static, stdin=stdin))
+        return outcome
     actual = _unwrap(words)
     operation = _operation(actual, cwd, static=static)
     if _copies_command(actual):
@@ -272,20 +369,26 @@ def inspect_invocation(words: list[Argument], cwd: Path, *, static: bool,
     if isinstance(source, UnknownProgramInput):
         # Static abstract shell helpers are checked at concrete call sites.
         return operation if static else _prefer(operation, UnresolvedOperation(source.reason))
+    choices: PolicyOutcome = NoForbiddenOperation()
+    if isinstance(source, ProgramWithChoiceTexts) and any(
+            _tree_making_text(text) for text in (source.text, *source.choice_texts)):
+        choices = UnresolvedOperation("cannot resolve interpreter program choices")
     if invocation.language == "shell":
         parsed = inspect_shell(source.text, cwd, static=static)
     else:
         try:
             tree = ast.parse(source.text)
         except SyntaxError:
-            return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
+            if isinstance(source, (ExpandedProgramInput, ProgramWithChoiceTexts)) and _tree_making_text(source.text):
+                return _prefer(operation, UnresolvedOperation("cannot parse Python program"))
+            return _prefer(operation, choices)
         parsed: PolicyOutcome = NoForbiddenOperation()
         for finding in PythonPolicy(cwd / "<python-command>", static=static).scan(tree):
             result: PolicyOutcome = (UnresolvedOperation(finding.operation.removeprefix("unresolved relevant operation: "))
                                      if finding.operation.startswith("unresolved relevant operation: ")
                                      else ForbiddenOperation(finding.operation))
             parsed = _prefer(parsed, result)
-    return _prefer(operation, parsed)
+    return _prefer(operation, _prefer(parsed, choices))
 
 
 def _prefer(left: PolicyOutcome, right: PolicyOutcome) -> PolicyOutcome:
@@ -302,6 +405,11 @@ def _description(outcome: PolicyOutcome) -> str:
     if isinstance(outcome, UnresolvedOperation):
         return "unresolved relevant operation: " + outcome.reason
     return ""
+
+
+def _refusal(outcome: PolicyOutcome) -> str:
+    description = _description(outcome)
+    return f"{description}: {REFUSAL}" if isinstance(outcome, ForbiddenOperation) else description
 
 
 def _text(argument: Argument) -> str:
@@ -371,17 +479,22 @@ def _unwrap(words: list[Argument]) -> list[Argument]:
 def _operation(words: list[Argument], cwd: Path, *, static: bool) -> PolicyOutcome:
     """Match only the real command/subcommand, never later operand text."""
     outcome: PolicyOutcome
-    for index, argument in enumerate(words):
-        if isinstance(argument, ArgumentChoices):
-            outcome = NoForbiddenOperation()
-            for choice in argument.choices:
-                outcome = _prefer(outcome, _operation(words[:index] + list(choice) + words[index + 1:], cwd, static=static))
-            return outcome
+    if any(isinstance(argument, ArgumentChoices) for argument in words):
+        outcome = NoForbiddenOperation()
+        for vector in _choice_vectors(tuple(words)):
+            outcome = _prefer(outcome, _operation(list(vector), cwd, static=static))
+        return outcome
     words = _unwrap(words)
     if not words or _copies_command(words):
         return NoForbiddenOperation()
     if not isinstance(words[0], KnownArgument):
-        return NoForbiddenOperation() if static else UnresolvedOperation("cannot resolve executable name")
+        arguments = [_text(word) for word in words[1:]]
+        tree_arguments = (arguments[:1] == ["clone"] or arguments[:2] == ["worktree", "add"]
+                          or any(text in {"--archive", "--recursive"}
+                                 or re.fullmatch(r"-[A-Za-z]*[arR][A-Za-z]*", text) for text in arguments))
+        return (NoForbiddenOperation() if static or isinstance(words[0], UnknownArgument)
+                and words[0].description == "expanded value" and not tree_arguments
+                else UnresolvedOperation("cannot resolve executable name"))
     program = Path(words[0].text).name
     rest = words[1:]
     if program == "git":
@@ -435,28 +548,46 @@ class ShellPolicy:
     directories: set[Path]
 
     def expand(self, word: syntax.Word) -> list[Argument]:
-        parts: list[str] = []
-        glob = False
+        value = word.literal()
+        if isinstance(value, syntax.LiteralWord):
+            text = value.text
+            if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
+                text = os.path.expanduser(text)
+            glob = any(isinstance(segment, syntax.Literal) and not segment.quoted
+                       and any(char in segment.text for char in "*?[") for segment in word.segments)
+            return ([UnknownArgument("expanded value", text)] if syntax.UNKNOWN_VALUE in text
+                    else [KnownArgument(text, glob)])
+        parts: list[Argument] = []
+        glob = any(isinstance(segment, syntax.Literal) and not segment.quoted
+                   and any(char in segment.text for char in "*?[") for segment in word.segments)
         for segment in word.segments:
             if isinstance(segment, syntax.Literal):
-                parts.append(segment.text)
-                glob = glob or (not segment.quoted and any(char in segment.text for char in "*?["))
+                parts.append(KnownArgument(segment.text))
             elif isinstance(segment, syntax.Parameter):
                 key = segment.name.removesuffix("[@]").removesuffix("[*]")
                 values = self.variables.get(key, (UnknownArgument(key),))
-                if all(part is segment or isinstance(part, syntax.Literal) and not part.text for part in word.segments) and segment.name.endswith(("[@]", "[*]")):
+                whole_parameter = all(part is segment or isinstance(part, syntax.Literal) and not part.text
+                                      for part in word.segments)
+                if whole_parameter and (segment.name.endswith(("[@]", "[*]"))
+                                        or len(values) == 1 and isinstance(values[0], (ForwardedArguments, ArgumentChoices))):
                     return list(values)
-                if all(part is segment or isinstance(part, syntax.Literal) and not part.text for part in word.segments) and len(values) == 1 and isinstance(values[0], ForwardedArguments):
-                    return list(values)
-                if len(values) != 1 or not isinstance(values[0], KnownArgument):
-                    return [UnknownArgument(key)]
-                parts.append(values[0].text)
+                parts.append(values[0] if len(values) == 1 else UnknownArgument(key))
             else:
-                return [UnknownArgument("command output" if isinstance(segment, syntax.Execution) else "array")]
-        value = "".join(parts)
-        if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
-            value = os.path.expanduser(value)
-        return [KnownArgument(value, glob)]
+                parts.append(UnknownArgument("command output" if isinstance(segment, syntax.Execution) else "array"))
+        joined: list[tuple[Argument, ...]] = []
+        for vector in _choice_vectors(tuple(parts)):
+            text = "".join(part.text if isinstance(part, (KnownArgument, UnknownArgument, UnresolvedChoices))
+                           else syntax.UNKNOWN_VALUE for part in vector)
+            if word.segments and isinstance(word.segments[0], syntax.Literal) and not word.segments[0].quoted:
+                text = os.path.expanduser(text)
+            if any(isinstance(part, UnresolvedChoices) for part in vector):
+                joined.append((UnresolvedChoices("word choices", text, _retained_choice_texts(vector)),))
+            elif all(isinstance(part, KnownArgument) for part in vector):
+                joined.append((KnownArgument(text, glob),))
+            else:
+                description = ", ".join(part.description for part in vector if not isinstance(part, (KnownArgument, ArgumentChoices)))
+                joined.append((UnknownArgument(description, text),))
+        return list(_merged_arguments(tuple(joined), "word choices"))
 
     def expansions(self, word: syntax.Word) -> PolicyOutcome:
         outcome: PolicyOutcome = NoForbiddenOperation()
@@ -484,8 +615,7 @@ class ShellPolicy:
         previous = self.variables.get(match[1])
         if match[2] == "+" and previous is not None:
             values = previous + values
-            previous = None
-        self.variables[match[1]] = values if previous is None or previous == values else (UnknownArgument(match[1]),)
+        self.variables[match[1]] = values
         return True
 
     def command(self, command: syntax.SimpleCommand) -> PolicyOutcome:
@@ -510,7 +640,7 @@ class ShellPolicy:
         inputs: dict[int, ProgramInput] = {0: UNAVAILABLE_STDIN}
         for redirect in command.redirects:
             if isinstance(redirect.document, syntax.HereDocument):
-                inputs[redirect.descriptor] = (UnknownProgramInput("cannot resolve expanded interpreter stdin")
+                inputs[redirect.descriptor] = (ExpandedProgramInput(syntax.expanded_text(redirect.document.body))
                                                if redirect.document.generated else LiteralProgramInput(redirect.document.body))
             elif redirect.operator == "<<<":
                 values = self.expand(redirect.target)
@@ -543,32 +673,41 @@ class ShellPolicy:
                 for word in command.headers:
                     outcome = _prefer(outcome, self.expansions(word))
                 previous = dict(self.variables)
+                if command.kind == "alternatives":
+                    branches: list[dict[str, tuple[Argument, ...]]] = []
+                    for branch in command.body.commands:
+                        self.variables = dict(previous)
+                        outcome = _prefer(outcome, self.program(syntax.Program((branch,))))
+                        branches.append(dict(self.variables))
+                    self.merge_branches(branches)
+                    continue
                 if command.kind == "function" and self.static:
                     self.variables["@"] = (ForwardedArguments("function argv"),)
                     self.variables["*"] = (ForwardedArguments("function argv"),)
                 outcome = _prefer(outcome, self.program(command.body))
                 if command.kind == "function":
                     self.variables = previous
+                elif command.kind in {"for", "loop"}:
+                    self.merge_branches([previous, self.variables])
             else:
                 outcome = _prefer(outcome, self.command(command))
         return outcome
 
+    def merge_branches(self, branches: list[dict[str, tuple[Argument, ...]]]) -> None:
+        self.variables = {}
+        for key in {key for branch in branches for key in branch}:
+            choices = tuple(dict.fromkeys(branch.get(key, (UnknownArgument(key),)) for branch in branches))
+            self.variables[key] = _merged_arguments(choices, key)
+
     def parse(self, source: str) -> PolicyOutcome:
         try:
             return self.program(syntax.parse(source))
-        except (syntax.ShellSyntaxError, RecursionError, OSError) as error:
-            return UnresolvedOperation("cannot parse shell program: " + str(error))
+        except (syntax.ShellSyntaxError, RecursionError, OSError):
+            parsed = self.program(syntax.readable_program(source))
+            return parsed if isinstance(parsed, ForbiddenOperation) else NoForbiddenOperation()
 
 
 def inspect_shell(command: str, cwd: Path, *, static: bool = False) -> PolicyOutcome:
-    if not static:
-        try:
-            checked = subprocess.run(["bash", "--noprofile", "--norc", "-n"], input=command,
-                                     text=True, capture_output=True, timeout=hook_timeout())
-            if checked.returncode:
-                return UnresolvedOperation("cannot parse shell program")
-        except (OSError, subprocess.TimeoutExpired):
-            return UnresolvedOperation("cannot validate shell syntax")
     policy = ShellPolicy(cwd, static, {key: (KnownArgument(value),) for key, value in os.environ.items()}, {cwd})
     return policy.parse(command)
 
@@ -578,8 +717,7 @@ def _first_operation(command: str, cwd: Path, *, static: bool = False) -> str:
 
 
 def refusal(command: str, cwd: Path) -> str:
-    operation = _first_operation(command, cwd)
-    return f"{operation}: {REFUSAL}" if operation else ""
+    return _refusal(inspect_shell(command, cwd))
 
 
 def hook_refusal(payload: str) -> str:
@@ -597,8 +735,7 @@ def hook_refusal(payload: str) -> str:
     directory = fields.get("cwd")
     cwd = Path(directory) if isinstance(directory, str) else Path.cwd()
     if isinstance(command, list) and all(isinstance(word, str) for word in cast(list[object], command)):
-        operation = _description(inspect_invocation([KnownArgument(word) for word in cast(list[str], command)], cwd, static=False))
-        return f"{operation}: {REFUSAL}" if operation else ""
+        return _refusal(inspect_invocation([KnownArgument(word) for word in cast(list[str], command)], cwd, static=False))
     return refusal(command, cwd) if isinstance(command, str) else ""
 
 
@@ -618,19 +755,36 @@ class ArgumentVector:
 
 
 @dataclass(frozen=True)
+class ModuleBinding:
+    """A module binding retains its full import path through aliases."""
+    name: str
+
+
+@dataclass(frozen=True)
+class KnownGitFunction:
+    """The Git function from a module with the known forwarding signature."""
+
+
+@dataclass(frozen=True)
+class FunctionBinding:
+    """A name refers to this function, including through an assignment alias."""
+    function: DeferredFunction
+
+
+@dataclass(frozen=True)
 class PossibleValues:
-    values: tuple[ScalarValue | ArgumentVector, ...]
+    values: tuple[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding, ...]
 
 
-PythonValue = ScalarValue | ArgumentVector | PossibleValues
+PythonValue = ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding | PossibleValues
 
 
-def _possibilities(value: PythonValue) -> tuple[ScalarValue | ArgumentVector, ...]:
+def _possibilities(value: PythonValue) -> tuple[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding, ...]:
     return value.values if isinstance(value, PossibleValues) else (value,)
 
 
 def _union(values: list[PythonValue]) -> PythonValue:
-    alternatives: list[ScalarValue | ArgumentVector] = []
+    alternatives: list[ScalarValue | ArgumentVector | ModuleBinding | KnownGitFunction | FunctionBinding] = []
     for value in values:
         for alternative in _possibilities(value):
             if alternative not in alternatives:
@@ -640,21 +794,36 @@ def _union(values: list[PythonValue]) -> PythonValue:
 
 def _join_bindings(target: dict[str, PythonValue], branches: list[dict[str, PythonValue]]) -> None:
     for key in {key for branch in branches for key in branch}:
-        target[key] = _union([branch.get(key, ScalarValue(UnknownArgument(key))) for branch in branches])
+        target[key] = _union([branch[key] if key in branch else ScalarValue(UnknownArgument(key)) for branch in branches])
+
+
+def _import_value(name: str) -> ModuleBinding | KnownGitFunction | ScalarValue:
+    module, _, member = name.rpartition(".")
+    if member == "git" and module in GIT_MODULES:
+        return KnownGitFunction()
+    if any(module == name or module.startswith(name + ".") for module in GIT_MODULES):
+        return ModuleBinding(name)
+    return ScalarValue(UnknownArgument(name))
 
 
 def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonValue:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if syntax.UNKNOWN_VALUE in node.value:
+            return ScalarValue(UnknownArgument("expanded value", node.value))
         return ScalarValue(KnownArgument(node.value))
     if isinstance(node, ast.Name):
         return bindings.get(node.id, ScalarValue(UnknownArgument(node.id)))
+    if isinstance(node, ast.Attribute):
+        return _union([_import_value(value.name + "." + node.attr) if isinstance(value, ModuleBinding)
+                       else ScalarValue(UnknownArgument(ast.unparse(node)))
+                       for value in _possibilities(_python_value(node.value, bindings))])
     if isinstance(node, (ast.List, ast.Tuple)):
         arguments: list[Argument] = []
         for element in node.elts:
             if isinstance(element, ast.Starred):
                 value = _python_value(element.value, bindings)
                 choices = tuple(tuple(part.arguments) if isinstance(part, ArgumentVector)
-                                else (part.argument,) if isinstance(part.argument, ForwardedArguments)
+                                else (part.argument,) if isinstance(part, ScalarValue) and isinstance(part.argument, ForwardedArguments)
                                 else (UnknownArguments(ast.unparse(element.value)),) for part in _possibilities(value))
                 arguments.extend(choices[0] if len(choices) == 1 else (ArgumentChoices(choices),))
             else:
@@ -675,6 +844,8 @@ def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonV
                     alternatives.append(ArgumentVector(first.arguments + second.arguments))
                 elif isinstance(first, ScalarValue) and isinstance(second, ScalarValue) and isinstance(first.argument, KnownArgument) and isinstance(second.argument, KnownArgument):
                     alternatives.append(ScalarValue(KnownArgument(first.argument.text + second.argument.text)))
+                elif isinstance(first, ScalarValue) and isinstance(second, ScalarValue) and isinstance(first.argument, (KnownArgument, UnknownArgument)) and isinstance(second.argument, (KnownArgument, UnknownArgument)):
+                    alternatives.append(ScalarValue(UnknownArgument("expanded value", first.argument.text + second.argument.text)))
                 else:
                     alternatives.append(ScalarValue(UnknownArgument(ast.unparse(node))))
         return _union(alternatives)
@@ -686,7 +857,8 @@ def _python_value(node: ast.AST, bindings: Mapping[str, PythonValue]) -> PythonV
 def _argv(value: PythonValue) -> list[Argument]:
     if isinstance(value, PossibleValues):
         return [ArgumentChoices(tuple(tuple(_argv(part)) for part in value.values))]
-    return list(value.arguments) if isinstance(value, ArgumentVector) else [value.argument]
+    return (list(value.arguments) if isinstance(value, ArgumentVector) else [value.argument]
+            if isinstance(value, ScalarValue) else [UnknownArgument("imported object")])
 
 
 @dataclass(frozen=True)
@@ -721,12 +893,64 @@ def _git_forwarder(node: ast.FunctionDef | ast.AsyncFunctionDef) -> GitForwarder
     return None
 
 
+def _local_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Collect names that shadow enclosing bindings throughout a function."""
+    names: set[str] = set()
+    declarations: set[str] = set()
+    for part in _scope_nodes(node):
+        if isinstance(part, (ast.Global, ast.Nonlocal)):
+            declarations.update(part.names)
+        elif isinstance(part, ast.Name) and isinstance(part.ctx, (ast.Store, ast.Del)):
+            names.add(part.id)
+        elif part is not node and isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(part.name)
+        elif isinstance(part, ast.alias):
+            names.add(part.asname or part.name.split(".")[0])
+        elif isinstance(part, ast.ExceptHandler) and part.name is not None:
+            names.add(part.name)
+    names.difference_update(declarations)
+    names.update(parameter.arg for parameter in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))
+    if node.args.vararg is not None:
+        names.add(node.args.vararg.arg)
+    if node.args.kwarg is not None:
+        names.add(node.args.kwarg.arg)
+    return names
+
+
+@dataclass(frozen=True)
+class LexicalScopeSnapshot:
+    """The bindings for one lexical scope at a call or after its body."""
+    scope: ast.AST
+    bindings: dict[str, PythonValue]
+    helpers: dict[str, GitForwarder]
+
+
+@dataclass(frozen=True)
+class FunctionExecution:
+    """The enclosing scopes that can reach a function execution."""
+    enclosing_scopes: tuple[LexicalScopeSnapshot, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class DeferredFunction:
+    """A function keeps its lexical scope and the bindings at its calls."""
+    definition: ast.FunctionDef | ast.AsyncFunctionDef
+    enclosing_scope: ast.AST
+    executions: list[FunctionExecution] = field(default_factory=list)
+
+
 class PythonPolicy:
     def __init__(self, path: Path, *, static: bool = True) -> None:
         self.static: bool = static
         self.path: Path = path
         self.found: list[TreeCreation] = []
-        self.git_modules: set[str] = set()
+        self.module_bindings: dict[str, PythonValue] = {}
+        self.module_helpers: dict[str, GitForwarder] = {}
+        self.deferred_functions: dict[ast.FunctionDef | ast.AsyncFunctionDef, DeferredFunction] = {}
+        self.unscanned_executions: deque[tuple[DeferredFunction, FunctionExecution]] = deque()
+        self.final_executions: deque[tuple[DeferredFunction, FunctionExecution]] = deque()
+        self.scopes: tuple[LexicalScopeSnapshot, ...] = ()
+        self.scope_functions: list[DeferredFunction] = []
         # Verified public signature: copies.git(repo, *arguments) forwards
         # ["git", "-C", str(repo), *arguments]. Local definitions override it.
         self.standard_git: GitForwarder = GitForwarder(("repo",), "arguments", cast(ast.List,
@@ -742,11 +966,9 @@ class PythonPolicy:
             if isinstance(outcome, ForbiddenOperation):
                 return ForbiddenOperation("copytree of repository")
             return outcome
-        qualified_git = (isinstance(node.func, ast.Attribute) and name == "git"
-                         and isinstance(node.func.value, ast.Name) and node.func.value.id in self.git_modules
-                         and node.func.value.id not in bindings)
-        if isinstance(node.func, ast.Name) and name in helpers or qualified_git:
-            signature = self.standard_git if qualified_git else helpers[name]
+        imported_git = any(isinstance(value, KnownGitFunction) for value in _possibilities(_python_value(node.func, bindings)))
+        if isinstance(node.func, ast.Name) and name in helpers or imported_git:
+            signature = self.standard_git if imported_git else helpers[name]
             values = dict(bindings)
             for index, parameter in enumerate(signature.parameters):
                 value = next((keyword.value for keyword in node.keywords if keyword.arg == parameter), None)
@@ -763,7 +985,7 @@ class PythonPolicy:
                                             and keyword.value.value is True for keyword in node.keywords)
             outcome: PolicyOutcome = NoForbiddenOperation()
             for alternative in _possibilities(value):
-                if shell and isinstance(alternative, ScalarValue) and isinstance(alternative.argument, KnownArgument):
+                if shell and isinstance(alternative, ScalarValue) and isinstance(alternative.argument, (KnownArgument, UnknownArgument)):
                     outcome = _prefer(outcome, inspect_shell(alternative.argument.text, self.path.parent, static=self.static))
                 elif isinstance(alternative, ArgumentVector):
                     input_node = next((keyword.value for keyword in node.keywords if keyword.arg == "input"), None)
@@ -776,6 +998,9 @@ class PythonPolicy:
 
     def expression(self, node: ast.AST, bindings: dict[str, PythonValue], helpers: dict[str, GitForwarder]) -> None:
         if isinstance(node, ast.Call):
+            for value in _possibilities(_python_value(node.func, bindings)):
+                if isinstance(value, FunctionBinding):
+                    self.enqueue(value.function, self.execution(value.function))
             outcome = self.call(node, bindings, helpers)
             if not isinstance(outcome, NoForbiddenOperation):
                 self.found.append(TreeCreation(self.path, node.lineno, _description(outcome)))
@@ -783,37 +1008,61 @@ class PythonPolicy:
             if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.expression(child, bindings, helpers)
 
-    def statements(self, statements: list[ast.stmt], bindings: dict[str, PythonValue], helpers: dict[str, GitForwarder]) -> None:
+    def execution(self, pending: DeferredFunction) -> FunctionExecution:
+        scopes: list[LexicalScopeSnapshot] = []
+        for scope in self.scopes:
+            scopes.append(LexicalScopeSnapshot(scope.scope, dict(scope.bindings), dict(scope.helpers)))
+            if scope.scope is pending.enclosing_scope:
+                break
+        return FunctionExecution(tuple(scopes))
+
+    def enqueue(self, pending: DeferredFunction, execution: FunctionExecution) -> None:
+        if execution not in pending.executions:
+            pending.executions.append(execution)
+            self.unscanned_executions.append((pending, execution))
+
+    def body(self, statements: list[ast.stmt], scope: ast.AST, bindings: dict[str, PythonValue],
+             helpers: dict[str, GitForwarder]) -> None:
+        enclosing_scopes = self.scopes
+        enclosing_functions = self.scope_functions
+        self.scopes = (*enclosing_scopes, LexicalScopeSnapshot(scope, bindings, helpers))
+        self.scope_functions = []
+        self.statements(statements, bindings, helpers)
+        for pending in self.scope_functions:
+            self.final_executions.append((pending, self.execution(pending)))
+        self.scopes = enclosing_scopes
+        self.scope_functions = enclosing_functions
+
+    def statements(self, statements: list[ast.stmt], bindings: dict[str, PythonValue],
+                   helpers: dict[str, GitForwarder]) -> None:
+        scopes = self.scopes
+        self.scopes = (*scopes[:-1], LexicalScopeSnapshot(scopes[-1].scope, bindings, helpers))
         for statement in statements:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 signature = _git_forwarder(statement)
+                if statement not in self.deferred_functions:
+                    self.deferred_functions[statement] = DeferredFunction(statement, self.scopes[-1].scope)
+                pending = self.deferred_functions[statement]
+                bindings[statement.name] = FunctionBinding(pending)
                 _ = helpers.pop(statement.name, None)
                 if signature is not None:
                     helpers[statement.name] = signature
-                local = dict(bindings)
-                # Python locals shadow enclosing values even before assignment.
-                for part in _scope_nodes(statement):
-                    if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store):
-                        local[part.id] = ScalarValue(UnknownArgument(part.id))
-                    elif part is not statement and isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        local[part.name] = ScalarValue(UnknownArgument(part.name))
-                    elif isinstance(part, ast.alias):
-                        alias = part.asname or part.name.split(".")[0]
-                        local[alias] = ScalarValue(UnknownArgument(alias))
-                    elif isinstance(part, ast.ExceptHandler) and part.name is not None:
-                        local[part.name] = ScalarValue(UnknownArgument(part.name))
-                for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
-                    local[parameter.arg] = ScalarValue(UnknownArgument(parameter.arg))
-                if statement.args.kwarg is not None:
-                    local[statement.args.kwarg.arg] = ScalarValue(UnknownArgument(statement.args.kwarg.arg))
-                if statement.args.vararg is not None:
-                    local[statement.args.vararg.arg] = ArgumentVector((ForwardedArguments(statement.args.vararg.arg),))
-                for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
-                    if parameter.annotation is not None and any(isinstance(part, ast.Name) and part.id in {"list", "tuple", "Sequence", "Iterable"} for part in ast.walk(parameter.annotation)):
-                        local[parameter.arg] = ArgumentVector((ForwardedArguments(parameter.arg),))
-                self.statements(statement.body, local, dict(helpers))
+                if pending not in self.scope_functions:
+                    self.scope_functions.append(pending)
             elif isinstance(statement, ast.ClassDef):
-                self.statements(statement.body, dict(bindings), dict(helpers))
+                bindings[statement.name] = ScalarValue(UnknownArgument(statement.name))
+                _ = helpers.pop(statement.name, None)
+                self.body(statement.body, statement, dict(bindings), dict(helpers))
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    if isinstance(statement, ast.Import):
+                        name = alias.asname or alias.name.split(".")[0]
+                        imported = alias.name if alias.asname else name
+                    else:
+                        name = alias.asname or alias.name
+                        imported = (statement.module + "." if statement.module else "") + alias.name
+                    bindings[name] = _import_value(imported)
+                    _ = helpers.pop(name, None)
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value = statement.value
                 if value is not None:
@@ -864,17 +1113,48 @@ class PythonPolicy:
                     self.statements(statement.finalbody, bindings, helpers)
             else:
                 self.expression(statement, bindings, helpers)
+        self.scopes = scopes
+
+    def function(self, pending: DeferredFunction, execution: FunctionExecution) -> None:
+        statement = pending.definition
+        module = execution.enclosing_scopes[0]
+        self.scopes = execution.enclosing_scopes
+        local = dict(self.scopes[-1].bindings)
+        local_helpers = dict(self.scopes[-1].helpers)
+        for part in _scope_nodes(statement):
+            if isinstance(part, ast.Global):
+                for name in part.names:
+                    local[name] = module.bindings.get(name, ScalarValue(UnknownArgument(name)))
+                    _ = local_helpers.pop(name, None)
+                    if name in module.helpers:
+                        local_helpers[name] = module.helpers[name]
+        for name in _local_names(statement):
+            local[name] = ScalarValue(UnknownArgument(name))
+            _ = local_helpers.pop(name, None)
+        if statement.args.vararg is not None:
+            local[statement.args.vararg.arg] = ArgumentVector((ForwardedArguments(statement.args.vararg.arg),))
+        for parameter in (*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs):
+            if parameter.annotation is not None and any(isinstance(part, ast.Name) and part.id in {"list", "tuple", "Sequence", "Iterable"} for part in ast.walk(parameter.annotation)):
+                local[parameter.arg] = ArgumentVector((ForwardedArguments(parameter.arg),))
+        self.body(statement.body, statement, local, local_helpers)
 
     def scan(self, tree: ast.Module) -> list[TreeCreation]:
-        self.git_modules = {
-            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.Import)
-            for alias in statement.names if alias.name in {"bulk_run", "scripts.style.bulk_run"}
-        }
-        self.git_modules.update(
-            alias.asname or alias.name for statement in tree.body if isinstance(statement, ast.ImportFrom)
-            and statement.module == "scripts.copies" for alias in statement.names if alias.name == "copies")
-        self.statements(tree.body, {}, {"git": self.standard_git})
-        return self.found
+        self.module_bindings = {}
+        self.module_helpers = {"git": self.standard_git}
+        self.scopes = ()
+        self.body(tree.body, tree, self.module_bindings, self.module_helpers)
+        # Calls copy snapshots without argument values or callee assignments.
+        # Stable function identities and finite lexical nesting make the queue finite.
+        while self.final_executions or self.unscanned_executions:
+            while self.final_executions:
+                pending, execution = self.final_executions.popleft()
+                module = LexicalScopeSnapshot(execution.enclosing_scopes[0].scope,
+                                              dict(self.module_bindings), dict(self.module_helpers))
+                self.enqueue(pending, FunctionExecution((module, *execution.enclosing_scopes[1:])))
+            if self.unscanned_executions:
+                pending, execution = self.unscanned_executions.popleft()
+                self.function(pending, execution)
+        return list(dict.fromkeys(self.found))
 
 
 def markdown_commands(text: str) -> list[tuple[int, str]]:
@@ -942,7 +1222,8 @@ def main() -> None:
     payload = sys.stdin.read()
     reason = hook_refusal(payload)
     if reason:
-        print(reason, file=sys.stderr)
+        print(reason + ": provide readable command input." if reason.startswith("unresolved relevant operation:") else reason,
+              file=sys.stderr)
         raise SystemExit(2)
     previous = sys.stdin
     try:

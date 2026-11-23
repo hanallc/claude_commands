@@ -1,11 +1,12 @@
 ---
 description: Send or defer a user update.
-argument-hint: "adhoc|silence [delay] <instructions> | show <template>"
+argument-hint: "adhoc [delay] [through silence] <instructions> | silence [delay] [instructions] | show <template>"
 ---
 
 # Nate
 
 **Usage:** `/nate <template> [delay] <instructions>`. Templates: `adhoc`, `silence` (instructions optional), `show`.
+For an adhoc push during silence, use `/nate adhoc [delay] through silence <instructions>`.
 
 ## help
 
@@ -15,8 +16,9 @@ text block, and stop:
 
 ```text
 Usage: /nate <template> [delay] <instructions>
+       /nate adhoc [delay] through silence <instructions>
 adhoc            Send you an update that the agent writes from your instructions.
-silence          Keep pushes until silence ends. Blocked pushes still go through.
+silence          Keep pushes until silence ends. Blocked pushes and "through silence" adhoc pushes still go through.
 show <template>  Show a push template with its placeholders and one example.
 
 Phone push templates:
@@ -33,30 +35,32 @@ A delay comes after the template name, in the user's plain words: `in ten minute
 `at 3pm`, `tomorrow at 9`. No delay: now. Delayed commands go through
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send_later.py" (--in <span> | --at <time>) [--run silence] -- <arguments>`,
 with a systemd span (`10min`, `1h`), or `--at "YYYY-MM-DD HH:MM"` in the user's zone, from
-`TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) date`.
+`TZ=$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py) date`.
 
 ## adhoc
 
+Every adhoc push is one the user asked for.
 Write the values from the instructions and what you know now, in Simplified Technical English:
 
-- `sender`: this session's name, as ListAgents gives it.
-- `title`: a few words, lower case after the first word.
-- `description`: one to three short sentences: what happened and what it means for the user.
+1. Set `sender` to this session's name, as ListAgents gives it.
+2. Write `title` with a few words, lower case after the first word.
+3. Write `description` with one to three short sentences. Start with the user's request: "You asked ...". Example: "You asked to be told when the nightly check passed."
 
-The send.py arguments:
+The push stays kept during silence unless the command includes `through silence` after the optional delay.
+With that phrase, add `--through-silence` to the send arguments, including delayed arguments.
+The push keeps its normal priority. It does not repeat or need acknowledgement.
+
+Use these send arguments for both immediate and delayed pushes.
 
 ```sh
---to user --from "<sender>" --need note --text-id nate.<template> \
+--to user --from "<sender>" --need note --text-id nate.adhoc --user-asked \
   --value "sender=<sender>" --value "title=<title>" --value "description=<description>"
 ```
 
-Now: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" <arguments>`. Report the
-result in one line; a delayed one names the send time in the user's zone, with its label.
+For an immediate push, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" <arguments>`.
+Report the result in one line. For a delayed push, give the send time and label. Use the user's time zone.
 
-The push is reviewed before it is sent; the user may receive the reviewer's rewrite. If review holds
-it (pushover exit 6, `pushover: not sent: …`), report in one line that it was not sent, with the reason.
-
-The user receives the reviewed title and description, which start as:
+The push goes out as written. The user receives the title and description in this form.
 
 ```text
 Title: <sender> <title>
@@ -70,8 +74,9 @@ Every push ends with these `Sent by` and `Template` lines; a push with no text i
 
 ## silence
 
-Sends no message. While silence is on, pushes are kept and go out when it ends; blocked (priority 2)
-pushes always go through, and each is cancelled when its `--clears-when` check passes. The delay says when silence starts. Act on the instructions:
+This command sends no message. Silence keeps pushes until it ends.
+Blocked pushes and adhoc pushes with `through silence` still go through.
+A blocked push stops when its `--clears-when` check passes. The delay sets the start of silence. Act on the instructions:
 
 - None: `on` (lasts until `off`).
 - An end (`until 7am`): `on --until "YYYY-MM-DD HH:MM"`; a length (`for an hour`): `on --for 1h`.

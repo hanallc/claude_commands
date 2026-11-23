@@ -1,5 +1,9 @@
 """Record local settings keys and deliver notices outside Git."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -10,7 +14,6 @@ import subprocess
 import sys
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import send_result, send_budget, session_send
@@ -74,17 +77,16 @@ def deliver(root: Path, machine: str) -> None:
     destination = conf.read("settings").text("local_key_notice_to")
     for key in pending:
         identity = hashlib.sha256(json.dumps([machine, key]).encode()).hexdigest()
-        command = [str(root / "scripts/lib/py"), str(session_send.SEND_SCRIPT),
-                   "--to", destination, "--from", "settings", "--key", "settings-local:" + identity,
+        command = session_send.send_argv("--to", destination, "--from", "settings", "--key", "settings-local:" + identity,
                    "--repeat-minutes", str(timedelta.max.days * 1440),
-                   "--text", f"Settings key {key} is local on {machine}."]
+                   "--text", f"Settings key {key} is local on {machine}.", python_interpreter=root / "scripts/lib/py")
         accepted = False
         try:
             sent = subprocess.run(command, input="", text=True, capture_output=True,
                                   check=False, timeout=send_budget.seconds())
             outcome = send_result.send_outcome(sent.returncode, sent.stdout)
             accepted = (isinstance(outcome, send_result.ConfirmedSendOutcome)
-                        and outcome.header.outcome in {"sent", "skipped", "queued"})
+                        and outcome.header.outcome in {"sent", "skipped", "queued", "kept"})
         except (OSError, subprocess.TimeoutExpired):
             pass
         if accepted:

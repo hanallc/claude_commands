@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
-"""Whether a /unit:direct run is currently active in a given Claude session.
+"""Read the open unit run from the director's staff row.
 
-`prepare_session.sh` drops a marker file named for `CLAUDE_CODE_SESSION_ID`
-(verified identical to the `session_id` in every hook payload) holding the
-unit session directory. `end_session.sh` removes it. Anything that needs to
-know "is this session mid-unit-run" reads the marker.
-
-Markers are in /tmp and a killed run never removes its own, so a run with no
-write inside MAX_AGE_SECONDS is treated as debris rather than an active run.
-Staleness is judged from the session directory's own contents, never from the
-marker's mtime -- see `_recently_active`.
+A run remains active while its own files have recent writes.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-import json
-import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-if TYPE_CHECKING:
-    from ..lib import unit_runs
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import unit_runs
-
-# A test's own marker folder; unset, the marker is under either run-folder name.
-ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None
+from scripts.direct import recorder_state
+from scripts.lib import unit_runs
+from scripts.direct.worker_state import worker_status_paths
 
 # Long enough to span a slow worker build plus the user's time at a gate, short
 # enough that yesterday's abandoned run cannot block today's turns. It bounds
@@ -36,20 +25,8 @@ ACTIVE_OVERRIDE = unit_runs.environ("ACTIVE_DIR") or None
 MAX_AGE_SECONDS = 12 * 60 * 60
 
 
-def marker_path(session_id: str) -> Path:
-    return unit_runs.marker(session_id, ACTIVE_OVERRIDE)
-
-
 def _recently_active(session_dir: Path) -> bool:
-    """True when the run itself wrote something inside MAX_AGE_SECONDS.
-
-    Liveness is read from the session directory, never from the marker's own
-    mtime. `prepare_session.sh` stamps the marker once at run start and nothing
-    refreshes it, so marker age measures how long ago the run *began* -- which
-    made every run silently unrecognizable to its own hooks twelve hours in,
-    while it was still writing state every few seconds. What actually stops
-    moving when a run dies is the run's own files.
-    """
+    """Return true when the run has a file written within MAX_AGE_SECONDS."""
     try:
         newest = max(
             (entry.stat().st_mtime for entry in session_dir.iterdir() if entry.is_file()),
@@ -65,12 +42,11 @@ def _recently_active(session_dir: Path) -> bool:
 def active_run(session_id: str) -> Path | None:
     """The unit session directory for an active run, or None."""
     try:
-        recorded = marker_path(session_id).read_text(encoding="utf-8").strip()
+        session_dir = unit_runs.open_run(session_id)
     except OSError:
         return None
-    if not recorded:
+    if session_dir is None:
         return None
-    session_dir = Path(recorded)
     return session_dir if _recently_active(session_dir) else None
 
 
@@ -83,24 +59,20 @@ def _text(path: Path) -> str:
 
 def running_work(session_dir: Path) -> str | None:
     """Name work in flight, or return None when the unit is waiting."""
-    # A launch that names its phase writes its status in that phase's directory.
-    directories = [session_dir, *(path for path in session_dir.glob("phases/*") if path.is_dir())]
-    statuses = [path for directory in directories for path in directory.glob("*_status*")]
+    statuses = worker_status_paths(session_dir)
     if any(_text(path) in {"implementing", "running"} for path in statuses):
         return "an implementation or fix pass"
     if any(_text(path) == "reviewing" for path in statuses):
         return "a review pass"
-    state_text = _text(session_dir / "progress_history_state.json")
-    if state_text:
-        try:
-            state = cast("dict[str, object]", json.loads(state_text))
-        except json.JSONDecodeError:
-            return None
-        activity = state.get("activity")
+    try:
+        phases = recorder_state.read_open_phases(session_dir)
+    except ValueError:
+        return None
+    for phase in phases:
+        activity = phase.get("activity")
         if isinstance(activity, dict):
             entry = cast("dict[str, object]", activity)
             if entry.get("status") == "active":
                 label = entry.get("label")
                 return label if isinstance(label, str) and label else "an activity"
     return None
-

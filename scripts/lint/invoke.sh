@@ -16,11 +16,15 @@
 
 BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    # Later session commands use this inherited TMPDIR after this command exits.
     "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable --path "$TMPDIR" >/dev/null || return
 fi
 # verify.sh needs the temporary parent before it loads the environment.
 [[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
+
+source "${BASH_SOURCE[0]%/*}/../build_hold/override_guard.sh" || return 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || return 2
 
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
 # Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
@@ -32,7 +36,7 @@ SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
 
 # Lint policy. Missing reader means every check runs — a caller must never be
 # silently under-verified because a config script moved.
-LINT_CONFIG_READER="${LINT_CONFIG_READER:-$HOME/.claude/scripts/lint/lint_config.sh}"
+LINT_CONFIG_READER="${LINT_CONFIG_READER:-$BUILD_HELPER_ROOT/lint/lint_config.sh}"
 if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
@@ -48,11 +52,15 @@ if declare -F lint_config_build_oom_score_adj >/dev/null; then
 else
     BUILD_OOM_SCORE_ADJ=500
 fi
+if declare -F lint_config_clippy_fix_jobs >/dev/null; then
+    lint_config_clippy_fix_jobs CLIPPY_FIX_JOBS
+else
+    CLIPPY_FIX_JOBS=8
+fi
 
-# natedev's machine-wide pool of build slots (/etc/nixos
-# modules/linux/jobserver.nix). The session environment names it, but a shell
-# started before the pool existed does not, so join it here too. The Mac has no
-# /dev/steve and skips this.
+# Builds use natedev's machine-wide pool (/etc/nixos/modules/linux/jobserver.nix).
+# Join the pool when the session does not name it. The Mac has no /dev/steve.
+# Clippy fixes use private jobs because they leave shared tokens unused.
 if [[ -z "${CARGO_MAKEFLAGS:-}" && -c /dev/steve && -r /dev/steve && -w /dev/steve ]]; then
     export CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"
 fi
@@ -96,10 +104,31 @@ fi
 # option), and run() runs it plainly.
 # The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
-BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+# The scope exports BUILDLOG_STEP_SCOPE, its cgroup folder. sccache runs each
+# compiler in sccache.service with the client's environment, so memory_admit
+# charges that compiler to the step that names its scope. sccache hashes CARGO_*
+# variables and the variables that rustc dependency data names. No crate reads
+# BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
+BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
+BUILDLOG_SCOPE_SH='
+exec 2>&3 3>&-
+{ : > "$0"; } 2>/dev/null || exit 125
+cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+if [ "${BUILDLOG_DEFER_SCOPE_SIDECAR:-0}" = 1 ]; then
+    export BUILDLOG_SCOPE_SIDECAR="$0.cgroup"
+else
+    printf "%s\n" "$cgroup" > "$0.cgroup"
+fi
+{ echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true
+export BUILDLOG_STEP_SCOPE="$cgroup"
+"$@"
+s=$?
+cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true
+cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true
+cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null
+exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
-source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
+source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2
 }
@@ -115,7 +144,7 @@ buildlog_now() {
 
 buildlog_read_context() {
     local context known_folder="${BUILD_TARGET_DIR:-${BUILDLOG_TEST_TARGET_DIR:-}}"
-    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$HOME/.claude/scripts/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
+    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$BUILD_HELPER_ROOT/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
     BUILDLOG_TREE="${context%%$'\n'*}"
     BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
 }
@@ -128,7 +157,7 @@ buildlog_begin() {
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
-    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
+    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
     fi
@@ -150,12 +179,23 @@ buildlog_step_compiles() {
 }
 
 buildlog_exec() {
+    local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        local socket_path="${ADMISSION_SOCKET:-}" step_directory
+        if [[ -n "$socket_path" && "$socket_path" != /* ]] && step_directory=$(pwd -P); then
+            socket_path="$step_directory/$socket_path"
+        fi
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}" "$socket_path"
+        export BUILDLOG_RESERVED_STEP
+    fi
     if [[ -z "${BUILDLOG_PEAK:-}" ]]; then
         "$@"
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
@@ -164,10 +204,17 @@ buildlog_exec() {
     "$@"
 }
 
+close_verify_exit_stderr() {
+    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+    fi
+    unset VERIFY_EXIT_STDERR_FD
+}
+
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
         BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
-        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
+        "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
 # buildlog_end STATUS LOG TTY ARGV...
@@ -184,15 +231,18 @@ buildlog_end() {
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
         buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
-        ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+        (
+            trap '' HUP
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} &
+        )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
 }
 
 buildlog_sample_anon() {
-    local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon peak=0
+    local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon shmem use peak=0
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
@@ -216,70 +266,89 @@ buildlog_sample_anon() {
         if [[ -r "$sidecar" ]]; then
             IFS= read -r scope < "$sidecar" || true
             if [[ -n "$scope" && -r "$scope/memory.stat" ]]; then
+                anon=""
+                shmem=""
                 while IFS= read -r line; do
                     if [[ "$line" == 'anon '* ]]; then
                         anon=${line#anon }
-                        if [[ "$anon" =~ ^[0-9]+$ ]]; then
-                            sampled_at=$(date +%s)
-                            if [[ -n "$phase_file" ]]; then
-                                if [[ "$phase_started" == null ]]; then
-                                    # memory.stat is hierarchical: one reading includes every
-                                    # parallel test, even when a child uses a nested cgroup.
-                                    executables=()
-                                    while IFS= read -r membership; do
-                                        while IFS= read -r pid; do
-                                            [[ "$pid" =~ ^[0-9]+$ ]] || continue
-                                            executables+=("${BUILDLOG_PROC:-/proc}/$pid/exe")
-                                        done < "$membership"
-                                    done < <(find "$scope" -name cgroup.procs -type f 2>/dev/null)
-                                    if (( ${#executables[@]} )); then
-                                        # One readlink process per tick, rather than one per
-                                        # compiler in a wide compilation before tests begin.
-                                        while IFS= read -r executable; do
-                                            if [[ "$executable" =~ /deps/[^/]+$ ]]; then
-                                                phase_started=$sampled_at
-                                                break
-                                            fi
-                                        done < <(readlink "${executables[@]}" 2>/dev/null)
+                    elif [[ "$line" == 'shmem '* ]]; then
+                        shmem=${line#shmem }
+                    fi
+                done < "$scope/memory.stat"
+                if [[ "$anon" =~ ^[0-9]+$ && "$shmem" =~ ^[0-9]+$ ]]; then
+                    use=$((10#$anon + 10#$shmem))
+                    sampled_at=$(date +%s)
+                    if [[ -n "$phase_file" ]]; then
+                        if [[ "$phase_started" == null ]]; then
+                            # memory.stat is hierarchical: one reading includes every
+                            # parallel test, even when a child uses a nested cgroup.
+                            executables=()
+                            while IFS= read -r membership; do
+                                while IFS= read -r pid; do
+                                    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+                                    executables+=("${BUILDLOG_PROC:-/proc}/$pid/exe")
+                                done < "$membership"
+                            done < <(find "$scope" -name cgroup.procs -type f 2>/dev/null)
+                            if (( ${#executables[@]} )); then
+                                # One readlink process per tick, rather than one per
+                                # compiler in a wide compilation before tests begin.
+                                while IFS= read -r executable; do
+                                    if [[ "$executable" =~ /deps/[^/]+$ ]]; then
+                                        phase_started=$sampled_at
+                                        break
                                     fi
-                                fi
-                                if [[ "$phase_started" != null ]]; then
-                                    if [[ "$phase_peak" == null ]] || (( anon > phase_peak )); then
-                                        if printf '{"test_phase_peak_bytes":%s,"test_phase_started_at":%s,%s\n' \
-                                            "$anon" "$phase_started" "${phase_context#\{}" > "$phase_temporary" \
-                                            && mv -f "$phase_temporary" "$phase_file"; then
-                                            phase_peak=$anon
-                                        else
-                                            rm -f "$phase_temporary" || true
-                                        fi
-                                    fi
-                                fi
+                                done < <(readlink "${executables[@]}" 2>/dev/null)
                             fi
-                            peak_published=0
-                            if (( anon > peak )); then
-                                if printf '%s\n' "$anon" > "$temporary" && mv -f "$temporary" "$maximum"; then
-                                    peak=$anon
-                                    peak_published=1
-                                else
-                                    rm -f "$temporary" || true
-                                fi
+                            # nextest_tokens.py wrote its width before the tests started.
+                            if [[ "$phase_started" != null && -n "${LINT_NEXTEST_WIDTH_FILE:-}" ]]; then
+                                buildlog_token_phase_context "$sampling_context" "${@:6}"
                             fi
-                            if (( peak_published || (anon * 2 >= peak && sampled_at - last_near_peak_at >= 60) )); then
-                                # Pair the time with the published peak; an old pair cannot decay a new peak.
-                                if printf '%s %s\n' "$peak" "$sampled_at" > "$near_peak_temporary" && mv -f "$near_peak_temporary" "$near_peak"; then
-                                    last_near_peak_at=$sampled_at
+                        fi
+                        if [[ "$phase_started" != null ]]; then
+                            if [[ "$phase_peak" == null ]] || (( use > phase_peak )); then
+                                if printf '{"test_phase_peak_bytes":%s,"test_phase_started_at":%s,%s\n' \
+                                    "$use" "$phase_started" "${phase_context#\{}" > "$phase_temporary" \
+                                    && mv -f "$phase_temporary" "$phase_file"; then
+                                    phase_peak=$use
                                 else
-                                    rm -f "$near_peak_temporary" || true
+                                    rm -f "$phase_temporary" || true
                                 fi
                             fi
                         fi
-                        break
                     fi
-                done < "$scope/memory.stat"
+                    peak_published=0
+                    if (( use > peak )); then
+                        if printf '%s\n' "$use" > "$temporary" && mv -f "$temporary" "$maximum"; then
+                            peak=$use
+                            peak_published=1
+                        else
+                            rm -f "$temporary" || true
+                        fi
+                    fi
+                    if (( peak_published || (use * 2 >= peak && sampled_at - last_near_peak_at >= 60) )); then
+                        # Pair the time with the published peak; an old pair cannot decay a new peak.
+                        if printf '%s %s\n' "$peak" "$sampled_at" > "$near_peak_temporary" && mv -f "$near_peak_temporary" "$near_peak"; then
+                            last_near_peak_at=$sampled_at
+                        else
+                            rm -f "$near_peak_temporary" || true
+                        fi
+                    fi
+                fi
             fi
         fi
         sleep 1
     done
+}
+
+# Recompute the test-phase context at the width the token holder took.
+buildlog_token_phase_context() {
+    local sampling_context=$1 threads="" context
+    shift
+    [[ -s "$LINT_NEXTEST_WIDTH_FILE" ]] && IFS= read -r threads < "$LINT_NEXTEST_WIDTH_FILE" || return 0
+    [[ "$threads" =~ ^[1-9][0-9]*$ ]] || return 0
+    context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" \
+        "${@:1:4}" "$threads" "${@:6}") || return 0
+    [[ "$context" != \{*\} ]] || phase_context=$context
 }
 
 buildlog_finish_memory() {
@@ -305,16 +374,51 @@ buildlog_retry_unstarted_step() {
     BUILDLOG_RETRY_STEP=0
 }
 
+without_progress_frames() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        printf '%s\n' "${line##*$'\r'}"
+    done
+}
+
+buildlog_exec_with_progress() {
+    CARGO_TERM_PROGRESS_WHEN=always \
+        CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
+        buildlog_exec "$@"
+}
+
 run_step_attempt() {
+    buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
     fi
+    # The dev shell's programs reach this step only; the next step starts from the caller's PATH.
+    local PATH=$PATH
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        lint_dev_shell_path || return $?
+    fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
-        build_hold_wait_local || return $?
+        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+            local hold_status=0
+            build_hold_check_local || hold_status=$?
+            if (( hold_status != 0 )); then
+                source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory "$hold_status"
+                if (( hold_status == 10 )); then return "$LINT_LEFT_QUEUE_STATUS"; fi
+                return "$hold_status"
+            fi
+        else
+            build_hold_wait_local || return $?
+        fi
     fi
-    buildlog_begin "$@" || true
+    if [[ "${BUILDLOG_PLACEMENT_PREPARED:-0}" != 1 ]]; then
+        buildlog_begin "$@" || true
+    fi
+    BUILDLOG_PLACEMENT_PREPARED=0
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
         while :; do
@@ -339,6 +443,11 @@ run_step_attempt() {
             else
                 status=$?
             fi
+            if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory 0
+                return "$LINT_LEFT_QUEUE_STATUS"
+            fi
             buildlog_release_memory 0
             if [[ "$status" != 10 ]]; then
                 BUILDLOG_MEM_WAIT_S=$memory_wait
@@ -355,10 +464,17 @@ run_step_attempt() {
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
-    if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
-        nextest_share_claim "$@"
-        set -- "${LINT_NEXTEST_SHARED_ARGV[@]}"
+    local holder=() LINT_NEXTEST_WIDTH_FILE=""
+    if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
+          && "${4:-}" == --test-threads ]]; then
+        LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
+        holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" --pool "$LINT_NEXTEST_POOL"
+                --width-file "$LINT_NEXTEST_WIDTH_FILE" --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
+    elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        nextest_thread_report "$@"
     fi
+    local LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -378,19 +494,30 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec "$@" 9>&-
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+            ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
+        fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
+        buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
-    nextest_share_end
+    if [[ -n "$LINT_NEXTEST_WIDTH_FILE" ]]; then
+        nextest_token_width "$LINT_NEXTEST_WIDTH_FILE"
+        [[ -z "$LINT_NEXTEST_TOKEN_WIDTH" ]] || set -- "${@:1:4}" "$LINT_NEXTEST_TOKEN_WIDTH" "${@:6}"
+    fi
     buildlog_finish_memory "$status" "$sampler_pid"
+    if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
+        rm -f -- "$BUILDLOG_PEAK.progress.log"
+    fi
     buildlog_retry_unstarted_step "$@" || {
         status=$?
         [[ -z "$log" ]] || rm -f "$log"
@@ -463,33 +590,55 @@ sweep_after_step() {
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= SWEEP_EVERY_S )) || return 0
     if [[ ! -d "$dir" ]]; then
+        # Later lint processes reuse the sweep time stored in this folder.
         "${BUILD_FOLDERS_SCRIPT%/*}/py" "$BUILD_FOLDERS_SCRIPT" stable \
             --parent "$parent" --name "$name" >/dev/null || return 0
     fi
     printf '%s\n' "$now" > "$stamp" || return 0
     # Cargo locks protect the sweep. It must not take the board token.
+    # Its removal lines go to the journal, where read_sweep_journal and the
+    # floor alert find them: this sweep can hold floor.lock while the
+    # disk-floor service run skips. The pipeline keeps no fd of the caller.
+    # When systemd-cat cannot reach the journal (a sandbox), cat reads the
+    # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        local fd
+        local -a copy_lease_fds=()
+        IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
+        for fd in ${copy_lease_fds[@]+"${copy_lease_fds[@]}"} \
+            "${DOC_COPY_LEASE_FD:-}" "${NUMBERED_COPY_LOCK_FD:-}" "${COPIES_STEP_SOURCE_LOCK_FD:-}"; do
+            if [[ "$fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
+                eval "exec $fd>&-"
+            fi
+        done
+        unset COPIES_COMMAND_LEASE_FDS COPIES_MIRROR_LEASE_FDS
+        unset DOC_COPY_LEASE_FD NUMBERED_COPY_LOCK_FD COPIES_STEP_SOURCE_LOCK_FD
         TOKEN_HELD=0
         run() { run_once "$@"; }
-        invoke_sweep </dev/null >/dev/null 2>&1 &
+        if command -v systemd-cat >/dev/null 2>&1; then
+            invoke_sweep </dev/null 2>&1 | { systemd-cat -t lint-sweep || cat; } >/dev/null 2>&1 &
+        else
+            invoke_sweep </dev/null >/dev/null 2>&1 &
+        fi
     )
 }
 
-have_nextest() {
-    cargo nextest --version >/dev/null 2>&1
-}
-
+# A failed version check prints its first error line, so a refusal such as the
+# Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
-    if ! have_nextest; then
-        echo "cargo nextest is required" >&2
+    local error
+    if ! error=$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo nextest --version 2>&1 >/dev/null
+    ); then
+        echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
 }
 
-# The nextest width mode: trial alternates physical and logical by block, and
-# physical or logical fixes the width. The trial block length must stay in sync
-# with BLOCK_S in scripts/buildlog/width_trial.py.
+# Use the logical or physical core count for the nextest width.
 LINT_TEST_WIDTH=logical
 
 nextest_physical_cores() {
@@ -531,83 +680,99 @@ nextest_logical_cores() {
     return 0
 }
 
-nextest_width_arm() {
-    local epoch="$1"
-    if (( (epoch / 6000) % 2 == 0 )); then
-        LINT_TEST_WIDTH_ARM=physical
-    else
-        LINT_TEST_WIDTH_ARM=logical
-    fi
-}
-
-# Local nextest runs share the machine's test threads: a run takes the mode's
-# width divided by the runs in flight, itself included, never below
-# nextest_budget.FLOOR (4). A run claims its share only after the memory gate
-# admits it (run_once calls nextest_share_claim), so a run still waiting for
-# memory never counts and never narrows the runs already testing. Each run holds
-# an flock on its own marker through fd 9 for as long as it runs, so a killed run
-# stops counting with its shell. The test processes do not inherit the fd. The
-# trial mode stays unshared, since width_trial.py names its arm by width. Any
-# failure runs at the full width.
+# On a host whose CARGO_MAKEFLAGS names a jobserver pool (natedev's
+# /dev/steve), a test run holds one pool token for each test thread, so test
+# threads and compile jobs share the one CPU pool. run_once runs the step
+# through nextest_tokens.py, inside the step's scope: it builds with --no-run
+# while it holds no test token, takes the tokens, and runs the tests at one
+# thread for each token. It writes that width to LINT_NEXTEST_WIDTH_FILE, and
+# run_once records the step at that width.
+# A host without a pool runs at the selected width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
+LINT_TEST_TOKENS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_tokens.py"
 
-run_nextest_shared() {
-    local width=$1 status=0 dir name
-    shift
-    dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
-    name="$$.$RANDOM$RANDOM"
-    if ! mkdir -p "$dir" 2>/dev/null; then
-        run cargo nextest run --test-threads "$width" "$@"
-        return
+# Set LINT_NEXTEST_POOL to the pool CARGO_MAKEFLAGS names, or to empty.
+nextest_token_pool() {
+    LINT_NEXTEST_POOL=""
+    local pattern='(^|[[:space:]])--jobserver-auth=fifo:([^[:space:]]+)' pool
+    [[ "${CARGO_MAKEFLAGS:-}" =~ $pattern ]] || return 0
+    pool="${BASH_REMATCH[2]}"
+    if [[ ( -c "$pool" || -p "$pool" ) && -r "$pool" && -w "$pool" ]]; then
+        LINT_NEXTEST_POOL=$pool
     fi
-    # The block puts fd 9 back as it was, so the marker nextest_share_claim
-    # opens on it closes when the run ends.
-    {
-        LINT_NEXTEST_SHARE="$dir/$name" run cargo nextest run --test-threads "$width" "$@" || status=$?
-    } 9>&-
-    rm -f "$dir/$name.run" "$dir/$name.new"
-    return "$status"
+    return 0
 }
 
-# nextest_share_claim ARGV... (`cargo nextest run --test-threads WIDTH ...`)
-# Called by run_once once the memory gate has admitted the step. It opens the
-# run's marker on fd 9, claims a share of WIDTH, and leaves the argv to run in
-# LINT_NEXTEST_SHARED_ARGV. A narrower share is written into the step's memory
-# reservation, so its peak is recorded against the width it ran at.
-nextest_share_claim() {
-    local shared="" width=$5
-    LINT_NEXTEST_SHARED_ARGV=("$@")
-    [[ "${4:-}" == --test-threads && "$width" =~ ^[1-9][0-9]*$ ]] || return 0
-    { exec 9>>"$LINT_NEXTEST_SHARE.new"; } 2>/dev/null || return 0
-    shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "${LINT_NEXTEST_SHARE%/*}" \
-        "${LINT_NEXTEST_SHARE##*/}" "$width" 9 2>/dev/null)" || shared=""
-    [[ "$shared" =~ ^[1-9][0-9]*$ && "$shared" != "$width" ]] || return 0
-    LINT_NEXTEST_SHARED_ARGV=("${@:1:4}" "$shared" "${@:6}")
-    printf 'nextest: %s of %s test threads, shared with the runs in flight\n' "$shared" "$width"
-    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" width "$BUILDLOG_MEM_RESERVATION" "$shared" \
-            >/dev/null 2>&1 || true
-    fi
+# Set LINT_NEXTEST_TOKEN_WIDTH to the width nextest_tokens.py wrote, or to
+# empty when the run ended before it took its tokens. The file goes.
+nextest_token_width() {
+    LINT_NEXTEST_TOKEN_WIDTH=""
+    [[ -s "$1" ]] && IFS= read -r LINT_NEXTEST_TOKEN_WIDTH < "$1" || true
+    rm -f -- "$1"
+    [[ "$LINT_NEXTEST_TOKEN_WIDTH" =~ ^[1-9][0-9]*$ ]] || LINT_NEXTEST_TOKEN_WIDTH=""
 }
 
-# The test run is over: drop the share before the build log write and the sweep
-# start in the background, so neither keeps the marker locked.
-nextest_share_end() {
-    [[ -z "${LINT_NEXTEST_SHARE:-}" ]] || exec 9>&-
+# Print the test threads and the load for a run that holds no tokens.
+nextest_thread_report() {
+    buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
+}
+
+# A workspace can declare artifacts that its tests need, under
+# workspace.metadata.dev.prebuild in its root Cargo.toml. prebuild.py goes in
+# front of the nextest command and its token holder, so the artifacts build
+# inside the step's own admission, on the host that runs the tests. LINT_WORKSPACE_MANIFEST names the
+# root manifest; without it, lint runs from the workspace root. A line that
+# holds the word "prebuild" adds the prefix, unless the word is after a "#" with
+# no quote before it (a comment). The check never misses a declaration in any
+# TOML form. The word in a value or another table starts Python once, which
+# reads no declaration and runs the tests unchanged. The shell reads the
+# manifest with no fork, so a manifest without the word starts no process.
+LINT_PREBUILD_SCRIPT="${BUILD_FOLDERS_SCRIPT%/*}/../lint/prebuild.py"
+lint_prebuild_prefix() {
+    local manifest=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} line before
+    LINT_PREBUILD_PREFIX=()
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *prebuild* ]] || continue
+        before=${line%%#*}
+        if [[ "$before" == *prebuild* || "$before" == *[\"\']* ]]; then
+            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest" --)
+            return 0
+        fi
+    done < "$manifest"
+}
+
+# A test can need a program that the workspace's flake development shell
+# declares (SpacetimeDB for hana_catalyst). verify.sh on natedev runs inside
+# that shell; the Mac route and a bare lint call do not. Outside a nix shell,
+# dev_shell.py prints the shell's program folders, and the step adds them to
+# the END of PATH, so every tool the host has stays first. A workspace without
+# flake.nix, or a step inside a nix shell, starts no process. The evaluation
+# is cached per flake input change; a failed one fails the step.
+lint_dev_shell_path() {
+    local root=${LINT_WORKSPACE_MANIFEST:-$PWD/Cargo.toml} folders
+    root=${root%/*}
+    [[ -z "${IN_NIX_SHELL:-}" && -f "$root/flake.nix" ]] || return 0
+    # On a failure the helper prints the one line that names the cause.
+    folders=$("${BUILD_FOLDERS_SCRIPT%/*}/py" "${BUILD_FOLDERS_SCRIPT%/*}/dev_shell.py" path --root "$root") ||
+        return 1
+    [[ -z "$folders" ]] || PATH="$PATH:$folders"
 }
 
 run_nextest() {
-    require_nextest
-    build_hold_wait_local || return $?
+    if [[ "${LINT_QUEUE_PLACEMENT:-0}" != 1 ]]; then
+        require_nextest
+        build_hold_wait_local || return $?
+    fi
 
-    local arg arm="" width=""
+    local arg width="" LINT_NEXTEST_POOL=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
         for arg in "$@"; do
             case "$arg" in
                 --)
                     break
                     ;;
-                --test-threads|--test-threads=*|-j|-j*)
+                --test-threads|--test-threads=*|--jobs|--jobs=*|-j|-j*)
                     run cargo nextest run "$@"
                     return
                     ;;
@@ -615,15 +780,6 @@ run_nextest() {
         done
 
         case "$LINT_TEST_WIDTH" in
-            trial)
-                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
-                arm="$LINT_TEST_WIDTH_ARM"
-                ;;
-            physical|logical)
-                arm="$LINT_TEST_WIDTH"
-                ;;
-        esac
-        case "$arm" in
             physical)
                 nextest_physical_cores
                 width="${LINT_PHYSICAL_CORES:-}"
@@ -634,11 +790,8 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            if [[ "$LINT_TEST_WIDTH" == trial ]]; then
-                run cargo nextest run --test-threads "$width" "$@"
-            else
-                run_nextest_shared "$width" "$@"
-            fi
+            nextest_token_pool
+            run cargo nextest run --test-threads "$width" "$@"
             return
         fi
     fi
@@ -656,13 +809,19 @@ fmt_cargo() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
-            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                cargo +nightly fmt --version
+            ) > "$version_file" 2>/dev/null || : > "$version_file"
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
             exit 2
         fi
-    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    elif ! (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo +nightly fmt --version
+    ) >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi
@@ -680,7 +839,7 @@ invoke_clippy() {
         return 0
     fi
     local -a cargo_args=() clippy_args=()
-    local seen_sep=0 arg
+    local seen_sep=0 fixing=0 arg
     for arg in "$@"; do
         if [[ "$arg" == "--" && $seen_sep -eq 0 ]]; then
             seen_sep=1
@@ -688,12 +847,19 @@ invoke_clippy() {
         fi
         if [[ $seen_sep -eq 0 ]]; then
             cargo_args+=("$arg")
+            [[ "$arg" != --fix ]] || fixing=1
         else
             clippy_args+=("$arg")
         fi
     done
-    run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
-        ${clippy_args[@]+"${clippy_args[@]}"}
+    if [[ $fixing -eq 1 ]]; then
+        run env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS \
+            cargo clippy --jobs "$CLIPPY_FIX_JOBS" ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    else
+        run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
+            ${clippy_args[@]+"${clippy_args[@]}"}
+    fi
 }
 
 # Use the same scope, lint arguments, gating, and run wrapper as judgment.
@@ -753,5 +919,5 @@ invoke_sweep() {
         lint_config_skip_notice sweep "lint sweep"
         return 0
     fi
-    run "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" "$@"
+    run "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/sweep.py" "$@"
 }

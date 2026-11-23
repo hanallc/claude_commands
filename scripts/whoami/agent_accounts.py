@@ -44,7 +44,6 @@ from collections.abc import Awaitable
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 from scripts.lib import conf
 from scripts.maintenance.schedule import IntervalHistory
@@ -87,7 +86,6 @@ def codex_account(home: Path) -> RefusingCodexAccount:
 @dataclass(frozen=True)
 class CreditsOn:
     """This account may pay for work after its allowance is used."""
-    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,21 +96,14 @@ class CreditsOff:
 CodexCreditsSetting = CreditsOn | CreditsOff
 
 
-def codex_credits_setting(label: str) -> CodexCreditsSetting:
-    from scripts.whoami.note_file import Note, note_path, read_note
+def codex_credit_accounts() -> frozenset[str]:
+    """The Codex accounts that the accounts config allows to spend paid credits."""
+    return frozenset(conf.read("accounts").text("codex_credit_accounts").split()) - {"none"}
 
-    try:
-        path = note_path(label)
-    except ValueError:
-        # An unnamed home's display label has no account note or explicit setting.
-        return CreditsOn()
-    note = read_note(path)
-    value = note.get("use_credits") if isinstance(note, Note) else None
-    if value == "off":
-        return CreditsOff()
-    if value is None or value == "on":
-        return CreditsOn()
-    return CreditsOn(f"{label}: use_credits must be on or off; reading it as on")
+
+def codex_credits_setting(label: str) -> CodexCreditsSetting:
+    """An account not named in codex_credit_accounts uses only its included allowance."""
+    return CreditsOn() if label in codex_credit_accounts() else CreditsOff()
 
 
 @dataclass(frozen=True)
@@ -363,6 +354,18 @@ class UsageSaveFailed:
 UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
 
 
+@dataclass(frozen=True)
+class LoginEndKnown:
+    """The server time limit for a Claude login."""
+
+    at: datetime
+
+
+@dataclass(frozen=True)
+class LoginEndUnknown:
+    """The reading has no login end date."""
+
+
 def usage_store_warning_line(warning: UsageStoreWarning) -> str:
     if isinstance(warning, UsageClaimFailed):
         return f"usage store: could not claim the read; {warning.reason}; read without a hold"
@@ -393,6 +396,7 @@ class Report:
     usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
     store_warnings: tuple[UsageStoreWarning, ...] = ()
+    login_ends_at: LoginEndKnown | LoginEndUnknown = field(default_factory=LoginEndUnknown)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -425,6 +429,7 @@ class ClaudeOauth(TypedDict, total=False):
     subscriptionType: str
     # Epoch milliseconds.
     expiresAt: int
+    refreshTokenExpiresAt: int | None
 
 
 class ClaudeCredentials(TypedDict, total=False):
@@ -524,6 +529,17 @@ def parse_reset(value: object) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+def login_end_from_iso(value: object) -> LoginEndKnown | LoginEndUnknown:
+    """Decode a stored login end date without using the machine's zone."""
+    at = parse_reset(value) if isinstance(value, str) else None
+    return LoginEndKnown(at.astimezone(timezone.utc)) if at is not None and at.tzinfo is not None else LoginEndUnknown()
+
+
+def login_end_iso(value: LoginEndKnown | LoginEndUnknown) -> str | None:
+    """Encode a known login end date as UTC for stored and public JSON."""
+    return value.at.astimezone(timezone.utc).isoformat() if isinstance(value, LoginEndKnown) else None
 
 
 def executable(name: str) -> str:
@@ -816,6 +832,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             if not stored_credentials:
                 stored_credentials = claude_credentials() if config_dir is None else claude_credentials(config_dir)
             oauth = stored_credentials.get("claudeAiOauth", {})
+            login_end = oauth.get("refreshTokenExpiresAt")
+            if login_end is not None:
+                report.login_ends_at = LoginEndKnown(datetime.fromtimestamp(login_end / 1000, timezone.utc))
             token = oauth.get("accessToken")
             expires = oauth.get("expiresAt")
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.
@@ -966,11 +985,11 @@ def codex_email_on_disk(home: Path | None = None) -> str | None:
     return email if isinstance(email, str) and email else None
 
 
-class CodexServerClosed(RuntimeError):
+class CodexAccountClosed(RuntimeError):
     """The server closed its output before answering a request."""
 
 
-class CodexServer:
+class CodexAccountClient:
     """A `codex app-server` over stdio, spoken to one JSON-RPC request at a time."""
 
     process: asyncio.subprocess.Process
@@ -1000,7 +1019,7 @@ class CodexServer:
                     if "error" in response:
                         raise RuntimeError("account API request failed")
                     return cast(object, response.get("result", {}))
-            raise CodexServerClosed("account API closed")
+            raise CodexAccountClosed("account API closed")
 
         return await asyncio.wait_for(receive(), timeout=timeout_seconds)
 
@@ -1075,9 +1094,9 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
     deadline = time.monotonic() + CODEX_HOME_PREPARATION_SECONDS
     reason = "initialize was not answered"
     while deadline - time.monotonic() > 0:
-        server: CodexServer | None = None
+        server: CodexAccountClient | None = None
         try:
-            server = CodexServer(await asyncio.create_subprocess_exec(
+            server = CodexAccountClient(await asyncio.create_subprocess_exec(
                 executable("codex"), "app-server", "--listen", "stdio://",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -1094,7 +1113,7 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
             break
         except OSError as error:
             return CodexHomePreparationFailed(f"Codex did not start at {codex_home_display(home)}: {error}")
-        except CodexServerClosed as error:
+        except CodexAccountClosed as error:
             reason = str(error) or type(error).__name__
         except (RuntimeError, ValueError, KeyError) as error:
             reason = str(error) or type(error).__name__
@@ -1111,10 +1130,10 @@ async def prepare_codex_home(home: Path) -> CodexHomePreparation:
 
 async def codex_live(home: Path) -> Report:
     report = Report("Codex", source=CodexHomeSource(home))
-    server: CodexServer | None = None
+    server: CodexAccountClient | None = None
     initialized = False
     try:
-        server = CodexServer(await asyncio.create_subprocess_exec(
+        server = CodexAccountClient(await asyncio.create_subprocess_exec(
             executable("codex"), "app-server", "--listen", "stdio://",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1197,10 +1216,11 @@ UNSCHEDULED_USAGE_READS = UnscheduledUsageReads()
 
 @dataclass(frozen=True)
 class ScheduledUsageReads:
-    """Independent account attempt times and the configured eligibility interval."""
+    """Track account attempt times and the interval for each tool."""
 
     history: IntervalHistory
     interval_seconds: float
+    codex_interval_seconds: float
 
 
 async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
@@ -1219,7 +1239,7 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWo
         directories = [directory for directory in directories
                        if schedule.history.is_due(str(directory), schedule.interval_seconds, checked_at)]
         homes = [home for home in homes
-                 if schedule.history.is_due(str(home), schedule.interval_seconds, checked_at)]
+                 if schedule.history.is_due(str(home), schedule.codex_interval_seconds, checked_at)]
 
     async def read_account(directory: Path, reading: Awaitable[Report]) -> Report:
         started_at = time.time() if isinstance(schedule, ScheduledUsageReads) else 0

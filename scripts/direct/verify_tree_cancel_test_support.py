@@ -1,8 +1,14 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
+)
+from scripts.build_queue import placement
+from scripts.mac_test import claim_state
+from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 import json
 import os
@@ -15,12 +21,13 @@ import time
 from pathlib import Path
 from typing import cast, override
 
-from scripts.agents.mesh_runs import RunRecord
+from scripts.agents.detached_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
+from scripts.direct.verify_lint_scope_test_support import CARGO_MEND_DISPATCH_SOURCE, write_fixture_cargo_mend
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
@@ -39,8 +46,11 @@ import subprocess
 import sys
 import signal
 from pathlib import Path
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 args = sys.argv[1:]
+if args == ["mend", "--build-info"]:
+    exec_fixture_cargo_mend(args[-1])
 root = Path(os.environ["TEST_CONTROL"])
 if "--version" in args:
     print("cargo fixture 1.0")
@@ -97,13 +107,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+import json
+import time
+arguments = sys.argv[1:]
 root = Path(os.environ["TEST_CONTROL"])
+result = Path(arguments[arguments.index("--result") + 1])
+''' + ASSIGNED_RUNNER_SETUP + r'''
 child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\"TEST_HANG_GUARD_SECS\"])); signal.pause()"])
 (root / "descendant.pid").write_text(str(child.pid))
 
 def cancel(signum, _frame):
+    global fixture_outcome, fixture_evidence, fixture_cleanup_confirmed
     child.terminate()
     child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
+    if "--assignment-file" in arguments:
+        fixture_outcome = placement.AttemptCancelled("the source tree changed")
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private child has ended", time.time())
+        fixture_cleanup_confirmed = True
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
 
@@ -140,6 +160,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         (stubs / "git").unlink()
         (stubs / "git").symlink_to(git)
         self.write_tool(stubs / "cargo", CARGO)
+        write_fixture_cargo_mend(stubs / "cargo-mend")
         self.write_shell_tool(stubs / "taplo", 'if [ "$1" = --version ]; then printf "taplo fixture 1.0\\n"; fi\n')
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
@@ -157,8 +178,8 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
-            "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
-            "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
+            "UNIT_TEAM_ROLE": "test",
+            "PYTHONPATH": str(VERIFY.resolve().parents[1] / "lib/python_startup"), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })
 
@@ -170,17 +191,29 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.board = self.root / "board"
         self.admission = caller_admission(self, self.root, self.environment)
 
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            if key.destination.provider == "local":
+                paths = claim_state.StatePaths(self.root / "local-provider", key.destination.target, platform="linux")
+            else:
+                paths = claim_state.StatePaths(self.root / "mac-state", key.destination.target, registry_selected=True)
+            return private_provider_evidence(self.admission, key, paths)
+
+        self.admission.server.host_probe = provider
+        _ = caller_provider_controls(self, self.admission)
+
     def release_lint_rewrites(self, process: subprocess.Popen[str]) -> None:
         # Formatting runs before clippy fix, then runs again without rewriting.
         for stage in ("mend", "fmt", "fix"):
             self.wait_for_running(self.control / (stage + ".rewritten"), process)
-            self.assertEqual(list((self.root / "tmp").glob("verify-tree.*")), [],
+            self.assertEqual(tool_folders(self.root / "tmp", "verify-tree"), [],
                              f"the watcher started during the {stage} rewrite")
             _ = (self.control / (stage + ".release")).touch()
 
     @staticmethod
     def write_tool(path: Path, code: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + code)
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup/sitecustomize.py"
+        bootstrap = f"import runpy, sys\nrunpy.run_path({str(startup)!r}, run_name='_fixture_python_startup')['select_checkout'](sys.argv)\n"
+        _ = path.write_text(f"#!{sys.executable}\n" + bootstrap + code)
         path.chmod(0o755)
 
     @staticmethod
@@ -210,14 +243,19 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             supervisor = """
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
-from scripts.agents import mesh_runs
-with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
-      patch.object(mesh_runs.staff, "local_snapshot", return_value=mesh_runs.staff.StaffSnapshot(())),
-      patch.object(mesh_runs.session_staff, "worker_directory", return_value=os.environ["PACKAGE_ROOT"])):
-    raise SystemExit(mesh_runs.main(["supervise", sys.argv[1]]))
+from scripts.agents import detached_runs
+
+def deliver_result(path: Path) -> int:
+    return detached_runs.main(["deliver", str(path)])
+
+with (patch.object(detached_runs, "deliver", return_value="private fixture"),
+      patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver_result),
+      patch.object(detached_runs.staff, "local_snapshot", return_value=detached_runs.staff.StaffSnapshot(()))):
+    raise SystemExit(detached_runs.main(["supervise", sys.argv[1]]))
 """
-            arguments = [sys.executable, "-c", supervisor, str(record_path)]
+            arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]
         process = subprocess.Popen(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -266,6 +304,7 @@ with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 
@@ -299,6 +338,11 @@ with (patch.object(mesh_runs, "deliver", return_value="private fixture"),
         targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
-                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n"
+                               + UNREACHABLE_WAIT_FIXTURE)
+        state = self.root / "mac-state"
+        self.environment.update({"MAC_TEST_STATE_DIR": str(state), "CONF_DIR": str(settings.parent),
+            "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),
+            "TEST_RUNNER_STATE": str(self.control)})
         return {"VERIFY_MAC_RUNNER": str(runner),
-                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(Path(settings).parent)}
+                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(settings.parent)}

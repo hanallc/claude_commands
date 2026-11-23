@@ -16,6 +16,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/health.py` | Recorder health: `calculate_snapshot()`, `write_snapshot()`, `read_snapshots()` and the freshness states (below). |
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, the one filesystem capacity and device reader. It imports `cgroup_capture` only. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command), the parsers `parse_meminfo`, `parse_pressure`, `parse_cpu_ticks` and `parse_boot_id`, the readers `read_pressure` and `read_cpu_ticks`, and `read_power_profile` with its path `POWER_PROFILE_STATE`. The `/proc` paths are module values (`MEMINFO`, `PRESSURE`, `CPU_PRESSURE`, `IO_PRESSURE`, `STAT`, `BOOT_ID`) that tests patch. Also the types `MachineMemoryUse`, `StallTotals`, `PartialStallTotals` (shared by memory, CPU and IO), `CpuTicks`, `PowerProfile` and `Unmeasured`. |
+| `scripts/buildlog/machine_facts.py` | `sample_once(path, at, probes)` saves the machine facts file; `read_facts(path)` reads it for the Builds feed, or returns `FactsUnread.VALUE` for a missing or invalid file. `Machine` names the three machines. `Probes` holds the command runner, the TCP connect, `/proc/loadavg`, the CPU count, the Mac SSH settings (`eligibility.SshProbeSettings`) and the gate box reader, which tests replace. `STALE_SECONDS` is three timer periods. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. `append_line`, `locked_append`, `last_whole_row_end` and `read_last_whole_row_end` keep each monthly file whole (below). `note_error(context)` writes one timestamped line to `errors.log`. |
 | `scripts/buildlog/index.py` | The schema number is in [build-memory-admission.md](build-memory-admission.md). This module owns the step stall columns, `SAMPLE_COLUMNS`, `samples`, `add_sample`, `samples_host_at`, and `steps_host_started`. |
 | `scripts/buildlog/cli.py` | The `sample` command takes no arguments and exits 2 if given any. `usage-hours [YYYY-MM-DD]` reports the preceding 24 hours. |
@@ -24,7 +25,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 
 ### App launches and admission waits
 
-`hana_shot.launch()` loads the build-log recorder by file path at the call, without changing `sys.path`, after its existing atomic launch-state write. The call is inside the cleanup block, so interruption also shuts the new process down. The recorder reads the state once and records a `step: launch`, `caller: hana-shot` process-start event. Its stable identity uses the launching host, PID, port and recorded start time. The event has no measured startup duration and leaves the screenshot unit's launch-state file unchanged.
+`hana_shot.launch()` imports `scripts.buildlog.record` at the call, after its atomic launch-state write. The call is inside the cleanup block, so interruption also shuts the new process down. The recorder reads the state once and records a `step: launch`, `caller: hana-shot` process-start event. Its stable identity uses the launching host, PID, port and recorded start time. The event has no measured startup duration and leaves the screenshot unit's launch-state file unchanged.
 
 Before publication, `record.launch()` saves the complete row under the build log's own `pending-launches/` directory using a temporary file, fsync and rename. `record.finish_pending_launch()` publishes one complete immutable `launch-<identity hash>.jsonl` using a hard link, then removes the pending record only after the row is durable or already present. The launcher and `buildlog launches` share that completion function and lock. A failed publication remains recoverable even after Hana shutdown removes its cache state; interruptions and repeated recorder, collector or report calls keep one row per launch.
 
@@ -64,7 +65,7 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 
 ### Per-step stall: scope file → step record → `steps`
 
-1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
+1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope --collect … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:
 
    ```sh
    exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; "$@"; s=$?; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s
@@ -89,6 +90,53 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 3. The `samples` table stores the machine counters, power profile, slices, filesystem, jobserver, and zram.
    The resource objects use JSON `TEXT` columns.
    The index uses `(host, at)`. Older source rows retain NULL for fields that they lack.
+
+### Machine facts: `buildlog sample` → `~/.local/state/machine-facts.json`
+
+On natedev, `buildlog sample` then calls `machine_facts.sample_once(state_path(), at)`.
+`MACHINE_FACTS_FILE` moves the file; the default is beside the `BUILDLOG_DIR` folder.
+The pass probes three machines in parallel threads. Each machine records its own state, so one failed probe keeps the others.
+- natedev: the 1-minute load from `/proc/loadavg`, `os.cpu_count()`, and the UPS from `upsc cyberpower` (`battery.charge`; `ups.status` `OL` is mains, `OB` is battery). Without `upsc`, `battery` is `"no_battery"`. A `upsc` failure, or a status without `OL` or `OB`, records `battery` `"unreadable"`.
+- Mac: `eligibility.SshProbeSettings(conf.read("mac_test"))` gives `host`, `connect_timeout_s` and `probe_timeout_s`. `ssh -G <host>` resolves the `host` alias. A TCP connect to its SSH port gives `link_ms`, with `connect_timeout_s`. A name lookup or connect that fails or passes `connect_timeout_s` records `unreachable`; the lookup runs in a daemon thread, because `getaddrinfo` has no time limit. A lookup error, for example a `UnicodeError` from a bad host name, fails at once and does not wait for the time limit. Then one SSH call, with `offload.ssh_prefix()` options and `probe_timeout_s`, runs `sysctl -n vm.loadavg hw.ncpu; pmset -g batt`. A failed SSH call after a good connect records `load_unreadable` with `link_ms`. A Mac without `InternalBattery` in `pmset` records `"no_battery"`.
+- AWS: the newest `GateRunning` reservation in the cost ledger that has not expired. No such box records `no_box`. A running box records `box_running`: `GateSecurityGroup` has egress rules only, so natedev cannot connect to it.
+The file is `{"version":1,"written":<epoch>,"machines":{"natedev"|"mac"|"aws":{"state","link_ms","load","cpus","battery","detail"}}}`.
+`state` is `read`, `load_unreadable`, `unreachable`, `no_box`, `box_running` or `failed`; `battery` is `{"percent","mains"}`, `"unreadable"` or `"no_battery"`. A probe that reads no battery (`unreachable`, `no_box`, `box_running`, `failed`) also records `"no_battery"`.
+`failed` means the probe could not start: the `mac_test.conf` or `ssh -G` read failed, the cost ledger is unavailable, or a probe raised another exception.
+A failed write prints `buildlog sample: machine facts not saved: <error>` and the sample still exits 0.
+The slowest probe sets the pass time. For the Mac it is at most three times `connect_timeout_s` (`ssh -G`, the name lookup, the connect) plus `probe_timeout_s`: 33 s with today's `mac_test.conf`, under the 60 s timer period.
+
+### Hourly Rust cache readings
+
+`buildlog hourly` records sccache statistics before sync. It writes a
+`sccache_sample` record to the monthly sample log. The index reads it into
+`sccache_samples`.
+
+The reading uses Rust hits and misses from the sccache JSON. Their sum counts
+Rust requests that reached the cache lookup. The hit rate is a fraction. It
+has no value when no requests reached the cache. The reading also records
+`cache_size` and `max_cache_size` in bytes. A size is null when sccache
+cannot measure it.
+
+`ExecMainStartTimestampMonotonic` identifies the start of the service's main
+process. It changes when systemd restarts that process. The host and boot ID
+identify the clock for that start time. The sampler checks the PID and start
+time before and after the statistics read. It reads the server's `SCCACHE_*`
+settings from `/proc/<MainPID>/environ`. The client starts in
+`/proc/<MainPID>/cwd` so relative socket paths resolve from the server's directory.
+The sampler skips the reading if it cannot read the environment or use the directory.
+It removes the server start flag because it conflicts with `--show-stats`.
+The sampler sets the logging level and disables log colors.
+It requires the sccache client to log `request_stats` at debug level and exit
+successfully. The client can return default counters after a connection failure
+without this message.
+
+`buildlog sccache START END` uses inclusive dates in the user's time zone.
+The earliest accepted date is 2000-01-01. With no dates, it uses today.
+It sums hit and miss deltas between readings inside the range from the same
+server life. A counter decrease starts a new
+baseline. The rate is unavailable until a measured delta contains requests.
+
+Baseline before the 128G cache (bob, 2026-11-19 about 11:37 EST, server up 4 d 16 h 45 min): Rust hits 76,653, misses 101,899, hit rate 42.93%.
 
 ### Raw resource readings and hourly use
 
@@ -229,6 +277,26 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
   - A pair across local midnight that is close enough counts, with `TZ=UTC` pinned.
   - An empty day keeps the heading, `memory waits: none` and `60 s samples: none; machine stall: unavailable.`
 
+## Build cost definitions
+
+Phase time is `phase_active_seconds`: the finish time minus `phase_started_at`, less the waits for the user or a supplier.
+A finish without `phase_active_seconds` has no phase time. Its day reads `phases ended before waits were recorded`.
+The phase finish time selects the window. Cost categories can overlap.
+
+Memory wait is the recorded wait time. A cold rebuild compiles at least 50 crates.
+A failed run has a counted nonzero step status, a nonzero gate run status or a failed CI result.
+A failed gate run costs its wall time on the machine that holds its file.
+A gate run also counts as a recorded event of that machine. AWS records only gate runs, under `aws`.
+
+A rerun after a pass repeats nextest within 60 minutes for the same worker.
+The recorded tree, worktree, and build input must match.
+
+CI cost sums job wall times. When job records are absent, CI cost uses the run wall time.
+Cancelled CI counts cancelled workflow attempts.
+
+Mac idle time starts with candidate wait intervals. It excludes Mac execution and recorded holds.
+Missing records remain unknown.
+
 ## Invariants
 
 - **The sampler never opens the SQLite index.** `buildlog sample` appends one JSON line and exits; the index ingests that line on the next query. A test checks that no file appears at `index_path()`.
@@ -251,11 +319,40 @@ Each host with a counted pair gets one line, `<host>: CPU some X%, full Y%; IO s
 
 ## Calibration and gotchas
 
+- **Full rebuilds and spill, 2026-11-08.** SQLite 3.51.2 reads the spill boolean through 8 bits.
+  `PRAGMA cache_spill = 65536` disables spill because `65536 & 255 = 0`.
+  `open_for_update` now applies `PRAGMA cache_spill = ON` after the threshold; spill stays enabled at 65,536 pages.
+  The index now uses WAL mode because spill takes no exclusive database lock; readers read the last committed snapshot.
+  Every measurement used 4096-byte pages, `cache_size=-2000`, and a private disk root without an index.
+  Phases 35 and 36 used rollback journal mode `delete`.
+  Phase 35 measured spill off: 132.73 s wall, 102.02 s CPU, and peak RSS 3,846,340 KiB (3,756.2 MiB).
+  Its one-minute load rose from 48.4 to 58.5.
+  The Phase 35 wrapper enabled spill: 252.73 s wall, 109.89 s CPU, and peak RSS 1,372,548 KiB (1,340.4 MiB).
+  Its one-minute load rose from 63.9 to 102.8.
+  Phase 36 used the repaired code with 443 JSONL files, 1,250,849,618 bytes, and 276,466 records.
+  It took 154.33 s wall and 98.01 s CPU, with peak RSS 1,378,896 KiB (1,346.6 MiB).
+  Its one-minute load rose from 47.2 to 68.9; peak RSS was 35.9% of the spill-off measurement.
+  The writer reported `cache_spill=65536`; the first spill grew the database past 307,200 bytes at 9.975 s.
+  During Phase 36 spill, `read_only()` failed after 30.214 s with `database is locked`; selection returned `NoCompleteGateIndex` after 1.006 s.
+  Phase 37 rebuilt 444 JSONL files, 1,256,597,996 bytes, and 276,884 records with WAL enabled.
+  It took 240.09 s wall and 119.54 s CPU, with peak RSS 1,386,436 KiB (1,353.9 MiB).
+  Peak RSS rose 0.55% from Phase 36; the one-minute load fell from 108.2 to 61.3.
+  The first spill grew the WAL beyond its 309,032-byte schema at 12.252 s.
+  Reader processes took 0.097 s (`read_only`), 0.103 s (selection), 0.205 s (`costs`), and 1.709 s (`moments`); all exited 0.
+  Each reader saw zero indexed steps, calls, samples, and gate runs; selection returned `NoCompleteGateIndex` during this first rebuild.
+  Costs reported no recorded costs; moments retained its fixed sections and external journal data.
+  The WAL reached 3,094,976,992 bytes, about the rebuilt index size of 3,076,661,248 bytes.
+  This WAL file adds disk use during a full rebuild; no WAL or SHM file remained after the writer closed.
+  A reader open when the writer closes keeps the WAL and SHM files; read-only readers cannot remove them, and the next update that closes alone removes them.
+  An update that converts a `delete` index to WAL waits for open read transactions, up to the 30 s busy timeout.
+  Phase 35 CLI readers waited on the update file lock and then succeeded; Phase 36 measured the direct SQL timeout.
+  Load and source records differed between measurements, so wall times do not isolate the effect of spill.
+  `INDEX_SPILL_PAGES` remains 65536; the private roots were deleted.
 - **The 5-minute gap rule.** `MAX_SAMPLE_GAP_S = 300`, five 60 s intervals. A counter rise across a longer gap cannot be placed on a day, so it is dropped. That happens when the timer stopped or the machine was off. A `boot_id` change also makes the interval unknown; a new counter cannot reveal its start time.
 - **Temp-folder steps are in the stall table.** They appear as `scratch (temp folders)` (`SCRATCH_LABEL`), and they count in every step's "at once". `SCRATCH` matches a cwd under `/tmp/`, `/var/folders/` or `/private/var/folders/`.
 - **Linux only.** `buildlog sample` without any of its three `/proc` files prints one line and exits 1. That includes a Linux kernel without PSI. A malformed `/proc/pressure/memory` raises and writes no row, and the next minute tries again. Step stalls need the systemd scope as well: a user manager, `systemd-run`, and `BUILDLOG_SCOPE` not set to `0`. That means natedev only, the same as `peak_mem_bytes`.
 - **The 60 s timer lives in `/etc/nixos`, on natedev.** It is a `nate.jobs` entry like the hourly `buildlog` job in `modules/linux/buildlog.nix`, not anything in `~/.claude`. Without it the `samples` table stays empty. The report then shows the stall table, if any, and `60 s samples: none; machine stall: unavailable.`
-- **Cost.** One `buildlog sample` run takes 0.04 s (median); the CPU, IO and stat reads add about 0.11 ms to the in-process `sample()` call (20-run median 0.234 ms → 0.347 ms). A month of samples is 43,200 rows; ingesting it costs 0.32 s the first time and 2 ms after that, because the index reads only bytes past its stored offset. `invoke.sh` prices the scope at 8 ms per step on top of the recorder's 2 ms (natedev, 2026-10-02); that figure predates the stall read.
+- **Cost.** One `buildlog sample` run takes 0.04 s (median) without the machine facts step. On natedev that step adds about 1.8 s (one live pass, 2026-11-22), mostly the Mac SSH round trip. The Mac probe imports `scripts.mac_test.offload` for its SSH options; that import costs about 100 ms once a minute (15-run median, 2026-11-22). The `eligibility` import in `machine_facts` costs about 21 ms. The CPU, IO and stat reads add about 0.11 ms to the in-process `sample()` call (20-run median 0.234 ms → 0.347 ms). A month of samples is 43,200 rows; ingesting it costs 0.32 s the first time and 2 ms after that, because the index reads only bytes past its stored offset. `invoke.sh` prices the scope at 8 ms per step on top of the recorder's 2 ms (natedev, 2026-10-02); that figure predates the stall read.
 - **The machine line has no host label.** It merges every host that has samples. Today only natedev samples, so it is natedev's figure. A second sampling host would add its stall into the same number.
 - **The scope file keeps its old name.** It is still `BUILDLOG_PEAK`, a `*.peak` temp file and `record.py step`'s `PEAK` argument, but it now holds peak and pressure.
 - **Peak still counts page cache.** The report's closing note says so. Stall, not peak, is the evidence of memory starvation.

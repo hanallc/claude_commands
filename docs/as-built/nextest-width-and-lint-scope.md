@@ -2,75 +2,113 @@
 
 ## What it is
 
-Two policies in the cargo layer that every session's builds go through. First, every `cargo nextest run` that `scripts/lint/invoke.sh` starts names its test width (`--test-threads N`), chosen by one mode line and divided among the local runs in flight once the memory gate admits the run. The memory gate pools every width's history for its reservation, and `scripts/buildlog/width_trial.py` scores a switchback trial between one test process per physical core and one per logical core. Width `logical` is the setting: a 72-hour trial found no memory-wait gain at physical width and slower hana runs. Second, `verify.sh lint` uses CI's clippy target scope (`--workspace --all-targets --all-features`). It adds `--keep-going` and can repair multiply-add warnings before its final judgment. It also checks TOML formatting with taplo.
+`scripts/lint/invoke.sh` selects the test width for `cargo nextest run`.
+On a host with a jobserver pool, the run holds one pool token for each test thread.
+The memory gate pools history from all widths for its reservation.
+The default width is `logical`.
+
+`verify.sh lint` uses the CI Clippy scope (`--workspace --all-targets --all-features`).
+It adds `--keep-going` and can repair multiply-add warnings before its final judgment.
+It checks TOML formatting with taplo.
 
 ## How it works
 
 ### Nextest width (`scripts/lint/invoke.sh`)
 
-`LINT_TEST_WIDTH` sits beside `run_nextest` and takes one of three values:
+`LINT_TEST_WIDTH` sits beside `run_nextest` and has two modes.
 
 | Mode | Width |
 | --- | --- |
-| `trial` | alternates by 100-minute block: `physical` in an even block, `logical` in an odd one |
 | `physical` | physical core count |
 | `logical` (current) | logical core count: 32 on natedev, nextest's own default there |
 
 - `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell. On Linux it counts distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`; on darwin it reads `sysctl -n hw.physicalcpu`. A value that is not a positive integer leaves it empty.
 - `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`, with the same rule.
-- `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`. `trial` mode passes `${EPOCHSECONDS:-$(date +%s)}`.
-- `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
+- `require_nextest` runs `cargo nextest --version`. On a failure it prints `cargo nextest is required`, then the first error line when there is one, such as a Mac cargo gate refusal. It exits 2.
+- `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `--jobs`, `--jobs=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
 
-### Shared width (`scripts/lint/nextest_budget.py`)
+### Jobserver tokens (`scripts/lint/nextest_tokens.py`)
 
-In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` runs `run cargo nextest run --test-threads WIDTH ARGS...` with `LINT_NEXTEST_SHARE=<dir>/<name>`, the directory `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/`. Once the memory gate admits the step, `run_once` calls `nextest_share_claim`, which opens fd 9 on `<name>.new` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. A narrower share replaces the width in the step's argv, prints `nextest: <shared> of <full> test threads, shared with the runs in flight`, and is written into the step's memory reservation (`memory_admit.py width`). The test process runs with fd 9 closed, `nextest_share_end` closes fd 9 as soon as it exits, before the build log write and the sweep start, and the marker is removed after `run` returns.
+On natedev, compiles and test threads share one jobserver pool, `/dev/steve`. Each token is one byte: a read takes a token, and a write of the same byte gives it back.
 
-- The claim comes after admission (2026-10-20, nightly 2026-10-16): when it came before, a run waiting for memory counted as in flight, so on 10-14 to 10-16 154 of 230 whole-hana runs ran at width 4, with a mean memory wait of 537 s against 50-113 s at widths 16 and 32. A run that leaves the memory wait for the Mac claims nothing.
+1. `run_nextest` calls `nextest_token_pool` in `physical` and `logical` mode. It sets `LINT_NEXTEST_POOL` to the path in `CARGO_MAKEFLAGS` `--jobserver-auth=fifo:PATH` when that path is a readable and writable character device or FIFO. Otherwise the pool is empty.
+2. After the memory gate admits the step, `run_step_attempt` runs `nextest_tokens.py --pool P --width-file F --reservation R -- cargo nextest run --test-threads W ...` inside the step's scope.
+3. The holder builds first with `--no-run` and the selection arguments before `--`. The compile takes tokens as cargo always does, and the step holds no test token while it compiles.
+4. The launcher limits total tokens to the selected test count plus `nested_tokens`, up to W. It waits for `test_token_floor` test tokens, up to the selected test count and W. An empty selection takes no tokens. The Builds page reads `nextest: waiting for K more jobserver tokens` and shows the `waiting` stage.
+5. The launcher takes free tokens up to the total limit. It gives nested Cargo a private FIFO with up to `nested_tokens` tokens above the test floor. If no surplus tokens are available, nested Cargo gets an empty FIFO and uses its implicit token. It gives one remaining token to each test thread. It writes the test thread count N to F and updates the reservation's `test_threads` when N differs from W. At startup, it uses the PID and process start time to remove orphaned FIFO folders under its private parent in `TMPDIR`.
+6. It prints `nextest: N of W test threads; load <one-minute load> on <cpu count> CPUs (<host>); one jobserver token for each thread`, then runs the tests with `--test-threads N`.
+7. Every token goes back when the tests end, on any exit or signal. TERM, INT and HUP go on to the child, and the holder exits 128 + the signal. steve also takes back the tokens of a process that dies.
+8. The shell reads F, removes it, and puts N in the step's argv for the build log. The memory sampler recomputes the test-phase context with N when the test phase starts.
 
-- The lock belongs to the file the shell opened, so it ends with the shell: a killed run's marker is unlocked, and the next claim neither counts it nor keeps it. A `.new` older than `PENDING_GRACE_S` (600 s) is a shell killed before it claimed.
-- On natedev: alone 32, 2 runs 16, 3 runs 10, 4 runs 8, 8 or more 4. On the Mac (12): alone 12, 2 runs 6, 3 or more 4.
-- A width is fixed when the run is admitted; runs that start later do not narrow it, and a run that outlives the others does not widen.
-- Any failure (no directory, the helper failing or printing a non-number) runs at the full width.
-- `trial` mode is not shared: `width_trial.py` names the arm by width (16 physical, 32 logical), and a shared 16 would read as physical.
+- A build failure returns its status and takes no token. A pool that does not open prints `nextest: W test threads with no jobserver tokens: <pool>: <error>` and runs at W.
+- `trial` mode and a host with no pool (the Mac) take no tokens. Those runs, and a caller-supplied width, print the line from `nextest_budget.py report`: `nextest: <granted> of <requested> test threads; load <one-minute load> on <cpu count> CPUs (<host>)`. The Python formatter prints `load unknown` if it cannot read the load.
+- steve stops handing out tokens while MemAvailable is under 12 GiB, so a holder can wait at the floor on memory too.
+- hana CI's nextest runs through `scripts/build_queue/ci_cargo_front.py` with `/dev/steve-ci`, not through `run_once`, and takes no test tokens.
 
 natedev has 16 physical and 32 logical cores. The Mac reads 12 for both and has no memory gate. GitHub CI and hand-run `cargo nextest` do not go through `invoke.sh` and keep nextest's default width.
 
-A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A shared run records the width it ran at: the build log takes the argv after the claim, and the reservation's `test_threads` is rewritten by the claim.
+A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A run that holds fewer tokens than its width records the width it ran at: the build log takes the argv with N, and the holder rewrites the reservation's `test_threads`.
+
+### Test prebuilds (`scripts/lint/prebuild.py`)
+
+A workspace can declare an artifact that its tests need, in its root `Cargo.toml`:
+
+```toml
+[workspace.metadata.dev.prebuild.hana_agora_server]
+target = "wasm32-unknown-unknown"
+env = "HANA_AGORA_SERVER_WASM"
+for = ["hana_agora", "hana"]
+```
+
+`platforms` is optional. It lists the platforms that build the artifact, `linux` and `macos`; the default is both.
+
+1. `run_step_attempt` calls `lint_prebuild_prefix` for a `cargo nextest run` step. When a line of the root manifest holds the word `prebuild`, it puts `prebuild.py --manifest M --` in front of the token holder and the nextest command. The word after a `#` with no quote before it is a comment and does not count. So the check finds a declaration in every TOML form: a header, a quoted or dotted key, or an inline table. The word in a value or another table starts Python once; `prebuild.py` reads no declaration and runs the tests unchanged. The shell reads the manifest without a fork, so a manifest without a declaration starts no process. `verify.sh` sets the manifest (`LINT_WORKSPACE_MANIFEST`) to the repository root `Cargo.toml`. A remote `lint nextest` runs in the mirror root and reads `$PWD/Cargo.toml`.
+2. `prebuild.py` reads the packages that the nextest arguments select. Plain `-p`/`--package` names select those packages; a `-E` filter can only narrow them. A glob, `--workspace`/`--all` (cargo then ignores `-p`), a short-option word other than `-p` that holds a `p` (`-phana`, `-rp`) or no `-p` selects the whole workspace. Filtersets are not read: a run that selects by `-E` alone builds every entry for its platform, and cargo's fingerprints make the extra builds cheap.
+3. For each entry whose `for` list holds a selected package, or for every entry on a whole-workspace run, it runs `cargo build --release --manifest-path M -p <package> --target <target>`. A `--target-dir` in the nextest arguments goes to the build too.
+4. It reads cargo's JSON messages for the `cdylib` or `bin` artifact whose `package_id` names the package, so a renamed `[lib]` target works. It needs exactly one such file, and sets `<env>` to its path. Then it runs the nextest command with `exec`.
+
+- The build runs inside the step's admission and memory scope, on the host that runs the tests: natedev, the Mac or an SSH target.
+- On a platform that `platforms` leaves out, it prints `prebuild: <package> builds only on <platforms>; not built on <platform>` and runs the tests without the build.
+- Cargo's fingerprints make an unchanged build a no-op. There is no second cache.
+- A failed build exits with cargo's status and prints `the tests did not run`. An invalid declaration exits 2 with one line. A `workspace`, `metadata` or `dev` value that is not a table declares nothing, and the tests run unchanged.
+- The profile is always `release`. The entry has no profile key.
+
+### Dev shell programs (`scripts/lib/dev_shell.py`)
+
+A test can need a program that the workspace's flake development shell declares, for example SpacetimeDB for hana_catalyst. `verify.sh` on natedev runs inside that shell (`nix_env.py exec`), and the Linux SSH runner sources the whole shell. The Mac route and a bare `lint` call do not.
+
+1. `run_step_attempt` makes `PATH` local, and for a `cargo nextest run` step it calls `lint_dev_shell_path` before admission.
+2. The workspace root is found as for prebuilds: the folder of `LINT_WORKSPACE_MANIFEST`, which `verify.sh` sets to the repository root, or else `$PWD` (a remote `lint nextest` runs in the mirror root). A bare `lint` from a member folder does not find the root flake. When `IN_NIX_SHELL` is not set and the workspace root has `flake.nix`, `dev_shell.py path --root R` prints the shell's `/nix/store` program folders. The step adds them to the END of `PATH`. Every tool the host has stays first: the Mac cargo gate, rustup's cargo and the system compiler. No other variable changes, so the step builds as before.
+3. The evaluation (`nix print-dev-env path:<inputs>#<selector>`) is cached per flake input change under `config/dev_shell.conf` `cache`. The inputs are `flake.nix`, `flake.lock` and the `nix/` folder, the same contract as the Linux SSH runner. A flake that reads another file, or has no `flake.lock`, fails the evaluation.
+4. A failed evaluation fails the step with one line from `dev_shell.py`: `dev_shell: <root>: nix print-dev-env failed: <nix's last error line>`, or the input problem. The tests do not run.
+5. A workspace without `flake.nix`, or a step inside a nix shell, starts no process. The next step starts from the caller's `PATH`.
+
+A program that the shell has and the host lacks is visible to build scripts too. Adding the folders last limits this to tools that the host does not have.
 
 ### Width in the reservation (`scripts/lint/memory_admit.py`)
 
 - `test_threads(argv) -> int | None` returns the first width in argv, from `--test-threads N`, `--test-threads=N`, `-j N` or `-jN`; absent or non-integer (`num-cpus`) is `None`.
-- `expected_peak(repo, step, host, now, root, test_threads=None)` reads only history before `now`, so a later call for a past `now` returns the same value. Its measured tier (≥ 5 `anon_peaks.jsonl` records in `HISTORY_DAYS` 14, p90) reads every width when `test_threads` is `None`, and only that width's records when one is given (`width_trial.py`'s R row). Its index tier (build-log `peak_mem_bytes` × `ANON_SHARE` 0.65) and `FALLBACK` (12 GiB) do not look at width.
-- `check` calls `expected_peak` with no width, so the gate pools every width: one width's history was thin and rebuild-heavy (11.4 GiB at width 4, 17.2 at 5, against 10.9 pooled, nightly 2026-10-16), and the shared width is claimed only after admission. It writes `test_threads(argv)` and `call_id` (`BUILDLOG_CALL_ID`, else `None`) into each reservation row; `set_width` (`memory_admit.py width <reservation> <n>`, under the admission lock) rewrites `test_threads` after a narrower claim, and `release` copies both into the `anon_peaks.jsonl` record.
-
-### Trial scorecard (`scripts/buildlog/width_trial.py`)
-
-`width_trial.py report --since <ISO-8601 with offset> --until <ISO-8601 | now>` prints the switchback scorecard for natedev. Exit 0 on a report, 2 on a usage error.
-
-- `load_steps` reads `step = 'nextest'` rows from the build-log index (`index_path()`, moved by `BUILDLOG_DIR`) and selects them by request time, `started_at − mem_wait_s`. A step's arm is `test_threads(argv)`: 16 is `physical`, 32 `logical`, none `unset`, any other width its number. Its block is `request // BLOCK_S` (6000 s).
-- **whole-hana** run: `caller = 'verify'`, `repo = 'hana'`, the `-E` value is exactly `package(hana)`, and no `--test` in argv.
-- Metrics, `physical` against `logical`:
-
-| Metric | Definition | Rule |
-| --- | --- | --- |
-| W | mean `mem_wait_s` per hana nextest step, any caller; steps requested in a block's first 900 s (`WASHOUT_S`) left out; NULL waits skipped | `proven` at ratio ≤ 0.50 and interval high < 1.00; `partial` at high < 1.00; `none` at high ≥ 1.00 |
-| P | p50 anon peak of whole-hana runs, from `anon_peaks.jsonl` joined on `call_id` | target physical ≤ 6.5 GiB, no effect on the verdict |
-| R | `expected_peak("hana", "nextest", host, until, root, width)` for 16 and 32 | target physical ≤ 9.0 GiB, no effect on the verdict |
-| T | p50 of `duration_s − finished_s` over whole-hana runs with `finished_s` set | fails at ratio > 1.11 and interval low > 1.00 |
-| F | share of whole-hana runs with `status ≠ 0`, difference in points | fails at difference > +5 and interval low > 0 |
-
-- Reported without a rule: timed-out tests per 100 whole-hana runs (`tests.status = 'timed_out'`), and mean memory wait per gated step over every natedev step, each block assigned the arm most of its nextest steps ran.
-- Intervals: 90% percentile intervals from 2,000 block-bootstrap resamples (each arm's blocks drawn with replacement, same count), `random.Random(20261009)`.
-- Sample: ≥ 60 whole-hana runs (`MIN_RUNS`) and ≥ 15 blocks (`MIN_BLOCKS`) per arm, counting only `physical` and `logical` when either is present.
-- `verdict(w, t, f)`: W `none` → `revert`; W `proven`/`partial` with T or F failing → `trade-off`; otherwise `keep`. A metric that cannot compare (`UncomparedMetric`, reason `needs both arms`, `zero denominator` or `no resamples`) gives `no verdict`, and the row prints `—` where a value needs the other arm.
-- P pairs each attempt of a call with its own anon peak by end time when the counts match; a retried call missing a peak gives no P for any of its attempts.
-- The header carries the script's own sha256 (first 12 hex) and the window in the user's zone (`user_zone()`).
+- `expected_peak(repo, step, host, now, root, test_threads=None)` reads history before `now`.
+  The measured tier uses the p90 of at least five `anon_peaks.jsonl` records within `HISTORY_DAYS` (14 days).
+  It reads all widths when `test_threads` is `None`.
+  It reads only the specified width when the caller gives a width.
+  The index tier uses `peak_mem_bytes` × `ANON_SHARE` (0.65).
+  The index tier and `FALLBACK` (12 GiB) apply to all widths.
+- `check` calls `expected_peak` with no width, so the gate pools every width: one width's history was thin and rebuild-heavy (11.4 GiB at width 4, 17.2 at 5, against 10.9 pooled, nightly 2026-10-16), and the token width is known only after admission. It writes `test_threads(argv)` and `call_id` (`BUILDLOG_CALL_ID`, else `None`) into each reservation row; `set_width` (`memory_admit.py width <reservation> <n>`, under the admission lock) rewrites `test_threads` after a narrower token count, and `release` copies both into the `anon_peaks.jsonl` record.
 
 ### CI-scope lint (`scripts/direct/verify.sh`, `lint` arm)
 
 Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy. Workspace rustdoc runs separately through `verify.sh doc` at the checkpoint.
 
-- Clippy: `invoke_clippy --workspace --all-targets --all-features --keep-going` (`-- -D warnings` from `invoke.sh`). The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`. The lint call sites add `--keep-going`; `invoke.sh` does not add it. Lint takes no trailing `--features`; `verify.sh doc --features <list>` selects workspace doc features. CI's Windows-target clippy pass has no local counterpart. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their own scope.
+- Clippy uses `invoke_clippy --workspace --all-targets --all-features --keep-going`.
+  `invoke.sh` adds `-- -D warnings`.
+  The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`.
+  The lint callers add `--keep-going`; `invoke.sh` does not add it.
+  Lint takes no trailing `--features`.
+  `verify.sh doc [<package>] --features <list>` checks the staged workspace.
+  A named package owns feature names without a slash.
+  CI's Windows-target Clippy pass has no local counterpart.
+  The other commands keep their own scope.
 - Clippy judges first. A passing judgment needs no fixes. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial failures return directly. Repairs run `cargo clippy --fix`, then fmt, with the judgment scope and lint levels. Repairs stop when the tree remains unchanged or reaches `clippy_fix_pass_limit` from lint.conf. The default limit is 3. Clippy judges again after repairs. The final judgment sets the lint status. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix).
 - Taplo: `run taplo fmt --check` from `workspace_root` (from `cargo metadata`), so taplo loads the workspace `taplo.toml` whatever directory lint starts in. `config/lint.conf` does not gate it; it gates only the cargo stages. An unformatted `.toml` fails lint, names the file, and is cached like any lint failure.
 - `require_taplo` exits 2 with `taplo is required` before any stage when taplo is not on `PATH`. A taplo panic (exit 101) exits 3 on macOS, with a message to re-run unsandboxed, and 2 elsewhere.
@@ -79,28 +117,28 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 ## Invariants
 
 - `invoke.sh` is the only place nextest policy flags are composed; callers own scope.
-- The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no marker and is not counted by others.
-- No counter: a run is in flight while its marker is locked, and nothing a killed run leaves behind is counted.
-- Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a failed claim runs at the full width.
-- `invoke.sh` adds its width before the caller's arguments, and `parse.test_threads` (admission calls it as `memory_admit.test_threads`) and `width_trial` read the first width in argv. Change both or neither.
-- The trial block in `nextest_width_arm` (6000 s) equals `BLOCK_S` in `width_trial.py`.
-- `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
+- The dev shell folders go at the end of `PATH`, never the start: the Mac cargo gate and the host's tools stay first.
+- The prebuild prefix goes before the token holder: `nextest_tokens.py` reads `cargo nextest run --test-threads W` at the start of its command.
+- The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no test tokens.
+- No counter: a run's tokens are the bytes it holds, and steve takes back the tokens of a dead process.
+- Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a pool that does not open runs at the full width.
+- `invoke.sh` adds its width before the caller's arguments.
+  `parse.test_threads` reads the first width in the command arguments.
 - The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. A width filter replaces any need to drop stale records.
 - `verify.sh lint`'s clippy target scope equals CI's `clippy` job and `pre_release_checks.sh`; change all three together. Its fix passes and its judgment all use `--keep-going`.
-- Tooling failures (exit 2, exit 3, killed runs) are never cached; only a lint failure of the tree is.
+- Tooling failures, killed runs, and lost-token status 125 are never cached. Only a lint failure of the tree is cached.
 - `invoke.sh` must parse under the Mac's bash 3.2 (no `EPOCHSECONDS`, no associative arrays, `${arr[@]+"${arr[@]}"}` for empty arrays).
-- Tests never read the live `~/.local/state/buildlog` (`BUILDLOG_DIR` points at a temp dir) and never run real `cargo`. `test_nextest_width.py` sets the mode in every case, so it passes under any `LINT_TEST_WIDTH` default.
+- Tests never read the live `~/.local/state/buildlog` (`BUILDLOG_DIR` points at a temp dir) and never run real `cargo`. Tests that reach `run_nextest` set `CARGO_MAKEFLAGS` to a FIFO of their own or to a path with no pool, so they never take a live `/dev/steve` token. `test_nextest_width.py` sets the mode in every case, so it passes under any `LINT_TEST_WIDTH` default.
 
 ## Calibration / gotchas
 
-- Switching width is one value: `LINT_TEST_WIDTH`. The width functions and the `trial`/`physical` modes stay in place for that.
+- Set `LINT_TEST_WIDTH` to select the core count.
 - `verify.sh` retries a memory-killed step once under the same `BUILDLOG_CALL_ID`, so `call_id` alone does not identify one attempt.
 - A step run outside `verify.sh` records `call_id` None; whole-hana runs all come through `verify.sh`.
 - `verify.sh`'s pass key hashes content and these scripts: touching a file replays a cached pass, so a timing run passes `--no-cache`, and every pass record misses once after an `invoke.sh` change.
 - Under `--all-features` hana pulls `bevy/hotpatching`, so the first lint in a target directory checks the bevy tree a second time (159 s against 128 s on hana main).
 - Any `verify.sh` test fixture that runs `lint` needs `workspace_root` in its `cargo metadata` answer and a `taplo` on `PATH`.
 - `~/rust/rust-template` is a cargo-generate template with no `Cargo.toml`; a live width check runs on a real crate such as `~/rust/cargo-liner`.
-- Interim reads of the scorecard move: T read as failing at 64 h of the 72 h trial and passed at 72 h (low end exactly 1.00).
 - Physical width cuts the whole-hana anon peak p50 by about a fifth but does not lower the gate's reservation, which follows the gate's own recorded peaks.
 
 ## Why
@@ -117,7 +155,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 
 Sample: 22 blocks per arm; 114 and 103 whole-hana runs. Verdict `revert`: W shows no memory-wait gain, and whole-hana runs are 13% slower at 16 threads. The widths stay labeled so a later measure can read them.
 
-The per-width key replaced deleting hana's old anon-peak records. Since 2026-10-20 the gate pools the widths again, and the labels stay for `width_trial.py`.
+The gate pools all widths. The records retain the width labels.
 
 **Lint runs CI's clippy.** A narrower local clippy (`--lib --bins --tests`, default features) passed on trees CI's Clippy job failed, for example a missing `#[must_use]` in hana_diegetic's `bench_support`. Measured on hana, `verify.sh lint hana --no-cache`, clippy step, memory wait 0 in every run:
 

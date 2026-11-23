@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Exercise mac_run.sh coordination with disposable state and command stand-ins."""
 
 from __future__ import annotations
@@ -7,23 +7,53 @@ import json
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
+from unittest import mock
 from pathlib import Path
-from typing import TypedDict, final, override
-from scripts.direct.wait_for_test_state import wait_for_file
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from typing import ClassVar, TypedDict, cast, final, override
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
+from scripts.lib import copy_record, scratch
+from scripts.lib.git_test_support import fixture_git_environment
+
+from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import claim_state, floor_claims
+from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("mac_run.sh")
 MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
-# build_hold.owning_session() reads these; a Mac block admits the session they name.
+MAC_RUN_CONFIG = {
+    "mac_run_host": "natemccoy@mac",
+    "mac_run_port": "15710",
+    "mac_run_log": "/tmp/mac_run_hana.log",
+    "mac_run_launch": "/tmp/mac_run_hana.command",
+    "mac_run_status": "/tmp/mac_run_hana.status",
+    "mac_run_example_seconds": "20",
+    "mac_run_examples": "hana_diegetic typography;hana_lagrange showcase fit_overlay",
+    "mac_run_deployment_target": "14.0",
+    "mac_run_status_grace_seconds": "60",
+    "mac_run_poll_seconds": "1",
+    "mac_run_log_lines": "20",
+    "mac_run_example_log_lines": "10",
+    "mac_run_bundle": "/tmp/mac_run.bundle",
+    "mac_run_example_log_prefix": "/tmp/mac_run_",
+    "mac_run_source": "~/rust/hana",
+}
+# owning_session.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
     "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
@@ -38,14 +68,41 @@ class CommandEvent(TypedDict):
 
 
 COMMAND_STUB = r'''
+run_real_copies() {
+    export PATH=$MAC_RUN_REAL_PATH
+    export COPIES_CONFIG=$MAC_RUN_REMOTE_COPIES_CONFIG
+    export MAC_TEST_STATE_DIR=$MAC_RUN_REMOTE_CLAIMS
+    eval "$remote"
+    exit $?
+}
 state=$MAC_RUN_STUB_STATE
 command=${0:t}
+remote=${@[-1]}
+placed_run=0
+if [[ $command == ssh && $remote == *mac_group=* ]]; then
+    outer=("${(@Q)${(z)remote}}")
+    wrapper=("${(@Q)${(z)outer[3]}}")
+    work=${wrapper[1]#work=}
+    printf '%s\0' "$work" >> "$state/placed-commands"
+    # (z) reads each newline of the wrapper as a ";" word.
+    print -rn -- "${wrapper[3]#on_close=}" > "$state/on-close"
+    words=("${(@Q)${(z)work}}")
+    remote=${words[4]}
+    set -- "${@[1,-2]}" "$remote"
+    placed_run=1
+    print -r -- mac_group=4567
+fi
 claimed=false
 [[ ! -e $MAC_TEST_STATE_DIR/run.json ]] || claimed=true
 input=""
 if [[ $command == ssh && ${@[-1]} == *'cat >'* ]]; then
-    input=$(cat; print -rn -- .)
-    input=${input%.}
+    if (( placed_run )); then
+        input=${remote#*"<<'HANA_LAUNCH'"$'\n'}
+        input=${input%%$'\nHANA_LAUNCH'*}
+    else
+        input=$(cat; print -rn -- .)
+        input=${input%.}
+    fi
 fi
 # NUL separates fields so labels and command input keep their original bytes.
 printf '%s\0' "$command" "$claimed" "$input" "$#" "$@" >> "$state/events"
@@ -56,6 +113,13 @@ case $command in
         if (( ${@[(Ie)merge-base]} && ${@[(Ie)--is-ancestor]} )); then
             [[ -n $MAC_RUN_CLONE_DESCENDANT && ${@[-2]} == $MAC_RUN_SHA && ${@[-1]} == $MAC_RUN_CLONE_DESCENDANT ]]
             exit $?
+        fi
+        if (( ${@[(Ie)remote]} && ${@[(Ie)get-url]} )); then
+            # Each fixture repository has a distinct origin, so it has a history key.
+            folder=${@[$((${@[(Ie)-C]} + 1))]}
+            [[ -e $folder/.git ]] || exit 2
+            print -r -- "https://example.invalid/${folder:t}.git"
+            exit 0
         fi
         if (( ${@[(Ie)rev-parse]} )); then
             code=0
@@ -82,7 +146,14 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
 fi
 
 remote=${@[-1]}
+if [[ $remote == *mac_stopped=* ]]; then
+    print -r -- mac_stopped=4567
+    exit 0
+fi
 clone_head=$state/clone-head
+if [[ $MAC_RUN_REAL_COPIES == 1 && $remote == *'copies.py '* ]]; then
+    run_real_copies
+fi
 if [[ $remote == *'hana_instances.py stop-checkout '* ]]; then
     print -r -- called > "$state/cleanup-called"
     code=${MAC_RUN_CLEANUP_STATUS:-0}
@@ -98,6 +169,9 @@ if [[ $remote == *'scratch.py end '* ]]; then
         print -u2 -- 'task end before confirmed exit'
         exit 98
     fi
+    if [[ $MAC_RUN_REAL_COPIES == 1 ]]; then
+        run_real_copies
+    fi
     print -r -- mac_exit=0
     exit 0
 fi
@@ -109,14 +183,20 @@ if [[ $remote == *'checkout -q --detach'* ]]; then
     print -rn -- "$MAC_RUN_SHA" > "$clone_head"
 fi
 if [[ $MAC_RUN_HOLD_BUILD == 1 && $remote == *'cargo build -q -p hana'* ]]; then
+    # Like the Mac wrapper, the held build ends when the SSH input closes.
     exec "$MAC_RUN_PYTHON" -c '
-import os
+import os, sys
 from pathlib import Path
-import signal
-signal.signal(signal.SIGTERM, lambda *arguments: os._exit(128 + arguments[0]))
 Path(os.environ["MAC_RUN_STUB_STATE"], "build-started").write_text("started\n")
-signal.pause()
+_ = sys.stdin.read()
+Path(os.environ["MAC_RUN_STUB_STATE"], "input-closed").write_text("closed\n")
+raise SystemExit(255)
 '
+fi
+if (( placed_run )); then
+    print -r -- "HEAD=$MAC_RUN_SHA"
+    print -r -- mac_exit=0
+    exit 0
 fi
 if [[ $remote == *'; echo mac_exit=$?'* ]]; then
     code=0
@@ -137,11 +217,95 @@ exit 0
 '''
 
 
+QUEUE_STUB = r'''
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import sys
+
+from scripts.mac_test import mac_test
+
+args = sys.argv[1:]
+state = Path(os.environ["MAC_RUN_STUB_STATE"])
+receipt = state / "placement-receipt"
+with (state / "queue-events").open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+def option(name):
+    return args[args.index(name) + 1]
+
+def run_mac_test(*arguments):
+    sys.argv = [mac_test.__file__, *arguments]
+    return mac_test.main()
+
+if args[0] == "place-step":
+    wait_reply = os.environ.get("MAC_RUN_QUEUE_WAIT_REPLY")
+    if wait_reply and not (wait_reply == "pending-evidence" and (state / "wait-reply").exists()):
+        from unittest.mock import patch
+        from scripts.build_queue import admission_client, admission_wire as wire, placement
+        from scripts.mac_test import claim_state
+
+        if (state / "wait-reply").exists():
+            raise SystemExit("the runner retried the wait reply")
+        (state / "wait-reply").touch()
+        episode, since = option("--episode"), float(option("--since"))
+        destination = placement.PlacementDestination("mac", "mac", "natemccoy@mac", claim_state.WHOLE_MAC)
+        if wait_reply in ("busy", "blocked"):
+            eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion(wait_reply))
+            diagnostics = ()
+            if wait_reply == "busy" and os.environ.get("MAC_RUN_QUEUE_BUSY_DIAGNOSTIC") != "0":
+                diagnostics = (placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00"),)
+            if wait_reply == "blocked":
+                print("fixture queue warning", file=sys.stderr)
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,),
+                wire.PlacementResourceWait("mac", wait_reply), provider_diagnostics=diagnostics)
+        elif wait_reply == "pending-evidence":
+            eligibility = placement.CandidateEligibility(destination, placement.EvidenceNeeded("host evidence is pending"))
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,))
+        elif wait_reply == "damaged-claim":
+            claim_state.state_paths().run.write_text("damaged\n")
+            reply = wire.PlacementWait(episode, since, 1, ())
+        else:
+            raise SystemExit("unknown wait reply in the fixture")
+        with patch.object(admission_client, "request_placement", return_value=reply):
+            raise SystemExit(admission_client.main(args))
+    with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+        status = run_mac_test("claim", "--identity", "--pid", option("--pid"),
+            "--what", "mac run " + os.environ["MAC_RUN_SHA"][:9], "--worktree", option("--repo-root"), "--wait", "0")
+    if status:
+        print(output.getvalue(), end="")
+        print(errors.getvalue(), end="", file=sys.stderr)
+        raise SystemExit(status)
+    identity = json.loads(next(line.removeprefix("claim_identity=") for line in output.getvalue().splitlines()
+        if line.startswith("claim_identity=")))
+    receipt.write_text(json.dumps({"identity": identity, "pid": option("--pid")}))
+    assignment = json.dumps({"episode": option("--episode"), "attempt": identity["attempt"]})
+    Path(option("--assignment-file")).write_text(assignment)
+    (state / "assigned").write_text(assignment)
+    print("\t".join(("mac", "mac", "natemccoy@mac", "0", option("--episode"), identity["attempt"])))
+elif receipt.exists():
+    saved = json.loads(receipt.read_text())
+    identity = saved["identity"]
+    status = run_mac_test("release", "--pid", saved["pid"],
+        "--claim-id", identity["claim_id"], "--episode", identity["episode"], "--attempt", identity["attempt"])
+    receipt.unlink()
+    raise SystemExit(status)
+'''
+
+
 SITE_CUSTOMIZE = r'''
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
+from pathlib import Path
+
+if sys.argv[0].endswith("/mac_queue_run.py"):
+    with (Path(os.environ["MAC_RUN_STUB_STATE"]) / "runner-events").open("a") as stream:
+        stream.write(json.dumps(sys.argv[1:]) + "\n")
 
 if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
     original_monotonic = time.monotonic
@@ -161,6 +325,17 @@ if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
 
 @final
 class MacRunTests(unittest.TestCase):
+    helper_home: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="mac-run-helpers-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.helper_home = Path(temporary.name)
+        _ = copy_helpers(cls.helper_home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -177,10 +352,15 @@ class MacRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
-        self.home.mkdir()
-        (self.home / ".claude").symlink_to(
-            SCRIPT.parent.parent.parent, target_is_directory=True
-        )
+        environment = fixture_git_environment(self.root)
+        environment.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                            "CLAUDE_SESSION_NAME": FIXTURE_OWNER})
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        installed = self.home / ".claude"
+        installed.mkdir(parents=True)
+        helpers = self.helper_home / ".claude"
+        (installed / "scripts").symlink_to(helpers / "scripts", target_is_directory=True)
+        _ = shutil.copytree(helpers / "config", installed / "config", symlinks=True)
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -191,10 +371,18 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "config/mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n")
-        # Keep both example argument forms without repeating all configured examples.
-        _ = write_config_fixture(self.root / "config/production.conf",
-                                 "mac_run_examples=hana_diegetic typography;hana_lagrange showcase fit_overlay\n")
+        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n"
+                                 + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n")
+        self.write_production_config()
+        queue = self.root / "fake-queue.py"
+        _ = queue.write_text(QUEUE_STUB)
+        _ = write_config_fixture(self.root / "config/mac_gate.conf",
+            "admission_client_command=" + shlex.join([str(SCRIPT.parents[1] / "lib/py"), str(queue)])
+            + "\nterminate_grace_seconds=3\n")
+        copies_config = self.config_path.parent / "copies.conf"
+        _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
+                                 + "owner.verify=verify\n"
+                                 + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync", "curl"):
@@ -205,11 +393,15 @@ class MacRunTests(unittest.TestCase):
             SITE_CUSTOMIZE, encoding="utf-8"
         )
         # The runner's session must not own the fixture's Mac block.
+        seed_interpreter_cache(self.root / "cache")
         self.environment = {
-            **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
-            "HOME": str(self.home),
+            **{name: value for name, value in memory_gate_shell_environment().items() if name not in SESSION_SELECTORS},
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
+            "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
+            "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             **config_environment(self.config_path.parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
@@ -220,13 +412,22 @@ class MacRunTests(unittest.TestCase):
             "TMPDIR": str(self.temp_directory),
         }
 
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
+    def write_production_config(self, **overrides: str) -> None:
+        settings = MAC_RUN_CONFIG | overrides
+        _ = write_config_fixture(self.config_path.parent / "production.conf",
+            "".join(f"{name}={value}\n" for name, value in settings.items())
+        )
+
     def write_executable(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/usr/bin/env zsh\n" + source, encoding="utf-8")
         path.chmod(0o755)
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(MAC_TEST), *arguments],
+            [str(SCRIPT.parents[1] / "lib/py"), str(MAC_TEST), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,
@@ -278,6 +479,9 @@ class MacRunTests(unittest.TestCase):
 
     def clear_events(self) -> None:
         (self.stub_state / "events").unlink(missing_ok=True)
+        (self.stub_state / "placed-commands").unlink(missing_ok=True)
+        (self.stub_state / "queue-events").unlink(missing_ok=True)
+        (self.stub_state / "runner-events").unlink(missing_ok=True)
 
     def assert_no_build_started(self) -> None:
         self.assertFalse(
@@ -294,8 +498,27 @@ class MacRunTests(unittest.TestCase):
     def assert_claim_released(self) -> None:
         self.assertFalse((self.state_directory / "run.json").exists())
 
-    def wait_for_path(self, path: Path) -> None:
-        wait_for_file(path)
+    def assert_placement_wait_cancelled(self) -> None:
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "cancel-placement"])
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+
+    def wait_for_path(self, path: Path, process: subprocess.Popen[str]) -> None:
+        wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
+        if process.poll() is not None:
+            output, errors = process.communicate()
+            self.fail("mac_run exited before the build marker: " + output + errors)
+        self.assertTrue(path.exists())
+
+    def test_mac_run_refuses_a_port_above_65535(self) -> None:
+        self.write_production_config(mac_run_port="65536")
+
+        result = self.mac_run()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("mac_run_port='65536': outside range 1..65535", result.stderr)
+        self.assert_no_build_started()
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(
@@ -315,7 +538,7 @@ class MacRunTests(unittest.TestCase):
         self.environment.update({
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })
@@ -323,11 +546,33 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         builds = [event["args"][-1] for event in self.events()
                   if event["command"] == "ssh" and "cargo build" in event["args"][-1]]
-        self.assertGreaterEqual(len(builds), 2)
+        self.assertGreaterEqual(sum(command.count("cargo build") for command in builds), 2)
         self.assertTrue(any("cargo build -q -p hana" in command for command in builds))
         self.assertTrue(any("--example" in command for command in builds))
         for command in builds:
-            self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build", command)
+            self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0 cargo build", command)
+            for build_kind, pattern in (("hana", "cargo build -q -p hana"), ("example", 'cargo build -q "${args[@]}"')):
+                with self.subTest(build_kind=build_kind):
+                    statement = next(line for line in command.splitlines() if pattern in line)
+                    self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0 cargo build", statement)
+        runner_calls = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "runner-events").read_text().splitlines()]
+        self.assertEqual(len(runner_calls), 1)
+        call = runner_calls[0]
+        self.assertEqual(call[call.index("--lifecycle-script") + 1], str(SCRIPT))
+        self.assertEqual(call[call.index("--kind") + 1], "run")
+        self.assertEqual(call[call.index("--worktree") + 1], str(self.repository))
+        placed_commands = (self.stub_state / "placed-commands").read_text().split("\0")[:-1]
+        self.assertEqual(len(placed_commands), 1)
+        placed_arguments = shlex.split(placed_commands[0])
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "cancel-placement"])
+        placed = queue_events[0]
+        assigned = cast(dict[str, str], json.loads((self.stub_state / "assigned").read_text()))
+        self.assertEqual(placed_arguments[0], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1]
+                         + "/" + assigned["attempt"])
+
 
     def test_busy_mac_exits_nine_without_starting_build(self) -> None:
         claimed = self.state_command(
@@ -348,7 +593,9 @@ class MacRunTests(unittest.TestCase):
         self.assertRegex(result.stdout, r"busy: unit tests since \d\d:\d\d")
         self.assert_no_build_started()
         self.assertTrue((self.state_directory / "run.json").exists())
-        released = self.state_command("release", "--pid", str(os.getpid()))
+        claim = cast(dict[str, str], json.loads((self.state_directory / "run.json").read_text()))
+        released = self.state_command("release", "--pid", str(os.getpid()), "--claim-id", claim["claim_id"],
+                                      "--episode", claim["episode"], "--attempt", claim["attempt"])
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
     def test_unreadable_state_exits_nine_without_starting_build(self) -> None:
@@ -363,7 +610,86 @@ class MacRunTests(unittest.TestCase):
         self.assert_no_build_started()
         self.assert_claim_released()
 
+    def test_queue_busy_reply_exits_nine_without_starting_build(self) -> None:
+        for diagnostic in ("1", "0"):
+            with self.subTest(diagnostic=diagnostic):
+                self.clear_events()
+                (self.stub_state / "wait-reply").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "busy",
+                                             "MAC_RUN_QUEUE_BUSY_DIAGNOSTIC": diagnostic},
+                                      timeout=TEST_HANG_GUARD_SECS)
+
+                self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                busy_lines = [line for line in result.stderr.splitlines()
+                              if line.startswith("busy:") or line == "Mac is busy"]
+                self.assertEqual(len(busy_lines), 1, result.stderr)
+                if diagnostic == "1":
+                    self.assertRegex(busy_lines[0], r"busy: unit tests since \d\d:\d\d")
+                else:
+                    self.assertEqual(busy_lines[0], "Mac is busy")
+                self.assert_placement_wait_cancelled()
+                self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+                self.assert_no_build_started()
+                self.assert_claim_released()
+                self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
+
+    def test_queue_blocked_reply_exits_nine_without_starting_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "blocked"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("fixture queue warning", result.stderr.splitlines())
+        self.assertEqual(result.stderr.splitlines().count("Mac is blocked"), 1, result.stderr)
+        self.assert_placement_wait_cancelled()
+        self.assert_no_build_started()
+        self.assert_claim_released()
+
+    def test_pending_host_evidence_retries_placement_and_starts_the_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence",
+                                     "MAC_TEST_ADVANCE_WAIT": "1"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "place-step", "cancel-placement"])
+        self.assertEqual(queue_events[0], queue_events[1])
+        self.assertTrue(any(event["command"] == "ssh" and "cargo build" in event["args"][-1]
+                            for event in self.events()))
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+        self.assert_claim_released()
+
+    def test_damaged_claim_exits_nine_without_starting_build(self) -> None:
+        self.state_directory.mkdir()
+        _ = (self.state_directory / "run.json").write_text("damaged\n", encoding="utf-8")
+
+        result = self.mac_run(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assertFalse((self.stub_state / "queue-events").exists())
+
+    def test_damaged_claim_during_placement_exits_nine_without_retry(self) -> None:
+        self.state_directory.mkdir()
+
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "damaged-claim"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assert_placement_wait_cancelled()
+
+    def assert_damaged_claim_refusal(self, result: subprocess.CompletedProcess[str]) -> None:
+        claim = self.state_directory / "run.json"
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, f"state unreadable: {claim}\n")
+        self.assertEqual(list(self.state_directory.iterdir()), [claim])
+        self.assertEqual(claim.read_text(), "damaged\n")
+        self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+        self.assert_no_build_started()
+
     def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
+        self.write_production_config(
+            smoke_ready_seconds="300", smoke_exit_seconds="30", smoke_connect_seconds="1",
+            smoke_call_seconds="5", smoke_signal_grace_seconds="2", smoke_poll_seconds="1",
+        )
         _ = write_config_fixture(self.root / "config/hana_shot.conf",
                                  "refused_port=17461\nhost=192.0.2.46\n")
         script = SCRIPT.with_name("smoke_launch.sh")
@@ -386,16 +712,6 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "curl"],
                          ["http://192.0.2.46:17462/jsonrpc"])
 
-    def test_mac_connect_timeout_uses_the_shared_fraction_and_rounds_up(self) -> None:
-        _ = write_config_fixture(self.config_path, "connect_timeout_s=2.5\n")
-
-        result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})
-
-        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-        calls = self.events()
-        self.assertEqual([event["command"] for event in calls], ["ssh"])
-        self.assertIn("ConnectTimeout=3", calls[0]["args"])
-
     def test_unreachable_mac_keeps_exit_three(self) -> None:
         result = self.mac_run(extra={"MAC_RUN_REACHABLE": "0"})
 
@@ -406,7 +722,7 @@ class MacRunTests(unittest.TestCase):
         )
         self.assert_claim_released()
 
-    def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
+    def test_claim_file_keyed_by_repository_lets_another_repository_run_beside_it(self) -> None:
         (self.repository / ".git").mkdir()
         other = self.root / "other"
         (other / ".git").mkdir(parents=True)
@@ -414,15 +730,18 @@ class MacRunTests(unittest.TestCase):
                                      "--worktree", str(other))
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
         claims = self.state_directory / "claims"
-        before = (claims / "other.json").read_bytes()
+        # A Mac claim file takes its name from the repository key.
+        other_key = "git-dir:" + str(other.resolve() / ".git")
+        other_claim = claims / f"{claim_state.mac_claim_stem(other_key, 0)}.json"
+        before = other_claim.read_bytes()
         self.clear_events()
 
         result = self.mac_run()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreater(len([event for event in self.events() if event["command"] in {"ssh", "scp"}]), 1)
-        self.assertEqual(sorted(path.name for path in claims.iterdir()), ["other.json"])
-        self.assertEqual((claims / "other.json").read_bytes(), before)
+        self.assertEqual(sorted(claims.iterdir()), [other_claim])
+        self.assertEqual(other_claim.read_bytes(), before)
         self.assert_claim_released()
 
     def test_success_releases_claim(self) -> None:
@@ -435,7 +754,9 @@ class MacRunTests(unittest.TestCase):
         ]
         self.assertGreater(len(remote_events), 1)
         self.assertFalse(remote_events[0]["claimed"])
-        self.assertTrue(all(event["claimed"] for event in remote_events[1:]))
+        changing = [event for event in remote_events[1:] if event["command"] == "ssh"
+                    and any(action in event["args"][-1] for action in ("clone ", "fetch ", "checkout ", "cargo "))]
+        self.assertTrue(all(event["claimed"] for event in changing))
 
     def test_ancestor_of_the_clone_head_checks_out_without_a_bundle(self) -> None:
         result = self.mac_run(extra={
@@ -473,7 +794,7 @@ class MacRunTests(unittest.TestCase):
 
     def test_bundle_with_a_space_has_the_same_sftp_and_ssh_filename(self) -> None:
         remote_bundle = "/tmp/Hana test.bundle"
-        _ = write_config_fixture(self.root / "config/production.conf", f"mac_run_bundle={remote_bundle}\n")
+        self.write_production_config(mac_run_bundle=remote_bundle)
         result = self.mac_run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.events()
@@ -507,6 +828,9 @@ class MacRunTests(unittest.TestCase):
         self.assertNotIn("HANA_TEST_PURPOSE", result.stdout + result.stderr)
         self.assert_claim_released()
         self.assert_no_build_started()
+        events = [cast(list[str], json.loads(line))
+                  for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in events], ["place-step", "cancel-placement"])
 
     def test_missing_purpose_refuses_before_ssh(self) -> None:
         for purpose in (None, "", " \t "):
@@ -563,112 +887,222 @@ class MacRunTests(unittest.TestCase):
                 self.assert_claim_released()
 
     def test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout(self) -> None:
-        for stop_status, confirm in ((0, "1"), (23, "0"), (0, "0")):
+        result = self.mac_run()
+        events = self.events()
+        stop = [event for event in events if event["command"] == "ssh"
+                and "hana_instances.py stop-checkout " in event["args"][-1]]
+        self.assertEqual(len(stop), 1, events)
+        self.assertTrue(stop[0]["claimed"])
+        words = shlex.split(stop[0]["args"][-1])
+        self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
+                         self.environment["MAC_RUN_CHECKOUT"])
+        ended = [event for event in events if event["command"] == "ssh"
+                 and "scratch.py end --task " in event["args"][-1]]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(ended), 1, events)
+        self.assertLess(events.index(stop[0]), events.index(ended[0]))
+        self.assertTrue(ended[0]["claimed"])
+        self.assert_claim_released()
+
+        program = shell_functions(SCRIPT, "cleanup_mac_run") + r'''
+clone=$1
+clone_arg=${(q)clone}
+clone_task=$2
+argv_file=$3
+bundle=''
+on_mac() {
+    printf '%s\0' "$1" >> "$MAC_RUN_STUB_STATE/cleanup-commands"
+    return "$MAC_RUN_CLEANUP_STATUS"
+}
+cleanup_mac_run
+'''
+        commands_path = self.stub_state / "cleanup-commands"
+        for stop_status, confirm in ((23, "0"), (0, "0")):
             with self.subTest(stop_status=stop_status, confirm=confirm):
-                self.clear_events()
-                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
-                result = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(stop_status),
-                                             "MAC_RUN_CONFIRM_STOP": confirm})
-                events = self.events()
-                stop = [event for event in events if event["command"] == "ssh"
-                        and "hana_instances.py stop-checkout " in event["args"][-1]]
-                self.assertEqual(len(stop), 1, events)
-                self.assertTrue(stop[0]["claimed"])
-                words = shlex.split(stop[0]["args"][-1])
+                commands_path.unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["zsh", "-f", "-c", program, "cleanup-test",
+                     self.environment["MAC_RUN_CHECKOUT"], f"gate:mac-run-{SHA}-123",
+                     str(self.stub_state / "cleanup-argv")],
+                    cwd=self.root,
+                    env={**self.environment, "MAC_RUN_CLEANUP_STATUS": str(stop_status)},
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                commands = commands_path.read_text().split("\0")[:-1]
+                stops = [command for command in commands if "hana_instances.py stop-checkout " in command]
+                self.assertEqual(len(stops), 1, commands)
+                words = shlex.split(stops[0])
                 self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
                                  self.environment["MAC_RUN_CHECKOUT"])
-                ended = [event for event in events if event["command"] == "ssh"
-                         and "scratch.py end --task " in event["args"][-1]]
-                if stop_status == 0 and confirm == "1":
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(len(ended), 1, events)
-                    self.assertLess(events.index(stop[0]), events.index(ended[0]))
-                    self.assertTrue(ended[0]["claimed"])
-                else:
-                    self.assertEqual(ended, [], events)
-                    self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
-                    self.assertIn("kept checkout", result.stderr.lower())
-                self.assert_claim_released()
+                ends = [command for command in commands if "scratch.py end --task " in command]
+                self.assertEqual(ends, [], commands)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
+                self.assertIn("kept checkout", result.stderr.lower())
 
-    def test_signals_clean_remote_work_before_releasing_claim(self) -> None:
-        for signal_number, cleanup_status in (
-            (signal.SIGTERM, 0),
-            (signal.SIGHUP, 23),
+    def clone_registry_records(self, config: str) -> list[dict[str, object]]:
+        with mock.patch.dict(os.environ, {"COPIES_CONFIG": config}):
+            return [cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                    for mirror in copies.remote_mirrors()]
+
+    def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
+                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> str:
+        source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
+                                         {"source.txt": "content\n"}).checkout
+        head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.write_production_config(mac_run_source=str(source))
+        local = self.root / "local-copies"
+        remote = self.root / "remote-copies"
+        local.mkdir()
+        remote.mkdir()
+        local_environment = copies_environment(local)
+        remote_environment = copies_environment(remote)
+        _ = shutil.copy2(Path(local_environment["CONF_DIR"]) / "build_folders.conf",
+                         Path(self.environment["CONF_DIR"]) / "build_folders.conf")
+        self.environment.update({key: value for key, value in local_environment.items()
+                                 if key not in ("HOME", "CONF_DIR")})
+        self.environment.update({
+            "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
+            "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],
+            "MAC_RUN_REMOTE_CLAIMS": str(self.root / "remote-claims"),
+        })
+        process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1", "MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
+        try:
+            ready = self.stub_state / "build-started"
+            wait_until(lambda: ready.exists() or process.poll() is not None, self.stub_state, processes=(process,))
+            if process.poll() is not None:
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.fail(output + errors)
+            before_local = self.clone_registry_records(local_environment["COPIES_CONFIG"])
+            before_remote = self.clone_registry_records(remote_environment["COPIES_CONFIG"])
+            self.assertEqual(len(before_local), 1)
+            self.assertEqual(len(before_remote), 1)
+            self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
+            self.assertEqual(before_local[0]["host"], "natemccoy@mac")
+            self.assertEqual(before_remote[0]["host"], "localhost")
+            with mock.patch.dict(os.environ, {"COPIES_CONFIG": local_environment["COPIES_CONFIG"]}):
+                prepare_cleanup(Path(str(before_local[0]["path"])))
+            send_process_group(process.pid, signal.SIGTERM)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        finally:
+            if process.poll() is None:
+                send_process_group(process.pid, signal.SIGKILL)
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        # The next run cleans the records of the run that the signal ended.
+        after = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
+        self.assertEqual(after.returncode, cleanup_status and 4, after.stdout + after.stderr)
+        for name, settings, before in (("natedev", local_environment["COPIES_CONFIG"], before_local),
+                                       ("Mac", remote_environment["COPIES_CONFIG"], before_remote)):
+            with self.subTest(registry=name):
+                records = self.clone_registry_records(settings)
+                if cleanup_status:
+                    # The failed cleanup keeps the ended run's record; the next run keeps its own too.
+                    self.assertIn(before[0], records)
+                else:
+                    self.assertEqual(records, [])
+        return after.stderr
+
+    def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
+        _ = self.assert_clone_records_after_cleanup(0)
+
+    def test_old_mirror_cleanup_keeps_the_clone_and_removes_both_registry_records(self) -> None:
+        checkouts: list[Path] = []
+
+        def remove_exclusions(checkout: Path) -> None:
+            checkouts.append(checkout)
+            exclude = checkout / ".git/info/exclude"
+            patterns = {f"/{name}" for name in floor_claims.MIRROR_METADATA}
+            _ = exclude.write_text("\n".join(line for line in exclude.read_text().splitlines()
+                                           if line not in patterns) + "\n")
+            status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
+            self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
+
+        errors = self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
+        self.assertEqual(len(checkouts), 1)
+        [checkout] = checkouts
+        self.assertEqual((checkout / "source.txt").read_text(), "content\n")
+        record = copy_record.read_record(checkout / copy_record.RECORD)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(record))
+        expected = f"kept for a manual removal list: {checkout} (scratch, task {record.task} ended)"
+        self.assertEqual([line for line in errors.splitlines() if line.startswith(
+            f"kept for a manual removal list: {checkout} (")], [expected])
+
+    def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
+        _ = self.assert_clone_records_after_cleanup(23)
+
+    def test_build_marker_wait_reports_a_failed_child(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            with self.assertRaisesRegex(AssertionError, "fixture start failed"):
+                self.wait_for_path(self.stub_state / "build-started", process)
+
+    def ended_runs(self) -> list[Path]:
+        runs = self.home / ".local/state/mac-queue/runs"
+        return sorted(runs.iterdir()) if runs.is_dir() else []
+
+    def test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run(self) -> None:
+        for signal_number, cleanup_status, whole_group in (
+            (signal.SIGTERM, 0, True),
+            (signal.SIGHUP, 23, True),
+            (signal.SIGTERM, 0, False),
         ):
             with self.subTest(
-                signal_number=signal_number, cleanup_status=cleanup_status
+                signal_number=signal_number, cleanup_status=cleanup_status, whole_group=whole_group
             ):
                 self.clear_events()
-                (self.stub_state / "build-started").unlink(missing_ok=True)
-                (self.stub_state / "cleanup-called").unlink(missing_ok=True)
-                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
-                process = self.start_mac_run(
-                    extra={
-                        "MAC_RUN_HOLD_BUILD": "1",
-                        "MAC_RUN_CLEANUP_STATUS": str(cleanup_status),
-                    }
-                )
+                for name in ("build-started", "cleanup-called", "checkout-clear", "input-closed", "on-close"):
+                    (self.stub_state / name).unlink(missing_ok=True)
+                extra = {"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)}
+                process = self.start_mac_run(extra={**extra, "MAC_RUN_HOLD_BUILD": "1"})
                 try:
-                    self.wait_for_path(self.stub_state / "build-started")
-                    send_process_group(process.pid, signal_number)
+                    self.wait_for_path(self.stub_state / "build-started", process)
+                    if whole_group:
+                        send_process_group(process.pid, signal_number)
+                    else:
+                        process.send_signal(signal_number)
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except BaseException:
                     send_process_group(process.pid, signal.SIGKILL)
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
-
-                self.assertEqual(
-                    process.returncode, 128 + signal_number, output + errors
-                )
-                self.assertTrue((self.stub_state / "cleanup-called").exists())
-                cleanup_events = [
-                    event
-                    for event in self.events()
-                    if event["command"] == "ssh"
-                    and any(
-                        "rm -f /tmp/mac_run.bundle" in argument
-                        and "[c]argo build" in argument
-                        for argument in event["args"]
-                    )
-                ]
-                self.assertEqual(len(cleanup_events), 1, self.events())
-                cleanup = cleanup_events[0]
-                self.assertTrue(cleanup["claimed"], cleanup)
-                self.assertEqual(
-                    cleanup["args"][:5],
-                    [
-                        "-o",
-                        "ConnectTimeout=6",
-                        "-o",
-                        "BatchMode=yes",
-                        "natemccoy@mac",
-                    ],
-                )
-                remote = cleanup["args"][-1]
-                self.assertIn("[c]argo build", remote)
+                # No handler: the signal ends the run with its default action.
+                self.assertEqual(process.returncode, -signal_number, output + errors)
+                self.assertFalse((self.stub_state / "cleanup-called").exists())
+                if not whole_group:
+                    # The SSH input closes when the run ends, so the Mac work stops at once.
+                    wait_until((self.stub_state / "input-closed").exists, self.stub_state)
+                # The Mac runs this close step when the SSH input closes.
                 checkout = self.environment["MAC_RUN_CHECKOUT"]
-                self.assertIn(f'{checkout}|{checkout}/*)', remote)
-                self.assertIn("/tmp/mac_run_hana.command", remote)
-                self.assertIn("/tmp/mac_run_hana.status", remote)
-                events = self.events()
-                stops = [event for event in events if event["command"] == "ssh"
+                close_step = (self.stub_state / "on-close").read_text()
+                self.assertIn("hana_instances.py stop-checkout " + shlex.quote(checkout), close_step)
+                self.assertIn("scratch.py end --task gate:mac-run-" + SHA, close_step)
+                self.assertLess(close_step.index("stop-checkout"), close_step.index("scratch.py end"))
+                self.assertEqual(len(self.ended_runs()), 1)
+
+                # The next run finishes the cleanup of the ended run under its own placement.
+                self.clear_events()
+                after = self.mac_run(extra=extra)
+                stops = [event for event in self.events() if event["command"] == "ssh"
                          and "hana_instances.py stop-checkout " in event["args"][-1]]
-                self.assertEqual(len(stops), 1, events)
-                self.assertTrue(stops[0]["claimed"])
-                words = shlex.split(stops[0]["args"][-1])
-                self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"), checkout)
-                self.assertLess(events.index(cleanup), events.index(stops[0]))
-                ends = [event for event in events if event["command"] == "ssh"
+                self.assertEqual(len(stops), 2, self.events())
+                self.assertTrue(all(stop["claimed"] for stop in stops))
+                ends = [event for event in self.events() if event["command"] == "ssh"
                         and "scratch.py end --task " in event["args"][-1]]
                 if cleanup_status == 0:
-                    self.assertEqual(len(ends), 1, events)
-                    self.assertLess(events.index(stops[0]), events.index(ends[0]))
-                    self.assertTrue(ends[0]["claimed"])
+                    self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+                    self.assertEqual(len(ends), 2, self.events())
+                    self.assertEqual(self.ended_runs(), [])
                 else:
-                    self.assertEqual(ends, [], events)
-                    self.assertIn("process exit not confirmed", errors)
+                    self.assertEqual(ends, [], self.events())
+                    self.assertIn("cleanup of an ended run failed", after.stderr)
+                    self.assertEqual(len(self.ended_runs()), 2)
+                    for kept in self.ended_runs():
+                        shutil.rmtree(kept)
                 self.assert_claim_released()
-
 
 if __name__ == "__main__":
     _ = unittest.main()

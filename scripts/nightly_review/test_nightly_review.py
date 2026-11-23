@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
+from scripts.agents import remote
+
 import json
 import io
 import os
@@ -13,32 +19,25 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from contextlib import redirect_stderr
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from scripts.lib.transcript_test_support import compressed_copy
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import nightly_review
+from scripts.nightly_review import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
 from scripts.production import showrunners, staff, fake_showrunner, session_staff, unit_config
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.production.staff_test_support import (isolated_staff_file, isolated_source_readers,
                                                     source_environment, recorded_unit, fixture_member,
                                                     fixture_runtime_id)
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-# `messages` reads the message review from its own folder, as the timer does.
-
-sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
-if TYPE_CHECKING:
-    from scripts.notify import review
-    from scripts.production.unit_lookup import LiveClaude
-else:
-    import review
-    from unit_lookup import LiveClaude
+from scripts.notify import review
+from scripts.production.unit_lookup import LiveClaude
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 NIGHT = date(2026, 9, 29)
 SESSION = "nightly-review"
@@ -47,7 +46,7 @@ UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/ru
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
     staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
-                   worktree=staff.PresentWorktree("natedev", DOC.parents[1])),
+                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1]), unit_type=staff.UnitDetails("direct")),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
 ))
 
@@ -77,7 +76,11 @@ class NightlyReviewTests(unittest.TestCase):
         configuration = self.root / "config"
         configuration.mkdir()
         for stem in ("nightly_review", "accounts", "nix_env"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+            _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "nightly_review.conf",
+                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
+                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n"
+                                 + "sample_timeout_overhead_seconds=15\nprimary_showrunner_name=natedev\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
@@ -94,7 +97,7 @@ class NightlyReviewTests(unittest.TestCase):
         doc = self.root / (name + ".md")
         _ = doc.write_text("# Transcript owner\n")
         row = fixture_member("showrunner", name=name, runtime_id=fixture_runtime_id(name),
-                             doc=staff.LiveDoc("natedev", doc))
+                             doc=staff.LiveDoc(remote.local_machine(), doc))
         return row.current_session
 
     def test_timer_runs_messages_after_rust(self) -> None:
@@ -108,8 +111,10 @@ class NightlyReviewTests(unittest.TestCase):
         _ = shutil.copyfile(nightly_review.__file__, copied)
         library = copied.parents[1] / "lib"
         library.mkdir()
-        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/process_failure.py",
-                            library / "process_failure.py")
+        for relative in (*STARTUP_FILES, "scripts/lib/process_failure.py", "scripts/lib/transcripts.py"):
+            destination = copied.parents[2] / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[2] / relative, destination)
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
@@ -144,6 +149,8 @@ class NightlyReviewTests(unittest.TestCase):
               mock.patch.object(showrunners, "production_of", side_effect=production_of),
               mock.patch.object(account, "process_config_dir", side_effect=AssertionError("recorded account lost"))):
             self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(paths))
+            compressed = [compressed_copy(path) for path in paths]
+            self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(compressed))
 
     def test_transcripts_keep_the_showrunners_earlier_native_session_in_the_window(self) -> None:
         registry = self.root / "sessions"
@@ -212,7 +219,7 @@ class NightlyReviewTests(unittest.TestCase):
             name="natedev", sessionId=identity, cwd="/current/folder", config_dir=str(config))))
         unrelated = path.with_name(f"{fixture_runtime_id('unrelated-transcript')}.jsonl")
         _ = unrelated.write_text(path.read_text())
-        with (mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+        with (mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}),
               mock.patch.object(nightly_review, "sessions_directory", return_value=records),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
@@ -227,6 +234,9 @@ class NightlyReviewTests(unittest.TestCase):
         records.append(nightly_review.NightlyVerdictRecord(time=(since - timedelta(seconds=1)).isoformat(),
             verdict="rewrite", failed_rules=["reader-starts-cold"]))
         path = self.root / "review.jsonl"
+        _ = path.write_text(json.dumps(records[0]) + "\n")
+        self.assertEqual(nightly_review.live_message_counts(path, since),
+                         nightly_review.LiveMessageCounts(1, 0, 0, ()))
         _ = path.write_text("\n".join(json.dumps(record) for record in records) + '\n{"time":{},"verdict":"ask"}\n')
         self.assertEqual(nightly_review.live_message_counts(path, since),
                          nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
@@ -275,7 +285,7 @@ class NightlyReviewTests(unittest.TestCase):
 
 
 class TonightTests(NightlyReviewTests):
-    def tonight(self, units: list[LiveClaude | None], runs: list[subprocess.CompletedProcess[str]],
+    def tonight(self, units: list[LiveClaude | nightly_review.NightlyUnitNotLive], runs: list[subprocess.CompletedProcess[str]],
                 production: nightly_review.NightlyProduction | str = PRODUCTION) -> tuple[list[str], list[list[str]]]:
         with (mock.patch.object(nightly_review, "nightly_production", return_value=production),
               mock.patch.object(nightly_review, "live_unit", side_effect=units),
@@ -293,20 +303,20 @@ class TonightTests(NightlyReviewTests):
         self.assertEqual((self.root / "nights/2026-09-29/launch.log").read_text(), f"{SESSION}: tonight's review sent\n")
 
     def test_a_gone_unit_is_started_through_add_unit_as_permanent_then_sent(self) -> None:
-        lines, calls = self.tonight([None, UNIT], [done(), done()])
+        lines, calls = self.tonight([nightly_review.NightlyUnitNotLive(), UNIT], [done(), done()])
         self.assertEqual(lines, [f"{SESSION}: started", f"{SESSION}: tonight's review sent"])
         self.assertEqual(calls[0], [sys.executable, str(nightly_review.SCRIPTS / "production/add_unit.py"),
-                                    "--production", str(DOC), SESSION, "--permanent"])
+                                    "--production", "build-followups", SESSION, "--permanent"])
         self.assertEqual(calls[1][calls[1].index("--to") + 1], f"uds:{UNIT.socket}")
 
     def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
-        lines, calls = self.tonight([None], [done(code=1, stderr="claude3 is shut down")])
+        lines, calls = self.tonight([nightly_review.NightlyUnitNotLive()], [done(code=1, stderr="claude3 is shut down")])
         self.assertEqual(lines, [f"{SESSION}: not started: stderr: claude3 is shut down"])
         self.assertEqual(len(calls), 1)
 
     def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:
-        lines, calls = self.tonight([], [], production="no running production has a permanent nightly-review-unit row")
-        self.assertEqual(lines, ["skipped: no running production has a permanent nightly-review-unit row"])
+        lines, calls = self.tonight([], [], production="no running production has a permanent nightly-review row")
+        self.assertEqual(lines, ["skipped: no running production has a permanent nightly-review row"])
         self.assertEqual(calls, [])
 
     def test_a_failed_send_is_reported(self) -> None:
@@ -325,12 +335,12 @@ class NightlyProductionTests(NightlyReviewTests):
         parent = staff.snapshot().parent_of(unit)
         if parent is None:
             self.fail("the nightly fixture unit lost its parent")
-        _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), name,
+        _ = fake_showrunner.write_timer(Path(os.environ["NOTIFIER_STATE_DIR"]), parent.name,
                                          parent.current_session, "UTC", path)
         return str(path)
 
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
-        return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
+        return [showrunners.Showrunner(session="", socket="", name=name, zone="", doc=doc) for name, doc in docs]
 
     def test_configuration_responsibility_wins_over_the_permanent_plan(self) -> None:
         _ = self.doc("old-alias", "permanent")
@@ -338,10 +348,10 @@ class NightlyProductionTests(NightlyReviewTests):
         _ = (self.root / "old-alias-unit/.unit.toml").write_text('plan = "permanent"\nresponsibilities = []\n')
         _ = (self.root / "new-alias-unit/.unit.toml").write_text('plan = "standby"\nresponsibilities = ["nightly-review"]\n')
         self.assertEqual(nightly_review.nightly_production(),
-                         nightly_review.NightlyProduction(destination, "new-alias"))
+                         nightly_review.NightlyProduction(destination, "new-alias-owner"))
 
     def test_stopped_responsibility_holder_starts_its_own_name_and_configured_launch_mode(self) -> None:
-        document = Path(self.doc("review-alias", "standby"))
+        _ = self.doc("review-alias", "standby")
         member = next(row for row in staff.snapshot().find(kind="unit"))
         member = staff.rename(member.id, "auditor")
         live: sessions.SessionRecord = {
@@ -353,15 +363,51 @@ class NightlyProductionTests(NightlyReviewTests):
             with self.subTest(plan=plan):
                 _ = (self.root / "review-alias-unit/.unit.toml").write_text(
                     f'plan = {json.dumps(plan)}\nresponsibilities = ["nightly-review"]\n')
-                with (mock.patch.object(sessions, "live_sessions", side_effect=[[], [live]]),
+                with (mock.patch.object(session_records, "enumerate_running_sessions", side_effect=[
+                          session_records.RunningSessionEnumeration((), ()),
+                          session_records.RunningSessionEnumeration((live,), ())]),
+                      mock.patch.object(session_records, "messaging_socket_exists", return_value=True),
                       mock.patch.object(subprocess, "run", return_value=done()) as run):
                     lines = nightly_review.tonight(NIGHT)
                 calls = [cast(list[str], call.args[0]) for call in run.call_args_list]
                 self.assertEqual(calls[0], [sys.executable, str(nightly_review.SCRIPTS / "production/add_unit.py"),
-                                           "--production", str(document), "auditor", *launch])
+                                           "--production", "review-alias-owner", "auditor", *launch])
                 self.assertEqual(len(calls), 2, calls)
                 self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/private/auditor.sock")
                 self.assertIn("tonight's review sent", lines[-1])
+
+    def test_unreadable_registry_prevents_a_nightly_start(self) -> None:
+        _ = self.doc("review-alias", "permanent")
+        member = next(row for row in staff.snapshot().find(kind="unit"))
+        registry = self.root / "sessions"
+        registry.mkdir(exist_ok=True)
+        path = registry / "unfinished.json"
+        _ = path.write_text("{")
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+              mock.patch.object(subprocess, "run") as run):
+            lines = nightly_review.tonight(NIGHT)
+        self.assertEqual(lines, [f"{member.name}: session registry unreadable: {path}"])
+        run.assert_not_called()
+
+    def test_running_unit_without_a_usable_socket_has_its_own_result(self) -> None:
+        _ = self.doc("review-alias", "permanent")
+        resolver = session_staff.RowResolver(staff.snapshot())
+        production = nightly_review.nightly_production(resolver=resolver)
+        self.assertIsInstance(production, nightly_review.NightlyProduction)
+        assert isinstance(production, nightly_review.NightlyProduction)
+        member = next(row for row in resolver.record.find(kind="unit"))
+        live = sessions.SessionRecord(pid=42, sessionId=member.current_session, name=member.name,
+            messagingSocketPath=str(self.root / "missing.sock"), updatedAt=1, tmux="", formerNames=[])
+        for unreadable in ((), (self.root / "unfinished.json",)):
+            with (self.subTest(unreadable=unreadable),
+                  mock.patch.object(session_records, "enumerate_running_sessions",
+                                    return_value=session_records.RunningSessionEnumeration((live,), unreadable)),
+                  mock.patch.object(subprocess, "run") as run):
+                self.assertEqual(nightly_review.live_unit(production, resolver=resolver),
+                                 nightly_review.NightlyUnitWithoutSocket())
+                self.assertEqual(nightly_review.tonight(NIGHT),
+                                 [f"{member.name}: the running unit has no usable messaging socket"])
+                run.assert_not_called()
 
     def test_missing_candidate_configuration_prevents_a_false_unique_nightly_owner(self) -> None:
         _ = self.doc("one", "permanent")
@@ -418,7 +464,9 @@ class NightlyProductionTests(NightlyReviewTests):
             return configuration(resolver, row)
 
         with (mock.patch.object(session_staff.RowResolver, "unit_config", autospec=True, side_effect=read_configuration),
-              mock.patch.object(sessions, "live_sessions", return_value=[live]),
+              mock.patch.object(session_records, "enumerate_running_sessions",
+                                return_value=session_records.RunningSessionEnumeration((live,), ())),
+              mock.patch.object(session_records, "messaging_socket_exists", return_value=True),
               mock.patch.object(subprocess, "run", return_value=done()) as run):
             lines = nightly_review.tonight(NIGHT)
         calls = [cast(list[str], call.args[0]) for call in run.call_args_list]
@@ -440,14 +488,14 @@ class NightlyProductionTests(NightlyReviewTests):
         listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=listed):
             self.assertEqual(nightly_review.nightly_production(),
-                             nightly_review.NightlyProduction(self.root / "two.md", "two"))
+                             nightly_review.NightlyProduction(self.root / "two.md", "two-owner"))
 
     def test_no_permanent_row_and_two_permanent_rows_are_each_named(self) -> None:
         with mock.patch.object(showrunners, "registered_showrunners", return_value=self.runners(("one", self.doc("one", "standby")))):
             self.assertIn("no running production", cast(str, nightly_review.nightly_production()))
         twice = self.runners(("one", self.doc("one", "permanent")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=twice):
-            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review-unit: one, two")
+            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review: one-owner, two-owner")
 
 
 if __name__ == "__main__":

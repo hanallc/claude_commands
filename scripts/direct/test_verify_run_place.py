@@ -1,20 +1,26 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
+from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
+
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
 import select
 import signal
 import subprocess
-import sys
 from typing import TypedDict, cast
 import unittest
+from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.production import staff
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -31,19 +37,21 @@ class VerifyRunPlaceTests(unittest.TestCase):
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
+        (direct / "file_lock.sh").symlink_to(VERIFY.with_name("file_lock.sh"))
         (direct / "step_record.py").symlink_to(VERIFY.with_name("step_record.py"))
         for directory in ("agents", "build_targets", "build_hold"):
             (scripts / directory).symlink_to(VERIFY.parent.parent / directory, target_is_directory=True)
         library = scripts / "lib"
         library.mkdir()
-        (library / "py").symlink_to(sys.executable)
+        _ = (library / "py").write_text(fixture_shim_source())
+        (library / "py").chmod(0o755)
+        (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
+        (library / "conf_record.sh").symlink_to(VERIFY.parent.parent / "lib/conf_record.sh")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()
         _ = (lint / "invoke.sh").write_text("return 0\n")
-        home_scripts = fixture.root / ".claude/scripts"
-        home_scripts.parent.mkdir()
-        home_scripts.symlink_to(scripts, target_is_directory=True)
+        _ = copy_helpers(fixture.root, *VERIFY_HELPERS)
         probe = direct / "probe.py"
         _ = probe.write_text('''import json, os, sys
 print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN", ""), "name": sys.argv[2]}), flush=True)
@@ -52,8 +60,8 @@ if not sys.stdin.readline():
 ''')
         prefix, command_marker, dispatch = VERIFY.read_text().partition('\nCMD="${1:-}"\n')
         self.assertTrue(command_marker, 'verify.sh startup marker is missing: CMD="${1:-}"')
-        _, detach_marker, after_detach_marker = dispatch.partition('\nMESH_RUNS_SCRIPT=')
-        self.assertTrue(detach_marker, "verify.sh startup marker is missing: MESH_RUNS_SCRIPT=")
+        _, detach_marker, after_detach_marker = dispatch.partition('\nDETACHED_RUNS_SCRIPT=')
+        self.assertTrue(detach_marker, "verify.sh startup marker is missing: DETACHED_RUNS_SCRIPT=")
         detach_and_identity, shift_marker, _ = after_detach_marker.partition('\nshift\n')
         self.assertTrue(shift_marker, "verify.sh startup marker is missing: shift after the run identity")
         script = direct / "verify.sh"
@@ -64,14 +72,19 @@ if [[ "$1" == outer ]]; then
 fi
 :
 ''')
+        copy_runtime(fixture.root)
         return script
 
-    def start(self, script: Path, name: str,
+    def start(self, script: Path, name: str, *words: str,
               **changes: str) -> subprocess.Popen[str]:
-        environment = {**os.environ, "IN_NIX_SHELL": "fixture", "CODEX_THREAD_ID": "",
-                       "UNIT_DETACHED_RUN": "", **changes}
-        _ = environment.pop("BUILDLOG_RUN", None)
-        process = subprocess.Popen(["bash", str(script), name], env=environment,
+        repository = script.parents[2] / "repository"
+        repository.mkdir()
+        _ = (repository / "Cargo.toml").write_text("[workspace]\n")
+        environment = verify_test_environment()
+        _ = subprocess.run(["git", "init", "--quiet"], cwd=repository, env=environment, check=True,
+                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        environment.update({"IN_NIX_SHELL": "fixture", "HOME": str(script.parents[2]), **changes})
+        process = subprocess.Popen(["bash", str(script), name, *words], cwd=repository, env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         self.addCleanup(self.stop, process)
@@ -102,6 +115,66 @@ fi
         self.assertEqual(probe["run"], f"{expected.pid}:{expected.start_time}")
         return expected
 
+    def limit_runs_to_one(self, fixture: AdmissionFixture) -> None:
+        """Write a run limit of one with the exempt unit the reader requires."""
+        config = fixture.root / "build_admission.conf"
+        _ = config.write_text(config.read_text()
+            + f"\nmax_runs.{fixture.server.host}.fixture=1\nmax_runs.exempt_unit=natemerge\n")
+
+    def finish_verify_step(self, fixture: AdmissionFixture, probe: RunProbe, run: wire.RunIdentity) -> wire.Owner:
+        reading = fixture.proc.owner_start(probe["pid"])
+        assert isinstance(reading, service.LiveOwnerIdentity)
+        owner = wire.Owner(probe["pid"], reading.start_time)
+        fixture.proc.register(owner)
+        request = fixture.request(owner=owner, episode=probe["name"], run=run)
+        request = replace(request,
+            identity=replace(request.identity, verify=records.VerifyCall("check", "verify check", 1, 1)))
+        _ = fixture.finish_step(request)
+        return owner
+
+    def test_verify_local_grant_checks_an_inherited_run_before_using_it_as_slot_owner(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.limit_runs_to_one(fixture)
+            run = fixture.run_owner()
+            memory_run = f"{run.pid}:{run.start_time}"
+            process = self.start(self.script(fixture), "check", BUILDLOG_RUN=memory_run)
+            probe = self.probe(process)
+            self.assertEqual(probe["run"], memory_run)
+            self.assertFalse(fixture.server.verify_run_slots)
+            owner = self.finish_verify_step(fixture, probe, run)
+            self.assertEqual(list(fixture.server.verify_run_slots.values()), [service.VerifyRunSlot("fixture", owner)])
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_nested_verify_uses_the_live_ancestor_slot_at_limit_one(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.limit_runs_to_one(fixture)
+            process = self.start(self.script(fixture), "outer")
+            outer = self.probe(process)
+            run = self.identity(fixture, outer)
+            owner = self.finish_verify_step(fixture, outer, run)
+            self.proceed(process)
+            inner = self.probe(process)
+            self.assertNotEqual(inner["pid"], outer["pid"])
+            _ = self.finish_verify_step(fixture, inner, run)
+            self.assertEqual(list(fixture.server.verify_run_slots.values()), [service.VerifyRunSlot("fixture", owner)])
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_startup_does_not_read_the_caller_bash_env(self) -> None:
+        with AdmissionFixture() as fixture:
+            startup = fixture.root / "caller-startup.sh"
+            _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
+            with mock.patch.dict(os.environ, {"BASH_ENV": str(startup)}):
+                process = self.start(self.script(fixture), "startup")
+            self.assertEqual(self.probe(process)["pid"], process.pid)
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertFalse(startup.with_suffix(".sh.ran").exists())
+
     def test_nested_verify_keeps_the_outer_identity_and_queue_order(self) -> None:
         with AdmissionFixture() as fixture:
             process = self.start(self.script(fixture), "outer")
@@ -109,6 +182,9 @@ fi
             run = self.identity(fixture, outer)
             first = fixture.request(run=run)
             _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            # A live reservation keeps the oversized continuation in the queue.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.free(0)
             fixture.clock.advance(1)
             peer = fixture.request()
@@ -148,8 +224,8 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             output_fd = os.open(outgoing, os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, input_fd)
             self.addCleanup(os.close, output_fd)
-            process = self.start(script, "detached", CODEX_THREAD_ID="fixture",
-                                 VERIFY_MESH_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
+            process = self.start(script, "detached", CODEX_THREAD_ID=staff.caller_identity() or "fixture",
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
                                  DETACHED_OUTPUT=str(outgoing), DETACHED_ERROR=str(fixture.root / "detached.err"))
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
@@ -172,6 +248,22 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             self.assertEqual(fixture.queue_pids(), [second.owner.pid, peer.owner.pid])
             _ = os.write(input_fd, b"continue\n")
 
+    def test_attached_build_stays_in_the_foreground_under_a_codex_worker(self) -> None:
+        with AdmissionFixture() as fixture:
+            script = self.script(fixture)
+            launcher = script.with_name("detach.py")
+            started = fixture.root / "detach-started"
+            _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
+            process = self.start(script, "build", "sample", "--release", "--attached",
+                                 CODEX_THREAD_ID=staff.caller_identity() or "fixture",
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
+            probe = self.probe(process)
+            self.assertEqual(probe["pid"], process.pid)
+            self.proceed(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertFalse(started.exists(), "an --attached build started the detach launcher")
+
     def end_detached(self, pid: int) -> None:
         try:
             send_process_group(pid, signal.SIGKILL)
@@ -183,12 +275,11 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             script = self.script(fixture)
             shim = fixture.root / "scripts/lib/py"
             shim.unlink()
-            _ = shim.write_text(f'''#!{sys.executable}
-import os, sys
+            _ = shim.write_text(python_tool_source('''import os, sys
 if sys.argv[2:3] == ["start"]:
     raise SystemExit("Mac startup requested a process start time")
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-''')
+'''))
             shim.chmod(0o755)
             process = self.start(script, "mac", OSTYPE="darwin23")
             probe = self.probe(process)

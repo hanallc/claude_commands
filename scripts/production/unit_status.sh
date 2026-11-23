@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Unit status for /showrunner:produce's update schedule.
-# Usage: unit_status.sh <state-dir> <user-zone> --production <production doc>
+# Usage: unit_status.sh <state-dir> <user-zone> --production <staff name>
 # The units are the live rows of the production doc.
 # Native session ids select panes. Staff ids identify saved state.
 # Each call checks every unit director: that its session and Claude are running, tick
@@ -11,7 +11,7 @@
 # would fail the `tail` before it with SIGPIPE.
 
 if (( $# != 4 )) || [[ $3 != --production && $3 != --showrunner ]]; then
-  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --production <production doc>'
+  print -u2 'usage: unit_status.sh <state-dir> <user-zone> --production <staff name>'
   exit 2
 fi
 # An update prompt written before a production was named by its doc passes `--showrunner <session>`.
@@ -22,39 +22,30 @@ REPO=${0:A:h:h:h}
 # One line per unit: its id, its place now, whether Claude runs there, its session name now.
 unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" --status "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
-# What a gate line may call a peer: its unit id, or its session name now.
+# Staff supplies peer names, fixed identities and current session ids.
 names=()
-for line in $units; do
-  fields=("${(@ps:\t:)line}")
-  names+=($fields[1] $fields[4])
-done
 PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
-sys.path.insert(0, sys.argv[1])
-from pathlib import Path
-from scripts.production import staff, unit_lookup, unit_names
-from scripts.production.showrunners import named
+from scripts.production import staff
+from scripts.production.showrunners import owner_for
 arguments = sys.argv[2:]
-doc = Path(arguments[1]) if arguments[0] == "--production" else Path(named(arguments[0])["doc"])
-for row in unit_lookup.doc_units(doc, staff.snapshot()):
-    for label in {row.name, unit_names.unit_id(row.name)}:
-        print(f"{label}\t{row.id}")
+record = staff.snapshot()
+owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
+for row in record.find(parent=owner.id, kind="unit"):
+    run = str(row.run.path) if isinstance(row.run, staff.OpenRun) else ""
+    print(f"{row.name}\t{row.id}\t{run}\t{row.current_session}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")
-typeset -A state_keys
+typeset -A state_keys open_runs
 for line in $staff_rows; do
   fields=("${(@ps:\t:)line}")
   state_keys[$fields[1]]=$fields[2]
+  open_runs[$fields[1]]=$fields[3]
+  names+=($fields[1] $fields[2] $fields[4])
 done
 NOTIFIER=$REPO/scripts/message/notifier.sh
-# Run markers sit under unit/, or delegate/ for a run started before the rename.
-if [[ -n ${UNIT_ACTIVE_DIR:-${PLAN_DELEGATE_ACTIVE_DIR:-}} ]]; then
-  ACTIVE_DIRS=(${UNIT_ACTIVE_DIR:-$PLAN_DELEGATE_ACTIVE_DIR})
-else
-  ACTIVE_DIRS=(/tmp/claude/unit/active /tmp/claude/delegate/active)
-fi
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -66,7 +57,6 @@ state_record() {
 import sys
 import time
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
 from scripts.lib.atomic_file import write_text_atomic
 action, filename, identity = sys.argv[2:5]
 path = Path(filename)
@@ -151,27 +141,21 @@ for line in $units; do
   [[ -n ${state_keys[$u]:-} ]] || { print -u2 "No staff id for $u"; exit 1; }
   target=$fields[2]
   echo "== $u"
-  if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi
   # Status columns: unit, place, state, Claude name, session id.
   claude_state=$fields[3]
+  if [[ -z $target && $claude_state != unknown ]]; then echo 'SESSION GONE'; continue; fi
   session_id=$fields[5]
   case $claude_state in
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
     stopped) echo 'CLAUDE NOT RUNNING' ;;
   esac
-  marker=
-  for active in $ACTIVE_DIRS; do
-    if [[ -n $session_id && -f $active/$session_id ]]; then marker=$active/$session_id; break; fi
-  done
-  if [[ -n $marker ]]; then
-    session_dir=$(< "$marker")
-    if [[ -n $session_dir ]]; then
-      instance=unit-${session_dir:t}
-      [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
-      health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
-      if (( $? == 1 )); then
-        print -r -- "TICKS FAILING (${health#failing: })"
-      fi
+  session_dir=${open_runs[$u]}
+  if [[ -n $session_id && -n $session_dir ]]; then
+    instance=unit-${session_dir:t}
+    [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
+    health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
+    if (( $? == 1 )); then
+      print -r -- "TICKS FAILING (${health#failing: })"
     fi
   fi
   [[ $claude_state == unknown || $claude_state == stopped ]] && continue
@@ -182,7 +166,7 @@ for line in $units; do
   print -r -- "$pane" | grep -E '^\s*▸ ' | tail -1 | sed 's/^ *//' | cut -c1-160
   print -r -- "$pane" | grep -E '^\s*[✢✻✽✶·*] [A-Z][a-z]+( [a-z]+)?…' | tail -1 | sed 's/^ *//' | cut -c1-80
   print -r -- "$pane" | grep -nE -- '^\s*(— )?(decision|blocked|gate):' | tail -1 | cut -c1-200
-  # The last three distinct ETA lines, in pane order. The dailies builder, which remembers when
+  # The last three distinct ETA lines, in pane order. The caller, which remembers when
   # it first saw each, picks the newest: the lowest line may be an old one pinned under later text.
   print -r -- "$pane" | grep -wE 'ETA' | grep -v 'From the user' | sed 's/^ *//' | cut -c1-160 \
     | awk '{ line[NR] = $0; last[$0] = NR }

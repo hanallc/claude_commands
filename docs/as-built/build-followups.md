@@ -2,7 +2,18 @@
 
 ## What it is
 
-Agents' test builds linked far more than the tests they ran, and the daily build report did not show what builds cost the machine. `verify.sh test <pkg>` builds only the named package's test programs (4 in hana, against 78 for `--lib --bins --tests` across the workspace) and runs the same tests. The build report (`buildlog report [day]`) shows that cost four ways: a Rebuilds section of where compile time goes, by how many crates each step compiled (cold builds, cascades, edited-crate rebuilds), with nextest's compile time against its test run; a temporary table of daily test-build time against fixed baselines; builds under temp folders (agent scratch clones, worker session folders) as one `scratch (temp folders)` caller in every kind's table and summary; and a Disk table of where natedev's root filesystem goes: `~/rust`, `/tmp`, the two CI runners, everything else, and free space against the sweep's floor. The buildlog test suite writes only to a temporary log and never walks the real disks, so nothing it does reaches the real log or shows up as a temp-folder build.
+`verify.sh test [<pkg>]` builds and runs the selected test programs.
+Without a package, it selects every workspace member.
+A named package selects only its test programs: 4 in hana, against 78 across the workspace.
+The daily build report (`buildlog report [day]`) shows four costs:
+
+1. The Rebuilds section groups compile time by crate count and compares nextest compile time with test time.
+2. A temporary table compares daily test build time with fixed baselines.
+3. The `scratch (temp folders)` row groups builds in temporary folders across callers.
+4. The Disk table shows space for fixed folders and the current Hana CI runners. It also shows disk capacity.
+
+The buildlog tests write to a temporary log and do not scan real disks.
+They do not add records to the real build log.
 
 ## How it works
 
@@ -10,9 +21,10 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 
 | File | Role |
 | --- | --- |
-| `scripts/direct/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
+| `scripts/direct/verify.sh` | `take_test_targets` reads the saved metadata answer into `TEST_SELECTION`; the `test` arm uses that selection. |
+| `scripts/direct/verify_metadata.py` | Answers `test-targets` from the call's saved Cargo metadata. |
 | `scripts/buildlog/report.py` | `report()` assembles the day. `rebuilds_section` with the rebuild-bin constants, `PACKAGE_PATTERN`, `KnownCrateStep`, `RebuildTiming`, `PackageRebuilds`, `rebuild_bin`, `known_crate_steps`, `rebuild_timings`, `rebuild_rows`, `whole_percent`, `nextest_rebuild_lines`, `rebuild_package`, `package_rebuild_rows`; `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
-| `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
+| `scripts/buildlog/disk.py` | Disk folders (`scanned_folders`), disk measurement (`measure`), the disk floor (`read_floor`), and the snapshot file. Disk floor alerts use the snapshot's directory sizes outside the build caches. |
 | `scripts/buildlog/filesystem.py` | `FilesystemUsage` and `filesystem_usage(path)`, shared by `disk.py` and the 60 s sample. |
 | `scripts/buildlog/index.py` | `build_keys(argv) -> CargoBuildKey \| NonCargoBuild` and the step build-key columns (Rebuilds section). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |
@@ -21,7 +33,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | `scripts/buildlog/test_index.py` | `use_test_log`, `point_root_at`, `LogIsolationTests`, and the record builders other tests import. |
 | `scripts/buildlog/test_report.py`, `test_disk.py`, `scripts/lint/test_sweep.py` | Report sections; the walk on fake trees; a hard link across two `directory_blocks` calls sharing `seen`. |
 | `commands/unit/direct.md` | The workers' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
-| `pyrightconfig.json` | `scripts/lint` on the `scripts/buildlog` environment's `extraPaths`, for `import sweep`. |
+| `pyrightconfig.json` | The buildlog environment uses the repository root in `extraPaths`. |
 | `/etc/nixos`, `nate.jobs.buildlog-disk` | The 10-minute timer that runs `buildlog disk` on natedev. Not in this repo. |
 
 ### Report layout
@@ -67,7 +79,7 @@ The edges are `NO_REBUILD_CRATES = 0`, `EDITED_CRATE_MAX_CRATES = 3` and `CASCAD
 
 **Recorded build identity.** Step rows keep `compiled_crate_names` in counted log order, including repeats, with the same length as `crates_compiled`; both are null when compilation was not measured. `target_dir` is the absolute, resolved `CARGO_TARGET_DIR` path, or `"unset"` (`record.TARGET_DIR_UNSET`). `repo_identity` is the repository key from `repository.repository_key` (the origin remote through `repository.remote_identity`, the one key rule admission also uses; else `git-root:<first root commit>`), or `"unknown"` (`store.UNKNOWN_IDENTITY`). The index stores those fields and derives `target_folder` (an absolute `target_dir`, else `worktree`, else `cwd`), `build_base` (cargo command, profile, target set, package scope and features), `build_items` (sorted target selectors; `[]` is the default selection), and `started_at_us` (UTC epoch microseconds). Non-cargo steps have null `build_base` and `build_items`. The index `steps_build_history (host, target_folder, build_base, started_at_us)` serves the warm rule.
 
-`index.build_keys(argv)` is the one argv key function. `base` is sorted JSON of the command (`nextest run` reads as `test`), profile, the sorted `--target` set, workspace, packages, excludes, features (split on commas and spaces), `all_features` and `no_default_features`. `items` is the sorted target-selector list. Run options (`-E`, `--test-threads`, `--target-dir`, …) and words after `--` are dropped. `compiled_crate_names` comes from `parse.log_facts`. `record.py` writes `target_dir` and `repo_identity` on every step row, never null; resources-unit's sweep (`scripts/lint/sweep.py`) reads them, so the wire values `"unset"` and `"unknown"` are its contract.
+`index.build_keys(argv)` is the one argv key function. `base` is sorted JSON of the command (`nextest run` reads as `test`), profile, the sorted `--target` set, workspace, packages, excludes, features (split on commas and spaces), `all_features` and `no_default_features`. `items` is the sorted target-selector list. Run options (`-E`, `--test-threads`, `--target-dir`, …) and words after `--` are dropped. `compiled_crate_names` comes from `parse.log_facts`. `record.py` writes `target_dir` and `repo_identity` on every step row, never null; resources's sweep (`scripts/lint/sweep.py`) reads them, so the wire values `"unset"` and `"unknown"` are its contract.
 
 Missing matching history puts a step that compiled 1–49 crates in `first build here`. Older rows without `target_dir` and `repo_identity` index them as `"unknown"`; their build keys still come from recorded argv and their folder falls back to `worktree` or `cwd`, so a `CARGO_TARGET_DIR` folder reads `first build here` until it builds once with the current recorder. A symlinked `target/` or `.cargo/config` `target-dir` is not discovered when `CARGO_TARGET_DIR` is unset, so the folder also falls back to the worktree. These gaps can miss shared output history. A `--target-dir` argument also reads as the worktree, so a step that builds into another folder shares the worktree's history and can read warm. A sweep that deletes output leaves no build-log row, so it is invisible to the warm rule and can leave a step classified as warm after its output was removed.
 
@@ -81,7 +93,20 @@ Missing matching history puts a step that compiled 1–49 crates in `first build
 
 `take_test_targets` pipes `cargo metadata --no-deps` into `TEST_TARGETS_PY` with the package and its `--features` list. The script expands the enabled features (`default` plus the `<pkg>/`-qualified names from `--features`, transitively). It emits `--lib` when the package has any lib kind (proc-macro included), then `--bin <name>` for each bin and `--test`/`--bench <name>` for each target with `test` enabled. It never selects an example; the example scan refuses an example that holds a test or sets `test = true` (see [rustdoc-once-and-final-targets.md](rustdoc-once-and-final-targets.md)). If one target needs a feature that is off, or shares its kind and name with a target in another member, the whole selection becomes `--bins --tests` (plus `--lib` when there is one); an empty selection becomes `--bins --tests` too.
 
-The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` with the feature flags. The filter is `package(<pkg>)`, or `package(<pkg>) & test(a)` for one `--filter`, or `package(<pkg>) & (test(a) | test(b) …)` for several. `test <pkg> <integration_test>` keeps its own `--test <name>` build and never calls the selector.
+The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` with the feature flags.
+For a named package, the filter is `package(<pkg>)`.
+One `--filter` adds `& test(a)`; several add `& (test(a) | test(b) …)`.
+Without a package, these filters apply across the workspace.
+`test [<pkg>] --test <integration_test>` selects the named integration target and does not call the target selector.
+
+### Call package names
+
+`scripts/buildlog/record.py` reads the package from the parsed verify command.
+It records `workspace` when no package is given, including `check --features foo`.
+`final <package>` records the named package and saves no gate pass.
+`WorkspacePackages` and `NamedPackage` in `step_record.py` separate package selection from display words.
+The Cargo and cache selectors do not use the display word `workspace`.
+The index, report, Mac outcome reader, and step estimator read the recorded package.
 
 ### Test builds table
 
@@ -95,13 +120,13 @@ The arm runs `cargo nextest --no-fail-fast --workspace <selection> -E <filter>` 
 
 The walk is too slow for report time, so a job measures and the report reads.
 
-**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first, then calls `measure(FOLDERS, lambda: filesystem_usage("/"), floor)`. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walking; the command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr, exits 1, and the previous `disk.json` stays.
+**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first. Without a newer walk request, `snapshot()` walks when no full previous snapshot exists. Otherwise, it walks when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` in the user's zone. Other runs refresh free and used space only and set `capacity_measured_at`. Folder freshness uses `measured_at`; a capacity refresh does not refresh folder sizes. A large unnamed fall requests one walk through `disk-walk-request.json`. A request newer than the last walk permits a walk outside the configured hour. The request needs recent floor records with the same held roots and filesystem. The floor sweep deletes the request after it sends the folder growth follow-up. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walk. The command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr. It exits 1 and keeps the previous `disk.json`.
+
+`FOLDERS` holds the fixed rows for `~/rust`, `~/.local/state`, and `/tmp`.
+`scanned_folders()` uses `build_folders.ci_folders("hana")` to list numbered folders under `<build root>/hana/ci`.
+It adds one row named `CI runner <N>` per folder, in number order.
 
 ```python
-FOLDERS = [("~/rust", "~/rust"), ("/tmp", "/tmp"),
-           ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
-           ("CI runner 2", "/var/lib/hana-ci/hana-linux-2")]
-
 class DiskRow(TypedDict):
     label: str
     bytes: int
@@ -109,7 +134,7 @@ class DiskRow(TypedDict):
 class MeasuredDiskSnapshot(TypedDict):
     measured_at: str     # store.utc_iso, stamped after the walk
     host: str            # store.host_name(), the short name
-    rows: list[DiskRow]  # FOLDERS order
+    rows: list[DiskRow]  # Measurement order
     used: int
     free: int
     floor: int | None    # bytes; None when lint.conf sets none
@@ -121,7 +146,10 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
             previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT) -> MeasuredDiskSnapshot
 ```
 
-`DiskSnapshot`, what `read_snapshot` returns, has the same keys with the last three `NotRequired`, so a `disk.json` written before they existed still reads. The Disk table uses only the first six; the three outside-cache keys (directories one and two levels under each `FOLDERS` entry holding at least 1 GiB outside cargo target dirs, with growth since `previous_measured_at`) serve the disk-floor alerts in `scripts/lint/sweep.py` (`docs/as-built/build-memory-admission.md`).
+`read_snapshot` returns a `DiskSnapshot` and can read older snapshots that lack the last three fields above.
+The disk floor alerts in `scripts/lint/sweep.py` use these three fields.
+They track growth since `previous_measured_at` for directories one or two levels below a measured folder.
+The snapshot includes these directories when they hold at least 1 GiB outside Cargo target directories.
 
 `measure` expands `~` and walks the rows in order with one `seen: set[sweep.InodeKey]` passed to every `sweep.directory_blocks(path, seen)` call, then measures the outside-cache directories, then calls `usage()` once, then stamps `measured_at`. A row's size is allocated blocks (`st_blocks * 512`, symlinks not followed), each `(st_dev, st_ino)` counted once across all rows: a file hard-linked into two rows counts in the first. `directory_blocks` skips any directory or entry it cannot read; called without `seen`, it counts per directory, as the sweep's own doc-index sizing does.
 
@@ -146,6 +174,12 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
 Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-linked file once.
 ```
 
+After a capacity refresh, the report shows both times:
+
+```text
+Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space at 12:14 EDT: allocated blocks, each hard-linked file once.
+```
+
 `other` is used minus the sum of the rows, clamped at zero. The free label is `free` alone when the floor is None. The time goes through `sync_time`, which adds the date when it is not today.
 
 ### Test log isolation
@@ -154,14 +188,14 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 
 ## Invariants
 
-- A test never reaches `~/.local/state/buildlog` and never walks the real disks. The suite needs no `BUILDLOG_DIR` from its caller; importing `test_index` sets it. Disk tests hand `measure` fake trees and run `snapshot()` only with `FOLDERS`, the walk and `filesystem_usage` patched.
+- Disk tests use a temporary build root for CI discovery. They pass temporary trees to `measure` and replace the fixed folders for tests of `snapshot()`.
 - A new `test_*.py` imports `test_index` or calls `use_test_log()`; `LogIsolationTests` fails until it does.
 - `store.py` carries no test-only default location.
 - `verify.sh test` builds under `--workspace`, never `-p <pkg>`. The selection decides what builds; `-E 'package(<pkg>)'` and the `--filter` union decide what runs.
 - The package's integration tests stay in its test build.
 - A temp-folder step is counted, never dropped: one scratch row per kind, and in every summary.
 - The report never walks the disk; it reads `disk.json` only. `buildlog disk` is its one writer and replaces it by rename, so a reader sees a whole snapshot, old or new.
-- Every inode counts once across all Disk rows, in `FOLDERS` order, through one shared `seen`; `other` is used minus the rows, clamped at zero.
+- The measurement counts each inode once across all Disk rows. When the report shows `other`, it subtracts the rows from used space and applies a minimum of zero.
 - `disk.json` stays at the log root beside `sync.json`. `buildlog sync` pushes only this host's folder and natedev's `ci/`, and pulls only the `record.SYNC_HOSTS` folders, so the snapshot never reaches the Mac, and the Mac's report has no Disk section.
 - `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. Times carry their zone, and their date when not today.
 - Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table: the Waiting, both Rebuilds, the Power profile and both Tests per edit tables have that line, and so does any new table; every other table ends at the next blank line (Memory pressure and Test builds put their `Source:` line under the heading, above the table).
@@ -188,10 +222,23 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - Rows, `other` and free add up to less than the disk: ext4's reserved blocks are in neither used (`f_blocks - f_bfree`) nor free (`f_bavail`), about 93 GiB on natedev (`stat -f /`, 2026-10-04).
 - `read_snapshot` casts the JSON to `DiskSnapshot` without checking its shape. A change to the snapshot's keys must still render the old `disk.json`, or the report raises `KeyError` until the job's next write.
 - The heading's host is `store.host_name()` (short); the floor key's host is `socket.gethostname()` (full), as the sweep reads it.
-- To try a disk change by hand without replacing the live snapshot: `BUILDLOG_DIR=$(mktemp -d) python3 scripts/buildlog/cli.py disk`, then `report` with the same `BUILDLOG_DIR`, and compare used and free with `df -B1 /`.
-- In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `python3 scripts/buildlog/cli.py report <day>`.
-- `test_report.py` has no `sys.path` setup and runs only under `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
-- `disk.py` puts `scripts/lint` at the front of `sys.path` to import `sweep`; basedpyright finds it through `extraPaths`.
+- Run this block from the worktree root to check a disk change without replacing the live snapshot.
+  Compare used and free space in the report with the `df` output.
+
+  ```sh
+  (
+    set -e
+    BUILDLOG_DIR=$(mktemp -d)
+    trap 'rm -rf "$BUILDLOG_DIR"' EXIT
+    export BUILDLOG_DIR
+    scripts/lib/py scripts/buildlog/cli.py disk
+    scripts/lib/py scripts/buildlog/cli.py report
+    df -B1 /
+  )
+  ```
+- In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
+- `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
+- `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.
 - `basedpyright scripts/buildlog` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 
 ## Why
@@ -209,5 +256,11 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - **Usage read once, after the walk.** It puts used as close to the rows in time as the walk allows, and `measured_at` marks when the numbers were complete.
 - **Floor read before the walk.** A malformed lint.conf fails in milliseconds instead of after a minute's walk, and the last good snapshot stays.
 - **Reuse the sweep's walk and config reader.** One block counter and one lint.conf parser; the floor shown is the one the sweep enforces, against free measured the same way (`f_bavail`).
-- **These four rows.** They are where builds write: worktrees and their targets under `~/rust`, scratch clones and session folders under `/tmp`, and the two CI runners' trees. Everything else is `other`.
+- **CI runner rows.** The build folder model supplies these rows so the report follows changes to the runner folders.
 - **natedev only.** The user scoped the Disk table to natedev; the Mac is not measured.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

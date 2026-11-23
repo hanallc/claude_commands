@@ -2,38 +2,36 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
-import sys
 from collections.abc import Callable
 from contextlib import redirect_stdout
 import unittest
-from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import declarations
-import approved_renames
-import style_footprint
-import style_ledger
-import style_plan
-import style_proposals
-import rules
-from unit_plans import AllCrates, PilotCrates
-from style_plan_test_support import StylePlanFixture
-from ledger_test_support import LedgerTestCase, PARENT_FILE
+from scripts.style import declarations
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_ledger
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.style import rules
+from scripts.style.unit_plans import AllCrates, PilotCrates
+from scripts.style.style_plan_test_support import StylePlanFixture
+from scripts.style.ledger_test_support import LedgerTestCase, PARENT_FILE
 
 
 @final
 class RefillSpeedTests(LedgerTestCase):
     def test_distinct_item_bodies_share_source_tokens(self) -> None:
         source = "fn first() { one(); }\nfn second() { two(); }\n"
-        file = declarations.read_declarations(source)
-        expected = [declarations.read_declarations(source).item_body(item) for item in file.declared_items]
+        items = declarations.read_declarations(source).declared_items
+        expected = [declarations.read_declarations(source).item_body(item) for item in items]
         with mock.patch.object(style_footprint, "token_spans", wraps=style_footprint.token_spans) as reads:
+            file = declarations.read_declarations(source)
             actual = [file.item_body(item) for item in file.declared_items]
             self.assertEqual(actual, expected)
             self.assertEqual(reads.call_count, 1)
@@ -84,6 +82,26 @@ class RefillSpeedTests(LedgerTestCase):
             self.assertEqual(reads.call_count, 1)
         self.assertTrue(any(isinstance(site, style_ledger.UnchangedSite) for site in actual.values()))
         self.assertTrue(any(isinstance(site, style_ledger.NeedsJudgment) for site in actual.values()))
+        with self.subTest("two judged commits"):
+            _, (later_id,) = self.hold_parent(ledger, ((2, "fn work() {"),), before="work", after="task")
+            first_anchor = ledger.finding_anchor(findings[0])
+            later_anchor = ledger.finding_anchor(ledger.named_held((later_id,))[0])
+            assert isinstance(first_anchor, style_ledger.FindingAnchor)
+            assert isinstance(later_anchor, style_ledger.FindingAnchor)
+            self.assertNotEqual(first_anchor.commit, later_anchor.commit)
+            tip = self.commit_tip(ledger, {PARENT_FILE: "// latest header\n" + (self.repo / PARENT_FILE).read_text()})
+            identities = (findings[0].finding_id, later_id, findings[1].finding_id)
+            expected_outcomes: list[style_ledger.DeclarationOutcome] = []
+            for identity in identities:
+                with style_ledger.Ledger(self.repo, ledger.database) as single:
+                    expected_outcomes.extend(single.declaration_reading((identity,), lambda _: True).outcomes)
+            reading = ledger.declaration_reading(identities, lambda _: True)
+            self.assertEqual(reading, style_ledger.DeclarationReading(tip, tuple(expected_outcomes)))
+            parsed = cast(dict[tuple[str, str], declarations.DeclaredFile], getattr(ledger, "_declared_files"))
+            self.assertFalse(any(commit == first_anchor.commit for commit, _ in parsed))
+            self.assertFalse(any(commit == later_anchor.commit for commit, _ in parsed))
+            self.assertTrue(any(commit == tip for commit, _ in parsed))
+            self.assertEqual(ledger.declaration_reading(identities, lambda _: True), reading)
 
     def test_built_cache_observes_local_and_external_writes(self) -> None:
         ledger, findings = self.sites()
@@ -111,10 +129,13 @@ class RefillSpeedTests(LedgerTestCase):
         candidates = declared(tip, PARENT_FILE).declared_items
         check = cast(Callable[[str, str, declarations.DeclaredItem, str, str, declarations.DeclaredItem], object],
                      getattr(ledger, "_outside_body_check"))
-        with mock.patch.object(declarations, "item_body", wraps=declarations.item_body) as reads:
+        with (mock.patch.object(declarations, "item_body", wraps=declarations.item_body) as reads,
+              mock.patch.object(declarations, "source_spans", wraps=declarations.source_spans) as scans):
             for item in candidates:
                 _ = check(old_tip, PARENT_FILE, old, tip, PARENT_FILE, item)
             self.assertEqual(reads.call_count, 1 + len(candidates))
+            # The old body is tokenized once, not once for each candidate.
+            self.assertEqual(scans.call_count, 1)
 
 
 @final
@@ -138,7 +159,7 @@ class RefillWaitTests(StylePlanFixture):
                       mock.patch.object(style_plan, "unsynced_changes", return_value=unsynced),
                       mock.patch.object(ledger, "_declaration_reading", side_effect=AssertionError("blocked file requested site proof")),
                       redirect_stdout(io.StringIO())):
-                    result = style_plan._select_phase(ledger, ticket_owner_id("names-unit"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
+                    result = style_plan._select_phase(ledger, ticket_owner_id("names"), "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                         self.doc, self.plan.read_text(), scope, busy, frozenset(), definitions,
                         style_plan.MainChanges(self.tip), family="names", selection=style_plan.FamilySelection.COUNT)
                 self.assertIsInstance(result, style_plan.BuildableFindings)

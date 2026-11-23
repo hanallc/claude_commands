@@ -1,13 +1,12 @@
 """Seed real Git workspaces for the final gate and its read-only pass query."""
 from __future__ import annotations
 
-from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 import json
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, override
 
@@ -26,10 +25,10 @@ class FinalPassFixture(ExampleWorkspaceFixture):
     @override
     def setUpClass(cls) -> None:
         builder = cls()
+        cls.addClassCleanup(builder.doCleanups)
         builder.build_fixture()
-        cls.addClassCleanup(builder.temporary.cleanup)
         cls.fixture_root = Path(builder.temporary.name)
-        seed = tempfile.TemporaryDirectory(prefix="final-pass-seed-")
+        seed = tempfile.TemporaryDirectory(prefix="final-seed-")
         cls.addClassCleanup(seed.cleanup)
         cls.fixture_seed = Path(seed.name) / "fixture"
         cls.fixture_environment = builder.environment.copy()
@@ -38,8 +37,8 @@ class FinalPassFixture(ExampleWorkspaceFixture):
 
     @override
     def setUp(self) -> None:
-        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
         self.root: Path = self.fixture_root / "repo"
         self.calls: Path = self.fixture_root / "cargo-calls"
         self.metadata_calls: Path = self.fixture_root / "metadata-calls"
@@ -74,9 +73,7 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         _ = self.git("add", ".")
         _ = self.git("commit", "--quiet", "-m", "initial")
         # Exercise the real interpreter shim's cache, avoiding repeated version probes.
-        cache = fixture / "cache/claude"
-        cache.mkdir(parents=True, exist_ok=True)
-        _ = (cache / cache_file_name()).write_text(sys.executable + "\n")
+        seed_interpreter_cache(fixture / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def git(self, *args: str) -> str:
@@ -108,6 +105,6 @@ class FinalPassFixture(ExampleWorkspaceFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.pass_files(), [])
         self.assertIn("no final pass record was written: the tree is dirty", result.stdout)
-        answer = self.verify("final-pass")
+        answer = self.verify("final", "--saved")
         self.assertEqual(answer.returncode, 1, answer.stdout + answer.stderr)
         self.assertIn("the tree is dirty", answer.stderr)

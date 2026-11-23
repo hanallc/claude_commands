@@ -4,7 +4,8 @@
     "CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP": "1",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "ENABLE_LSP_TOOL": "1",
-    "TMPPREFIX": "/tmp/claude/zsh"
+    "TMPPREFIX": "/tmp/claude/zsh",
+    "DISABLE_AUTOUPDATER": "1"
   },
   "includeCoAuthoredBy": false,
   "permissions": {
@@ -17,6 +18,7 @@
       "Read(~/.claude2/projects/**/tool-results/**)",
       "Read(~/.claude3/projects/**/tool-results/**)",
       "Read(~/.claude4/projects/**/tool-results/**)",
+      "Read(~/.claude5/projects/**/tool-results/**)",
       "Bash(cargo *)",
       "Bash(cargo-berth *)",
       "Bash(gh *)",
@@ -53,6 +55,7 @@
       "Edit(~/.claude2/**)",
       "Edit(~/.claude3/**)",
       "Edit(~/.claude4/**)",
+      "Edit(~/.claude5/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",
@@ -62,7 +65,6 @@
       "Read(//var/folders/rf/twhh0jfd243fpltn5k0w1t980000gn/T/**)",
       "Read(/private/tmp*)",
       "mcp__brp",
-      "Bash(~/.claude/scripts/berth_fix/*)",
       "Bash(zsh ~/.claude/scripts/direct/unit_notifier.sh *)",
       "Bash(bash ~/.claude/scripts/direct/verify.sh *)",
       "Bash(bash ~/.claude/scripts/direct/implement.sh *)",
@@ -98,7 +100,7 @@
       "Bash(date)",
       "Bash(true)",
       "Bash(git ls-files)",
-      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [
@@ -113,7 +115,6 @@
       "Bash(gh auth token*)",
       "Bash(gh auth refresh*)",
       "Bash(gh auth setup-git*)",
-      "Bash(gh gist *)",
       "Bash(gh extension *)",
       "Bash(gh alias *)",
       "Bash(gh ssh-key *)",
@@ -128,12 +129,53 @@
       "Bash(git config filter.*)",
       "Bash(git config credential.*)",
       "Bash(git config url.*)",
+      "Bash(git config set core.*)",
+      "Bash(git config set alias.*)",
+      "Bash(git config set filter.*)",
+      "Bash(git config set credential.*)",
+      "Bash(git config set url.*)",
       "Bash(git config --global*)",
       "Bash(git config --system*)",
       "Bash(git config --local*)",
       "Bash(git config --worktree*)",
       "Bash(git config --file*)",
       "Bash(git config -f *)",
+      "Bash(git push*--no-v*)",
+      "Bash(git * push*--no-v*)",
+      "Bash(git -c hook.*)",
+      "Bash(git * -c hook.*)",
+      "Bash(git *--config-env*hook.*)",
+      "Bash(git config hook.*)",
+      "Bash(git config * hook.*)",
+      "Bash(git config set hook.*)",
+      "Bash(git config unset hook.*)",
+      "Bash(HOME=*git*push*)",
+      "Bash(* HOME=*git*push*)",
+      "Bash(env HOME=*git*push*)",
+      "Bash(env * HOME=*git*push*)",
+      "Bash(export HOME=*)",
+      "Bash(XDG_CONFIG_HOME=*git*push*)",
+      "Bash(* XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env * XDG_CONFIG_HOME=*git*push*)",
+      "Bash(export XDG_CONFIG_HOME=*)",
+      "Bash(GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(* GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env * GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(export GIT_CONFIG_GLOBAL=*)",
+      "Bash(GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(* GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env * GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(export GIT_CONFIG_COUNT=*)",
+      "Bash(GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(* GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env * GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(export GIT_CONFIG_PARAMETERS=*)",
+      "Bash(git send-pack*)",
+      "Bash(git * send-pack*)",
       "Bash(rg --pre*)",
       "Bash(rg * --pre*)",
       "Bash(gpg -d*)",
@@ -146,13 +188,16 @@
       "Read(~/.codex*/auth.json)"
     ],
     "ask": [
+      "Bash(gh gist *)",
       "Bash(git push --force*)",
       "Bash(git push * --force*)",
       "Bash(git push -f*)",
-      "Bash(git push * -f*)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
       "Bash(git push --mirror*)",
       "Bash(git push * --mirror*)",
-      "Bash(git push * +*)",
+      "Bash(git push * +refs/*)",
+      "Bash(git push * +HEAD*)",
       "Bash(git push * :main*)",
       "Bash(git push * --delete main*)",
       "Bash(git push --delete * main*)",
@@ -179,6 +224,7 @@
     "additionalDirectories": [
       "~/Library",
       "~/rust",
+      "~/worktrees",
       "/tmp",
       "/tmp/claude/",
       "~/.claude/projects",
@@ -219,7 +265,6 @@
     "exclude_from_merge": "user-invocable-only",
     "focused_eval": "user-invocable-only",
     "idle_timeout": "user-invocable-only",
-    "implement_issue": "user-invocable-only",
     "improve_decisions": "user-invocable-only",
     "local_style": "user-invocable-only",
     "monitor": "user-invocable-only",
@@ -229,13 +274,19 @@
     "style_rename": "user-invocable-only",
     "watcher": "user-invocable-only",
     "zed": "user-invocable-only",
-    "banned_word_analysis": "user-invocable-only",
-    "banned_word_hook": "user-invocable-only",
-    "revert_banned_count": "user-invocable-only",
-    "add_banned_word": "user-invocable-only",
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/compaction-marker-clear.py\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -256,6 +307,16 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-compact-marker.py\" --family claude"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Write|NotebookEdit",
@@ -263,7 +324,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" pre_tool_use",
-            "timeout": 3040
+            "timeout": 3050
           }
         ]
       },
@@ -304,6 +365,16 @@
             "timeout": 120
           }
         ]
+      },
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-review-hold-send.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -332,6 +403,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-ste.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-review-hold.py\""
           }
         ]
       },
@@ -384,14 +459,14 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" stop",
-            "timeout": 1840
+            "timeout": 1850
           },
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\"",
+            "timeout": 60,
             "asyncRewake": true,
-            "rewakeSummary": "Continuing the unit run",
-            "timeout": 60
+            "rewakeSummary": "Continuing the unit run"
           }
         ]
       }
@@ -451,11 +526,13 @@
         "~/.claude2",
         "~/.claude3",
         "~/.claude4",
+        "~/.claude5",
         "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
         "~/rust",
+        "~/worktrees",
         "/private/tmp",
         "/tmp"
       ]
@@ -499,7 +576,7 @@
       "**Default / protected branches**: main is the default branch; no repo has branch protection or a ruleset, so a force push or a delete on main is not blocked by GitHub",
       "**CI/CD deploy targets**: None configured",
       "**Network posture**: None configured",
-      "**Source control**: the user's own GitHub account natepiano. PRIVATE: natepiano/hana (~/rust/hana and its worktrees), natepiano/nixos (/etc/nixos on natedev, ~/nixos on the Mac). PUBLIC: natepiano/bevy_brp, natepiano/claude_commands (~/.claude), natepiano/cargo-liner, natepiano/nate_style, natepiano/obsidian_knife, natepiano/nateroids, natepiano/bevy, natepiano/bevy_hana, natepiano/rust-template, natepiano/gltf-ibl-sampler-egui and the user's other natepiano/* repos. Also hanallc/hanadocs (~/rust/hanadocs), the user's docs vault. Each is cloned under ~/rust unless noted; pushing a repo's own work to its own remote is routine. PUBLIC repos take no secrets or confidential material.",
+      "**Source control**: the user's own GitHub account natepiano and the user's own GitHub organization hanallc (natepiano is its only member and admin). PRIVATE: hanallc/nixos (/etc/nixos on natedev, ~/nixos on the Mac), hanallc/hanadocs (~/rust/hanadocs), the user's docs vault, and hana (~/rust/hana and its worktrees) at natepiano/hana or hanallc/hana. PUBLIC: claude_commands (~/.claude) at natepiano/claude_commands or hanallc/claude_commands, natepiano/bevy_brp, natepiano/cargo-liner, natepiano/nate_style, natepiano/obsidian_knife, natepiano/nateroids, natepiano/bevy, natepiano/bevy_hana, natepiano/rust-template, natepiano/gltf-ibl-sampler-egui and the user's other natepiano/* and hanallc/* repos. Each is cloned under ~/rust unless noted; pushing a repo's own work to its own remote is routine. PUBLIC repos take no secrets or confidential material.",
       "**Trusted internal domains**: None configured",
       "**Trusted cloud buckets**: None configured",
       "**Key internal services**: None configured",
@@ -514,9 +591,9 @@
       "**Trusted repo**: ~/rust/bevy_brp and its remote https://github.com/natepiano/bevy_brp (PUBLIC — only this repo's own work should be pushed there; confidential material and secrets are never cleared into it by visibility)",
       "**Org-specific CLIs**: None configured",
       "**routine under natepiano/ prefix qualifiers**: publishing to crates.io as bevy_brp_mcp, bevy_brp_extras, bevy_brp_mcp_macros is this repo's own routine publish workflow",
-      "**Trusted repo**: ~/rust/hana and its remote git@github.com:natepiano/hana (PRIVATE, owned by the user). Its git worktrees are part of it: ~/rust/hana_catalyst and every production unit worktree under ~/rust (such as ~/rust/tool-based-ui-trunk, ~/rust/tool-based-ui-geometry-material, ~/rust/widget-enhancements).",
+      "**Trusted repo**: ~/rust/hana and its remote git@github.com:natepiano/hana or git@github.com:hanallc/hana (PRIVATE, owned by the user). Its git worktrees are part of it: ~/rust/hana_catalyst and every production unit worktree under ~/rust or ~/worktrees/hana (such as ~/rust/hana_catalyst-trunk, ~/rust/widget-enhancements, ~/worktrees/hana/trunk/worktree, ~/worktrees/hana/startup/worktree, ~/worktrees/hana/widget/enhancements).",
       "**Production merge branches in hana**: a branch like init/catalyst, checked out in ~/rust/hana_catalyst, is the working branch of the showrunner session. Editing, committing, merging unit checkpoints into it and pushing it are its routine job, and so is starting a helper agent to write and commit fixes there that the user asked for. Only main is protected.",
-      "**Machine configuration**: /etc/nixos (natepiano/nixos, PRIVATE) is the user's own NixOS/nix-darwin configuration; running its read-only checks (`check`, nixfmt --check, statix, deadnix, nix eval), committing to its main and pushing it are routine. ~/.claude (natepiano/claude_commands, PUBLIC) holds the user's own commands, scripts and settings; committing and pushing there is routine.",
+      "**Machine configuration**: /etc/nixos (hanallc/nixos, PRIVATE) is the user's own NixOS/nix-darwin configuration; running its read-only checks (`check`, nixfmt --check, statix, deadnix, nix eval), committing to its main and pushing it are routine. ~/.claude (claude_commands at natepiano/claude_commands or hanallc/claude_commands, PUBLIC) holds the user's own commands, scripts and settings; committing and pushing there is routine.",
       "**cargo-berth**: the user's own coordination tool for their local worktrees (~/rust/cargo-liner and its worktrees, ~/rust/hana and its worktrees). Its ledger under each repo's .git/cargo-berth is local state the user's sessions share by design. Every cargo-berth verb (claim with --before/--after/--defer/--override/--proposal, sequence, resolve, release, renew, retire) is routine work for any session in the user's repos. The showrunner session decides integration order for its production: the user delegated that authority to it, and a unit that records the order the showrunner chose is doing routine work. The user asked for cargo-berth, its skills (~/.claude/commands, ~/.claude/docs) and the berth memories to drop the human-approval handshake for overlap answers and to name an optional approver session instead; that work in ~/rust/berth-fix (branch fix/berth) is their requested design change.",
       "Starting Codex workers with `bash ~/.claude/scripts/direct/implement.sh` and the unit's own prompt files is a unit director's routine work.",
       "When the user asks, deleting obsolete folders under /tmp/claude, /tmp/mat-test-* and /tmp/style-sync-lint-* is routine cleanup: only folders with no file changed in 24 hours, that no running process uses, and that belong to no live Claude session. Never /tmp/claude/unit or /tmp/claude/delegate: those hold paused units' run state, and only tmp_sweep.py cleans them."
@@ -525,5 +602,7 @@
   "voiceEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754090074729
-  }
+  },
+  "precomputeCompactionEnabled": false,
+  "cleanupPeriodDays": 3650
 }

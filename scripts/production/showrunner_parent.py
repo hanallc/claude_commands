@@ -7,12 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production.store_owner import showrunner_id
 from scripts.production import showrunners
-import showrunner_tree
+from scripts.production import showrunner_tree
 from scripts.production import staff, staff_sources
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -62,20 +60,20 @@ def _tell(child: str, texts: dict[str, str]) -> None:
         _notice_file(child).unlink(missing_ok=True)
 
 
-def _row(slug: str, record: staff.StaffSnapshot) -> staff.StaffRow:
-    found = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
+def _row(production_name: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    found = staff_sources.member(staff_sources.ShowrunnerMember(production_name), record)
     if isinstance(found, staff_sources.NoSuchMember):
-        raise staff.StaffRefused(f"{slug}: no matching showrunner staff row")
+        raise staff.StaffRefused(f"{production_name}: no matching showrunner staff row")
     return found.row
 
 
 def attach_parent(child: str, parent: str = "") -> None:
     with staff.operation():
-        child = showrunners.canonical_slug(child)
-        parent = parent or showrunners.own_slug()
+
+        parent = parent or showrunners.own_name()
         if not parent:
             raise ValueError("name the parent: this session runs no production")
-        parent = showrunners.canonical_slug(parent)
+
         record = staff.snapshot()
         try:
             showrunner_tree.check_attach(child, parent, record=record)
@@ -104,7 +102,7 @@ def attach_parent(child: str, parent: str = "") -> None:
 
 def detach_parent(child: str) -> None:
     with staff.operation():
-        child = showrunners.canonical_slug(child)
+
         pending = _pending_notice(child)
         if isinstance(pending, PendingParentNotice) and pending.action != "detach":
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")

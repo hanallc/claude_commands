@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — two checkpoints, build-report unit.** The showrunner, unit and issue skills file, approve, start and close proposals as hanadocs issues instead of rows in `proposals/index.md`.
 
-> **Production: build-followups** — unit `build-report`; production doc `docs/plans/build-followups-production.md`
 
 ## Decisions (mine, settled with the hanadocs dashboard unit 2026-10-15)
 
@@ -23,7 +22,6 @@
 - **The production doc's `Proposals:` line** now names the issues folder (`~/rust/hanadocs/issues`).
   `/showrunner:proposals` lists every open issue there tagged `proposal`, across projects, as the old index
   did across production headings. The hana production doc's line is the hana showrunner's to change.
-- **dailies counts** gain a kind `issues <folder> <tag>` counting open issues with that tag.
 - **targets.md** is read "when present" by ux_eval, the UI review pool and the contract lens; a miss is a defect.
 
 ## Checkpoint 1 — the proposals table reads issues
@@ -33,7 +31,6 @@
   `date_created`). Keep the backlog and add-on sources. Tests updated.
 - `commands/showrunner/proposals.md`, `docs/production_format.md` (`Proposals:` line),
   `docs/as-built/showrunner-automation.md`.
-- `dailies_counts.py` `issues` kind + test; `config/dailies.conf` hana line.
 
 ## Checkpoint 2 — the proposal lifecycle
 

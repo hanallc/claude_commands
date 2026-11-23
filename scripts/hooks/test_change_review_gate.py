@@ -4,7 +4,6 @@ Every test stages files in a temporary git repository; none commits or reads the
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import shlex
@@ -15,13 +14,15 @@ import unittest
 from pathlib import Path
 from typing import Protocol, cast, override
 
+from scripts.lib.file_module import load_file_module
 from scripts.production import change_review
 from scripts.hooks import checkpoint_gate
 from unittest import mock
 
 
 HOOK = Path(__file__).with_name("pre-tool-use-change-review-gate.py")
-spec = importlib.util.spec_from_file_location("change_review_gate", HOOK)
+module = load_file_module("change_review_gate", HOOK)
+spec = module.__spec__
 assert spec is not None and spec.loader is not None
 
 
@@ -29,11 +30,9 @@ class Gate(Protocol):
     def refusal(self, command: str, cwd: Path) -> str: ...
 
 
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
 gate = cast(Gate, cast(object, module))
 SEE = ("Change-Review: The grid fades more gently | Run `hana` in a natedev terminal"
-       + " | The grid lines fade out farther away")
+       + " | The grid lines fade out farther away | image 012345abcdef")
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 
 
@@ -141,6 +140,14 @@ class RefusalTest(unittest.TestCase):
         for command in ('git commit -m "checkpoint(u): grid" -m ' + shlex.quote(SEE),
                         "git commit -F - <<'EOF'\ncheckpoint(u): grid\n\nChange-Review: none — scripts only\nEOF"):
             self.assertEqual(self.refused(command), "", command)
+
+    def test_a_visible_checkpoint_without_an_image_uses_the_shared_refusal(self) -> None:
+        self.stage("a.py")
+        line = SEE.removesuffix(" | image 012345abcdef")
+        message = "checkpoint(u): grid\n\n" + line
+        self.assertEqual(self.refused("git commit -m " + shlex.quote(message)),
+                         change_review.problem("checkpoint(u): grid", message, ("a.py",)))
+        self.assertIn("has no image", self.refused("git commit -m " + shlex.quote(message)))
 
     def test_help_passes_each_invocation_without_reading_the_repository(self) -> None:
         for cargo in (False, True):

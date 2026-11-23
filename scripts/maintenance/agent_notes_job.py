@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Run independent, bounded maintenance parts; never collect recovery snapshots."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import re
@@ -16,10 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 from scripts.lib import process_group
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
-from scripts.maintenance.settings import Part, Schedule, settings
+from scripts.maintenance.settings import InvalidPartSchedule, Part, Schedule, settings
 
 
 class Outcome(str, Enum):
@@ -43,7 +46,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
     remaining = min(cadence.timeout_seconds, deadline - started)
     if remaining <= 0:
         return PartResult(part, Outcome.TIMED_OUT, 0, 124)
-    command = [sys.executable, str(Path(__file__).resolve()), "--part", part.value]
+    command = [str(ROOT / "scripts/lib/py"), str(Path(__file__).resolve()), "--part", part.value]
     try:
         with subprocess.Popen(command, cwd=ROOT, start_new_session=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True) as child:
@@ -68,30 +71,53 @@ def run_job() -> list[PartResult]:
         if isinstance(history, ScheduleBusy):
             return [PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running") for part in Part]
         deadline = time.monotonic() + config.job.timeout_seconds
-        due = {part for part in Part if history.is_due(part.value, config.parts[part].interval_seconds, time.time())}
+        now = time.time()
+        due: dict[Part, Schedule] = {}
         results: dict[Part, PartResult] = {}
+        for part, cadence in config.parts.items():
+            if isinstance(cadence, InvalidPartSchedule):
+                results[part] = PartResult(part, Outcome.FAILED, 0, 1, cadence.reason)
+            elif history.is_due(part.value, cadence.interval_seconds, now):
+                due[part] = cadence
 
         def record(result: PartResult) -> None:
             results[result.part] = result
             if result.outcome is Outcome.SUCCESS:
                 history.record(result.part.value, time.time())
 
-        # Quota and the pacer read completed notes; the vault follows all writers.
+        # Quota and the pacer read completed notes. The vault parts follow the writers.
+        vault_parts = (Part.VAULT, Part.VAULT_SAVE)
         with ThreadPoolExecutor(max_workers=len(Part)) as pool:
-            tasks = {part: pool.submit(run_part, part, config.parts[part], deadline)
-                     for part in Part if part in due and part not in (Part.QUOTA, Part.PACER, Part.VAULT)}
+            tasks = {part: pool.submit(run_part, part, cadence, deadline)
+                     for part, cadence in due.items() if part not in (Part.QUOTA, Part.PACER, *vault_parts)}
             def after_notes(part: Part) -> PartResult:
                 if Part.NOTES in tasks:
                     _ = tasks[Part.NOTES].result()
-                return run_part(part, config.parts[part], deadline)
+                return run_part(part, due[part], deadline)
             for part in (Part.QUOTA, Part.PACER):
                 if part in due:
                     tasks[part] = pool.submit(after_notes, part)
             for task in as_completed(tasks.values()):
                 record(task.result())
-        if Part.VAULT in due:
-            record(run_part(Part.VAULT, config.parts[Part.VAULT], deadline))
+        for part in vault_parts:
+            if part in due:
+                record(run_part(part, due[part], deadline))
         return [results.get(part, PartResult(part, Outcome.NOT_DUE, 0, 0)) for part in Part]
+
+
+def run_now(part: Part) -> PartResult:
+    """Run one part at once, after a pass that is running; record it as done."""
+    config = settings()
+    with locked_history(schedule_directory("job"), wait=True) as history:
+        if isinstance(history, ScheduleBusy):
+            return PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running")
+        cadence = config.parts[part]
+        if isinstance(cadence, InvalidPartSchedule):
+            return PartResult(part, Outcome.FAILED, 0, 1, cadence.reason)
+        result = run_part(part, cadence, time.monotonic() + config.job.timeout_seconds)
+        if result.outcome is Outcome.SUCCESS:
+            history.record(part.value, time.time())
+        return result
 
 
 def perform(part: Part) -> int:
@@ -102,24 +128,26 @@ def perform(part: Part) -> int:
 
 
 def _perform(part: Part) -> int:
-    # Match the sibling imports the existing command-line tools use.
-    sys.path[:0] = [str(ROOT / "scripts/whoami"), str(ROOT / "scripts/production")]
     if part in (Part.NOTES, Part.QUOTA, Part.PACER):
         if TYPE_CHECKING:
             from scripts.whoami import agent_notes, codex_pacer
         else:
-            import agent_notes
-            import codex_pacer
+            from scripts.whoami import agent_notes
+            from scripts.whoami import codex_pacer
         from scripts.whoami import note_file
         if part is Part.NOTES:
             for line in agent_notes.update(include_warnings=False):
                 print(line)
+            from scripts.accounts import role_activity
+            # The notes are written. Any other error fails this part with its traceback, so a defect shows.
+            try:
+                role_activity.sample_now(datetime.now(timezone.utc))
+            except (OSError, ValueError) as error:
+                print(f"role activity: {' '.join(str(error).split())}")
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
-            if TYPE_CHECKING:
-                from scripts.whoami import quota_alert
-            else:
-                import quota_alert
+            from scripts.lib import live_settings, mac_wake
+            from scripts.whoami import quota_alert
             from scripts.whoami import agent_accounts, usage_store
             # Quota uses the notes' saved usage, never a second live account probe.
             workers = agent_accounts.observe_workers_home()
@@ -131,15 +159,13 @@ def _perform(part: Part) -> int:
             observed = saved.observed_at if isinstance(saved, usage_store.RecentTimerUsage) else now
             readings = quota_alert.codex_alert_pass(workers, reports, observed)
             for line in [*agent_notes.watch_usage(reports, selection, workers, readings),
-                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings)]:
+                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings),
+                         *live_settings.publish_waiting(), *mac_wake.start()]:
                 print(line)
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
     elif part is Part.REFUSALS:
-        if TYPE_CHECKING:
-            from scripts.whoami import agent_notes
-        else:
-            import agent_notes
+        from scripts.whoami import agent_notes
         from scripts.accounts import accounts, refusal_watch
         from scripts.whoami import agent_accounts, note_file
         def refresh_refusal_usage() -> None:
@@ -147,15 +173,32 @@ def _perform(part: Part) -> int:
                 agent_accounts.observe_workers_home(), agent_notes.claude_note_logins(note_file.read_notes()))
             for line in refreshed.messages:
                 print(line)
-        for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
+        from scripts.agents import stop_resume
+
+        with stop_resume.detached_moves():
+            for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
+                print(line)
+        from scripts.herdr import turn_end
+        for line in turn_end.report_quota_refusals():
             print(line)
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
             print(line)
+    elif part is Part.LOGINS:
+        from scripts.accounts import login_sittings
+        for line in login_sittings.run(datetime.now(timezone.utc)):
+            print(line)
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()
+    elif part is Part.FOLDER_SIZE:
+        from scripts.maintenance import folder_size
+        folder_size.run()
+    elif part is Part.VAULT_SAVE:
+        from scripts.maintenance.vault_save import main
+
+        return main([])
     else:
         from scripts.maintenance import vault_commit
         vault = Path.home() / "rust/hanadocs"
@@ -172,6 +215,7 @@ def _perform(part: Part) -> int:
         relative = [str(Path(path).relative_to(vault)) for path in paths]
         if vault_commit.changed(str(vault), relative, patterns):
             from scripts.direct import phase_table
+            from scripts.production import staff
 
             phase_notes = vault / "showrunners"
             tracked_phases = vault_commit.git(str(vault), "ls-files", "-z", "--", "showrunners")
@@ -180,6 +224,7 @@ def _perform(part: Part) -> int:
                 vault / path for path in tracked_phases.stdout.split("\0")
                 if Path(path).suffix == ".md" and Path(path).parent.parent == Path("showrunners")
             )
+            record = staff.snapshot()
             for path in candidates:
                 content = vault_commit.read(str(path))
                 if isinstance(content, vault_commit.NoteAbsent):
@@ -187,7 +232,7 @@ def _perform(part: Part) -> int:
                     if shown.returncode != 0:
                         continue
                     content = vault_commit.NoteContent(shown.stdout)
-                if isinstance(phase_table.phase_note_ownership(content.text), phase_table.NoteOwnership):
+                if isinstance(phase_table.phase_note_ownership(content.text, record), phase_table.NoteOwnership):
                     paths.add(str(path))
         return vault_commit.main(["--job", "agent-notes", *[arg for pattern in timestamps for arg in ("--timestamp", pattern)], "--", *sorted(paths)])
     return 0
@@ -195,16 +240,20 @@ def _perform(part: Part) -> int:
 
 class Arguments(argparse.Namespace):
     part: str = ""
+    now: str = ""
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--part", choices=[part.value for part in Part])
+    choices = [part.value for part in Part]
+    options = parser.add_mutually_exclusive_group()
+    _ = options.add_argument("--part", choices=choices, help="run one part in this process, with no lock")
+    _ = options.add_argument("--now", choices=choices, help="run one part now, after a running pass")
     args = parser.parse_args(namespace=Arguments())
     try:
         if args.part:
             return perform(Part(args.part))
-        results = run_job()
+        results = [run_now(Part(args.now))] if args.now else run_job()
         for result in results:
             print(f"{result.part.value}: {result.outcome.value}; {result.seconds:.3f} s; exit {result.exit_code}")
             if result.output.strip():

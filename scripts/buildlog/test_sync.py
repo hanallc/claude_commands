@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Sync pauses and Mac command status stay within a temporary state root."""
 
 from __future__ import annotations
@@ -16,25 +16,20 @@ from contextlib import ExitStack, redirect_stdout
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import ci
-import cli
-import index
-import health
-import record
-import rust_release
-import store
-import sync
-import vault_pull
-from test_index import point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment
+from scripts.buildlog import ci, cli
+from scripts.buildlog import index
+from scripts.buildlog import health
+from scripts.buildlog import record
+from scripts.buildlog import rust_release
+from scripts.buildlog import sample
+from scripts.buildlog import store
+from scripts.buildlog import sync, vault_pull
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
 
 def setUpModule() -> None:
@@ -51,6 +46,7 @@ class SyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
+        _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
         point_root_at(self, self.root)
         self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(Path(temporary)),
@@ -89,16 +85,30 @@ class SyncTests(unittest.TestCase):
 
     def test_mkdir_uses_last_printed_status_and_then_runs_rsync(self) -> None:
         (self.root / "natedev").mkdir(parents=True)
-        self.responses = [
-            subprocess.CompletedProcess(["ssh"], 0, stdout="rc=1\nmessage\nrc=0\n", stderr=""),
-            subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
-            subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
-        ]
-        with mock.patch.object(store, "host_name", return_value="natedev"):
-            self.assertEqual(sync.sync(), 0)
+        for stats in ("Total bytes sent: 1,234\nTotal bytes received: 56\n",
+                      "sent 1,234 bytes  received 56 bytes  1.0 bytes/sec\n"):
+            with self.subTest(stats=stats):
+                self.commands = []
+                self.responses = [
+                    subprocess.CompletedProcess(["ssh"], 0, stdout="rc=1\nmessage\nrc=0\n", stderr=""),
+                    subprocess.CompletedProcess(["rsync"], 0, stdout=stats, stderr=""),
+                    subprocess.CompletedProcess(["rsync"], 0, stdout=stats, stderr=""),
+                ]
+                with mock.patch.object(store, "host_name", return_value="natedev"):
+                    self.assertEqual(sync.sync(), 0)
 
-        self.assertEqual([command[0] for command in self.commands], ["ssh", "rsync", "rsync"])
-        self.assertIs(self.status()["ok"], True)
+                self.assertEqual([command[0] for command in self.commands], ["ssh", "rsync", "rsync"])
+                self.assertIs(self.status()["ok"], True)
+                transfers = self.status()["transfers"]
+                self.assertEqual(transfers, [
+                    {"operation": "buildlog_control", "sent_bytes": len(self.commands[0][-1].encode()),
+                     "received_bytes": len("rc=1\nmessage\nrc=0\n".encode()), "complete": True},
+                    {"operation": "buildlog_push", "sent_bytes": 1234, "received_bytes": 56, "complete": True},
+                    {"operation": "buildlog_pull", "sent_bytes": 1234, "received_bytes": 56, "complete": True},
+                ])
+                for command in self.commands[1:]:
+                    self.assertIn("--stats", command)
+                    self.assertIn("--compress", command)
 
     def test_non_255_ssh_exit_uses_printed_success(self) -> None:
         self.responses = [
@@ -152,6 +162,20 @@ class SyncTests(unittest.TestCase):
                 self.assertLess(filters.index(exclusion), filters.index("--include=/Mac/***"))
         self.assertNotIn("--include=/*/", filters)
         self.assertEqual(filters[-1], "--exclude=*")
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json",
+                     "index.sqlite-wal", "launch.lock", "record.tmp", "old.jsonl.bak"):
+            path = source / "Mac" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(name)
+        process = subprocess.Popen(["rsync", "-rt", "--compress", *filters, f"{source}/", f"{destination}/"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        copied = {str(path.relative_to(destination / "Mac")): path.read_text()
+                  for path in (destination / "Mac").rglob("*") if path.is_file()}
+        self.assertEqual(copied, {name: name for name in (
+            "2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json")})
 
     def test_pull_excludes_unknown_folders_and_the_current_host(self) -> None:
         filters = self.assert_host_pull("Mac")
@@ -308,22 +332,29 @@ class SyncTests(unittest.TestCase):
     def test_hourly_still_polls_ci_while_sync_is_paused(self) -> None:
         self.assertEqual(cli.main(["sync", "pause", "Mac hold"]), 0)
         with (
+            mock.patch.object(sample, "sccache_sample", return_value=0) as cache,
             mock.patch.object(ci, "ci", return_value=0) as poll,
             mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
+            mock.patch.object(cli, "aws_snapshot", return_value=0) as snapshot,
+            mock.patch.object(cli, "aws_page", return_value=0) as page,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
             self.assertEqual(cli.hourly(), 0)
 
+        cache.assert_called_once_with()
         poll.assert_called_once_with()
         screenshots.assert_called_once_with()
         release.assert_called_once_with()
+        snapshot.assert_called_once_with()
+        page.assert_called_once_with()
         self.assertEqual(self.commands, [])
 
     def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
-        jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
+        jobs = ((sample, "sccache_sample", "sccache"), (sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
-                (rust_release, "check_release", "rust release"), (index, "update", "index"))
+                (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
+                (cli, "aws_page", "AWS page"), (index, "update", "index"))
         expected = [name for _, _, name in jobs]
         for failed in expected:
             for raises in (False, True):
@@ -348,6 +379,32 @@ class SyncTests(unittest.TestCase):
                     # index.update returns a row count, unlike the job exit statuses.
                     self.assertEqual(result, 0 if failed == "index" and not raises else 1)
 
+    def test_aws_snapshot_uses_the_installed_settings_and_state_directory(self) -> None:
+        from scripts.aws_target import aws_target
+        from scripts.build_targets import target_config
+        from scripts.lib import conf
+
+        folder = self.root / "aws"
+        with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
+              mock.patch.object(aws_target, "hourly", return_value=1) as read):
+            self.assertEqual(cli.aws_snapshot(), 1)
+        state.assert_called_once_with("aws")
+        read.assert_called_once_with(conf.path("aws_target"), folder, allow_aws_unavailable=True)
+
+    def test_aws_page_publishes_from_the_installed_settings_and_state_directory(self) -> None:
+        from scripts.aws_target import aws_page
+        from scripts.build_targets import target_config
+        from scripts.lib import conf
+
+        folder = self.root / "aws"
+        with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
+              mock.patch.object(aws_page, "output_folder", return_value=self.root / "page"),
+              mock.patch.object(aws_page, "publish", return_value=self.root / "page" / aws_page.PAGE_NAME) as publish):
+            self.assertEqual(cli.aws_page(), 0)
+        state.assert_called_once_with("aws")
+        self.assertEqual(publish.call_args.args[::2], (folder, self.root / "page"))
+        self.assertEqual(publish.call_args.kwargs, {"settings_path": conf.path("aws_target")})
+
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []
 
@@ -370,10 +427,7 @@ class SyncTests(unittest.TestCase):
         if spec is None or spec.loader is None:
             self.fail(f"could not load {module_path}")
         module = importlib.util.module_from_spec(spec)
-        with (
-            mock.patch.object(sys, "path", [str(module_path.parent), *sys.path]),
-            mock.patch.dict(sys.modules, {spec.name: module}),
-        ):
+        with mock.patch.dict(sys.modules, {spec.name: module}):
             spec.loader.exec_module(module)
 
         mac_timeout = cast(int, getattr(module, "MAC_SSH_TIMEOUT_SECONDS"))

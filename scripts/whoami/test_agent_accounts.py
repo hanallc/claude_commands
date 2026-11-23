@@ -201,6 +201,7 @@ class SharedUsageReadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True))
+        _ = self.enterContext(scratch_accounts_config())
         self.now = datetime(2026, 10, 19, 12, 11, tzinfo=timezone.utc)
         _ = self.enterContext(patch.object(agent_accounts, "command_json", return_value={
             "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai"}))
@@ -301,6 +302,39 @@ class SharedUsageReadTests(unittest.TestCase):
         self.assertEqual(report.plan, "max")
         self.assertEqual(report.weekly_remaining, 75)
 
+    def test_live_login_end_uses_the_same_loaded_metadata_with_or_without_disk_identity(self) -> None:
+        end = datetime(2026, 12, 4, 21, 7, tzinfo=timezone.utc)
+        cases: tuple[agent_accounts.ClaudeOauth, ...] = ({}, {"refreshTokenExpiresAt": None},
+                                                       {"refreshTokenExpiresAt": int(end.timestamp() * 1000)})
+        for disk_identity in (False, True):
+            for metadata in cases:
+                with self.subTest(disk_identity=disk_identity, metadata=metadata):
+                    self.now += timedelta(seconds=100)
+                    oauth: agent_accounts.ClaudeOauth = {"accessToken": "fixture", "subscriptionType": "max"}
+                    oauth.update(metadata)
+                    with (patch.object(agent_accounts, "claude_on_disk", return_value=agent_accounts.Report(
+                              "Claude", email="shared@example.invalid")),
+                          patch.object(agent_accounts, "claude_credentials", return_value={"claudeAiOauth": oauth}) as credentials,
+                          patch.object(agent_accounts, "command_json", return_value={
+                              "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                              "subscriptionType": "max"}) as cli,
+                          patch.object(urllib.request, "urlopen", side_effect=self.response)):
+                        report = agent_accounts.claude_live(self.home / ".claude2", use_disk_identity=disk_identity)
+                    credentials.assert_called_once_with(self.home / ".claude2")
+                    self.assertEqual(cli.call_count, 0 if disk_identity else 1)
+                    self.assertEqual(report.login_ends_at, agent_accounts.LoginEndKnown(end)
+                                     if metadata.get("refreshTokenExpiresAt") is not None else agent_accounts.LoginEndUnknown())
+                    self.assertEqual(report.weekly_remaining, 75)
+
+    def test_stale_access_token_keeps_the_separate_login_end(self) -> None:
+        end = datetime(2026, 12, 4, 21, 7, tzinfo=timezone.utc)
+        with (patch.object(agent_accounts, "claude_credentials", return_value={"claudeAiOauth": {
+                  "accessToken": "fixture", "expiresAt": 1, "refreshTokenExpiresAt": int(end.timestamp() * 1000)}}),
+              patch.object(urllib.request, "urlopen", side_effect=AssertionError("stale token sent"))):
+            report = self.read()
+        self.assertEqual(report.login_ends_at, agent_accounts.LoginEndKnown(end))
+        self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.STALE_TOKEN)
+
     def test_missing_disk_subscription_keeps_cli_plan_label(self) -> None:
         folder = self.home / ".claude2"
         folder.mkdir()
@@ -386,7 +420,7 @@ with (patch.object(agent_accounts, 'command_json', return_value={
                   + "claim = usage_store.claim_read\n"
                   + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
                   + script)
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:

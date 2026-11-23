@@ -7,17 +7,21 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
+from scripts.direct import recorder_state
 from scripts.direct.findings_test_support import FindingsLedgerFixture, findings
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class SimplifyFindingTests(FindingsLedgerFixture):
     def complete_held_phase(self) -> str:
         self.write_progress_state("simplify-instance", "simplify")
         finding_id = self.open_simplify("Remove retry behavior", held=True)
-        path = self.session_dir / "progress_history_state.json"
+        path = self.session_dir / recorder_state.STATE_FILENAME
         progress = cast(dict[str, object], json.loads(path.read_text()))
-        cast(dict[str, object], progress["phase"])["status"] = "completed"
+        phase = recorder_state.open_phases(progress)[0]
+        progress["phase"] = {**phase, "status": "completed"}
+        progress[recorder_state.OPEN_PHASES_KEY] = []
         _ = path.write_text(json.dumps(progress))
         return finding_id
 
@@ -35,8 +39,9 @@ class SimplifyFindingTests(FindingsLedgerFixture):
 
     def test_held_finding_survives_a_repair_round_and_phase_end(self) -> None:
         environment = self.environment(1_000)
-        environment.update({"UNIT_ACTIVE_DIR": str(self.root / "active"),
+        environment.update({
                             "TZ": "UTC", "USER_ZONE": "UTC"})
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         for arguments in (
             ["start-run", "--working-dir", str(self.root),
              "--main-family", "codex", "--main-model", "fixture-model",
@@ -111,7 +116,7 @@ class SimplifyFindingTests(FindingsLedgerFixture):
             ("open", "--severity", "minor", "--title", "Late change", "--caught-by", "worker"),
             ("gate",),
             ("dispatch", "--covers", held_id),
-            ("route", "--id", held_id, "--reason", "spec-gap", "--owner", "later-unit",
+            ("route", "--id", held_id, "--reason", "spec-gap", "--owner", "later",
              "--work-order", "docs/plan.md — Phase later — Retry", "--due", "later checkpoint"),
         )
         for parked in (False, True):
@@ -121,12 +126,21 @@ class SimplifyFindingTests(FindingsLedgerFixture):
             before = {path: path.read_bytes() for path in self.session_dir.glob("*.json")}
             phase_options = (("--phase", "simplify"),) if parked else ((), ("--phase", "simplify"))
             for command in commands:
-                for options in phase_options:
+                # A named closed phase takes a late finding, so only an unnamed open with no later phase is refused.
+                late_options: tuple[tuple[str, ...], ...] = () if parked else ((),)
+                for options in late_options if command[0] == "open" else phase_options:
                     with self.subTest(parked=parked, command=command[0], options=options):
                         result = self.run_failing_command(*command, *options)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("Phase simplify is not open", result.stderr)
                         self.assertEqual({path: path.read_bytes() for path in before}, before)
+            with self.history_file.open("a", encoding="utf-8") as history:
+                _ = history.write(json.dumps({"event_type": "phase_started", "phase_id": "simplify",
+                                              "phase_instance_id": "simplify-instance"}) + "\n")
+            late = self.run_command("open", "--phase", "simplify", "--severity", "nit",
+                                    "--title", f"Late change, parked={parked}", "--caught-by", "main")
+            titles = [entry["title"] for entry in cast(list[dict[str, object]], self.phase_status("simplify")["findings"])]
+            self.assertIn(f"Late change, parked={parked}", titles, late)
 
     def test_status_keeps_the_last_decision_without_a_later_phase(self) -> None:
         held_id = self.complete_held_phase()

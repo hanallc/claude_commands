@@ -1,5 +1,20 @@
 # Unit progress history
 
+Staff records a unit's open run through `OpenRun(path)` or `NoRun`.
+`unit_runs.run_is_open(folder)` checks the owner's staff pointer for unit run folders.
+Hooks and displays use the local staff record by default.
+Lifecycle commands supply a record from `staff.initial_snapshot()`.
+`unit_runs.is_unit_run(folder)` tests whether the folder is under a root from `run_roots()`.
+Run state has no `status` while the run is open.
+After closure, `status` records `completed`, `error`, `stopped`, `interrupted`, or `ended`, with `finished_at`.
+Every folder outside those roots is a helper run with no staff pointer.
+Their state has no outcome while their run is open.
+History events retain outcomes and durations.
+Readers select the current unit run from staff.
+`start-phase` reopens a closed run or a run whose state still has an outcome.
+It removes `status` and `finished_at`, records `reopened`, and writes the state before it claims the staff pointer.
+
+
 Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
 remain only for the pending archive cleanup; they do not dispatch new reviews.
@@ -13,10 +28,58 @@ per-run JSONL files under:
 ```
 
 The live session cache remains in
-`/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
+`<run root>/<run-id>/progress_history_state.json`. The run root is `/session/<name>/run` for a run made in a session folder, else `/tmp/claude/unit` (`/tmp/claude/delegate` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
+The guard refuses old recorder state with a root `phase_last_percent` key.
+The warning gives the path to the state file and names no command.
+
+## Configuration digest
+
+`config_digest` hashes the exact model registry text and `direct.conf` bytes at each call. A call costs about 30 microseconds, and verify_helper.py can run many recorder commands in one process.
+It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
+Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
+The same text and direct settings produce the same digest.
+An unreadable or invalid source produces an empty digest.
+Telemetry does not stop the launch.
+
 ## Event model
+
+`owner_staff_id` is the run's owner field.
+Owner lookup uses a fixed staff id and reads the current unit or showrunner row.
+Fixed owner references resolve current staff facts.
+Historical session identities remain event-time data.
+Saved event names remain historical text.
+Run state stores no current folder, branch, production name, or unit name for a staffed owner.
+State reads resolve the folder through staff and read the branch through Git.
+Closed states use the same rule.
+History keeps the event-time folder and branch.
+History reads preserve those recorded values.
+Staffed run state stores no director session, director family, or dispatch participant name.
+Current reads resolve those facts through the fixed staff references.
+Native transcript evidence supplies the director family.
+Shared account-home discovery includes numbered Codex accounts when staff has no session home.
+Active readers obtain the current folder through `pass_record.staff_directory`.
+They do not route through saved folder copies or an absolute plan path.
+`start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
+`start-run` with a different plan on an existing run records that plan and its project clock.
+The same plan changes nothing.
+Staff stores neither the plan nor the port.
+
+`progress_history.last_dispatch(worker_id)` returns `RecordedDispatch` or `NoDispatchRecorded`.
+It finds the newest open or finished dispatch across the worker parent's runs.
+A recorded worker id selects the dispatch.
+The dispatch history lookup selects workers through fixed staff IDs.
+Current readers validate the worker's parent through staff.
+`DispatchDetailNotRecorded.UNRECORDED` represents an absent dispatch field.
+The result includes the phase instance and status.
+It uses no current-role fallback from the role history.
+Resume messages use these settings to construct `assign.sh` commands.
+`write_review_turn` owns review-turn records.
+
+Supplier lookup resolves a staff member reference or an explicit native id.
+It joins the selected row's `current_session` to a live native registry record.
+Registry names and former names do not select suppliers.
 
 Schema version 1 records these event types:
 
@@ -53,12 +116,15 @@ stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
-`start-run` resolves the project clock without an agent-supplied timestamp. For
-a supplied plan, the recorder uses its timezone-qualified `Project started`
-field. If absent, it persists the oldest Git commit time for that plan, or the
-run start when the plan has no history. For ad hoc work without a plan, it
-reuses the most recent plan-backed clock for the exact working directory and
-branch. With no such history, the project clock starts with the run.
+`start-run` resolves the project clock without an agent-supplied timestamp.
+For a supplied plan, the recorder uses its timezone-qualified `Project started` field.
+If the field is absent, the recorder saves the oldest Git commit time for that plan.
+If the plan has no Git history, the recorder saves the run start time.
+For ad hoc work without a plan, the recorder reuses the most recent plan-backed clock for the exact working directory and branch.
+For older events without a folder, this lookup resolves the folder through the fixed staff owner ID.
+The lookup preserves a recorded folder and branch.
+It does not change the event file.
+With no matching history, the project clock starts with the run.
 
 The live state and every event record `project_start_source` and
 `project_plan_doc`. `progress` resolves these fields for legacy active runs that
@@ -87,7 +153,7 @@ active Claude or Codex transcript. `_main_identity_from_codex` and
 `_main_identity_from_claude` each return `KnownMainIdentity |
 MainIdentityUnavailable`; `_detect_main_identity()` takes explicit `--main-*`
 flags first, then the Codex transcript (`CODEX_THREAD_ID`), then the Claude one
-(`CLAUDE_CODE_SESSION_ID`), and falls back to model `unknown`. `implement.sh` and `review.sh` provide the
+(`CLAUDE_CODE_SESSION_ID`), and falls back to model `unknown`. `assign.py` and `review.sh` provide the
 called task, family, model, and effort after resolving `config/models.conf`.
 
 Each recorder command takes a session lock around its state transition. Each
@@ -165,23 +231,28 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/direct/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
-`FIX_PASS < 10` counter, which could not converge: the re-review after each fix
-was a fresh blind review of a now-larger diff, with no memory of what had already
-been accepted, so it always returned something.
+`scripts/direct/findings.py` records findings and controls repair batches for `/unit:direct`.
+Stable finding identities preserve accepted verdicts across reviews.
 
 State lives in `findings_state.json` beside the progress state and holds the
-ledger of the newest open phase. When the current phase changes, the ledger it
-displaces is copied to `findings_state-<instance_id>.json` and read back when
+ledger of the newest open phase. When the newest open phase changes, its previous ledger is copied to `findings_state-<instance_id>.json` and read back when
 that phase is current again; a phase with no ledger yet starts fresh. Every
 command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. implement.sh passes its `--phase` to `landed` and `abandon`. Findings get stable
+--phase`. `decision` and `status` also take a closed phase by its newest ledger.
+`open` takes a late finding for a closed phase: it writes the parked ledger of
+the newest instance that the run started, which `review-trial` reads.
+`open --accepted` records a late finding that is already fixed, with the
+`finding_verdict` event that `verdict` writes. It refuses an open or unnamed
+phase and `--held-for-decision`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
-Each finding is `open`, `fixed_pending_review`, or `accepted`.
+Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
+Decision states are `held_for_decision` and `decided`.
+A routed finding remains unresolved outside the gating batch.
+Its receiving checkpoint records closure through `close-route`.
 
 `gate` returns one of two verdicts and the unit director follows it — it never
 decides on its own whether to run another round:
@@ -192,14 +263,14 @@ decides on its own whether to run another round:
 There is no third verdict. The gate does not stop the run, and it holds no
 override, because there is nothing to override.
 
-Three rules are enforced by refusal, not by prose:
+The ledger enforces these batch rules:
 
-- **Severity narrows.** Round 1 gates blockers and minors; every later round
+1. **Severity narrows.** Round 1 gates blockers and minors; every later round
   gates blockers only. Nits never gate, and are returned as `non_gating_open` so
   they can still be reported.
-- **One batch per round.** `dispatch --covers` refuses a partial batch, so a
+2. **One batch per round.** `dispatch --covers` refuses a partial batch, so a
   round cannot repair one finding, re-review, and rediscover the rest.
-- **No gate with verdicts outstanding.** `gate` refuses while any finding is
+3. **No gate with verdicts outstanding.** `gate` refuses while any finding is
   `fixed_pending_review`; reopening an `accepted` finding requires `--evidence`
   naming the hunk that invalidated it.
 
@@ -211,44 +282,62 @@ consecutive rounds with no decrease in the gating-open count;
 `MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
 `RUNAWAY_ROUNDS` backstop.
 
-Each of these used to stop the phase and hand it to the user. They stopped too
-much: the stall test in particular fires on a converging phase whose every
-round repairs exactly what it was handed and whose next gate finds something
-genuinely new, which reads as one open blocker round after round. The count cannot tell
-that apart from a repair that will not take. So the tests were kept for what they
-are good at — naming the shape of a phase that is not converging — and the
-enforcement was dropped. The unit director reports the sentence and dispatches the
-round; the user watches the run and stops it themselves when it warrants.
+These advisories describe repair cost and progress.
+They do not stop the phase.
+The director reports the advisory and continues through the repair rules.
+An unchanged open count can describe new findings or repeated failed repairs, so the count alone cannot decide when to stop.
 
 The repair budget is the first round's gating count times
 `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
-limits are set in `~/.claude/config/direct.conf`, read at startup by
-`findings.py` and required there — an absent or unusable value exits 2 rather
-than falling back. They now decide when an advisory is worth printing rather than
-when a phase stops, so the shipped values set where a phase starts being reported
-as slow, not where it is cut off.
+limits are set in `~/.claude/config/direct.conf` and read by `findings.py` at startup.
+An absent or unusable required value exits 2.
+The budget and convergence limits control advisories.
+`ROUTING_FROM_ROUND=4` and `ASTRA_AFTER_FAILED_FIXES=2` enforce repair evidence.
+From round four, each kept finding needs its category and evidence.
+A due Astra record applies to the finding's current fix-attempt count.
+Every dispatch records affected accepted checks or an explicit reason for none.
+The [repair overview](repair-rounds.md#repair-control-and-routed-work) defines these controls and the distinct round measures.
+
+A ledger batch with a started fix pass counts as one repair round. Relaunches of that batch add no round.
+A dispatch alone adds no round. Passes without a ledger batch add no round to `repair_round`.
+A refused launch spends no fix attempt or repair budget.
+`history.py rounds` still reports their overlap groups, including gate, merge and live work.
+`dispatch` records the batch before the worker launch. Its `round` is a stable audit number.
+`repair_round` uses the fix pass history and its `launch_check.fix_cause.round` ledger number. Missing pass history gives no repair rounds.
+`abandon --reason "<launch refusal>"` refunds a refused launch's reserved fix attempt.
+Refunded batches spend no repair round or repair budget and do not trigger the runaway advisory.
+The history reader uses `finding_batch_abandoned.edits_landed=false` to identify a refund. A later landed event restores the batch.
+The first batch without a refund sets the budget's original finding count.
+The consecutive-fix advisory counts each ledger batch once per worker. Refunded batches add no fix to that count.
 
 ## Commands
 
+`findings.py close-route --from` accepts the exact key printed by the routed-work list.
+The key is `<run id>:<phase instance id>:<finding id>`.
+A route created before its phase record uses `<run id>::<finding id>`.
+The parser requires three parts and nonblank run and finding ids.
+It accepts an empty phase instance id and preserves the `finding_route_closed` event format.
+
 ```text
-findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>] [--accepted]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
-findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,...
+findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<category>:<evidence>]
 findings.py status --session-dir <dir> [--phase <id>]
 ```
 
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
-progress_history.py start-pass ...        # launcher only
-progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
+pass_record.py start-pass ...        # launcher only
+pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
 progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
 progress_history.py timeline --session-dir <dir> [--phase <id>]
@@ -256,32 +345,48 @@ progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
 
-Phases can be open together. State holds the most recently started open phase
-under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
-`findings.py` use) and the older open ones under `open_phases`, each carrying
-its own percent, calibration and early-review state under `parked`.
-An unchanged `start-phase` retry leaves the open phase and its records unchanged from any working directory.
-A changed title or explicit start time can trigger a restart refusal from another recorded worktree.
-Reopening a finished id removes its old worktree and baselines; the next claim records the worker's repository root, HEAD and status.
+`review-trial` reports code, UX, and simplify counts and review times for one phase instance.
+[Review regime records](review-regime-trial.md) define its sources, output, and checkpoint parser.
+
+`drop-phase` closes an open phase as stopped and records `phase_dropped` with the newest finished instance ID and reason.
+It refuses an unknown phase, a completed newest instance, or an empty reason.
+A repeat with the same reason changes nothing; a different reason adds a new event.
+The board shows no row for the dropped attempt.
+
+The recorder stores all open phases in `open_phases`.
+Each entry owns its start, activity, early review, percent, and calibration.
+Passes, waits, and checkpoints identify the phase instance.
+The recorder retains the last closed phase for reports on work after closure.
+When it reads an older record, it moves the active phase and saved fields into the open list.
+
+Starting another phase leaves every open phase and its work unchanged.
+A retry with the same title and start keeps the existing phase instance.
+A changed title or start can cause a refusal from a different worktree.
+Reopening a phase clears its old worktree and baselines.
 A held reservation prevents this reset until its release is confirmed.
-Starting another id leaves every open phase open. A phase closes only by its own `finish-phase`:
-`--phase-id` names it, and without it the current one closes. Only that phase's
-passes close with it (each pass carries the phase it was opened in, under
-`phase`), and when the current phase closes, the newest older open phase is
-current again. `finish-run` closes every open phase, newest first. A back-fill
-is `start-phase --started-at` then `finish-phase --phase-id <id>
---finished-at`; both events carry `backfilled: true` and `recorded_at`, neither
-time may be in the future or the finish before the start, and the phase table's
-gap samples skip them. Findings recorded between the two calls go to the
-back-filled phase. A launcher names no phase, so a pass it starts belongs to
-the current phase.
+
+Use `--phase-id` to select a phase while several are open.
+An unnamed phase command selects the only open phase or lists the open IDs in its refusal.
+`finish-phase` closes only the selected phase, its passes, and its waits.
+`drop-phase` records the reason for a stopped attempt.
+`finish-run` finishes every open phase before it closes the run.
+Elapsed time spans each phase's own start and finish.
+
+Use `progress --all` to read each open phase's elapsed time, last recorded percent, and ETA.
+Use `progress --phase-id <id>` to assess one phase.
+Use `eta --phase-id <id>` to record a time for one phase.
+
+To record a past start or finish, use `--started-at` or `--finished-at`.
+Both events carry `backfilled: true` and `recorded_at`.
+The time must be in the past or present.
+The finish must follow the start.
+The phase table excludes those events from gap samples.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
 phase note from the event stream; `eta` asks for it after its append and before
 its `ETA recorded:` line. A refresh failure adds one stderr line and changes
-neither the command's output nor its exit status. Plans without a
-`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+neither the command's output nor its exit status. Runs whose plan has no staff unit skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
 `eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`):
@@ -296,7 +401,7 @@ enclose the target, one range end alone, a blank basis, or no active phase and
 no `--phase-id`. `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the
 process `TZ` is not read.
 
-`implement.sh` and `review.sh` own pass lifecycle: they set
+`assign.py` and `review.sh` own pass lifecycle: they set
 `UNIT_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
 calls, per invocation so the agent subprocess never inherits it. The recorder
 rejects an unowned call, because a hand-written pass forges one that never ran
@@ -474,9 +579,11 @@ with the round's result on the row that closes it. A later occupancy reports the
 kind its own pass recorded: the role the last occupant left on the board
 describes work that is already over.
 
-Window names come from the pass kind and its position among that kind in the
-phase — `Impl`, `Fix 1`, `Fix 2` — and a fix carries the round the ledger
-dispatched, so its number is the one convergence counts. A review is named for
+Window names use the pass kind and its position within the phase: `Impl`, `Fix 1`, `Fix 2`.
+A fix also carries its ledger dispatch number for the audit trail.
+Relaunches with the same ledger number count as one repair round for convergence.
+Refunded batches add no round unless they later land. The repair count can therefore differ from the dispatch number.
+A review is named for
 the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
 `Review Fix 1` — since a review always follows the pass it judges, and an
 activity between them is transparent, so verification does not break the pair. A
@@ -484,20 +591,13 @@ review with no unclaimed pass behind it, the closure review after verification,
 keeps the ordinal `Review 3`. An
 activity's name is its `--label`, and its `Worker` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
-than per run, and `start-pass` and `start-activity` re-detect the unit director
-as they open, so a unit director that changes model or effort part way through
-shows the change on the rows after it. Windows are also opened from inside
-workers: a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but
-detects as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
-of its own. So `_refresh_main_identity` replaces `main_agent` only when the
-detected session is the run's director (`unit_runs.director`, the run folder's
-`director` file, else the `run_started` event's session), else the stored
-identity's session; with neither known it takes any detection. The director is
-read from the run folder rather than from `main_agent` because until 2026-10-17
-every window rewrote it, and three live runs then carried a worker's thread there;
-the director's next window repairs such a run. Detection that comes back unknown
-leaves the stored identity alone, because a window that cannot answer must not
-erase the answer already recorded.
+than per run.
+`start-pass` and `start-activity` detect the director's model and effort when they open a window.
+The fixed run owner reference selects the director through staff.
+A worker's detection cannot replace that director's settings.
+State stores model and effort as turn telemetry.
+Staff supplies the current session and backend family when a state read has a fixed owner.
+Events keep their event-time identities for attribution.
 
 A round's result is every finding the ledger stamped with that round: verdicts
 make it `N fixed` plus `M open` where those apply, findings opened make it

@@ -1,6 +1,10 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime
+
+from scripts.agents import remote
+
 from scripts.production.fake_unit_host import labeled as labeled_host
 
 from contextlib import contextmanager
@@ -8,6 +12,7 @@ from collections.abc import Generator
 import json
 import os
 from pathlib import Path
+import runpy
 import shlex
 import shutil
 import socket
@@ -18,21 +23,18 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
-sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
-                for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production import staff, unit_names
+from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
 )
-from dailies_input import StatusBlock, UnitRow, status_blocks
-from unit_lookup import UnitState
-import fake_unit_host
-from fake_unit_host import HostedUnit
-from sessions import SessionRecord
-from fake_herdr import CommandResponse, pane_list
+from scripts.production.unit_status import StatusBlock, status_blocks
+from scripts.production import fake_unit_host
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.message.sessions import SessionRecord
+from scripts.herdr.fake_herdr import CommandResponse, pane_list
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
@@ -50,7 +52,60 @@ def _write_executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
-def publish_host(environment: dict[str, str], units: list[HostedUnit]) -> None:
+def run_fixture_python() -> None:
+    """Run the status command with process facts from the private process tree."""
+    from scripts.agents import detached_run_process
+    from scripts.herdr import herdr
+    from scripts.message import process_identity, process_table, relay_identity, session_records, sessions
+
+    root = Path(os.environ["HERDR_PROC"])
+    starts: dict[int, str] = {}
+    processes: dict[int, process_table.Process] = {}
+    for stat in root.glob("[0-9]*/stat"):
+        pid = int(stat.parent.name)
+        fields = stat.read_text().rsplit(")", 1)[1].split()
+        started = fields[19]
+        if not started:
+            raise AssertionError(f"No start for fixture process {pid}")
+        starts[pid] = started
+        arguments = (stat.parent / "cmdline").read_text().rstrip("\0").split("\0")
+        processes[pid] = process_table.Process(pid, int(fields[1]), arguments[0], shlex.join(arguments))
+
+    def fixture_start(pid: int) -> str:
+        try:
+            return starts[pid]
+        except KeyError as error:
+            raise AssertionError(f"No start for fixture process {pid}") from error
+
+    def check_process(pid: int, signal: int) -> None:
+        if signal != 0:
+            raise AssertionError("The status fixture only checks whether a process exists.")
+        if pid not in starts:
+            raise ProcessLookupError(pid)
+
+    def socket_reply(client: herdr.Herdr, method: str, **params: object) -> dict[str, object]:
+        if method != "pane.process_info":
+            raise AssertionError(f"Unexpected fixture socket request: {method}")
+        responses = cast(dict[str, CommandResponse], json.loads(Path(os.environ["FAKE_HERDR_RESPONSES"]).read_text()))
+        response = responses[f"--session {client.session} pane process-info --pane {params['pane_id']}"]
+        return herdr.json_object(herdr.decode_object(response["stdout"], "fixture response")["result"], "fixture result")
+
+    sys.argv = sys.argv[1:]
+    with (mock.patch.object(process_identity, "process_start", side_effect=starts.get),
+          mock.patch.object(relay_identity, "process_start", side_effect=starts.get),
+          mock.patch.object(session_records, "process_start", side_effect=starts.get),
+          mock.patch.object(sessions, "process_start", side_effect=fixture_start),
+          mock.patch.object(process_table, "snapshot", return_value=processes),
+          mock.patch.object(detached_run_process, "supervisor_records", return_value={}),
+          mock.patch.object(herdr.Herdr, "socket_request", new=socket_reply),
+          mock.patch.object(os, "kill", side_effect=check_process)):
+        if sys.argv[0] == "-":
+            exec(compile(sys.stdin.read(), "<stdin>", "exec"), {"__name__": "__main__"})
+        else:
+            _ = runpy.run_path(sys.argv[0], run_name="__main__")
+
+
+def publish_host(environment: dict[str, str], units: list[HostedUnit], pids: dict[str, int]) -> None:
     """Keep fake process ancestry, listener ownership, argv logs and exact response bytes.
 
     These tests use only static read responses, so generate their shell dispatch
@@ -58,6 +113,9 @@ def publish_host(environment: dict[str, str], units: list[HostedUnit]) -> None:
     Unknown commands fail loudly rather than silently accepting an untested call.
     """
     fake_unit_host.write(environment, units)
+    for unit in units:
+        if unit.session in pids:
+            fake_unit_host.place_process(environment, pids[unit.session], unit.pane, session=unit.session, exec_shell=True)
     responses = cast(dict[str, CommandResponse], json.loads(Path(environment["FAKE_HERDR_RESPONSES"]).read_text()))
     lines = ["#!/usr/bin/env zsh", 'case "$*" in']
     for command, response in responses.items():
@@ -105,17 +163,19 @@ class UnitStatusFixture(unittest.TestCase):
         (root / "scripts/agents").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "agents/worker_lifecycle.py", root / "scripts/agents/worker_lifecycle.py")
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py", "pane_launch.py"):
+        for name in ("herdr.py", "herdr_types.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
-        (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
+            _ = shutil.copy2(SCRIPT.parents[1] / "agents" / name, root / "scripts/agents" / name)
         _ = shutil.copytree(SCRIPT.parents[1] / "lib", root / "scripts/lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
-        for name in ("active", "sessions"):
+        _write_executable(root / "scripts/lib/py",
+                          f"#!/bin/sh\nPYTHONPATH={shlex.quote(str(root))} exec {shlex.quote(sys.executable)} "
+                          + '-PS -m scripts.production.unit_status_test_support "$@"\n')
+        for name in ("sessions",):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
+        copy_runtime(root)
         _ = shutil.copytree(root, cls.fixture_seed)
         shutil.rmtree(root)
 
@@ -127,14 +187,6 @@ class UnitStatusFixture(unittest.TestCase):
         finally:
             shutil.rmtree(self.fixture_case)
 
-    def live_pid(self) -> int:
-        """A unique real live process whose lifetime ends on pipe EOF."""
-        child = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        assert child.stdin is not None
-        self.addCleanup(child.wait, timeout=TEST_HANG_GUARD_SECS)
-        self.addCleanup(child.stdin.close)
-        return child.pid
-
     def run_statuses(
         self, marker: str | None, health_text: str, health_exit: int, *,
         panes: tuple[dict[str, str], ...],
@@ -143,16 +195,17 @@ class UnitStatusFixture(unittest.TestCase):
         stopped_units: tuple[str, ...] = (),
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
+        unreadable_registry: bool = False,
     ) -> tuple[tuple[str, ...], str | None, str]:
-        with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
+        with self.case_directory() as root, isolated_staff_file(
+            root / "staff.json", environment := {**os.environ, "XDG_CONFIG_HOME": str(root / "xdg-config")},
+        ):
             script = root / "scripts/production/unit_status.sh"
-            active_dir = root / "active"
             call_log = root / "notifier_calls"
             records = root / "sessions"
             responses_file = root / "herdr-responses.json"
             environment.update({
                 "HOME": str(root),
-                "UNIT_ACTIVE_DIR": str(active_dir),
                 "UNIT_HISTORY_DIR": str(root / "history"),
                 "NOTIFIER_STATE_DIR": str(root / "notifier"),
                 "NOTIFIER_NOW_EPOCH": "20100",
@@ -160,6 +213,7 @@ class UnitStatusFixture(unittest.TestCase):
                 "NOTIFIER_HEALTH_TEXT": health_text,
                 "NOTIFIER_HEALTH_EXIT": str(health_exit),
                 "NOTIFIER_SESSIONS_DIR": str(records),
+                "XDG_STATE_HOME": str(root / "state"),
                 "HERDR_BIN": str(root / "fake-herdr"),
                 "HERDR_PROC": str(root / "proc"),
                 "HERDR_PANE_RECORD_DIR": str(root / "panes"),
@@ -174,7 +228,7 @@ class UnitStatusFixture(unittest.TestCase):
             self.unit_ids = {row.name: row.id for row in staff.initial_snapshot().find(kind="unit")}
             pids: dict[str, int] = {}
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
-            for unit in units:
+            for index, unit in enumerate(units, start=1):
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
                 for arguments in (
@@ -187,7 +241,7 @@ class UnitStatusFixture(unittest.TestCase):
                                        timeout=TEST_HANG_GUARD_SECS)
                 if unit not in retired_units:
                     member = unit_membership("example", unit)
-                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", worktree), expected=member.worktree)
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=member.worktree)
                     write_text_atomic(worktree / ".unit.toml", 'plan = "docs/plan.md"\nresponsibilities = []\n')
                 if unit in missing_units:
                     continue
@@ -199,44 +253,50 @@ class UnitStatusFixture(unittest.TestCase):
                     if unit in retired_units:
                         owner = showrunner_relationship("example")
                         member = fixture_member("unit", name=unit, parent=owner.id,
-                                                worktree=staff.RemovedWorktree("natedev", worktree))
+                                                worktree=staff.RemovedWorktree(remote.local_machine(), worktree))
                     else:
                         member = unit_membership("example", unit)
                     session_id = member.id
-                    if marker is not None:
-                        _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
-                    pids[unit] = self.live_pid()
-                    record = SessionRecord(pid=pids[unit], sessionId=session_id, name=f"claude-{unit}",
+                    if marker:
+                        _ = staff.set_run(member.id, staff.OpenRun(Path(marker.strip())))
+                    pid = pids[unit] = 992000 + index
+                    record = SessionRecord(pid=pid, sessionId=session_id, name=f"claude-{unit}",
                         messagingSocketPath=str(address), updatedAt=1,
-                        tmux="", formerNames=[])
-                    _ = (records / f"{unit}.json").write_text(
+                        procStart="1", tmux="", formerNames=[])
+                    _ = (records / f"{pid}.json").write_text(
                         "{" if unit in unreadable_units else json.dumps(record))
             production_doc = root / "example-production.md"
             _ = production_doc.write_text("# Production\n", encoding="utf-8")
             owner = showrunner_relationship("example")
-            _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", production_doc))
+            _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), production_doc))
             zsh = shutil.which("zsh")
             if zsh is None:
                 raise RuntimeError("zsh is required for unit status tests")
             outputs: list[str] = []
             for pane_by_unit in panes:
                 hosted = [
-                    labeled_host(unit, f"w{index}:p1", unit, slug="example",
+                    labeled_host(unit, f"w{index}:p1", unit, production_name="example",
                                  screen=pane_by_unit.get(unit, "— holding: waiting on x\n"))
                     for index, unit in enumerate(units, start=1) if unit not in missing_units]
                 for unit in hosted:
-                    if unit.session in stopped_units:
-                        unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
-                publish_host(environment, hosted)
-                for unit in hosted:
-                    if unit.session in pids:
-                        fake_unit_host.place_process(environment, pids[unit.session], unit.pane, exec_shell=True)
+                    unit.marks["CLAUDE_CODE_SESSION_ID"] = unit.marks.pop("CODEX_THREAD_ID")
+                publish_host(environment, hosted, pids)
+                if unreadable_registry and records.is_dir():
+                    shutil.rmtree(records)
+                    records.touch()
                 result = subprocess.run(
-                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
+                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", "example"],
                     check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stderr, "")
+                expected_errors = "".join(
+                    f"anomaly: pid {pids[unit.session]} in herdr:{unit.session}:{unit.pane}: "
+                    + f"the session record of pid {pids[unit.session]} could not be read\n"
+                    for unit in hosted if unit.session in unreadable_units
+                )
+                if unreadable_registry:
+                    expected_errors += "anomaly: cannot list session records\n"
+                self.assertEqual(result.stderr, expected_errors)
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"
@@ -268,4 +328,8 @@ class UnitStatusFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.txt"
             _ = path.write_text(output, encoding="utf-8")
-            return status_blocks(path, tuple(UnitRow(unit, unit, UnitState.RUNNING, self.unit_ids[unit_names.name(unit)]) for unit in units))
+            return status_blocks(path, units)
+
+
+if __name__ == "__main__":
+    run_fixture_python()

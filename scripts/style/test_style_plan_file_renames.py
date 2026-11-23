@@ -2,28 +2,25 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
-import sys
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import approved_renames
-import style_footprint
-import style_plan
-import style_proposals
-import proposal_issue
+from scripts.style import approved_renames
+from scripts.style import style_footprint
+from scripts.style import style_plan
+from scripts.style import style_proposals
+from scripts.production import proposal_issue
 
-import rules
-import style_ledger
+from scripts.style import rules
+from scripts.style import style_ledger
 
-from style_plan_test_support import StylePlanFixture, unit_staff_id
+from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
 
 @final
@@ -39,14 +36,14 @@ class StylePlanTests(StylePlanFixture):
             finding = ledger.hold(rule, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: {unit_staff_id("names-unit")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+                             + f'unit: {unit_staff_id("names")}\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
         self.proposals_field(folder)
         def start(*args: str) -> None:
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(proposal_issue.main(list(args)), 0)
         with mock.patch.object(style_proposals, "proposal_command", side_effect=start):
             self.assertEqual(self.run_next()[0], 0)
-            ticket = self.ledger().ticket_open(ticket_owner_id("names-unit"))[0]
+            ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
             self.assertEqual(ticket["kind"], "proposal")
             self.assertEqual(ticket["files"], [self.sources[0]])
             first = self.plan.read_text()
@@ -322,6 +319,11 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),),
                                          pairs=(("lock::LockError", "lock::LockFailure"),))
         self.renamed_ledger(handle, "LockFailure")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("lock::LockError -> lock::LockFailure not applied", output)
+        moved = "crates/alpha/src/ledger/mutation_lock.rs"
+        self.write(moved, (self.repo / moved).read_text().replace("LockError", "LockFailure"))
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
         path = self.repo / "crates/alpha/src/ledger/handle.rs"
         _ = path.write_text(path.read_text().replace("super::mutation_lock::LockFailure", "super::mutation_lock::LockFault"))
@@ -377,9 +379,14 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual(result, 1, output)
                 self.assertIn(self.RENAMED_REFUSAL, output)
 
-    def test_approved_file_rename_leaves_the_renamed_file_free_when_another_finding_names_it(self) -> None:
+    def test_approved_file_rename_checks_contents_with_an_approved_declaration(self) -> None:
         self.assertEqual(self.renamed_declaration_gate((("lock::LockError", "lock::LockFailure"),)),
                          (0, "approved proposal\n"))
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        self.write(new, (self.repo / new).read_text() + "pub struct Other;\n")
+        result, output = self.reference_gate("1")
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.RENAMED_REFUSAL, output)
 
     def test_approved_file_rename_refuses_a_declaration_rename_that_no_finding_names(self) -> None:
         result, output = self.renamed_declaration_gate(())

@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
@@ -18,28 +15,21 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from memory_test_support import config_environment, write_config_fixture
+from scripts.build_hold.owning_session import OwningSession
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
-import targets
-import build_hold
-import mac_test
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.build_targets import build_targets, target_config, targets
+from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
+from scripts.buildlog import repository
+from scripts.mac_test import mac_test
+from scripts.lib import atomic_file
+from scripts.lib import process_start as process_identity
 
-import offload
-if TYPE_CHECKING:
-    from . import target_config
-else:
-    import target_config
+from scripts.mac_test import claim_state, eligibility, offload
 
 
-from override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
 
 require_checkout(Path(__file__))
 
@@ -49,6 +39,13 @@ NOW = datetime(2026, 10, 11, 21, 0, tzinfo=timezone.utc)
 SINCE = datetime(2026, 10, 11, 20, 5, tzinfo=timezone.utc)
 END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)
 
+
+def fixture_mac_mirror(worktree: Path, repository: str, key: str) -> claim_state.ResolvedMacMirror:
+    """Give routing tests a mirror identity without Git commands."""
+    fence = claim_state.mac_claim_stem(key, 0)
+    return claim_state.ResolvedMacMirror(key, repository, f"{fence}.json", fence, str(worktree))
+
+
 HoldRecord = TypedDict(
     "HoldRecord",
     {"holder": str, "since": str, "for": str, "release_eta": str},
@@ -56,6 +53,10 @@ HoldRecord = TypedDict(
 
 
 class ClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     pid: int
     proc_start: str
     what: str
@@ -99,6 +100,10 @@ class IsolatedTargetTest(unittest.TestCase):
         self.holders.mkdir()
         self.mac_state.mkdir()
         (self.root / "sessions").mkdir()
+        _ = config_environment(self.root)
+        _ = write_config_fixture(self.root / "build_targets.conf",
+                                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                                 + "kind.natedev=local\nplatform.natedev=linux\n")
         _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
@@ -108,7 +113,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
@@ -156,6 +161,8 @@ class IsolatedTargetTest(unittest.TestCase):
 
     def write_claim(self, file_name: str = "run.json", what: str = "nextest hana", since: datetime = SINCE) -> None:
         record: ClaimRecord = {
+            "claim_id": file_name, "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "test-run-start",
             "what": what,
@@ -168,26 +175,61 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
-    def test_aws_classification_requires_linux_and_a_name_or_settings_match(self) -> None:
-        cases: tuple[tuple[str, target_config.Platform, str, bool], ...] = (
-            ("aws", "linux", "custom.conf", True),
-            ("builder", "linux", "aws_target.conf", True),
-            ("builder", "linux", "custom.conf", False),
-            ("aws", "macos", "custom.conf", False),
-            ("builder", "macos", "aws_target.conf", False),
-            ("aws", "macos", "aws_target.conf", False),
-        )
-        for name, platform, filename, expected in cases:
-            with self.subTest(name=name, platform=platform, filename=filename):
-                target = target_config.SshTarget(name, platform, self.root / filename)
-                self.assertEqual(target_config.is_aws_target(target), expected)
+    def test_removed_builder_cannot_register_by_name_or_settings(self) -> None:
+        registry = self.root / 'removed-target.conf'
+        for name, filename in (('aws', 'custom.conf'), ('builder', 'aws_target.conf')):
+            with self.subTest(name=name, filename=filename):
+                _ = (self.root / filename).write_text('')
+                _ = registry.write_text(f'targets={name}\nkind.{name}=ssh\nplatform.{name}=linux\nsettings.{name}={filename}\n')
+                with self.assertRaisesRegex(targets.ConfigError, 'permanent AWS builder was removed'):
+                    _ = targets.read_targets(registry)
 
-    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
-        self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
-            targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
+
+    def test_fixture_config_reads_mac_then_natedev(self) -> None:
+        self.assertEqual(targets.read_targets(self.root / "build_targets.conf"), (
+            targets.SshTarget("mac", "macos", self.settings),
             targets.LocalTarget("natedev", "linux"),
-            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
+
+    def test_pinned_targets_require_an_explicit_registry_lookup(self) -> None:
+        gpu_settings = self.write_config("execution_transport=hana-gpu\n", "gpu.conf")
+        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=gpu.conf\n")
+        local = targets.LocalTarget("natedev", "linux")
+        gpu = targets.SshTarget("hana-gpu", "linux", gpu_settings)
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                target_config.command_configuration()):
+            self.assertEqual(targets.read_targets(config), (local,))
+            self.assertEqual(target_config.configured_ssh_target("hana-gpu"), gpu)
+            self.assertEqual(targets.read_targets(config, target_name="hana-gpu"), (gpu,))
+            self.assertEqual(targets.read_targets(config), (local,))
+
+    def test_lookup_validates_only_the_requested_target(self) -> None:
+        hana = self.write_config("execution_transport=hana-control\nhost=hana\n", "hana.conf")
+        config = self.write_config("targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\n"
+            + "settings.hana-aws=hana.conf\npinned_targets=hana-gpu\n"
+            + "kind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=missing.conf\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+            self.assertEqual(target_config.configured_ssh_target("hana-aws"),
+                             targets.SshTarget("hana-aws", "linux", hana))
+            with self.assertRaisesRegex(targets.ConfigError, "settings.hana-gpu"):
+                _ = target_config.configured_ssh_target("hana-gpu")
+            _ = self.write_config("execution_transport=invalid\n", "missing.conf")
+            self.assertEqual(target_config.configured_ssh_target("hana-aws").settings, hana)
+            with self.assertRaisesRegex(targets.ConfigError, "execution_transport"):
+                _ = target_config.read_execution_transport(target_config.configured_ssh_target("hana-gpu"))
+
+    def test_malformed_pinned_list_does_not_block_hana_lookup(self) -> None:
+        hana = self.write_config("execution_transport=hana-control\nhost=hana\n", "hana.conf")
+        gpu = self.write_config("execution_transport=hana-gpu\n", "gpu.conf")
+        for pinned in ("hana-gpu,", " , hana-gpu, hana-gpu ,hana-aws,"):
+            with self.subTest(pinned=pinned):
+                config = self.write_config("targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\n"
+                    + f"settings.hana-aws=hana.conf\npinned_targets={pinned}\n"
+                    + "kind.hana-gpu=ssh\nplatform.hana-gpu=linux\nsettings.hana-gpu=gpu.conf\n")
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                    self.assertEqual(target_config.configured_ssh_target("hana-aws").settings, hana)
+                    self.assertEqual(target_config.configured_ssh_target("hana-gpu").settings, gpu)
 
     def test_order_follows_targets_key(self) -> None:
         config = self.write_config(
@@ -265,7 +307,7 @@ class EligibilityTests(IsolatedTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
 
     def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
         mac = targets.SshTarget("mac", "macos", self.settings)
@@ -285,8 +327,25 @@ class EligibilityTests(IsolatedTargetTest):
                 self.assertEqual(targets.target_eligibility(self.root, "hana", routing),
                                  (expected, targets.EligibleTarget(local)))
 
+    def test_mac_table_uses_the_offload_linux_only_rule(self) -> None:
+        for name, manifest in (("portable", 'name="portable"\nversion="0.1.0"\n'),
+                               ("linux-part", 'name="linux-part"\nversion="0.1.0"\n')):
+            (self.root / name).mkdir()
+            _ = (self.root / name / "Cargo.toml").write_text("[package]\n" + manifest)
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
+        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\n", template="mac_test")
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        for package, expected in (("portable", targets.EligibleTarget(mac)),
+                                  ("linux-part", targets.ExcludedTarget(mac, "linux_only")),
+                                  ("", targets.ExcludedTarget(mac, "linux_only"))):
+            with self.subTest(package=package):
+                self.assertEqual(targets.target_eligibility(self.root, package, targets.AnyEligibleTarget())[0], expected)
+        _ = (self.root / "Cargo.toml").write_text("[workspace]\nmembers=[\n")
+        self.assertEqual(targets.target_eligibility(self.root, "", targets.AnyEligibleTarget())[0],
+                         targets.ExcludedTarget(mac, "repo"))
+
     def test_unknown_repository_excludes_mac_without_excluding_linux(self) -> None:
-        with mock.patch.object(offload, "repository_identity", return_value=offload.UNKNOWN_REPOSITORY):
+        with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.UNKNOWN_REPOSITORY):
             results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
         self.assertEqual(results[0], targets.ExcludedTarget(targets.SshTarget("mac", "macos", self.settings), "repo"))
         self.assertEqual(results[1], targets.EligibleTarget(targets.LocalTarget("natedev", "linux")))
@@ -330,8 +389,19 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_local_eta_is_expected_release(self) -> None:
         self.write_holder(END.isoformat())
-        self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END), targets.HolderSession("hana")))
+        before = (self.holders / "hana").read_bytes()
+        for now, end, text in (
+            (NOW, targets.ReleaseEstimated(END), "release expected 22:05 UTC"),
+            (END, targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
+            (END + timedelta(seconds=1), targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
+        ):
+            with self.subTest(now=now), mock.patch.object(targets, "utc_now", return_value=now), \
+                 mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
+                                 targets.Held("hana", "render checks", SINCE, end, targets.HolderSession("hana")))
+                self.assertEqual(build_targets.command_status(), 0)
+                self.assertIn(f"natedev: held by hana since 20:05 UTC {text} — render checks", output.getvalue())
+                self.assertEqual((self.holders / "hana").read_bytes(), before)
 
     def test_local_without_eta_is_held_until_release(self) -> None:
         self.write_holder()
@@ -342,7 +412,7 @@ class TargetStateTests(IsolatedTargetTest):
         eta = NOW - timedelta(minutes=1)
         self.write_holder(eta.isoformat())
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(eta), targets.HolderSession("hana")))
+                         targets.Held("hana", "render checks", SINCE, targets.ReleaseOverdue(eta), targets.HolderSession("hana")))
 
     def test_mac_without_block_or_claim_is_free(self) -> None:
         self.assertEqual(targets.target_state(self.mac()), targets.Free())
@@ -375,7 +445,8 @@ class TargetStateTests(IsolatedTargetTest):
         block = self.mac_state / "block.json"
         before = block.read_bytes()
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(NOW - timedelta(seconds=1)),
+                                             targets.HolderSession("hana-session")))
         self.assertEqual(block.read_bytes(), before)
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
 
@@ -388,7 +459,7 @@ class TargetStateTests(IsolatedTargetTest):
     def test_pending_blocks_refuse_claims_before_and_after_expiry(self) -> None:
         cases: tuple[tuple[datetime, targets.HoldEnd], ...] = (
             (END, targets.ExpiresAt(END)),
-            (NOW - timedelta(seconds=1), targets.AwaitingBlockRemoval()),
+            (NOW - timedelta(seconds=1), targets.AwaitingBlockRemoval(NOW - timedelta(seconds=1))),
         )
         for expires, end in cases:
             with self.subTest(expires=expires):
@@ -407,8 +478,44 @@ class TargetStateTests(IsolatedTargetTest):
     def test_mac_block_expires_at_current_time(self) -> None:
         self.write_block(NOW)
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(NOW), targets.HolderSession("hana-session")))
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
+
+    def write_backoff(self, text: str) -> None:
+        from scripts.mac_test import eligibility
+
+        path = eligibility.backoff_path("mac")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(text, encoding="utf-8")
+
+    def test_block_precedes_an_unreadable_backoff(self) -> None:
+        self.write_block()
+        self.write_backoff("not a time")
+        snapshot = targets.ssh_target_snapshot(self.mac())
+        self.assertEqual(snapshot.states, (targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END),
+                                                        targets.HolderSession("hana-session")),))
+
+    def test_backoff_without_block_names_its_state(self) -> None:
+        cases = (("not a time", "retry backoff: could not convert string to float: 'not a time'"),
+                 ("nan", "retry backoff: backoff time is not finite"))
+        for text, reason in cases:
+            with self.subTest(text=text):
+                self.write_backoff(text)
+                self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.StateUnreadable(reason),))
+        self.write_backoff(str((NOW + timedelta(minutes=1)).timestamp()))
+        self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.Unreachable("retry backoff"),))
+        self.write_backoff(str((NOW - timedelta(minutes=1)).timestamp()))
+        self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.Free(),))
+
+    def test_local_snapshot_lists_every_holder_and_an_unrecorded_start(self) -> None:
+        self.write_holder(END.isoformat())
+        _ = (self.holders / "sweep").write_text("cargo sweep without a time", encoding="utf-8")
+        states = sorted(targets.local_hold_states(), key=lambda state: getattr(state, "holder", ""))
+        self.assertEqual(states, [
+            targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END), targets.HolderSession("hana")),
+            targets.Held("sweep", "cargo sweep without a time", targets.StartNotRecorded(), targets.UntilReleased(),
+                         targets.HolderSession("sweep")),
+        ])
 
     def test_live_claim_is_running(self) -> None:
         self.write_claim()
@@ -448,6 +555,8 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_ended_repository_claim_leaves_only_live_jobs(self) -> None:
         record: ClaimRecord = {
+            "claim_id": "ended-claim", "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "ended-run-start",
             "what": "nextest cargo-liner",
@@ -580,6 +689,8 @@ class TargetStateTests(IsolatedTargetTest):
 
     def test_claim_with_invalid_timestamp_is_a_state_read_failure(self) -> None:
         record: ClaimRecord = {
+            "claim_id": "invalid-time-claim", "episode": "fixture-episode", "attempt": "fixture-attempt",
+            "submitting_session": "",
             "pid": 12345,
             "proc_start": "test-run-start",
             "what": "nextest hana",
@@ -602,6 +713,68 @@ class TargetStateTests(IsolatedTargetTest):
                          targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
 
+class ReservationTests(IsolatedTargetTest):
+    def test_takeover_retry_publishes_its_session_after_an_interrupted_publication(self) -> None:
+        _ = self.write_config(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+        _ = write_config_fixture(self.settings, "offload=on\nhost=test-mac\nlinux_only.hana=\n", template="mac_test")
+        args = build_targets.CliArguments()
+        args.target, args.kind, args.package = "mac", "test", "sample"
+        args.repo_root, args.pid = str(self.root), os.getpid()
+        reservation = self.root / "reservation.tsv"
+        identity_file = self.root / "reservation.identity"
+        args.reservation_file, args.claim_identity_file = str(reservation), str(identity_file)
+        paths = mac_test.StatePaths(self.mac_state)
+        session = OwningSession("cleanup-session")
+        write_atomic = atomic_file.write_text_atomic
+
+        def process_start(pid: int) -> process_identity.ProcessStart:
+            return process_identity.Gone() if pid == 12345 else process_identity.Started("cleanup-start")
+
+        for failed_path in (reservation, identity_file):
+            with self.subTest(publication_failure=failed_path.name):
+                reservation.unlink(missing_ok=True)
+                identity_file.unlink(missing_ok=True)
+                retained: mac_test.RemoteJobClaim = {
+                    "claim_id": "kept-claim", "episode": "kept-episode", "attempt": "kept-attempt",
+                    "submitting_session": "original-session", "holder_session": "original-holder",
+                    "pid": 12345, "proc_start": "ended-start", "what": "older tests",
+                    "worktree": str(self.root), "since": SINCE.isoformat(), "remote_host": "test-mac",
+                }
+                mac_test.write_json(paths.run, retained)
+
+                def interrupted_write(path: Path, text: str) -> None:
+                    if path == failed_path:
+                        raise OSError("publication interrupted")
+                    write_atomic(path, text)
+
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}), \
+                        mock.patch.object(session_owner, "owning_session", return_value=session), \
+                        mock.patch.object(process_identity, "process_start", side_effect=process_start), \
+                        mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
+                        mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.ResolvedMacMirror(
+                            "fixture-hana", "hana", "hana.json", "hana", str(self.root))), \
+                        mock.patch.object(repository, "repository_key", return_value="https://fixture.invalid/hana"), \
+                        mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
+                    with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
+                        with self.assertRaisesRegex(OSError, "publication interrupted"):
+                            _ = build_targets.command_reserve(args)
+                    self.assertEqual(reservation.exists(), failed_path == identity_file)
+                    self.assertFalse(identity_file.exists())
+                    self.assertEqual(build_targets.command_reserve(args), 0)
+                self.assertEqual(reservation.read_text(), f"mac\t{self.settings}\n")
+                self.assertEqual(identity_file.read_text(),
+                                 "kept-claim\tkept-episode\tkept-attempt\tcleanup-session\n")
+                saved = mac_test.read_run(paths.run)
+                self.assertNotIsInstance(saved, mac_test.NoRun)
+                assert not isinstance(saved, mac_test.NoRun)
+                self.assertEqual(saved["submitting_session"], "cleanup-session")
+                self.assertEqual({key: value for key, value in saved.items()
+                                  if key not in ("pid", "proc_start", "submitting_session", "cleanup_pending")},
+                                 {key: value for key, value in retained.items()
+                                  if key not in ("pid", "proc_start", "submitting_session", "cleanup_pending")})
+
+
 class ValueTests(unittest.TestCase):
     def test_domain_values_are_frozen_dataclasses(self) -> None:
         values: tuple[object, ...] = (
@@ -617,6 +790,7 @@ class ValueTests(unittest.TestCase):
             targets.StateUnreadable("holder access denied"),
             targets.ExpiresAt(END),
             targets.ReleaseEstimated(END),
+            targets.ReleaseOverdue(END),
             targets.UntilReleased(),
             targets.AwaitingBlockRemoval(),
         )
@@ -625,6 +799,34 @@ class ValueTests(unittest.TestCase):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(value, "extra", "changed")
 
+    def test_start_and_end_text_name_each_case(self) -> None:
+        self.assertEqual(targets.start_text(SINCE, timezone.utc), "since 20:05 UTC")
+        self.assertEqual(targets.start_text(targets.StartNotRecorded(), timezone.utc), "start not recorded")
+        cases: tuple[tuple[targets.HoldEnd, str], ...] = (
+            (targets.ExpiresAt(END), "until 22:05 UTC"),
+            (targets.ReleaseEstimated(END), "expected release 22:05 UTC"),
+            (targets.ReleaseOverdue(END), "release overdue since 22:05 UTC"),
+            (targets.UntilReleased(), "until released"),
+            (targets.AwaitingBlockRemoval(END), "awaiting unblock; requested expiry was 22:05 UTC"),
+            (targets.AwaitingBlockRemoval(), "awaiting unblock"),
+        )
+        for end, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(targets.end_text(end, timezone.utc), expected)
+
+    def test_step_route_follows_the_placement_client_order(self) -> None:
+        # Each case: local, mac_only, target, writes_tree, then the route.
+        cases: tuple[tuple[bool, bool, str, bool, target_config.StepRoute], ...] = (
+            (True, True, "mac", True, target_config.WRITES_TREE),
+            (True, True, "mac", False, target_config.LOCAL_CALLER),
+            (False, True, "natedev", False, target_config.MAC_ONLY),
+            (False, False, "natedev", False, target_config.PinnedTarget("natedev")),
+            (False, False, "", False, target_config.ANY_ELIGIBLE_TARGET),
+        )
+        for local, mac_only, target, writes_tree, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(target_config.step_route(local=local, mac_only=mac_only, target=target,
+                                                          writes_tree=writes_tree), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

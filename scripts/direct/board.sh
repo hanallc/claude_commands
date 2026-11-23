@@ -10,16 +10,18 @@
 # at once -- rather than N-1 point-to-point sends that can each fail.
 #
 # Usage:
-#   board.sh post    <session_dir> <agent> <kind> <message...>
-#   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
+#   board.sh post    [<session_dir>] <agent> <kind> <message...>
+#   board.sh read    [<session_dir>] [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS] [--pid PID]
-#   board.sh role    <session_dir> <slot> <role> [note...]
+#   board.sh role    [<session_dir>] <slot> <role> [note...]
 #   board.sh roles   <session_dir>
 #   board.sh locks   <session_dir>
+#
+# post, read, and role use UNIT_RUN_DIR when the first argument is not an absolute path.
 #
 # Post kinds (a closed set, so peers can scan for what concerns them):
 #   register  — "I am <slot>, opening in <role>". The launcher stamps the same
@@ -51,13 +53,18 @@
 # exactly one of N racing acquirers creates the directory and the rest fail.
 
 set -euo pipefail
-UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+BOARD_SCRIPT=${BASH_SOURCE[0]}
+[[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
+BOARD_DIR=${BOARD_SCRIPT%/*}
+# shellcheck source=/dev/null
+source "$BOARD_DIR/file_lock.sh"
+UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
 # shellcheck source=/dev/null
-source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
+source "$BOARD_DIR/../lib/conf.sh"
 
 die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 
@@ -86,15 +93,18 @@ now_epoch() {
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
 flatten() {
-  "${BASH_SOURCE[0]%/*}/../lib/py" -c '
-import sys
-text = sys.argv[2].translate(str.maketrans({"\n": " ", "\r": " ", "\t": " "}))
-print("".join(character for character in text if character.isprintable())[:int(sys.argv[1])], end="")
-' "$MAX_MESSAGE_CHARS" "$*"
+  # Clean as UTF-8 in every caller locale; glibc builds C.UTF-8 in and the Mac has en_US.UTF-8.
+  local LC_ALL text="$*" probe=$'\xc3\xa9'
+  for LC_ALL in C.UTF-8 en_US.UTF-8 UTF-8; do ((${#probe} == 1)) && break; done 2>/dev/null
+  text=${text//$'\n'/ }
+  text=${text//$'\r'/ }
+  text=${text//$'\t'/ }
+  text=${text//[^[:print:]]/}
+  printf '%s' "${text:0:MAX_MESSAGE_CHARS}"
 }
 
 # `ask` and `answer` are deliberately absent. A question to a peer is a message
-# now -- SendMessage for a claude member, codex_mesh.py for a codex one -- and
+# through its native session, and
 # leaving the kinds here would give a worker two ways to ask one question,
 # with the board's way being the one nobody is listening on. Every kind that
 # remains is a record something later reads back: the progress table, a peer
@@ -170,11 +180,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if python3 -c 'import fcntl, sys
-try:
-    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    sys.exit(75)' 9 2>/dev/null; then
+  if lock_file_descriptor 9 nonblocking 2>/dev/null; then
     return 0
   else
     status=$?
@@ -227,11 +233,10 @@ pid_is_gone() {
 owned_group_matches() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 1
-  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PYTHON'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PYTHON'
 import json
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start, process_start_format
 try:
     record = json.loads(Path(sys.argv[1]).read_text())
@@ -284,7 +289,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
 from __future__ import annotations
 
 import json
@@ -295,7 +300,6 @@ import time
 
 record = Path(sys.argv[1])
 
-sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[1]))
 from scripts.lib.process_start import Started, Zombie, process_start
 
 def identity(pid: int) -> str | None:
@@ -617,6 +621,14 @@ main() {
   local command="${1:-}"
   [[ -n "$command" ]] || die "usage: board.sh {post|read|acquire|release|renew|role|roles|locks} <session_dir> ..."
   shift
+  case "$command" in
+    post|read|role)
+      if [[ "${1:-}" != /* ]]; then
+        [[ -n "${UNIT_RUN_DIR:-}" ]] || die "$command needs <session_dir> or UNIT_RUN_DIR"
+        set -- "$UNIT_RUN_DIR" "$@"
+      fi
+      ;;
+  esac
   case "$command" in
     post)    cmd_post "$@" ;;
     read)    cmd_read "$@" ;;

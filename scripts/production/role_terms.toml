@@ -87,11 +87,6 @@ reason = "Recorded command output with transport placeholders."
 
 [[terms.kept_contexts]]
 path = "docs/as-built/shutdown-and-restart.md"
-text = "`codex_mesh: <seat>: <reason>`"
-reason = "Command diagnostic placeholders; the transport contract stays unchanged."
-
-[[terms.kept_contexts]]
-path = "docs/as-built/shutdown-and-restart.md"
 text = "`<seat> (<role>, was working): <command>`"
 reason = "Resume command output placeholder."
 
@@ -197,13 +192,7 @@ name = "change"
 kind = "record"
 defined_in = "commands/change_review.md#add"
 other_names = ["change-review row"]
-other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
-
-[[terms]]
-name = "dailies"
-kind = "document"
-defined_in = "commands/showrunner/dailies.md#Dailies"
-other_names = ["scheduled update"]
+other_meaning_files = ["commands/changelog.md"]
 
 [[terms]]
 name = "checkpoint"
@@ -263,13 +252,13 @@ other_names = ["Pending decision block"]
 [[terms]]
 name = "finding"
 kind = "record"
-defined_in = "commands/unit/direct.md#<FindingsLedger/>"
+defined_in = "docs/direct/repair_rounds.md#<FindingsLedger/>"
 other_names = ["issue"]
 
 [[terms]]
 name = "reservation"
 kind = "record"
-defined_in = "commands/unit/direct.md#<PhaseReservationContract/>"
+defined_in = "docs/direct/phase_reservation.md#<PhaseReservationContract/>"
 other_names = ["phase reservation", "delegated phase reservation"]
 
 [[terms]]

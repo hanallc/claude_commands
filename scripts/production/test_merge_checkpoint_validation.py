@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
+from scripts.production import checkpoint_gate
+
 from contextlib import redirect_stdout
 from io import StringIO
 import os
 import sys
+import tomllib
 import unittest
 from unittest import mock
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import staff
+from scripts.production.production_doc import read_new_production
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -44,7 +47,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint("shared.txt", "alpha shared\n")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("beta-unit", result.process.stdout)
+        self.assertIn("beta", result.process.stdout)
         self.assertIn("shared.txt", result.process.stdout)
     def test_changed_example_gets_its_own_verify_call(self) -> None:
         self.write(self.unit, "crates/alpha/Cargo.toml", '[package]\nname = "alpha"\nversion = "0.1.0"\n')
@@ -72,12 +75,16 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), result.before)
         self.assertEqual(self.events("validate_and_push.sh"), [[
             "--quick", "--to", "production", "--fix-commit",
-            "ci(example): format fixes after alpha-unit phase 2",
+            "ci(example): format fixes after alpha phase 2",
         ]])
         self.assertEqual(self.events("review_regime.py"), [])
     def test_cancel_prior_reaches_validate_and_push_only_when_requested(self) -> None:
         self.push = "validate_and_push"
         self.production_doc()
+        self.executable(self.bin / "validate_and_push.sh", STUB + '''
+with (state / "validation-locks").open("a") as output:
+    output.write(os.environ.get("MAIN_PUSH_LOCK_HELD", "missing") + "\\n")
+''')
         first = self.checkpoint()
         first_result = self.run_checkpoint(first)
         self.assertEqual(first_result.process.returncode, 0, first_result.process.stderr + first_result.process.stdout)
@@ -89,17 +96,20 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("--cancel-prior", calls[0])
         self.assertIn("--cancel-prior", calls[1])
-    def test_cancel_prior_with_git_push_is_refused_before_merge(self) -> None:
-        sha = self.checkpoint()
-        result = self.run_checkpoint(sha, "--cancel-prior")
-        self.assertEqual(result.process.returncode, 1)
-        self.assertIn("input: failed", result.process.stdout)
-        self.assertIn("--cancel-prior applies only to Push: validate_and_push", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
-        self.assertEqual(self.events("checkpoint-test"), [])
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
+                         [str(common / "main-push.lock")] * len(calls))
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
-        import change_review
+        from scripts.production import change_review
 
+        with self.subTest(line="malformed on a non-checkpoint commit"):
+            malformed = self.dated_checkpoint("Show waiting and starting session states\n\n"
+                                             + "Change-Review: a worker reads waiting")
+            result = self.run_checkpoint(malformed)
+            self.assertEqual(result.process.returncode, 1)
+            self.assert_stopped_before_merge(result, "held", "needs three parts")
+            self.assertIn(malformed[:change_review.SHORT], result.process.stdout)
+            self.assertNotIn("change review: ok", result.process.stdout)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 1)
@@ -107,30 +117,63 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(sha[:change_review.SHORT], result.process.stdout)
         self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
         self.assertIn(change_review.COVERS, result.process.stdout)
+    def test_a_visible_checkpoint_without_an_image_is_held_before_merge(self) -> None:
+        line = "Change-Review: The grid fades | Open Hana | The grid appears"
+        with mock.patch.dict(self.env, {"GIT_COMMITTER_DATE": "2026-11-16T00:00:00-05:00",
+                                       "GIT_AUTHOR_DATE": "2026-10-15T12:00:00-04:00"}):
+            sha = self.checkpoint(subject="checkpoint(alpha): grid fades\n\n" + line)
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 1)
+        self.assert_stopped_before_merge(result, "held", "has no image")
+        self.assertIn(sha[:8] + " checkpoint(alpha): grid fades:", result.process.stdout)
+        self.assertIn("change_review.py image --image <png>", result.process.stdout)
+        self.assertIn(line, result.process.stdout)
+
+    def test_a_visible_checkpoint_before_the_image_cutoff_passes_without_an_image(self) -> None:
+        line = "Change-Review: The grid fades | Open Hana | The grid appears"
+        with mock.patch.dict(self.env, {"GIT_COMMITTER_DATE": "2026-11-15T23:59:59-05:00",
+                                       "GIT_AUTHOR_DATE": "2026-11-17T12:00:00-05:00"}):
+            sha = self.checkpoint(subject="checkpoint(alpha): grid fades\n\n" + line)
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("change review: ok — 1 unit commit(s) carry their Change-Review lines", result.process.stdout)
+        self.assertNotIn("has no image", result.process.stdout + result.process.stderr)
+
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
-        review = self.root / "change-review.md"
+        self.promotions = str(self.promote)
+        review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
         self.production_doc(change_review=review)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
-                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
+                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
                                     + "Change-Review: none — the merge script")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         with mock.patch.dict(os.environ, self.env):
-            producer = next(row.id for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+            member = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+            producer = member.id
+            assert isinstance(member.parent, staff.ReportsTo)
+            production = member.parent.id
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {producer} \| {producer} \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d \d\d:\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {production} \| {producer} \| 012345abcdef \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
     def test_a_production_without_a_list_writes_no_rows(self) -> None:
-        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
-                      result.process.stdout)
+        for message, count in (("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script", 1),
+                               ("Show waiting and starting session states", 0),
+                               ("Show waiting and starting session states\n\n"
+                                + "Change-Review: Sessions show waiting | Read the session list | The state reads waiting | image 012345abcdef", 1)):
+            with self.subTest(message=message):
+                sha = self.dated_checkpoint(message)
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
+                              result.process.stdout)
+                self.assertIn(f"change review: ok — {count} unit commit(s) carry their Change-Review lines",
+                              result.process.stdout)
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""
         self.production_doc()
@@ -144,7 +187,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint()
         result = self.run_checkpoint(sha, delivers="Delivers one reusable checkpoint command.")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        subject = f"Merge alpha-unit phase 2 ({sha[:7]}) into production"
+        subject = f"Merge alpha phase 2 ({sha[:7]}) into production"
         self.assertEqual(self.git("log", "-1", "--format=%B"),
                          subject + "\n\nDelivers one reusable checkpoint command.\n\n"
                          + "Co-authored-by: Test <test@example.invalid>")
@@ -168,6 +211,24 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.events("review_regime.py"), [])
         self.assertEqual(self.events("style_sync.py"), [])
     def test_style_notification_observes_the_successfully_pushed_tip(self) -> None:
+        observer = STUB + '''
+import fcntl
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
+with (Path(common) / "main-push.lock").open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_state = "held"
+    else:
+        lock_state = "free"
+with (state / "refreshed-test-locks").open("a") as output:
+    output.write(lock_state + "\\n")
+(state / "refreshed-test-tip").write_text(tip)
+'''
+        for name in ("verify.sh", "checkpoint-test"):
+            self.executable(self.bin / name, observer)
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         tip = self.git("rev-parse", "HEAD")
@@ -175,23 +236,41 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             "notify", "--repo-dir", str(self.checkout), "--branch", "production", "--tip", tip,
         ]])
         self.assertEqual((self.state / "notified-tip").read_text(), tip)
-    def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
-        _ = (self.state / "fail-style_sync.py").touch()
-        result = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("style sync: exit 1", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
+        self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free"])
+        with self.subTest(refresh="main moved"):
+            main = self.push_main_change("crates/main-proof/Cargo.toml",
+                                         '[package]\nname = "main-proof"\nversion = "0.1.0"\n')
+            production = read_new_production(self.doc, "example")
+            with mock.patch.dict(os.environ, self.env):
+                refreshed = merge_checkpoint.refresh_pushed_tip(production, tip)
+            self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free", "held", "held"])
+            self.assertEqual(refreshed, (self.state / "refreshed-test-tip").read_text())
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), refreshed)
+            self.assertEqual(self.git("merge-base", "--is-ancestor", main, refreshed), "")
+            self.assertIn(["test", "main-proof"], self.events("verify.sh"))
+        with self.subTest(refresh="main has a malformed manifest"):
+            before_refresh = self.git("rev-parse", "HEAD")
+            writer = self.root / "main-fix-writer"
+            self.write(writer, "crates/main-proof/Cargo.toml", "[package\n")
+            _ = self.git("add", "crates/main-proof/Cargo.toml", cwd=writer)
+            _ = self.git("commit", "-m", "malformed manifest on main", cwd=writer)
+            _ = self.git("push", "origin", "main", cwd=writer)
+            with mock.patch.dict(os.environ, self.env), self.assertRaises(tomllib.TOMLDecodeError):
+                _ = merge_checkpoint.refresh_pushed_tip(production, before_refresh)
+            self.assertEqual(self.git("rev-parse", "HEAD"), before_refresh)
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), before_refresh)
+            self.assertEqual(self.git("status", "--porcelain"), "")
     def test_notification_value_error_leaves_the_completed_checkpoint_successful(self) -> None:
         sha = self.checkpoint()
         original_notify = merge_checkpoint.notify_style
 
         def malformed_notification(checkout: Path, branch: str, tip: str) -> bool:
-            with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
+            with mock.patch("scripts.production.merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
                 return original_notify(checkout, branch, tip)
 
-        arguments = [str(SCRIPT), "--production", str(self.doc), "alpha-unit", "2", sha,
+        arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
-                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+                     "--review-trial", TRIAL, "--delivers", DELIVERS]
         output = StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
             merge_checkpoint, "notify_style", side_effect=malformed_notification,
@@ -211,10 +290,55 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("commit", "-m", "conflicting main edit", cwd=main_writer)
         _ = self.git("push", "origin", "main", cwd=main_writer)
         result = self.run_checkpoint(sha)
-        self.assertIn("push: failed", result.process.stdout)
+        self.assertIn("push: held", result.process.stdout)
+        self.assertIn("src/alpha.txt", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
+        self.assertNotEqual(merge_checkpoint.git(self.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode, 0)
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), result.before)
+
+    def test_push_main_conflict_preserves_checkout_for_both_rollback_policies(self) -> None:
+        _ = self.checkpoint(content="unit alpha\n")
+        sha = self.checkpoint("src/beta.txt", "unit beta\n")
+        before_checkpoint_merge = self.git("rev-parse", "HEAD")
+        original_files = {path: (self.checkout / path).read_bytes() for path in ("src/alpha.txt", "src/beta.txt")}
+        _ = self.git("merge", "--no-ff", "-m", "merge checkpoint", sha)
+        _ = self.git("push", "origin", "production")
+        for path in ("src/alpha.txt", "src/beta.txt"):
+            self.write(self.promote, path, "main side\n")
+        _ = self.git("add", "src", cwd=self.promote)
+        _ = self.git("commit", "-m", "conflicting main edits", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        production = read_new_production(self.doc, "example")
+        before = self.git("rev-parse", "HEAD")
+        before_files = {path: (self.checkout / path).read_bytes() for path in ("src/alpha.txt", "src/beta.txt")}
+        for may_undo in (False, True):
+            with self.subTest(may_undo=may_undo):
+                with self.assertRaises(checkpoint_gate.Stop) as stopped:
+                    if may_undo:
+                        _ = merge_checkpoint.prepare_checkpoint(production, before)
+                        _ = merge_checkpoint.push_git(production, True)
+                    else:
+                        _ = merge_checkpoint.refresh_pushed_tip(production, before)
+                error = stopped.exception
+                output = StringIO()
+                with redirect_stdout(output):
+                    checkpoint_gate.report(error.step, error.state, error.detail)
+                self.assertIn("push: held", output.getvalue())
+                self.assertIn("src/alpha.txt, src/beta.txt", output.getvalue())
+                self.assertIn("merge origin/main into the merge branch", error.message)
+                self.assertIn("run the push again", error.message)
+                self.assertNotEqual(merge_checkpoint.git(self.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD"), before_checkpoint_merge if may_undo else before)
+                self.assertEqual(self.git("status", "--porcelain"), "")
+                if may_undo:
+                    for path, content in original_files.items():
+                        self.assertEqual((self.checkout / path).read_bytes(), content)
+                else:
+                    for path, content in before_files.items():
+                        self.assertEqual((self.checkout / path).read_bytes(), content)
+
+
     def test_red_package_resets_merge_and_known_flake_continues(self) -> None:
         self.write(self.unit, "crates/alpha/Cargo.toml", '[package]\nname = "alpha"\nversion = "0.1.0"\n')
         self.write(self.unit, "crates/alpha/src/lib.rs", "pub fn value() -> i32 { 1 }\n")
@@ -278,7 +402,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         failed = self.run_checkpoint(sha)
         self.assertIn("red: failed", failed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
-        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"]])
+        # The base check runs the red tests alone on the tip before the merge; they pass there.
+        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"],
+                                                    ["test", "cargo-tile", "--filter", locale, "--filter", reader]])
+        self.assertIn(f"send alpha: repair merge test 1 ({locale}, {reader})", failed.process.stdout)
+        self.assertNotIn("merge director:", failed.process.stdout)
         (self.state / "events.jsonl").unlink()
         self.known_flaky_tests = f"`{reader}`, `{locale}` — red only under load"
         self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")

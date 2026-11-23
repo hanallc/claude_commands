@@ -8,18 +8,15 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 import unittest
 from unittest import mock
 
-import index
-import report
-from test_index import Record, STAMP, call, encode, local_day, point_root_at, step
+from scripts.buildlog import index
+from scripts.buildlog import report
+from scripts.buildlog.test_index import Record, STAMP, call, encode, local_day, point_root_at, step
 
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
-else:
-    from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class TargetReportTests(unittest.TestCase):
@@ -38,6 +35,7 @@ class TargetReportTests(unittest.TestCase):
             + "sync.hosts.natedev=natedev\n"
             + "# whole: 0..10\nvault.lock_retries=5\n"
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
+            + UNREACHABLE_WAIT_FIXTURE
         )
         _ = (self.root.parent / "mac.conf").write_text("host=fake-mac\nci_repo=\n")
         point_root_at(self, self.root)
@@ -137,6 +135,7 @@ class TargetReportTests(unittest.TestCase):
             + "sync.hosts.laptop=Mac\nsync.hosts.builder=natedev\n"
             + "# whole: 0..10\nvault.lock_retries=5\n"
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
+            + UNREACHABLE_WAIT_FIXTURE
         )
         self.write(
             call("remote", target="laptop", mac="passed", mac_s=5),

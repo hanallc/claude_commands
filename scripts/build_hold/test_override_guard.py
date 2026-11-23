@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import ast
 import io
 import os
@@ -15,14 +14,12 @@ from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
-if TYPE_CHECKING:
-    from . import override_guard
-    from ..lib import test_hang_guard
-else:
-    from scripts.build_hold import override_guard
-    from scripts.lib import test_hang_guard
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.build_hold import override_guard
+from scripts.lib import test_hang_guard
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -41,8 +38,6 @@ EXPECTED_VARIABLES = (
     "BUILD_TARGETS_SCRIPT",
     "BUILD_TARGETS_CONFIG",
     "BUILD_TARGETS_NOW",
-    "UNIT_ACTIVE_DIR",
-    "PLAN_DELEGATE_ACTIVE_DIR",
 )
 SHELL_CALL = 'source "$1"; build_override_refusal "$2" "$3" "$4"'
 READ_ONLY_HOME_LINE = (
@@ -59,7 +54,9 @@ class InstalledScript:
 
 
 def temporary_root(test: unittest.TestCase) -> Path:
-    return Path(test.enterContext(tempfile.TemporaryDirectory(prefix="override-guard-")))
+    root = Path(test.enterContext(tempfile.TemporaryDirectory(prefix="override-guard-")))
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, interpreter_cache_environment(root / "cache"))))
+    return root
 
 
 def installed_script(root: Path, relative: str) -> InstalledScript:
@@ -80,6 +77,7 @@ def script_links(root: Path, script: Path) -> tuple[Path, Path]:
 
 def child_environment(values: Mapping[str, str]) -> dict[str, str]:
     environment = {"PATH": os.defpath, "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"}
+    environment["XDG_CACHE_HOME"] = os.environ["XDG_CACHE_HOME"]
     environment.update(values)
     return environment
 
@@ -99,9 +97,57 @@ def run_shell(program: str, arguments: Sequence[str], environment: Mapping[str, 
 
 
 class OverrideGuardPythonTests(unittest.TestCase):
+    def test_helper_root_uses_the_checkout_for_each_override_without_home_links(self) -> None:
+        root = temporary_root(self)
+        home = root / "home"
+        for name in ("", *EXPECTED_VARIABLES):
+            for value in ("", "private"):
+                with self.subTest(name=name, value=value):
+                    environment = {"HOME": str(home)}
+                    if name:
+                        environment[name] = value
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        selected = override_guard.helper_root(CHECKOUT_SCRIPT)
+                    expected = SCRIPT_DIRECTORY.parent if name else home / ".claude/scripts"
+                    self.assertEqual(selected, expected)
+                    self.assertFalse((home / ".claude").exists())
+
+    def test_shared_state_requires_the_installed_copy_but_private_state_remains_usable(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, PYTHON_RELATIVE)
+        private = root / "private"
+        private.mkdir()
+        for name in ("buildlog", "build-hold", "build-hold-release", "build-hold-enforcer"):
+            shared = installed.home / ".local/state" / name
+            shared.mkdir(parents=True)
+            marker = shared / "saved"
+            _ = marker.write_bytes(b"unchanged\n")
+            linked = root / (name + "-link")
+            linked.symlink_to(shared, target_is_directory=True)
+            for script, directories, allowed in (
+                (CHECKOUT_SCRIPT, (private,), True),
+                (installed.script, (shared,), True),
+                (CHECKOUT_SCRIPT, (shared,), False),
+                (CHECKOUT_SCRIPT, (private, shared), False),
+                (CHECKOUT_SCRIPT, (linked / "future" / "record",), False),
+            ):
+                with self.subTest(root=name, script=script, directories=directories), \
+                     mock.patch.object(override_guard, "user_home", return_value=installed.home):
+                    result = override_guard.shared_state_access(script, PYTHON_RELATIVE, directories)
+                    if allowed:
+                        self.assertIsInstance(result, override_guard.SharedStateAllowed)
+                        override_guard.require_shared_state_write(script, PYTHON_RELATIVE, *directories)
+                    else:
+                        assert isinstance(result, override_guard.SharedStateRefused)
+                        self.assertIn(str(installed.script), result.line)
+                        with self.assertRaises(override_guard.SharedStateWriteRefused) as raised:
+                            override_guard.require_shared_state_write(script, PYTHON_RELATIVE, *directories)
+                        self.assertEqual(str(raised.exception), result.line)
+                    self.assertEqual(marker.read_bytes(), b"unchanged\n")
+
     def test_wired_modules_keep_their_checkout_import_forms(self) -> None:
         checkout = SCRIPT_DIRECTORY.parent.parent
-        environment = child_environment({})
+        environment = child_environment({"XDG_CACHE_HOME": str(temporary_root(self) / "cache")})
         modules = (
             ("lint/memory_test_support.py", True, True),
             ("build_hold/build_hold_test_support.py", False, False),
@@ -110,6 +156,7 @@ class OverrideGuardPythonTests(unittest.TestCase):
             ("build_hold/test_hold_enforcer.py", False, True),
             ("build_targets/test_targets.py", False, True),
             ("lint/test_nextest_budget.py", False, True),
+            ("lint/test_nextest_tokens.py", False, True),
             ("lint/test_nextest_width.py", True, True),
         )
         for relative, package_import, direct_run in modules:
@@ -119,12 +166,13 @@ class OverrideGuardPythonTests(unittest.TestCase):
                 + f"loader.discover({str(path.parent)!r}, pattern={path.name!r}); "
                 + "assert not loader.errors, '\\n'.join(loader.errors)"
             )
-            commands = [[sys.executable, "-B", "-c", discover]]
+            python = str(checkout / "scripts/lib/py")
+            commands = [[python, "-B", "-c", discover]]
             if package_import:
                 module = str(path.with_suffix("")).replace("/", ".")
-                commands.append([sys.executable, "-B", "-c", f"import {module}"])
+                commands.append([python, "-B", "-c", f"import {module}"])
             if direct_run:
-                commands.append([sys.executable, "-B", str(path), "--help"])
+                commands.append([python, "-B", str(path), "--help"])
             for command in commands:
                 with self.subTest(module=relative, command=command):
                     result = subprocess.run(
@@ -162,11 +210,11 @@ class OverrideGuardPythonTests(unittest.TestCase):
             override_guard.require_checkout(checkout)
 
     def test_build_hold_imports_as_a_scripts_package_module(self) -> None:
-        _ = temporary_root(self)
-        environment = child_environment({})
+        root = temporary_root(self)
+        environment = child_environment({"HOME": str(root), "CLAUDE_PYTHON": sys.executable})
         self.assertNotIn("PYTHONPATH", environment)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.build_hold import build_hold"],
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.build_hold import build_hold"],
             cwd=SCRIPT_DIRECTORY.parent.parent, env=environment,
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
@@ -289,6 +337,24 @@ class OverrideGuardPythonTests(unittest.TestCase):
 
 
 class OverrideGuardShellTests(unittest.TestCase):
+    def test_helper_root_matches_python_without_home_links(self) -> None:
+        root = temporary_root(self)
+        home = root / "home"
+        program = 'source "$1"; build_helper_root "$2"'
+        for name in ("", *EXPECTED_VARIABLES):
+            for value in ("", "private"):
+                with self.subTest(name=name, value=value):
+                    environment = {"HOME": str(home)}
+                    if name:
+                        environment[name] = value
+                    answer = run_shell(program, [str(CHECKOUT_SCRIPT)], child_environment(environment))
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        expected = override_guard.helper_root(CHECKOUT_SCRIPT)
+                    self.assertEqual(answer.returncode, 0, answer.stderr)
+                    self.assertEqual(answer.stdout, f"{expected}\n")
+                    self.assertEqual(answer.stderr, "")
+                    self.assertFalse((home / ".claude").exists())
+
     def test_changed_read_only_home_returns_one_refusal_line(self) -> None:
         root = temporary_root(self)
         result = run_shell(
@@ -527,7 +593,6 @@ class GuardCallSiteTests(unittest.TestCase):
             ("mac_test/mac_test.py", "main"),
             ("mac_test/offload.py", "main"),
             ("mac_test/audit.py", "main"),
-            ("production/dailies_input.py", "main"),
             ("buildlog/rust_release.py", "build_hold_active"),
         ):
             with self.subTest(file=relative, function=function_name):

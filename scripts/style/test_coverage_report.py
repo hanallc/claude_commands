@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -14,15 +15,23 @@ import unittest
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import coverage_report
-import rules
-import style_ledger
-import style_rules
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, unit_membership
+from scripts.style import coverage_report, style_config
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.style.ledger_test_support import write_style_units
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style import style_rules
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, unit_membership
+
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
 
 
 @dataclass(frozen=True)
@@ -69,17 +78,31 @@ class CoverageReportTests(unittest.TestCase):
     repo: Path = Path()
     rule_dir: Path = Path()
     tip: str = ""
+    repository_seed: ClassVar[Path]
+    repository_tip: ClassVar[str]
     sources: tuple[str, ...] = tuple(
         f"crates/{crate}/src/{name}.rs"
         for crate in ("alpha", "beta") for name in ("lib", "other")
     )
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        builder = cls(methodName="runTest")
+        builder.repo = cls.repository_seed
+        builder.build_repository()
+        cls.repository_tip = builder.tip
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style/rust"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
+        self.tip = self.repository_tip
+        _ = self.git("update-index", "--refresh")
         self.rule_dir.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
@@ -87,6 +110,11 @@ class CoverageReportTests(unittest.TestCase):
             "USER_ZONE": "America/New_York",
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="report")
+
+    def build_repository(self) -> None:
+        self.repo.mkdir()
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("config", "user.name", "Coverage report tests")
         _ = self.git("config", "user.email", "coverage@example.invalid")
@@ -130,11 +158,16 @@ class CoverageReportTests(unittest.TestCase):
                           input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("coverage_report.py")),
-             "--repo", str(self.repo), *arguments],
-            check=False, capture_output=True, text=True,
-        )
+        command = ["--repo", str(self.repo), *arguments]
+        if process_boundary_for_case(self):
+            result = subprocess.run(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"),
+                 str(Path(__file__).with_name("coverage_report.py")), *command],
+                check=False, capture_output=True, text=True,
+            )
+        else:
+            result = invoke_cli(coverage_report, lambda: coverage_report.main(sys.argv[1:]),
+                                command, dict(os.environ), Path.cwd())
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -160,32 +193,56 @@ class CoverageReportTests(unittest.TestCase):
                                "value", "count", definition.blob, "40001").finding_id
 
     def staff_units(self, *units: str) -> None:
-        doc = self.root / "sample-style/docs/sample-style-production.md"
+        doc = self.repo / ".git/tool-based-ui-production.md"
         doc.parent.mkdir(parents=True, exist_ok=True)
-        _ = doc.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = doc.write_text(f"# Style production\n- **Kind:** style\n- **Branch point:** main\n"
+                           + f"- **Merge branch:** style/main\n- **Showrunner checkout:** {self.repo}\n")
+        assignments = tuple(style_config.StyleUnitAssignment(
+            next((unit for unit in units if unit == family or unit.endswith("-" + family)), f"sample-style-{family}"),
+            (family,)) for family in cast(tuple[rules.Family, ...], ("names", "types", "values", "modules")))
+        write_style_units(doc, assignments)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample-style", doc)
         for unit in units:
             _ = unit_membership("sample-style", unit)
 
 
-    def test_staff_units_use_full_ids_without_a_document_and_mixed_ids_with_one(self) -> None:
+    def test_report_skips_both_style_branch_names_without_a_registration(self) -> None:
+        _ = self.git("branch", "style/main")
+        _ = self.git("branch", "sample-style-worktree")
+        self.sync(style_branch="sample-style-worktree")
+
+        self.assertIn(f"synced main {self.tip[:7]}", self.report().stdout)
+
+        _ = self.git("branch", "-m", "main", "z-parent")
+        self.assertIn(f"synced z-parent {self.tip[:7]}", self.report().stdout)
+
+    def test_report_reads_configured_units_without_a_family_suffix(self) -> None:
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
-            self.assertEqual(set(coverage_report.production(ledger, self.tip).units), {
-                "sample-style-names-unit", "sample-style-types-unit",
-                "sample-style-values-unit", "sample-style-modules-unit",
-            })
-            self.staff_units("names-unit", "sample-style-types-unit", "feature-unit")
-            self.assertEqual(coverage_report.production(ledger, self.tip).units,
-                             ("names-unit", "sample-style-types-unit"))
+            self.assertEqual(coverage_report.production(ledger, self.tip).units, ())
+            self.staff_units("cargo-liner-style")
+            doc = self.repo / ".git/tool-based-ui-production.md"
+            write_style_units(doc, (style_config.StyleUnitAssignment(
+                "cargo-liner-style", ("names", "types", "values", "modules")),))
+            for kind in ("style", "product"):
+                with self.subTest(kind=kind):
+                    text = doc.read_text().replace("**Kind:** style", f"**Kind:** {kind}")
+                    if kind == "product":
+                        text = text.replace("**Merge branch:** style/main", "**Merge branch:** main")
+                        text = text.replace("## Style units", "### Style units ###")
+                    _ = doc.write_text(text)
+                    production = coverage_report.production(ledger, self.tip)
+                    self.assertEqual(production.units, ("cargo-liner-style",))
+                    self.assertEqual(production.name, "sample-style")
+                    self.assertEqual(production.branch_point, "main")
 
     def test_report_finds_a_moved_ticket_by_the_declared_full_unit_id(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             from scripts.production import staff
@@ -198,9 +255,9 @@ class CoverageReportTests(unittest.TestCase):
     def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
         rule = self.rule("read")
         self.sync()
-        self.staff_units("names-unit")
+        self.staff_units("names")
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.ticket_add("1", ticket_owner_id("names-unit"), "read", "names", "crates/alpha",
+            ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha",
                               list(self.sources[:2]), [rule])
             ledger.ticket_assign("1", "main")
             database = ledger.database
@@ -224,6 +281,7 @@ class CoverageReportTests(unittest.TestCase):
         self.assertEqual(rows["manifests"].current, "1 of 2 crates")
         self.assertEqual(rows["structure"].current, "1 of 4 files")
 
+    @process_boundary
     def test_rows_cover_each_counted_tier_and_held_and_waived_judgments_still_finish_a_rule(self) -> None:
         _ = self.rule("lint", "tier: A\nmechanism: clippy\n")
         listed = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")
@@ -421,19 +479,19 @@ class CoverageReportTests(unittest.TestCase):
         selected = self.rule("selected")
         other = self.rule("other")
         self.sync()
-        units = ("names-unit", "sample-style-names-unit", "other-style-names-unit", "types-unit")
+        units = ("names", "sample-style-names", "other-style-names", "types")
         self.staff_units(*units)
         with style_ledger.open_ledger(self.repo) as ledger:
             for number, rule in enumerate((selected, selected, selected, other), start=1):
                 unit = units[number - 1]
                 ticket = str(number)
-                ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+                path = self.sources[number - 1]
+                ledger.ticket_add(ticket, ticket_owner_id(unit), "read", "names", path.split("/src/")[0], [path], [rule])
                 if number != 3:
                     ledger.ticket_assign(ticket, "main")
                 if number == 2:
                     definition = next(row for row in rules.load_rules(self.repo) if row.rule_id == rule)
-                    for path in self.sources[:2]:
-                        ledger.record(rule, path, self.tip, definition.blob, "clean", ticket=ticket, worker="test")
+                    ledger.record(rule, path, self.tip, definition.blob, "clean", ticket=ticket, worker="test")
                     ledger.ticket_checkpoint(ticket, self.tip)
         output = self.report("--rule", "selected").stdout
         self.assertEqual(set(self.rows(output)), {"selected"})
@@ -445,16 +503,16 @@ class CoverageReportTests(unittest.TestCase):
     def test_crate_filter_limits_cells_and_prints_the_oldest_open_ticket(self) -> None:
         read = self.rule("read")
         self.sync()
-        self.staff_units("names-unit", "sample-style-names-unit", "types-unit")
+        self.staff_units("names", "sample-style-names", "types")
         for path in self.sources[:2]:
             self.record(read, path)
         with style_ledger.open_ledger(self.repo) as ledger:
-            for identity, unit, crate in (("1", "names-unit", "alpha"), ("2", "sample-style-names-unit", "alpha"), ("2001", "types-unit", "beta")):
+            for identity, unit, crate in (("1", "names", "alpha"), ("2", "sample-style-names", "alpha"), ("2001", "types", "beta")):
                 with mock.patch.object(style_ledger, "_now", return_value=(
-                    "2026-10-01T12:00:00+00:00" if unit == "names-unit" else "2026-10-02T12:00:00+00:00"
+                    "2026-10-01T12:00:00+00:00" if unit == "names" else "2026-10-02T12:00:00+00:00"
                 )):
-                    ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate,
-                                      [f"crates/{crate}/src/lib.rs"], [read])
+                    path = self.sources[1] if identity == "2" else f"crates/{crate}/src/lib.rs"
+                    ledger.ticket_add(identity, ticket_owner_id(unit), "read", "names", "crates/" + crate, [path], [read])
                 ledger.ticket_assign(identity, "main")
         output = self.report("--crate", "crates/alpha").stdout
         row = self.rows(output)["read"]

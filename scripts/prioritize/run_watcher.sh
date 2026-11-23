@@ -6,7 +6,7 @@ set -uo pipefail
 # by VERSION rather than by path. These scripts used to pin "$PY" --
 # Apple 3.9 on the Mac, nonexistent on NixOS. The pin was never load-bearing:
 # the tests in tests/ import typing.override and cannot run under 3.9 at all.
-PY="$HOME/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 SNAPSHOT_TOOL="$HOME/.claude/scripts/prioritize/snapshot.py"
 RENUMBER_TOOL="$HOME/.claude/scripts/prioritize/renumber.py"
 WRITER_LOCK_TOOL="$HOME/.claude/scripts/prioritize/writer_lock.py"
@@ -164,9 +164,7 @@ settled_state_is_current() {
 # This touches .git/index alone, never a watched file, so it cannot perturb the
 # signature this daemon polls and cannot wake itself in a loop.
 refresh_vault_git_index() {
-    local configured
-    local path
-    local -a pathspec=("$VAULT_ISSUES_PATHSPEC")
+    local configured output
 
     [[ -d "$VAULT_DIR/.git" ]] || return 0
     command -v git >/dev/null 2>&1 || return 0
@@ -180,14 +178,18 @@ refresh_vault_git_index() {
         return 0
     fi
 
-    while IFS= read -r -d '' path; do
-        pathspec+=(":(exclude,literal)$path")
-    done < <(
-        git -C "$VAULT_DIR" diff --name-only -z -- "$VAULT_ISSUES_PATHSPEC" 2>/dev/null
-    )
-
-    if git -C "$VAULT_DIR" add --renormalize -- "${pathspec[@]}" >> "$EVENT_LOG" 2>&1; then
-        log "refreshed vault git index after ranking writes; real edits left alone=$(( ${#pathspec[@]} - 1 ))"
+    if output=$("$PY" -m scripts.lib.main_push_lock --checkout "$VAULT_DIR" -- bash -c '
+        vault=$1
+        issues=$2
+        pathspec=("$issues")
+        while IFS= read -r -d "" path; do
+            [[ -n "$path" ]] || exit 1
+            pathspec+=(":(exclude,literal)$path")
+        done < <(git -C "$vault" diff --name-only -z -- "$issues" || printf "\0")
+        git -C "$vault" add --renormalize -- "${pathspec[@]}" || exit
+        printf "%s\n" "$(( ${#pathspec[@]} - 1 ))"
+    ' bash "$VAULT_DIR" "$VAULT_ISSUES_PATHSPEC" 2>> "$EVENT_LOG"); then
+        log "refreshed vault git index after ranking writes; real edits left alone=$output"
     else
         log "warning: vault git index refresh failed; status may report ranking churn"
     fi

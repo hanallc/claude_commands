@@ -4,32 +4,22 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-import re
 import string
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..lib.conf import UseConfiguredValue
-    from ..message import session_send
-    from ..message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
-else:
-    from scripts.lib.conf import UseConfiguredValue
-    from scripts.message import session_send
-    from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
+from scripts.lib.conf import UseConfiguredValue
+from scripts.message import session_send
+from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
-# A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
-_UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
 
 
 @dataclass(frozen=True)
@@ -60,8 +50,7 @@ class TemplateValues:
 
 
 def display_values(given: dict[str, str]) -> TemplateValues:
-    displayed = {key: shown_value(key, value) for key, value in given.items()}
-    return TemplateValues(displayed, dict(displayed))
+    return TemplateValues(dict(given), dict(given))
 
 
 @dataclass(frozen=True)
@@ -81,6 +70,9 @@ class PushText:
     header: bool = True
     # An agent writes the text at send time; no person approved it, so check it like free text.
     agent_written: bool = False
+    # True: the phone shows the app name as the title and the rendered title as the whole message.
+    # Only an entry with no action, no session and no body can use it.
+    one_line: bool = False
     expand_values: Callable[[dict[str, str]], TemplateValues] = display_values
 
 
@@ -95,14 +87,27 @@ class RenderedPush:
     values: dict[str, str]
     session: NotificationSession = NO_SESSION_LINE
     header: bool = True
+    one_line: bool = False
+
+    @property
+    def posted_title(self) -> str:
+        """The title Pushover gets; empty for a one-line text, so the phone shows the app name."""
+        return "" if self.one_line else self.title
+
+    @property
+    def posted_body(self) -> str:
+        """The body a Draft carries: the line alone for a one-line text."""
+        return self.title if self.one_line else self.body
 
     @property
     def message(self) -> str:
+        if self.one_line:
+            return self.title
         return first_line(self.action, self.session) + "\n" + self.body if self.header else self.body
 
 
 def catalog() -> tuple[PushText, ...]:
-    module = importlib.import_module("push_catalog")
+    module = importlib.import_module('scripts.notify.push_catalog')
     entries = cast(tuple[PushText, ...], module.ENTRIES)
     if len({entry.id for entry in entries}) != len(entries):
         raise ValueError("duplicate push text id")
@@ -111,13 +116,12 @@ def catalog() -> tuple[PushText, ...]:
             raise ValueError(f"{entry.id}: examples need distinct names and must not be empty")
         if not entry.header and (isinstance(entry.action, ActionTemplate) or isinstance(entry.session, SessionTemplate)):
             raise ValueError(f"{entry.id}: an entry without a header cannot state an action or a session")
+        if entry.one_line and (isinstance(entry.action, ActionTemplate) or isinstance(entry.session, SessionTemplate)
+                               or entry.body):
+            raise ValueError(f"{entry.id}: a one-line entry cannot state an action, a session or a body")
     return entries
 
 
-def shown_value(key: str, value: str) -> str:
-    """A session name loses its "-unit" end: the {sender} and {session} values, and any value that is
-    a whole unit id. Free text keeps every word, "per-unit" included (reviewer, 2026-10-21)."""
-    return value.removesuffix("-unit") if key in ("sender", "session") or _UNIT_ID.fullmatch(value) else value
 
 
 @dataclass(frozen=True)
@@ -154,8 +158,7 @@ def decision_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError("decision.choices: recommended_choice must name a listed choice")
     if "choice_labels" in given:
         raise ValueError("decision.choices: choice_labels is generated from choices")
-    displayed = {key: shown_value(key, value) if key in ("sender", "session") else value
-            for key, value in given.items()} | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
+    displayed = dict(given) | {"choice_labels": " or ".join(choice.label.lower() for choice in choices),
                     "choices": "\n".join(f"{choice.label}: {choice.effect}" for choice in choices)}
     return TemplateValues(displayed, dict(given))
 
@@ -181,7 +184,7 @@ def render_entry(entry: PushText, given: dict[str, str]) -> RenderedPush:
     return RenderedPush(entry.id, entry.sender.format(**values), entry.need,
                         entry.title.format(**values), action, entry.body.format(**values), expanded.supplied,
                         SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
-                        entry.header)
+                        entry.header, entry.one_line)
 
 
 def render(id: str, **values: str) -> RenderedPush:
@@ -204,12 +207,16 @@ def shown(entry: PushText) -> str:
                             ActionRequired(entry.action.text) if isinstance(entry.action, ActionTemplate) else NoActionRequired(),
                             entry.body, {},
                             SessionLine(entry.session.text) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
-                            entry.header)
+                            entry.header, entry.one_line)
     example = entry.examples[0]
     filled = render_entry(entry, example.values)
     return (f"{entry.id}  {entry.purpose}\n\n"
-            + f"Template:\nTitle: {template.title}\n{template.message}\n\n"
-            + f"Example ({example.name}):\nTitle: {filled.title}\n{filled.message}")
+            + f"Template:\n{shown_title(template)}\n{template.message}\n\n"
+            + f"Example ({example.name}):\n{shown_title(filled)}\n{filled.message}")
+
+
+def shown_title(rendered: RenderedPush) -> str:
+    return f"Title: {rendered.posted_title}" if rendered.posted_title else "Title: none (the phone shows the app name)"
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
@@ -257,6 +264,7 @@ class FilledExampleRecord(TypedDict):
 class FingerprintRecord(TypedDict):
     session: NotRequired[str]
     header: NotRequired[bool]
+    one_line: NotRequired[bool]
     sender: str
     need: Need
     title: str
@@ -324,4 +332,6 @@ def fingerprint(entry: PushText) -> str:
         value["session"] = entry.session.text
     if not entry.header:
         value["header"] = False
+    if entry.one_line:
+        value["one_line"] = True
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

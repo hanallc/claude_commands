@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import asyncio
 import base64
 import json
@@ -17,7 +16,6 @@ from typing import cast, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.note_file import note_name
 from scripts.accounts import accounts, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
@@ -26,7 +24,7 @@ from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami import usage_store
-import whoami
+from scripts.whoami import whoami
 from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,
@@ -127,14 +125,14 @@ class CodexHomesTests(unittest.TestCase):
         self.assertEqual(held["weekly"]["left"], 87)
         self.assertEqual(held["weekly"]["at"], now.isoformat())
 
-    def test_credit_setting_reads_on_off_and_defaults_to_on(self) -> None:
-        path = self.home / "codex1.md"
-        for field, expected in (("use_credits: off\n", agent_accounts.CreditsOff),
-                                ("use_credits: on\n", agent_accounts.CreditsOn),
-                                ("", agent_accounts.CreditsOn),
-                                ("use_credits: sometimes\n", agent_accounts.CreditsOn)):
-            with self.subTest(field=field):
-                _ = path.write_text("---\nlogin: next@example.invalid\n" + field + "---\n")
+    def test_credit_setting_reads_the_accounts_config(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        lines = [line for line in config.read_text().splitlines() if not line.startswith("codex_credit_accounts=")]
+        for value, expected in (("codex1 codex2", agent_accounts.CreditsOn),
+                                ("codex2", agent_accounts.CreditsOff),
+                                ("none", agent_accounts.CreditsOff)):
+            with self.subTest(value=value):
+                _ = config.write_text("\n".join([*lines, f"codex_credit_accounts={value}"]) + "\n")
                 self.assertIsInstance(agent_accounts.codex_credits_setting("codex1"), expected)
 
     def test_credit_setting_off_disallows_paid_room_in_either_exhausted_window(self) -> None:
@@ -159,18 +157,17 @@ class CodexHomesTests(unittest.TestCase):
         self.assertEqual(accounts.main(["set-role", "workers", label]), 0)
         return home
 
-    def test_legacy_codex_note_alone_keeps_login_resolution_and_the_user_credit_setting(self) -> None:
+    def test_legacy_codex_note_alone_keeps_login_resolution(self) -> None:
         home = self.select_workers("codex2")
         numbered = self.home / "codex2.md"
         legacy = self.home / "codex 2.md"
         _ = numbered.rename(legacy)
-        _ = legacy.write_text("---\nlogin: selected@example.invalid\nuse_credits: off\n---\n")
+        _ = legacy.write_text("---\nlogin: selected@example.invalid\n---\n")
         identity = agent_accounts.codex_account(home)
         self.assertIsInstance(identity, agent_accounts.KnownCodexAccount)
         assert isinstance(identity, agent_accounts.KnownCodexAccount)
         self.assertEqual(identity.label, "codex2")
         self.assertEqual(agent_accounts.codex_account_home("codex2").home, home)
-        self.assertIsInstance(agent_accounts.codex_credits_setting("codex2"), agent_accounts.CreditsOff)
         self.assertFalse(numbered.exists(), "readers must not migrate files")
 
     def legacy_selection(self) -> ClaudeAccountsInUse:
@@ -180,7 +177,7 @@ class CodexHomesTests(unittest.TestCase):
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
 
     def test_shared_user_zone_uses_production_or_the_users_zone_setting(self) -> None:
-        runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
+        runner = showrunners.Showrunner(session="fixture", socket="", name="fixture", zone="Asia/Tokyo", doc="")
         with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
@@ -234,8 +231,8 @@ class CodexHomesTests(unittest.TestCase):
             patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex"), "RETAIN_ENV": "fixture"}),
             patch.object(agent_accounts, "executable", return_value="fixture-codex"),
             patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
-            patch.object(agent_accounts.CodexServer, "request", side_effect=[{}, identity, usage]),
-            patch.object(agent_accounts.CodexServer, "send"),
+            patch.object(agent_accounts.CodexAccountClient, "request", side_effect=[{}, identity, usage]),
+            patch.object(agent_accounts.CodexAccountClient, "send"),
         ):
             before = dict(os.environ)
             report = asyncio.run(agent_accounts.codex_live(selected))
@@ -257,8 +254,8 @@ class CodexHomesTests(unittest.TestCase):
         with (
             patch.object(agent_accounts, "executable", return_value="fixture-codex"),
             patch.object(asyncio, "create_subprocess_exec", return_value=process),
-            patch.object(agent_accounts.CodexServer, "request", side_effect=[{}, {"account": None}]),
-            patch.object(agent_accounts.CodexServer, "send"),
+            patch.object(agent_accounts.CodexAccountClient, "request", side_effect=[{}, {"account": None}]),
+            patch.object(agent_accounts.CodexAccountClient, "send"),
         ):
             report = asyncio.run(agent_accounts.codex_live(selected))
         self.assertEqual(report.source, CodexHomeSource(selected))
@@ -465,9 +462,9 @@ class CodexHomesTests(unittest.TestCase):
         with (
             patch.object(agent_accounts, "executable", return_value="fixture-codex"),
             patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
-            patch.object(agent_accounts.CodexServer, "request", side_effect=[agent_accounts.CodexServerClosed("provider exited before reply"), {}]) as request,
-            patch.object(agent_accounts.CodexServer, "send") as send,
-            patch.object(agent_accounts.CodexServer, "close") as close,
+            patch.object(agent_accounts.CodexAccountClient, "request", side_effect=[agent_accounts.CodexAccountClosed("provider exited before reply"), {}]) as request,
+            patch.object(agent_accounts.CodexAccountClient, "send") as send,
+            patch.object(agent_accounts.CodexAccountClient, "close") as close,
             patch.object(asyncio, "sleep"),
         ):
             result = asyncio.run(agent_accounts.prepare_codex_home(home))
@@ -488,9 +485,9 @@ class CodexHomesTests(unittest.TestCase):
         process = MagicMock(spec=asyncio.subprocess.Process)
         process.returncode = 0
         with patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch, \
-                patch.object(agent_accounts.CodexServer, "request", side_effect=[RuntimeError("request rejected: closed account"), {}]), \
-                patch.object(agent_accounts.CodexServer, "send"), patch.object(asyncio, "sleep"), \
-                patch.object(agent_accounts.CodexServer, "close"):
+                patch.object(agent_accounts.CodexAccountClient, "request", side_effect=[RuntimeError("request rejected: closed account"), {}]), \
+                patch.object(agent_accounts.CodexAccountClient, "send"), patch.object(asyncio, "sleep"), \
+                patch.object(agent_accounts.CodexAccountClient, "close"):
             result = asyncio.run(agent_accounts.prepare_codex_home(self.home / ".codex1"))
         self.assertIsInstance(result, agent_accounts.CodexHomePreparationFailed)
         _ = launch.assert_awaited_once()
@@ -502,9 +499,9 @@ class CodexHomesTests(unittest.TestCase):
             output.feed_eof()
             process.stdout = output
             process.stdin = MagicMock(spec=asyncio.StreamWriter)
-            server = agent_accounts.CodexServer(process)
+            server = agent_accounts.CodexAccountClient(process)
             _ = await server.request(1, "initialize", {})
-        with self.assertRaises(agent_accounts.CodexServerClosed):
+        with self.assertRaises(agent_accounts.CodexAccountClosed):
             asyncio.run(request())
 
     def test_server_close_reads_the_account_timeout(self) -> None:
@@ -512,7 +509,7 @@ class CodexHomesTests(unittest.TestCase):
         _ = config.write_text(config.read_text().replace("codex_close_timeout_seconds=3", "codex_close_timeout_seconds=7"))
         process = MagicMock(spec=asyncio.subprocess.Process)
         process.returncode = None
-        server = agent_accounts.CodexServer(process)
+        server = agent_accounts.CodexAccountClient(process)
         with patch.object(asyncio, "wait_for", wraps=asyncio.wait_for) as wait:
             asyncio.run(server.close())
         cast(MagicMock, process.terminate).assert_called_once_with()
@@ -528,8 +525,8 @@ class CodexHomesTests(unittest.TestCase):
             patch.object(agent_accounts, "executable", return_value="fixture-codex"),
             patch.object(agent_accounts, "CODEX_HOME_PREPARATION_SECONDS", 1),
             patch.object(asyncio, "create_subprocess_exec", return_value=process) as launch,
-            patch.object(agent_accounts.CodexServer, "request", side_effect=asyncio.TimeoutError),
-            patch.object(agent_accounts.CodexServer, "close") as close,
+            patch.object(agent_accounts.CodexAccountClient, "request", side_effect=asyncio.TimeoutError),
+            patch.object(agent_accounts.CodexAccountClient, "close") as close,
         ):
             result = asyncio.run(agent_accounts.prepare_codex_home(home))
         self.assertIsInstance(result, agent_accounts.CodexHomePreparationFailed)
@@ -548,8 +545,8 @@ class CodexHomesTests(unittest.TestCase):
         with (
             patch.object(agent_accounts, "executable", return_value="fixture-codex"),
             patch.object(asyncio, "create_subprocess_exec", return_value=process),
-            patch.object(agent_accounts.CodexServer, "request", side_effect=asyncio.TimeoutError),
-            patch.object(agent_accounts.CodexServer, "close"),
+            patch.object(agent_accounts.CodexAccountClient, "request", side_effect=asyncio.TimeoutError),
+            patch.object(agent_accounts.CodexAccountClient, "close"),
         ):
             report = asyncio.run(agent_accounts.codex_live(home))
         self.assertIsNotNone(report.problem)

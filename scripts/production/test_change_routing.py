@@ -1,6 +1,10 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import pictured_changes
+
+from scripts.agents import remote
+
 import json
 import os
 import tempfile
@@ -16,6 +20,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
+from scripts.production.unrouted_alert import notify as notify_unrouted
 
 
 class StaffRoutingTests(unittest.TestCase):
@@ -41,7 +46,7 @@ class StaffRoutingTests(unittest.TestCase):
         self.top = fixture_member("showrunner", name="top")
         self.child = fixture_member("showrunner", name="child", parent=self.top.id)
         self.unit = fixture_member("unit", name="builder", parent=self.child.id,
-            worktree=staff.PresentWorktree("natedev", self.root / "builder"))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root / "builder"))
 
     def router(self, record: staff.StaffSnapshot | None = None) -> change_routing.StaffRouting:
         return change_routing.StaffRouting(record or staff.snapshot(), {})
@@ -49,7 +54,7 @@ class StaffRoutingTests(unittest.TestCase):
     def configured_root_document(self) -> Path:
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n")
         _ = write_config_fixture(config / "change_review.conf")
@@ -73,16 +78,43 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(self.router().owner({"#": "C1", "Merged": "abcdef12"}, self.root / "change-review - top.md"),
                          change_routing.ShowrunnerOwnChange(self.top.id, "top"))
 
+    def test_a_production_cell_uses_the_unit_id_after_rename_and_transfer(self) -> None:
+        row = {"#": "C1", "Production": self.unit.id}
+        _ = staff.rename(self.unit.id, "renamed")
+        _ = staff.move(self.unit.id, staff.ReportsTo(self.top.id))
+        _ = fixture_member("unit", name="builder", parent=self.child.id,
+                           runtime_id=fixture_runtime_id("replacement-builder"))
+        self.assertEqual(self.router().owner(row, self.root / "change-review - child.md"),
+                         change_routing.StaffRoutedChange(self.unit.id, self.top.id, "top"))
+
+    def test_a_stored_production_name_goes_to_the_list_owner(self) -> None:
+        row = {"#": "C1", "Production": self.child.name}
+        owner = self.router().owner(row, self.root / "change-review - top.md")
+        self.assertEqual(owner, change_routing.ShowrunnerOwnChange(self.top.id, "top"))
+        cast(mock.Mock, self.alert).assert_not_called()
+
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
+        _ = self.configured_root_document()
         _ = self.enterContext(production_staff_record())
         _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))
-        identity = fixture_runtime_id("missing-producer")
-        owner = self.router().owner({"#": "C777", "Producer": identity}, self.root / "change-review - top.md")
-        self.assertIsInstance(owner, change_routing.UnroutedChange)
-        assert isinstance(owner, change_routing.UnroutedChange)
-        self.assertIn(identity, owner.note)
-        self.assertEqual(owner.tab, "unrouted")
-        self.assertEqual(cast(mock.Mock, self.alert).call_args.args[2]["#"], "C777")
+        _ = self.enterContext(mock.patch.object(unrouted_alert, "notify", notify_unrouted))
+        cached = staff.snapshot()
+        added = fixture_member("unit", name="new-builder", parent=self.child.id)
+        listing = self.root / "change-review - top.md"
+        for identity, seen_by_authority in ((added.id, True), (fixture_runtime_id("missing-producer"), False)):
+            with (self.subTest(seen_by_authority=seen_by_authority), staff.supplied_snapshot(cached),
+                  mock.patch.object(unrouted_alert, "send_message") as alert):
+                owner = self.router().owner({"#": "C777", "Producer": identity}, listing)
+                self.assertIsInstance(owner, change_routing.UnroutedChange)
+                assert isinstance(owner, change_routing.UnroutedChange)
+                self.assertIn(identity, owner.note)
+                self.assertEqual(owner.tab, "unrouted")
+                if seen_by_authority:
+                    alert.assert_not_called()
+                    self.assertEqual(list((self.root / "links" / ".review-link-unrouted").glob("*.json")), [])
+                else:
+                    alert.assert_called_once()
+                    self.assertIn("Row: C777", cast(str, alert.call_args.args[2]).splitlines())
 
     def test_a_staff_override_record_sends_no_alert_for_a_real_list(self) -> None:
         with (mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root),
@@ -158,7 +190,7 @@ class StaffRoutingTests(unittest.TestCase):
         row = {"#": "C1", "Producer": self.unit.id}
         before = self.router().owner(row, self.root / "change-review - top.md")
         _ = staff.rename(self.unit.id, "renamed")
-        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree("natedev", self.root / "builder"),
+        _ = staff.set_worktree(self.unit.id, staff.RemovedWorktree(remote.local_machine(), self.root / "builder"),
                                    expected=self.unit.worktree)
         self.assertEqual(self.router().owner(row, self.root / "change-review - top.md"), before)
 
@@ -178,12 +210,12 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_owner_document_does_not_require_a_list_document(self) -> None:
         doc = self.root / "child-production.md"
         _ = doc.write_text("# Child")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), doc))
         listing = self.root / "change-review - missing.md"
         assignment = self.router().owner_and_production(listing, {"#": "C1", "Producer": self.unit.id})
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "child")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         assignment = self.router().owner_and_production(self.root / "change-review - top.md", {"#": "C2"})
         self.assertEqual(assignment.production, doc)
         self.assertEqual(assignment.owner.tab, "top")
@@ -199,7 +231,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_a_missing_staff_document_uses_the_supplied_production_document(self) -> None:
         doc = self.root / "supplied.md"
         _ = doc.write_text("# Supplied")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", self.root / "missing.md"))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.root / "missing.md"))
         router = change_routing.StaffRouting(staff.snapshot(), {"child": doc})
         self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
                          {"#": "C1", "Producer": self.unit.id}).production, doc)
@@ -238,7 +270,7 @@ class StaffRoutingTests(unittest.TestCase):
         listing = self.root / "change-review - top.md"
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         config.mkdir()
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
@@ -256,7 +288,7 @@ class StaffRoutingTests(unittest.TestCase):
         listing = self.root / "change-review - orphan.md"
         doc = self.root / "top-production.md"
         _ = doc.write_text("# Top")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), doc))
         config = self.root / "config"
         config.mkdir()
         setting = config / "review_links.conf"
@@ -311,7 +343,8 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(assignment.owner.showrunner_recipients, ())
         self.assertEqual(assignment.production, doc)
         cast(mock.Mock, self.alert).assert_called_once_with(self.root / "links", "orphan", row,
-                                                          f"No staff record for {identity}", (identity,))
+                                                          f"No staff record for {identity}", (identity,),
+                                                          still_unrouted=mock.ANY)
 
     def test_an_orphan_list_keeps_a_broken_parent_unrouted_with_the_root_document(self) -> None:
         doc = self.configured_root_document()
@@ -340,7 +373,7 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_page_and_footer_count_an_unrouted_orphan_under_unrouted(self) -> None:
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
-        import change_review as cli_review
+        from scripts.production import change_review as cli_review
 
         doc = self.configured_root_document()
         listing = self.root / "change-review - orphan.md"
@@ -363,7 +396,7 @@ class StaffRoutingTests(unittest.TestCase):
         supplied, authoritative = self.root / "supplied.md", self.root / "staff.md"
         _ = supplied.write_text("# Supplied")
         _ = authoritative.write_text("# Staff")
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", authoritative))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), authoritative))
         router = change_routing.StaffRouting(staff.snapshot(), {"child": supplied})
         self.assertEqual(router.owner_and_production(self.root / "change-review - top.md",
                          {"#": "C1", "Producer": self.unit.id}).production, authoritative)
@@ -379,18 +412,18 @@ class StaffRoutingTests(unittest.TestCase):
     def test_the_page_and_footer_count_each_producer_state_the_same_way(self) -> None:
         from scripts.production import footer_counts, showrunners
         from scripts.review_links import change_browser, change_page
-        import change_review as cli_review
+        from scripts.production import change_review as cli_review
 
         docs = {name: self.root / f"{name}-production.md" for name in ("top", "child")}
         listing = self.root / "change-review - top.md"
         for name, doc in docs.items():
             _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n")
-        _ = staff.set_doc(self.top.id, staff.LiveDoc("natedev", docs["top"]))
-        _ = staff.set_doc(self.child.id, staff.LiveDoc("natedev", docs["child"]))
+        _ = staff.set_doc(self.top.id, staff.LiveDoc(remote.local_machine(), docs["top"]))
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), docs["child"]))
         retired = fixture_member("unit", name="retired", parent=self.child.id,
-                                worktree=staff.RemovedWorktree("natedev", self.root / "removed"))
+                                worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed"))
         _ = staff.rename(self.unit.id, "renamed")
-        _ = change_review.append_rows(listing, [change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)],
+        _ = change_review.append_rows(listing, pictured_changes([change_review.Visible(f"Change {i}", "Read", "Proof") for i in range(5)]),
             date(2026, 11, 2), "", docs["top"],
             producers=[self.unit.id, change_review.UnknownProducer(), staff.StaffId(fixture_runtime_id("missing-producer")), retired.id, self.child.id], record=staff.snapshot())
         with (mock.patch.object(change_review, "lists_directory", return_value=self.root), mock.patch.object(cli_review, "lists_directory", return_value=self.root),
@@ -419,6 +452,76 @@ class StaffRoutingTests(unittest.TestCase):
                 with self.subTest(fields=fields):
                     _ = record.write_text(json.dumps(fields))
                     self.assertEqual(change_routing.waits_for_user(listing, row, root), expected)
+
+    def test_delivery_readers_keep_default_fallbacks_and_require_complete_collected_reads(self) -> None:
+        listing = self.root / "change-review - top.md"
+        row = {"#": "C1"}
+        path = change_routing.delivery_path(self.root, listing, "C1")
+        read_text = Path.read_text
+        with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}):
+            for failure in ("unreadable", "invalid JSON", "invalid encoding"):
+                with self.subTest(failure=failure):
+                    _ = path.write_bytes(b"\xff" if failure == "invalid encoding" else b"{")
+
+                    def read(source: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                        if source == path and failure == "unreadable":
+                            raise PermissionError(str(path))
+                        return read_text(source, encoding=encoding, errors=errors)
+
+                    with mock.patch.object(Path, "read_text", read):
+                        if failure != "invalid encoding":
+                            self.assertTrue(change_routing.waits_for_user(listing, row, self.root))
+                            self.assertEqual(change_routing.waiting_rows(listing, [row]), [row])
+                        for single in (False, True):
+                            sources: list[Path] = []
+                            with self.assertRaises((OSError, ValueError)):
+                                if single:
+                                    _ = change_routing.waits_for_user(listing, row, self.root, sources=sources)
+                                else:
+                                    _ = change_routing.waiting_rows(listing, [row], sources=sources)
+                            self.assertIn(path, sources)
+            path.unlink()
+            sources = []
+            self.assertTrue(change_routing.waits_for_user(listing, row, self.root, sources=sources))
+            self.assertIn(path, sources)
+
+    def test_collected_legacy_document_reads_fail_while_default_readers_skip_them(self) -> None:
+        doc = self.root / "child-production.md"
+        listing = self.root / "legacy.md"
+        _ = doc.write_text(f"- **Change review:** {listing}\n")
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == doc:
+                raise PermissionError(str(doc))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with mock.patch.object(Path, "read_text", read):
+            record = staff.snapshot()
+            self.assertEqual(change_routing.StaffRouting(record, {"child": doc}).list_owner(listing), "legacy")
+            sources: list[Path] = []
+            with self.assertRaises(PermissionError):
+                _ = change_routing.StaffRouting(record, {"child": doc}, sources=sources).list_owner(listing)
+            self.assertIn(doc, sources)
+
+    def test_missing_optional_source_folders_are_empty_and_unreadable_folders_raise(self) -> None:
+        from scripts.production.issues import source_paths
+
+        folder = self.root / "missing"
+        sources: list[Path] = []
+        self.assertEqual(source_paths(folder, "*.md", sources=sources), [])
+        self.assertEqual(sources, [folder])
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(str(folder))):
+            with self.assertRaises(PermissionError):
+                _ = source_paths(folder, "*.md", sources=sources)
+
+    def test_collected_routing_does_not_read_or_send_alerts(self) -> None:
+        self.enterContext(production_staff_record())
+        sources: list[Path] = []
+        router = change_routing.StaffRouting(staff.snapshot(), {}, sources=sources)
+        owner = router.owner({"#": "C1", "Producer": "missing"}, self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
 
 
     def test_only_named_fixture_rows_receive_producer_ids(self) -> None:
@@ -450,11 +553,10 @@ class StaffRoutingTests(unittest.TestCase):
             config.mkdir()
             config_env = config_environment(config)
             _ = write_config_fixture(config / "scratch.conf",
-                                     f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
+                                     f"holds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
-            source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
-            _ = (config / "review_links.conf").write_text(source.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+            _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "REVIEW_LINKS_ROOT": str(root / "links"),
                            "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
@@ -463,7 +565,7 @@ class StaffRoutingTests(unittest.TestCase):
                 _ = listing.write_text("## To review\n\n| # | Change | Production |\n| --- | --- | --- |\n| C1 | Known | natedev |\n")
                 docs = {name: root / f"{name}-production.md" for name in ("natedev", "builds")}
                 producer_rows(root, docs, {listing: "natedev"})
-                written = change_review.append_rows(listing, [change_review.Visible("Unknown AWS change", "Read", "Proof")],
+                written = change_review.append_rows(listing, pictured_changes([change_review.Visible("Unknown AWS change", "Read", "Proof")]),
                                                date(2026, 11, 2), "e41fa2a4", docs["builds"], record=staff.snapshot())
                 _ = listing.write_text(listing.read_text().replace("| C2 |", "| C777 |"))
                 runner = staff.snapshot().by_path("builds")
@@ -473,7 +575,7 @@ class StaffRoutingTests(unittest.TestCase):
                     written[0].replace("| C2 |", "| C777 |"),
                     written[0].replace("| C2 |", "| C777 |").replace(str(runner.id), "builds")))
                 _ = staff.move(runner.id, staff.ReportsTo(parent.id))
-                import change_review as cli_review
+                from scripts.production import change_review as cli_review
                 with (mock.patch.object(change_review, "lists_directory", return_value=root), mock.patch.object(cli_review, "lists_directory", return_value=root),
                       mock.patch.object(showrunners, "timer_docs", return_value=docs)):
                     browser = change_page.ReviewBrowser("secret")
@@ -506,14 +608,11 @@ class StaffRoutingTests(unittest.TestCase):
 
 class MergeWriterRoutingTests(ProducerFixture):
     def test_a_gate_written_producer_routes_to_the_unit_and_receives_return_feedback(self) -> None:
-        from scripts.production import merge_gate
+        from scripts.production import gate
         from scripts.review_links import change_page
 
-        merged = self.merge()
-        commits = change_review.merge_commits(self.repo, merged)
-        with mock.patch.object(change_review, "drift", return_value=[]):
-            merge_gate.record_changes(self.repo, self.listing, self.doc,
-                                      change_review.publication_changes(commits, self.doc), "main")
+        _ = self.merge()
+        gate.record_changes(self.repo, self.listing, self.doc, "main")
         row = change_review.pending(self.listing)[0]
         owner = change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.listing)
         self.assertIsInstance(owner, change_routing.StaffRoutedChange)
@@ -523,6 +622,10 @@ class MergeWriterRoutingTests(ProducerFixture):
 
 
 class ChangeReviewConfigTests(unittest.TestCase):
+    def test_shipped_config_has_a_review_links_directory(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        self.assertIsInstance(conf.read(path).origin("review_links_directory", str), conf.UsableLiveValue)
+
     def test_delivery_root_reads_the_folder_setting_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -533,10 +636,9 @@ class ChangeReviewConfigTests(unittest.TestCase):
                 _ = settings.write_text(f"review_links_directory={root / 'second'}\n")
                 self.assertEqual(change_routing.review_root(), root / "second")
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/change_review.conf")
-        for key, expected in {'lists_directory': '~/rust/hanadocs/change-review', 'review_links_directory': '~/.local/share/review-links'}.items():
-            with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
+    def test_config_reads_explicit_fixture_values(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "change_review.conf"
+        _ = write_config_fixture(path, f"lists_directory={folder / 'lists'}\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
+            self.assertEqual(change_routing.configured_lists_directory(), folder / "lists")

@@ -1,268 +1,369 @@
 """Check named assignment review with the shared loopback fixture."""
 from __future__ import annotations
 
-from scripts.lib.test_models_registry import write_registry
-import fcntl
+from scripts.direct import pass_record as pass_recorder
+
 import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+import unittest
 from pathlib import Path
-from typing import cast, final
-from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import workers
-from scripts.production import session_staff
-from scripts.direct.assign_launcher_test_support import ROOT, read_object
-from scripts.direct import assign_launcher_test_support as launcher_fixture
+from collections.abc import Callable
+from typing import cast, final, override
+from unittest.mock import patch
+from scripts.agents import codex_test_support as codex_fixture
+from scripts.astra import astra_roles
+from scripts.astra.design_role_test_support import HeldRolePaneCase
+from scripts.direct import assign, progress_history, recorder_state
+from scripts.production import staff, worker
+from scripts.herdr import turn_end, worker_panes
+from scripts.production.cli_fixture import invoke_cli
+from scripts.direct.assign_launcher_test_support import (
+    ROOT, AssignLauncherFixture, assignment_environment, read_object,
+)
+from scripts.lib import build_folders, unit_runs
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lint import style_review
 
-setUpModule = mesh_fixture.setUpModule
+setUpModule = codex_fixture.setUpModule
+
 
 @final
-class AssignReviewTests(launcher_fixture.AssignLauncherFixture):
-    def watch(self, path: Path) -> codex_mesh.LinuxFileChanges | codex_mesh.KqueueFileChanges:
-        if sys.platform.startswith("linux"):
-            return codex_mesh.LinuxFileChanges({path})
-        return codex_mesh.KqueueFileChanges({path})
-
-    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> None:
-        """Mark the return from the real follow call."""
-        self.instrument_launcher(
-            "from pathlib import Path\nfrom scripts.direct import assign\n" +
-            transport_override +
-            "real_follow = assign.Dispatch.follow\n" +
-            "def follow(dispatch, command, shown, log):\n" +
-            "    result = real_follow(dispatch, command, shown, log)\n" +
-            f"    Path({str(settled)!r}).touch()\n" +
-            "    return result\n" +
-            "assign.Dispatch.follow = follow\n")
-
-    def review_after_stage_one(self) -> subprocess.CompletedProcess[str]:
-        """Omit Stage 2 delivery after the first follow completes."""
-        ready = self.session_dir.parent / "handoff.ready"
-        settled = self.session_dir.parent / "stage-one-settled"
-        reply = self.session_dir / "phases/7/project-review_reply_contract_1.txt"
-        # A successful transport acknowledgment alone must not complete a review.
-        # Keep the recorder, follower, and server real. Omit the send.
-        transport = self.session_dir.parent / "codex_mesh.py"
-        _ = transport.write_text(
-            "import runpy, sys\n" +
-            "if sys.argv[1] == 'send':\n" +
-            "    print('queued transport acknowledgment without delivery')\n" +
-            "else:\n" +
-            f"    runpy.run_path({str(ROOT / 'scripts/agents/codex_mesh.py')!r}, run_name='__main__')\n")
-        transport_override = f"assign.MESH = {str(transport)!r}\n"
-        self.observe_follow_settlement(settled, transport_override)
-        original = self.server.respond
-
-        @self.hang_guard.callback
-        def provisional_reply(request: dict[str, object]) -> list[dict[str, object]] | None:
-            frames = original(request)
-            if request.get("method") == "turn/start" and frames is not None:
-                params = cast(dict[str, object], request["params"])
-                frames.insert(-1, {"jsonrpc": "2.0", "method": "item/completed", "params": {
-                    "threadId": params["threadId"], "turnId": "turn-1",
-                    "item": {"id": "provisional", "type": "agentMessage", "text": "Stage 1 only."},
-                }})
-            return frames
-
-        self.server.respond = provisional_reply
-        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
-        watch = self.watch(settled)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready),
-                                           execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
-                try:
-                    while not settled.exists():
-                        self.assertFalse(launched.done(), "Stage 1 completed the entire review")
-                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
-                        if event == codex_mesh.WaitDeadlineExpired.EXPIRED:
-                            ready.touch()
-                            stopped = self.hang_guard.result(launched)
-                            self.fail(f"Stage 1 never settled: {stopped.stdout}{stopped.stderr}; " +
-                                      f"roster={roster_path.read_text() if roster_path.exists() else 'missing'}")
-                    self.assertFalse(launched.done(), "Stage 1 completed the entire review")
-                    self.assertIn("Stage 1 only.", reply.read_text())
-                    roster = self.assignment_records()
-                    self.assertTrue(roster)
-                    self.assertTrue(all(record.get("status") == "done" for record in roster.values()), roster)
-                    self.assertEqual(self.turn_starts, 1)
-                    self.assertFalse(any(event.get("event_type") == "pass_finished" for event in self.events()))
-                    ready.touch()
-                    result = self.hang_guard.result(launched)
-                finally:
-                    ready.touch()
-        finally:
-            watch.close()
-        return result
-
-    def test_an_early_review_receives_its_final_diff_once_after_the_ready_event(self) -> None:
-        ready = self.session_dir.parent / "final.ready"
-        self.outcomes = ["disconnect"]
-        self.server.hold_turn_completion = True
-        self.server.answer_requests_during_held_turn = True
-        self.server.held_turn_completes_successfully = True
-        original = self.server.respond
-        deliveries: list[str] = []
-
-        @self.hang_guard.callback
-        def final_diff(request: dict[str, object]) -> list[dict[str, object]] | None:
-            params = cast(dict[str, object], request.get("params", {}))
-            if request.get("method") == "turn/start" and "Stage 2" in json.dumps(params):
-                self.assertTrue(ready.exists(), "final diff was sent before its ready event")
-                deliveries.append(json.dumps(params))
-            frames = original(request)
-            if request.get("method") == "turn/start" and self.turn_starts == 1 and frames is not None:
-                self.live_turn = f"turn-{self.turn_starts}"
-                frames.append({"jsonrpc": "2.0", "method": "item/completed", "params": {
-                    "threadId": params["threadId"], "turnId": self.live_turn,
-                    "item": {"id": "review-answer", "type": "agentMessage", "text": "Review complete."},
-                }})
-            return frames
-
-        self.server.respond = final_diff
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                       "--early-ready", str(ready),
-                                       execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
+class AssignmentFixtureIsolationTests(unittest.TestCase):
+    def test_commits_keep_the_inherited_git_repository_unchanged(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        sentinel = root / "sentinel"
+        git_dir = sentinel / ".git"
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=str(write_fixture_git_config(root)), GIT_CONFIG_NOSYSTEM="1")
+        _ = subprocess.run(["git", "init", "-q", str(sentinel)], env=environment, check=True, capture_output=True)
+        write_text_atomic(sentinel / "tracked", "Sentinel contents.\n")
+        head = commit_repository(sentinel, "Create the sentinel.", env=environment)
+        index = (git_dir / "index").read_bytes()
+        shallow = root / "shallow"
+        write_text_atomic(shallow, head + "\n")
+        locations = {
+            "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(sentinel), "GIT_INDEX_FILE": str(git_dir / "index"),
+            "GIT_COMMON_DIR": str(git_dir), "GIT_OBJECT_DIRECTORY": str(git_dir / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_dir / "objects"), "GIT_CEILING_DIRECTORIES": str(root),
+            "GIT_SHALLOW_FILE": str(shallow), "GIT_TEMPLATE_DIR": str(root / "external-templates"),
+        }
+        case = AssignLauncherFixture("runTest")
+        with patch.dict(os.environ, locations):
             try:
-                self.hang_guard.event(self.server.held_turn_ready)
-                self.assertEqual(deliveries, [])
-                phase = self.session_dir / "phases/7"
-                self.assertEqual((phase / "project-review_status_contract").read_text().strip(), "reviewing")
-                launcher_pid = int((phase / "project-review_pid_contract").read_text())
-                os.kill(launcher_pid, 0)
-                address = next(iter(self.assignment_records()))
-                pending = session_staff.worker_inbox_path(self.session_dir, address)
-                watch = self.watch(pending)
-                try:
-                    ready.touch()
-                    while True:
-                        if pending.exists():
-                            with pending.open() as inbox:
-                                fcntl.flock(inbox, fcntl.LOCK_SH)
-                                if "Stage 2" in inbox.read():
-                                    break
-                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
-                        self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED,
-                                            "ready event delivered no Stage 2 message")
-                finally:
-                    watch.close()
-                self.live_turn = ""
-                self.server.hold_turn_completion = False
-                self.server.release_held_turn.set()
-                result = self.hang_guard.result(launched)
+                case.setUp()
+                self.assertEqual({name for name in os.environ if name.startswith("GIT_")},
+                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TEMPLATE_DIR"})
+                # The worktree model gets the fixture's own empty templates, never the inherited folder.
+                self.assertEqual(Path(os.environ["GIT_TEMPLATE_DIR"]), case.home / "git-templates")
+                write_text_atomic(case.project / "fixture.txt", "Private work.\n")
+                case.commit_project("Record private work.")
             finally:
-                self.server.release_held_turn.set()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.session_dir / "phases/7/project-review_status_contract").read_text().strip(), "reviewed")
-        self.assertEqual(len(deliveries), 1, deliveries)
-        self.assertIn("Stage 2", deliveries[0])
-        self.assertIn(str(ready.with_suffix(".diff")), deliveries[0])
+                case.doCleanups()
+        current = subprocess.check_output(["git", "-C", str(sentinel), "rev-parse", "HEAD"],
+                                          env=environment, text=True).strip()
+        self.assertEqual(current, head)
+        self.assertEqual((git_dir / "index").read_bytes(), index)
+        self.assertEqual((sentinel / "tracked").read_text(), "Sentinel contents.\n")
 
-    def test_an_early_review_that_finishes_stage_one_waits_for_stage_two_to_finish(self) -> None:
-        ready = self.session_dir.parent / "final.ready"
-        reply = self.session_dir / "phases/7/project-review_reply_contract_1.txt"
-        status = reply.with_name("project-review_status_contract_1")
-        settled = self.session_dir.parent / "stage-one-settled"
-        self.observe_follow_settlement(settled)
-        original = self.server.respond
-        deliveries: list[str] = []
-
-        @self.hang_guard.callback
-        def hold_final_review(request: dict[str, object]) -> list[dict[str, object]] | None:
-            params = cast(dict[str, object], request.get("params", {}))
-            stage_two = request.get("method") == "turn/start" and "Stage 2:" in json.dumps(params)
-            if stage_two:
-                self.assertTrue(ready.exists())
-                deliveries.append(json.dumps(params))
-                self.outcomes = ["disconnect"]
-                self.server.hold_turn_completion = True
-                self.server.answer_requests_during_held_turn = True
-                self.server.held_turn_completes_successfully = True
-            frames = original(request)
-            if stage_two and frames is not None:
-                self.live_turn = f"turn-{self.turn_starts}"
-                frames.append({"jsonrpc": "2.0", "method": "item/completed", "params": {
-                    "threadId": params["threadId"], "turnId": self.live_turn,
-                    "item": {"id": "final-review-answer", "type": "agentMessage", "text": "Final review."},
-                }})
-            elif request.get("method") == "turn/start" and self.turn_starts == 1 and frames is not None:
-                frames.insert(-1, {"jsonrpc": "2.0", "method": "item/completed", "params": {
-                    "threadId": params["threadId"], "turnId": "turn-1",
-                    "item": {"id": "provisional-answer", "type": "agentMessage", "text": "Provisional review."},
-                }})
-            return frames
-
-        self.server.respond = hold_final_review
-        watch = self.watch(settled)
+    def test_fixture_context_releases_the_style_folder_lock(self) -> None:
+        descriptors = Path("/dev/fd")
+        before = len(list(descriptors.iterdir()))
+        case = AssignLauncherFixture("runTest")
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready),
-                                           execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
-                try:
-                    while not settled.exists():
-                        self.assertFalse(launched.done(), "review exited before its final diff existed")
-                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
-                        self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
-                    self.assertFalse(launched.done(), "Stage 1 alone completed the review")
-                    self.assertEqual(deliveries, [])
-                    self.assertIn("Provisional review.", reply.read_text())
-                    self.assertFalse(any(event.get("event_type") in {"pass_started", "pass_finished"}
-                                         for event in self.events()))
-                    ready.touch()
-                    self.hang_guard.event(self.server.held_turn_ready)
-                    self.assertEqual(len([event for event in self.events()
-                                          if event.get("event_type") == "pass_started"]), 1)
-                    self.assertFalse(any(event.get("event_type") == "pass_finished" for event in self.events()))
-                    self.assertEqual(status.read_text().strip(), "running")
-                    self.live_turn = ""
-                    self.server.release_held_turn.set()
-                    result = self.hang_guard.result(launched)
-                finally:
-                    ready.touch()
-                    self.server.release_held_turn.set()
+            case.setUp()
+            held = build_folders.held_build_folder_descriptors()
+            folder = style_review.start(case.project, "HEAD", case.session_dir / "phases/7", case.prompt, "review")
+            self.assertEqual(build_folders.held_build_folder_descriptors(), held)
+            self.assertTrue((folder / "prompt.md").is_file())
         finally:
-            watch.close()
+            case.doCleanups()
+        self.assertEqual(len(list(descriptors.iterdir())), before)
+
+
+@final
+class PaneAstraReviewTests(HeldRolePaneCase):
+    """Run the assignment entry point with real worker and transcript paths."""
+
+    @override
+    def setUp(self) -> None:
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
+        super().setUp()
+        _ = self.enterContext(assignment_environment(bytecode_setting))
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.panes.root))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.panes.root)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
+        self.panes.command_case.agent.final = "Verdict: clear."
+        _ = self.enterContext(self.panes.world.process_starts())
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run_worker_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and Path(command[1]).resolve() == ROOT / "scripts/production/worker.py":
+                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:],
+                                    cast(dict[str, str], options["env"]), ROOT)
+                if not options.get("capture_output"):
+                    print(result.stdout + result.stderr, end="")
+                return result
+            return run_process(command, **options)
+
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run_worker_command))
+        _ = self.enterContext(patch.object(assign, "require_live_director"))
+
+    def run_review(self, run_name: str = "astra-run") -> subprocess.CompletedProcess[str]:
+        run = self.panes.root / run_name
+        run.mkdir(exist_ok=True)
+        return invoke_cli(assign, assign.main, ["--role", "review", "--operation", "astra-review",
+            "--new-worker", "astra-reviewer", "--session-dir", str(run), "--cwd", str(self.panes.root),
+            "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(run / "review.md")],
+            os.environ.copy(), ROOT)
+
+    def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
+        write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
+        project = self.panes.root / "project"
+        project.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)
+        write_text_atomic(project / "design.md", "The first design.\n")
+        baseline = commit_repository(project, "Record the first design.", "design.md")
+        write_text_atomic(project / "design.md", "The next design.\n")
+        case = self.panes.command_case
+        write_text_atomic(case.prompt, "Phase 8 — Workers\nReview the assigned change.\n")
+        opened = case.opened()
+        _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
+            worker_name="impl", worker_id=opened.row.id, launcher_command=["implementation"],
+            prompt=case.prompt, kind="impl", lens="")
+        for lens, style in (("adversary", False), ("contract", True)):
+            with self.subTest(lens=lens, style=style):
+                name = "models-review-" + lens
+                case.agent.final = ("<!-- phase-style-review:start -->\nStyle review: Pass\n"
+                                    "<!-- phase-style-review:end -->\nAPPROVE")
+                arguments = ["--role", "review", "--to", name, "--lens", lens, "--pass", "1",
+                             "--phase", "8", "--session-dir", str(case.run_dir), "--cwd", str(project),
+                             "--prompt", str(case.prompt)]
+                if style:
+                    arguments += ["--style-since", baseline]
+                notices = len(case.agent.notices)
+                result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), project)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                pane = case.agent.submitted[-1][0]
+                row = case.agent.row(pane)
+                active = progress_history.active_dispatch(row.id, case.run_dir)
+                assert isinstance(active, progress_history.ActiveDispatch)
+                for expected in (turn_end.TurnOutcome.DONE, turn_end.TurnOutcome.IGNORED):
+                    self.assertEqual(case.finish(name), expected)
+                    self.assertEqual(len(case.agent.notices), notices + 1)
+                passed = worker_panes.worker_pass(row, case.run_dir)
+                self.assertEqual(passed["status"], "completed")
+                delivery = pass_recorder.dispatch_delivery(passed)
+                self.assertEqual(Path(delivery.actions.status_file).read_text(), "done\n")
+                self.assertTrue(Path(delivery.reply_file).read_text().endswith(f"DONE {active.instance_id}\n"))
+                self.assertIn(f"{name}: phase 8: done", case.agent.notices[-1])
+                if style:
+                    saved = read_object(case.run_dir / "phases/8/style_review_state.json")
+                    self.assertEqual(saved["state"], "complete")
+                    self.assertEqual(saved["in_flight"], False)
+                    directory = Path(str(saved["input_directory"]))
+                    self.assertTrue(directory.name.startswith(f"{name}-"))
+                    self.assertEqual(len(directory.name.removeprefix(f"{name}-")), 11)
+                    self.assertTrue((directory / "assignment.md").read_text())
+                    self.assertEqual((directory / "style-review-additions.txt").read_text(), "+The next design.\n")
+
+    def assert_review_lifetime(self, failed: bool) -> None:
+        records: list[dict[str, object]] = []
+        rows: list[staff.StaffRow] = []
+        self.panes.command_case.agent.without_done = failed
+
+        def observe() -> None:
+            rows.extend(staff.find(kind="worker"))
+            records.extend(cast(dict[str, object], json.loads(path.read_text()))
+                           for path in (self.panes.root / "holds").glob("*.json"))
+
+        self.panes.command_case.agent.during_prompt = observe
+        if failed:
+            def exit_after_reply(pane: str) -> None:
+                _ = self.panes.world.foreground.pop(pane)
+            self.panes.command_case.agent.after_complete = exit_after_reply
+        holder_state = (self.panes.command_case.run_dir / "progress_history_state.json").read_bytes()
+        result = self.run_review()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(deliveries), 1, deliveries)
-        self.assertEqual(self.turn_starts, 2)
-        finished = [event for event in self.events() if event.get("event_type") == "pass_finished"]
-        self.assertEqual(len(finished), 1, self.events())
-        self.assertEqual(finished[0]["status"], "completed")
-        self.assertEqual(status.read_text().strip(), "done")
-        self.assertIn("Final review.", status.with_name("project-review_summary_contract_1.txt").read_text())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(records), 1)
+        row = rows[0]
+        self.assertEqual((row.name, row.parent), (
+            "astra-reviewer", staff.ReportsTo(self.panes.command_case.fixture.parent.id)))
+        self.assertEqual({key: value for key, value in records[0].items() if key not in ("held_at", "pid_start")}, {
+            "staff_id": row.id, "pid": next(pid for pid, process in self.panes.world.processes.items()
+                                            if process.identity.id == row.current_session)})
+        self.assertEqual(len(self.panes.world.launches), 1)
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+        run = self.panes.root / "astra-run"
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(self.panes.world.closed, [])
+        self.assertEqual(len(list((self.panes.root / "holds").glob("*.json"))), 1)
+        self.assertIsInstance(progress_history.active_dispatch(row.id, run), progress_history.ActiveDispatch)
+        end = worker.end
+        endings: list[str] = []
 
-    def test_an_early_review_without_stage_two_delivery_records_error_instead_of_done(self) -> None:
-        result = self.review_after_stage_one()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        folder = self.session_dir / "phases/7"
-        self.assertEqual((folder / "project-review_status_contract_1").read_text().strip(), "error")
-        self.assertEqual(self.turn_starts, 1)
-        finished = [event for event in self.events() if event.get("event_type") == "pass_finished"]
-        self.assertEqual(len(finished), 1, self.events())
-        self.assertEqual(finished[0]["status"], "error")
-        self.assertFalse(any(record.get("adopted_to") for record in self.assignment_records().values()))
+        def check_end(parent: staff.StaffId, name: staff.WorkerName, *,
+                      lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+                      retire: bool = True) -> worker.ExitCode:
+            passed = read_object(self.panes.root / "astra-run/progress_history_state.json")
+            status = assign.object_map(assign.object_map(passed["pass"])[row.name])["status"]
+            endings.append(str(status))
+            self.assertEqual(status, "error" if failed else "completed")
+            self.assertEqual(len(list((self.panes.root / "holds").glob("*.json"))), 1)
+            return end(parent, name, lock=lock, retire=retire)
 
-    def test_a_review_launcher_follow_uses_the_current_review_row_instead_of_history(self) -> None:
-        self.commit_project()
-        self.review_launcher("--new-worker", "project-review", "1")
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(record["turn_model"], "gpt-kept-sol")
-        identity_path = self.identity_path(name)
-        identity = read_object(identity_path)
-        self.assertEqual(identity["model"], "gpt-kept-sol")
-        self.assertEqual(workers.resolve(self.session_dir, "review", working_dir=self.project), name)
-        reservation = workers.allocation_for_follow(self.session_dir, name)
-        workers.release_allocation(self.session_dir, name, reservation)
-        self.assertTrue(self.assignment_records()[name].get("unit_ledger"))
-        _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
-        self.review_launcher("--to", name, "2")
-        self.assertEqual(self.assignment_records()[name]["turn_model"], "gpt-other-sol")
-        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual(turn["model"], "gpt-other-sol")
-        self.assertEqual(self.turn_starts, 2)
-        self.assertEqual(read_object(identity_path), identity)
+        with patch.object(worker, "end", side_effect=check_end):
+            outcome = self.panes.command_case.finish(row.name)
+        self.assertEqual(endings, ["error" if failed else "completed"])
+        self.assertEqual(outcome, turn_end.TurnOutcome.NO_DONE if failed else turn_end.TurnOutcome.DONE)
+        self.assertFalse(list((self.panes.root / "holds").glob("*.json")))
+        self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(len(self.panes.world.closed), 1)
+        self.assertEqual((self.panes.command_case.run_dir / "progress_history_state.json").read_bytes(), holder_state)
+        state = read_object(self.panes.root / "astra-run/progress_history_state.json")
+        status = assign.object_map(assign.object_map(state["pass"])[row.name])["status"]
+        run_status = "error" if failed else "completed"
+        self.assertEqual(recorder_state.open_phase_ids(state), [])
+        self.assertEqual(state["status"], run_status)
+        events = [assign.object_map(cast(object, json.loads(line)))
+                  for line in Path(assign.text(state["history_file"])).read_text().splitlines()]
+        self.assertEqual([(event["event_type"], event["status"]) for event in events
+                          if event["event_type"] in ("phase_finished", "run_finished")],
+                         [("phase_finished", run_status), ("run_finished", run_status)])
+        self.assertEqual([event["status"] for event in events if event["event_type"] == "pass_finished"],
+                         [run_status])
+        if not failed:
+            reply = (self.panes.root / "astra-run/review.md").read_text().splitlines()
+            self.assertEqual(reply[0], "Verdict: clear.")
+            self.assertTrue(reply[-1].startswith("DONE "))
+            self.assertEqual(status, "completed")
+            repeated = self.run_review()
+            self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+            self.assertEqual(len(self.panes.world.launches), 1)
+            self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+            self.assertEqual(staff.snapshot().find(kind="worker"), [])
+            self.assertFalse(list((self.panes.root / "holds").glob("*.json")))
+        else:
+            self.assertEqual(status, "error")
+            self.assertIn("no DONE", self.panes.command_case.agent.notices[-1])
+
+    def test_pane_reviewer_writes_the_reply_and_ends_its_row_and_hold(self) -> None:
+        self.assert_review_lifetime(False)
+
+    def test_failed_pane_review_ends_its_row_and_hold(self) -> None:
+        self.assert_review_lifetime(True)
+
+    def test_failed_reviewer_setup_closes_only_its_new_pane(self) -> None:
+        for failure, existing in (("hold error", False), ("hold unavailable", False),
+                                  ("hold error", True), ("hold unavailable", True),
+                                  ("close", False), ("dispatch", False), ("dispatch", True), ("incomplete", False)):
+            with self.subTest(failure=failure, existing=existing):
+                case = PaneAstraReviewTests("runTest")
+                case.setUp()
+                try:
+                    commands = case.panes.command_case
+                    world = case.panes.world
+                    if existing:
+                        opened = commands.opened("astra-reviewer", "astra-reviewer")
+                        case.assertIsNotNone(staff.by_id(opened.row.id))
+                    before = staff.snapshot()
+                    rows: list[staff.StaffRow] = []
+                    def hold(role: astra_roles.AstraRole, lifetime: astra_roles.ExecProcess,
+                             staff_id: str = "") -> astra_roles.HeldRole | astra_roles.HoldWorkerUnavailable:
+                        rows.extend(staff.find(kind="worker"))
+                        if failure == "dispatch":
+                            return real_hold(role, lifetime, staff_id)
+                        if failure == "hold unavailable":
+                            print("TEST hold unavailable", file=sys.stderr)
+                            return astra_roles.HoldWorkerUnavailable("TEST hold unavailable")
+                        raise ValueError("TEST hold unavailable")
+                    real_hold = astra_roles.hold
+                    real_launch = assign.launch
+                    def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
+                               policy: worker_panes.LaunchPolicy, *,
+                               lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+                               ) -> worker_panes.WorkerStart:
+                        result = real_launch(target, policy, lock=lock)
+                        if failure == "incomplete":
+                            assert isinstance(result, worker_panes.OpenWorker)
+                            rows.append(result.row)
+                            return worker_panes.IncompleteStart(result.row, result.pane, "TEST hold unavailable", result.created_pane)
+                        return result
+                    with (patch.object(astra_roles, "hold", side_effect=hold),
+                          patch.object(assign, "launch", side_effect=launch)):
+                        if failure == "close":
+                            with (patch.object(world, "close_tab_confirmed", return_value=False),
+                                  patch.object(world, "close_terminal_pane", return_value=False)):
+                                result = case.run_review()
+                        elif failure == "dispatch":
+                            with patch.object(worker, "dispatch", return_value=worker.ExitCode.REFUSED):
+                                result = case.run_review()
+                        else:
+                            result = case.run_review()
+                    case.assertEqual(result.returncode, 2 if failure == "dispatch" else 8 if failure == "incomplete" else 1, result.stdout + result.stderr)
+                    row, = rows
+                    case.assertEqual(commands.agent.submitted, [])
+                    if existing or failure == "close":
+                        case.assertEqual(staff.by_id(row.id), before.by_id(row.id) if existing else row)
+                        case.assertEqual(world.closed, [])
+                    else:
+                        case.assertIsNone(staff.by_id(row.id))
+                        case.assertEqual(len(world.closed), 1)
+                    if failure != "dispatch":
+                        case.assertIn("TEST hold unavailable", result.stderr)
+                    if failure == "close":
+                        state = worker_panes.observe_worker(commands.fixture.parent.id, row, staff.snapshot())
+                        assert isinstance(state, worker_panes.OpenWorker)
+                        case.assertIn(f"anomaly: {state.pane}: cleanup failed:", result.stderr)
+                        case.assertEqual(result.stderr.count("anomaly:"), 1)
+                        case.assertIn("pane close is incomplete", result.stderr)
+                finally:
+                    case.doCleanups()
+
+    def test_recording_failure_returns_an_error_and_attempts_remaining_finishes(self) -> None:
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        cases = (("finish-phase", False), ("finish-phase", True), ("finish-run", False))
+        for operation, dispatch_failed in cases:
+            with self.subTest(operation=operation, dispatch_failed=dispatch_failed):
+                def refuse_record(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if len(command) > 2 and command[1] == assign.PROGRESS and command[2] == operation:
+                        command = [*command, "--status", "recording-refused"]
+                    return run_process(command, **options)
+
+                def complete(pane: str) -> None:
+                    if dispatch_failed:
+                        _ = self.panes.world.foreground.pop(pane)
+
+                self.panes.command_case.agent.without_done = dispatch_failed
+                self.panes.command_case.agent.after_complete = complete
+                run_name = operation + ("-dispatch-error" if dispatch_failed else "-review")
+                with patch.object(subprocess, "run", side_effect=refuse_record):
+                    result = self.run_review(run_name)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.panes.command_case.finish("astra-reviewer"), turn_end.TurnOutcome.ERROR)
+                self.assertIn("recording-refused", self.panes.command_case.agent.notices[-1])
+                if dispatch_failed:
+                    self.assertIn("no DONE", self.panes.command_case.agent.notices[-1])
+                state = read_object(self.panes.root / run_name / "progress_history_state.json")
+                self.assertEqual(recorder_state.open_phase_ids(state), [])
+                self.assertEqual(state.get("status"), None if operation == "finish-run" else "error")
+
+    def test_failed_pane_end_returns_one_and_keeps_the_hold(self) -> None:
+        result = self.run_review()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row, = staff.snapshot().find(kind="worker")
+        with patch.object(self.panes.world, "close_terminal_pane", return_value=False):
+            self.assertEqual(self.panes.command_case.finish(row.name), turn_end.TurnOutcome.DONE)
+        record = read_object(self.panes.root / "holds" / (str(row.id) + ".json"))
+        self.assertEqual(record["staff_id"], row.id)
+        self.assertEqual(self.panes.world.closed, [])
+        self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
+        state = read_object(self.panes.root / "astra-run/progress_history_state.json")
+        self.assertEqual(recorder_state.open_phase_ids(state), [])
+        self.assertEqual(state["status"], "error")
+        self.assertIn("pane close is incomplete", self.panes.command_case.agent.notices[-1])

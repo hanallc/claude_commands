@@ -1,6 +1,8 @@
-"""A production's LOG is copied on every update tick, and the newest copies are kept."""
+"""Keep the newest LOG copies from explicit backup calls and production checks."""
 
 from __future__ import annotations
+
+from scripts.production.staff_test_support import foreign_hostname
 
 import os
 import subprocess
@@ -13,15 +15,21 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
+from scripts.agents import remote
 from scripts.production import log_backup, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("log_backup.py")
 CHECK = Path(__file__).with_name("production_check.sh")
 ZONE = ZoneInfo("America/Los_Angeles")
 NOON = datetime(2026, 10, 12, 12, 0, tzinfo=ZONE)
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class LogBackupTests(unittest.TestCase):
@@ -45,10 +53,10 @@ class LogBackupTests(unittest.TestCase):
         self.write_doc("running")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN,
             "SHOWRUNNER_STATE_DIR": str(self.state),
         })))
-        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc("natedev", self.doc))
+        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
         _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
         self.owner_id = owner.id
         self.backups = self.state / owner.id / "log-backups"
@@ -110,17 +118,17 @@ class LogBackupTests(unittest.TestCase):
 
     def test_the_command_copies_into_the_production_s_own_directory(self) -> None:
         _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 0, result.stderr)
         names = self.names()
         self.assertEqual(len(names), 1)
         self.assertRegex(names[0], r"^log-\d{8}T\d{4}\.md$")
         self.assertEqual(result.stdout, f"copied to {self.backups / names[0]}\n")
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), str(self.doc)]).stdout, "nothing new to copy\n")
+        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), "backup-owner"]).stdout, "nothing new to copy\n")
 
     def test_the_command_refuses_a_doc_it_cannot_read(self) -> None:
         self.write_doc("running", log_field=False)
-        result = self.run_script([sys.executable, str(SCRIPT), str(self.doc)])
+        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
         self.assertEqual(result.returncode, 1)
         self.assertIn("log_backup: production doc lacks Log", result.stderr)
         self.assertEqual(self.run_script([sys.executable, str(SCRIPT)]).returncode, 2)
@@ -134,6 +142,11 @@ class LogBackupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(len(self.names()), copied)
+
+    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
+        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.names(), [])
 
     def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
         self.write_doc("running", log_field=False)

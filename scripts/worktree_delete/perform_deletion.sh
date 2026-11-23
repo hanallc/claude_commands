@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Removes a worktree and deletes its branch, locally and on origin.
+# Report a worktree and its build output for manual removal.
 # Usage: perform_deletion.sh <worktree_path> <branch_name>
-# Returns: Status of removal and branch deletion
 #
-# Requires a confirmation nonce written by the /worktree_delete confirm step
-# (record_confirmation.sh). Without it this script refuses to delete, so a
-# caller that skips the confirmation step cannot trigger a deletion.
+# Require the landing checks or a nonce from record_confirmation.sh.
 
 set -euo pipefail
 
@@ -22,8 +19,43 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
-if ! wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME"; then
-    exit 1
+HAS_CONFIRMATION=false
+CHECKED_LOCAL_TIP=""
+if [[ -f "$(wt_confirm_file "$WORKTREE_PATH")" ]]; then
+    if ! wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME"; then
+        exit 1
+    fi
+    HAS_CONFIRMATION=true
+else
+    if ! CHECKED_TIPS=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" cleanup "$WORKTREE_PATH" --checked-tips 2>&1); then
+        wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME" || true
+        printf '%s\n' "$CHECKED_TIPS"
+        exit 1
+    fi
+    read -r CHECKED_LOCAL_TIP _ <<< "$CHECKED_TIPS"
+    if [[ "$(git -C "$WORKTREE_PATH" branch --show-current)" != "$BRANCH_NAME" ]]; then
+        wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME" || true
+        echo "Error: the worktree branch does not match $BRANCH_NAME."
+        exit 1
+    fi
+    if [[ "$(git -C "$WORKTREE_PATH" rev-parse --path-format=absolute --git-common-dir)" != \
+          "$(git rev-parse --path-format=absolute --git-common-dir)" ]]; then
+        wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME" || true
+        echo "Error: the worktree belongs to a different repository."
+        exit 1
+    fi
+fi
+
+# Refuse a branch lookup fault before origin deletion.
+if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    if [[ "$HAS_CONFIRMATION" == true ]]; then
+        CHECKED_LOCAL_TIP=$(git rev-parse --verify "refs/heads/$BRANCH_NAME")
+    fi
+else
+    BRANCH_LOOKUP_STATUS=$?
+    if [[ "$BRANCH_LOOKUP_STATUS" -ne 1 ]]; then
+        exit "$BRANCH_LOOKUP_STATUS"
+    fi
 fi
 
 ORIGIN_DEFAULT="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
@@ -33,20 +65,11 @@ if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "${ORIGIN_DEFAULT#origin/}" 
     exit 1
 fi
 
-cleanup_residual_directory() {
-    local project_dir="$1"
+if [[ "$WORKTREE_PATH" != /* ]]; then
+    WORKTREE_PATH="$PWD/$WORKTREE_PATH"
+fi
 
-    if [[ -e "$project_dir" ]]; then
-        echo "Removing residual directory: $project_dir"
-        rm -rf "$project_dir"
-    fi
-}
-
-# Every git call below runs against the ambient cwd. When the caller's cwd is
-# inside the worktree being removed, that directory stops existing partway
-# through and git aborts with "Unable to read current working directory". Move
-# to the main worktree first — it is the first entry of `git worktree list`, and
-# it is never the deletion target.
+# Run the review from the repository's main checkout.
 MAIN_WORKTREE="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
 if [[ -n "$MAIN_WORKTREE" && -d "$MAIN_WORKTREE" ]]; then
     cd "$MAIN_WORKTREE"
@@ -54,55 +77,14 @@ else
     echo "Warning: could not resolve the main worktree; staying in $PWD"
 fi
 
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
-
-echo "Removing worktree: $WORKTREE_PATH"
-if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
-    echo "Standard removal failed, forcing..."
-    if ! git worktree remove --force "$WORKTREE_PATH" 2>/dev/null; then
-        echo "Force removal failed, pruning and cleaning up manually..."
-        git worktree prune
-    fi
-fi
-
-cleanup_residual_directory "$WORKTREE_PATH"
-
-if [[ -e "$WORKTREE_PATH" ]]; then
-    echo "Error: Worktree path still exists after cleanup: $WORKTREE_PATH"
+echo "Reviewing worktree: $WORKTREE_PATH"
+if [[ -n "$CHECKED_LOCAL_TIP" ]] && [[ "$(git rev-parse --verify "refs/heads/$BRANCH_NAME")" != "$CHECKED_LOCAL_TIP" ]]; then
+    echo "Error: the local branch changed after the cleanup check; the worktree stays."
     exit 1
 fi
 
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-clean "$WORKTREE_PATH"
-
-echo ""
-echo "Deleting branch: $BRANCH_NAME"
-if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-    if ! git branch -D "$BRANCH_NAME"; then
-        echo "Error: Failed to delete branch"
-        exit 1
-    fi
-else
-    BRANCH_LOOKUP_STATUS=$?
-    if [[ "$BRANCH_LOOKUP_STATUS" -ne 1 ]]; then
-        exit "$BRANCH_LOOKUP_STATUS"
-    fi
+remove_options=()
+if [[ "$HAS_CONFIRMATION" == true ]]; then
+    remove_options+=(--force)
 fi
-echo "Branch deleted."
-
-# A failed remote deletion becomes the exit status.
-REMOTE_STATUS=0
-if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
-    echo ""
-    echo "Deleting origin/$BRANCH_NAME"
-    if git push origin --delete "$BRANCH_NAME"; then
-        echo "Remote branch deleted."
-    else
-        REMOTE_STATUS=1
-    fi
-fi
-
-if [[ "$REMOTE_STATUS" -ne 0 ]]; then
-    echo ""
-    echo "Error: could not delete origin/$BRANCH_NAME; the worktree and local branch are gone."
-fi
-exit "$REMOTE_STATUS"
+exec "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" remove "${remove_options[@]}" -- "$WORKTREE_PATH"

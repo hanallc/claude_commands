@@ -40,7 +40,7 @@ A driver script, `scripts/herdr/trial.py`, ran the whole trial, with 98 tests ov
 5. **The showrunner's view of its units.**
    - The fake showrunner reported workers as running because it read its directors' holding lines; the workers had never started (issue 14). Inside herdr it could read worker states directly, but no rule tells it to.
    - The merge script pushes and then fails at its promote step under `Promote: none`, and it has no as-built mode (issue 16). This is being fixed separately by the showrunner's fixer.
-6. **Showing one unit.** The user asked for a command that opens the session showing one showrunner or unit. In herdr 0.9.0 every attached window keeps its own view. `agent focus slug-unit` moved herdr's recorded focus (`api snapshot` reported `focused_tab_id` `w9:t2`), but the open window did not move. A newly attached window opened on the showrunner's tab while herdr still reported slug-unit as focused. No CLI option, API field or config key selects the tab a window shows. A herdr production that wants `attach <unit>` needs one herdr session per unit and one for the showrunner. Within one session, the user switches in the window with Ctrl+b and the tab number, or Ctrl+b g for the goto picker.
+6. **Showing one unit.** The user asked for a command that opens the session showing one showrunner or unit. In herdr 0.9.0 every attached window keeps its own view. `agent focus slug` moved herdr's recorded focus (`api snapshot` reported `focused_tab_id` `w9:t2`), but the open window did not move. A newly attached window opened on the showrunner's tab while herdr still reported slug as focused. No CLI option, API field or config key selects the tab a window shows. A herdr production that wants `attach <unit>` needs one herdr session per unit and one for the showrunner. Within one session, the user switches in the window with Ctrl+b and the tab number, or Ctrl+b g for the goto picker.
 7. **Relays reach trial sessions.** A Claude pane in herdr is an ordinary local session, so the machine's postmaster sends it real quota alerts (issues 13, 20). That is correct on a shared account. A trial that wants silence would need its own account.
 8. **earlyoom and resume.** Every pane is a child of the one `herdr --session herdr-trial server` process. Losing that process (to earlyoom, a crash or a server stop) ends all 10 agents at once. Under tmux, each session is its own tree. Resuming after a server loss was not tried; the herdr Claude integration that would allow it was not installed, because it writes into `~/.claude/hooks/` and `settings.json`.
 
@@ -54,7 +54,7 @@ The showrunner's first lookup at 13:24 said "not running", one minute after laun
 | Prompts on first use | folder trust, then hooks trust | none |
 | Memory | 46–83 MB per pane, plus a 0.3–5 MB `codex-code-mode` child | shared server per session |
 | State | herdr reads `idle`, `working` and `done` correctly; misses the trust screen | launcher reads turn status |
-| Interrupt | `agent send-keys <name> esc` stopped a turn cleanly | steer/interrupt via the mesh |
+| Interrupt | `agent send-keys <name> esc` stopped a turn cleanly | a worker interrupt command |
 | Daemon | uses the account's managed app-server daemon (`--managed-daemon`); none new started | one app-server per worker session |
 
 One Codex pane stalled with `Working` and a frozen timer on a one-line task. `trial.py wait` timed out as designed, and `esc` recovered the pane (issue 19). No worker hit a quota limit. Claude 1 used 5% of its 5-hour window across the run.
@@ -111,6 +111,6 @@ herdr 0.9.0:
 
 ## Teardown
 
-The trial ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session. `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree, `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`, and the fake showrunner's notifier and showrunner state. It named five worker mesh servers as `not a managed Codex daemon; retained` and left them running; all five were alive afterwards. `trial.py leftovers` then exited 0. The 20 logged issues are in this document; their archive and the cleanup manifest were deleted.
+The trial ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session. `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree, `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`, and the fake showrunner's notifier and showrunner state. It named five worker servers as `not a managed Codex daemon; retained` and left them running; all five were alive afterwards. `trial.py leftovers` then exited 0. The 20 logged issues are in this document; their archive and the cleanup manifest were deleted.
 
 **Retained, by design:** Claude's `hasTrustDialogAccepted` for `repo/`, Codex's `trust_level=trusted` for `repo/`, and the Codex hooks trust in `~/.codex1/config.toml`. They are left for the user to remove.

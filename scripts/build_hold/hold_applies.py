@@ -2,38 +2,16 @@
 """Report whether natedev's hold refuses the calling session's build."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
-import build_targets
-import build_hold
-from targets import Held, StateUnreadable, target_state
-
-
-BUILDING_CARGO_VERBS = frozenset({
-    "build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r", "bench", "doc", "d",
-    "rustc", "rustdoc", "fix", "install", "miri", "mend",
-})
-CARGO_OPTIONS_WITH_VALUES = frozenset({
-    "-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path", "--target-dir", "--target",
-    "-j", "--jobs", "-p", "--package", "--exclude", "-F", "--features", "--profile", "--message-format",
-    "--artifact-dir", "--out-dir",
-})
-
-
-def cargo_verb(arguments: tuple[str, ...]) -> str:
-    """Match the cargo wrapper's first-verb and option-value rules."""
-    skip_value = False
-    for argument in arguments:
-        if skip_value:
-            skip_value = False
-        elif argument in CARGO_OPTIONS_WITH_VALUES:
-            skip_value = True
-        elif not argument.startswith(("+", "-")):
-            return argument
-    return ""
+from scripts.build_targets import build_targets
+from scripts.build_hold import build_hold
+from scripts.build_targets.targets import Held, StateUnreadable, target_state
 
 
 class HoldStateReadError(ValueError):
@@ -49,8 +27,9 @@ def hold_applies() -> str:
         state = target_state(build_targets.local_target())
         if isinstance(state, StateUnreadable):
             raise HoldStateReadError(state.reason)
-        holds = build_hold.natedev_holds(build_hold.holder_directory())
-        if not holds.in_force or build_targets.caller_holds_only_own():
+        directory = build_hold.holder_directory()
+        holds = build_hold.natedev_holds(directory)
+        if not build_targets.caller_waits_on_hold(holds, directory):
             return ""
         if not isinstance(state, Held):
             raise HoldStateReadError("holder file exists; target state disagrees")

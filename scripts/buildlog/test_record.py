@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Tests for record.py, run as invoke.sh and verify.sh run it: a subprocess, BUILDLOG_DIR on a temporary root."""
+"""Test record contents in process and keep real CLI entry cases on temporary roots."""
 
 from __future__ import annotations
 
 from functools import cached_property
+from dataclasses import replace
 from contextlib import closing
 import gzip
+import io
 import json
 import os
 import re
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,38 +24,30 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, cast, override
+from typing import BinaryIO, ClassVar, cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-if TYPE_CHECKING:
-    from ..lib.socket_test_support import short_socket_directory
-    from ..lib.shell_test_support import shell_function, shell_functions
-else:
-    from scripts.lib.socket_test_support import short_socket_directory
-    from scripts.lib.shell_test_support import shell_function, shell_functions
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.shell_test_support import shell_function, shell_functions
 
-import record as recorder
-import step_context
-import index
-import report
-import sample
-import store
-from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
+from scripts.aws_target import hana_result
+from scripts.aws_target.test_hana_result import command_result
+from scripts.buildlog import record as recorder
+from scripts.buildlog import step_context
+from scripts.buildlog import index, parse
+from scripts.buildlog import report, sample
+from scripts.buildlog import store
+from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
-if TYPE_CHECKING:
-    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from ..lint.memory_test_support import fake_memory_readings
-else:
-    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from scripts.lint.memory_test_support import fake_memory_readings
-from test_index import point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_records, step_estimator
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
+from scripts.buildlog.test_index import point_root_at
+from scripts.lib import test_hang_guard
+from scripts.lint.build_shape import build_shape
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -85,6 +80,7 @@ AMBIENT = (
     "BUILDLOG_MEM_WAIT_S",
     "BUILDLOG_TARGET_FOLDER",
     "BUILDLOG_KNOWN_TARGET_DIR",
+    "BUILDLOG_OUTPUT_ROOTS",
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
 )
@@ -119,14 +115,43 @@ def setUpModule() -> None:
 
 
 class RecordTests(unittest.TestCase):
+    repository_seed: ClassVar[Path]
     base: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     repo: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="record-seed-"))).resolve()
+        seed_home = seed_root / "home"
+        seed_home.mkdir()
+        cls.repository_seed = seed_root / "repository"
+        cls.repository_seed.mkdir()
+        builder = cls()
+        builder.base = seed_root
+        builder.root = seed_root / "buildlog"
+        builder.repo = cls.repository_seed
+        with mock.patch.dict(os.environ, {"HOME": str(seed_home), "XDG_CONFIG_HOME": str(seed_home / ".config")}):
+            _ = builder.git("init", "-q", "-b", "main", cwd=builder.repo)
+            _ = builder.git("commit", "-q", "--allow-empty", "-m", "first", cwd=builder.repo)
+
     @override
     def setUp(self) -> None:
+        # Other test modules also construct this fixture without class setup.
+        cls = type(self)
+        if not hasattr(cls, "repository_seed") or not cls.repository_seed.is_dir():
+            self.addCleanup(cls.doClassCleanups)
+            cls.setUpClass()
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ))
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base.parent)}))
+        is_file = Path.is_file
+        def fixture_file(path: Path) -> bool:
+            if path.name == "Cargo.toml" and not path.is_relative_to(self.base):
+                return False
+            return is_file(path)
+        _ = self.enterContext(mock.patch.object(Path, "is_file", fixture_file))
         if "BUILDLOG_REPO_IDENTITY" in os.environ:
             del os.environ["BUILDLOG_REPO_IDENTITY"]
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
@@ -135,11 +160,11 @@ class RecordTests(unittest.TestCase):
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
         self.repo = self.base / "hana"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "-b", "main", cwd=self.repo)
-        _ = self.git("commit", "-q", "--allow-empty", "-m", "first", cwd=self.repo)
+        _ = shutil.copytree(cls.repository_seed, self.repo)
         _ = self.admission
-        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+        # The admission thread reads os.environ from now on. A patch.dict exit empties os.environ for a moment,
+        # and the thread then reads the live builds.slice. The first patch.dict above restores this value.
+        os.environ["USER_ZONE"] = "America/Los_Angeles"
 
     @cached_property
     def admission(self) -> AdmissionFixture:
@@ -148,13 +173,13 @@ class RecordTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
             name: value
-            for name, value in os.environ.items()
+            for name, value in memory_gate_shell_environment().items()
             if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
         environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
         environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
-        environment["UNIT_ACTIVE_DIR"] = str(self.base / "active")
+        environment["STAFF_FILE"] = str(self.base / "staff.json")
         environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
         environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
@@ -180,8 +205,20 @@ class RecordTests(unittest.TestCase):
     def record(
         self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
+        if process_boundary_for_case(self):
+            return self.record_process(*args, cwd=cwd, extra=extra, input=input)
+        module = step_context if args and args[0] == "step-context" else recorder
+        arguments = list(args)
+        with mock.patch.object(sys, "stdin", io.StringIO(input)):
+            return invoke_cli(module, lambda: module.main(arguments), arguments,
+                              self.environment(**(extra or {})), cwd or self.repo)
+
+    def record_process(
+        self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"),
+             str(CONTEXT_SCRIPT if args and args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
             input=input,
             env=self.environment(**(extra or {})),
@@ -206,6 +243,63 @@ class RecordTests(unittest.TestCase):
         for path in sorted(self.root.glob("*/*.jsonl")):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
+
+    def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        handoff = self.base / "nextest.log"
+        _ = handoff.write_text(output)
+        local = self.step(0, "0", str(handoff), "", NEXTEST)
+        value = replace(command_result(), argv=tuple(NEXTEST), stdout=b"output with no newline", stderr=output.encode())
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        remote, = [row for row in self.records() if row.get("attempt_role") == "remote"]
+
+        with closing(sqlite3.connect(":memory:")) as database:
+            index.create_schema(database)
+            for row in (local, remote):
+                with self.subTest(host=row["host"]):
+                    self.assertEqual(row["observed_tests"], {
+                        "by_binary": {"hana::bin/hana": ["tests::fast"]}, "complete": True,
+                    })
+                    self.assertEqual(row["tests"], [])
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana::bin/hana", "tests::fast"): index.NextestGpuClass.NO_GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.NO_GPU)
+            self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
+
+    def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana tests::forged\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
+                                     (["--status-level", "none"], {}), (["--status-level=slow"], {}),
+                                     (["--show-progress=only"], {}), ([], {"NEXTEST_STATUS_LEVEL": "retry"})):
+            with self.subTest(options=options, environment=environment):
+                handoff = self.base / "nextest.log"
+                _ = handoff.write_text(output)
+                row = self.step(0, "0", str(handoff), "", [*NEXTEST, *options], environment)
+                self.assertEqual(row["observed_tests"], {"by_binary": {}, "complete": False})
+                with closing(sqlite3.connect(":memory:")) as database:
+                    index.create_schema(database)
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana", "tests::forged"): index.NextestGpuClass.GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.UNKNOWN)
+
+    def test_hana_parse_failure_still_publishes_the_step_result(self) -> None:
+        value = command_result(status=101)
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        with mock.patch.object(parse, "log_facts", side_effect=ValueError("invalid capture")):
+            self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        row, = self.records()
+        self.assertEqual(row["status"], 101)
+        self.assertNotIn("observed_tests", row)
 
     def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
         reservation = "sampled-reservation"
@@ -287,7 +381,7 @@ class RecordTests(unittest.TestCase):
         for entry_point in (["-m", "scripts.buildlog.step_context"], [str(CONTEXT_SCRIPT.resolve())]):
             with self.subTest(entry_point=entry_point):
                 result = subprocess.run(
-                    [sys.executable, "-B", *entry_point, "step-context", "cargo", "check"],
+                    [str(repository / "scripts/lib/py"), "-B", *entry_point, "step-context", "cargo", "check"],
                     cwd=workspace, env=environment, input="", capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
@@ -295,6 +389,10 @@ class RecordTests(unittest.TestCase):
                 lines = result.stdout.splitlines()
                 self.assertEqual(len(lines), 2, result.stdout + result.stderr)
                 self.assertEqual(lines[1], str(workspace / "target"))
+        result = self.record_process(cwd=workspace)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("record.py step STATUS START END TTY LOG PEAK ARGV...", result.stderr)
 
     def folder_context(self, argv: list[str], *, extra: dict[str, str] | None = None,
                        cwd: Path | None = None, metadata: str = "") -> str:
@@ -406,6 +504,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(self.resolved_folder(argv), "/x")
         _ = self.assert_folder_record(argv, "/x")
 
+    @process_boundary
     def test_changed_target_environment_rejects_the_callers_metadata(self) -> None:
         _ = (self.repo / "Cargo.toml").write_text('[workspace]\n')
         metadata = json.dumps({"workspace_root": str(self.repo), "target_directory": "/stale"})
@@ -542,6 +641,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
 '''
         completion, refresh = command.split('export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"', 2)[1:]
         environment = self.environment(HOME=str(home), BUILDLOG_RECORD=str(SCRIPT),
+            BUILD_HELPER_ROOT=str(launcher.parent.parent),
             BUILDLOG_SCOPE="0", PY=sys.executable, HOLD_WAIT_DIR=str(hold),
             TEST_FIRST_FOLDER=str(self.repo / "first"), TEST_CHANGED_FOLDER=str(self.repo / "changed"),
             TEST_METADATA=json.dumps({"workspace_root": str(self.repo),
@@ -662,6 +762,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = path.write_text("123456\n")
         return path
 
+    @process_boundary
     def test_step_record_fields(self) -> None:
         handoff, peak = self.handoff(), self.peak_file()
         record = self.step(1, "0", str(handoff), str(peak), NEXTEST, {"BUILDLOG_CALL_ID": CALL_ID})
@@ -818,7 +919,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
+        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: .* needs \d+\.\d GiB; 10\.5 GiB free; ")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
         reason = "memory admission check failed (launch wait limit reached without admission); step refused"
         self.assertEqual(result.stderr.count(reason), 1)
@@ -842,7 +943,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = cases["above floor"].write_text("MemAvailable: 13631488 kB\n")
         for name, meminfo in cases.items():
             with self.subTest(name=name):
-                self.admission.allow_next_start()
                 result = subprocess.run(
                     ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
                     env=self.environment(BUILDLOG_MEMINFO=str(meminfo)),
@@ -861,25 +961,25 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         meminfo = self.base / "meminfo-fifo"
         os.mkfifo(meminfo)
         opened = threading.Event()
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
 
-        def bounded_fifo_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def bounded_fifo_read(path: Path) -> bytes:
             if path != meminfo:
-                return read_text(path, encoding=encoding, errors=errors)
+                return read_bytes(path)
             descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 opened.set()
                 if not select.select([descriptor], [], [], 5)[0]:
                     raise TimeoutError("the meminfo FIFO received no sample within 5 seconds")
-                value = os.read(descriptor, 4096).decode()
+                value = os.read(descriptor, 4096)
                 sample_path = self.base / "fifo-sample"
-                _ = sample_path.write_text(value)
+                _ = sample_path.write_bytes(value)
                 self.admission.readings.host_path = sample_path
                 return value
             finally:
                 os.close(descriptor)
 
-        _ = self.enterContext(mock.patch.object(Path, "read_text", autospec=True, side_effect=bounded_fifo_read))
+        _ = self.enterContext(mock.patch.object(Path, "read_bytes", autospec=True, side_effect=bounded_fifo_read))
         command = 'source "$1"; SECONDS=0; printf "ready\\n"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
         process = subprocess.Popen(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
@@ -974,8 +1074,8 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             self.assertIn("waiting for memory since ", first_message)
             self.assertFalse(marker.exists())
             _ = threading.Event().wait(1.1)
-            released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
+            released_at = meminfo.stat().st_mtime
             output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             errors = first_message + remaining_errors
         finally:
@@ -991,14 +1091,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         started = datetime.fromisoformat(str(record["started_at"]).replace("Z", "+00:00")).timestamp()
         self.assertGreaterEqual(started, released_at - 0.01)
         self.assertEqual(record["mem_wait_s"], int(output.split("wait=")[-1].strip()))
-
-    def test_scope_memory_names_its_values_and_marks_missing_stalls_unmeasured(self) -> None:
-        peak = self.peak_file()
-        memory = recorder.peak_and_stall(str(peak))
-        self.assertIsInstance(memory, recorder.StepScopeMemory)
-        self.assertEqual(memory.peak_bytes, 123456)
-        self.assertIs(memory.stall_some_s, sample.Unmeasured.VALUE)
-        self.assertIs(memory.stall_full_s, sample.Unmeasured.VALUE)
 
     def test_scope_memory_uses_shared_pressure_parser_for_partial_counters(self) -> None:
         peak = self.base / "partial-pressure"
@@ -1083,6 +1175,16 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(detached["branch"], "detached")
         self.assertEqual(detached["sha"], self.git("rev-parse", "--short", "HEAD", cwd=self.repo))
 
+    def test_step_in_another_process_leaves_that_process_attached(self) -> None:
+        # verify_helper.py runs main in its long-lived process. A detach there would leave the
+        # verify.sh session and close the helper's request pipe.
+        arguments = ["step", "0", str(START), "", "0", "", "", *SWEEP]
+        with mock.patch.object(recorder, "detach") as detach, mock.patch.object(sys, "stdin", io.StringIO("")):
+            result = invoke_cli(recorder, lambda: recorder.main(arguments), arguments, self.environment(), self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detach.assert_not_called()
+        self.assertEqual(self.records()[-1]["kind"], "step")
+
     def test_manifest_path_names_the_repo(self) -> None:
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()
@@ -1091,6 +1193,46 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
+
+    def test_gitless_build_uses_its_recorded_peak_after_the_first_fallback(self) -> None:
+        directory = self.base / "sample"
+        directory.mkdir()
+        manifest = directory / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
+        argv = ["cargo", "build", "--manifest-path", str(manifest)]
+        shape = build_shape(argv)
+        now = datetime.fromtimestamp(START + 60, UTC)
+        config = admission_records.read_memory_config(report=False)
+        fallback = config.program_first_peaks["cargo"]
+        self.assertEqual(fallback, 12 * admission_records.GIB)
+        step_estimator.clear_git_identity_cache()
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        with mock.patch.dict(os.environ, {"MANIFEST_PATH": ""}):
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            first = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                 shape=shape, first_peak_bytes=fallback)
+            self.assertEqual((first.bytes, first.count, first.basis),
+                             (fallback, 0, admission_records.ShapeFallback()))
+            peak = self.base / "peak"
+            _ = peak.write_text(str(3 * admission_records.GIB) + "\n")
+            row = self.step(0, "1", "", str(peak), argv, cwd=self.base)
+            history = self.root / "admission/anon_peaks.jsonl"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            _ = history.write_text(json.dumps({
+                "host": row["host"], "repo_identity": row["repo_identity"], "step": row["step"],
+                "ended_at": row["ended_at"], "anon_peak_bytes": row["peak_mem_bytes"],
+                "shape": shape.key, "outcome": "completed",
+            }) + "\n")
+            step_estimator.clear_git_identity_cache()
+            identity, _ = step_estimator.git_identity(argv, str(self.base))
+            second = step_estimator.expected_peak(identity, "build", store.host_name(), now, self.root,
+                                                  shape=shape, first_peak_bytes=fallback)
+        self.assertIsInstance(second.basis, admission_records.ShapeLargest)
+        self.assertEqual(second.count, 1)
+        factor = admission_records.DevSizeHeadroom(config.dev_size_factor, config.dev_size_margin_bytes)
+        self.assertEqual(second.bytes, step_estimator.shape_headroom_bytes(3 * admission_records.GIB, factor))
+        self.assertEqual(row["repo_identity"], "manifest-path:" + str(manifest))
+        self.assertEqual(identity, admission_records.RepositoryIdentity("manifest-path:" + str(manifest), "sample"))
 
     def key(self, *argv: str, cwd: Path | None = None) -> str:
         result = self.record("step-context", *argv, cwd=cwd)
@@ -1117,18 +1259,21 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
     def test_mirror_steps_record_the_sent_repository_identity_without_derivation(self) -> None:
         mirror = self.base / "mirror"
         mirror.mkdir()
-        _ = self.git("init", "-q", "--template=", cwd=mirror)
+        _ = (mirror / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
         identity = "https://example.org/source"
-        for caller in ("verify-mac", "verify-linux"):
-            with self.subTest(caller=caller), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
-                row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
-                self.assertEqual(row["repo_identity"], identity)
-                _ = index.update()
-                with closing(index.read_only()) as connection:
-                    indexed = cast(tuple[str, int], connection.execute(
-                        "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
-                    ).fetchone())
-                self.assertEqual(indexed, (identity, 0))
+        for git in (False, True):
+            if git:
+                _ = self.git("init", "-q", "--template=", cwd=mirror)
+            for caller in ("verify-mac", "verify-linux"):
+                with self.subTest(caller=caller, git=git), mock.patch.dict(os.environ, {"BUILDLOG_REPO_IDENTITY": identity}):
+                    row = self.step(0, "0", "", "", NEXTEST, {"BUILDLOG_CALLER": caller}, cwd=mirror)
+                    self.assertEqual(row["repo_identity"], identity)
+                    _ = index.update()
+                    with closing(index.read_only()) as connection:
+                        indexed = cast(tuple[str, int], connection.execute(
+                            "SELECT repo_identity, identity_derived FROM steps WHERE id = ?", (row["id"],),
+                        ).fetchone())
+                    self.assertEqual(indexed, (identity, 0))
 
     def test_ordinary_steps_ignore_the_sent_repository_identity(self) -> None:
         directory = self.base / "ordinary"
@@ -1306,11 +1451,12 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual([record[key] for key in ("repo_path", "worktree", "branch", "sha")], [None] * 4)
 
     def test_call_record_fields(self) -> None:
+        session = staff.caller_identity() or "session-1"
         board = {"UNIT_TEAM_ROLE": "impl2", "UNIT_RUN_DIR": "/x/boards/run-7/"}
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": "session-1", **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
@@ -1333,7 +1479,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             "branch": "main",
             "worker": "impl2",
             "unit_session": "run-7",
-            "session": "session-1",
+            "session": session,
             "backfilled": False,
         }
         self.assertEqual({key: record[key] for key in expected}, expected)
@@ -1345,7 +1491,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         final = self.record("call", "interrupted", "", "0", "0", "12", "", "0", "12", "final")
         self.assertEqual(final.returncode, 0, final.stderr)
         record = self.records()[-1]
-        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", None, None, None))
+        self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
 
@@ -1435,14 +1581,6 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
                                             "2026-10-12T12:00:00+00:00"]), 0)
         self.assertEqual(self.records(), [])
         self.assertIn("write failed", (self.root / "errors.log").read_text())
-
-    def test_hold_event_refuses_invalid_or_naive_planned_ends_without_failing_its_caller(self) -> None:
-        for until in ("later", "2026-10-12T14:00:00"):
-            with self.subTest(until=until):
-                result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
-                                     "2026-10-12T12:00:00Z", until)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.records(), [])
 
     def test_hold_event_accepts_an_empty_planned_end(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",

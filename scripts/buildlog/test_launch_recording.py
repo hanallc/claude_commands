@@ -6,7 +6,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -16,29 +15,23 @@ from contextlib import ExitStack, closing, contextmanager, redirect_stderr
 from enum import Enum
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import launches
-import record
-import report
-import store
-from test_index import Record, encode, point_root_at, step
-from test_launches import CLI, result_line
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment
+from scripts.aws_target.ledger_test_support import install_cost_settings, write_gate_config
+from scripts.buildlog import index
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import report
+from scripts.buildlog import store
+from scripts.buildlog.test_index import Record, encode, point_root_at, step
+from scripts.buildlog.test_launches import CLI, result_line
+from scripts.lib import scratch as scratch_folders
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment
 
-if TYPE_CHECKING:
-    from ..hana_shot import hana_shot
-    from ..hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
-else:
-    from scripts.hana_shot import hana_shot
-    from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
+from scripts.hana_shot import hana_shot
+from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
 class RecordingStopped(BaseException):
@@ -72,9 +65,14 @@ class LaunchRecordingTests(unittest.TestCase):
             ["git", "init", "--quiet", "--initial-branch=main", str(self.worktree)],
             check=True, capture_output=True,
         )
+        aws_settings = base / 'config/aws_target.conf'
+        install_cost_settings(aws_settings)
+        write_gate_config(base / 'config/cloud_gate.conf')
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(base / "config"),
+            "AWS_TARGET_CONFIG": str(aws_settings),
+            "BUILD_TARGETS_STATE_DIR": str(base / "targets"),
             "XDG_CACHE_HOME": str(self.cache),
             "BUILDLOG_LAUNCH_STATES": str(self.cache / "hana-shot" / "launches"),
             "BUILDLOG_TRANSCRIPTS": str(base / "transcripts"),
@@ -139,7 +137,7 @@ class LaunchRecordingTests(unittest.TestCase):
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
             mock.patch.object(hana_shot, "wait_ready"),
-            mock.patch.object(tempfile, "mkdtemp", return_value=str(scratch)),
+            mock.patch.object(scratch_folders, "new", return_value=scratch),
             mock.patch.object(subprocess, "Popen", side_effect=start, wraps=subprocess.Popen),
             mock.patch.object(hana_shot, "Brp", return_value=mock.Mock(call=mock.Mock(side_effect=stop))),
             redirect_stderr(io.StringIO()),
@@ -278,11 +276,11 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def test_importing_hana_shot_leaves_the_import_path_and_record_name_unchanged(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-c", "\n".join((
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "\n".join((
                 "import json, sys",
                 "before = list(sys.path)",
                 "import scripts.hana_shot.hana_shot",
-                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'record' in sys.modules}))",
+                "print(json.dumps({'before': before, 'after': sys.path, 'record': 'scripts.buildlog.record' in sys.modules}))",
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
@@ -293,26 +291,25 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(imports["after"], imports["before"])
         self.assertIs(imports["record"], False)
 
-    def test_signal_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
+    def test_ctrl_c_during_recording_shuts_down_the_fake_app_and_removes_launch_state(self) -> None:
         recorder_path = str(Path(record.__file__).resolve())
 
         def interrupt_recording(*profile_event: object) -> None:
             frame = cast(FrameType, profile_event[0])
             if (profile_event[1] == "call" and frame.f_code.co_name == "launch"
                     and frame.f_code.co_filename == recorder_path):
-                raise hana_shot.ExitSignal(signal.SIGTERM)
+                raise KeyboardInterrupt
 
         port = 15815
         with self.fake_launch_process(port) as process:
             previous_profile = sys.getprofile()
             try:
                 sys.setprofile(interrupt_recording)
-                with self.assertRaises(hana_shot.ExitSignal) as caught:
+                with self.assertRaises(KeyboardInterrupt):
                     _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
-            self.assertEqual(caught.exception.number, signal.SIGTERM)
             self.assertEqual(process.poll(), 0)
             self.assertFalse(hana_shot.launch_state_path(port).exists())
             self.assertFalse((self.root.parent / f"new-scratch-{port}").exists())

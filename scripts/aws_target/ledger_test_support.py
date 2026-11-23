@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import os
+import re
+from decimal import Decimal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,12 +13,15 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.aws_target import ledger
 
 
 REAL_RUN = subprocess.run
 REAL_POPEN = subprocess.Popen
+FIXTURES = Path(__file__).with_name('fixtures')
 
 
 def git_only(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -34,10 +39,16 @@ def instant(value: str) -> int:
 
 def numeric_settings(path: Path, values: dict[str, str]) -> None:
     """Give each private cost its explicit numeric limit."""
-    lines = [line for line in path.read_text().splitlines()
-             if line.partition("=")[0].strip() not in values]
+    lines: list[str] = []
+    for line in path.read_text().splitlines():
+        if line.partition('=')[0].strip() in values:
+            if lines and re.fullmatch(r'# (whole|range): .*', lines[-1]):
+                _ = lines.pop()
+        else:
+            lines.append(line)
     for key, value in values.items():
-        form = "whole" if key.endswith(("_seconds", "_timeout_s")) else "range"
+        whole = key == "cost_explorer_unchanged_reads" or key.endswith(("_seconds", "_timeout_s", "_days"))
+        form = "whole" if whole else "range"
         if key in ("connect_timeout_s", "leftover_timeout_s"):
             form = "range"
         lines.extend((f"# {form}: 0..", f"{key}={value}"))
@@ -50,26 +61,166 @@ def text_setting(path: Path, key: str, value: str) -> None:
     _ = path.write_text("\n".join([*lines, f"{key}={value}"]) + "\n")
 
 
-def install_cost_settings(path: Path, overrides: str = "") -> None:
+def install_cost_settings(path: Path) -> None:
     """Install complete settings with exact, private test prices."""
-    _ = write_config_fixture(path, "offload=on\nregion=us-east-1\ninstance_id=i-fixture\n" + overrides)
-    numeric_settings(path, {
-        "daily_limit_usd": "20", "monthly_limit_usd": "400", "limit_reserve_usd": "3",
-        "fallback_usd_per_hour": "1", "fixed_usd_per_month": "0",
-        "retained_storage_usd_per_month": "0", "root_storage_usd_per_month": "0",
-        "ipv4_usd_per_month": "0", "gp3_iops_usd_per_month": "0",
-        "gp3_throughput_usd_per_month": "0", "cost_explorer_read_usd": "0",
-        "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
-        "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
-        "notification_timeout_s": "5", "notification_retry_s": "60",
-    })
-    text_setting(path, "cost_explorer_tag_key", "Project")
-    text_setting(path, "cost_explorer_tag_value", "fixture-build")
-    text_setting(path, "accounting_zone", "UTC")
-    text_setting(path, "notification_recipient", "fixture-showrunner")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_bytes((FIXTURES / 'aws_target.conf').read_bytes())
 
 
-class CostFixture(unittest.TestCase):
+def write_gate_config(path: Path) -> None:
+    """Install fixed settings for gate and GPU trial tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_bytes((FIXTURES / 'cloud_gate.conf').read_bytes())
+
+
+def override_fixture_settings(path: Path, overrides: str) -> None:
+    """Apply values to the private file and keep its limits unless overrides supply limits."""
+    source = path.read_text()
+    lines = source.splitlines()
+    existing = conf.settings(source)
+    limit_prefixes = ('# whole:', '# range:', '# one of:')
+    for key, override in conf.settings(overrides).items():
+        line = f'{key}={override.value}'
+        current = existing.get(key)
+        if override.limit.startswith(limit_prefixes):
+            if current is not None and current.limit.startswith(limit_prefixes):
+                lines[current.line - 1] = override.limit
+            else:
+                line = f'{override.limit}\n{line}'
+        if current is None:
+            lines.append(line)
+        else:
+            lines[current.line] = line
+    _ = path.write_text('\n'.join(lines) + '\n')
+
+
+HANA_GUEST_RUNTIME_SETTINGS = """\
+# whole: 1..
+control_poll_seconds=2
+execution_shell=default
+# whole: 1..
+free_floor_gib=30
+# whole: 1..
+source_max_bytes=1048576
+# whole: 1..
+source_download_timeout_s=60
+# whole: 1..
+source_git_timeout_s=60
+source_allowed_environment=RUST_BACKTRACE
+"""
+
+
+def write_hana_config(path: Path | None = None) -> Path:
+    """Write fixed setup settings to the test configuration directory."""
+    if path is None:
+        path = conf.path('hana_aws')
+    _ = path.write_text("""\
+enabled=off
+host=fixture-hana
+region=us-east-2
+availability_zone=us-east-2b
+instance_type=m7a.2xlarge
+fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
+stack_name=fixture-hana
+ami_id=fixture-image
+ami_owner_id=000000000000
+vpc_id=fixture-vpc
+subnet_id=fixture-subnet
+# range: 0.001..
+spot_max_usd_per_hour=0.25
+# range: 5e-324..
+spot_ceiling_margin=0.25
+# whole: 1..
+root_gib=40
+# whole: 1..
+data_gib=300
+daily_budget_usd=6
+gp3_usd_per_gib_month=0.08
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+# whole: 1..
+aws_timeout_s=10
+# whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
+idle_stop_seconds=600
+# whole: 1..
+start_timeout_seconds=120
+# whole: 1..
+tick_interval_s=5
+# whole: 1..
+controller_tick_timeout_s=45
+# whole: 1..604800
+control_url_seconds=3600
+# whole: 1..
+stop_wait_timeout_s=600
+# whole: 1..
+stop_poll_seconds=10
+# whole: 1..
+setup_idle_wait_timeout_s=1500
+# whole: 1..
+setup_idle_heartbeat_s=15
+# whole: 1..
+intent_lookup_timeout_s=120
+image_upload_tool=fixture-nixos#coldsnap
+# whole: 60..
+image_upload_timeout_s=3600
+# whole: 1..60
+image_wait_interval_s=10
+""" + HANA_GUEST_RUNTIME_SETTINGS)
+    return path
+
+
+def install_aws_fixture_settings(folder: Path) -> None:
+    """Install fixed AWS settings in the private folder."""
+    install_cost_settings(folder / 'aws_target.conf')
+    write_gate_config(folder / 'cloud_gate.conf')
+    _ = write_hana_config(folder / 'hana_aws.conf')
+
+
+def install_hana_spending_settings(path: Path) -> None:
+    """Enable private Hana spending at the test price."""
+    _ = write_hana_config(path)
+    text_setting(path, 'enabled', 'on')
+    numeric_settings(path, {'spot_max_usd_per_hour': '0.15'})
+
+
+def account_reply(arguments: Sequence[str], amount: str = '0') -> dict[str, object]:
+    """Return daily usage costs for the requested UTC period."""
+    period = arguments[arguments.index('--time-period') + 1]
+    bounds = dict(part.split('=', 1) for part in period.split(','))
+    start, end = (datetime.fromisoformat(bounds[key]) for key in ('Start', 'End'))
+    days: list[dict[str, object]] = []
+    while start < end:
+        following = start + timedelta(days=1)
+        days.append({'TimePeriod': {'Start': start.date().isoformat(), 'End': following.date().isoformat()},
+                     'Estimated': False, 'Total': {}, 'Groups': [
+                         {'Keys': ['USE2-SpotUsage:m7a.4xlarge'],
+                          'Metrics': {'UnblendedCost': {'Amount': amount, 'Unit': 'USD'},
+                                      'UsageQuantity': {'Amount': '1', 'Unit': 'Hrs'}}}]})
+        start = following
+    return {'ResultsByTime': days}
+
+
+def charge_readings(start: int, end: int, usd: Decimal, query_usd: Decimal) -> tuple[ledger.ChargeRead, ...]:
+    """Return account bills without an AWS command."""
+    return tuple(ledger.ChargeRead(datetime.fromtimestamp(at, UTC).date().isoformat(), end, at, at + 86400,
+                                  usd, Decimal(0), query_usd if at + 86400 == end else Decimal(0),
+                                  (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', usd),), False)
+                 for at in range(start, end, 86400))
+
+
+class AwsSettingsFixture(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()
     state: Path = Path()
@@ -80,15 +231,35 @@ class CostFixture(unittest.TestCase):
         self.settings = self.root / "aws_target.conf"
         self.state = self.root / "state"
         self.state.mkdir()
-        environment = config_environment(self.root)
+        install_aws_fixture_settings(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **environment, "HOME": str(self.root),
+            **self.fixture_environment(), "HOME": str(self.root),
+            "AWS_TARGET_CONFIG": str(self.settings),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
-        install_cost_settings(self.settings)
+        # Remove inherited AWS paths and credentials. The patch restores them when the test ends.
+        for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
+            del os.environ[name]
+
+    def fixture_environment(self) -> dict[str, str]:
+        return {"CONF_DIR": str(self.root)}
 
     def configure(self, overrides: str) -> None:
-        _ = write_config_fixture(self.settings, overrides)
+        override_fixture_settings(self.settings, overrides)
+
+    def configure_gate(self, overrides: str) -> None:
+        override_fixture_settings(self.root / 'cloud_gate.conf', overrides)
+
+
+class CostFixture(AwsSettingsFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.replace('cost_explorer_watch_days', '1')
+
+    @override
+    def fixture_environment(self) -> dict[str, str]:
+        return config_environment(self.root)
 
     def costs(self, values: dict[str, str]) -> None:
         numeric_settings(self.settings, values)

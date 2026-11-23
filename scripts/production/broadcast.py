@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send roster groups a message, with one concurrent delivery per recipient.
 
-  broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | --units TEXT |
+  broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
                            --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 
 Overlapping groups receive the text of the last selecting flag. The sender is
@@ -9,7 +9,12 @@ left out by session or Codex thread identity. Every message names its groups so
 recipients know it was sent directly.
 """
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import json
 import os
 import shlex
 import subprocess
@@ -22,13 +27,12 @@ from pathlib import Path
 from typing import Literal, NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
-sys.path.insert(0, str(MESSAGE))
-import roster  # noqa: E402
+from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
-USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
+USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
          + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
 AT_ONCE = 24
@@ -47,6 +51,12 @@ class Showrunners:
 @dataclass(frozen=True)
 class UnitDirectors:
     """Every unit director."""
+
+
+@dataclass(frozen=True)
+class UnitsOfProduction:
+    address: str
+    production: str
 
 
 @dataclass(frozen=True)
@@ -71,13 +81,14 @@ class TopLevel:
     """Claude sessions that receive top-level announcements."""
 
 
-BroadcastGroup = AllRoles | Showrunners | UnitDirectors | Agents | Workers | WorkersOfUnit | TopLevel
-Outcome = Literal["sent", "no live session", "NOT sent"]
+BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction | Agents | Workers | WorkersOfUnit | TopLevel
+Outcome = Literal["sent", "kept", "no live session", "NOT sent"]
 FLAGS: dict[str, BroadcastGroup] = {
     "--all": AllRoles(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
     "--agents": Agents(), "--workers": Workers(), "--top-level": TopLevel(),
-    # Internal replay spelling selects all workers without inheriting an earlier --of.
+    # Internal replay spellings keep unscoped groups independent of earlier scopes.
     "--all-workers": Workers(),
+    "--all-units": UnitDirectors(),
 }
 
 
@@ -119,6 +130,9 @@ def selects(group: BroadcastGroup, entry: roster.RosterEntry) -> bool:
             return entry.role == "showrunner"
         case UnitDirectors():
             return entry.role == "unit director"
+        case UnitsOfProduction(address):
+            return (entry.role == "unit director" and isinstance(entry.showrunner, roster.UnderShowrunner)
+                    and entry.showrunner.address == address)
         case Agents():
             return entry.role in ("worker", "freestanding")
         case Workers():
@@ -150,11 +164,24 @@ def ending(told: Collection[BroadcastGroup], scope: roster.RosterScope = roster.
     return f"Sent directly to {series(names, 'and')} on {machines}; do not pass it on."
 
 
-def send(session: str, sender: str, text: str, *options: str) -> str:
-    """One message through send.py; the empty string when it was sent, else send.py's own line."""
+def _send(session: str, sender: str, text: str, *options: str) -> tuple[Outcome, str]:
     done = subprocess.run(session_send.send_argv("--to", session, "--from", sender, *options, "--text", text, send_script=SEND),
                           capture_output=True, text=True, check=False)
-    return "" if done.returncode == 0 else (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
+    result = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(result, send_result.ConfirmedSendOutcome):
+        if result.header.outcome == "kept":
+            return "kept", "in a review"
+        if result.header.outcome in ("sent", "skipped", "replaced"):
+            return "sent", ""
+    if SEND != session_send.SEND_SCRIPT and done.returncode == 0 and not done.stdout.strip():
+        return "sent", ""
+    return "NOT sent", (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
+
+
+def send(session: str, sender: str, text: str, *options: str) -> str:
+    """Return a delivery error or an empty string for an accepted message."""
+    outcome, detail = _send(session, sender, text, *options)
+    return detail if outcome == "NOT sent" else ""
 
 
 def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages) -> str:
@@ -188,10 +215,10 @@ def _broadcast(
                 return Delivery(recipient, "no live session", _unreachable(entry, entry.reach))
             case roster.Messageable(address):
                 try:
-                    problem = send(address, sender, f"{text}\n\n{last}", "--here")
+                    outcome, detail = _send(address, sender, f"{text}\n\n{last}", "--here")
                 except OSError as error:
-                    problem = str(error)
-                return Delivery(recipient, "NOT sent" if problem else "sent", problem)
+                    return Delivery(recipient, "NOT sent", str(error))
+                return Delivery(recipient, outcome, detail)
 
     with ThreadPoolExecutor(max_workers=AT_ONCE) as pool:
         return list(pool.map(deliver, chosen))
@@ -206,7 +233,7 @@ def broadcast(
 
 
 def report(deliveries: list[Delivery]) -> bool:
-    """Print one line per recipient; true when every live one has the message."""
+    """Print one line per recipient. Return true when no send failed."""
     for recipient, outcome, detail in deliveries:
         match recipient:
             case PeerOutput(host, line):
@@ -240,6 +267,24 @@ def _unit_group(target: str, entries: Sequence[roster.RosterEntry]) -> WorkersOf
                          director.machine)
 
 
+def _production_group(target: str, entries: Sequence[roster.RosterEntry]) -> UnitsOfProduction:
+    showrunners = [(entry, f"session:{entry.session.session_id}") for entry in entries
+                   if entry.role == "showrunner" and isinstance(entry.session, roster.ClaudeSession)]
+    matches = [(entry, address) for entry, address in showrunners if entry.name == target or address == target]
+    if len(matches) != 1:
+        known = matches if matches else showrunners
+        descriptions = [f"  {entry.name} ({entry.machine}): {address}" for entry, address in known]
+        loaded = display_names.runtime_names()
+        role_label = loaded.job("showrunner") if isinstance(loaded, display_names.Names) else "director"
+        reason = (f"{target} matches more than one {role_label}:" if matches
+                  else f"unknown production {target}; known showrunners:")
+        raise ValueError("\n".join([reason, *descriptions]))
+    showrunner, address = matches[0]
+    production = (showrunner.showrunner.production if isinstance(showrunner.showrunner, roster.RunsProduction)
+                  else showrunner.name)
+    return UnitsOfProduction(address, production)
+
+
 def _group_name(group: BroadcastGroup) -> str:
     loaded = display_names.runtime_names()
     if not isinstance(loaded, display_names.Names):
@@ -252,6 +297,8 @@ def _group_name(group: BroadcastGroup) -> str:
             key = "showrunners"
         case UnitDirectors():
             key = "unit_directors"
+        case UnitsOfProduction(production=production):
+            return f"{loaded.audience('unit_directors')} of {production}"
         case Agents():
             key = "agents"
         case Workers():
@@ -276,8 +323,12 @@ def _remote_arguments(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
     for group, text in texts.items():
         if isinstance(group, WorkersOfUnit):
             arguments.extend(("--of", group.address, "--workers", text))
+        elif isinstance(group, UnitsOfProduction):
+            arguments.extend(("--resolved-production", json.dumps([group.address, group.production]), "--units", text))
         elif isinstance(group, Workers):
             arguments.extend(("--all-workers", text))
+        elif isinstance(group, UnitDirectors):
+            arguments.extend(("--all-units", text))
         else:
             flag = next(flag for flag, candidate in FLAGS.items() if candidate == group)
             arguments.extend((flag, text))
@@ -296,7 +347,7 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
                + ' "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/broadcast.py" '
                + shlex.join(_remote_arguments(sender, texts)))
     try:
-        done = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+        done = subprocess.run(["ssh", "-o", "BatchMode=yes", host, command],
                               capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         why = "timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error).splitlines()[0]
@@ -306,9 +357,8 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
         return [Delivery(PeerOutput(host, f"NOT sent: {why}"), "NOT sent", "")]
     deliveries: list[Delivery] = []
     for line in done.stdout.splitlines():
-        parts = line.split(" - ", 2)
-        status = parts[2].partition(":")[0] if len(parts) == 3 else ""
-        outcome = cast(Outcome, status) if status in {"sent", "NOT sent", "no live session"} else "no live session"
+        status = line.partition(": ")[0].rpartition(" - ")[2]
+        outcome = cast(Outcome, status) if status in {"sent", "kept", "NOT sent", "no live session"} else "no live session"
         deliveries.append(Delivery(PeerOutput(host, line), outcome, ""))
     for line in done.stderr.splitlines():
         deliveries.append(Delivery(PeerOutput(host, line), "no live session", ""))
@@ -342,6 +392,7 @@ def main(arguments: list[str]) -> int:
     pairs: list[tuple[str, str]] = []
     sender = ""
     scope: roster.RosterScope = roster.AllMachines()
+    production_pending = False
     index = 0
     while index < len(arguments):
         flag = arguments[index]
@@ -349,7 +400,7 @@ def main(arguments: list[str]) -> int:
             scope = roster.ThisMachine()
             index += 1
             continue
-        if index + 1 >= len(arguments) or flag not in FLAGS.keys() | {"--of", "--from"}:
+        if index + 1 >= len(arguments) or flag not in FLAGS.keys() | {"--of", "--production", "--resolved-production", "--from"}:
             print(USAGE, file=sys.stderr)
             return 2
         value = arguments[index + 1]
@@ -357,19 +408,25 @@ def main(arguments: list[str]) -> int:
             sender = value
         else:
             pairs.append((flag, value))
+            if flag == "--production":
+                production_pending = True
+            elif flag == "--units":
+                production_pending = False
         index += 2
-    if not sender or not any(flag in FLAGS for flag, _ in pairs):
+    if not sender or not any(flag in FLAGS for flag, _ in pairs) or production_pending:
         print(USAGE, file=sys.stderr)
         return 2
     identity = roster.sender_identity(os.environ)
-    if any(flag == "--of" for flag, _ in pairs):
+    production_scope = any(flag in ("--production", "--resolved-production") for flag, _ in pairs)
+    if production_scope or any(flag == "--of" for flag, _ in pairs):
         result = roster.roster(os.environ, scope)
         for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()
-        failures = [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")]
+        failures = (result.problems if production_scope else
+                    [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")])
         if failures:
-            # A partial roster cannot prove that a director name is unique.
+            # Production delivery needs every row; unit name resolution needs a reachable peer.
             _ = report([Delivery(PeerOutput(host, f"NOT sent: {failures[0]}"), "NOT sent", "")])
             return 1
         unit_entries = result.entries
@@ -379,19 +436,28 @@ def main(arguments: list[str]) -> int:
         unit_entries = entries
     texts: dict[BroadcastGroup, str] = {}
     workers: Workers | WorkersOfUnit = Workers()
+    units: UnitDirectors | UnitsOfProduction = UnitDirectors()
     scope_pending = False
+    production_pending = False
     try:
         for flag, text in pairs:
             if flag == "--of":
                 workers = _unit_group(text, unit_entries)
                 scope_pending = True
                 continue
-            group = workers if flag == "--workers" else FLAGS[flag]
+            if flag in ("--production", "--resolved-production"):
+                units = (_production_group(text, unit_entries) if flag == "--production"
+                         else UnitsOfProduction(*cast(tuple[str, str], json.loads(text))))
+                production_pending = True
+                continue
+            group = workers if flag == "--workers" else units if flag == "--units" else FLAGS[flag]
             if flag == "--workers":
                 scope_pending = False
+            if flag == "--units":
+                production_pending = False
             _ = texts.pop(group, None)
             texts[group] = text
-        if scope_pending:
+        if scope_pending or production_pending:
             print(USAGE, file=sys.stderr)
             return 2
     except ValueError as error:

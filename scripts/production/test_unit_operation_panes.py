@@ -6,7 +6,6 @@ import io
 from contextlib import redirect_stderr
 import math
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,12 +13,12 @@ from typing import final, override
 from unittest import mock
 
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.herdr import herdr_types
 from scripts.production.fake_unit_host import PaneShellFixture
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import unit_move
-import herdr
-import unit_lookup
-from rename_state import RenameRefused
+from scripts.production import unit_move
+from scripts.herdr import herdr
+from scripts.production import unit_lookup
+from scripts.production.unit_move import RenameRefused
 
 
 @final
@@ -41,7 +40,7 @@ class UnitOperationPaneTests(unittest.TestCase):
         staff_fixture = StaffTestCase()
         staff_fixture.setUp()
         self.addCleanup(staff_fixture.doCleanups)
-        _ = unit_membership("demo", "alpha-unit")
+        _ = unit_membership("demo", "alpha")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.worktree = self.root / 'worktree'
         self.worktree.mkdir()
@@ -54,7 +53,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
 
     def test_claude_execing_the_pane_shell_needs_no_close(self) -> None:
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit',
+        self.pane.found = unit_lookup.LabeledSession('alpha',
             unit_lookup.LiveClaude('alpha', self.pane.native_id, 'socket', self.pane.shell), self.pane.place)
         self.assertIsNone(unit_move.unit_pane(self.pane.found, 'demo'))
         self.assertEqual(self.pane.close_calls(), [])
@@ -67,8 +66,8 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.assertEqual(self.pane.close_calls(), [])
 
     def test_unknown_director_and_foreign_occupant_do_not_require_pane_proof(self) -> None:
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit', unit_lookup.ClaudeUnknown('unreadable'), self.pane.place)
-        self.pane.add_occupant(991551, unit='beta-unit')
+        self.pane.found = unit_lookup.LabeledSession('alpha', unit_lookup.ClaudeUnknown('unreadable'), self.pane.place)
+        self.pane.add_occupant(991551, unit='beta')
         with mock.patch.object(herdr, 'herdr_processes', side_effect=AssertionError('no occupant scan')):
             pane = unit_move.unit_pane(self.pane.found, 'demo')
             with self.assertRaisesRegex(RenameRefused, 'other live work'):
@@ -77,7 +76,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_close_uses_saved_place_without_record_launch_or_generation_rechecks(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        self.pane.found = unit_lookup.LabeledSession('alpha-unit',
+        self.pane.found = unit_lookup.LabeledSession('alpha',
             unit_lookup.LiveClaude('alpha', 'new-session', 'socket', self.pane.director), self.pane.place)
         with (mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
             unit_move.close_unit_pane(pane)
@@ -85,7 +84,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_a_pane_already_gone_counts_as_closed(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
+        gone = herdr_types.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
         with (mock.patch.object(herdr.Herdr, 'pane_activity', return_value=herdr.PaneAtShell()),
               mock.patch.object(herdr.Herdr, 'panes', side_effect=[
                   [{'pane_id': 'w1:p1', 'terminal_id': 'unit-terminal', 'workspace_id': 'w1', 'session_id': None}], []]),
@@ -103,7 +102,7 @@ class UnitOperationPaneTests(unittest.TestCase):
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
-        failure = herdr.HerdrFailure('fixture close failed')
+        failure = herdr_types.HerdrFailure('fixture close failed')
         run = herdr.Herdr.run
         def fail_close(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
             if arguments == ('pane', 'close', 'w1:p1'):

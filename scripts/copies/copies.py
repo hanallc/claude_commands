@@ -1,41 +1,92 @@
 #!/usr/bin/env python3
-"""Run gates in one warm checkout per owner, with a second checkout when busy."""
+"""Run gates in fresh copies or reusable copies with build output."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 import json
+import fcntl
+import hashlib
+import shlex
 import math
 import os
 from pathlib import Path
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
-from threading import Event, Thread
-from typing import NoReturn, cast, override
+from types import MappingProxyType
+from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
+from urllib.parse import unquote, urlsplit
+from uuid import UUID
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import conf, copy_record, file_lock, scratch
+from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
+from scripts.lib.copy_record import (
+    AllRepositories as AllRepositories,
+    SelectedRepository as SelectedRepository,
+    RepositoryScope as RepositoryScope,
+    ALL_REPOSITORIES as ALL_REPOSITORIES,
+)
+from scripts.buildlog.store import host_name
+from scripts.buildlog import treekey
+from scripts.lib.build_slots import SlotGitFailure, source_checkout
+from scripts.build_queue import first_step
+from scripts.lib.build_steps import (
+    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
+)
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
-from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.mac_test import floor_claims
+if TYPE_CHECKING:
+    from scripts.lint import tmp_sweep
+    from scripts.production import staff
 
-GATE_RECORD = ".gate.json"
+# Checksums skip equal files. Changed files get the receiver write time.
+RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
-OWNER = re.compile(r"[a-z0-9][a-z0-9-]*")
+OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
-GATE_SUFFIXES = ("", "-2")
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
-ACTIVE_GATES: ContextVar[tuple[Path, ...]] = ContextVar("active_gate_checkouts", default=())
+
+
+@dataclass(frozen=True)
+class ActiveGate:
+    """A gate holds this slot through its caller's context."""
+
+    tree: Path
+    source: Path
+    owner: str
+
+
+ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
+
+
+@dataclass(frozen=True)
+class AdmissionSourceCopy:
+    """A temporary source copy uses the real repository's slot pool."""
+
+    tree: Path
+    source: Path
+
+
+ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
 
 
 class CopyError(Exception):
@@ -44,20 +95,122 @@ class CopyError(Exception):
     exit_code: int = 2
 
 
-@dataclass(frozen=True)
-class AllRepositories:
-    """Remove copies from every repository."""
+# Git's exit status when `git remote get-url` names no configured remote.
+NO_SUCH_REMOTE = 2
+
+
+class GitExit(CopyError):
+    """A git command ended with a nonzero status."""
+
+    def __init__(self, message: str, returncode: int) -> None:
+        super().__init__(message)
+        self.returncode: int = returncode
 
 
 @dataclass(frozen=True)
-class SelectedRepository:
-    """Remove copies from one canonical repository name."""
+class StaffOwner:
+    """A fixed staff row owns the copy."""
+
+    row_id: str
+
+
+@dataclass(frozen=True)
+class RoleOwner:
+    """A fixed role owns the copy without a staff row."""
 
     name: str
 
 
-RepositoryScope = AllRepositories | SelectedRepository
-ALL_REPOSITORIES = AllRepositories()
+CopyOwner = StaffOwner | RoleOwner
+
+
+def copy_owner(text: str) -> CopyOwner:
+    """Read a row identity or a fixed role at the text boundary."""
+    try:
+        identity = str(UUID(text))
+    except ValueError:
+        return RoleOwner(text)
+    return StaffOwner(identity)
+
+
+def owner_name(owner: CopyOwner) -> str:
+    """Read the current name without changing the copy's folder."""
+    if isinstance(owner, RoleOwner):
+        return owner.name
+    from scripts.production import staff
+
+    try:
+        row = staff.local_snapshot().by_id(staff.StaffId(owner.row_id))
+    except staff.StaffUnreadable:
+        row = None
+    return row.name if row is not None else owner.row_id
+
+
+@dataclass(frozen=True)
+class CurrentStaffOwnerName:
+    name: str
+
+
+@dataclass(frozen=True)
+class RoleOwnerName:
+    name: str
+
+
+@dataclass(frozen=True)
+class OwnerNameUnavailable:
+    """The list cannot resolve the stored staff owner to a current name."""
+
+
+OwnerDisplay = CurrentStaffOwnerName | RoleOwnerName | OwnerNameUnavailable
+
+
+@dataclass(frozen=True)
+class UnreadStaffNames:
+    """The list has not needed staff names yet."""
+
+
+@dataclass(frozen=True)
+class AvailableStaffNames:
+    snapshot: staff.StaffSnapshot
+
+
+@dataclass(frozen=True)
+class UnavailableStaffNames:
+    """The staff read failed for this list call."""
+
+
+class ListStaffNames:
+    """Use one staff snapshot for all names in a list call."""
+
+    def __init__(self) -> None:
+        self._state: UnreadStaffNames | AvailableStaffNames | UnavailableStaffNames = UnreadStaffNames()
+
+    def read(self) -> AvailableStaffNames | UnavailableStaffNames:
+        if isinstance(self._state, UnreadStaffNames):
+            from scripts.production import staff
+
+            try:
+                self._state = AvailableStaffNames(staff.local_snapshot())
+            except staff.StaffUnreadable:
+                self._state = UnavailableStaffNames()
+        return self._state
+
+
+def list_owner_name(owner: CopyOwner, staff_names: ListStaffNames) -> OwnerDisplay:
+    """Resolve an owner for display without changing its stored identity or folder name."""
+    if isinstance(owner, RoleOwner):
+        return RoleOwnerName(owner.name)
+    from scripts.production import staff
+
+    names = staff_names.read()
+    if isinstance(names, UnavailableStaffNames):
+        return OwnerNameUnavailable()
+    row = names.snapshot.by_id(staff.StaffId(owner.row_id))
+    return CurrentStaffOwnerName(row.name) if row is not None else OwnerNameUnavailable()
+
+
+def _owner_display_text(owner: OwnerDisplay) -> str:
+    return owner.name if isinstance(owner, (CurrentStaffOwnerName, RoleOwnerName)) else "unavailable"
 
 
 def repository_scope(repo: object) -> RepositoryScope:
@@ -69,6 +222,112 @@ def repository_scope(repo: object) -> RepositoryScope:
     if isinstance(repo, AllRepositories):
         return repo
     raise CopyError("expected a repository scope: AllRepositories or SelectedRepository")
+
+
+@dataclass(frozen=True)
+class CommittedSource:
+    """Copy one committed revision."""
+
+    revision: str
+
+
+@dataclass(frozen=True)
+class WorktreeSource:
+    """Apply all worktree changes to a committed revision."""
+
+    revision: str
+    worktree: str | Path
+
+
+@dataclass(frozen=True)
+class StagedSource:
+    """Copy only the specified staged tree."""
+
+    tree: str
+
+
+@dataclass(frozen=True)
+class NoMerge:
+    """Keep the source without an additional merge."""
+
+
+@dataclass(frozen=True)
+class MergeRevision:
+    """Merge the named revision after source preparation."""
+
+    revision: str
+
+
+SourcePolicy = CommittedSource | WorktreeSource | StagedSource
+MergePolicy = NoMerge | MergeRevision
+NO_MERGE = NoMerge()
+
+
+def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
+    """Run Git with the private index and retain its preparation errors."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(source), *arguments],
+                                env={**os.environ, "GIT_INDEX_FILE": str(index)},
+                                capture_output=True, timeout=timeout,
+                                pass_fds=(build_folders.build_folder_lock_fd(index.parent),))
+    except subprocess.TimeoutExpired as error:
+        raise PreparationError(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
+    if result.returncode:
+        raise PreparationError(result.stderr.decode(errors="replace").strip() or f"Git exited with status {result.returncode}")
+    return result.stdout
+
+
+DEFAULT_INDEX_PARENT = build_folders.InheritedTemporaryParent()
+
+
+def staged_tree(source: Path, *, include_worktree: bool = False,
+                index_parent: build_folders.ExplicitBuildParent | build_folders.InheritedTemporaryParent
+                = DEFAULT_INDEX_PARENT) -> str:
+    """Read staged or working files through a private index."""
+    parent = index_parent.path if isinstance(index_parent, build_folders.ExplicitBuildParent) else None
+    with build_folders.tool_folder("copies-index", parent=parent) as temporary:
+        index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
+        private = temporary / "index"
+        if index.exists():
+            git_index.private_copy(index, private)
+        if include_worktree:
+            _ = _private_index_git(source, private, "add", "--all", "--", ".")
+        tree = _private_index_git(source, private, "write-tree").decode().strip()
+        if include_worktree:
+            head_links = {row.split(b"\t", 1)[1] for row in git(source, "ls-tree", "-rz", "HEAD").split(b"\0")
+                          if row.startswith(b"160000 ")}
+            for row in git(source, "ls-tree", "-rz", tree).split(b"\0"):
+                if row.startswith(b"160000 ") and row.split(b"\t", 1)[1] not in head_links:
+                    path = os.fsdecode(row.split(b"\t", 1)[1])
+                    raise NestedRepository(f"NestedRepository: {path}: new Git links cannot supply working files")
+        return tree
+
+
+def source_commit(source: Path, policy: SourcePolicy) -> str:
+    """Give a staged tree a private commit without changing any source refs."""
+    if isinstance(policy, (CommittedSource, WorktreeSource)):
+        return commit_at(source, policy.revision)
+    tree = policy.tree
+    return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+               "commit-tree", tree, "-p", commit_at(source, "HEAD"),
+               data=b"copies: staged source\n").decode().strip()
+
+
+def capture_source(source: Path, *,
+                   index_parent: build_folders.ExplicitBuildParent | build_folders.InheritedTemporaryParent
+                   = DEFAULT_INDEX_PARENT) -> str:
+    """Commit exact working files through the private index without changing caller refs."""
+    before = treekey.tree_key(str(source))
+    head = source_commit(source, WorktreeSource("HEAD", source))
+    index = staged_tree(source, index_parent=index_parent)
+    tree = staged_tree(source, include_worktree=True, index_parent=index_parent)
+    if (staged_tree(source, include_worktree=True, index_parent=index_parent) != tree or not before
+            or treekey.tree_key(str(source)) != before or staged_tree(source, index_parent=index_parent) != index
+            or commit_at(source, "HEAD") != head):
+        raise SourceChangedDuringCapture("SourceChanged: inputs changed during source capture")
+    return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+               "commit-tree", tree, data=b"copies: source snapshot\n").decode().strip()
 
 
 class BusyCopy(CopyError):
@@ -102,8 +361,16 @@ class PreparationError(CopyError):
     exit_code: int = 3
 
 
+class NestedRepository(PreparationError):
+    """The worktree adds a Git link that cannot supply working files."""
+
+
+class SourceChangedDuringCapture(PreparationError):
+    """The source changed before capture could verify its snapshot."""
+
+
 class PostUseError(CopyError):
-    """The caller finished, but refreshing its standing checkout metadata failed."""
+    """Cleanup or a metadata refresh failed after the caller used a checkout."""
 
     def __init__(self, message: str, *, caller_error: BaseException | None = None) -> None:
         super().__init__(message)
@@ -114,12 +381,6 @@ class ClaimState(Enum):
     ACQUIRED = auto()
     BUSY = auto()
     REPLACED = auto()
-
-
-@dataclass(frozen=True)
-class GateLease:
-    tree: Path
-    descriptors: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -141,19 +402,8 @@ class UnreadableHolder:
 
 
 @dataclass(frozen=True)
-class GateRecord:
-    owner: str
-    repo: str
-    source: str
-    commit: str
-    last_use: float
-    holder_pid: int
-
-
-@dataclass(frozen=True)
 class CopiesConfiguration:
-    root: Path
-    wait_seconds: float
+    remote_registry: Path
     git_timeout_seconds: float
     guard_timeout_seconds: float
     allow_list: dict[str, str]
@@ -168,19 +418,65 @@ def config_settings() -> tuple[Path, dict[str, str]]:
 def load_config() -> CopiesConfiguration:
     path, values = config_settings()
     try:
-        root = Path(values["root"]).expanduser()
-        delay = float(values["wait_seconds"])
+        registry = Path(values["remote_registry"]).expanduser()
         git_timeout = float(values["git_timeout_seconds"])
         guard_timeout = float(values["guard_timeout_seconds"])
-        if not root.is_absolute():
-            raise ValueError("root must be absolute")
-        if any(not math.isfinite(value) or value <= 0 for value in (delay, git_timeout, guard_timeout)):
-            raise ValueError("wait_seconds, git_timeout_seconds and guard_timeout_seconds must be finite and positive")
+        if not registry.is_absolute():
+            raise ValueError("remote_registry must be absolute")
+        if any(not math.isfinite(value) or value <= 0 for value in (git_timeout, guard_timeout)):
+            raise ValueError("git_timeout_seconds and guard_timeout_seconds must be finite and positive")
     except (KeyError, ValueError) as error:
         raise CopyError(f"{path}: invalid copies configuration: {error}") from error
     allow_list = {key.removeprefix("allow."): reason for key, reason in values.items()
                   if key.startswith("allow.") and reason}
-    return CopiesConfiguration(root.resolve(), delay, git_timeout, guard_timeout, allow_list)
+    return CopiesConfiguration(registry.resolve(), git_timeout, guard_timeout, allow_list)
+
+
+def guard_choice_limit() -> int:
+    """Read the branch limit, using the repository setting for older configuration files."""
+    path, values = config_settings()
+    if "guard_choice_limit" not in values:
+        path = Path(__file__).resolve().parents[2] / "config/copies.conf"
+        values = conf.read(path).values()
+    try:
+        limit = int(values["guard_choice_limit"])
+        if limit <= 0:
+            raise ValueError("guard_choice_limit must be positive")
+    except (KeyError, ValueError) as error:
+        raise CopyError(f"{path}: invalid copies configuration: {error}") from error
+    return limit
+
+
+def unit_owner(name: str) -> str:
+    """Keep the recorded unit name and append one unit suffix."""
+    return name.removesuffix("-unit") + "-unit"
+
+
+def source_owner(source: Path) -> str:
+    """Use the recorded owner, or the configured verify owner."""
+    return recorded_owner(source) or fallback_owner("verify")
+
+
+def recorded_owner(source: Path, *,
+                   intent: scratch.RemovalIntentAccess = scratch.RemovalIntentAccess.RECOVER) -> str:
+    """Use the standing checkout owner, copy owner or staff owner; empty when none is recorded."""
+    for active in reversed(ACTIVE_GATES.get()):
+        if active.tree == source.resolve():
+            return active.owner
+    record = scratch.task_of(source, intent=intent)
+    if isinstance(record, copy_record.Registered):
+        owner = record.fields.get("owner_unit")
+        if isinstance(owner, str):
+            return checked_owner(owner)
+    from scripts.production import staff
+    from scripts.agents.remote import local_machine
+    try:
+        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
+        if member is not None:
+            return str(member.id)
+    except staff.StaffUnreadable:
+        pass
+    return ""
 
 
 def fallback_owner(role: str) -> str:
@@ -193,7 +489,8 @@ def fallback_owner(role: str) -> str:
 
 
 def gates_root() -> Path:
-    return load_config().root
+    """Return the root that contains numbered test copies."""
+    return build_folders.build_root()
 
 
 def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
@@ -208,7 +505,7 @@ def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
     if result.returncode:
         detail = "\n".join(part.decode(errors="replace").strip() for part in (result.stdout, result.stderr)
                            if part.strip()) or f"exit {result.returncode}"
-        raise CopyError(f"git {' '.join(arguments)} in {repo}: {detail}")
+        raise GitExit(f"git {' '.join(arguments)} in {repo}: {detail}", result.returncode)
     return result.stdout
 
 
@@ -216,60 +513,80 @@ def commit_at(repo: Path, revision: str) -> str:
     return git(repo, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}").decode().strip()
 
 
+def caller_owner() -> str:
+    """Read the calling session's owner from the local staff record."""
+    from scripts.production import staff
+
+    try:
+        record = staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        raise CopyError(f"calling session has no readable staff row: {error}".replace("\n", " ")) from error
+    row = record.owner_of(staff.caller_identity())
+    if row is None:
+        raise CopyError("calling session has no staff row or unit owner")
+    return str(row.id)
+
+
+type GitSettings = dict[str, list[str]]
+
+
+def read_git_settings(repo: Path, *options: str) -> GitSettings:
+    settings: GitSettings = {}
+    for entry in os.fsdecode(git(repo, "config", *options, "--null", "--list")).split("\0"):
+        if entry:
+            key, _, value = entry.partition("\n")
+            settings.setdefault(key, []).append(value)
+    return settings
+
+
+def origin_url(source: Path) -> str | None:
+    """Read the origin URL when the repository has one."""
+    try:
+        return git(source, "remote", "get-url", "origin").decode().strip()
+    except GitExit as error:
+        # Git exits 2 when no remote of that name is configured.
+        if error.returncode == NO_SUCH_REMOTE:
+            return None
+        raise
+
+
+
+
 def repository_name(source: Path) -> str:
-    record = scratch.task_of(source)
-    if isinstance(record, copy_record.Registered):
-        original = record.fields.get("source_path")
-        if isinstance(original, str) and Path(original) != source:
-            source = Path(original)
-    common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
-    # Linked unit worktrees share the main repository's name, including .claude.
-    return common.parent.name if common.name == ".git" else source.name
+    """Follow local origins to the repository's upstream identity."""
+    seen: set[Path] = set()
+    while True:
+        origin = origin_url(source)
+        if (origin is not None and not origin.startswith("file://")
+                and not Path(resolved_remote_url(source, origin)).is_absolute()):
+            return origin.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+        checkout = main_checkout(source)
+        if checkout in seen:
+            raise CopyError(f"{source}: local origins form a cycle")
+        seen.add(checkout)
+        if origin is None:
+            return checkout.name
+        source = (Path(unquote(urlsplit(origin).path)) if origin.startswith("file://")
+                  else Path(resolved_remote_url(checkout, origin)))
+
+
+def main_checkout(source: Path) -> Path:
+    """Keep the public copies API for the shared checkout reader."""
+    return source_checkout(source)
 
 
 def checked_owner(owner: str) -> str:
     if not OWNER.fullmatch(owner):
-        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9-]*")
+        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9_-]*")
     return owner
 
 
-def tree_paths(owner: str, repo: str, pool: CopiesConfiguration) -> tuple[Path, ...]:
-    parent = pool.root / repo
-    return tuple(parent / f"{owner}-gate{suffix}" for suffix in GATE_SUFFIXES)
-
-
-def read_record(tree: Path) -> GateRecord:
-    try:
-        raw = cast(object, json.loads((tree / GATE_RECORD).read_text(encoding="utf-8")))
-        if not isinstance(raw, dict):
-            raise ValueError("expected an object")
-        fields = cast(dict[str, object], raw)
-        labels = [fields.get(key) for key in ("owner", "repo", "source", "commit")]
-        moment, pid = fields.get("last_use"), fields.get("holder_pid")
-        if (not all(isinstance(value, str) for value in labels)
-                or not isinstance(moment, (int, float)) or not isinstance(pid, int)):
-            raise ValueError("invalid owner, repo, source, commit, last_use or holder_pid")
-        owner, repo, source, commit = cast(list[str], labels)
-        return GateRecord(owner, repo, source, commit, float(moment), pid)
-    except (OSError, ValueError) as error:
-        raise CopyError(f"{tree / GATE_RECORD}: unreadable gate record: {error}") from error
-
-
-def write_record(tree: Path, owner: str, repo: str, source: Path, commit: str) -> None:
-    fields = {"owner": owner, "repo": repo, "source": str(source), "commit": commit,
-              "last_use": time.time(), "holder_pid": os.getpid()}
-    write_text_atomic(tree / GATE_RECORD, json.dumps(fields) + "\n")
-
-
 def holder(tree: Path) -> KnownHolder | UnreadableHolder:
-    try:
-        return KnownHolder(read_record(tree).holder_pid)
-    except CopyError as error:
-        for mark in (tree / scratch.BUSY, tree.parent / scratch.BUSY):
-            pid = file_lock.lock_holder(str(mark))
-            if pid is not None and pid > 0:
-                return KnownHolder(pid)
-        return UnreadableHolder(str(error))
+    for mark in (tree / scratch.BUSY, tree.parent / scratch.BUSY):
+        pid = file_lock.lock_holder(str(mark))
+        if pid is not None and pid > 0:
+            return KnownHolder(pid)
+    return UnreadableHolder("no busy lock holder")
 
 
 @contextmanager
@@ -298,67 +615,11 @@ def claim_tree(tree: Path, *, create: bool, inherited_fds: list[int] | None = No
         yield ClaimState.ACQUIRED if idle and same else ClaimState.BUSY if same else ClaimState.REPLACED
 
 
-@contextmanager
-def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generator[GateLease]:
-    candidates = tree_paths(owner, repo, pool)
-    announced = False
-    wake = Event()
-
-    def first_tree_released() -> None:
-        try:
-            # Wait on the existing busy mark, using scratch's only flock path.
-            with scratch.busy_locks(candidates[0], create=False, wait=True):
-                pass
-        finally:
-            wake.set()
-
-    waiter = Thread(target=first_tree_released, daemon=True)
-    while True:
-        for tree in candidates:
-            if removing_path(tree).exists():
-                continue
-            descriptors: list[int] = []
-            with claim_tree(tree, create=not tree.exists(), inherited_fds=descriptors) as state:
-                if state is ClaimState.ACQUIRED:
-                    yield GateLease(tree, tuple(descriptors))
-                    return
-        if not announced:
-            held = "; ".join(f"{tree} held by pid {holder(tree)}" for tree in candidates)
-            print(f"copies: waiting for {held}", file=sys.stderr, flush=True)
-            announced = True
-        if (candidates[0] / scratch.BUSY).exists() and not removing_path(candidates[0]).exists():
-            if not waiter.is_alive():
-                wake.clear()
-                waiter = Thread(target=first_tree_released, daemon=True)
-                waiter.start()
-        _ = wake.wait(pool.wait_seconds)
-
-
-def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> None:
-    remove_dead_temporary_files(tree / GATE_RECORD)
-    replace_git = False
-    if (tree / GATE_RECORD).exists():
-        previous = read_record(tree)
-        if previous.owner != owner or previous.repo != repo:
-            raise CopyError(f"{tree}: gate record belongs to another owner or repository")
-        replace_git = previous.source != str(source)
-    elif any(child.name != scratch.BUSY for child in tree.iterdir()):
-        raise CopyError(f"{tree}: refusing an unregistered existing directory")
-    if (tree / ".git").is_dir() and not replace_git:
-        try:
-            _ = git(tree, "rev-list", "--objects", "--all", "--quiet")
-        except CopyError:
-            replace_git = True
-    write_record(tree, owner, repo, source, base)
-    if replace_git and (tree / ".git").is_dir() and not (tree / ".git").is_symlink():
-        shutil.rmtree(tree / ".git")
-    initialize_git(tree, source)
-
-
 def source_origin(source: Path) -> tuple[str, str]:
     """Return the upstream URL and the source refs that represent it."""
-    if "origin" in git(source, "remote").decode().splitlines():
-        return git(source, "remote", "get-url", "origin").decode().strip(), "refs/remotes/origin"
+    origin = origin_url(source)
+    if origin is not None:
+        return origin, "refs/remotes/origin"
     return str(source), "refs/heads"
 
 
@@ -369,39 +630,72 @@ def resolved_remote_url(repo: Path, url: str) -> str:
     return str((repo / Path(url).expanduser()).resolve())
 
 
-def refresh_remotes(tree: Path, source: Path) -> None:
+def refresh_remotes(tree: Path, source: Path, *, new_checkout: bool = False) -> None:
     """Keep upstream refs and saved local branches in separate remotes."""
     url, refs = source_origin(source)
+    settings = read_git_settings(tree, "--local")
+
+    def references(repo: Path, *prefixes: str) -> dict[str, str]:
+        listing = git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", *prefixes)
+        return dict(line.split(" ", 1) for line in listing.decode().splitlines())
+
+    # A new checkout gets both ref sets in one fetch. Compare refs only on reuse.
+    source_references = {} if new_checkout else references(source, refs, "refs/heads")
+    current_refs = {} if new_checkout else references(tree, "refs/remotes/origin", "refs/remotes/source")
+    mappings: list[str] = []
+    stale_heads: list[str] = []
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
-        _ = git(tree, "config", "--replace-all", f"remote.{remote}.url", remote_url)
-        _ = git(tree, "config", "--replace-all", f"remote.{remote}.fetch",
-                f"+refs/heads/*:refs/remotes/{remote}/*")
+        for key, value in ((f"remote.{remote}.url", remote_url),
+                           (f"remote.{remote}.fetch", f"+refs/heads/*:refs/remotes/{remote}/*")):
+            if settings.get(key) != [value]:
+                _ = git(tree, "config", "--replace-all", key, value)
+        prefix = f"refs/remotes/{remote}/"
+        expected = {name.removeprefix(source_refs + "/"): value.split()[0]
+                    for name, value in source_references.items() if name.startswith(source_refs + "/")}
+        current = {name.removeprefix(prefix): value.strip()
+                   for name, value in current_refs.items() if name.startswith(prefix)}
+        if new_checkout or current != expected:
+            stale_heads.append(prefix + "HEAD")
+            mappings.append(mapping)
+    if stale_heads:
         # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
-        _ = git(tree, "update-ref", "--no-deref", "-d", f"refs/remotes/{remote}/HEAD")
-        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), mapping)
+        _ = git(tree, "update-ref", "--no-deref", "--stdin",
+                data="".join(f"delete {ref}\n" for ref in stale_heads).encode())
+    if mappings:
+        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
-    if not (tree / ".git").exists():
+    new_checkout = not (tree / ".git").exists()
+    if new_checkout:
         # clone needs an empty destination; the tree already holds scratch's busy mark.
         # Stage only Git metadata, so first creation never has an unlocked checkout.
-        stage = tree / CLONE_STAGE
-        if stage.exists():
-            shutil.rmtree(stage)
-        _ = git(source, "clone", "--shared", "--no-checkout", "--quiet", "--", str(source), str(stage))
-        _ = (stage / ".git").rename(tree / ".git")
-        stage.rmdir()
+        clone_source = source
+        clone_mode = "--shared"
+        if any(active.tree == source for active in ACTIVE_GATES.get()):
+            clone_mode = "--no-local"
+        with tempfile.TemporaryDirectory(dir=tree, prefix=CLONE_STAGE + "-") as directory:
+            stage = Path(directory)
+            _ = git(source, "clone", clone_mode, "--no-checkout", "--quiet", "--", str(clone_source), str(stage))
+            _ = (stage / ".git").rename(tree / ".git")
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
     if Path(actual).resolve() != (tree / ".git").resolve():
         raise CopyError(f"{tree}: Git directory is {actual}, expected {tree / '.git'}")
-    refresh_remotes(tree, source)
+    (tree / ".git/index.lock").unlink(missing_ok=True)
+    index = tree / ".git/index"
+    if index.exists() or index.is_symlink():
+        try:
+            _ = git(tree, "ls-files", "--stage")
+        except CopyError:
+            index.unlink(missing_ok=True)
+    refresh_remotes(tree, source, new_checkout=new_checkout)
     exclude = tree / ".git/info/exclude"
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    entries = [entry for entry in (f"/{GATE_RECORD}", f"/{scratch.BUSY}", "/target/")
+    entries = [entry for entry in (f"/{scratch.BUSY}", "/target")
                if entry not in text.splitlines()]
     if entries:
         exclude.parent.mkdir(parents=True, exist_ok=True)
@@ -409,94 +703,171 @@ def initialize_git(tree: Path, source: Path) -> None:
                           + "\n".join(entries) + "\n")
 
 
+@dataclass(frozen=True)
+class CloneSourceCommit:
+    """The repository path and commit recorded for a clone."""
+
+    repository: str
+    commit: str
+
+
+class CloneSource(Enum):
+    UNAPPROVED = auto()
+
+
+def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, *,
+                           generated_from: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED,
+                           owner: str = "", repository: str = "", session: str = "",
+                           scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Record a scratch clone and the source commit used to check its envrc."""
+    fields: dict[str, object] = {"test_hana_clone": True, "clone_path": str(path.resolve())}
+    if owner:
+        fields.update(clone_owner=owner, clone_repository=repository, clone_session=session)
+    if isinstance(source, CloneSourceCommit):
+        fields.update(source_path=source.repository, source_commit=source.commit)
+    if isinstance(generated_from, CloneSourceCommit):
+        fields["generated_source"] = True
+    _ = scratch.update_record(path, lambda record: {
+        **(record.fields if isinstance(record, copy_record.Registered) else {}), **fields,
+    }, scratch_settings=scratch_settings)
+
+
 def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None, *,
+          owner: str = "", repository: str = "hana", session: str = "",
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """Create a task-owned clone. Keep partial files owned if Git fails."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    path = scratch.new(task, word, now=now, scratch_settings=scratch_settings)
-    _ = scratch.update_record(path, lambda record: {
-        **(record.fields if isinstance(record, copy_record.Registered) else {}),
-        "test_hana_clone": True, "source_path": str(source.resolve()),
-    }, scratch_settings=scratch_settings)
-    checkout = path / "checkout"
-    try:
-        # The task folder keeps one lock path while its checkout gains Git metadata.
-        with claim_tree(path, create=False) as state:
-            if state is not ClaimState.ACQUIRED:
-                raise CopyError(f"{path}: task folder is busy")
-            checkout.mkdir()
-            initialize_git(checkout, source.resolve())
-            _ = git(checkout, "reset", "--hard", "--quiet")
-            from scripts.accounts import accounts
+    moment = time.time() if now is None else now
+    task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
+    destination = scratch.target(task, word, scratch_settings=scratch_settings)
+    if owner:
+        destination = scratch.free_name(destination.parent, clone_owner_prefix(checked_owner(owner)) + destination.name)
+    spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=destination.parent,
+                                        suffix_length=0, suffix=destination.name, owner=owner)
+    with build_folders.leased_build_folder(spec) as path:
+        scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
+        if scratch.in_session_folder(path):
+            _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
+        register_scratch_clone(path, CloneSource.UNAPPROVED, owner=owner, repository=repository, session=session,
+                               scratch_settings=scratch_settings)
+        try:
+            if owner:
+                record_clone_setup_lease(path)
+                mark_mirror(path, owner, repository, session)
+            # The task folder is the checkout, so its cargo build folder has the task folder's name.
+            descriptors = [build_folders.build_folder_lock_fd(path)]
+            with ExitStack() as locks:
+                state = locks.enter_context(claim_tree(path, create=False, inherited_fds=descriptors))
+                if state is not ClaimState.ACQUIRED:
+                    raise CopyError(f"{path}: task folder is busy")
+                token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *descriptors))
+                _ = locks.callback(COMMAND_LOCKS.reset, token)
+                initialize_git(path, source.resolve())
+                scratch.exclude_copy_metadata(path, additional=floor_claims.MIRROR_METADATA if owner else ())
+                _ = git(path, "reset", "--hard", "--quiet")
+                register_scratch_clone(path, CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD")),
+                                       scratch_settings=scratch_settings)
+                from scripts.accounts import accounts
 
-            if accounts.any_claude_home_trusts(source):
-                folder = str(checkout.resolve())
-                _ = scratch.update_record(path, lambda record: {
-                    **(record.fields if isinstance(record, copy_record.Registered) else {}),
-                    "claude_trust_folder": folder,
-                }, scratch_settings=scratch_settings)
-                accounts.set_claude_folder_trust(checkout, trusted=True)
-    except (OSError, CopyError) as error:
-        raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
-    return checkout
+                if accounts.source_has_claude_trust(source):
+                    _ = scratch.update_record(path, lambda record: {
+                        **(record.fields if isinstance(record, copy_record.Registered) else {}),
+                        "claude_trust_folder": str(path.resolve()),
+                    }, scratch_settings=scratch_settings)
+                    trust = accounts.set_claude_folder_trust(path, trusted=True)
+                    if isinstance(trust, accounts.FolderTrustFailed):
+                        trust.report()
+            # The claim began before .git existed; later claims lock .git/.claude-busy.
+            (path / scratch.BUSY).unlink(missing_ok=True)
+            if owner:
+                record_clone_setup_lease(path, released=True)
+        except (OSError, CopyError) as error:
+            raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
+    return path
 
 
-def apply_changes(tree: Path, worktree: Path, base: str) -> None:
+class EnvrcReference(Enum):
+    CALLER_ANCHOR = "caller"
+    WORKTREE_EDIT = "worktree"
+    NO_COMMITTED_MERGE = "no-committed-merge"
+
+
+@dataclass(frozen=True)
+class MergedEnvrcReference:
+    """The selected input and the merge of committed inputs."""
+
+    merged_input: str
+    committed_merge: str
+
+
+def apply_changes(tree: Path, worktree: Path, base: str) -> EnvrcReference:
     changed: list[str] = []
     try:
         changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
                    if name]
-        diff = git(worktree, "diff", "--binary", "HEAD", "--")
-        if diff:
-            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
             if not name:
                 continue
-            relative = Path(os.fsdecode(name))
-            changed.append(str(relative))
-            if relative.parts[0] in (GATE_RECORD, scratch.BUSY, ".git", CLONE_STAGE):
-                raise CopyError(f"{relative}: path conflicts with gate metadata")
-            original, destination = worktree / relative, tree / relative
-            mode = original.lstat().st_mode
-            if not destination.parent.resolve().is_relative_to(tree.resolve()):
-                raise CopyError(f"{relative}: path escapes the gate checkout")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.is_symlink():
-                destination.unlink()
-            if stat.S_ISLNK(mode):
-                destination.symlink_to(os.readlink(original))
-            elif stat.S_ISREG(mode):
-                _ = shutil.copyfile(original, destination)
-                shutil.copymode(original, destination)
-            else:
-                raise CopyError(f"{relative}: not a regular file or symlink")
-            _ = git(tree, "--literal-pathspecs", "add", "--force", "--", str(relative))
+            changed.append(os.fsdecode(name))
+            if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
+                raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
+        snapshot = staged_tree(worktree, include_worktree=True)
+        envrc_changed = git(worktree, "diff", "--name-only", "-z", "HEAD", snapshot, "--", ".envrc")
+        diff = git(worktree, "diff", "--binary", "HEAD", snapshot, "--")
+        if diff:
+            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         short = git(tree, "rev-parse", "--short", base).decode().strip()
         _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                 "-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "--allow-empty", "-m",
                 f"gate: uncommitted {worktree} at {short}")
+        return EnvrcReference.WORKTREE_EDIT if envrc_changed else EnvrcReference.CALLER_ANCHOR
     except (CopyError, OSError) as error:
         files = ", ".join(changed) or "no changed files could be read"
         raise PreparationError(f"cannot apply uncommitted {worktree}; files: {files}; {error}") from error
 
 
-def merge_changes(tree: Path, source: Path, revision: str) -> None:
+def merge_committed_envrc(tree: Path, base: str, incoming: str) -> MergedEnvrcReference | EnvrcReference:
+    """Prepare a merge reference that excludes staged and working edits."""
     try:
+        merged_tree = git(tree, "merge-tree", "--write-tree", base, incoming).decode().strip()
+    except GitExit as error:
+        if error.returncode == 1:
+            return EnvrcReference.NO_COMMITTED_MERGE
+        raise
+    commit = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+                 "commit-tree", merged_tree, "-p", base, "-p", incoming,
+                 data=b"copies: merge committed inputs for envrc approval\n").decode().strip()
+    return MergedEnvrcReference(incoming, commit)
+
+
+class MergeEnvrcProof(Enum):
+    NOT_REQUIRED = auto()
+
+
+def merge_changes(tree: Path, source: Path, revision: str, *,
+                  committed_base: str | MergeEnvrcProof = MergeEnvrcProof.NOT_REQUIRED
+                  ) -> MergedEnvrcReference | EnvrcReference:
+    try:
+        before = commit_at(tree, "HEAD") if isinstance(committed_base, str) else ""
         if revision.startswith("origin/"):
             branch = revision.removeprefix("origin/")
             origin, _ = source_origin(source)
             origin = resolved_remote_url(source, origin)
             _ = git(source, "check-ref-format", f"refs/heads/{branch}")
-            _ = git(tree, "fetch", "-q", "--", origin,
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
-            commit = commit_at(tree, revision)
+            _ = git(tree, "fetch", "-q", "--refmap=", "--", origin, f"refs/heads/{branch}")
+            commit = commit_at(tree, "FETCH_HEAD")
         else:
             commit = commit_at(source, revision)
             _ = git(tree, "fetch", "-q", "--", str(source), commit)
         _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-edit", "--no-verify", commit)
+        if isinstance(committed_base, MergeEnvrcProof):
+            return EnvrcReference.CALLER_ANCHOR
+        if before == committed_base:
+            return MergedEnvrcReference(commit, commit_at(tree, "HEAD"))
+        return merge_committed_envrc(tree, committed_base, commit)
     except CopyError as error:
         conflicts = git(tree, "diff", "--name-only", "--diff-filter=U").decode(errors="replace").strip()
         raise PreparationError(f"cannot merge {revision}; files: {conflicts or 'see git error'}; {error}") from error
@@ -509,256 +880,663 @@ def mark_target(tree: Path) -> None:
         scratch.mark_cargo_cache(target)
 
 
-def prepare(tree: Path, source: Path, owner: str, name: str, base: str,
-            apply_uncommitted: str | Path | None, merge: str | None) -> None:
-    """Convert only our own preparation errors, before entering caller code."""
-    try:
-        initialize(tree, source, owner, name, base)
-        _ = git(tree, "fetch", "-q", "--", str(source), base)
-        _ = git(tree, "checkout", "-q", "--force", "--detach", base)
-        _ = git(tree, "clean", "-ffdq")
-        target = tree / "target"
-        if target.is_symlink():
-            target.unlink()
-        mark_target(tree)
-        if apply_uncommitted is not None:
-            apply_changes(tree, Path(apply_uncommitted).expanduser().resolve(), base)
-        if merge is not None:
-            merge_changes(tree, source, merge)
-        write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
-    except (OSError, scratch.ScratchError) as error:
-        raise CopyError(str(error)) from error
+def _check_workspace_name(name: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise CopyError(f"{name!r}: invalid workspace name")
 
 
 def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
     """Locate a named editable copy in the existing scratch registry."""
     owner = checked_owner(owner)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-        raise CopyError(f"{name!r}: invalid workspace name")
+    _check_workspace_name(name)
     source = Path(repo).expanduser().resolve()
     return copy_record.copies_root() / f"{repository_name(source)}-{owner}" / name
 
 
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
-              task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
+              task: str = "", path: Path | None = None, run_manifest: Path | None = None,
+              on_create: build_folders.FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold a registered editable copy without resetting edits during recovery."""
+    _ = on_create
     source = Path(repo).expanduser().resolve()
-    base = commit_at(source, commit)
+    for active in ACTIVE_GATES.get():
+        if active.tree == source:
+            source = active.source
+            break
+    common, base = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir", "--verify",
+                       "--end-of-options", f"{commit}^{{commit}}").decode().rstrip("\n").rsplit("\n", 1)
     owner = checked_owner(owner)
-    tree = path.resolve() if path is not None else workspace_path(owner, source, name)
+    if path is None:
+        _check_workspace_name(name)
+    identity = repository_name(source)
+    tree = copy_record.copies_root() / f"{identity}-{owner}" / name if path is None else path.resolve()
     legacy = copy_record.copy_folder(tree) != tree
-    if legacy and not tree.is_dir():
-        raise CopyError(f"{tree}: a legacy workspace must already exist")
+    if tree.is_symlink() or not tree.is_dir() or (legacy and path is None and not (tree / ".git").is_dir()):
+        raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
+    if not legacy and not isinstance(copy_record.read_record(tree / copy_record.RECORD), copy_record.Registered):
+        raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
     branch = branch.removeprefix("refs/heads/")
     _ = git(source, "check-ref-format", f"refs/heads/{branch}")
-    common = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip()
     descriptors: list[int] = []
-    with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
-        if state is not ClaimState.ACQUIRED:
-            raise CopyError(f"{tree}: workspace is busy")
-        token = COMMAND_LOCKS.set(tuple(descriptors))
-        try:
-            record = scratch.task_of(tree)
-            task = scratch.task_or_default(task or (record.task if isinstance(record, copy_record.Registered) else ""), time.time())
-
-            linked_run = record.fields.get("crate_run", "") if isinstance(record, copy_record.Registered) else ""
-            manifest_path = str(run_manifest.resolve()) if run_manifest is not None else linked_run
-            if not isinstance(manifest_path, str) or linked_run and manifest_path != linked_run:
-                raise CopyError(f"{tree}: crate run link changed")
-
-            def register(copy_commit: str) -> None:
-                if legacy:
-                    _ = scratch.hold(tree, task, LEGACY_WORKER_HOLD_REASON)
-                    fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),
-                        source_commit=base, copy_commit=copy_commit, target_mode="none",
-                        seed_source="", borrows_from=common)
-                    if manifest_path:
-                        fields["crate_run"] = manifest_path
-                    _ = scratch.update_record(tree, lambda _: scratch.fields_for_task(fields, task))
-                    scratch.exclude_copy_metadata(tree)
-                else:
-                    scratch.register_copy(tree, task=task, owner_unit=owner, source_path=str(source),
-                                          source_commit=base, copy_commit=copy_commit, target_mode="none",
-                                          seed_source="", borrows_from=common, crate_run=manifest_path)
-
-            if isinstance(record, copy_record.Registered):
-                expected = {"owner_unit": owner, "source_path": str(source), "source_commit": base}
-                if any(record.fields.get(key) != value for key, value in expected.items()):
-                    raise CopyError(f"{tree}: workspace belongs to another request")
-            elif legacy:
-                if not isinstance(record, copy_record.NotRegistered):
-                    raise CopyError(f"{tree}: unreadable legacy workspace")
-                origin = git(tree, "remote", "get-url", "origin").decode().strip()
-                upstream, _ = source_origin(source)
-                resolved_origin = resolved_remote_url(tree, origin)
-                if resolved_origin not in (resolved_remote_url(source, upstream), str(source)):
-                    raise CopyError(f"{tree}: legacy workspace source differs")
-                _ = git(tree, "merge-base", "--is-ancestor", base, "HEAD")
-                if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
-                    raise CopyError(f"{tree}: workspace branch changed")
-                if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
-                    raise CopyError(f"{tree}: workspace must own its Git directory")
-                register(commit_at(tree, "HEAD"))
-                record = scratch.task_of(tree)
-            else:
-                if not isinstance(record, copy_record.NotRegistered) or any(
-                        child.name != scratch.BUSY for child in tree.iterdir()):
-                    raise CopyError(f"{tree}: refusing an unregistered workspace")
-                register("")
-                record = scratch.task_of(tree)
-            assert isinstance(record, copy_record.Registered)
-            if record.fields.get("copy_commit"):
-                if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
-                    raise CopyError(f"{tree}: workspace must own its Git directory")
-                if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
-                    raise CopyError(f"{tree}: workspace branch changed")
-                if record.task != task or manifest_path != linked_run:
-                    register(str(record.fields["copy_commit"]))
-                else:
-                    scratch.renew(tree)
-                refresh_remotes(tree, source)
-            else:
-                initialize_git(tree, source)
-                _ = git(tree, "checkout", "-q", "-B", branch, base)
-                for key in ("user.name", "user.email"):
-                    _ = git(tree, "config", key, git(source, "config", key).decode().strip())
-                register(base)
-            try:
-                yield tree
-            finally:
-                caller_error = sys.exception()
-                try:
-                    refresh_remotes(tree, source)
-                    mark_target(tree)
-                    register(commit_at(tree, "HEAD"))
-                except (OSError, scratch.ScratchError, CopyError) as error:
-                    raise PostUseError(f"{tree}: workspace refresh failed: {error}",
-                                       caller_error=caller_error) from error
-        except (OSError, scratch.ScratchError) as error:
-            raise CopyError(str(error)) from error
-        finally:
-            COMMAND_LOCKS.reset(token)
-
-
-def end_workspaces(task: str, paths: list[Path]) -> None:
-    """End native copies for the sweep and remove adopted workers through guarded cleanup."""
-    holds = scratch.holds()
-    changed = False
-    for hold in holds.values():
-        if hold["task"] == task:
-            hold["ended"] = time.time()
-            changed = True
-    if changed:
-        scratch.write_holds(holds)
-    for tree in paths:
-        if copy_record.copy_folder(tree) != tree.resolve():
-            if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
-                    or scratch.end_copy(tree, task, time.time())):
-                hold = scratch.holds().get(str(tree.resolve()))
-                if hold is not None and hold["task"] == task:
-                    _ = scratch.release(tree)
-            continue
-        if not tree.exists():
-            continue
-        with claim_tree(tree, create=False) as state:
+    with ExitStack() as lifetime:
+        if not legacy:
+            lease = lifetime.enter_context(build_folders.folder_removal_lease(tree))
+            if isinstance(lease, build_folders.RefusedRemovalLease):
+                raise CopyError(f"{tree}: workspace is busy")
+            if isinstance(lease, build_folders.HeldFolderRemovalLease):
+                descriptors.append(lease.descriptor)
+        with claim_tree(tree, create=False, inherited_fds=descriptors) as state:
             if state is not ClaimState.ACQUIRED:
+                raise CopyError(f"{tree}: workspace is busy")
+            token = COMMAND_LOCKS.set(tuple(descriptors))
+            try:
+                record = scratch.task_of(tree)
+                task = scratch.task_or_default(task or (record.task if isinstance(record, copy_record.Registered) else ""), time.time())
+
+                linked_run = record.fields.get("crate_run", "") if isinstance(record, copy_record.Registered) else ""
+                manifest_path = str(run_manifest.resolve()) if run_manifest is not None else linked_run
+                if not isinstance(manifest_path, str) or linked_run and manifest_path != linked_run:
+                    raise CopyError(f"{tree}: crate run link changed")
+
+                def register(copy_commit: str) -> None:
+                    if legacy:
+                        _ = scratch.hold(tree, task, LEGACY_WORKER_HOLD_REASON)
+                        fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),
+                            source_commit=base, copy_commit=copy_commit, target_mode="none",
+                            seed_source="", borrows_from=common, repository_identity=identity)
+                        if manifest_path:
+                            fields["crate_run"] = manifest_path
+                        _ = scratch.update_record(tree, lambda _: scratch.fields_for_task(fields, task))
+                        scratch.exclude_copy_metadata(tree)
+                    else:
+                        scratch.register_copy(tree, task=task, owner_unit=owner, source_path=str(source),
+                                              source_commit=base, copy_commit=copy_commit, target_mode="none",
+                                              seed_source="", borrows_from=common, crate_run=manifest_path,
+                                              repository_identity=identity)
+
+                if isinstance(record, copy_record.Registered):
+                    expected = {"owner_unit": owner, "source_path": str(source), "source_commit": base}
+                    if any(record.fields.get(key) != value for key, value in expected.items()):
+                        raise CopyError(f"{tree}: workspace belongs to another request")
+                elif legacy:
+                    if not isinstance(record, copy_record.NotRegistered):
+                        raise CopyError(f"{tree}: unreadable legacy workspace")
+                    origin = git(tree, "remote", "get-url", "origin").decode().strip()
+                    upstream, _ = source_origin(source)
+                    resolved_origin = resolved_remote_url(tree, origin)
+                    if resolved_origin not in (resolved_remote_url(source, upstream), str(source)):
+                        raise CopyError(f"{tree}: legacy workspace source differs")
+                    _ = git(tree, "merge-base", "--is-ancestor", base, "HEAD")
+                    if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
+                        raise CopyError(f"{tree}: workspace branch changed")
+                    if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
+                        raise CopyError(f"{tree}: workspace must own its Git directory")
+                    register(commit_at(tree, "HEAD"))
+                    record = scratch.task_of(tree)
+                else:
+                    raise CopyError(f"{tree}: use worktrees.py make <repo> <unit> <short-name>")
+                assert isinstance(record, copy_record.Registered)
+                if record.fields.get("copy_commit"):
+                    if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
+                        raise CopyError(f"{tree}: workspace must own its Git directory")
+                    if git(tree, "symbolic-ref", "HEAD").decode().strip() != f"refs/heads/{branch}":
+                        raise CopyError(f"{tree}: workspace branch changed")
+                    if record.task != task or manifest_path != linked_run:
+                        register(str(record.fields["copy_commit"]))
+                    else:
+                        scratch.renew(tree)
+                    refresh_remotes(tree, source)
+                else:
+                    initialize_git(tree, source)
+                    _ = git(tree, "checkout", "-q", "-B", branch, base)
+                    source_settings = read_git_settings(source)
+                    for key in ("user.name", "user.email"):
+                        values = source_settings.get(key)
+                        value = values[-1] if values else os.fsdecode(git(source, "config", key))
+                        _ = git(tree, "config", key, value.strip())
+                    register(base)
+                try:
+                    yield tree
+                finally:
+                    caller_error = sys.exception()
+                    try:
+                        refresh_remotes(tree, source)
+                        mark_target(tree)
+                        register(commit_at(tree, "HEAD"))
+                    except (OSError, scratch.ScratchError, CopyError) as error:
+                        raise PostUseError(f"{tree}: workspace refresh failed: {error}",
+                                           caller_error=caller_error) from error
+            except (OSError, scratch.ScratchError) as error:
+                raise CopyError(str(error)) from error
+            finally:
+                COMMAND_LOCKS.reset(token)
+
+
+@dataclass(frozen=True)
+class HeldCrateRunLock:
+    """The caller holds this run lock through workspace removal."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class AcquireCrateRunLock:
+    """The removal guard must acquire the linked run lock."""
+
+
+CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
+ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+NO_CREATED_WORKSPACES: Mapping[Path, os.stat_result] = MappingProxyType({})
+
+
+def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
+    """Retain an editable copy's rescue in its source before deletion."""
+    saved = git_rescue.rescue(tree, f"workspace-{time.time_ns()}",
+                             generated=[tree / name for name in ("target", copy_record.RECORD, scratch.BUSY)],
+                             retain_local_refs=True)
+    if not isinstance(saved, git_rescue.Saved):
+        return
+    original = Path(str(record.fields["source_path"]))
+    if original.exists():
+        destination = slot_source(original)
+    else:
+        origin = origin_url(tree)
+        local = (Path(unquote(urlsplit(origin).path)) if origin is not None and origin.startswith("file://")
+                 else Path(resolved_remote_url(tree, origin)) if origin is not None else original)
+        if local.is_absolute() and local.exists():
+            destination = local
+        else:
+            root = copy_record.copies_root()
+            destination = root.with_name(root.name + "-rescues.git")
+            destination.mkdir(parents=True, exist_ok=True)
+            _ = git(destination, "init", "--bare", "-q")
+    _ = git(destination, "fetch", "-q", "--", str(tree), f"{saved.ref}:{saved.ref}")
+    if commit_at(destination, saved.ref) != saved.commit:
+        raise CopyError(f"{tree}: workspace rescue verification failed")
+
+
+def end_workspaces(task: str, paths: list[Path], *,
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK,
+                   created: Mapping[Path, os.stat_result] = NO_CREATED_WORKSPACES) -> None:
+    """End workspace records and remove terminal folders made by this run."""
+    moment = time.time()
+    selected = {str(path.resolve()) for path in paths}
+    with scratch.locked_holds() as holds:
+        changed = False
+        for path, hold in holds.items():
+            if path in selected and hold["task"] == task and not hold["ended"]:
+                hold["ended"] = moment
+                changed = True
+        if changed:
+            scratch.write_holds(holds)
+
+    for tree in dict.fromkeys(paths):
+        if not os.path.lexists(tree):
+            continue
+        record = scratch.task_of(tree)
+        if isinstance(record, copy_record.NotRegistered):
+            scratch.report_retained_task_folder(tree, "the workspace has no task record")
+            continue
+        if not isinstance(record, copy_record.Registered) or record.task != task:
+            raise CopyError(f"{tree}: workspace task differs")
+        removed = False
+        with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
+              scratch.removal_lock(tree) as idle,
+              scratch.copy_record_lock(tree)):
+            if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(record, copy_record.Registered) or record.task != task:
-                    raise CopyError(f"{tree}: workspace task differs")
-                return {**record.fields, "ended": time.time(), "ended_task": task}
-            _ = scratch.update_record(tree, ended)
+            validate()
+            if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
+                scratch.record_task_end(tree, task, moment)
+            if ("crate_run" in record.fields and tree in created
+                    and os.path.samestat(tree.lstat(), created[tree])):
+                scratch.remove_marked(tree, source_deletion=scratch.SourceDeletion.CRATE_WORKSPACE_ONLY)
+                removed = True
+        if removed:
+            _ = scratch.release(tree)
+        else:
+            scratch.report_retained_task_folder(tree, f"task {task} ended")
+
+
+def slot_source(source: Path) -> Path:
+    """Follow registered source copies to the repository that retains slot objects."""
+    seen: set[Path] = set()
+    while source not in seen:
+        seen.add(source)
+        if str(source) == os.environ.get("COPIES_STEP_SOURCE"):
+            return Path(os.environ["COPIES_STEP_POOL"])
+        for copy in reversed(ADMISSION_SOURCE_COPIES.get()):
+            if copy.tree == source:
+                return copy.source
+        for active in ACTIVE_GATES.get():
+            if active.tree == source:
+                return active.source
+        record = scratch.task_of(source)
+        if not isinstance(record, copy_record.Registered):
+            origin = origin_url(source)
+            if origin is not None:
+                local = Path(resolved_remote_url(source, origin))
+                if (local / ".git").exists():
+                    source = local.resolve()
+                    continue
+            return main_checkout(source)
+        original = record.fields.get("source_path")
+        if not isinstance(original, str) or not Path(original).exists():
+            return main_checkout(source)
+        source = Path(original).resolve()
+    raise CopyError(f"{source}: local origins form a cycle")
 
 
 @contextmanager
-def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: str | Path | None = None,
-             merge: str | None = None) -> Generator[Path]:
-    """Hold a warm gate checkout through preparation and the caller's entire use."""
-    owner = checked_owner(owner)
+def _slot_preparation() -> Generator[None]:
+    """Report preparation failures through the copies API."""
     try:
-        source = Path(repo).expanduser().resolve()
-        name = repository_name(source)
-        base = commit_at(source, commit)
-    except OSError as error:
+        yield
+    except subprocess.CalledProcessError as error:
+        detail = str(error)
+        stderr = cast(object, error.stderr)
+        if isinstance(stderr, bytes):
+            detail += ": " + stderr.decode(errors="replace").strip()
+        elif isinstance(stderr, str):
+            detail += ": " + stderr.strip()
+        raise CopyError(detail) from error
+    except (OSError, subprocess.SubprocessError, SlotGitFailure, git_rescue.RescueError) as error:
         raise CopyError(str(error)) from error
-    if (source in ACTIVE_GATES.get() and read_record(source).owner == owner
-            and commit_at(source, "HEAD") == base and apply_uncommitted is None and merge is None):
-        yield source
-        return
-    with available_tree(owner, name, load_config()) as lease:
-        tree = lease.tree
-        token = COMMAND_LOCKS.set(lease.descriptors)
-        active = ACTIVE_GATES.set((*ACTIVE_GATES.get(), tree))
+
+
+@contextmanager
+def worktree_objects(tree: Path, worktree: Path) -> Generator[None]:
+    """Write working file objects into the copy while it borrows the source objects."""
+    objects = tree / ".git/objects"
+    source_objects = git(worktree, "rev-parse", "--path-format=absolute", "--git-path", "objects").decode().strip()
+    alternates = objects / "info/alternates"
+    with alternates.open("a") as output:
+        _ = output.write(source_objects + "\n")
+    previous = os.environ.get("GIT_OBJECT_DIRECTORY")
+    os.environ["GIT_OBJECT_DIRECTORY"] = str(objects)
+    try:
+        yield
+    finally:
+        if previous is None:
+            _ = os.environ.pop("GIT_OBJECT_DIRECTORY", None)
+        else:
+            os.environ["GIT_OBJECT_DIRECTORY"] = previous
+
+
+@dataclass(frozen=True)
+class SnapshotOrigin:
+    """Keep the snapshot base and the source of its envrc approval."""
+
+    base: CloneSourceCommit
+    envrc: EnvrcReference | MergedEnvrcReference
+
+
+def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, merge: MergePolicy) -> SnapshotOrigin:
+    """Check out the requested files without changing the source refs."""
+    initialize_git(tree, source)
+    origin = origin_url(source)
+    if origin is None:
+        _ = git(tree, "remote", "remove", "origin")
+    else:
+        _ = git(tree, "remote", "set-url", "origin", resolved_remote_url(source, origin))
+    base = source_commit(source, policy)
+    _ = git(tree, "fetch", "-q", "--", str(source), base)
+    _ = git(tree, "checkout", "--quiet", "--detach", base)
+    committed_base = commit_at(tree, f"{base}^") if isinstance(policy, StagedSource) else base
+    envrc: EnvrcReference | MergedEnvrcReference = EnvrcReference.CALLER_ANCHOR
+    if isinstance(policy, WorktreeSource):
+        worktree = Path(policy.worktree).expanduser().resolve()
+        with worktree_objects(tree, worktree):
+            envrc = apply_changes(tree, worktree, base)
+    if isinstance(merge, MergeRevision):
+        if envrc is EnvrcReference.CALLER_ANCHOR:
+            envrc = merge_changes(tree, source, merge.revision, committed_base=committed_base)
+        else:
+            _ = merge_changes(tree, source, merge.revision)
+    return SnapshotOrigin(CloneSourceCommit(str(source.resolve()), committed_base), envrc)
+
+
+def write_snapshot_origin(tree: Path, origin: SnapshotOrigin, policy: SourcePolicy) -> None:
+    """Bind a private checkout to the repository and commit that supplied it."""
+    source = Path(origin.base.repository)
+    if isinstance(policy, WorktreeSource):
+        worktree = Path(policy.worktree).expanduser().resolve()
+        if worktree != source and main_checkout(worktree) != main_checkout(source):
+            return
+    envrc = origin.envrc
+    snapshot_commit = commit_at(tree, "HEAD")
+    write_text_atomic(tree.parent / copy_record.SNAPSHOT_ORIGIN, json.dumps({
+        "repository": origin.base.repository, "source_commit": origin.base.commit,
+        "checkout": str(tree.resolve()), "snapshot_commit": snapshot_commit,
+        "envrc_reference": envrc.value if isinstance(envrc, EnvrcReference) else "merge",
+        "merged_input": envrc.merged_input if isinstance(envrc, MergedEnvrcReference) else "",
+        "envrc_commit": envrc.committed_merge if isinstance(envrc, MergedEnvrcReference) else "",
+    }))
+
+
+def read_snapshot_origin(tree: Path, caller: Path) -> SnapshotOrigin | CloneSource:
+    """Check the binding before using the caller's repository for trust.
+
+    Processes with the same user identity are outside the threat model.
+    The binding in our 0700 tool folder is trusted metadata.
+    """
+    try:
+        repository = str(caller.resolve())
+        raw = cast(object, json.loads((tree.parent / copy_record.SNAPSHOT_ORIGIN).read_text()))
+        if not isinstance(raw, dict):
+            return CloneSource.UNAPPROVED
+        binding = cast(dict[str, object], raw)
+        commit = binding.get("source_commit")
+        head = binding.get("snapshot_commit")
+        if (binding.get("repository") != repository or binding.get("checkout") != str(tree.resolve())
+                or not isinstance(head, str) or not isinstance(commit, str)):
+            return CloneSource.UNAPPROVED
+        revisions = ["HEAD"]
+        expected = [head]
+        reference = binding.get("envrc_reference")
+        if reference == "merge":
+            merged_input = binding.get("merged_input")
+            merged_commit = binding.get("envrc_commit")
+            if not isinstance(merged_input, str) or not isinstance(merged_commit, str):
+                return CloneSource.UNAPPROVED
+            revisions.extend((merged_input, merged_commit))
+            expected.extend((merged_input, merged_commit))
+            envrc = MergedEnvrcReference(merged_input, merged_commit)
+        else:
+            envrc = EnvrcReference(reference)
+        observed = git(tree, "rev-parse", "--revs-only", "--end-of-options",
+                       *(f"{revision}^{{commit}}" for revision in revisions)).decode().splitlines()
+        if observed != expected or commit_at(caller, commit) != commit:
+            return CloneSource.UNAPPROVED
+        return SnapshotOrigin(CloneSourceCommit(repository, commit), envrc)
+    except (OSError, CopyError, ValueError):
+        pass
+    return CloneSource.UNAPPROVED
+
+
+@contextmanager
+def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy) -> Generator[Path]:
+    """Freeze the requested files for admission without taking a build slot."""
+    with build_folders.tool_folder("copies-source") as folder:
+        tree = folder / "source"
+        tree.mkdir()
+        origin = prepare_requested_source(tree, source, policy, merge)
+        write_snapshot_origin(tree, origin, policy)
+        token = ADMISSION_SOURCE_COPIES.set((*ADMISSION_SOURCE_COPIES.get(),
+            AdmissionSourceCopy(tree, slot_source(source))))
         try:
-            prepare(tree, source, owner, name, base, apply_uncommitted, merge)
+            yield tree
+        finally:
+            ADMISSION_SOURCE_COPIES.reset(token)
+
+
+@dataclass(frozen=True)
+class SshSourceTrust:
+    """Provide the checks for an SSH copy's source."""
+
+    trusted_caller: Callable[[Path], bool]
+    trusted_root: Callable[[Path], bool]
+    registered_worktree: Callable[[Path], bool]
+
+
+def ssh_trust_anchor(caller: Path, commit: str, trust: SshSourceTrust) -> CloneSourceCommit | CloneSource:
+    """Find the approved repository and commit for an SSH copy."""
+    if not trust.trusted_caller(caller):
+        return CloneSource.UNAPPROVED
+    try:
+        if trust.trusted_root(caller):
+            anchor = CloneSourceCommit(str(caller), commit)
+        elif trust.registered_worktree(caller):
+            anchor = CloneSourceCommit(str(main_checkout(caller)), commit)
+        else:
+            path = copy_record.record_path(caller)
+            if path is None:
+                return CloneSource.UNAPPROVED
+            record = copy_record.read_record(path)
+            if not isinstance(record, copy_record.Registered):
+                return CloneSource.UNAPPROVED
+            source = record.fields.get("source_path")
+            pinned = record.fields.get("source_commit")
+            if not isinstance(source, str) or not source or not isinstance(pinned, str) or not pinned:
+                return CloneSource.UNAPPROVED
+            anchor = CloneSourceCommit(source, pinned)
+        repository = Path(anchor.repository)
+        if trust.trusted_root(repository) and commit_at(repository, anchor.commit) == anchor.commit:
+            return anchor
+    except (OSError, CopyError, SlotGitFailure, ValueError):
+        pass
+    return CloneSource.UNAPPROVED
+
+
+def envrc_blob(repository: Path, revision: str) -> bytes:
+    """Read the committed file identity, including its mode."""
+    return git(repository, "ls-tree", revision, "--", ".envrc")
+
+
+def dispatched_envrc_matches(checkout: Path, expected: bytes) -> bool:
+    """Compare the dispatched regular file with the committed envrc."""
+    envrc = checkout / ".envrc"
+    try:
+        mode = envrc.lstat().st_mode
+    except FileNotFoundError:
+        return not expected
+    if not stat.S_ISREG(mode) or not expected.startswith((b"100644 blob ", b"100755 blob ")):
+        return False
+    actual = git(checkout, "hash-object", "--no-filters", "--", str(envrc)).strip()
+    return actual == expected.split(b"\t", 1)[0].rsplit(b" ", 1)[-1]
+
+
+def ssh_envrc_anchor(snapshot: Path, checkout: Path, origin: SnapshotOrigin,
+                     anchor: CloneSourceCommit) -> CloneSourceCommit | CloneSource:
+    """Register a commit only when it matches the dispatched envrc bytes."""
+    reference = origin.envrc
+    if reference in (EnvrcReference.WORKTREE_EDIT, EnvrcReference.NO_COMMITTED_MERGE):
+        return CloneSource.UNAPPROVED
+    repository = Path(anchor.repository)
+    if not isinstance(reference, MergedEnvrcReference):
+        expected = envrc_blob(Path(origin.base.repository), origin.base.commit)
+        if not dispatched_envrc_matches(checkout, expected):
+            return CloneSource.UNAPPROVED
+        if origin.base == anchor or dispatched_envrc_matches(checkout, envrc_blob(repository, anchor.commit)):
+            return anchor
+        return CloneSource.UNAPPROVED
+    commit = reference.committed_merge
+    if not dispatched_envrc_matches(checkout, envrc_blob(snapshot, commit)):
+        return CloneSource.UNAPPROVED
+    if dispatched_envrc_matches(checkout, envrc_blob(repository, anchor.commit)):
+        return anchor
+    _ = git(repository, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=",
+            "--no-recurse-submodules", "--no-auto-maintenance", "--", str(snapshot), commit)
+    if commit_at(repository, commit) != commit:
+        raise CopyError(f"{repository}: the committed merge is missing after fetch")
+    return CloneSourceCommit(anchor.repository, commit)
+
+
+@contextmanager
+def remote_step_source(source: Path, tree_id: str, caller: Path, trust: SshSourceTrust) -> Generator[Path]:
+    """Keep a registered copy of the admitted tree while the SSH runner uses it."""
+    with build_folders.tool_folder("copies-ssh-source", copy_record.root()) as checkout:
+        _ = prepare_requested_source(checkout, source, StagedSource(tree_id), NO_MERGE)
+        if os.path.lexists(checkout / copy_record.RECORD):
+            raise CopyError(f"{checkout}: the admitted tree contains {copy_record.RECORD}")
+        scratch.exclude_copy_metadata(checkout)
+        now = time.time()
+        scratch.write_record(checkout, scratch.task_or_default("", now), now, throwaway=True)
+        origin = read_snapshot_origin(source, caller)
+        anchor: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED
+        envrc: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED
+        if isinstance(origin, SnapshotOrigin):
+            base = origin.base
+            anchor = ssh_trust_anchor(Path(base.repository), base.commit, trust)
+            if isinstance(anchor, CloneSourceCommit):
+                envrc = ssh_envrc_anchor(source, checkout, origin, anchor)
+        register_scratch_clone(checkout, envrc, generated_from=anchor)
+        yield checkout
+
+
+@contextmanager
+def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
+             merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = ()) -> Generator[Path]:
+    """Hold a numbered copy through preparation and use."""
+    del command
+    from scripts.production import staff
+
+    owner = checked_owner(owner)
+    source = Path(repo).expanduser().resolve()
+    base = source_commit(source, policy)
+    for active in reversed(ACTIVE_GATES.get()):
+        if (source == active.tree and active.owner == owner and commit_at(source, "HEAD") == base
+                and isinstance(policy, CommittedSource) and isinstance(merge, NoMerge)):
+            yield source
+            return
+    with _slot_preparation():
+        canonical = slot_source(source)
+        if source != canonical and main_checkout(source) != canonical:
+            _ = git(canonical, "fetch", "-q", "--", str(source), base)
+    work = step or "build"
+    purpose = read_step_names().shown(work)
+    unit = owner
+    caller = copy_owner(owner)
+    showrunner = owner
+    if isinstance(caller, StaffOwner):
+        try:
+            rows = staff.local_snapshot()
+            member = rows.owner_of(caller.row_id)
+            if member is not None:
+                unit = member.name
+                parent = rows.parent_of(member)
+                showrunner = parent.name if parent is not None else member.name
+        except staff.StaffUnreadable:
+            pass
+    with ExitStack() as held_slot:
+        with _slot_preparation():
+            copy = held_slot.enter_context(build_slots.take_copy(canonical, base, showrunner=showrunner,
+                unit=unit, work=work, purpose=purpose))
+        tree = copy.path
+        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *copy.pass_fds))
+        defaults = copy.env
+        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner)))
+        previous = {key: os.environ.get(key) for key in defaults}
+        os.environ.update(defaults)
+        try:
+            with _slot_preparation():
+                mark_target(tree)
+                if isinstance(policy, WorktreeSource):
+                    _ = apply_changes(tree, Path(policy.worktree).expanduser().resolve(), base)
+                if isinstance(merge, MergeRevision):
+                    _ = merge_changes(tree, source, merge.revision)
             try:
                 yield tree
             finally:
                 caller_error = sys.exception()
                 try:
-                    refresh_remotes(tree, source)
-                    mark_target(tree)
-                    write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
+                    held_slot.close()
                 except (OSError, scratch.ScratchError, CopyError) as error:
-                    raise PostUseError(f"{tree}: post-use refresh failed: {error}",
+                    raise PostUseError(f"{tree}: slot lease release failed: {error}",
                                        caller_error=caller_error) from error
         finally:
-            ACTIVE_GATES.reset(active)
+            for key, value in previous.items():
+                if value is None:
+                    _ = os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            ACTIVE_GATES.reset(active_token)
             COMMAND_LOCKS.reset(token)
 
 
+
+@contextmanager
+def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
+    """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
+    job = command_job(command)
+    label = step or (job.step if isinstance(job, StepJob) else "")
+    try:
+        with ExitStack() as scope:
+            if isinstance(job, StepJob):
+                source = Path(repo).expanduser().resolve()
+                if gate_targets or isinstance(verify_command(command), VerifyCommand):
+                    source = scope.enter_context(requested_source(source, policy, merge))
+                    policy = CommittedSource(commit_at(source, "HEAD"))
+                    merge = NO_MERGE
+                admission = (first_step.admitted_run(command, source, targets=gate_targets) if gate_targets
+                             else first_step.admitted_run(command, source))
+                admitted = scope.enter_context(admission)
+                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
+                admitted.handoff(tree)
+            else:
+                # OtherCommand has no first queue step to admit.
+                tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
+            yield tree
+    except first_step.FirstStepRefused as error:
+        failure = CopyError(str(error))
+        failure.exit_code = error.exit_code
+        raise failure from error
+
+
 def list_trees() -> None:
-    root = gates_root()
-    if not root.exists():
-        return
-    for directory in sorted(root.iterdir()):
-        if directory.is_symlink() or not directory.is_dir():
+    staff_names = ListStaffNames()
+    print("number\towner\trepository\thost\tpath\tsession\tcommit\tstate\tholder_pid\ttarget")
+    number = 0
+    host = host_name()
+    held = {row.path: row for row in build_folders.held_folder_leases()}
+    for path, form in sorted(build_folders.copy_folders(gates_root()), key=lambda entry: entry[0]):
+        number += 1
+        owner = held.pop(path, None)
+        state = "busy" if isinstance(owner, build_folders.KnownFolderLease) else "unknown" if owner else "idle"
+        try:
+            fields = build_folders.folder_lease_fields(path)
+        except (OSError, ValueError):
+            fields = {}
+        target = path / "target"
+        size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True) if target.exists() else None
+        disk = size.stdout.split()[0] if size is not None and size.returncode == 0 else "0"
+        pid = owner.pid if isinstance(owner, build_folders.KnownFolderLease) else "-"
+        print(f"{number}\t{form.unit}\t{form.repo}\t{host}\t{path}\t-\t{fields.get('commit', '')}\t{state}\t{pid}\t{disk}")
+    for path in held:
+        number += 1
+        print(f"{number}\t-\t-\t{host}\t{path}\t-\t-\tunknown\t-\t-")
+    mirrors = sorted(remote_mirrors(), key=lambda mirror: (mirror.host, mirror.path))
+    for mirror, lease in list_remote_leases(mirrors, staff_names):
+        if mirror.host == "localhost" and not floor_claims.mirror_local_path(mirror.path).exists():
+            unregister_remote(mirror.host, mirror.path)
             continue
-        for tree in sorted(directory.iterdir()):
-            if tree.is_symlink() or not tree.is_dir():
-                continue
-            try:
-                record = read_record(tree)
-            except CopyError as error:
-                print(f"{tree}\t{error}")
-                continue
-            with scratch.busy_locks(tree, create=False) as idle:
-                state = "idle" if idle else "busy"
-            target = tree / "target"
-            disk = "0"
-            if target.exists():
-                size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True)
-                words = size.stdout.split()
-                disk = words[0] if size.returncode == 0 and words else "unreadable"
-            print(f"{tree}\t{record.owner}\t{record.repo}\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
-
-
-def removing_path(tree: Path) -> Path:
-    return tree.with_name(tree.name + ".removing")
+        number += 1
+        owner = _owner_display_text(list_owner_name(copy_owner(mirror.owner), staff_names))
+        if isinstance(lease, HeldMirrorLease):
+            state = "held"
+            pid = str(lease.pid)
+            if isinstance(lease.holder, CurrentHolderName):
+                session = lease.holder.name
+            else:
+                session = "not recorded" if isinstance(lease.holder, HolderNotRecorded) else "unavailable"
+        else:
+            state = "idle" if isinstance(lease, IdleMirrorLease) else "unavailable"
+            pid = "-"
+            session = "-"
+        local_host = host if mirror.host == "localhost" else mirror.host
+        print(f"{number}\t{owner}\t{mirror.repository.name}\t{local_host}\t{mirror.path}\t{session}\t-\t{state}\t{pid}\t-")
 
 
 def workspace_repository(record: copy_record.Registered) -> str:
-    """Read repository provenance without requiring the source checkout to exist."""
-    seen: set[str] = set()
-    while True:
-        common = record.fields.get("borrows_from")
-        if not isinstance(common, str) or common in seen:
-            source = record.fields.get("source_path")
-            return Path(source).name if isinstance(source, str) else ""
-        seen.add(common)
-        git_dir = Path(common)
-        if git_dir.name != ".git":
-            source = record.fields.get("source_path")
-            return Path(source).name if isinstance(source, str) else ""
-        parent = scratch.task_of(git_dir.parent)
-        if not isinstance(parent, copy_record.Registered):
-            return git_dir.parent.name
-        record = parent
+    """Read the repository identity saved when the workspace was registered."""
+    identity = record.fields["repository_identity"]
+    if not isinstance(identity, str):
+        raise CopyError("workspace repository_identity must be a string")
+    return identity
 
 
-def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[tuple[Path, copy_record.Registered]]:
-    """Select registered copies and adopted copies without depending on a live source."""
+class WorkspaceScanPurpose(Enum):
+    """Choose the checks for removal or session reporting."""
+
+    REMOVE = auto()
+    REPORT = auto()
+
+
+def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
+                     purpose: WorkspaceScanPurpose = WorkspaceScanPurpose.REMOVE) -> list[tuple[Path, copy_record.Registered]]:
+    """Select registered workspaces for the owner."""
     root = copy_record.copies_root()
     paths = set(scratch.registered_copy_paths())
     paths.update(scratch.pending_copy_paths(root))
@@ -767,19 +1545,24 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
     found: list[tuple[Path, copy_record.Registered]] = []
     for tree in sorted(paths):
         record = scratch.task_of(tree)
-        if isinstance(record, copy_record.UnreadableRecord):
-            raise CopyError(record.reason)
         if isinstance(record, copy_record.NotRegistered):
             hold = held.get(str(tree))
             if (copy_record.copy_folder(tree) != tree.resolve()
                     and (hold is None or hold["reason"] != LEGACY_WORKER_HOLD_REASON)):
                 continue
-            raise CopyError(f"repair record {tree / copy_record.RECORD}: copy is not registered")
-        if record.fields.get("owner_unit") != owner:
+            record = copy_record.UnreadableRecord(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+        if isinstance(record, copy_record.UnreadableRecord):
+            if purpose is WorkspaceScanPurpose.REMOVE:
+                raise CopyError(record.reason)
+            print(f"copies: {' '.join(record.reason.splitlines())}", file=sys.stderr)
+            continue
+        if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
         found.append((tree, record))
+    if purpose is WorkspaceScanPurpose.REPORT:
+        return found
     selected = dict(found)
     ordered: list[tuple[Path, copy_record.Registered]] = []
     visited: set[Path] = set()
@@ -805,8 +1588,9 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
 
 
 @contextmanager
-def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Generator[Callable[[], None]]:
-    """Lock the linked run before the copy, then read its state under both locks."""
+def workspace_removal_guard(tree: Path, record: copy_record.Registered, *,
+                            run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> Generator[Callable[[], None]]:
+    """Use the caller's run lock or acquire it before the copy lock."""
     if "crate_run" not in record.fields:
         yield lambda: None
         return
@@ -830,7 +1614,7 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 raise ValueError("manifest authority differs or crate records are missing")
             stages: list[str] = []
             matched = False
-            terminal = True
+            terminal = False
             for package, item in cast(dict[str, object], crates).items():
                 if not isinstance(item, dict):
                     raise ValueError("invalid crate record")
@@ -838,19 +1622,24 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 checkout, stage = fields.get("checkout"), fields.get("stage")
                 if not isinstance(checkout, str) or not isinstance(stage, str):
                     raise ValueError("crate checkout or stage is missing")
-                matched |= Path(checkout).resolve() == tree.resolve()
+                if Path(checkout).resolve() == tree.resolve():
+                    matched = True
+                    terminal = stage in ("integrated", "abandoned")
                 stages.append(f"{package}={stage}")
-                terminal &= stage in ("integrated", "abandoned")
             if not matched:
                 raise ValueError("manifest does not own this copy")
             stage_summary = ", ".join(stages)
             if not terminal:
-                raise CopyError(f"{tree}: crate run {path} is not terminal; stages: {stage_summary}")
+                raise CopyError(f"{tree}: crate run {path}: owning crate is not terminal; stages: {stage_summary}")
         except (OSError, UnicodeError, ValueError) as error:
             raise CopyError(f"{tree}: repair crate run {path}: {error}") from error
 
+    lock_path = path.parent / "run.lock"
+    if isinstance(run_lock, HeldCrateRunLock) and run_lock.path == lock_path:
+        yield validate
+        return
     try:
-        with file_lock.exclusive(path.parent / "run.lock", wait=False) as state:
+        with file_lock.exclusive(lock_path, wait=False) as state:
             if state is file_lock.LockResult.BUSY:
                 pid = file_lock.lock_holder(str(path.parent / "run.lock"))
                 busy = BusyCopy(tree, KnownHolder(pid) if pid is not None else None)
@@ -864,52 +1653,1241 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
         raise CopyError(f"{tree}: repair crate run {path}: {error}") from error
 
 
+class RemoteMirrorKept(CopyError):
+    """A remote mirror needs another cleanup attempt before retirement."""
+
+
 def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
     """Remove an owner's idle trees within the selected repository scope."""
-    pool = load_config()
     scope = repository_scope(repo)
-    directories = ([pool.root / scope.name] if isinstance(scope, SelectedRepository) else
-                   sorted(path for path in pool.root.iterdir() if path.is_dir() and not path.is_symlink())
-                   if pool.root.exists() else [])
-    if not OWNER.fullmatch(owner):
-        directories = []
     workspaces = owned_workspaces(owner, scope)
+    failures: list[str] = []
+    failure_type: type[CopyError] = CopyError
+    try:
+        owned_mirrors = owned_remote_mirrors(owner, scope)
+    except CopyError as error:
+        failures.append(str(error))
+        failure_type = RemoteMirrorKept
+        owned_mirrors = []
     with ExitStack() as locks:
-        present: list[Path] = []
-        for directory in directories:
-            for candidate in tree_paths(owner, directory.name, pool):
-                for tree in (removing_path(candidate), candidate):
-                    if not tree.exists():
+        mirrors: list[RemoteMirror] = []
+        for mirror in owned_mirrors:
+            try:
+                locks.enter_context(remote_lease(mirror))
+                mirrors.append(mirror)
+            except (CopyError, OSError) as error:
+                failures.append(str(error))
+                failure_type = RemoteMirrorKept
+        unreachable_hosts: set[str] = set()
+        for mirror in mirrors:
+            try:
+                if mirror.host not in unreachable_hosts:
+                    try:
+                        remove_remote_mirror(mirror)
                         continue
-                    state = locks.enter_context(claim_tree(tree, create=False))
-                    if state is ClaimState.REPLACED:
-                        continue
-                    if state is not ClaimState.ACQUIRED:
-                        raise BusyCopy(tree)
-                    if (tree / GATE_RECORD).exists():
-                        record = read_record(tree)
-                        if record.owner != owner or record.repo != directory.name:
-                            raise CopyError(f"{tree}: gate record belongs to another owner or repository")
-                    present.append(tree)
+                    except RemoteHostUnreachable:
+                        unreachable_hosts.add(mirror.host)
+                defer_remote_removal(mirror)
+            except (CopyError, OSError, subprocess.SubprocessError) as error:
+                failures.append(str(error))
+                failure_type = RemoteMirrorKept
         for tree, record in workspaces:
             try:
                 with workspace_removal_guard(tree, record) as validate:
-                    if not scratch.end_selected_copy(tree, record, time.time(), validate=validate):
+                    def rescue_selected() -> None:
+                        validate()
+                    if not scratch.end_selected_copy(tree, record, time.time(), validate=rescue_selected):
                         with scratch.judgment_lock(tree) as idle:
                             if not idle:
                                 raise BusyCopy(tree)
                         reason = scratch.unsaved_work(tree) or str(scratch.lifetime(tree))
                         raise CopyError(f"{tree}: kept: {reason}")
-            except scratch.ScratchError as error:
-                raise CopyError(str(error)) from error
-            _ = scratch.release(tree)
-            print(f"removed {tree}")
-        for tree in present:
-            tombstone = tree if tree.name.endswith(".removing") else removing_path(tree)
-            if tombstone != tree:
-                _ = tree.rename(tombstone)
-            shutil.rmtree(tombstone)
-            print(f"removed {tree}")
+                _ = scratch.release(tree)
+                print(f"removed {tree}")
+            except (CopyError, OSError, scratch.ScratchError, git_rescue.RescueError) as error:
+                failures.append(str(error))
+    if failures:
+        raise failure_type("\n".join(failures))
+
+
+REMOTE_MIRROR_PROBE_TIMEOUT_S = 5
+
+
+class RemoteRemoval(Enum):
+    KEEP = "keep"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True)
+class RemoteMirror:
+    """An owner's registered repository copy on a remote host."""
+
+    owner: str
+    repository: SelectedRepository
+    host: str
+    path: str
+    session: str
+    removal: RemoteRemoval = RemoteRemoval.KEEP
+    task: str = ""
+
+
+@dataclass(frozen=True)
+class CurrentHolderName:
+    name: str
+
+
+@dataclass(frozen=True)
+class HolderNameUnavailable:
+    """The recorded live holder has no available current staff name."""
+
+
+@dataclass(frozen=True)
+class HolderNotRecorded:
+    """The record does not identify the process that holds the current lease."""
+
+
+MirrorHolderName = CurrentHolderName | HolderNameUnavailable | HolderNotRecorded
+
+
+@dataclass(frozen=True)
+class HeldMirrorLease:
+    pid: int
+    holder: MirrorHolderName
+
+
+@dataclass(frozen=True)
+class IdleMirrorLease:
+    """The readable lock table has no lease for this mirror."""
+
+
+@dataclass(frozen=True)
+class UnavailableMirrorLease:
+    """The list cannot read the mirror's lease evidence."""
+
+
+MirrorLeaseState = HeldMirrorLease | IdleMirrorLease | UnavailableMirrorLease
+
+
+def remote_registry() -> Path:
+    return load_config().remote_registry
+
+
+def remote_key(host: str, path: str) -> str:
+    return hashlib.sha256(f"{host}\0{path}".encode()).hexdigest()
+
+
+def remote_record_path(mirror: RemoteMirror) -> Path:
+    return remote_registry() / (remote_key(mirror.host, mirror.path) + ".json")
+
+
+def remote_lease_path(mirror: RemoteMirror) -> Path:
+    return remote_registry() / (remote_key(mirror.host, mirror.path) + ".lease")
+
+
+def _list_holder_name(mirror: RemoteMirror, pid: int, staff_names: ListStaffNames) -> MirrorHolderName:
+    """Read the recorded pid and session together before resolving the live holder's name."""
+    try:
+        raw = cast(object, json.loads(remote_record_path(mirror).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return HolderNotRecorded()
+    if not isinstance(raw, dict):
+        return HolderNotRecorded()
+    fields = cast(dict[str, object], raw)
+    session = fields.get("session")
+    if fields.get("holder_pid") != pid or not isinstance(session, str):
+        return HolderNotRecorded()
+    names = staff_names.read()
+    if isinstance(names, UnavailableStaffNames):
+        return HolderNameUnavailable()
+    row = names.snapshot.by_current_session(session)
+    return CurrentHolderName(row.name) if row is not None else HolderNameUnavailable()
+
+
+def list_remote_leases(mirrors: Sequence[RemoteMirror], staff_names: ListStaffNames) -> list[tuple[RemoteMirror, MirrorLeaseState]]:
+    """Read the lock table once and preserve each mirror's held, idle, or unavailable state."""
+    if not mirrors:
+        return []
+    try:
+        devices = file_lock.held_flock_keys()
+    except OSError:
+        return [(mirror, UnavailableMirrorLease()) for mirror in mirrors]
+    leases: list[tuple[RemoteMirror, MirrorLeaseState]] = []
+    for mirror in mirrors:
+        try:
+            device = file_lock.device_key(remote_lease_path(mirror))
+        except FileNotFoundError:
+            state: MirrorLeaseState = IdleMirrorLease()
+        except OSError:
+            state = UnavailableMirrorLease()
+        else:
+            pid = devices.get(device)
+            state = IdleMirrorLease() if pid is None else HeldMirrorLease(pid, _list_holder_name(mirror, pid, staff_names))
+        leases.append((mirror, state))
+    return leases
+
+
+def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
+    """Read the kernel lock table once for all registered mirrors."""
+    try:
+        devices = file_lock.held_flock_keys(file_lock.PROC_LOCKS)
+    except OSError:
+        return ()
+    held: list[floor_claims.HeldMirror] = []
+    for mirror in remote_mirrors():
+        try:
+            device = file_lock.device_key(remote_lease_path(mirror))
+        except OSError:
+            continue
+        if device in devices:
+            held.append(floor_claims.HeldMirror(floor_claims.MirrorIdentity(mirror.host, mirror.path), mirror.session))
+    return tuple(held)
+
+
+def register_remote(mirror: RemoteMirror) -> None:
+    """Publish ownership while the caller holds the mirror lease."""
+    _ = checked_owner(mirror.owner)
+    _ = repository_scope(mirror.repository)
+    remote_registry().mkdir(parents=True, exist_ok=True)
+    fields: dict[str, object] = {
+        "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
+        "host": mirror.host, "path": mirror.path, "session": mirror.session,
+        "holder_pid": os.getpid(), "last_use": time.time(),
+    }
+    if mirror.task:
+        fields["task"] = mirror.task
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
+    remove_deferred_mirrors(mirror.host)
+
+
+def defer_remote_removal(mirror: RemoteMirror) -> None:
+    """Keep the removal request until the next use of the host."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        path = remote_record_path(mirror)
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["removal"] = RemoteRemoval.DEFERRED.value
+        write_text_atomic(path, json.dumps(fields) + "\n")
+    print(f"{mirror.host}:{mirror.path}: removal deferred; removal runs at the next use of the host")
+
+
+def remove_deferred_mirrors(host: str) -> None:
+    """Retry local removal requests after a successful use of the host."""
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            mirror = read_remote_mirror(path)
+            if mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
+                continue
+            with remote_lease(mirror):
+                current = read_remote_mirror(path)
+                if current.removal is RemoteRemoval.DEFERRED:
+                    remove_remote_mirror(current)
+        except (CopyError, OSError, subprocess.SubprocessError) as error:
+            print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
+
+
+def unregister_remote(host: str, path: str) -> None:
+    """Remove the registry record after confirmed mirror cleanup."""
+    with file_lock.exclusive(remote_registry() / "records.lock"):
+        key = remote_key(host, path)
+        (remote_registry() / (key + ".json")).unlink(missing_ok=True)
+
+
+def decode_remote_mirror(record: str) -> RemoteMirror:
+    raw = cast(object, json.loads(record))
+    if not isinstance(raw, dict):
+        raise ValueError("expected a remote mirror record")
+    fields = cast(dict[str, object], raw)
+    values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError("invalid remote mirror record")
+    task = fields.get("task", "")
+    if not isinstance(task, str):
+        raise ValueError("invalid remote mirror task")
+    unit, repo, host, remote, session = cast(list[str], values)
+    return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
+                        RemoteRemoval(fields.get("removal", "keep")), task=task)
+
+
+def read_remote_mirror(path: Path) -> RemoteMirror:
+    """Decode one registry record without scanning other records."""
+    try:
+        return decode_remote_mirror(path.read_text())
+    except (OSError, ValueError) as error:
+        raise CopyError(f"{path}: repair remote mirror record: {error}") from error
+
+
+def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
+    found: list[RemoteMirror] = []
+    for path in sorted(remote_registry().glob("*.json")):
+        mirror = read_remote_mirror(path)
+        if isinstance(scope, AllRepositories) or scope.name == mirror.repository.name:
+            found.append(mirror)
+    return found
+
+
+def owned_remote_mirrors(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
+    return [mirror for mirror in remote_mirrors(scope) if copy_owner(mirror.owner) == copy_owner(owner)] if owner else []
+
+
+def clone_owner_prefix(owner: str) -> str:
+    """Select a caller's clone names without opening other owners' records."""
+    return f"clone-{owner}."
+
+
+def read_clone_metadata(path: Path) -> str:
+    """Read a regular file without following links or blocking on a replaced file."""
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{path}: expected a regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as stream:
+        if not os.path.samestat(before, os.fstat(stream.fileno())):
+            raise ValueError(f"{path}: file changed during the read")
+        return stream.read()
+
+
+def clone_lease_fields(checkout: Path) -> dict[str, object]:
+    root = build_folders.build_root()
+    canonical = root.resolve()
+    if checkout != canonical and checkout.is_relative_to(canonical):
+        return build_folders.folder_lease_fields(root / checkout.relative_to(canonical))
+    # The status reader only accepts paths under the build root. Task clones can use scratch.
+    raw = cast(object, json.loads(read_clone_metadata(build_folders.lease_path(checkout))))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{checkout}: invalid folder lease")
+    return cast(dict[str, object], raw)
+
+
+def record_clone_setup_lease(path: Path, *, released: bool = False) -> None:
+    """Record the maker identity until setup releases the folder lease."""
+    fields = clone_lease_fields(path.resolve())
+    if released:
+        fields["released"] = True
+    else:
+        started = process_start.process_start(os.getpid())
+        if not isinstance(started, process_start.Started):
+            return
+        fields["process_start"] = started.start
+    write_text_atomic(build_folders.lease_path(path), json.dumps(fields) + "\n")
+
+
+DARWIN_CLONE_START = re.compile(
+    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +"
+    + r"([1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9]) ([0-9]{4})")
+DARWIN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+DARWIN_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def clone_process_identity(value: str, *, linux: bool) -> str:
+    """Return a comparable process start, or reject invalid evidence."""
+    if linux and re.fullmatch(r"[0-9]+", value):
+        return value.lstrip("0") or "0"
+    if not linux and (match := DARWIN_CLONE_START.fullmatch(value)):
+        weekday, month, day, hour, minute, second, year = match.groups()
+        month_number = next(number for number, name in enumerate(DARWIN_MONTHS, 1) if name == month)
+        date = datetime(int(year), month_number, int(day), int(hour), int(minute), int(second))
+        if DARWIN_WEEKDAYS[date.weekday()] == weekday:
+            return date.isoformat()
+    raise ValueError("invalid clone holder start")
+
+
+def mac_clone_processes() -> dict[int, process_start.Started | process_start.Zombie]:
+    """Read start identities for the clone holders in one Mac process request."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,lstart=,stat="], capture_output=True, text=True,
+                                check=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S,
+                                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return {}
+    found: dict[int, process_start.Started | process_start.Zombie] = {}
+    for line in result.stdout.splitlines():
+        if (match := re.fullmatch(r"\s*([0-9]+)\s+(.+)\s+([A-Za-z][A-Za-z0-9+<>-]*)\s*", line)):
+            pid, identity, status = match.groups()
+            identity = identity.strip()
+            if DARWIN_CLONE_START.fullmatch(identity):
+                found[int(pid)] = process_start.Zombie(identity) if status.startswith("Z") else process_start.Started(identity)
+    return found
+
+
+def owner_clone_paths(owner: str) -> Iterator[Path]:
+    """List only paths with the selected owner's clone name prefix."""
+    pattern = clone_owner_prefix(checked_owner(owner)) + "*"
+    yield from copy_record.root().glob(pattern)
+    if (root := session_folder.session_root()) is not None:
+        for directory in root.iterdir():
+            if directory.is_dir() and not directory.is_symlink():
+                yield from directory.glob(pattern)
+
+
+def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
+    """Require the task record, mirror marker and any registry record to agree."""
+    checkout = path.resolve(strict=True)
+    task = copy_record.read_record(checkout / copy_record.RECORD)
+    if (not isinstance(task, copy_record.Registered) or task.fields.get("test_hana_clone") is not True
+            or task.fields.get("clone_path") != str(checkout) or task.fields.get("clone_owner") != owner):
+        raise ValueError("not a recorded clone of this owner")
+    repository, session = task.fields.get("clone_repository"), task.fields.get("clone_session")
+    if not isinstance(repository, str) or not isinstance(session, str):
+        raise ValueError("incomplete clone registration")
+    identity = RemoteMirror(owner, SelectedRepository(repository), "localhost", str(path), session)
+    _ = repository_scope(identity.repository)
+    marker = cast(object, json.loads(read_clone_metadata(checkout / floor_claims.MIRROR_RECORD)))
+    if not isinstance(marker, dict):
+        raise ValueError("invalid clone marker")
+    fields = cast(dict[str, object], marker)
+    if (fields.get("kind"), fields.get("owner"), fields.get("repo"), fields.get("session")) != (
+            "remote-mirror", owner, repository, session):
+        raise ValueError("clone marker differs from the task record")
+    try:
+        registration = decode_remote_mirror(read_clone_metadata(remote_record_path(identity)))
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        pass
+    else:
+        if (registration.owner, registration.repository, registration.host, registration.path, registration.session) != (
+                identity.owner, identity.repository, identity.host, identity.path, identity.session):
+            raise ValueError("clone registry identity changed")
+    return identity
+
+
+def refuse_dead_clones(owner: str, source: Path) -> None:
+    """Require removal only when the selected owner's folder lease proves the holder ended."""
+    try:
+        paths = list(owner_clone_paths(owner))
+        protected = (Path.home().resolve(), Path.cwd().resolve(), source.resolve())
+    except (OSError, RuntimeError, ValueError, CopyError):
+        return
+    linux = os.uname().sysname == "Linux"
+    mac_processes: dict[int, process_start.Started | process_start.Zombie] = {}
+    read_mac_processes = False
+    dead: list[RemoteMirror] = []
+    for path in sorted(paths):
+        try:
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                continue
+            checkout = path.resolve(strict=True)
+            if any(folder.is_relative_to(checkout) for folder in protected):
+                continue
+            with build_folders.folder_removal_lease(checkout, wait=False) as lease:
+                if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+                    continue
+                mirror = local_clone_registration(path, owner)
+                fields = clone_lease_fields(checkout)
+                pid, start, timestamp = fields.get("pid"), fields.get("process_start"), fields.get("start_time")
+                if (fields.get("unit") != owner or fields.get("released", False) is not False
+                        or type(pid) is not int or pid <= 0 or not isinstance(timestamp, str)
+                        or datetime.fromisoformat(timestamp).tzinfo is None):
+                    continue
+                if "process_start" in fields and not isinstance(start, str):
+                    continue
+                saved_start = clone_process_identity(start, linux=linux) if isinstance(start, str) else ""
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    dead.append(mirror)
+                    continue
+                if linux:
+                    current = process_start.proc_table_start(pid, Path("/proc"))
+                else:
+                    if not read_mac_processes:
+                        mac_processes = mac_clone_processes()
+                        read_mac_processes = True
+                    current = mac_processes.get(pid, process_start.Gone())
+                if (isinstance(current, process_start.Zombie)
+                        or isinstance(current, process_start.Started) and saved_start
+                        and clone_process_identity(current.start, linux=linux) != saved_start):
+                    dead.append(mirror)
+        except (OSError, ValueError, RuntimeError, OverflowError, CopyError):
+            continue
+    if dead:
+        commands = [remote_copies_command("mirror-remove", mirror, "--host", "localhost") for mirror in dead]
+        raise CopyError("\n".join(["The holder ended for these clones.", *(mirror.path for mirror in dead),
+                                   "Run one removal command per path.", *commands]))
+
+
+class BusyRemoteMirror(CopyError):
+    """A live run holds this remote mirror."""
+
+
+class BusyRemoteHost(BusyRemoteMirror):
+    """An operation holds the lease for the host's mirrors."""
+
+
+@contextmanager
+def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
+    """Use a shared lease for one mirror and an exclusive lease for all mirrors."""
+    registry = remote_registry()
+    registry.mkdir(parents=True, exist_ok=True)
+    lock_path = registry / (remote_key(host, "") + ".host-lease")
+    with lock_path.open("a", encoding="utf-8") as lock:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BusyRemoteHost(f"{host}: a mirror lease is busy") from error
+        yield
+
+
+@contextmanager
+def remote_lease(mirror: RemoteMirror) -> Generator[None]:
+    """Take the mirror lease before admission, claims and record locks."""
+    with _remote_mirror_lock(mirror.host, remote_lease_path(mirror)) as state:
+        if state is file_lock.LockResult.BUSY:
+            record = remote_record_path(mirror)
+            session = read_remote_mirror(record).session if record.exists() else mirror.session
+            raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
+        yield
+
+
+@contextmanager
+def remote_mirror_lease(host: str, path: Path) -> Generator[None]:
+    """Take the lease named in a shell run's sidecar."""
+    if (path.parent != remote_registry() or path.suffix != ".lease" or len(path.stem) != 64
+            or any(character not in "0123456789abcdef" for character in path.stem)):
+        raise CopyError(f"{path}: invalid remote mirror lease path")
+    with _remote_mirror_lock(host, path) as state:
+        if state is file_lock.LockResult.BUSY:
+            raise BusyRemoteMirror(f"{path}: the mirror lease is busy")
+        record = path.with_suffix(".json")
+        if record.exists():
+            mirror = read_remote_mirror(record)
+            if mirror.host != host or remote_lease_path(mirror) != path:
+                raise CopyError(f"{path}: the lease does not match the registered mirror")
+        yield
+
+
+@contextmanager
+def _remote_mirror_lock(host: str, path: Path) -> Generator[file_lock.LockResult]:
+    """Take the same host and mirror leases for shell and Python callers."""
+    with (
+        remote_host_lease(host, exclusive=False),
+        file_lock.exclusive(path, wait=False) as state,
+    ):
+        yield state
+
+
+def path_missing_command(path: str) -> str:
+    """Build a remote check that succeeds only when lstat reports a missing path."""
+    program = "\n".join((
+        "import os, sys",
+        "try:",
+        "    os.lstat(sys.argv[1])",
+        "except FileNotFoundError:",
+        "    sys.exit(0)",
+        "sys.exit(1)",
+    ))
+    return '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join([program, path])
+
+
+@dataclass(frozen=True)
+class IdleRemoteMirror:
+    """The record of a mirror that was idle before the probe."""
+
+    mirror: RemoteMirror
+    record_path: Path
+    record: str
+
+
+def idle_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> list[IdleRemoteMirror]:
+    candidates: list[IdleRemoteMirror] = []
+    for path in sorted(remote_registry().glob("*.json")):
+        try:
+            record = path.read_text()
+            mirror = decode_remote_mirror(record)
+            if (mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
+                    or path != remote_record_path(mirror) or not select(mirror)):
+                continue
+            with remote_lease(mirror):
+                if path.read_text() == record:
+                    candidates.append(IdleRemoteMirror(mirror, path, record))
+        except (CopyError, OSError, ValueError):
+            continue
+    return candidates
+
+
+def probe_remote_mirrors(host: str, candidates: Sequence[IdleRemoteMirror]) -> list[IdleRemoteMirror]:
+    """Use one remote command to check the paths on this host."""
+    program = "\n".join((
+        "import os, sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, str(Path.home() / '.claude'))",
+        "from scripts.lib import scratch",
+        "from scripts.mac_test import floor_claims",
+        "def missing(path):",
+        "    try:",
+        "        os.lstat(path)",
+        "    except FileNotFoundError:",
+        "        return True",
+        "    return False",
+        "for path in sys.argv[1:]:",
+        "    tree = floor_claims.mirror_local_path(path)",
+        "    paths = (tree, floor_claims.removal_authority_path(tree),",
+        "             scratch.removal_mark(tree), scratch.cargo_removal_mark(tree))",
+        "    print('absent' if all(missing(item) for item in paths) else 'present')",
+    ))
+    command = '"$HOME/.claude/scripts/lib/py" -c ' + shlex.join(
+        [program, *(candidate.mirror.path for candidate in candidates)])
+    answer = subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "--", host, command],
+                            capture_output=True, text=True, timeout=REMOTE_MIRROR_PROBE_TIMEOUT_S)
+    if answer.returncode:
+        raise CopyError(failure_detail(answer))
+    states = answer.stdout.splitlines()
+    if len(states) != len(candidates) or any(state not in ("present", "absent") for state in states):
+        raise CopyError("the host did not confirm the state of every path")
+    return [candidate for candidate, state in zip(candidates, states, strict=True) if state == "absent"]
+
+
+def reconcile_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> None:
+    """Unregister a selected, unchanged mirror only after the host confirms its removal."""
+    try:
+        candidates = idle_remote_mirrors(host, select)
+        if not candidates:
+            return
+        missing = probe_remote_mirrors(host, candidates)
+    except (CopyError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+        detail = ("the probe timed out" if isinstance(error, subprocess.TimeoutExpired)
+                  else " ".join(str(error).split()))
+        print(f"anomaly: remote mirror check on {host}: {detail}", file=sys.stderr)
+        return
+    for candidate in missing:
+        path = candidate.record_path
+        try:
+            with remote_lease(candidate.mirror), file_lock.exclusive(path.parent / "records.lock"):
+                if path.read_text() == candidate.record:
+                    path.unlink()
+        except (CopyError, OSError, UnicodeError):
+            continue
+
+
+def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
+    """Build the remote command with one mirror identity."""
+    arguments = [action, "--path", mirror.path, "--owner", mirror.owner]
+    for option, value in (("--repository", mirror.repository.name), ("--session", mirror.session)):
+        arguments.extend([f"{option}={value}"] if value.startswith("-") else [option, value])
+    return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([*arguments, *tail])
+
+
+def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
+    """Refresh a leased mirror through the remote copy owner."""
+    receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
+    # Keep the existing command order while metadata removal keeps the record last.
+    exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
+    return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
+            *(f"--exclude=/{name}" for name in exclusions),
+            f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),
+            f"{source}/", f"{mirror.host}:{shlex.quote(mirror.path)}/"]
+
+
+def remote_use_command(mirror: RemoteMirror, command: str) -> str:
+    return remote_copies_command("mirror-use", mirror, "--", "sh", "-c", command)
+
+
+def mirror_probe_setup(path: str) -> str:
+    """Create a marked probe copy through the registered remote kind."""
+    program = "\n".join((
+        "import sys",
+        "from scripts.copies import copies",
+        "copies.probe_remote_folder(sys.argv[1])",
+    ))
+    relative = path.removeprefix("~/")
+    mark = shlex.quote(str(Path(relative) / floor_claims.MIRROR_MARK))
+    shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
+    return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
+            shlex.quote(path) + " || exit 1")
+
+
+def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
+    """Publish mirror metadata before removal authority can disappear."""
+    scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
+    write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
+        "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
+    }) + "\n")
+    write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
+    write_text_atomic(tree / floor_claims.MIRROR_MARK, "registered remote mirror\n")
+
+
+def probe_remote_folder(path: str) -> None:
+    tree = floor_claims.mirror_local_path(path)
+    if tree.is_dir():
+        return
+    with local_mirror_lease(tree, "probe"):
+        mark_mirror(tree, "probe", "probe", "probe")
+
+
+@dataclass(frozen=True)
+class MirrorProcessScan:
+    """Share process paths and unreadable lease groups across mirror checks."""
+
+    uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable
+    unreadable_groups: frozenset[int]
+
+
+def scan_mirror_processes(mirrors: Sequence[Path]) -> MirrorProcessScan:
+    from scripts.lint import tmp_sweep
+
+    prefixes = tuple(str(tree.resolve()) for tree in mirrors)
+    if not prefixes:
+        return MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+    unreadable_groups: set[int] = set()
+    platform = sys.platform
+    if platform == "linux":
+        uses = tmp_sweep.process_paths("/proc", prefixes)
+        if isinstance(uses, tmp_sweep.ProcessUsesKnown):
+            for pid in uses.unreadable_cwd_pids:
+                if pid == os.getpid():
+                    continue
+                try:
+                    unreadable_groups.add(os.getpgid(pid))
+                except ProcessLookupError:
+                    continue
+    else:
+        uses = tmp_sweep.lsof_paths(prefixes)
+    return MirrorProcessScan(uses, frozenset(unreadable_groups))
+
+
+def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
+    """Keep a mirror with an active path, unreadable lease group, or unavailable scan."""
+    from scripts.lint import tmp_sweep
+
+    if not tree.exists():
+        return False
+    tree = tree.resolve()
+    root = str(tree)
+    descendant_prefix = os.path.join(root, "")
+    if isinstance(processes.uses, tmp_sweep.ProcessUsesUnavailable):
+        return True
+    if any(pid != os.getpid() and how in (tmp_sweep.WORKS_IN, tmp_sweep.MAPS_FILE, tmp_sweep.WRITES_FILE)
+           and (path == root or path.startswith(descendant_prefix))
+           for path, pid, how in processes.uses.paths):
+        return True
+    try:
+        group = floor_claims.read_mirror_record(tree / floor_claims.MIRROR_RECORD).get("process_group")
+    except (OSError, ValueError):
+        return False
+    return isinstance(group, int) and group in processes.unreadable_groups
+
+
+@contextmanager
+def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Generator[None]:
+    """Lock the mirror before any claim or record operation."""
+    if not create and not tree.parent.exists():
+        yield
+        return
+    parent_lock = floor_claims.mirror_parent_lock_path(tree)
+    parent_lock.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as leases:
+        lease_files: list[TextIO] = []
+        check = "mirror lease"
+        try:
+            outside = leases.enter_context(parent_lock.open("a+"))
+            lease_files.append(outside)
+            fcntl.flock(outside.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(outside.fileno()).st_ino != parent_lock.stat().st_ino:
+                raise BlockingIOError
+            if create:
+                tree.parent.mkdir(parents=True, exist_ok=True)
+            lock = leases.enter_context(floor_claims.mirror_lock_path(tree).open("a+"))
+            lease_files.append(lock)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            check = "mirror process check"
+            busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
+        except (BlockingIOError, FileNotFoundError):
+            busy = True
+        if busy:
+            try:
+                held = (tree / floor_claims.MIRROR_SESSION).read_text().strip() or "unreadable"
+            except OSError:
+                held = "unreadable"
+            raise CopyError(f"{tree}: busy; held by session {held} ({check})")
+        if create:
+            tree.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
+        token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *(lease.fileno() for lease in lease_files)))
+        try:
+            yield
+        finally:
+            COMMAND_LOCKS.reset(token)
+            # The parent lease guards the sibling lock; with both gone it guards nothing.
+            if not tree.exists() and not floor_claims.mirror_lock_path(tree).exists():
+                parent_lock.unlink(missing_ok=True)
+            # Closing releases only our descriptor. Live children retain the flock.
+
+
+@contextmanager
+def mirror_lease_set(mirrors: set[Path]) -> Generator[frozenset[Path]]:
+    """Hold idle mirror leases and identify mirrors held by live runs."""
+    protected: set[Path] = set()
+    with ExitStack() as leases:
+        candidates: dict[Path, TextIO] = {}
+        for mirror in sorted(mirrors):
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            lock = leases.enter_context(floor_claims.mirror_lock_path(mirror).open("a+"))
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                protected.add(mirror)
+            else:
+                candidates[mirror] = lock
+        processes = scan_mirror_processes(tuple(candidates))
+        for mirror, lock in candidates.items():
+            if mirror_has_process(mirror, processes):
+                lock.close()
+                protected.add(mirror)
+        yield frozenset(protected)
+
+
+@dataclass(frozen=True)
+class MirrorSweepLeases:
+    """Separate acquired mirror leases from mirrors that another process holds."""
+
+    held: frozenset[Path]
+    busy: frozenset[Path]
+
+
+@contextmanager
+def mirror_sweep_leases(root: Path) -> Generator[MirrorSweepLeases]:
+    """Take idle mirror leases before reading the floor claims."""
+    mirrors = {mark.parent for pattern in (f"*/{floor_claims.MIRROR_MARK}", f"*/*/{floor_claims.MIRROR_MARK}")
+               for mark in root.glob(pattern)}
+    for item in remote_mirrors():
+        if item.host == "localhost":
+            checkout = floor_claims.mirror_local_path(item.path)
+            if checkout.exists():
+                mirrors.add(checkout)
+            else:
+                unregister_remote(item.host, item.path)
+    authority_glob = floor_claims.removal_authority_path(Path("*")).name
+    mirrors.update(path.parent / path.name[1:-len(floor_claims.MIRROR_REMOVAL_SUFFIX)]
+                   for pattern in (authority_glob, "*/" + authority_glob)
+                   for path in root.glob(pattern))
+    with mirror_lease_set(mirrors) as protected:
+        yield MirrorSweepLeases(frozenset(mirrors) - protected, protected)
+
+
+@contextmanager
+def target_mirror_leases(targets: Sequence[str]) -> Generator[frozenset[Path]]:
+    """Keep remote copies safe during a Linux floor sweep."""
+    mirrors: set[Path] = set()
+    for target in targets:
+        path = Path(target).resolve()
+        for parent in (path, *path.parents):
+            if (parent / floor_claims.MIRROR_MARK).is_file():
+                mirrors.add(parent)
+                break
+    with mirror_lease_set(mirrors) as protected:
+        yield protected
+
+
+class RemoteHostUnreachable(CopyError):
+    """The removal command could not connect to the mirror host."""
+
+
+def remove_remote_mirror(mirror: RemoteMirror) -> None:
+    command = remote_copies_command("mirror-remove", mirror, "--host", mirror.host)
+    command += '; copies_status=$?; printf "\\nrc=%s\\n" "$copies_status"; exit "$copies_status"'
+    try:
+        answer = subprocess.run(["ssh", "-o", "BatchMode=yes", mirror.host, command],
+                                capture_output=True, text=True, timeout=load_config().git_timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise RemoteHostUnreachable(f"{mirror.host}:{mirror.path}: {error}") from error
+    if answer.returncode:
+        failure = (RemoteHostUnreachable if answer.returncode == 255 and any(
+            text in answer.stderr.lower() for text in (
+                "ssh: connect to host ", "ssh: connect to address ", "ssh: could not resolve hostname ",
+            )) else CopyError)
+        raise failure(f"{mirror.host}:{mirror.path}: {failure_detail(answer)}")
+    status = next((line for line in reversed(answer.stdout.splitlines()) if line.startswith("rc=")), "")
+    if status != "rc=0":
+        detail = status or "remote status is missing"
+        raise CopyError(f"{mirror.host}:{mirror.path}: {detail}; {failure_detail(answer)}")
+    unregister_remote(mirror.host, mirror.path)
+
+
+def clear_mirror_content(tree: Path) -> None:
+    """Remove the payload before the mirror metadata."""
+    for child in tree.iterdir():
+        if child.name in floor_claims.MIRROR_METADATA:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    for name in floor_claims.MIRROR_METADATA:
+        (tree / name).unlink(missing_ok=True)
+
+
+@contextmanager
+def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
+    """Read claims, then lock the record while the caller holds the mirror lease."""
+    claims = floor_claims.read_claims(load_config().git_timeout_seconds)
+    with file_lock.exclusive(floor_claims.record_lock_path(tree)):
+        yield claims
+
+
+def mirror_remove(args: CopyArguments) -> int:
+    tree = floor_claims.mirror_local_path(args.path)
+    authority = floor_claims.removal_authority_path(tree)
+    with local_mirror_lease(tree, args.session, create=False):
+        with mirror_metadata_locks(tree) as claims:
+            if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
+                    and not scratch.cargo_removal_mark(tree).exists()):
+                return 0
+            if tree.exists() and claims.holds(str(tree), tree.parent,
+                    exemption=floor_claims.MirrorIdentity(args.host, args.path)):
+                raise CopyError(f"{tree}: busy; held by session {args.session}")
+            record = tree / floor_claims.MIRROR_RECORD
+            raw = floor_claims.read_mirror_record(record if record.exists() else authority)
+            if copy_owner(str(raw.get("owner", ""))) != copy_owner(args.owner) or raw.get("repo") != args.repository:
+                raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
+            if tree.exists():
+                task_record = copy_record.record_path(tree)
+                clone_path = (args.host == "localhost" and OWNER.fullmatch(args.owner) is not None
+                              and tree.name.startswith(clone_owner_prefix(args.owner))
+                              and (tree.resolve().parent == copy_record.root().resolve() or scratch.in_session_folder(tree)))
+                if task_record is None and scratch.in_session_folder(tree):
+                    candidate = tree / copy_record.RECORD
+                    task = copy_record.read_record(candidate)
+                    if (isinstance(task, copy_record.Registered) and task.fields.get("test_hana_clone") is True
+                            and task.fields.get("clone_path") == str(tree.resolve())):
+                        task_record = candidate
+                if clone_path:
+                    task = scratch.task_of(tree)
+                    if (tree.is_symlink() or not isinstance(task, copy_record.Registered)
+                            or task.fields.get("test_hana_clone") is not True
+                            or (task.fields.get("clone_path"), task.fields.get("clone_owner"),
+                                task.fields.get("clone_repository"), task.fields.get("clone_session"), raw.get("session"))
+                            != (str(tree.resolve()), args.owner, args.repository, args.session, args.session)):
+                        raise CopyError(f"{tree}: clone registration changed")
+                    task_record = tree / copy_record.RECORD
+                write_text_atomic(authority, json.dumps(raw) + "\n")
+                # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
+                if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
+                    scratch.remove_marked(task_record.parent)
+                    # A task clone is its task folder, so its lock files sit in the scratch root.
+                    if task_record.parent == tree.resolve():
+                        for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
+                            lock.unlink(missing_ok=True)
+                else:
+                    clear_mirror_content(tree)
+                    tree.rmdir()
+            if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
+                scratch.remove_marked(tree)
+            authority.unlink(missing_ok=True)
+    return 0
+
+
+def command_tail(command: list[str]) -> list[str]:
+    """Remove the CLI separator before command execution."""
+    return command[1:] if command[:1] == ["--"] else command
+
+
+def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
+    """Run verify from a snapshot and other commands under a numbered copy lease."""
+    owner = caller_owner()
+    source = Path(args.repo or "").expanduser().resolve()
+    verification = verify_command(command)
+    with ExitStack() as scope:
+        captured = ""
+        if isinstance(verification, VerifyCommand):
+            tree = scope.enter_context(requested_source(source, policy, merge))
+            environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
+                           "COPIES_STEP_REPOSITORY": str(source),
+                           "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
+            target = tree / "target"
+            environment.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(target))
+            source_lock = build_folders.build_folder_lock_fd(tree.parent)
+            environment["COPIES_STEP_SOURCE_LOCK_FD"] = str(source_lock)
+            locks = (*COMMAND_LOCKS.get(), source_lock)
+            if args.publish:
+                output = tree.parent / "step-output"
+                output.mkdir()
+                _ = (output / "paths.json").write_text(json.dumps(args.publish))
+                captured = environment["COPIES_STEP_OUTPUT"] = str(output)
+        else:
+            targets = first_step.gate_targets(command, args.targets)
+            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge, gate_targets=targets))
+            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
+                           "BUILDLOG_PREPARED_COPY": str(tree)}
+            target = tree / "target"
+            locks = COMMAND_LOCKS.get()
+        arguments = [part.replace("{tree}", str(tree)) for part in command]
+        environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
+        before = publication_candidates(tree, target, arguments, args.publish)
+        result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
+        command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
+        selection = PublicationSelection.CHANGED
+        if command_exit == 0 and not isinstance(verification, VerifyCommand):
+            tool = tuple(build_call_arguments(command)[:1])
+            if tool in (("cargo",), ("cargo-nextest",)) or isinstance(command_job(command), StepJob):
+                selection = PublicationSelection.AVAILABLE
+        publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
+        return command_exit
+
+
+def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
+    """Place and run a named gate in the caller's prepared checkout."""
+    source = Path(args.repo or "").resolve()
+    targets = first_step.gate_targets(command, args.targets)
+    if not targets:
+        raise CopyError("gate-step requires a gate command and named targets")
+    with first_step.admitted_run(command, source, targets=targets) as admitted:
+        admitted.handoff(source)
+        result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
+                                                          check=False, text=True))
+        if result.stderr:
+            _ = sys.stderr.write(result.stderr)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def captured_path(root: Path, number: int, path: Path) -> Path:
+    return root / str(number) / path.name
+
+
+class PublicationState(Enum):
+    MISSING = auto()
+    DIRECTORY = auto()
+    UNREADABLE = auto()
+
+
+class PublicationSelection(Enum):
+    AVAILABLE = auto()
+    CHANGED = auto()
+
+
+def publication_digest(path: Path) -> bytes | PublicationState:
+    """Read file contents, or record a directory for publication error reporting."""
+    try:
+        stats = path.stat()
+    except FileNotFoundError:
+        return PublicationState.MISSING
+    if stat.S_ISDIR(stats.st_mode):
+        return PublicationState.DIRECTORY
+    if not stat.S_ISREG(stats.st_mode):
+        return PublicationState.MISSING
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").digest()
+
+
+def explicit_target_directory(command: Sequence[str]) -> str:
+    """Read a target directory argument before Cargo's argument separator."""
+    arguments = iter(command[1:])
+    for word in arguments:
+        if word == "--":
+            break
+        if word == "--target-dir":
+            return next(arguments, "")
+        if word.startswith("--target-dir="):
+            return word.removeprefix("--target-dir=")
+    return ""
+
+
+PublicationCandidates = dict[Path, bytes | PublicationState]
+
+
+def publication_candidates(tree: Path, target: Path, command: Sequence[str],
+                           paths: Sequence[str]) -> list[PublicationCandidates]:
+    """Record each candidate in target precedence order before the command runs."""
+    explicit = explicit_target_directory(command) if paths else ""
+    groups: list[PublicationCandidates] = []
+    for word in paths:
+        relative = Path(word)
+        ordered: list[Path] = []
+        if relative.is_relative_to("target"):
+            name = relative.relative_to("target")
+            if explicit:
+                ordered.append(tree / explicit / name)
+            ordered.append(target / name)
+        ordered.append(tree / relative)
+        candidates: PublicationCandidates = {}
+        for path in dict.fromkeys(ordered):
+            try:
+                candidates[path] = publication_digest(path)
+            except OSError as error:
+                candidates[path] = PublicationState.UNREADABLE
+                print(f"copies: publish: {error}", file=sys.stderr)
+        groups.append(candidates)
+    return groups
+
+
+def select_publication(candidates: PublicationCandidates, selection: PublicationSelection) -> Path | None:
+    """Select the first available or changed candidate in target order."""
+    for path, before in candidates.items():
+        try:
+            if selection is PublicationSelection.AVAILABLE:
+                if path.is_file() or path.is_dir():
+                    return path
+                continue
+            after = publication_digest(path)
+            if isinstance(after, bytes) and after != before:
+                return path
+            if after is PublicationState.DIRECTORY and before not in (PublicationState.DIRECTORY, PublicationState.UNREADABLE):
+                return path
+        except OSError as error:
+            print(f"copies: publish: {error}", file=sys.stderr)
+    return None
+
+
+def capture_step_files(output: Path, paths: Sequence[str], before: Sequence[PublicationCandidates]) -> None:
+    """Copy changed files while the step holds its slot."""
+    for number, (word, candidates) in enumerate(zip(paths, before, strict=True)):
+        if Path(word).is_absolute():
+            continue
+        try:
+            source = select_publication(candidates, PublicationSelection.CHANGED)
+            if source is None:
+                continue
+            destination = captured_path(output, number, Path(word))
+            destination.parent.mkdir(exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
+                pending = Path(temporary.name)
+            try:
+                _ = shutil.copy2(source, pending)
+                _ = pending.replace(destination)
+            finally:
+                pending.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"copies: publish: {error}", file=sys.stderr)
+
+
+def publish_files(tree: Path, paths: Sequence[str], before: Sequence[PublicationCandidates],
+                  command_exit: int, *, selection: PublicationSelection, captured: str = "") -> None:
+    """Copy requested build files into one scratch folder with a deadline."""
+    if not paths:
+        return
+    try:
+        sources: list[Path] = []
+        for number, (path, candidates) in enumerate(zip(paths, before, strict=True)):
+            try:
+                if captured and (saved := captured_path(Path(captured), number, Path(path))).exists():
+                    sources.append(saved)
+                elif (built := select_publication(candidates, selection)) is not None:
+                    sources.append(built)
+                else:
+                    print(f"copies: publish: {path} not built", file=sys.stderr)
+            except OSError as error:
+                print(f"copies: publish: {error}", file=sys.stderr)
+        if not sources:
+            return
+        commit = commit_at(tree, "HEAD")
+        repository = repository_name(tree)
+        with ExitStack() as cleanup:
+            publication = scratch.new(word="gate-binary", throwaway=True)
+            _ = cleanup.callback(shutil.rmtree, publication)
+            for source in sources:
+                destination = publication / source.name
+                temporary = publication / f".{source.name}.tmp"
+                _ = shutil.copy2(source, temporary)
+                _ = temporary.replace(destination)
+            write_text_atomic(publication / "manifest.json", json.dumps({
+                "repository": repository, "commit": commit, "command_exit": command_exit,
+                "files": [source.name for source in sources],
+            }) + "\n")
+            _ = cleanup.pop_all()
+        for source in sources:
+            print(f"published: {publication / source.name} {commit}")
+    except (CopyError, OSError, scratch.ScratchError) as error:
+        print(f"copies: publish: {error}", file=sys.stderr)
+
+
+def step_owner(source: Path) -> str:
+    if str(source) == os.environ.get("COPIES_STEP_SOURCE"):
+        return os.environ["COPIES_STEP_OWNER"]
+    return source_owner(source)
+
+
+def run_slot_step(source: Path, args: CopyArguments) -> int:
+    """Run the step under a numbered copy's lease."""
+    command = command_tail(args.command)
+    if not command or not args.tree:
+        raise CopyError("a copy step needs a tree and command")
+    # Print the tree from the same commit object that supplies the commit ID.
+    revisions = git(source, "log", "-1", "--format=%H%n%T", "--no-show-signature", "--no-notes",
+                    "--no-decorate", "--no-color", "--encoding=UTF-8", "HEAD", "--").decode().splitlines()
+    if len(revisions) != 2:
+        raise CopyError(f"{source}: cannot read the HEAD commit and tree")
+    head, head_tree = revisions
+    policy = CommittedSource(head) if head_tree == args.tree else StagedSource(args.tree)
+    with standing(step_owner(source), source, policy, step=args.step) as checkout:
+        if args.step == "doc" and staged_tree(source) != args.tree:
+            print("verify.sh: the staged tree changed before doc ran; no doc pass record was written.", file=sys.stderr)
+            return 77
+        if (len(command) >= 5 and command[2:4] == ["--manifest", str(source / "Cargo.toml")]
+                and Path(command[1]).name == "prebuild.py"):
+            command[3] = str(checkout / "Cargo.toml")
+        output = Path(os.environ["COPIES_STEP_OUTPUT"]) if (
+            str(source) == os.environ.get("COPIES_STEP_SOURCE") and "COPIES_STEP_OUTPUT" in os.environ
+        ) else checkout
+        paths: list[str] = []
+        if output != checkout:
+            try:
+                paths = cast(list[str], json.loads((output / "paths.json").read_text()))
+            except OSError as error:
+                print(f"copies: publish: {error}", file=sys.stderr)
+        target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
+        before = publication_candidates(checkout, target, command, paths)
+        status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
+                                                 pass_fds=COMMAND_LOCKS.get())
+        capture_step_files(output, paths, before)
+        return status
+
+
+def watch_copy_owner(owner: int, verify: int) -> None:
+    """Send TERM to verify when the enclosing copies command ends."""
+    platform = sys.platform
+    if platform != "linux":
+        return
+    open_pidfd = cast(Callable[[int], int], getattr(os, "pidfd_open"))
+    send_pidfd_signal = cast(Callable[[int, int], None], getattr(signal, "pidfd_send_signal"))
+    with ExitStack() as descriptors:
+        verify_fd = open_pidfd(verify)
+        _ = descriptors.callback(os.close, verify_fd)
+        try:
+            owner_fd = open_pidfd(owner)
+        except ProcessLookupError:
+            ready = True
+        else:
+            _ = descriptors.callback(os.close, owner_fd)
+            ready = owner_fd in select.select([owner_fd, verify_fd], [], [])[0]
+        if ready:
+            try:
+                send_pidfd_signal(verify_fd, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def receive_metadata(tree: Path, args: CopyArguments) -> None:
+    """Finish pending removal and publish all metadata before deleting its authority."""
+    authority = floor_claims.removal_authority_path(tree)
+    record = tree / floor_claims.MIRROR_RECORD
+    previous = floor_claims.read_mirror_record(record) if record.exists() else {}
+    if authority.exists():
+        pending = floor_claims.read_mirror_record(authority)
+        # A different record identifies a complete replacement. Keep its content.
+        if not record.exists() or previous == pending:
+            clear_mirror_content(tree)
+        if not previous:
+            previous = pending
+    mark_mirror(tree, cast(str, previous.get("owner", args.owner)),
+                cast(str, previous.get("repo", args.repository)), args.session,
+                last_use=time.time(), process_group=os.getpgrp())
+    authority.unlink(missing_ok=True)
+
+
+def mirror_run(args: CopyArguments) -> int:
+    tree = floor_claims.mirror_local_path(args.path)
+    with local_mirror_lease(tree, args.session):
+        with mirror_metadata_locks(tree):
+            if args.action == "mirror-receive":
+                receive_metadata(tree, args)
+            else:
+                mark_mirror(tree, args.owner, args.repository, args.session,
+                            last_use=time.time(), process_group=os.getpgrp())
+        command = command_tail(args.command)
+        if not command:
+            raise CopyError("remote mirror requires a command")
+        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, COMMAND_LOCKS.get()))}
+        answer = subprocess.run(command, pass_fds=COMMAND_LOCKS.get(), env=environment)
+        return answer.returncode
 
 
 class CopyParser(argparse.ArgumentParser):
@@ -919,63 +2897,177 @@ class CopyParser(argparse.ArgumentParser):
 
 
 class CopyArguments(argparse.Namespace):
+    host: str = ""
+    shell_lease: bool = False
+    path: str = ""
+    repository: str = ""
+    session: str = ""
     action: str = ""
     owner: str = ""
     repo: str | None = None
     commit: str = ""
     apply_uncommitted: str | None = None
     merge: str | None = None
+    publish: list[str] = []
+    targets: str = ""
+    lease_fd: list[int] = []
     command: list[str] = []
     source: str = ""
     task: str = ""
     until: str = ""
     name: str = "hana"
+    episode: str = ""
+    since: float = 0
+    step: str = "hold"
+    tree: str = ""
+    deadline: float = 0
+    pid: int = 0
+    verify_pid: int = 0
+    scratch: bool = False
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     parser = CopyParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("mirror-receive", "mirror-use", "mirror-remove"):
+        remote = commands.add_parser(action)
+        if action == "mirror-remove":
+            _ = remote.add_argument("--host", default="")
+        _ = remote.add_argument("--path", required=True)
+        _ = remote.add_argument("--owner", required=True)
+        _ = remote.add_argument("--repository", required=True)
+        _ = remote.add_argument("--session", required=True)
+        if action != "mirror-remove":
+            _ = remote.add_argument("command", nargs=argparse.REMAINDER)
+    for action in ("register-remote", "unregister-remote"):
+        registry = commands.add_parser(action)
+        _ = registry.add_argument("--host", required=True)
+        _ = registry.add_argument("--path", required=True)
+        if action == "register-remote":
+            _ = registry.add_argument("--owner", required=True)
+            _ = registry.add_argument("--repository", required=True)
+            _ = registry.add_argument("--session", required=True)
+            _ = registry.add_argument("--shell-lease", action="store_true")
     clone_command = commands.add_parser("clone", help="create a task-owned test clone")
     _ = clone_command.add_argument("source")
     ends = clone_command.add_mutually_exclusive_group()
     _ = ends.add_argument("--task", default="")
     _ = ends.add_argument("--until", default="")
     _ = clone_command.add_argument("--name", default="hana")
-    run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
-    remove = commands.add_parser("remove", help="remove an owner's idle standing trees")
-    for command in (run, remove):
-        _ = command.add_argument("--owner", required=True)
+    _ = clone_command.add_argument("--owner", default="")
+    _ = clone_command.add_argument("--repository", default="hana")
+    _ = clone_command.add_argument("--session", default="")
+    run = commands.add_parser("run", help="run a command in a private source copy")
+    gate = commands.add_parser("gate-step", help="place a gate in a prepared checkout")
+    _ = gate.add_argument("--repo", required=True)
+    _ = gate.add_argument("--targets", required=True)
+    _ = gate.add_argument("--lease-fd", action="append", type=int, default=[])
+    _ = gate.add_argument("command", nargs=argparse.REMAINDER)
+    hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
+    _ = hold.add_argument("--repo", required=True)
+    _ = hold.add_argument("--tree", default="")
+    _ = hold.add_argument("--step", default="hold")
+    _ = hold.add_argument("--scratch", action="store_true")
+    _ = hold.add_argument("command", nargs=argparse.REMAINDER)
+    snapshot_tree = commands.add_parser("snapshot-tree")
+    _ = snapshot_tree.add_argument("--repo", required=True)
+    watch_owner = commands.add_parser("watch-owner")
+    _ = watch_owner.add_argument("--pid", type=int, required=True)
+    _ = watch_owner.add_argument("--verify-pid", type=int, required=True)
+    remove = commands.add_parser("remove", help="remove the caller's idle standing trees")
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
     _ = run.add_argument("--commit", required=True)
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
+    _ = run.add_argument("--targets", default="", help="name the gate targets in a comma-separated list")
+    _ = run.add_argument("--publish", action="append", default=[], metavar="PATH",
+                         help="copy a built relative path into a scratch folder")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
     _ = commands.add_parser("list", help="list standing trees and their busy state")
+    return parser.parse_args(argv, namespace=CopyArguments())
+
+
+def main(argv: list[str] | None = None) -> int:
     try:
-        args = parser.parse_args(argv, namespace=CopyArguments())
+        args = parse_copy_arguments(argv)
+        if args.action in ("register-remote", "unregister-remote"):
+            remote_registry().mkdir(parents=True, exist_ok=True)
+            if args.action == "unregister-remote":
+                unregister_remote(args.host, args.path)
+            else:
+                mirror = RemoteMirror(args.owner, SelectedRepository(args.repository), args.host, args.path, args.session)
+                if args.shell_lease:
+                    print(remote_lease_path(mirror))
+                else:
+                    register_remote(mirror)
+            return 0
+        if args.action == "hold":
+            if not args.tree:
+                raise CopyError("hold requires --tree. Run verify.sh again.")
+            source = Path(args.repo or "").expanduser().resolve()
+            if not args.scratch:
+                return run_slot_step(source, args)
+            with requested_source(source, StagedSource(args.tree), NO_MERGE) as checkout:
+                if command := command_tail(args.command):
+                    return subprocess.run(command, cwd=checkout).returncode
+                print(checkout, flush=True)
+                _ = sys.stdin.read(1)
+            return 0
+        if args.action == "snapshot-tree":
+            source = Path(args.repo or "").expanduser().resolve()
+            tree = staged_tree(source, include_worktree=True)
+            print(tree, treekey.committed_tree_key(tree.encode("ascii")), git(source, "rev-parse", "HEAD^{tree}").decode().strip())
+            return 0
+        if args.action == "watch-owner":
+            watch_copy_owner(args.pid, args.verify_pid)
+            return 0
+        if args.action == "mirror-remove":
+            return mirror_remove(args)
+        if args.action in ("mirror-receive", "mirror-use"):
+            return mirror_run(args)
         if args.action == "clone":
             task = scratch.parsed_until(args.until) if args.until else args.task
-            print(clone(Path(args.source), task, args.name))
+            owner = checked_owner(args.owner) if args.owner else ""
+            if not owner:
+                try:
+                    owner = caller_owner()
+                except CopyError:
+                    pass
+            source = Path(args.source)
+            if owner:
+                refuse_dead_clones(owner, source)
+            session = args.session
+            if not args.owner and not session:
+                session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            checkout = clone(source, task, args.name, owner=owner, repository=args.repository, session=session)
+            if args.owner:
+                with local_mirror_lease(checkout, args.session):
+                    mark_mirror(checkout, args.owner, args.repository, args.session)
+                    register_remote(RemoteMirror(args.owner, SelectedRepository(args.repository),
+                                                "localhost", str(checkout), args.session))
+            print(checkout)
             return 0
         if args.action == "run":
-            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            command = command_tail(args.command)
             if not command:
                 raise CopyError("run requires a command after --")
-            with standing(args.owner, args.repo or "", args.commit,
-                          apply_uncommitted=args.apply_uncommitted, merge=args.merge) as tree:
-                result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
-                                        cwd=tree, pass_fds=COMMAND_LOCKS.get())
-                return result.returncode if result.returncode >= 0 else 128 - result.returncode
+            policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
+                                    CommittedSource(args.commit))
+            merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
+            return run_copy(args, command, policy, merge)
+        if args.action == "gate-step":
+            return run_gate_step(args, command_tail(args.command))
         if args.action == "list":
             list_trees()
         else:
             scope = (ALL_REPOSITORIES if args.repo is None else
                      SelectedRepository(repository_name(Path(args.repo).expanduser().resolve())))
-            remove_trees(args.owner, scope)
-    except (CopyError, OSError, scratch.ScratchError) as error:
+            remove_trees(caller_owner(), scope)
+    except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
+            SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
-        return error.exit_code if isinstance(error, CopyError) else 2
+        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else 2
     return 0
 
 

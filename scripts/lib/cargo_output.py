@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class CargoOutputRoots:
+    """The paths identify the Cargo workspace, target directory, and build directory."""
     workspace_root: Path
     target_directory: Path
     build_directory: Path
@@ -20,7 +21,28 @@ class CargoOutputRoots:
 
 @dataclass(frozen=True)
 class CargoOutputUnavailable:
+    """The reason explains why Cargo output paths are unavailable."""
     reason: str
+
+
+def cargo_metadata_output_roots(text: str) -> CargoOutputRoots | CargoOutputUnavailable:
+    """Decode the workspace and output folders in Cargo metadata."""
+    try:
+        metadata = cast(object, json.loads(text))
+        if not isinstance(metadata, dict):
+            return CargoOutputUnavailable("cargo metadata did not return an object")
+        fields = cast(dict[str, object], metadata)
+        workspace = fields.get("workspace_root")
+        target = fields.get("target_directory")
+        build = fields.get("build_directory", target)
+        if not all(isinstance(value, str) and value.strip() for value in (workspace, target, build)):
+            return CargoOutputUnavailable("cargo metadata has invalid output roots")
+        paths = [Path(cast(str, value)) for value in (workspace, target, build)]
+        if not all(path.is_absolute() for path in paths):
+            return CargoOutputUnavailable("cargo metadata has relative output roots")
+        return CargoOutputRoots(*(path.resolve() for path in paths))
+    except (OSError, ValueError) as error:
+        return CargoOutputUnavailable(str(error))
 
 
 def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",), options: Sequence[str] = (),
@@ -35,18 +57,6 @@ def read_cargo_output_roots(checkout: Path, *, cargo: Sequence[str] = ("cargo",)
         )
         if result.returncode:
             return CargoOutputUnavailable(result.stderr.strip() or f"cargo metadata exited {result.returncode}")
-        metadata = cast(object, json.loads(result.stdout))
-        if not isinstance(metadata, dict):
-            return CargoOutputUnavailable("cargo metadata did not return an object")
-        fields = cast(dict[str, object], metadata)
-        workspace = fields.get("workspace_root")
-        target = fields.get("target_directory")
-        build = fields.get("build_directory", target)
-        if not all(isinstance(value, str) and value.strip() for value in (workspace, target, build)):
-            return CargoOutputUnavailable("cargo metadata has invalid output roots")
-        paths = [Path(cast(str, value)) for value in (workspace, target, build)]
-        if not all(path.is_absolute() for path in paths):
-            return CargoOutputUnavailable("cargo metadata has relative output roots")
-        return CargoOutputRoots(*(path.resolve() for path in paths))
+        return cargo_metadata_output_roots(result.stdout)
     except (OSError, ValueError) as error:
         return CargoOutputUnavailable(str(error))

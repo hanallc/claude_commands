@@ -18,14 +18,21 @@ from unittest.mock import patch
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
-sys.path.insert(0, str(Path(__file__).parents[2]))
 from scripts.lib.process_group import send_process_group
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
+
+
+def setUpModule() -> None:
+    isolate_state_home()
 
 
 class RelaunchObservation(TypedDict):
@@ -39,6 +46,58 @@ class RelaunchObservation(TypedDict):
 class FinishedChild:
     def wait(self) -> int:
         return 23
+
+
+class UnitResumeCommandTests(StaffTestCase):
+    def test_resume_and_account_move_name_the_recorded_command(self) -> None:
+        runner = fixture_member("showrunner", name="demo")
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                row = staff.ensure("unit", name=unit_type, parent=staff.ReportsTo(runner.id),
+                    runtime_id=fixture_runtime_id(unit_type), unit_type=unit_type)
+                text = resume_message("maintenance", unit=row, move=AccountMove("claude1", "claude2"))
+                self.assertIn(f"/unit:{unit_type}", text)
+                self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", text)
+                self.assertIn("moved from claude1 to claude2", text)
+                self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.", text)
+
+    def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("merges"), unit_type="merge")
+        fixture_session(row.current_session, staff.ClaudeBackend())
+        row = staff.rename(row.id, "renamed")
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers())):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        self.assertIn("/unit:merge", arguments[-1])
+        self.assertNotIn("/unit:direct", arguments[-1])
+
+    def test_relaunch_in_no_worker_mode_gives_the_notice_and_no_worker_lines(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
+        from scripts.whoami import quota_state
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="held", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("held"), unit_type="direct")
+        fixture_session(row.current_session, staff.ClaudeBackend())
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        notice = "Codex workers have no capacity. Send no assign."
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(quota_state, "no_worker_mode", return_value=True),
+              patch.object(quota_state, "no_worker_notice", return_value=notice),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers()) as listed):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        listed.assert_not_called()
+        self.assertIn(notice, arguments[-1])
+        self.assertNotIn("Resume your workers", arguments[-1])
 
 
 class RelaunchTests(ShutdownTestCase):
@@ -58,7 +117,7 @@ class RelaunchTests(ShutdownTestCase):
             cwd=self.root, env={"PATH": os.defpath, "HOME": str(self.root),
                 "SHUTDOWN_STATE_DIR": str(self.state), "REMOVE_ON_RELAUNCH": "old"},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+            text=True, start_new_session=True, restore_signals=False,
         )
         self.addCleanup(self.reap, process)
         return process
@@ -81,17 +140,25 @@ class RelaunchTests(ShutdownTestCase):
     def waiting_child(self) -> str:
         return (
             "import os,time; from pathlib import Path; "
+            "Path('child-pid').write_text(str(os.getpid())); "
             "Path('ready.tmp').write_text(str(os.getppid())); os.replace('ready.tmp', 'ready'); "
             "\nwhile not Path('release').exists(): time.sleep(.01)\n"
+            "Path('released').touch()\n"
             "raise SystemExit(7)"
         )
 
-    def request(self, pid: int) -> Path:
+    def request(self, pid: int, *, previous_child: int | None = None) -> Path:
         destination = self.root / "next cwd"
         destination.mkdir(exist_ok=True)
         output = self.root / "observation.json"
+        check_reaped = "" if previous_child is None else (
+            f"try:\n os.getpgid({previous_child})\n"
+            "except ProcessLookupError:\n pass\n"
+            "else:\n raise AssertionError('the original child still exists')\n"
+        )
         child = (
-            "import json,os; from pathlib import Path; "
+            "import json,os; from pathlib import Path\n"
+            f"{check_reaped}"
             f"Path({str(output)!r}).write_text(json.dumps({{'parent':os.getppid(),"
             "'process_group':os.getpgrp(),"
             "'cwd':os.getcwd(),'marker':os.environ.get('RELAUNCH_MARKER',''),"
@@ -116,6 +183,91 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(stdout.count("restarting fixture on its target account\n"), 1)
         self.assertFalse(request.exists(), "a consumed request could launch twice")
 
+    def test_resume_message_names_busy_dispatch(self) -> None:
+        from scripts.lib.resume_message import AccountMove, BusyPass, IdleWorker, PaneWorkerResume, ResumeWorkers, resume_message
+        from scripts.production import staff
+
+        workers = ResumeWorkers(panes=(PaneWorkerResume(staff.StaffId("busy-id"), BusyPass("dispatch-id")),
+                                      PaneWorkerResume(staff.StaffId("idle-id"), IdleWorker())))
+        text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
+        self.assertIn("for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.", text)
+        self.assertIn("moved from source to destination", text)
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
+                      text.splitlines()[1])
+        self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
+        self.assertEqual(text.count("Worker idle-id: idle"), 1)
+        self.assertNotIn("implement.sh", resume_message("a shutdown"))
+
+    def test_resume_message_lists_every_idle_director_worker(self) -> None:
+        from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers, resume_message
+        from scripts.production import staff
+
+        text = resume_message("a shutdown", workers=ResumeWorkers(panes=[
+            PaneWorkerResume(staff.StaffId(name), IdleWorker()) for name in ("impl-id", "review-id")]))
+        self.assertIn("You were stopped and resumed because a shutdown.", text)
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
+                      text.splitlines()[1])
+        self.assertIn("for messages kept while you were down", text)
+        for name in ("impl-id", "review-id"):
+            self.assertEqual(text.count(f"Worker {name}: idle"), 1)
+        self.assertNotIn("Continue pass", text)
+
+    def test_director_note_keeps_the_saved_assignment_prompt_and_uses_one_receipt(self) -> None:
+        import shlex
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from scripts.herdr import worker_panes
+        from scripts.lib import atomic_file, unit_runs
+        from scripts.lib.resume_message import resume_message
+        from scripts.production import staff, worker, worker_admission
+
+        fixture = WorkerPaneTests("runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        row, source, dispatch = fixture.resume_fixture()
+        state_path = fixture.root / "run/progress_history_state.json"
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        passes = cast(dict[str, dict[str, object]], state["pass"])
+        command = ("bash", "assign.sh", "--role", "impl", "--prompt", str(fixture.root / "saved prompt.md"))
+        passes[row.name]["worker_id"] = row.id
+        passes[row.name]["launcher_command"] = list(command)
+        for status in ("unsubmitted", "submitted", "done", "completed"):
+            with self.subTest(status=status):
+                passes[row.name]["status"] = "completed" if status == "completed" else "active"
+                atomic_file.write_text_atomic(state_path, json.dumps(state))
+                entry = {"type": "user", "message": {"role": "user",
+                         "content": f"End your final reply with DONE {dispatch}."}}
+                text = "" if status == "unsubmitted" else json.dumps(entry) + "\n"
+                if status == "done":
+                    text += json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "DONE " + dispatch}}) + "\n"
+                atomic_file.write_text_atomic(source, text)
+                with (patch.object(unit_runs, "held", return_value=[str(fixture.root / "run")]),
+                      patch.object(worker_panes, "dispatch_role", wraps=worker_panes.dispatch_role) as roles,
+                      patch.object(worker_admission, "transcript_entries", wraps=worker_admission.transcript_entries) as reads):
+                    note = resume_message("a shutdown", workers=worker.resume_workers(fixture.parent.id, staff.snapshot()))
+                if status == "unsubmitted":
+                    self.assertIn(shlex.join(command), note)
+                    self.assertNotIn("resume-prompt.md", note)
+                    self.assertNotIn("Continue pass", note)
+                elif status == "submitted":
+                    self.assertIn("Continue pass " + dispatch, note)
+                    self.assertNotIn("assign.sh", note)
+                else:
+                    self.assertNotIn(str(row.id), note)
+                    self.assertNotIn(dispatch, note)
+                self.assertEqual(reads.call_count, int(status != "completed"))
+                roles.assert_not_called()
+
+    def test_resume_message_continues_only_the_recipients_own_pass(self) -> None:
+        from scripts.lib.resume_message import AccountMove, BusyPass, resume_message
+
+        text = resume_message("quota", move=AccountMove("source", "destination"), own_pass=BusyPass("own-dispatch"))
+        self.assertIn("You were stopped and resumed because quota.", text)
+        self.assertIn("moved from source to destination", text)
+        self.assertIn("Continue pass own-dispatch in this conversation. Keep the same pass id.", text)
+        self.assertNotIn("Worker ", text)
+        self.assertEqual(text.count('<system-reminder source="script">'), 1)
+
+
     def test_child_environment_marks_supervision_without_changing_the_parent(self) -> None:
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)
@@ -132,6 +284,51 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(environment["RELAUNCH_SUPERVISED"], "1")
         self.assertEqual(environment["PRESERVED_MARKER"], "keep")
 
+    def test_agent_launch_inside_a_staff_operation_removes_its_descriptor(self) -> None:
+        from scripts.production import staff
+
+        command = [sys.executable, "-c", "import os; print('STAFF_OPERATION_FD' in os.environ)"]
+        shell = str(SUPERVISOR.parents[1] / "agents/models_config.sh")
+        with (patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.state)}),
+              staff.operation()):
+            descriptor = os.environ["STAFF_OPERATION_FD"]
+            for argv in ([sys.executable, str(SUPERVISOR), "run", "--", *command],
+                         ["bash", "-c", 'source "$1"; models_agent_environment; shift; exec "$@"', "launch", shell, *command]):
+                with self.subTest(launcher=argv[0]):
+                    child = subprocess.run(argv, cwd=self.root, capture_output=True, text=True,
+                                           timeout=TEST_HANG_GUARD_SECS, check=False)
+                    self.assertEqual(child.returncode, 0, child.stderr)
+                    self.assertEqual(child.stdout, "False\n")
+            self.assertEqual(os.environ["STAFF_OPERATION_FD"], descriptor)
+
+    def test_director_resume_without_a_pane_marker_names_its_workers(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_session
+        from scripts.agents import pane_record
+
+        with patch.dict(os.environ, {"HOME": str(self.root), "ROSTER_RUN_ROOT": str(self.root / "runs"),
+                                     "UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}):
+            runner = fixture_member("showrunner", name="TEST-showrunner")
+            director = fixture_member("unit", name="TEST-director", parent=runner.id,
+                                      worktree=staff.PresentWorktree("natedev", self.root))
+            fixture_session(director.current_session, staff.ClaudeBackend())
+            workers = [fixture_worker(name, director.id) for name in ("impl", "review")]
+            entry = pane_record.launch("w1:p2", director.current_session, str(self.root), {}, ["claude"])
+            from scripts.agents.test_pane_record_recovery import FakeClient
+            from scripts.herdr import herdr
+
+            client = FakeClient([{"pane_id": "w1:p2", "label": director.name, "workspace_id": "w1"}])
+            with (patch.object(pane_record, "RECORD_DIR", self.root / "panes"),
+                  patch.object(herdr, "Herdr", return_value=client)):
+                pane_record.write("agents", entry)
+                arguments, _ = relaunch.restored_launch(["claude", "--resume", director.current_session],
+                    {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"})
+        prompt = arguments[-1]
+        self.assertIn("You were stopped and resumed", prompt)
+        for row in workers:
+            self.assertIn(f"Worker {row.id}: idle", prompt)
+        self.assertEqual(prompt.count('<system-reminder source="script">'), 1)
+
     def test_no_request_preserves_the_child_exit_code(self) -> None:
         process = self.start("raise SystemExit(23)")
         stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -139,8 +336,8 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(stdout, "")
 
     def test_herdr_relaunch_restores_its_conversation_marks_and_one_resume_note(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.stop_resume import resume_message
+        from scripts.agents import pane_record
+        from scripts.agents.stop_resume import resume_message
 
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)
@@ -150,10 +347,10 @@ class RelaunchTests(ShutdownTestCase):
             + "{k:v for k,v in os.environ.items() if k.startswith('SHOWRUNNER_') or k in ('STAFF_ID','CLAUDE_CODE_SESSION_ID')}}))\n")
         program.chmod(0o700)
         environment = {"HOME": str(self.root), "PATH": os.defpath, "HERDR_ENV": "1",
-            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2", "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2", "HERDR_BIN": MISSING_HERDR_BIN,
             "HERDR_PANE_RECORD_DIR": str(self.root / "panes"), "SHUTDOWN_STATE_DIR": str(self.state)}
         native = {"CLAUDE_CODE_SESSION_ID": "2d058b83-b9da-46fd-9e87-877cd3f50a52"}
-        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", **native}
+        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha", **native}
         retained = pane_record.launch("w1:p2", "2d058b83-b9da-46fd-9e87-877cd3f50a52", str(self.root), {}, ["claude"])
         retained["environment"] = marks
         with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
@@ -172,8 +369,54 @@ class RelaunchTests(ShutdownTestCase):
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
+        from scripts.production import staff
+
+        from scripts.herdr import pane_launch
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from dataclasses import replace
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        with self.subTest(record="reused pane"):
+            arguments = ["claude", "--resume", str(owner.current_session)]
+            resumed = relaunch.restored_launch(arguments,
+                {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p7"})[0]
+            self.assertEqual(resumed, [*arguments, resume_message("you were stopped and resumed")])
+
+
+    def test_explicit_move_account_replaces_the_saved_launch_account(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production import session_staff
+
+        entry = pane_record.launch("w1:p2", "session", str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2"), "ENABLE_TOOL_SEARCH": "true"}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p2", "RELAUNCH_PROMPT_DELIVERY": "pane",
+            "CLAUDE_CONFIG_DIR": str(self.root / ".claude5"),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / ".claude5/memory")}
+        with (patch.dict(os.environ, {"HOME": str(self.root)}),
+              patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(session_staff, "record_membership", return_value=entry)):
+            _, restored = relaunch.restored_launch(["claude", "--resume", "session"], environment)
+        self.assertEqual(restored["CLAUDE_CONFIG_DIR"], environment["CLAUDE_CONFIG_DIR"])
+        self.assertEqual(restored["CLAUDE_CODE_REMOTE_MEMORY_DIR"], environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"])
+        self.assertEqual(restored["ENABLE_TOOL_SEARCH"], "true")
+
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
 
         entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
@@ -184,7 +427,7 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(arguments, ["claude", "--resume", "session"])
 
     def test_enveloped_resume_needs_no_source_record(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
         from scripts.lib import script_prompts
 
@@ -234,46 +477,51 @@ class RelaunchTests(ShutdownTestCase):
         self.assertIn("no restart came; this window is free\n", stdout)
         self.assertFalse(hold.exists())
 
-    def test_terminal_interrupts_do_not_kill_the_supervisor(self) -> None:
-        for terminal_signal in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
-            with self.subTest(signal=terminal_signal):
-                (self.root / "ready").unlink(missing_ok=True)
-                (self.root / "release").unlink(missing_ok=True)
-                process = self.start(self.waiting_child())
-                self.wait_for_file(self.root / "ready", process)
-                os.kill(process.pid, terminal_signal)
-                request = self.request(process.pid)
-                (self.root / "release").touch()
-                self.assert_relaunched(process, request)
+    def test_supervisor_interrupt_allows_a_restart_after_the_child_exits(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        previous_child = int((self.root / "child-pid").read_text())
+        request = self.request(process.pid, previous_child=previous_child)
+        os.kill(process.pid, signal.SIGINT)
+        assert process.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            _ = selector.register(process.stdout, selectors.EVENT_READ)
+            self.assertFalse(selector.select(timeout=1), "restart began before the child was released")
+        self.assertTrue(request.exists())
+        (self.root / "release").touch()
+        self.assert_relaunched(process, request)
+        self.assertTrue((self.root / "released").exists())
 
-    def test_termination_and_hangup_are_forwarded_to_the_child(self) -> None:
-        for forwarded in (signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signal=forwarded):
-                (self.root / "ready").unlink(missing_ok=True)
-                received = self.root / "received"
-                received.unlink(missing_ok=True)
-                child = (
-                    "import signal,time; from pathlib import Path\n"
-                    "def received(number,frame):\n"
-                    " Path('received').write_text(str(number)); raise SystemExit(19)\n"
-                    "signal.signal(signal.SIGTERM,received); signal.signal(signal.SIGHUP,received)\n"
-                    "Path('ready').touch()\nwhile True: time.sleep(.01)\n"
-                )
-                process = self.start(child)
-                self.wait_for_file(self.root / "ready", process)
-                os.kill(process.pid, forwarded)
-                _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(process.returncode, 19, stderr)
-                self.assertEqual(received.read_text(), str(forwarded))
+    def test_group_hangup_ends_the_supervisor_and_child(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        request = self.request(process.pid)
+        send_process_group(process.pid, signal.SIGHUP)
+        # The child keeps both output pipes open until it exits.
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, -signal.SIGHUP, stderr)
+        self.assertFalse((self.root / "released").exists())
+        self.assertTrue(request.exists())
+
+    def test_supervisor_pid_term_leaves_the_child_running(self) -> None:
+        process = self.start(self.waiting_child())
+        self.wait_for_file(self.root / "ready", process)
+        request = self.request(process.pid)
+        os.kill(process.pid, signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+        (self.root / "release").touch()
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertTrue((self.root / "released").exists(), stderr)
+        self.assertTrue(request.exists())
 
     def test_terminal_group_interrupt_reaches_child_and_supervisor_can_relaunch(self) -> None:
         child = (
             "import os,signal,time; from pathlib import Path\n"
-            "def interrupted(number,frame):\n"
-            " Path('interrupted').write_text(str(number)); raise SystemExit(17)\n"
-            "signal.signal(signal.SIGINT,interrupted)\n"
-            "Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
-            "while True: time.sleep(.01)\n"
+            "try:\n"
+            " Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
+            " while True: time.sleep(.01)\n"
+            "except KeyboardInterrupt:\n"
+            " Path('interrupted').write_text(str(signal.SIGINT)); raise SystemExit(17)\n"
         )
         process = self.start(child)
         self.wait_for_file(self.root / "ready", process)
@@ -282,6 +530,19 @@ class RelaunchTests(ShutdownTestCase):
         send_process_group(process.pid, signal.SIGINT)
         self.assert_relaunched(process, request)
         self.assertEqual((self.root / "interrupted").read_text(), str(signal.SIGINT))
+
+    def test_resume_message_keeps_busy_and_idle_claude_children(self) -> None:
+            from scripts.lib.resume_message import Idle, Resumable, ResumeWorkers, resume_message
+            from scripts.lib.resume_message import ClaudeChildResume
+
+            seats = [ClaudeChildResume(run_dir=str(self.root), seat=name, role="impl", staff_id=name,
+                                turn_live=busy, launcher_command=[]) for name, busy in (("busy", True), ("idle", False))]
+            with patch("scripts.lib.resume_message.resume_worker_command", return_value="saved assignment") as command:
+                text = resume_message("a shutdown", workers=ResumeWorkers(results=[Resumable(seats[0]), Idle(seats[1])], cwd=str(self.root)))
+            command.assert_called_once_with(seats[0], str(self.root))
+            self.assertIn("busy (impl, was working): saved assignment", text)
+            self.assertIn("idle (impl, idle): paused on its thread", text)
+            self.assertIn("for messages kept while you were down", text)
 
 
 if __name__ == "__main__":

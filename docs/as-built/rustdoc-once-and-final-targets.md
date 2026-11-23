@@ -2,7 +2,11 @@
 
 ## What it is
 
-Rustdoc runs once per phase, as the unit director's last command before a Rust checkpoint commit. It does not run in every `verify.sh lint` call. A PreToolUse hook refuses a checkpoint commit in a Cargo repository unless a passing rustdoc run exists for the exact tree that the commit writes, so the check cannot be skipped. `lint.conf` cannot switch it off. `verify.sh final` type-checks every example once with `cargo check --all-targets`. Its nextest build no longer builds and links the examples again. A scan before any build refuses an example that holds a test or sets `test = true`, so no test is lost. The reason is fewer and shorter builds with the same guarantees: rustdoc used much worker time on each lint call and caught few errors, and the second example build in `final` added work but no checks.
+`verify.sh doc` checks the staged tree before a Cargo checkpoint commit.
+The checkpoint hook requires a passing record for that exact tree.
+Workers run lint separately, without rustdoc.
+`verify.sh final` checks all workspace targets, then runs nextest without linking examples.
+The example scan refuses tests inside examples before a build starts.
 
 ## How it works
 
@@ -10,7 +14,7 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 
 | File | Role |
 | --- | --- |
-| `scripts/direct/verify.sh` | The `doc` verb and its staged-tree checkout, `doc_tree`, `doc_record`, `lint` without rustdoc, `final`, `UNTESTED_EXAMPLES_PY`, `TEST_TARGETS_PY`, and the header and usage text for each. |
+| `scripts/direct/verify.sh` | The `doc` verb and its staged-tree checkout, `doc_tree`, `doc_record`, `lint` without rustdoc, `final`, the metadata helpers, and the header and usage text for each. |
 | `scripts/lint/invoke.sh` | `invoke_doc`: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --jobs ${LINT_DOC_JOBS:-8}`. |
 | `scripts/hooks/pre-tool-use-checkpoint-doc-gate.py` | The checkpoint doc gate. |
 | `scripts/hooks/checkpoint_gate.py` | Supplies the command parser and the message and tree readers for both checkpoint hooks. |
@@ -26,18 +30,46 @@ Rustdoc runs once per phase, as the unit director's last command before a Rust c
 
 ### The `doc` verb
 
-`verify.sh doc [--features <list>]` does these steps:
+`verify.sh doc [<package>] [--features <list>]` does these steps:
 
-1. It reads the repo top (`git rev-parse --show-toplevel`) and the staged tree id (`doc_tree`).
-2. It resolves the original repo's target directory: `CARGO_TARGET_DIR` when set (relative to the repo top), otherwise `cargo metadata`'s `target_directory` at the repo top. It exports that absolute target for rustdoc and locks `<target>/verify-doc/<repo-path-hash>/lock` for the whole run. The stable `tree/` there has its own index. The first run checks out all staged files; later runs use `git read-tree -m -u <previous-tree> <new-tree>`, retaining unchanged mtimes and updating changed or deleted files. Untracked build outputs are cleaned from the source checkout. Missing metadata or a failed update triggers one fresh full checkout.
+1. It reads the repository root through `git rev-parse --show-toplevel`.
+2. It resolves the original target directory from `CARGO_TARGET_DIR` or `cargo metadata` and exports this target for rustdoc.
+   It starts `copies.py hold` without a tree argument.
+   `hold` computes the staged tree and creates `StagedSource(tree)`.
+   It prints the tree identity and standing checkout path on separate lines.
+   `verify.sh` reads both lines.
+   The copies owner leases the standing checkout for the whole run.
+   The checkout has its own index.
+   The copies owner updates staged content and preserves unchanged modification times.
+   It removes a stale index lock before index writes.
+   It repairs a damaged private index under the checkout lease.
+   Source files and the source index stay unchanged.
 3. If `lint.conf` has `doc=off`, it prints one line that says it ignores the switch.
-4. In `tree/`, it runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace`, through the cargo token and the memory gate. Feature names pass through unchanged.
+4. It runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace` against the staged snapshot.
+   Local execution uses the Cargo token and memory gate.
+   Remote execution sends the snapshot through `--source-root` with the original repository identity.
+   A named package owns feature names without a slash.
+   Without a package, feature names pass unchanged.
 5. On exit 0, `doc_record` computes the staged tree id again. If the staged tree changed during the run, it prints a notice and writes no record.
 6. Otherwise it writes `~/.local/state/verify/doc_pass/<tree_id>.json`.
 
-At call start, `verify.sh` reads `[workspace.metadata.dev] features = [...]` once from the repo root `Cargo.toml`. It adds that list to check, test (filtered runs included), final, doc and build without `--release`. Work Order `--features` and a build example's required features are merged without duplicates; package feature names are qualified, and names that contain `/` keep their spelling. Doc keeps workspace feature names unchanged. Release builds and lint receive no dev features. A missing or empty list keeps the existing Cargo arguments; a value other than a list of strings refuses the step with one line.
+At call start, `verify.sh` reads `[workspace.metadata.dev] features = [...]` once from the repository root `Cargo.toml`.
+It adds this list to check, test, final, doc, and build without `--release`.
+This includes filtered test runs.
+It merges Work Order `--features` and the build example's required features without duplicates.
+A named package owns feature names without a slash. Names with a slash keep their spelling.
+Without a package, feature names pass unchanged, including for `doc`.
+Release builds and lint receive no dev features.
+A missing or empty list keeps the Cargo arguments unchanged.
+A value other than a list of strings refuses the step with one line.
 
-The checkout and target survive exit, including a failed rustdoc run. Unchanged dependencies reuse artifacts in the repo's target directory; path-source package ids separate the checkout's workspace artifacts from the worktree's. The lock prevents concurrent runs for this repo from sharing its checkout. No checkout goes in tmpfs. Rustdoc never reads the working tree, so unstaged and untracked files do not change the result.
+The local checkout and target survive exit, including a failed rustdoc run.
+Local rustdoc reuses dependencies in the original target directory.
+Path-source package ids separate checkout workspace artifacts from worktree artifacts.
+Remote rustdoc uses its mirror's build output.
+The copies lease prevents concurrent runs from sharing the standing checkout.
+No checkout goes in tmpfs.
+Rustdoc reads staged sources only, so unstaged and untracked files do not change the result.
 
 The record has four keys: `repo_top` (the resolved path of the original repo, not the checkout), `tree_id`, `time` (UTC ISO 8601) and `call_id` (the build-log call id, `BUILDLOG_CALL_ID`). The write goes to a temporary file and is then renamed, with fsync on the file and the folder. Each write deletes records older than 14 days. The records are outside the worker session folder, so `end_session.sh` does not delete them. Workers can run `doc` too; their Work Orders do not ask for it.
 
@@ -47,7 +79,12 @@ The record has four keys: `repo_top` (the resolved path of the original repo, no
 
 ### `lint`
 
-`lint` runs mend, fmt, taplo, clippy fix, fmt and clippy judgment. It does not run rustdoc. It takes `<package>` or `--workspace [--check]` and refuses all other arguments, `--features` included (usage, exit 2).
+`lint` runs mend, fmt, taplo, and a clippy judgment.
+After a failed judgment, it runs fix and fmt passes, then judges again.
+[Lint-step fix](build-followups-mul-add.md#lint-step-fix) defines those passes.
+Lint does not run rustdoc.
+Its form is `verify.sh lint [<package>] [--check] [routing flags]`.
+No package means the whole workspace. `--features` and `lint --workspace` refuse with exit 2.
 
 ### The hook
 
@@ -80,13 +117,21 @@ A refusal is a `permissionDecision: deny` with a reason. The reason names the ca
 
 ### `final`
 
-`final` runs `cargo check --workspace --all-targets`, then `run_nextest --workspace --tests`. The check type-checks every example once. `--tests` selects each target with `test = true`. By default that is each lib, bin and integration test, and no example. `final` does not pass `--lib`, so a workspace with no library works.
+An unpinned `verify.sh final [<package>]` runs the workspace all-targets check, then nextest with `--tests`.
+Both steps run on natedev.
+A target flag pins both movable steps to that target.
+A pinned final keeps the clean-tree check and saves no pass.
+The check type-checks every example once.
+A named package limits nextest to that package. The check still covers the whole workspace.
+`--tests` selects each target with `test = true`.
+By default, this includes libraries, binaries, and integration tests, but no examples.
+`final` does not pass `--lib`, so a workspace without a library works.
 
-`final` always runs these commands, even when a prior pass exists. On exit 0,
-it records a pass only when the checkout was clean at call start and remains
-clean with the same Git tree at exit. Staged changes, unstaged changes and
-untracked files prevent a record. A failed run or a changed tree prints one
-line and writes no record.
+Without `--saved`, `final` always runs these commands, even when a prior pass exists.
+A run with a named package or an explicit routing flag saves no pass.
+On exit 0, an unpinned workspace run saves a pass only if the checkout stays clean with the same Git tree.
+Staged changes, unstaged changes, and untracked files prevent a record.
+A failed run or changed tree prints one line and writes no record.
 
 The machine-wide record is `~/.local/state/verify/final_pass/<tree>.json`.
 `VERIFY_STATE_DIR` changes the `verify` folder for private state. The record
@@ -97,23 +142,35 @@ and folder are synced after an atomic write. Writes prune JSON records older
 than 14 days. The record survives session cleanup and can be reused from a
 second checkout of the same tree.
 
-`verify.sh final-pass [<tree>]` reads this proof. Without a tree argument, it
-requires the current clean HEAD tree. It prints the JSON record and exits 0
-only when the tree, status, compiler text and verify.sh hash match. A missing,
-unreadable or different record exits 1 with one reason. This query runs before
-environment setup, uses no Cargo or build admission, and needs no unit session.
-It never writes state or prunes records.
+`verify.sh final --saved [--tree <tree>]` reads this proof.
+Without `--tree`, it requires the current clean HEAD tree.
+It prints the JSON record and exits 0 only when the tree, status, compiler text, and `verify.sh` hash match.
+A missing, unreadable, or different record exits 1 with one reason.
+This query runs before environment setup. It uses no Cargo or build admission and needs no unit session.
+It never writes state or prunes records. `--tree` requires `--saved`.
 
 ### The example scan
 
-`UNTESTED_EXAMPLES_PY` reads `cargo metadata --no-deps`. It runs before the cache lookup and before any build, for `final` (the whole workspace) and for `verify.sh test <package>` with or without `--features`. It does not run for `--filter` or for a named integration test. For each example target, it scans the source for a line that starts with `#[cfg(test)]` or `#[...test]` (with optional `path::` segments). For an example at `examples/<name>/main.rs`, it scans every `.rs` file in that folder. A commented attribute does not match. Each offender gets two lines on stderr, a reason and a fix:
+`verify_metadata.py` answers `untested-examples:<scope>` from the call's saved metadata before the cache lookup and any build.
+It runs for `final` and `verify.sh test [<package>]`, with or without `--features`.
+It does not run for `--filter` or `--test <name>`.
+For each example, it scans for source lines that start with `#[cfg(test)]` or `#[...test]`, with optional `path::` segments.
+For a directory example (`examples/<name>/main.rs`), it scans every `.rs` file in that folder.
+A commented attribute does not match.
+Each violation gets two stderr lines, a reason and a correction:
 
 - `example <name> holds a test: <path>:<line> has <attribute>, and examples carry no tests.` / `move it into <package>'s src/ or tests/, or delete it.`
 - `example <name> sets test = true in <manifest>, and examples carry no tests.` / `remove test = true from its [[example]] entry.`
 
 One example can get both refusals; the test refusal comes first. Offenders follow metadata order: package, then target. A blank line separates two offenders. Any offender gives exit 2.
 
-`TEST_TARGETS_PY` picks the targets for `verify.sh test <package>`: `--lib` when the package has a lib, plus its bins and its test-enabled `test` and `bench` targets. It never selects examples. If a target needs features that are off, or another member has a target with the same kind and name, it falls back to `--bins --tests`, with `--lib` when the package has a lib.
+The `test-targets` answer in `verify_metadata.py` selects targets for `verify.sh test [<package>]`.
+`take_test_targets` reads that answer into `TEST_SELECTION`.
+Without a package, it reads every workspace member.
+For a named package, it selects `--lib` when present, binaries, and test-enabled `test` and `bench` targets.
+It never selects examples.
+If required features are off, or another member shares a target's kind and name, it uses `--bins --tests`.
+It also adds `--lib` when the package has a library.
 
 ## Invariants
 
@@ -121,7 +178,11 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - `doc` always covers the whole workspace. A change in one member can break the intra-doc links of another member.
 - The doc record path is `~/.local/state/verify/doc_pass/<tree_id>.json`, and its keys are `repo_top`, `tree_id`, `time` and `call_id`. `verify.sh` and the hook must agree on both.
 - `doc_tree` writes the staged tree from a private copy of the index. It runs no `git add` and never changes the real index. Unstaged and untracked files are not in the tree.
-- `doc` runs rustdoc in a locked, stable staged-tree checkout under the original repo's target directory, never in the working tree or tmpfs. The record's `repo_top` is the original repo top. The private index and checkout persist; unchanged source mtimes and dependency artifacts are reused.
+- `doc` prepares its staged snapshot through `copies.py hold` with `StagedSource`.
+  Local rustdoc runs there and stores artifacts in the original target directory.
+  Remote rustdoc copies that snapshot to its mirror and uses the mirror's build output.
+  The record names the original repository top.
+  The checkout and private index persist for later reuse.
 - A staged tree that changes during a `doc` run writes no record. An unstaged edit during the run does not stop the record. A failed `doc` writes no record.
 - `lint` does not run rustdoc and refuses `--features`.
 - The hook fails closed for Cargo checkpoints and opaque commands with git commit/merge words plus explicit checkpoint text in any cwd (or unreadable messages in a Cargo cwd). Modeled constructs never use quote-removed fallback evidence. Unrelated opaque calls and default merges pass. The first check stays cheap: every Bash call reaches it.
@@ -130,6 +191,8 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - Both hooks use the command parser in `checkpoint_gate.py`. The doc hook uses `SUBJECT` to check each message line.
 - `final` must not link examples, and the example scan must run before any build. Together they make sure no test is lost.
 - `final` must not pass `--lib`.
+- `verify_doc_test_support.py` sets `LINT_SKIP_SWEEP=1` in the doc-test environment.
+  This prevents a detached lint sweep from writing into the temporary home after the test ends.
 - Tests that pin this: `test_verify_doc.py`, the `test_verify_lint_*.py` modules (shared fixture: `verify_lint_scope_test_support.py`), `test_checkpoint_doc_gate.py`, `test_verify_final_targets.py` and `test_verify_untested_examples.py`.
 - A repo with no `Cargo.toml`, such as `~/.claude`, needs no doc record, but its checkpoints still follow the own-call rule.
 
@@ -143,23 +206,22 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - Both hooks ignore example checkpoint text in other commands. Both hooks pass help requests before repository and message checks.
 - Both hooks refuse `--trailer` on checkpoints and merges, or when the message or merge state is unknown. Supply the complete message through literal `-m` text, a `-F` file, or a supported heredoc.
 - `doc` judges only the staged tree. A plain `git commit` also leaves out unstaged and untracked files, so they need no action. With `-a`, `--only`, `--include` or paths, the commit writes working changes that `doc` did not judge. The record then matches only if those changes were staged before `doc`.
-- `doc` always uses the original repo's target directory and a stable checkout below it. Later staged trees preserve unchanged source mtimes; the private checkout lock covers the whole doc run. Missing or damaged checkout metadata gets one fresh checkout, not a shared or temporary source tree.
-- The memory gate can hold a doc step for minutes. A one-file crate waited 15 min for a 2.6 s rustdoc run.
-- An example that sets `test = true` makes `final` and `test` refuse until the line is removed. hana main and bevy_hana still have two such lines (fairy_dust and hana_clerestory). hana_clerestory pads the `=`, so a search for `test = true` misses it; search with `test *= *true`.
-- A hana build outside its checkout needs its flake shell (`direnv exec <hana checkout> …`). Without it, mold fails with "library not found: gbm".
-- Measured on hana init/catalyst (83 examples in 27 packages, natedev): the `final` test build fell from 1,051 build units to 942, and its log held no example unit. Timed 2026-10-28 under a natedev build hold (nothing else compiling): after a touch of `hana_tool_schema` (21 of 27 members and 82 examples depend on it), the test build (`cargo nextest run --no-run`) rebuilt 49 units with examples and 35 without. Two alternated runs each: 124 s and 86 s before, 77 s and 63 s after, a mean of 105 s against 70 s, about 35 s (a third) saved per `final` test build. A first timing without a hold (load 180–220, about 900 s memory-gate waits) was noise.
+- Local `doc` uses the original target directory and a standing checkout from `copies.py hold`.
+  Its lease covers the whole doc run.
+  `StagedSource` preserves unchanged source mtimes.
+  The copies owner repairs the private index and removes stale private index locks under that lease.
+- A local doc step can wait for memory even when rustdoc itself needs little time.
+- An example that sets `test = true` makes an unfiltered `test` or `final` refuse. Whitespace around `=` does not change this rule.
+- A hana build outside its checkout needs its flake shell (`direnv exec <hana checkout> …`).
+  Without it, mold can fail with `library not found: gbm`.
 
 ## Why
 
-Rustdoc ran in every `verify.sh lint` call. It used much worker time and caught few errors. One run per phase, at the checkpoint, keeps the check and removes the repeats. The user required that it be impossible to skip rustdoc in a phase, so a hook enforces it, and the record is keyed to the exact committed tree. Rustdoc runs on a checkout of the staged tree, so it judges what a plain commit writes and nothing else. A staged edit after the doc run makes the record not match. An unstaged or untracked file is in neither tree, so it cannot change the verdict.
+One rustdoc run at the checkpoint checks the exact committed tree without repeating rustdoc in worker lint calls.
+The shared hook covers Cargo repositories without installing a Git hook in each repository.
+Whole-workspace rustdoc checks links between members.
 
-The hook is a Claude Code PreToolUse hook, not a git commit-msg hook. A commit-msg hook needs an install in each repo; the PreToolUse hook covers every repo from one `settings.json` entry.
-
-Rustdoc runs on the whole workspace, not on changed members only. A change in one member can break the intra-doc links of another member.
-
-In `final`, `cargo check --all-targets` already type-checks the examples, so linking them again in the test build adds no check. `--tests` alone selects the right targets. These options were ruled out:
-
-- `--lib --bins --tests` fails with "no library targets found" (exit 101) in a workspace with no library.
-- Exact per-target selection from metadata needs more code, and `--bins` still links bins that set `test = false`.
-
-An example test that `--tests` does not select would be lost without a signal. The example scan refuses such examples before the build, so the smaller build loses no test.
+The all-targets check already type-checks examples.
+Nextest uses `--tests` to avoid linking those examples again.
+The example scan prevents this selection from losing an example test.
+`--lib --bins --tests` cannot replace it, because `--lib` fails in a workspace with no library.

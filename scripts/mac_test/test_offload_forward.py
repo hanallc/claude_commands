@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 import shlex
 import signal
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
+from unittest import mock
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import offload
-from offload_test_support import HANA, OffloadCommandFixture
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.build_queue import execution_identity
+from scripts.build_hold.owning_session import OwningSession
+from scripts.build_queue import placement
+from scripts.mac_test import eligibility, nextest_log, offload
+from scripts.mac_test.claim_state import RepositoryScope
+from scripts.buildlog import sync as buildlog_sync
+from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
+from scripts.lib import test_hang_guard
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -44,6 +45,16 @@ class OffloadForwardTests(OffloadCommandFixture):
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
 
+    def test_named_environment_reaches_the_remote_copy_command(self) -> None:
+        self.environment["SHOT_OUTPUT"] = "target/shots"
+        answer = self.command(
+            "--workspace", runner_options=("--env", "SHOT_OUTPUT", "--copy"), call_id="call-forward",
+            subprocess_cli=True, separate_stderr=True,
+        )
+        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
+
     def test_values_keep_their_bytes_and_only_named_variables_are_forwarded(self) -> None:
         value = "spaces 'quotes' \"double\"\nand a newline; $(do-not-run)"
         self.environment.update({"SHOT_OUTPUT": value, "UNNAMED_PRIVATE_VALUE": "never sent"})
@@ -54,34 +65,84 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         remote = self.events_for("ssh")[-1]["args"][-1]
         words = shlex.split(remote)
-        self.assertEqual(words[3:6], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
-        self.assertEqual(words[6], "PATH=$HOME/.cargo/bin:$PATH")
+        forwarded_start = words.index(f"SHOT_OUTPUT={value}")
+        self.assertEqual(words[forwarded_start:forwarded_start + 3], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
+        self.assertEqual(words[forwarded_start + 3], "PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", words)
         self.assertNotIn("UNNAMED_PRIVATE_VALUE", remote)
         self.assertNotIn("never sent", remote)
         self.assert_wire("passed", "")
 
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
-        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",))
-        config = offload.read_config(self.config_path)
+        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
+        config = eligibility.read_config(self.config_path)
         expected = (
-            'cd .local/state/mac-test/mirror/hana && PATH="$HOME/.cargo/bin:$PATH" '
+            'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
+            + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
+            + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
+            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
+            + nextest_log.capture_function(nextest_log.output_limits(config.settings)) + " && "
+            + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
-            + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
+            + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
+            + '{ if cd "$HOME"/.local/state/mac-test/test-mirror/hana; then trim_started=$(date +%s); '
+            + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
+            + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
+                          + 'config = conf.read("lint"); '
+                          + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
+                          + 'config.number(sweep.RECENT_KEY)))')
+            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1; then '
+            + 'trim_status=0; else trim_status=$?; fi; '
+            + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
+            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
+            + 'trim_size=${trim_size%%[[:space:]]*}; '
+            + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
+            + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
+            + 'else over_budget=unknown; fi; '
+            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
+            + '"$trim_status" "$trim_elapsed" "$over_budget"; '
             + 'if free_gib=$(df -g "$HOME"); then '
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/mirror/hana/target; then echo mac_cleanup=0; '
-            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
+            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
+            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
+            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
+            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
+            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; '
+            + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
-        self.assertIn("cd .local/state/mac-test/mirror/hana && rm -rf -- target/shots && PATH=", fetch)
+        self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
+        self.assertIn(" || :; } && rm -rf -- target/shots && run_nextest_logged() ", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)
+
+    def test_nextest_setup_failure_declines_without_fetching(self) -> None:
+        self.configure_fetch(run_status_line="mac_nextest_setup=failed")
+        result = self.command(runner_options=("--fetch", "target/shots"))
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assert_fetch_wire("not_run", mac="declined", reason="state")
+        self.assertNotIn("Treat the failure as real", result.stdout)
+        self.assertFalse(any("fetch_kib=" in event["args"][-1] for event in self.events_for("ssh")))
+        self.assertFalse(self.claim_file.exists())
+
+    def test_placed_mac_command_sends_the_assignment_placement_to_the_cargo_gate(self) -> None:
+        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
+        destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
+        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, execution_identity.SourceKeyKnown("source-a"),
+            placement.SubmittingOwner("natedev", 42, "start"), OwningSession("submitting-session"), 1.0)
+        config = eligibility.read_config(self.config_path)
+        with self.subTest(placement="assigned"), mock.patch.dict(os.environ, {"MAC_PLACEMENT": "environment/value"}):
+            placed = shlex.split(offload.remote_test_command(
+                config, replace(request, placement=offload.AssignedOffloadRequest(assignment)), HANA))
+            gate = placed.index("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH")
+            self.assertEqual(placed[gate + 1], "MAC_PLACEMENT=episode-a/attempt-b")
+        with self.subTest(placement="direct"):
+            self.assertNotIn("MAC_PLACEMENT=", offload.remote_test_command(config, request, HANA))
 
     def test_argument_refusals_start_no_work(self) -> None:
         self.environment["SHOT_OUTPUT"] = ""
@@ -89,7 +150,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         cases = [
             ("--env",), ("--fetch",), ("--env", "bad-name"), ("--env", "1BAD"),
             ("--env", "NOT_SET_HERE"), ("--env", "SHOT_OUTPUT", "--verb", "check"),
-            ("--env", "SHOT_OUTPUT", "--copy"), ("--fetch", "target/shots", "--verb", "doc"),
+            ("--fetch", "target/shots", "--verb", "doc"),
             ("--fetch", "target/shots", "--copy"),
         ]
         cases.extend(("--fetch", folder) for folder in (
@@ -100,7 +161,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             with self.subTest(options=options):
                 answer = self.command(
                     "--workspace", runner_options=options, call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True,
+                    subprocess_cli=True, separate_stderr=True, direct_placement=True,
                 )
                 self.assertEqual(answer.returncode, 2, answer.stdout + answer.stderr)
                 self.assertIn("error:", answer.stderr)
@@ -118,7 +179,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--env", "bad-name"),
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, direct_placement=True,
         )
         self.assertEqual(answer.returncode, 2, answer.stdout + answer.stderr)
         self.assertFalse(self.result_path.exists())
@@ -135,9 +196,18 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_fetch_publishes_files_before_releasing_claim(self) -> None:
         self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0")
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace('exit "${pull_status:-0}"',
+            'printf "Total bytes sent: 72\\nTotal bytes received: 128\\n"; exit "${pull_status:-0}"').replace(
+                'if [[ $remote == *fetch_kib=* ]]; then',
+                'if [[ $remote == *sweep.sweep_workspace* ]]; then\n'
+                + '    printf "mac_exit=0\\nmac_cleanup=kept\\n"\n'
+                + '    exit 0\n'
+                + 'fi\n'
+                + 'if [[ $remote == *fetch_kib=* ]]; then'))
         answer = self.command(
-            "--workspace", runner_options=("--fetch", "target/shots/"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            "--workspace", runner_options=("--fetch", "target/shots/", "--target", "mac"), call_id="call-forward",
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         landing = self.state_directory / "fetched/call-forward/target/shots"
@@ -146,20 +216,29 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assert_fetch_wire("fetched")
         self.assertIn(f"mac_test: fetched target/shots from the Mac to {landing} (12 KiB)", answer.stdout)
         events = self.events()
-        self.assertEqual([event["command"] for event in events], ["ssh", "rsync", "ssh", "ssh", "rsync"])
+        self.assertEqual([event["command"] for event in events], ["ssh", "rsync", "ssh", "ssh", "rsync", "ssh"])
         self.assertTrue(all(event["claimed"] for event in events))
         self.assertFalse(self.claim_file.exists())
-        self.assertIn("du -sk target/shots", events[-2]["args"][-1])
-        pull = events[-1]["args"]
-        self.assertEqual(pull[:4], ["-rlp", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
-        self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
+        self.assertIn("du -sk target/shots", events[-3]["args"][-1])
+        self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
+        pull = events[-2]["args"]
+        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
+        self.assertEqual(pull[-2], "mac:.local/state/mac-test/test-mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        attempt = [row for row in rows if row.get("kind") == "ssh_attempt"][-1]
+        transfers = cast(list[buildlog_sync.TransferBytes], attempt["transfers"])
+        self.assertEqual(transfers[-2], {"operation": "rsync_fetch", "sent_bytes": 72,
+                                        "received_bytes": 128, "complete": True})
+        self.assertEqual(transfers[-1]["operation"], "ssh_run")
 
     def test_fetch_missing_does_not_pull(self) -> None:
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("missing")
@@ -172,7 +251,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_answer="fetch_kib=1025\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("too_large")
@@ -183,7 +262,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(pull_status=23)
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("failed")
@@ -197,7 +276,7 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.configure_fetch(fetch_answer=response, fetch_probe_status=status)
                 answer = self.command(
                     "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True,
+                    subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
                 )
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                 self.assert_fetch_wire("failed")
@@ -209,7 +288,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(hold_fetch_probe=True)
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertTrue((self.stub_directory / "fetch-probe-started").exists())
@@ -218,13 +297,14 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
 
     def test_fetch_after_failure_and_no_tests_preserves_the_mac_status(self) -> None:
-        for status, wire_status, reason, exit_code in ((37, "failed", "", 37), (4, "declined", "no_tests", 75)):
+        cases = ((37, "failed", "", 37), (75, "failed", "", 75), (4, "declined", "no_tests", 75))
+        for status, wire_status, reason, exit_code in cases:
             with self.subTest(status=status):
                 self.fixture["run_status_line"] = f"mac_exit={status}"
                 self.sync_fixture()
                 answer = self.command(
                     "--workspace", runner_options=("--fetch", f"target/shots-{status}", "--call-id", f"call-{status}"), call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True,
+                    subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
                 )
                 self.assertEqual(answer.returncode, exit_code, answer.stdout + answer.stderr)
                 self.assert_fetch_wire("fetched", wire_status, reason)
@@ -238,14 +318,15 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
-        self.assert_fetch_wire("not_run", "lost")
+        # The launch was authorized and its start never settled, so its cleanup is unconfirmed.
+        self.assert_fetch_wire("not_run", "lost", "cleanup_unconfirmed")
         self.assertFalse((self.stub_directory / "pull-started").exists())
         self.config["offload"] = "off"
         self.sync_config()
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "declined", "off")
@@ -257,7 +338,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         _ = (landing / "keep").write_text("original")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("failed")
@@ -276,7 +357,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True,
+            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertFalse((fetched / "old-call").exists())

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import json
-import sys
 import tempfile
 import time
 import unittest
@@ -11,7 +10,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import script_prompts  # noqa: E402
 
 
@@ -35,6 +33,16 @@ class ScriptPromptTests(unittest.TestCase):
         self.assertFalse(script_prompts.typed_by_script("", "/resume where you stopped."))
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
             self.assertTrue(script_prompts.typed_here("/resume where you stopped."))
+
+    def test_script_typed_prose_classifies_as_scheduled(self) -> None:
+        from scripts.hooks import conversation_pause
+
+        text = "yes i approve it"
+        script_prompts.record("w1:p1", text)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "CLAUDE_CODE_SESSION_ID": ""}):
+            source = conversation_pause.prompt_source(text, lambda: frozenset(), lambda: ())
+        self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
+        self.assertFalse(script_prompts.typed_by_script("w1:p1", text))
 
     def test_old_record_classifies_as_script_until_the_hook_consumes_it(self) -> None:
         from scripts.hooks import conversation_pause

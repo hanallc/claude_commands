@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import foreign_hostname
+
 import os
 import json
 import subprocess
@@ -12,34 +14,32 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast, override
+from typing import Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
-import index
-import launches
-import mac_report
-import mac_outcome
-import store
+from scripts.buildlog import index
+from scripts.buildlog import launches, mac_report
+from scripts.buildlog import mac_outcome
+from scripts.buildlog import store
 
-if TYPE_CHECKING:
-    from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from ..lint.memory_test_support import config_environment
-else:
-    from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-    from scripts.lint.memory_test_support import config_environment
-from test_holds import hold_event, timed_hold_events, write_mac_block
-from test_index import Record, call, encode, point_root_at, step
-from test_report import MeasuredCliRun, measure_cli_work
-from user_zone import user_zone
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.lint.memory_test_support import config_environment
+from scripts.buildlog.test_holds import hold_event, timed_hold_events, write_mac_block
+from scripts.buildlog.test_index import Record, call, encode, point_root_at, step
+from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
+from scripts.buildlog.test_memory_window import configured_local_host
+from scripts.lib.user_zone import user_zone
+from scripts.lib import test_hang_guard
+from scripts.mac_test.offload import MirrorBusyCheck, RecordedMirrorSession
 
 CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
 START = "2026-10-11T15:09:00.000Z"
 END = "2026-10-12T15:09:00.000Z"
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(foreign_hostname())
 
 
 class MacCallFields(TypedDict, total=False):
@@ -578,7 +578,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("| Blocked | natedev held |", output)
 
     def test_mac_report_cli_accepts_custom_hours_without_collecting_launches(self) -> None:
-        import cli
+        from scripts.buildlog import cli
 
         with patch.object(launches, "collect", side_effect=AssertionError("launch collection must not run")):
             with patch("builtins.print") as printed:
@@ -586,7 +586,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("## Last 2 hours", str(printed.call_args))
 
     def test_mac_report_cli_rejects_invalid_hours_before_updating_index(self) -> None:
-        import cli
+        from scripts.buildlog import cli
 
         for args in (["--hours", "0"], ["--hours", "nan"], ["--hours", "-1"], ["--hours"], ["--day", "today"]):
             with self.subTest(args=args):
@@ -634,6 +634,30 @@ class MacReportTests(unittest.TestCase):
         summary = self.summary()
         self.assertEqual(len(summary.busy_holders), 2)
         self.assertEqual(sorted(summary.busy_holders.values()), [1, 1])
+
+    def test_recorded_mirror_sessions_read_and_print_the_stored_holder_text(self) -> None:
+        cases = (
+            ("last recorded mirror session reader", MirrorBusyCheck.UNREPORTED),
+            ("last recorded mirror session reader (mirror lease)", MirrorBusyCheck.LEASE),
+            ("last recorded mirror session reader (mirror process check)", MirrorBusyCheck.PROCESS),
+        )
+        for number, (text, _) in enumerate(cases):
+            self.write(self.mac_call(f"mirror-{number}", "declined", "busy", mac_holder=text))
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            holders = {call.call_id: call.holder for call in mac_report.read_test_calls(connection, START, END)}
+        output = self.report()
+        for number, (text, check) in enumerate(cases):
+            holder = holders[f"mirror-{number}"]
+            with self.subTest(text=text, stage="read"):
+                assert isinstance(holder, RecordedMirrorSession), holder
+                self.assertEqual(holder.session, "reader")
+                self.assertEqual(holder.mirror_check, check)
+            with self.subTest(text=text, stage="print"):
+                self.assertIn(f"- {text}: 1", output)
+
+    def test_holder_text_formats_a_recorded_mirror_session(self) -> None:
+        self.assertEqual(mac_report.holder_text(RecordedMirrorSession("reader")), "last recorded mirror session reader")
 
     def test_mac_block_intervals_replace_decline_bounds_and_natedev_holds_use_the_union(self) -> None:
         self.write(hold_event("began", "mac-block", "2026-10-12T07:00:00Z", "mac"),
@@ -687,7 +711,8 @@ class MacReportTests(unittest.TestCase):
                     caller="verify-mac" if 100 <= number < 200 else "verify",
                     tree_key=f"tree-{number % 100}", status=1 if 100 <= number < 200 else 0,
                 )))
-            hold_rows = timed_hold_events(began, now)
+            with patch.object(store, "host_name", side_effect=configured_local_host):
+                hold_rows = timed_hold_events(began, now)
             for hold_row in hold_rows:
                 _ = handle.write(encode(hold_row))
         self.assertEqual(index.update(), 65_600 + len(hold_rows))

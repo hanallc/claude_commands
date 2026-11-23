@@ -1,7 +1,7 @@
 # Message clarity
 
 `send.py` resolves staff names and addresses through one staff snapshot. Staff selects the row's `current_session`.
-Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+Unit names match their staff names exactly. Ambiguous staff names stop delivery.
 A non-staff name uses a unique live roster session, locally before the peer.
 A missing name exits 2 with a named note. It creates no relay or queue.
 Explicit non-staff addresses retain their transport and queue behavior. Worker staff lookup uses native IDs from either machine's roster.
@@ -22,12 +22,8 @@ Claude identity comes from the runtime registry checks.
 
 Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
 The generated metadata forms one block directly after the preview line.
-Only the `Authority:` line in that block grants authority.
-Quoted labels elsewhere grant no authority.
-Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
-The live key must contain a valid native address. A missing or invalid key grants no mark.
-A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
-The mark proves runtime attribution, not authentication.
+No sender gets an authority line. The sender lines name the sender for each message (user, 2026-11-13).
+The stamp proves runtime attribution, not authentication.
 Code under the same operating-system account can set its environment.
 
 `Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
@@ -38,18 +34,94 @@ This context check prevents accidental use. It does not prove that `remote()` su
 A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
 Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
 A drain never attributes an old message to its own runtime.
-Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Delivered caller lines that start with `Sender native id:` get a `> ` prefix.
 Rendering first converts CR, CRLF, and Unicode line separators to LF.
 This rule covers the summary, body, sender name, and forwarded display text.
 The prefix also applies after leading spaces. Generated stamp lines keep their original form.
 Queue records and logs keep the raw caller text.
 These fields do not change the recipient, reply name, or message key.
 
+### Messages during an ad hoc review
+
+`review_hold=off` in `config/send.conf` disables message holding for all sessions.
+The next prompt or session start delivers any messages still held.
+Use `/tune` to set `review_hold=on` when message holding can resume.
+
+`send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
+Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
+Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
+The session then gets one short notice: `N held messages from the review in <path>, under "Released at HH:MM:SS <zone>". Read them at your own pace.` (`Read it` for one message.)
+A send that ends a hold puts the notice above the new message.
+A failed append keeps the messages held. A send that carries a new message fails; other paths print one stderr line.
+When an urgent message replaces every held message by its key, nothing is filed and the urgent message goes plain.
+An unconfirmed delivery cuts the file back to its size before the append and keeps the messages held.
+If the file changed after the append, the file stays as it is and stderr gets one line.
+No code deletes the file; the agent reads it.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a unique name match, it gives a `session:` address.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
+
 ### Replies to relay sockets
 
-The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
+The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
+On Linux, it also records the boot ID. The launcher saves the sender name in `message/relay_senders/<pid>`.
+Claude runs with the same PID and owns `cc-socks/<pid>.sock`.
 
-`send.py drain-sockets` recovers old raw `uds__*.sock.jsonl` queues. It delivers each message in a file whose newest entry is under 24 hours old to the named live session, marked `Stuck message from <original time>:`. Recovery uses the relay record, then queued recipient metadata (`to_name`, `to-name`, `recipient_name`, or a named `to`). Each stable recovery ID gets a flushed and fsynced attempt in `message/socket-recovery-attempts.jsonl` before delivery, followed by its durable result in `message/log.jsonl`. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends. An attempt without a result is archived without resending: `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent` (exit 3); a later run has nothing to repeat. Known failed sends remain for retry, without another queued copy. Unresolved or unreadable files stay in place and are reported by path (exit 3); other files still run. Older files move intact to `message/socket-queue-archive/`; one line gives the file count and oldest and newest message times. Archive names never overwrite another item, and a retry reuses an identical uncertain entry's archive. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report, without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move.
+A native session or registered socket selects one conversation from the routing registry read.
+The sender uses the same owner check as the unit report.
+A staff name or `staff:<id>` selects a staff recipient.
+Only a staff recipient can select a successor when the sender prepares another attempt.
+A reply to an active relay selects its process generation.
+After confirmed absence, the relay's saved sender can supply a fallback conversation.
+A retry to a native conversation can use a new process generation for that conversation.
+
+The sender checks the owner before connecting.
+The private proxy checks the peer PID, process start, registry conversation, and socket immediately before forwarding on the same connection.
+A pre-tool hook permits one `SendMessage` call with the private address and expected message.
+The proxy buffers the request until the relay closes its write side.
+Before it writes any bytes, the proxy compares the decoded body with the exact encoding of the approved text.
+The encoder matches the two tag escape passes in Claude Code 2.1.319.
+The sender uses the tool ID from the completed proxy write to find the approved call and its result.
+The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
+Claude's socket protocol has no expected conversation field.
+The race window extends from the final registry check until the receiver accepts the request.
+The sender closes its cleanup pipe on exit. The cleanup process removes the private directory.
+
+A queue entry stores the native conversation or staff ID and the process generation when available.
+The queue reader checks the current native owner before it prints the message.
+An explicit staff queue request reads the queue for that staff ID.
+The reader preserves the original bytes of entries with invalid, ambiguous, or conflicting recipient fields.
+An unknown owner or a peer mismatch fails the send.
+An offline staff queue requires proof of absence.
+SSH forwards native session addresses as conversations and staff addresses as staff IDs.
+
+Registered Claude delivery uses the checked relay. The Python postmaster records include the recipient PID and process start.
+New postmaster receipts must match that recipient. Postmaster stays disabled for registered sends until its mod validates the generation.
+Existing receipts without recipient evidence can settle earlier claims that also lack that evidence.
+A staff retry checks legacy reservations under its current or original conversation.
+The retry stays pending until a definite result resolves the legacy reservation.
+
+`send.py drain-sockets` can recover a raw socket queue when its entry proves the recipient.
+An entry with conflicting recipient fields stays in the file for inspection.
+A proved reply expires after 24 hours and moves to `message/socket-queue-archive/`.
+The drain moves the file intact when all of its replies qualify.
+The drain retains entries that need inspection in the original file.
+The drain records each attempt in `message/socket-recovery-attempts.jsonl` before delivery. It records the result in `message/log.jsonl` before removing the entry.
+An interrupted or unconfirmed attempt moves to the archive. A confirmed failure keeps the entry for retry.
+The drain prints and flushes each completed result before it removes the entry.
 
 ### The message guide
 
@@ -144,7 +216,8 @@ The gate permits only an exact match. A missing template id or failed gate check
 | --- | --- |
 | `check --title T (--action A \| --no-action) --text B [--priority N]` | Dry full review (including the second check). Prints the outcome and logs `dry`. Exits 0. A `Session:` line at the start of `--text` is kept. |
 | `replay [--limit N]` | Reviews sent pushes again from `pushover.jsonl`, newest first. Logs `replay`. Posts nothing. |
-| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Dry-reviews every catalog example. Exits 1 if any fails. See the catalog section. |
+| `texts [--id X]… [--approve [--user-spec SOURCE]]` | Reviews each selected example. Uses any current user approval when `--approve` has no `--user-spec`. Exits 1 if any review fails. |
+| `texts --ask --id X` | Prints each example and saves an approval request for the current herdr pane and Claude session. |
 | `sample <transcripts…> [--limit 20] [--since ISO]` | Dry-reviews recent replies. See the nightly section. |
 | `release --identity I -- SOURCE` | Prints one `ReleaseOutcome` word. |
 | `due` | Posts expired holds (legacy, see below). |
@@ -152,7 +225,7 @@ The gate permits only an exact match. A missing template id or failed gate check
 
 ### `scripts/notify/pushover.py`
 
-- Usage: `pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…`, which takes no positional arguments and no action flags.
+- Usage: `pushover.py --text-id ID --value k=v… [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] [--through-silence]`. The template supplies the title, action, and message.
 - Footer (user ask, 2026-10-27: an emergency push from the hana session did not say who sent it). `post_message()` is the one place a push goes out, also a push kept during silence (`post_kept()`) and a held push sent at hold expiry. It adds one last line after the review and the length checks, so a reviewed text and its approval do not change:
 
   ```
@@ -166,10 +239,11 @@ The gate permits only an exact match. A missing template id or failed gate check
   - The footer always fits in 1024 characters: a long message is cut at the end first, never the footer.
   - An empty sender is refused: nothing is posted, the log outcome is `refused before sending: no sender`, and the exit is 2.
   - `pushover.jsonl` logs the posted message, footer included. A kept push logs its message without the footer when kept, and with it when posted.
-  - Only `pushover.py` holds `api.pushover.net` under `scripts/` (`test_push_texts.py`), so no path posts round the footer.
+  - Only `pushover.py` holds `api.pushover.net` under `scripts/` (`test_push_texts_sources.py`), so no path posts round the footer.
 - An emergency push (priority 2) repeats every 300 s for 3 h until the user taps Acknowledge. Deleting it on the phone does not stop it. With `--key`, the post carries `tags=push_tag(KEY)` (`key-` and the first 16 hex digits of the key's SHA-256: the same key gives the same tag). Below priority 2, or with no key, there is no tag. Priority 2 is never kept during silence, and `post_kept()` passes the kept key, so a tag is never lost.
 - `pushover.py cancel [--source NAME] KEY` posts `token` to `receipts/cancel_by_tag/<tag>.json`, which stops every emergency push with the key's tag. It logs to `pushover.jsonl` with title `cancel emergency push` and outcome `cancel: cancelled N`, `cancel: nothing to cancel`, `cancel: refused: …`, `cancel: unreachable: …` or `cancel: keys missing`. It prints `pushover: cancelled N` or `pushover: nothing to cancel` and exits 0; it exits 1 when Pushover refused it or could not be reached, and 2 on usage or keys missing. No receipt is stored. (2026-10-23: a stall-watch prompt push kept repeating after the user answered the prompt.)
-- While the user's silence is on (`silence.py`), `deliver()` keeps a push below priority 2 in `silence-kept.jsonl` and silence end posts it. `deliver(…, key=, text_id=)` puts `--key` and `--text-id` in the `KeptPush`, so a released push gets the same footer. A kept push with the same non-empty key from the same source replaces the older kept one (`silence.keep_here()`), so silence end sends only the newest. On the Mac the key goes in the push JSON to natedev's `silence.py keep`. A held push sent after its hold expires has no key (`""`), and an old kept line with no key reads as `""`. An old kept line with no text id reads as `""` and is sent as free text. `silence.py drop --source S --key K` (`silence.drop()`) removes the kept pushes with that source and non-empty key and prints how many; on the Mac it asks natedev over ssh, and gives 0 when natedev cannot answer. `send.py retire --to user` runs it, so each kept push goes out once, and the alert of a closed rca.py case is gone before silence ends. When auto silence ends (`auto_silence.come_back()`), `silence.auto_off` goes first and the kept pushes follow: title `{sender}: you are back`, body `{held}`, one of `No pushes were held while you were away.`, `The push held while you were away comes next.` or `The N pushes held while you were away come next.`
+- Silence keeps a push below priority 2 in `silence-kept.jsonl` unless it uses `--through-silence`. Silence end posts the kept pushes. `deliver(…, key=, text_id=)` puts `--key` and `--text-id` in the `KeptPush`, so a released push gets the same footer. A kept push with the same non-empty key from the same source replaces the older kept one (`silence.keep_here()`), so silence end sends only the newest. On the Mac `deliver()` and `cancel()` run on natedev over ssh (`pushover.py deliver` with the push JSON, `pushover.py cancel`); the Mac has no Pushover keys. When natedev cannot be reached, the Mac logs the cause and returns 1. A held push sent after its hold expires has no key (`""`), and an old kept line with no key reads as `""`. An old kept line with no text id reads as `""` and is sent as free text. `silence.py drop --source S --key K` (`silence.drop()`) removes the kept pushes with that source and non-empty key and prints how many; on the Mac it asks natedev over ssh, and gives 0 when natedev cannot answer. `send.py retire --to user` runs it, so each kept push goes out once, and the alert of a closed rca.py case is gone before silence ends. When auto silence ends (`auto_silence.come_back()`), `silence.auto_off` goes first and the kept pushes follow: title `{sender}: you are back`, body `{held}`, one of `No pushes were held while you were away.`, `The push held while you were away comes next.` or `The N pushes held while you were away come next.`
+- `/nate adhoc [delay] through silence <instructions>` adds `--through-silence` to `send.py` and `pushover.py`. The push keeps its normal priority and review. A normal push does not repeat or need acknowledgement. `KeptPush.silence_policy` carries `SilencePolicy.SEND_THROUGH_SILENCE` in the Mac JSON sent to natedev. A record without this field uses `SilencePolicy.KEEP_DURING_SILENCE`. Every adhoc description starts with the user's request: "You asked ...". The reviewer never withholds such a note. Without `through silence`, silence keeps the requested note until silence ends.
 - With `--text-id`, the push is rendered from the catalog. The template sets the sender, the action and the Session line. The priority comes from the template's `need` (`note`→0, `decision`→0, `blocked`→2), unless `--priority 2` is given.
 - Refused before sending (exit 2, logged as `refused before sending: <reason>`):
   - no action stated
@@ -181,7 +255,7 @@ The gate permits only an exact match. A missing template id or failed gate check
   This logic lives in `user_action.py`: `parse_user_action`, `refused_at`, `FIX` and `REFUSED_BEFORE_SENDING`.
 - `action_conflicts(action, body)` gives a reason for each second action in the body (the text after the `Session:` and `Action:` lines) of a push with an action. A second action is a thing to type that the Action line does not hold: `type` or `type:` and its text, or a `! <command>` shell escape (`typed_texts()`). It is also a pane or session name that is not the one the Action line names: `in the X pane`, `X session`, `session named X` (`named_places()`). `a type of`, `type the go`, `the pane` and `a Claude session` name nothing. When the Action line names no pane or session, only the first check applies. Every catalog example gives no reason (`test_user_action.py`).
 - `user_action.py` also holds `SessionLine`, `NoSessionLine`, `NotificationSession`, `NO_SESSION_LINE`, `split_session`, `session_prefix` and `first_line(action, session)`. Every reader of the header keeps `Session: …` above `Action: …`.
-- `push_texts.render_entry()` drops a trailing `-unit` from a session name in a template value: the `sender` and `session` values, and any value that is a whole unit id such as `types-unit` (`push_texts.shown_value`; reviewer, 2026-10-21). Free text and other values keep every word, `per-unit` and `the trunk-unit plan` included. `parse()` changes no text.
+- `push_texts.render_entry()` preserves each staff name in template values. `parse()` changes no text.
 - Review order: the hold lookup runs first for free text and agent-written ids (`nate.adhoc`). Other registered ids skip it and, with a current approval (`push_texts.approval_date()`: every example's `sha256` in `push_texts_reviewed.json` matches `fingerprint()`), skip live review: outcome `Unreviewed`, detail `registered text, approved <date of the newest approval>`. Agent-written ids are checked like free text even with a current approval. Otherwise `review.review()` runs, unless `review_off` exists, in which case the push goes out as written with detail `review: off`. A `Questions` outcome is treated as `Failed`.
 - `pushover: reviewed JSON: {title, action, body[, session, text_id, failed_rules, findings, held, sent_despite_failed_review, held_source, held_identity]}` is printed before any post. `send.py` reads it.
 - Failed or Withheld:
@@ -219,19 +293,24 @@ The gate permits only an exact match. A missing template id or failed gate check
 A failed phone send permits no other phone path.
 Legacy failure records remain readable by the existing tools.
 
-- An auto-mode refusal goes only through `--text-id auto_mode.refused`. A push without it whose title or text has `auto mode` (or `auto-mode`) and `refused`, `denied` or `stopped` is held, before the claim, so a resend with the template is not skipped by `--repeat-minutes`. The three rca.py pushes (`RCA_TEXTS`: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`) are not held: their titles say the session stopped, and a cause can say that auto mode refused a command.
-- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `use_credits` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
+- An auto-mode refusal uses `--text-id auto_mode.refused`. A free-text refusal push is held before the claim.
+  The check matches `auto mode` or `auto-mode`, plus `refused`, `denied` or `stopped`, in its title or text.
+  A resend with the template is not skipped by `--repeat-minutes`.
+  The three rca.py pushes in `RCA_TEXTS` are exempt: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`.
+  They describe permission stops or refusals. A cause can name an auto-mode refusal.
+- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `codex_credit_accounts` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
 - `--text-id quota.paid_credits`: the caller gives `account`, `machine`, `credits`, `refill` and `next_reset`. `paid_credits_values()` fills `sender` from the session's own record; with no record (a script such as `quota_alert.py` on its timer, or the far side of `--machine`), it uses `--value sender`, then `--from`, and refuses a run with none.
 - `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the registered pushes (`SESSION_TEMPLATES`): the templates a session sends, and the three rca.py pushes with the rca.py call that sends them. `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
+  The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
 - After `parse()` renders a registered text, it refuses the run when `action_conflicts()` gives a reason: `<id> gives a second action: <reasons>`. A template value cannot add a second action. Registered texts other than agent-written ids are sent as rendered and skip live review when approved (2026-10-23: a `waits` value told the user to type `! kill …` in a second session).
 - `--text-id session.needs_go`: the session gives `session`, `machine`, `go`, `why` and `does`. `needs_go_values()` fills `sender` from the session's own record and drops a final period from `why` and `does`. It refuses the same things as `auto_mode.refused`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `type: Go:`, `until you allow`, `until you type` or `waits for your go` is held (`wrong_template()`).
 - `user()` passes the message's `--key` to `pushover.py`, in the free-text and the `--text-id` forms, so a kept push with the same key from the same sender replaces the older kept one, and a `--need blocked` push carries the key's tag. `remote()` forwards `--key` to the far `send.py`. `push_texts.user_send_argv(…, key=)` adds `--key`.
 - `send.py retire --to user --from SENDER --key KEY` stops the emergency push sent with KEY, once its reason has ended. It prints `retired N queued messages`, then `dropped N kept pushes` (`silence.drop()`: the pushes kept during silence with KEY from SENDER). Then it runs `pushover.py cancel --source SENDER KEY` (`cancel_user_push()`, through `run()` like `user()`, 30 s limit) and prints one line: `cancelled: the emergency push for KEY stopped` (exit 0), `nothing to cancel: no emergency push for KEY is repeating` (exit 0), or `FAILED: the emergency push for KEY may still repeat: <why>` (exit 3). The cancel is by tag with the app token, so it reaches a push sent from either machine that uses the same token. `escalate.py close KEY` calls it for a sent `--need blocked` hold; its pushes carry `--key escalate-KEY`.
-- One event sends one emergency push (2026-10-27: two `--key github-cold` sends 23 s apart reached the phone twice). A `--need blocked` send with no `--key` gets `user-emergency:<sender>:<first 12 hex of the title's sha256>` (`user_emergency_key()`). With no `--repeat-minutes`, its window is `pushover.EXPIRE_S` (`emergency_lifetime()`), and `claim(…, live=True)` skips a repeat: `SKIPPED: an emergency push with key K went to the user at T and is still live until E; to send a new one, retire it first: send.py retire --to user --from S --key K`, exit 0. A push that is not `sent` releases its claim (`forget_sent()`), and `retire --to user` forgets the key's last send to the user. `remote()` forwards `--repeat-minutes 0`, so only the sending host holds the window. An explicit `--repeat-minutes` wins; note and decision have no window without it.
-- An emergency push stops by itself when its cause is fixed (2026-10-27: a `github-cold` push repeated after the user ran `github-warmup` three times). A `--need blocked` (or `--priority 2`) send to the user with neither `--clears-when CMD` nor `--self-clearing` is refused before the claim: `REFUSED: ` and `NO_CLEAR_STEP`, exit 2, nothing pushed, no key claimed. `--self-clearing` (hidden from `--help`) is for a script that retires its own push: `stall_watch.py` (`user_send_argv(…, self_clearing=True)`; `end_prompt()` retires) and `escalate.py deliver()` for a blocked hold (`close` retires). `remote()` forwards `--self-clearing` for every blocked push, and this host keeps the record. A sent push with `--clears-when` is recorded in `STATE/emergencies.json` under the lock (`record_emergency()`, one record per sender and key): `key`, `sender`, `check`, `machine` (the host that posted it: this one, or the `--machine` host), `sent` and `expires` (sent + `pushover.EXPIRE_S`). `send.py clear-check` (`clear_check()`) prints nothing when the file is absent. It takes `.clear-check.lock` without waiting (a second run prints `clear-check: another run is in progress`), reads the records, and releases the lock while checks run. Each check runs as `/bin/sh -c CMD` in the home, stdin from `/dev/null`, with `CHECK_TIMEOUT_S` (20 s); past it the process group is killed. One line per record: `retired: KEY from SENDER: its check passed; <cancel line>` (record removed; `retire_user()`, the `retire --to user` path, or `ssh HOST send.py retire …` when `machine` is another host, after `forget_sent()` here), `kept: KEY from SENDER: its check exits N`, `kept: …: its check ran past 20 s and was stopped`, `dropped: KEY from SENDER: its push expired at T` (check not run), or `FAILED: KEY from SENDER: its check passed, but …` (record kept, exit 3). A file with no records is removed. `notifier.sh tick` runs it on both machines after its unlock while the file is non-empty, and logs only a failure to `notifier.log`; a tick with `NOTIFIER_STATE_DIR` set reads only `NOTIFIER_EMERGENCIES`. `github-warmup` runs it once the keys are warm (in /etc/nixos).
+- One event sends one emergency push (2026-10-27: two `--key github-cold` sends 23 s apart reached the phone twice). A `--need blocked` send with no `--key` gets `user-emergency:<sender>:<first 12 hex of the title's sha256>` (`user_emergency_key()`). With no `--repeat-minutes`, its window is `pushover.EXPIRE_S` (`emergency_lifetime()`), and `claim(…, live=True)` skips a repeat: `SKIPPED: an emergency push with key K went to the user at T and is still live until E; to send a new one, retire it first: send.py retire --to user --from S --key K`, exit 0. A push that is not `sent` releases its claim (`forget_sent()`), and `retire --to user` forgets the key's last send to the user. An emergency claim saves the owner pid and process start. Only a gone or replaced owner releases an unfinished claim, and a live owner or an unknown result keeps it, so only delivery starts the live window. `remote()` forwards `--repeat-minutes 0`, so only the sending host holds the window. An explicit `--repeat-minutes` wins; note and decision have no window without it.
+- An emergency push stops by itself when its cause is fixed (2026-10-27: a `github-cold` push repeated after the user ran `github-warmup` three times). A `--need blocked` (or `--priority 2`) send to the user with neither `--clears-when CMD` nor `--self-clearing` is refused before the claim: `REFUSED: ` and `NO_CLEAR_STEP`, exit 2, nothing pushed, no key claimed. `--self-clearing` (hidden from `--help`) is for a script that retires its own push: `stall_watch.py` (`user_send_argv(…, self_clearing=True)`; `end_prompt()` retires) and `escalate.py deliver()` for a blocked hold (`close` retires). `remote()` forwards `--self-clearing` for every blocked push, and this host keeps the record. A push with `--clears-when` is recorded in `STATE/emergencies.json` under the lock (`record_emergency()`, one record per sender and key). An emergency writes the record at acceptance (`accept_sent`). A `github.keys_cold:` key, or a push that is not an emergency, writes it at the claim, so a warm check also clears an interrupted cold-key claim. The record fields are `key`, `sender`, `check`, `machine` (the host that posted it: this one, or the `--machine` host), `sent` and `expires` (sent + `pushover.EXPIRE_S`). `send.py clear-check` (`clear_check()`) prints nothing when the file is absent. It takes `.clear-check.lock` without waiting (a second run prints `clear-check: another run is in progress`), reads the records, and releases the lock while checks run. Each check runs as `/bin/sh -c CMD` in the home, stdin from `/dev/null`, with `CHECK_TIMEOUT_S` (20 s); past it the process group is killed. One line per record: `retired: KEY from SENDER: its check passed; <cancel line>` (record removed; `retire_user()`, the `retire --to user` path, or `ssh HOST send.py retire …` when `machine` is another host, after `forget_sent()` here), `kept: KEY from SENDER: its check exits N`, `kept: …: its check ran past 20 s and was stopped`, `dropped: KEY from SENDER: its push expired at T` (check not run), or `FAILED: KEY from SENDER: its check passed, but …` (record kept, exit 3). A file with no records is removed. `notifier.sh tick` runs it on both machines after its unlock while the file is non-empty, and logs only a failure to `notifier.log`; a tick with `NOTIFIER_STATE_DIR` set reads only `NOTIFIER_EMERGENCIES`. `github-warmup` runs it once the keys are warm (in /etc/nixos).
 - The wait for a user send is raised to at least `review.user_send_seconds()`.
 - `--answerable` is an internal flag, valid only with `--to user`. `send.py` sets it automatically when there is no `--from` and the default sender resolved a session name, and `remote()` forwards it. It is recorded in the `Draft` but no longer changes the outcome.
-- Remote (`--machine HOST`): `remote()` runs `CLAUDE_PID= send.py --here …` over `ssh -o BatchMode=yes -o ConnectTimeout=10`, so the far side never writes a marker:
+- Remote (`--machine HOST`): `remote()` runs `CLAUDE_PID= send.py --here …` over `ssh -o BatchMode=yes`, so the far side never writes a marker:
   - On failure, the far side prints `send.py: failed push JSON: {…, reviewed, need, held}` to stderr. The calling side reads that record first, so `reviewed` and `need` survive even when ssh drops stdout. It then writes the marker with `held_machine=<host>`.
   - The header is the first line starting with `SENT|HELD|SKIPPED|QUEUED|FAILED|REFUSED|REPLACED: `. Every later line is kept, and the detail is prefixed `on <host>: `.
 - Template-fix requests:
@@ -277,7 +356,8 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
@@ -285,13 +365,37 @@ New escalate holds retain their registered template and values.
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
-- `auto_mode.refused` (user approved 2026-10-21, need `decision`): title `{sender}: auto mode stopped {session}`, `Session: {session}`, Action `On {machine}, in the {session} pane, approve the prompt or add an allow rule`, then `Auto mode refused {action} in the {session} session.{waits_line}`, each refused command on its own line, `Approve: the work goes on now, and auto mode can stop it on {this} {noun} again.` and `Allow rule: the work goes on now, and auto mode lets {this} {noun} run from then on.{rule_line}`.
+- `nightly.result` reports the branch, finish time, type result and full test result.
+  `nightly.not_run` reports the reason that the checks could not start.
+  Both texts use sender `nightly`, need `note`, and key `nightly-result`.
+  The result requires no action. The failure text includes an action.
+  The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+  Silence keeps only the newest push and delivers it when silence ends.
+  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
+  `off` disables both pushes. The module limit controls how many failed modules the result names.
+  A run that never reaches merge_gate.py sends no push unless the timer script sends one.
+- `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.
+  Title: `{sender}: {session} {noun} refused`. The first body line is `Session: {session}`.
+  Action: `On {machine}, in the {session} pane, type: Go: run the refused {noun}`.
+  The body starts `Auto mode refused {action} in the {session} session.{waits_line}`.
+  Each refused command has its own line. Two paragraphs follow:
+  `Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.`
+  `Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}`.
 - `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
-- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}`, then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
-- `quota.paid_credits_queued` (agreed with accounts-unit 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
+- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}` (changed 2026-11-13: the setting moved to the accounts config), then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
+- `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
-  - `texts --approve` writes passing examples only.
+  - `texts --approve` writes approvals for examples that pass review or have a current user approval.
+  - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
+    The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
+  - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
+    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
+    The function deletes the request before it saves the user's exact words under `text-approvals`.
+    The prompt hook still needs to call this function before it can record live approvals.
+  - A matching text ID and fingerprint let `texts --approve --id X` skip the reviewer.
+    The command records `user-prompt: <words> (<session>, <time>)` and an empty list of objections for each example.
   - `--approve --user-spec SOURCE` writes every example whatever the verdict. The `reviewer` field is `user-spec: <source>; reviewer: <model>` and `objections` lists `{rule, quote}`. The command still exits 1 when there are objections.
   - Approving an id keeps records only for its current examples.
   - Hand-written user-spec entries use `push_texts.fingerprint(entry)`.
@@ -300,14 +404,23 @@ New escalate holds retain their registered template and values.
   - the title is under 45 characters and the header plus body is under 500 (the Session line counts);
   - no rendered push contains `@`.
 
-  It also fails any literal phone send under `scripts/`, `commands/`, and `codex/` outside `push_texts.py`, `pushover.py`, `send.py`. A literal phone send is `--to user`, `--to=user`, a `pushover.py` path, or `broadcast.send("user", …)`, and the test tracks list mutations and aliases.
+  `scripts/notify/test_push_texts_sources.py` fails any literal phone send under `scripts/`, `commands/`, and `codex/` outside `push_texts.py`, `pushover.py`, `send.py`. A literal phone send is `--to user`, `--to=user`, a `pushover.py` path, or `broadcast.send("user", …)`, and the test tracks list mutations and aliases.
 - A status note that asks nothing goes to a log or to the requesting session, not the phone. For example, `quota_alert.py` logs `quota status <name>: …`.
 
 ### Repeated machine messages
 
-`repeat_guard` counts a resolved recipient once across send.py, direct mesh and run-result routes. Adoption is followed before counting; a director fallback counts at the director boundary. The first two exact copies pass. Later exact copies to the same receiver are held. Arbitrary prose compares literally, including times, timestamps, PIDs, socket paths, message IDs and placeholders: these may be meaningful. Counter identity version 2 retires the old masked counters without dropping unfinished notices. Exact-text replay retained all 746 historical watchdog holds, so no producer-specific repeat key is needed.
+`repeat_guard` counts a resolved recipient once across send.py and detached result routes. A director fallback counts at the director boundary. The first two exact copies pass. Later exact copies to the same receiver are held. Arbitrary prose compares literally, including times, timestamps, PIDs, socket paths, message IDs and placeholders: these may be meaningful. Counter identity version 2 retires the old masked counters without dropping unfinished notices. Exact-text replay retained all 746 historical watchdog holds, so no producer-specific repeat key is needed.
 
-`config/send_repeat_guard.conf` owns holding policy and notice deadlines. The caller has a fixed I/O-free 250 ms safety ceiling; it reads no configuration at import. Policy reads, state I/O, nonblocking locks and publication run inside an isolated checker. Errors, busy locks, corrupt state and timeout admit the message and print a diagnostic. Person and phone exemptions precede worker launch. Lock identity is independent of reloadable capacity; records and previews are bounded.
+`config/send_repeat_guard.conf` owns holding policy and notice deadlines.
+The caller uses a fixed 750 ms deadline for checks and events.
+The caller reads no configuration file.
+The check and event workers use Python `-I -S` to skip site hooks.
+They load local modules from the checkout that contains the worker.
+The worker reads policy and state, takes nonblocking locks, and publishes state.
+Errors, busy locks, corrupt state, and timeouts admit the message and print a diagnostic.
+Person and phone exemptions precede worker launch.
+Lock identity is independent of reloadable capacity.
+The guard limits record and preview sizes.
 
 Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy.
 The sender record holds one owner notice per literal-repeat flood across receivers.
@@ -335,31 +448,41 @@ Each sender keeps at most `max_keys` rate counters.
 Decoding removes saved sender-wide rate counters and their active outbox entries without a warning.
 Literal counters and owner notices keep their existing rules.
 
-`--from user`, `--human` (also mesh send/steer/interrupt), phone destinations and the reserved `send-repeat-guard` sender bypass counting. Accounting ownership is chosen before forwarding: the originating send.py records its outcome, including failures; internal mesh/SSH calls suppress duplicate rows and return their canonical receiver when available. Standalone transports record themselves. All event writers share one JSONL append helper, with original text, canonical receiver, provenance and observed outcome. An accounting fault never disables delivery.
+`--from user`, `--human`, phone destinations and the reserved `send-repeat-guard` sender bypass counting. Accounting ownership is chosen before forwarding: the originating send.py records its outcome, including failures; internal SSH calls suppress duplicate rows and return their canonical receiver when available. Standalone transports record themselves. All event writers share one JSONL append helper, with original text, canonical receiver, provenance and observed outcome. An accounting fault never disables delivery.
 
 The notifier detaches one supervised notice job with explicit HOME, XDG, configuration and repeat-state paths. The supervisor owns its process group, including delivery children, and kills descendants at its configured deadline or normal completion on Linux and macOS. Delivery subprocesses inherit this group. There is no nested drain worker or alarm. The nonblocking drain lock prevents overlap. Scheduling progress records admitted attempts, never inspection: insufficient budget leaves the sender cursor and notice order unchanged. An admitted attempt persists its claim and rotation to the tail of the sender’s notice list, then advances the sender cursor before discovery or delivery. Discovery and delivery share one bounded child attempt. A new attempt starts only when the supervisor deadline leaves its full configured budget plus subprocess cleanup; otherwise it stays pending for the next job. No synchronous launcher fallback runs.
 
 With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
 
-`python3 scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
-
 ### Permission root cause: `scripts/message/rca.py`
 
 The user asked for this on 2026-10-23: each permission alert starts a root cause analysis, and the user gets one push when it starts and one when it is fixed, so the same command never stops a session again.
 
-- A case is one JSON file, `<id>.json`, in `$XDG_STATE_HOME/message/rca` (else `~/.local/state/message/rca`), with a `.lock` for `flock`. Its fields are `id`, `session`, `machine`, `production` (or `""`), `commands`, `kind` (`prompt` or `auto_mode`), `transcript`, `opened` (UTC ISO time), `status` (`open`, `started` or `fixed`), `owner`, `cause`, `fix`, `commit`, `reminded`, `alerts`, `stopped` (UTC ISO time the session stopped; `opened` when the report gives none), `waits` (the waits sentence the alert showed, or `""`), `alert_source` and `alert_key` (the alert's sender and key, `""` when it had no key) and `refusals` (how many times the push review refused the fixed text). `read_case()` gives a case file from before a field existed that field's default (`stopped` reads `opened`). The id is the date in the user's zone and a counter: `261023-1` is the first case of 2026-10-23. Each machine keeps its own cases, so the rca.py commands run on the machine that opened the case.
-- `rca.py open --session S --machine M --kind K [--command C …] [--transcript P] [--production SLUG]` makes a case, or, when an open or started case has the same session and the same set of commands (whitespace collapsed, order ignored), adds 1 to its `alerts`. It prints `rca: opened <id>` or `rca: joined <id>`. `open_case(Report)` never raises and the command always exits 0: the alert already went out, so an error only prints `rca: no case opened: …` to stderr.
+- A case is one JSON file, `<id>.json`, in `$XDG_STATE_HOME/message/rca` (else `~/.local/state/message/rca`), with a `.lock` for `flock`. Its fields are `id`, `session`, `machine`, `production` (or `""`), `commands`, `kind` (`prompt` or `auto_mode`), `transcript`, `opened` (UTC ISO time), `status` (`open`, `started` or `fixed`), `owner`, `cause`, `fix`, `commit`, `reminded`, `alerts`, `stopped` (UTC ISO time of the permission stop or refusal; `opened` when the report gives none), `waits` (the waits sentence the alert showed, or `""`), `alert_source` and `alert_key` (the alert's sender and key, `""` when it had no key) and `refusals` (how many times the push review refused the fixed text). `read_case()` gives a case file from before a field existed that field's default (`stopped` reads `opened`). The id is the date in the user's zone and a counter: `261023-1` is the first case of 2026-10-23. Each machine keeps its own cases, so the rca.py commands run on the machine that opened the case.
+- `rca.py open --session S --machine M --kind K [--command C …] [--transcript P] [--production <showrunner name>]` makes a case, or, when an open or started case has the same session and the same set of commands (whitespace collapsed, order ignored), adds 1 to its `alerts`. It prints `rca: opened <id>` or `rca: joined <id>`. `open_case(Report)` never raises and the command always exits 0: the alert already went out, so an error only prints `rca: no case opened: …` to stderr.
 - The transcript belongs to the selected session. The current staff row supplies its production and unit labels.
-- The owner is the production's showrunner (`showrunners.current_address(slug)`). With no production, or when its showrunner does not run, the owner is the `natedev` session. A new case sends the owner one message: `send.py --to <owner> --from rca --key rca-<id> --text …`. The message names the case, session, machine, commands and transcript (no `Transcript:` line when the case has none), and gives four steps: run `~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py start <id> --owner <unit>`; find where the command came from (a work order, a helper prompt, a skill or a script); route the fix to the unit that owns that source, so the command never needs a prompt (an allow rule only when the command is safe and expected); after the fix merges, run `rca.py fixed <id> --cause … --fix … --commit <sha>`, with cause and fix in plain words for a reader who does not know the code (no file names, commands or shas), rewritten once when the push review refuses them. `tell_owner()` waits through the shared `send(argv)` path and appends the UTC time, key and completed outcome to `owner.log`. New cases persist `owner_told=false` before delivery and set it true only after success. The watcher and the auto-mode refusal send defer owner delivery until the next concurrent RCA batch; first notices, due reminders, owner socket lookups and case locks share the remaining 110-second tick budget, below the notifier’s 120-second watchdog. Failed or timed-out notices remain in their cases for the next pass. Direct RCA calls retain the 300-second send limit.
+- The owner message says `stopped at a permission prompt` for a prompt case.
+  For an auto-mode case, it says `had a command refused by auto mode`.
+  Both forms say `Find why this happened and fix the source.`
+- The owner is the production's showrunner (`showrunners.current_address(name)`). With no production, or when its showrunner does not run, the owner is the `natedev` session. A new case sends the owner one message: `send.py --to <owner> --from rca --key rca-<id> --text …`. The message names the case, session, machine, commands and transcript (no `Transcript:` line when the case has none), and gives four steps: run `~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py start <id> --owner <unit>`; find where the command came from (a work order, a helper prompt, a skill or a script); route the fix to the unit that owns that source, so the command never needs a prompt (an allow rule only when the command is safe and expected); after the fix merges, run `rca.py fixed <id> --cause … --fix … --commit <sha>`, with cause and fix in plain words for a reader who does not know the code (no file names, commands or shas), rewritten once when the push review refuses them. `tell_owner()` waits through the shared `send(argv)` path and appends the UTC time, key and completed outcome to `owner.log`. New cases persist `owner_told=false` before delivery and set it true only after success. The watcher and the auto-mode refusal send defer owner delivery until the next concurrent RCA batch; first notices, due reminders, owner socket lookups and case locks share the remaining 110-second tick budget, below the notifier’s 120-second watchdog. Failed or timed-out notices remain in their cases for the next pass. Direct RCA calls retain the 300-second send limit.
 - `rca.py start <id> --owner <unit>` sets `started` and the owner, and sends `permission.rca_started`. `rca.py fixed <id> --cause TEXT --fix TEXT --commit SHA` first runs the cold-read push review (`review.review()`, as pushover.py runs it) on the whole rendered `permission.rca_fixed`, since cause and fix are free text. On the first refusal (`Rewritten`, `Failed` or `Withheld`) it sends nothing, adds 1 to `refusals`, prints `rca: not sent: the push review refused this text:` with the text, the reviewer's failures, questions and rewrite, and exits 1, so the owner writes cause and fix again once. On a second refusal it sends the reviewer's rewrite as `permission.rca_fixed_rewritten`, or the owner's text when the reviewer gave no rewrite. With no reviewer (`Unreviewed`) or the review off, the owner's text goes. When the text goes, `fixed` sets `fixed` and the commit, then retires the case's alert by its sender and key (`send.py retire --to user --from <alert_source> --key <alert_key>`, `push_texts.user_retire_argv`), and then sends the push; a case with no `alert_key` skips the retire. So a kept alert never goes out at silence end, and an emergency alert stops repeating. Each push goes through `push_texts.user_send_argv` and `send.py --to user --text-id … --from <sender> --key rca-<id>`, so while silence is on the fixed push replaces the kept started one. The sender is the production, or `messaging` when there is none. A fixed case takes no `start`; `fixed` can run again to send its push again. A push that send.py does not send exits 1 and keeps the new status; a first refusal exits 1 and keeps the old status; an unknown id exits 2.
 - `rca.py list` prints one line per open or started case. `rca.py remind`, and `rca.remind()` at the end of each `stall_watch.py` pass, sends the owner one reminder (`--key rca-<id>-remind`) for each case still `open` 30 minutes after it opened. First notices still pending and due reminders run concurrently, wait for delivery and mark `owner_told` or `reminded` only on exit 0; a failure retries on the next pass. The `start` and `fixed` pushes wait for send.py (`SEND_SECONDS`, 300 s) and print its outcome, because a showrunner runs them by hand and reads it.
-- The three texts (need `note`, no action, user ask 2026-10-23; approved under a user spec, 2026-10-23 19:20 AST via the showrunner). They use plain words and name no owner, file, command or commit; the commit stays in the case and `owner.log`. `story()` fills `time` (`silence.shown()` of `stopped`) and `stop`: `auto mode refused <kind>` or `it asked you to allow <kind>`, with the kind from `rca.action_of()` (`a file change`, `a shell command`, `an action`, `2 shell commands`, `2 actions`). rca.py no longer cuts commands; only send.py cuts a refused command.
-  - `permission.rca_started`: title `{sender}: finding why {session} stopped`, body `The {session} session stopped at {time} when {stop}.{waits_line} A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.` `waits_line` is the case's `waits` sentence, or `""`.
-  - `permission.rca_fixed`: title `{sender}: fixed why {session} stopped`, body `The {session} session stopped at {time} when {stop}.`, `Why: {cause}.` and `Now: {fix}.` It has no waits sentence, since nothing waits once the stop is fixed. rca.py collapses cause and fix to one line and drops a final period so the template's own period never doubles.
+- The three texts have need `note` and no action. They name no owner, file, command or commit.
+  The commit stays in the case and `owner.log`.
+  `story()` fills `time` from `silence.shown(stopped)` and `stop` from the case.
+  The stop text is `auto mode refused <kind>` or `the session asked you to allow <kind>`.
+  `rca.action_of()` supplies the kind: `a file change`, `a shell command`, `an action`, `2 shell commands` or `2 actions`.
+  Only send.py cuts refused commands.
+  - `permission.rca_started` title: `{sender}: finding why {session} hit a check`.
+    Body: `At {time} in the {session} session, {stop}.{waits_line} A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.`
+    `waits_line` is the case's waits sentence, or `""`.
+  - `permission.rca_fixed` title: `{sender}: fixed why {session} hit a check`.
+    The body has three lines: `At {time} in the {session} session, {stop}.`, `Why: {cause}.` and `Now: {fix}.`
+    The fixed push has no waits sentence. rca.py puts cause and fix on one line each and removes their final periods.
   - `permission.rca_fixed_rewritten`: title `{title}`, body `{body}`: the reviewer's rewrite of a fixed text it refused twice.
 - Hooks:
-  - `stall_watch.py`: after a 60-second prompt wait, its owner receives the unit, machine and request first. The saved `told` mark stops repeated owner notices. The prompt start plus 60 seconds plus `prompt_grace_seconds` from `config/stall_watch.conf` determines user escalation, even if owner delivery keeps failing. Missing or invalid grace is reported and uses zero grace. A prompt that clears before that deadline sends no push. A prompt alert's `Delivery` carries an `rca.Report` (`prompt_report()`: the unit, the machine, kind `prompt`, the pending Bash call's command or else the pending tool's name, the session's transcript, the production slug, `stopped` (the wait's start), source `stall-watch` and key `stall-watch:prompt:<slug>:<unit>`). `send_all()` immediately saves a successful alert's `alerted` flag and its report as `case_pending` in the prompt state. After the batch, `retry_cases()` attempts each pending case and clears its report only when the case opened or joined. A failed case retries on later ticks without another alert. When the prompt clears, its alert is retired as usual; successful retirement atomically moves a prompt with a pending case to `<report hash>.case.json` in the same stall-watch state directory. This saved snapshot is solely a case obligation, so a new prompt starts its own wait and can alert while the old case still fails. `retry_cases()` also reads these case files and removes each only after its case opened or joined. With no pending case, retirement deletes the prompt state. Failed alerts still retry with the same alert key.
-  - `send.py`: when a local `auto_mode.refused` push ends `sent` or `kept` (silence on), `send()` opens a case with `refusal_report()`: the `session` value (the stopped session, not the sender), the `machine` value, kind `auto_mode`, each `--value command=` as given (`Options.commands`, not cut), the waits sentence the alert showed (`""` when the review dropped it), and the alert's sender and key. It defers owner delivery to the next `rca.remind()` pass, so completing the refusal send does not wait for the owner. It gives no transcript, so rca.py finds the stopped session's by the `session` value. A held, replaced, refused or failed push opens no case. `auto_mode.refused` takes no `--machine`, so no remote send opens one.
+  - `stall_watch.py`: after a 60-second prompt wait, its owner receives the unit, machine and request first. The saved `told` mark stops repeated owner notices. The prompt start plus 60 seconds plus `prompt_grace_seconds` from `config/stall_watch.conf` determines user escalation, even if owner delivery keeps failing. Missing or invalid grace is reported and uses zero grace. A prompt that clears before that deadline sends no push. A prompt alert's `Delivery` carries an `rca.Report` (`prompt_report()`: the unit, the machine, kind `prompt`, the pending Bash call's command or else the pending tool's name, the session's transcript, the showrunner staff name, `stopped` (the wait's start), source `stall-watch` and key `stall-watch:prompt:<showrunner name>:<unit>`). `send_all()` immediately saves a successful alert's `alerted` flag and its report as `case_pending` in the prompt state. After the batch, `retry_cases()` attempts each pending case and clears its report only when the case opened or joined. A failed case retries on later ticks without another alert. When the prompt clears, its alert is retired as usual; successful retirement atomically moves a prompt with a pending case to `<report hash>.case.json` in the same stall-watch state directory. This saved snapshot is solely a case obligation, so a new prompt starts its own wait and can alert while the old case still fails. `retry_cases()` also reads these case files and removes each only after its case opened or joined. With no pending case, retirement deletes the prompt state. Failed alerts still retry with the same alert key.
+  - `send.py`: when a local `auto_mode.refused` push ends `sent` or `kept` (silence on), `send()` opens a case with `refusal_report()`: the `session` value (the session with refused commands, not the sender), the `machine` value, kind `auto_mode`, each `--value command=` as given (`Options.commands`, not cut), the waits sentence the alert showed (`""` when the review dropped it), and the alert's sender and key. It defers owner delivery to the next `rca.remind()` pass, so completing the refusal send does not wait for the owner. It gives no transcript, so rca.py finds that session's transcript by the `session` value. A held, replaced, refused or failed push opens no case. `auto_mode.refused` takes no `--machine`, so no remote send opens one.
 
 ### Question review in showrunner replies
 
@@ -367,17 +490,27 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
   - An `open_for_user` entry is either a reminder (a plain one-line string) or an object `{text, after?, question?}`.
   - A new object item (its `text` not already outstanding) must carry `question`. Registration refuses one without it, before any review runs.
   - Duplicate texts are handled once, at their first occurrence.
-  - The plumbing check (`dailies_render.plumbing(line) -> str | None`, the `PLUMBING` words) runs here, on each `text`, and nowhere on read (2026-10-18). A new or changed text that fails it is refused (`questions: failed — <text>: …`) and nothing is written. A stored text that fails it is named (`questions: reword — <text>: …`) and the write goes on. `read_outstanding` no longer refuses: one stored word blocked every update to hana's list.
-  - Each new question is reviewed once with `review.review_question(QuestionKey(slug, text), question, revision=False) -> QuestionOutcome`. This uses guide tags `question,all`, no push header parsing, no length limits and no `withhold`.
+  - `update_registration.plumbing(line) -> str | None` checks each `text` against `PLUMBING` when registration writes it.
+    It performs no read-time check.
+    A new or changed text that fails the check prints `questions: failed — <text>: …` and prevents the write.
+    A stored text that fails the check prints `questions: reword — <text>: …` but permits the write.
+    Read-time checks were removed on 2026-10-18 because one stored word blocked every update to hana's list.
+  - Each new question is reviewed once with `review.review_question(QuestionKey(name, text), question, revision=False) -> QuestionOutcome`. This uses guide tags `question,all`, no push header parsing, no length limits and no `withhold`.
   - Outcomes:
     - `QuestionAccepted(question)`: the original, or the rewrite if it passed a second check.
     - `QuestionAwaitingFacts(question, questions)`
     - `QuestionReviewFailed(question, details)`
     - `QuestionReviewUnavailable(question, reason)`: stored as written. A blank rewrite from the reviewer lands here.
   - An awaiting-facts or failed outcome fails the whole registration with `question held for review: …`. Nothing is written: outstanding and history stay unchanged.
-  - Such a question is held in `~/.local/state/notify/questions/<sha256(slug+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
-- **Stored fields:** an outstanding item carries `question` plus either `reviewed` or `review_unavailable`. Items that were already outstanding keep their fields and are not reviewed again. Accepted text is printed as `reviewed question: <text>`, and the reply must carry that text. `commands/showrunner/produce.md` (under `open_for_user`) tells the showrunner to register before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices.
-- **History:** `record_question_history()` records each new open item's `text`, `question` and `reviewed` in `~/.local/state/showrunner/outstanding/<slug>.history.jsonl`.
+  - Such a question is held in `~/.local/state/notify/questions/<sha256(name+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
+- **Stored fields:** a canonical question record carries `question` and either `reviewed` or `review_unavailable`.
+  The [production question store](showrunner-automation.md#updates-time-log-and-questions-update_registrationpy) owns question files and fixed asker ids.
+  Existing questions retain their fields without another review.
+  Accepted text prints as `reviewed question: <text>`.
+  The reply carries that reviewed text.
+  `commands/showrunner/produce.md` defines registration before a reply asks the user for input.
+- **History:** `record_question_history()` records each new open item in `~/.local/state/showrunner/outstanding/<showrunner staff id>.history.jsonl`.
+  Each record contains `text`, `question` and `reviewed`.
   `withdraw` sets `withdrawn` to the withdrawal time on the item's history record.
   History remains for 48 h.
 - **No Stop hook checks a reply** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The hook file was deleted after `settings.json` stopped naming it. Registering a question and carrying its reviewed text is the showrunner's rule in `commands/showrunner/produce.md`; the nightly count still reads the history.
@@ -391,7 +524,9 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
     - "… said/wrote/asked/in its own words/own words".
 
     A user-return marker (`back to you:`, `for you:`, `to you:`, `to the user:`, `question for you:`, `your decision:`) gives the rest of the line back to the user.
-- `dailies_render.read_outstanding()` returns `OutstandingReminder` or `OutstandingQuestion`, with `DueNow` or `DeferredUntil` in place of an optional `after`. `open_items()` prints each stored full question.
+- `update_registration.read_open_items()` reads typed questions and reminders from the production question store.
+  Timing uses `DueNow` or `DeferredUntil`.
+  `open_items()` prints each stored full question.
 
 ### Nightly `messages` mode
 
@@ -459,7 +594,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
   - `DELIVERED_KEEP_SECONDS` 3600.
   - 2 s cap on the model lookup.
   - `send.py` `TIMEOUT` 40; a user send waits at least `user_send_seconds()`.
-  - ssh wait: timeout + `KILL_GRACE` 10 + 30. ssh `ConnectTimeout=10`.
+  - ssh wait: timeout + `KILL_GRACE` 10 + 30.
   - Priority 2 repeats every `RETRY_S` 300 s for up to `EXPIRE_S` 10800 s.
 - Live reviews take about 10–13 s each.
 
@@ -476,8 +611,8 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 **Reviewer behaviour:**
 - Without explicit instruction the reviewer repeats the action line at the top of the body. `validate` removes it, along with an `Action: ` prefix on the action.
-- The reviewer is not deterministic and not always stable on its own rewrite. Approve a catalog text only after three passing runs. Example values decide the verdict as much as templates do: names that are unrealistic or contradict each other fail review.
-- Changing a template or an example value invalidates its approval. Rerun `review.py texts --id <id>`, then `--approve`.
+- Reviewer results can vary between runs. For reviewer approval, wait for three passing runs. Use realistic and consistent example values.
+- A change to a template or example value invalidates its approval. Get a new approval for the new fingerprint.
 - `--user-spec` without `--approve`, or with an empty source, is a usage error. The reviewer objects to the user's four-line holdout text on every run, and those objections are recorded, never applied.
 
 **Holds and the gate:**

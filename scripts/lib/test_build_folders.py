@@ -2,20 +2,542 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Generator
 import os
+import errno
+import fcntl
+import io
 import json
+import select
 import signal
+import shutil
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
-from typing import cast, override
+from typing import Never, cast, override
 from unittest import mock
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
-from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs
-from scripts.lint.memory_test_support import config_environment
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+
+
+def _release_folder(path: Path) -> None:
+    release = cast(Callable[[Path], None], getattr(folders, "_release_build_folder"))
+    release(path)
+
+
+class FolderFormTests(unittest.TestCase):
+    root: Path = Path()
+    config: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.config = self.root / "build_folders.conf"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(self.root),
+            "HOME": str(self.root),
+            copy_record.ROOT_ENV: str(self.root / "scratch"),
+            copy_record.COPIES_ENV: str(self.root / "legacy-workspaces"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })))
+        _ = cast(object, self.enterContext(mock.patch("socket.gethostname", return_value="natedev")))
+        self.write_config()
+        _ = (self.root / "copies.conf").write_text("# range: 5e-324..\ngit_timeout_seconds=10\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "COPIES_CONFIG": str(self.root / "copies.conf"),
+        })))
+
+    def write_config(self, *, alias: str = "claude", machine_root: str = "disk") -> None:
+        _ = self.config.write_text(
+            "roots.workspace=~/worktrees\nroots.build=~/build\n"
+            + f"roots.build.natedev=~/{machine_root}\nrepo_word.claude_commands={alias}\n"
+            + "# whole: 1..\nfolders.unused_days=2\n# range: 0..60\nlocks.probe_wait_seconds=0.25\n"
+            + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n",
+            encoding="utf-8",
+        )
+
+    def set_origin(self, url: str) -> None:
+        _ = subprocess.run(
+            ["git", "-C", str(self.root), "config", "remote.origin.url", url],
+            check=True, capture_output=True, timeout=10,
+        )
+
+    def init_repository(self) -> None:
+        _ = subprocess.run(
+            ["git", "init", "-q", str(self.root)], check=True, capture_output=True, timeout=10,
+        )
+
+    def test_repo_word_reads_the_origin_and_current_alias(self) -> None:
+        self.init_repository()
+        for url, word in (
+            ("https://example.invalid/example/hana.git", "hana"),
+            ("ssh://git@example.invalid:2222/example/bevy_brp.git/", "bevy_brp"),
+            ("git@example.invalid:project.git", "project"),
+            ("git@[::1]:example/cargo-liner.git", "cargo-liner"),
+            ("file:///source/local.git", "local"),
+            ("/source/repo.with.dots.git", "repo.with.dots"),
+        ):
+            with self.subTest(url=url):
+                self.set_origin(url)
+                self.assertEqual(folders.repo_word(self.root), word)
+        self.set_origin("git@example.invalid:tools/claude_commands.git")
+        self.assertEqual(folders.repo_word(self.root), "claude")
+        self.write_config(alias="tools")
+        self.assertEqual(folders.repo_word(self.root), "tools")
+
+    def test_repo_word_refuses_missing_or_invalid_names(self) -> None:
+        self.init_repository()
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+        self.set_origin("https://example.invalid/")
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+        self.set_origin("https://example.invalid/claude_commands.git")
+        self.write_config(alias="../tools")
+        with self.assertRaises(folders.InvalidFolderForm):
+            _ = folders.repo_word(self.root)
+
+    def test_repo_word_uses_the_configured_git_timeout(self) -> None:
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout="git@example.invalid:team/widget.git\n")) as git:
+            self.assertEqual(folders.repo_word(self.root), "widget")
+        self.assertEqual(git.call_args.kwargs["timeout"], 10)
+
+    def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
+        from scripts.lib import build_slots, process_start
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/claude_commands.git")
+        _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "first"],
+                           check=True, capture_output=True, timeout=10)
+        with build_slots.take_copy(self.root, "HEAD", showrunner="tools", unit="proof",
+                                   work="test", purpose="test all") as copied:
+            self.assertEqual(copied.path, folders.copy_path("claude", "proof", 1))
+            lease, = folders.held_folder_leases()
+            self.assertIsInstance(lease, folders.KnownFolderLease)
+            assert isinstance(lease, folders.KnownFolderLease)
+            self.assertEqual(lease.pid, os.getpid())
+            started = process_start.process_start(lease.pid)
+            self.assertIsInstance(started, process_start.Started)
+            assert isinstance(started, process_start.Started)
+            self.assertEqual(lease.process_start, started.start)
+            self.assertEqual(lease.repository, "claude")
+            self.assertEqual(lease.unit, "proof")
+            self.assertLessEqual(lease.start_time, lease.last_use)
+            sidecar = folders.lease_path(copied.path)
+            saved = sidecar.read_text()
+            try:
+                sidecar.unlink()
+                self.assertEqual([type(row) for row in folders.held_folder_leases()], [folders.UnknownFolderLease])
+                _ = sidecar.write_text('{"pid": 1}\n')
+                self.assertEqual([type(row) for row in folders.held_folder_leases()], [folders.UnknownFolderLease])
+            finally:
+                _ = sidecar.write_text(saved)
+        self.assertEqual(list(folders.held_folder_leases()), [])
+
+    def test_free_copy_with_a_damaged_lease_is_unknown(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                   work="test", purpose="test hold") as copy:
+            lease = folders.lease_path(copy.path)
+        self.assertEqual(list(folders.held_folder_leases()), [])
+        lease.unlink()
+        for fields in ("", "{invalid", '{"pid": 1}'):
+            with self.subTest(fields=fields):
+                if fields:
+                    _ = lease.write_text(fields)
+                with mock.patch.object(folders, "_settings", wraps=cast(Callable[[], conf.ConfigRead], getattr(folders, "_settings"))) as settings:
+                    state, = folders.held_folder_leases()
+                self.assertIsInstance(state, folders.UnknownFolderLease)
+                self.assertEqual(state.path, copy.path)
+                settings.assert_called_once()
+
+    def test_reuse_retains_a_copy_with_a_changed_git_back_pointer(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+
+        def take() -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                         work="test", purpose="test reuse")
+
+        with take() as first:
+            git = git_files.at(first.path).git_dir
+        pointer = git / "gitdir"
+        _ = pointer.write_text(str(self.root / ".git") + "\n")
+        index_lock = git / "index.lock"
+        index_lock.touch()
+        with take() as second:
+            self.assertEqual(second.number, 2)
+        self.assertTrue(first.path.exists())
+        self.assertTrue(index_lock.exists())
+
+    def test_interrupted_preparation_keeps_the_copy_eligible_for_expiry(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = write_config_fixture(self.root / "scratch.conf", "repo_depth=3\n")
+        _ = (self.root / "source.txt").write_text("source")
+        revision = commit_repository(self.root, "source", "source.txt")
+
+        def take(unit: str) -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit=unit,
+                                         work="test", purpose="test preparation")
+
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                unit = "existing" if existing else "new"
+                path = folders.copy_path("widget", unit, 1)
+                if existing:
+                    with take(unit) as first:
+                        self.assertEqual(first.path, path)
+                    module, name = build_slots, "_exclude_slot_target"
+                else:
+                    module, name = folders, "_copy_identity_fields"
+                before = folders.numbered_copy_record(path)
+                failure = mock.patch.object(module, name, side_effect=OSError("interrupted"))
+                with failure, self.assertRaisesRegex(OSError, "interrupted"), take(unit):
+                    self.fail("the interrupted copy was ready")
+                fields = folders.folder_lease_fields(path)
+                self.assertIs(fields["ready"], False)
+                source = folders.numbered_copy_record(path)
+                self.assertIsInstance(source, folders.NumberedCopySource)
+                if existing:
+                    self.assertEqual(before, source)
+                else:
+                    self.assertNotIn("git_directory", fields)
+                    self.assertFalse((path / folders.COPY_USE_STAMP).exists())
+                with folders.numbered_copy_use_lease(path) as unreadied:
+                    self.assertIsInstance(unreadied, folders.NumberedCopyUseRefused)
+                self.assertTrue(folders.expired_folder(path, cutoff=time.time() + 1))
+                self.assertTrue(path.exists())
+
+    def test_sweep_retains_a_nested_mount_or_unreadable_table(self) -> None:
+        from scripts.lint import sweep
+
+        path = folders.main_output_path("widget")
+        nested = path / "mount with spaces"
+        nested.mkdir(parents=True)
+        stamp = path / folders.COPY_USE_STAMP
+        stamp.touch()
+        os.utime(stamp, (0, 0))
+        _ = (self.root / "lint.conf").write_text("sweep_max_tree_depth=2\n")
+        lint = conf.read("lint")
+        for platform, reader in (("linux", "_linux_mount_points"), ("darwin", "_mac_mount_points")):
+            for points in ((Path("/"), nested), (), OSError("mount table unavailable")):
+                with (self.subTest(platform=platform, points=points),
+                      mock.patch("scripts.lib.build_folders.sys.platform", platform),
+                      mock.patch.object(folders, reader) as read):
+                    if isinstance(points, OSError):
+                        read.side_effect = points
+                    else:
+                        read.return_value = points
+                    self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
+                    self.assertTrue(nested.is_dir())
+
+    def test_copy_with_an_unreadable_lock_is_unknown(self) -> None:
+        path = folders.copy_path("claude", "proof", 1)
+        path.mkdir(parents=True)
+        path.with_suffix(".lock").symlink_to(self.root / "absent")
+        lease, = folders.held_folder_leases()
+        self.assertIsInstance(lease, folders.UnknownFolderLease)
+        self.assertEqual(lease.path, path)
+
+    def test_copy_reuses_an_existing_number_before_a_gap_and_keeps_output(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+
+        def commit(text: str) -> str:
+            _ = (self.root / "version.txt").write_text(text)
+            command = ["git", "-C", str(self.root)]
+            _ = subprocess.run([*command, "add", "version.txt"], check=True, capture_output=True, timeout=10)
+            _ = subprocess.run([*command, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                "commit", "-qm", text], check=True, capture_output=True, timeout=10)
+            return subprocess.run([*command, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+
+        first = commit("one")
+        second = commit("two")
+
+        def take(revision: str) -> AbstractContextManager[build_slots.LeasedCopy]:
+            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                         work="test", purpose="test all")
+
+        with take(first) as one, take(first) as two:
+            self.assertEqual((one.number, two.number), (1, 2))
+            _ = (two.cargo_dir / "artifact").write_text("keep")
+        self.assertTrue(folders.expired_folder(one.path, cutoff=time.time() + 10))
+        self.assertTrue(one.path.is_dir())
+        _ = subprocess.run(["git", "worktree", "remove", "--force", str(one.path)],
+                           cwd=self.root, check=True, capture_output=True)
+        folders.lease_path(one.path).unlink()
+        one.path.with_suffix(".lock").unlink()
+        with take(second) as reused:
+            self.assertEqual(reused.path, two.path)
+            self.assertEqual((reused.path / "version.txt").read_text(), "two")
+            self.assertEqual((reused.cargo_dir / "artifact").read_text(), "keep")
+            with take(second) as gap:
+                self.assertEqual(gap.number, 1)
+                self.assertEqual(gap.env["CARGO_TARGET_DIR"], str(gap.cargo_dir))
+                self.assertEqual(gap.env["CARGO_BUILD_BUILD_DIR"], str(gap.cargo_dir))
+
+    def test_natedev_uses_the_legacy_scratch_override(self) -> None:
+        with self.config.open("a", encoding="utf-8") as config:
+            _ = config.write("roots.scratch=~/scratch\nroots.scratch.natedev=~/legacy-scratch\n")
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop(copy_record.ROOT_ENV)
+            self.assertEqual(copy_record.root(), self.root / "legacy-scratch")
+
+    def test_report_is_the_default_folder_check(self) -> None:
+        config = self.root / "defaults/build_folders.conf"
+        config.parent.mkdir()
+        _ = write_config_fixture(config)
+        self.assertEqual(conf.read(config).text("folders.check"), "report")
+
+    def test_mark_folder_use_stamps_main_and_worktree_output(self) -> None:
+        for path in (folders.main_output_path("widget"), folders.output_path("widget", "unit", "tests")):
+            path.mkdir(parents=True)
+            clock = path / folders.COPY_USE_STAMP
+            now = time.time() - 1
+            with folders.folder_removal_lease(path, create=True):
+                folders.mark_folder_use(path)
+            self.assertGreater(clock.stat().st_mtime, now)
+
+    def test_numbered_copy_record_and_envrc_require_the_original_checkout(self) -> None:
+        from scripts.lib import build_slots
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / ".envrc").write_text("export FIXTURE=one\n")
+        revision = commit_repository(self.root, "source", ".envrc")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test envrc") as copy:
+            record = folders.numbered_copy_record(copy.path)
+            assert isinstance(record, folders.NumberedCopySource)
+            self.assertEqual((record.source, record.commit), (self.root, revision))
+            with folders.numbered_copy_use_lease(copy.path) as reader:
+                assert isinstance(reader, folders.NumberedCopyUseLease)
+                self.assertEqual(reader.source, record)
+                self.assertTrue(reader.pass_fds)
+            self.assertFalse(build_slots.remove_copy(record))
+            envrc = copy.path / ".envrc"
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            _ = envrc.write_text("export FIXTURE=changed\n")
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            envrc.unlink()
+            envrc.symlink_to(self.root / ".envrc")
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
+        _ = copy.path.rename(copy.path.with_name("old"))
+        copy.path.mkdir()
+        self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
+        self.assertFalse(build_slots.remove_copy(record))
+
+    def test_copy_removal_keeps_borrowers_and_resumes_after_git_deletes_the_checkout(self) -> None:
+        from scripts.lib import build_slots
+        from scripts.lint import sweep
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("checkout\n")
+        revision = commit_repository(self.root, "source", "source.txt")
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test removal") as copy:
+            _ = (copy.cargo_dir / "warm").write_text("warm")
+        record = folders.numbered_copy_record(copy.path)
+        assert isinstance(record, folders.NumberedCopySource)
+        borrower = copy_record.copies_root() / "widget-legacy/borrower"
+        borrower.mkdir(parents=True)
+        _ = (borrower / copy_record.RECORD).write_text(json.dumps({
+            "task": "gate:borrower", "borrows_from": str(copy.path / ".git"),
+        }))
+        self.assertFalse(build_slots.remove_copy(record))
+        self.assertTrue((copy.cargo_dir / "warm").exists())
+        shutil.rmtree(borrower)
+
+        with folders.folder_removal_lease(copy.path):
+            folders.mark_numbered_copy_removal(record)
+            shutil.rmtree(copy.path)
+        self.assertTrue(record.git_directory.is_dir())
+        pending, = folders.numbered_copy_records()
+        self.assertIsInstance(pending, folders.NumberedCopyRemovalPending)
+        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test removal") as other:
+            self.assertEqual(other.number, 2)
+        _ = (self.root / "lint.conf").write_text("sweep_max_tree_depth=2\n")
+        lint = conf.read("lint")
+        self.assertEqual(sweep.sweep_unused_folders(True, now=time.time(), lint_settings=lint), 0)
+        self.assertTrue(record.git_directory.is_dir())
+        self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
+        self.assertTrue(record.git_directory.exists())
+        self.assertTrue(folders.lease_path(copy.path).exists())
+        self.assertTrue(other.path.is_dir())
+
+    def test_unused_pass_keeps_live_copies_ci_and_other_top_entries(self) -> None:
+        from scripts.lint import sweep
+
+        lint = self.root / "lint.conf"
+        _ = lint.write_text("sweep_max_tree_depth=2\n")
+        now = 300000.0
+        main = folders.main_output_path("widget")
+        old = folders.output_path("widget", "gone", "old")
+        recent = folders.output_path("widget", "active", "recent")
+        busy = folders.copy_path("widget", "active", 1)
+        ci = folders.ci_path("widget", 1)
+        unexpected = folders.build_root() / "unexpected"
+        odd = folders.build_root() / "odd"
+        outside = self.root / "outside"
+        outside.mkdir()
+        for path in (main, old, recent, busy, ci, unexpected):
+            path.mkdir(parents=True)
+            stamp = path / folders.COPY_USE_STAMP
+            stamp.touch()
+            os.utime(stamp, (0, 0) if path != recent else (now, now))
+        odd.symlink_to(outside, target_is_directory=True)
+        with busy.with_suffix(".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            settings = conf.read(lint)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(sweep.sweep_unused_folders(False, now=now, lint_settings=settings), 0)
+            self.assertIn(f"kept for a manual removal list: {main}", output.getvalue())
+            self.assertIn(f"kept for a manual removal list: {old}", output.getvalue())
+            for path in (recent, busy, ci, unexpected, odd):
+                self.assertNotIn(f"kept for a manual removal list: {path}", output.getvalue())
+        self.assertTrue(main.is_dir())
+        self.assertTrue(old.is_dir())
+        for kept in (recent, busy, ci, unexpected, outside):
+            self.assertTrue(kept.is_dir())
+
+    def test_paths_use_the_current_roots(self) -> None:
+        self.assertEqual(folders.worktree_path("hana", "demo", "try-2"),
+                         self.root / "worktrees/hana/demo/try-2")
+        self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "disk/hana/demo")
+        self.assertEqual(folders.output_path("hana", "demo", "try-2"), self.root / "disk/hana/demo/try-2")
+        self.assertEqual(folders.copy_path("hana", "demo", 1), self.root / "disk/hana/demo/1")
+        self.assertEqual(folders.main_output_path("hana"), self.root / "disk/hana/main")
+        self.assertEqual(folders.ci_path("hana", 2), self.root / "disk/hana/ci/2")
+        self.write_config(machine_root="new-disk")
+        self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "new-disk/hana/demo")
+        self.assertIsInstance(folders.parse_form(self.root / "disk/hana/demo/try-2"), folders.OutsideFolderLayout)
+
+    def test_mac_uses_the_common_build_root(self) -> None:
+        with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
+            path = folders.output_path("hana", "demo", "mac")
+            self.assertEqual(path, self.root / "build/hana/demo/mac")
+            self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
+
+    def test_paths_refuse_invalid_components_and_numbers(self) -> None:
+        for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
+            with self.subTest(name=name):
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.main_output_path(name)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.unit_folder("hana", name)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.output_path("hana", "demo", name)
+        for unit in ("main", "ci"):
+            with self.subTest(unit=unit), self.assertRaises(folders.InvalidFolderForm):
+                _ = folders.worktree_path("hana", unit, "demo")
+        for name in ("3", "03", "0"):
+            with self.subTest(name=name), self.assertRaises(folders.InvalidFolderForm):
+                _ = folders.output_path("hana", "demo", name)
+        for number in (0, -1, True):
+            with self.subTest(number=number):
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.copy_path("hana", "demo", number)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.ci_path("hana", number)
+
+    def test_removal_keeps_the_build_root_and_a_repository_owned_by_another_user(self) -> None:
+        root = folders.build_root()
+        repository = root / "hana"
+        repository.mkdir(parents=True)
+        self.assertFalse(folders.may_remove_build_path(root))
+        self.assertTrue(folders.may_remove_build_path(repository))
+        with mock.patch.object(os, "geteuid", return_value=repository.stat().st_uid + 1):
+            self.assertFalse(folders.may_remove_build_path(repository))
+            self.assertFalse(folders.remove_build_folder(repository, repository.rmdir))
+        self.assertTrue(repository.is_dir())
+
+    def test_parse_form_recognizes_only_complete_forms(self) -> None:
+        forms: dict[Path, folders.FolderForm] = {
+            folders.output_path("hana", "demo", "try-2"): folders.WorktreeOutput("hana", "demo", "try-2"),
+            folders.copy_path("hana", "demo", 2): folders.BuildCopy("hana", "demo", 2),
+            folders.main_output_path("hana"): folders.MainOutput("hana"),
+            folders.ci_path("hana", 3): folders.CiOutput("hana", 3),
+        }
+        for path, form in forms.items():
+            with self.subTest(path=path):
+                self.assertEqual(folders.parse_form(path), form)
+                self.assertIsInstance(folders.parse_form(path / "target"), folders.InvalidFolderComponents)
+        for relative in ("", "hana", "hana/demo", "hana/ci", "hana/ci/name", "hana/ci/0",
+                         "hana/demo/01", "hana-demo/2", "hana/demo/probe.lock", "hana/demo/probe.lease.json",
+                         "hana/demo/probe.lease.json.0123456789abcdef.tmp"):
+            with self.subTest(relative=relative):
+                self.assertIsInstance(folders.parse_form(self.root / "disk" / relative), folders.InvalidFolderComponents)
+        self.assertIsInstance(folders.parse_form(self.root / "outside/hana/demo/2"), folders.OutsideFolderLayout)
+
+    def test_parse_form_resolves_the_root_and_the_path(self) -> None:
+        physical = self.root / "physical"
+        target = physical / "hana/demo/work"
+        target.mkdir(parents=True)
+        (self.root / "disk").symlink_to(physical, target_is_directory=True)
+        source_link = self.root / "target"
+        source_link.symlink_to(target, target_is_directory=True)
+        self.assertEqual(folders.parse_form(source_link), folders.WorktreeOutput("hana", "demo", "work"))
+
+        escape = physical / "hana/demo/escape"
+        escape.symlink_to(self.root / "outside/hana/demo/work", target_is_directory=True)
+        self.assertIsInstance(folders.parse_form(escape), folders.OutsideFolderLayout)
+        loop = physical / "hana/demo/loop"
+        loop.symlink_to(loop, target_is_directory=True)
+        result = folders.parse_form(loop)
+        assert isinstance(result, folders.UnverifiedFolderPath), result
+        self.assertEqual(result.error.errno, errno.ELOOP)
+        for name in ("work.lock", "work.lease.json", "work.lease.json.0123456789abcdef.tmp"):
+            with self.subTest(name=name):
+                sidecar = physical / "hana/demo" / name
+                sidecar.symlink_to(target, target_is_directory=True)
+                self.assertIsInstance(folders.parse_form(sidecar), folders.InvalidFolderComponents)
+                with self.assertRaises(folders.InvalidFolderForm):
+                    _ = folders.output_path("hana", "demo", name)
 
 
 class BuildFolderTests(unittest.TestCase):
@@ -23,19 +545,1294 @@ class BuildFolderTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        private = Path(tempfile.mkdtemp(prefix="build-folders-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, private)
+        self.root = private / "case"
+        self.root.mkdir()
+        config = Path(self.enterContext(tempfile.TemporaryDirectory(dir=private)))
+        environment = fixture_git_environment(private)
+        _ = environment.pop("STAFF_CONFIG", None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(config), "TMPDIR": str(self.root), copy_record.ROOT_ENV: str(self.root / "scratch"),
             copy_record.COPIES_ENV: str(self.root / "copies"),
             scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-        })))
+        }, clear=True)))
+        _ = write_config_fixture(config / "build_folders.conf",
+            "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
+            + "patterns.standing={repository}/{owner}-gate{suffix}\n"
+            + "patterns.target={purpose}\n"
+            + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
+            + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
+            + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
+            + "prefixes.verify-hold=verify-hold.{owner}.\nprefixes.admit-test=admit-test-\n")
+        _ = write_config_fixture(config / "scratch.conf", "suffix_length=6\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
+
+    def editable_source(self) -> tuple[Path, str, Path]:
+        source = self.root / "source"
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, capture_output=True)
+        _ = (source / "source.txt").write_text("committed source\n")
+        tip = commit_repository(source, "source")
+        bare = self.root / "origin.git"
+        _ = subprocess.run(["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True)
+        return source, tip, bare
+
+    def test_editable_worktrees_keep_new_and_existing_branches(self) -> None:
+        source, tip, bare = self.editable_source()
+        del bare
+        for cli in (False, True):
+            for new in (False, True):
+                with self.subTest(cli=cli, new=new):
+                    branch = f"review-{cli}-{new}"
+                    path = self.root / f"editable path {branch}"
+                    if not new:
+                        _ = subprocess.run(["git", "-C", str(source), "branch", branch, tip], check=True)
+                    if cli:
+                        flags = (["--new-branch", branch, "--start-point", tip] if new
+                                 else ["--existing-branch", branch])
+                        result = self.command("editable-repository", "--path", str(path), "--source", str(source), *flags)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), str(path))
+                    else:
+                        selection = folders.NewWorktreeBranch(branch, tip) if new else folders.ExistingWorktreeBranch(branch)
+                        self.assertEqual(folders.create_build_folder(folders.LinkedEditableRepository(path, source, selection)), path)
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "branch", "--show-current"], text=True).strip(), branch)
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
+                    self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                    self.assertEqual(folders.build_folder_state(path), "free")
+
+    def test_remote_editable_clones_keep_the_ref_and_depth(self) -> None:
+        source, tip, bare = self.editable_source()
+        _ = (source / "source.txt").write_text("later source\n")
+        _ = commit_repository(source, "later")
+        _ = subprocess.run(["git", "-C", str(source), "push", str(bare), "main"], check=True, capture_output=True)
+        for cli in (False, True):
+            with self.subTest(cli=cli):
+                path = self.root / f"clone {cli}"
+                if cli:
+                    result = self.command("editable-repository", "--path", str(path), "--url", bare.as_uri(),
+                                          "--ref", "main", "--depth", "1")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), str(path))
+                else:
+                    _ = folders.create_build_folder(folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1))
+                self.assertEqual((path / "source.txt").read_text(), "later source\n")
+                self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-list", "--count", "HEAD"], text=True).strip(), "1")
+                self.assertNotEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
+                self.assertEqual(folders.build_folder_state(path), "free")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_editable_git_children_do_not_inherit_the_lease(self) -> None:
+        source, tip, bare = self.editable_source()
+        real_git = shutil.which("git")
+        assert real_git is not None
+        commands = self.root / "commands"
+        commands.mkdir()
+        fake_git = commands / "git"
+        _ = fake_git.write_text(f"#!{sys.executable}\n" + """import os, pathlib, signal, sys
+arguments = sys.argv[1:]
+if arguments[:1] == ['clone'] or arguments[2:4] == ['worktree', 'add']:
+    child = os.fork()
+    if child == 0:
+        sink = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(sink, descriptor)
+        os.close(sink)
+        signal.pause()
+        os._exit(0)
+    pathlib.Path(os.environ['EDITABLE_GIT_CHILD_PID']).write_text(str(child))
+os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arguments])
+""")
+        fake_git.chmod(0o755)
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                path = self.root / f"editable-child-{remote}"
+                pid_file = self.root / f"git-child-{remote}.pid"
+                request: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("child-lease", tip)))
+                try:
+                    with mock.patch.dict(os.environ, {
+                        "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                        "EDITABLE_REAL_GIT": real_git, "EDITABLE_GIT_CHILD_PID": str(pid_file),
+                    }):
+                        self.assertEqual(folders.create_build_folder(request), path)
+                    self.assertTrue(pid_file.is_file())
+                    os.kill(int(pid_file.read_text()), 0)
+                    self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                    self.assertEqual(folders.build_folder_state(path), "free")
+                finally:
+                    if pid_file.exists():
+                        try:
+                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_new_worktree_request_keeps_a_branch_created_by_another_request(self) -> None:
+        source, tip, _ = self.editable_source()
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        for scenario in ("before", "during"):
+            with self.subTest(scenario=scenario):
+                branch = f"other-request-{scenario}"
+                path = self.root / branch
+                if scenario == "before":
+                    _ = run(["git", "-C", str(source), "branch", "--", branch, tip], check=True)
+                injected: list[str] = []
+
+                def create_other_branch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    creates_branch = command[:4] == ["git", "-C", str(source), "branch"]
+                    adds_worktree = command[:5] == ["git", "-C", str(source), "worktree", "add"]
+                    if scenario == "during" and not injected and (creates_branch or adds_worktree):
+                        _ = run(["git", "-C", str(source), "branch", "--", branch, tip], check=True)
+                        injected.append(branch)
+                    return run(command, **options)
+
+                request = folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch(branch, tip))
+                with mock.patch.object(subprocess, "run", side_effect=create_other_branch):
+                    with self.assertRaisesRegex(OSError, branch):
+                        _ = folders.create_build_folder(request)
+                if scenario == "during":
+                    self.assertEqual(injected, [branch])
+                self.assertTrue(path.is_dir())
+                self.assertEqual(list(path.iterdir()), [])
+                self.assertEqual(folders.build_folder_state(path), "free")
+                self.assertEqual(subprocess.check_output(["git", "-C", str(source), "rev-parse", "--verify",
+                                                         f"refs/heads/{branch}"], text=True).strip(), tip)
+
+    def test_editable_creation_refuses_an_occupied_checkout_without_changes(self) -> None:
+        source, tip, bare = self.editable_source()
+        _ = (source / "source.txt").write_text("keep edits\n")
+        _ = (source / "untracked.txt").write_text("keep untracked work\n")
+        before = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"])
+        requests: tuple[folders.EditableRepositoryRequest, ...] = (
+            folders.LinkedEditableRepository(source, source, folders.NewWorktreeBranch("refused", tip)),
+            folders.RemoteEditableRepository(source, bare.as_uri(), "main", 1),
+        )
+        for request in requests:
+            with self.subTest(request=type(request).__name__):
+                with self.assertRaisesRegex(FileExistsError, "occupied"):
+                    _ = folders.create_build_folder(request)
+                self.assertEqual(subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"]), before)
+                self.assertEqual((source / "source.txt").read_text(), "keep edits\n")
+                self.assertEqual((source / "untracked.txt").read_text(), "keep untracked work\n")
+                self.assertEqual(folders.build_folder_state(source), "free")
+
+    def test_failed_editable_clone_can_retry_and_the_linked_checkout_is_retained(self) -> None:
+        source, tip, bare = self.editable_source()
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                path = self.root / f"failed {remote}"
+                failed: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "missing-ref", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("retry", "missing-ref")))
+                with self.assertRaisesRegex(OSError, str(path)) as caught:
+                    _ = folders.create_build_folder(failed)
+                self.assertIn("missing-ref", str(caught.exception))
+                self.assertEqual(path.exists(), not remote)
+                self.assertEqual(folders.build_folder_state(path), "free")
+                if not remote:
+                    self.assertEqual(list(path.iterdir()), [])
+                    path = self.root / "linked-retry"
+                retry: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("retry", tip)))
+                _ = folders.create_build_folder(retry)
+                self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                self.assertEqual(folders.build_folder_state(path), "free")
+
+        template = self.root / "template"
+        hook = template / "hooks/post-checkout"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text("#!/bin/sh\nprintf 'interrupted checkout work' > recovery.txt\nexit 1\n")
+        hook.chmod(0o755)
+        path = self.root / "interrupted-clone"
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "init.templateDir",
+                                          "GIT_CONFIG_VALUE_0": str(template)}):
+            with self.assertRaisesRegex(OSError, str(path)):
+                _ = folders.create_build_folder(folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1))
+        self.assertFalse(path.exists())
+        self.assertEqual(folders.build_folder_state(path), "free")
+        recovery = path.with_name(path.name + "-rescues.git")
+        self.assertFalse(recovery.exists())
+        self.assertFalse(recovery.with_name(recovery.name + ".lock").exists())
+        self.assertFalse(recovery.with_name(recovery.name + ".lease.json").exists())
+
+    def test_failed_worktree_creation_retains_the_path_and_branch(self) -> None:
+        source, tip, _ = self.editable_source()
+        _ = (source / "source.txt").write_text("later source\n")
+        later = commit_repository(source, "later")
+        hook = source / ".git/hooks/post-checkout"
+        for scenario in ("new", "existing", "occupied-branch", "moved"):
+            with self.subTest(scenario=scenario):
+                branch = f"retry-{scenario}"
+                path = self.root / branch
+                if scenario in ("existing", "occupied-branch"):
+                    _ = subprocess.run(["git", "-C", str(source), "branch", branch, tip], check=True)
+                move = f"git update-ref refs/heads/{branch} {later}\n" if scenario == "moved" else ""
+                _ = hook.write_text("#!/bin/sh\n" + move + "printf 'checkout failed' >&2\nexit 1\n")
+                hook.chmod(0o755)
+                selection = (folders.ExistingWorktreeBranch(branch) if scenario == "existing"
+                             else folders.NewWorktreeBranch(branch, tip))
+                request = folders.LinkedEditableRepository(path, source, selection)
+                with self.assertRaisesRegex(OSError, str(path)):
+                    _ = folders.create_build_folder(request)
+                self.assertTrue(path.is_dir())
+                self.assertEqual(folders.build_folder_state(path), "free")
+                trees = subprocess.check_output(["git", "-C", str(source), "worktree", "list", "--porcelain"], text=True)
+                self.assertEqual(str(path) in trees, scenario != "occupied-branch")
+                actual = subprocess.check_output(
+                    ["git", "-C", str(source), "rev-parse", "--verify", f"refs/heads/{branch}"], text=True)
+                self.assertEqual(actual.strip(), later if scenario == "moved" else tip)
+
+    def test_failed_clone_without_head_removes_its_folder_and_preserves_the_git_error(self) -> None:
+        _, _, bare = self.editable_source()
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                path = self.root / f"incomplete-clone-{timeout}"
+                failure = (subprocess.TimeoutExpired(["git", "clone"], 1, stderr=b"clone interrupted") if timeout else
+                           subprocess.CalledProcessError(1, ["git", "clone"], stderr="clone interrupted"))
+
+                def interrupt(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if command[:2] == ["git", "clone"]:
+                        _ = run(["git", "init", "-q", str(path)], check=True, capture_output=True, text=True)
+                        raise failure
+                    return run(command, **options)
+
+                request = folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1)
+                with mock.patch.object(subprocess, "run", side_effect=interrupt):
+                    with self.assertRaisesRegex(OSError, "clone interrupted") as caught:
+                        _ = folders.create_build_folder(request)
+                self.assertIs(caught.exception.__cause__, failure)
+                self.assertIn(str(path), str(caught.exception))
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertFalse(path.with_name(path.name + "-rescues.git").exists())
+                self.assertEqual(folders.create_build_folder(request), path)
+
+    def test_existing_worktree_branch_rejects_commits_tags_and_missing_names_before_allocation(self) -> None:
+        source, tip, _ = self.editable_source()
+        _ = subprocess.run(["git", "-C", str(source), "tag", "saved", tip], check=True)
+        for name in (tip, "saved", "missing"):
+            for cli in (False, True):
+                with self.subTest(name=name, cli=cli):
+                    path = self.root / f"refused-{name}-{cli}"
+                    if cli:
+                        result = self.command("editable-repository", "--path", str(path), "--source", str(source),
+                                              "--existing-branch", name)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(name, result.stderr)
+                    else:
+                        request = folders.LinkedEditableRepository(path, source, folders.ExistingWorktreeBranch(name))
+                        with self.assertRaisesRegex(ValueError, name):
+                            _ = folders.create_build_folder(request)
+                    self.assertFalse(path.exists())
+                    self.assertFalse(path.with_name(path.name + ".lock").exists())
+                    self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+
+    def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        lines = [line for line in settings.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("roots.scratch")]
+
+        def configure(root: Path) -> None:
+            text = "\n".join(f"{line}\nroots.scratch={root}" if line == "[roots]" else line for line in lines)
+            _ = settings.write_text(text + "\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ):
+            del os.environ[copy_record.ROOT_ENV]
+            configure(self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            configure(self.root / "second-root")
+            self.assertEqual(copy_record.root(), self.root / "second-root")
+
+    def test_cli_remove_cleans_free_records_and_keeps_a_held_folder(self) -> None:
+        allocated = self.command("unique", "--prefix", "remove-cli-")
+        self.assertEqual(allocated.returncode, 0, allocated.stderr)
+        path = Path(allocated.stdout.strip())
+        _ = (path / "output").write_text("temporary output")
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.command("remove", str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+        held = folders.create_build_folder(folders.UniqueBuildFolder("held-remove-cli-"))
+        self.addCleanup(_release_folder, held)
+        _ = (held / "output").write_text("held output")
+        result = self.command("remove", str(held))
+        self.assertEqual((result.returncode, result.stderr), (1, f"build folders: {held}: the folder lock is held\n"))
+        self.assertEqual((held / "output").read_text(), "held output")
+        self.assertTrue(held.with_name(held.name + ".lease.json").is_file())
+        self.assertTrue(held.with_name(held.name + ".lock").is_file())
+        _release_folder(held)
+        result = self.command("remove", str(held))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(held.exists())
+        self.assertFalse(held.with_name(held.name + ".lease.json").exists())
+        self.assertFalse(held.with_name(held.name + ".lock").exists())
+        local = folders.create_build_folder(folders.UniqueBuildFolder("local-remove-cli-"))
+        self.addCleanup(_release_folder, local)
+        self.assertEqual(folders.main(["remove", str(local)]), 0)
+        self.assertFalse(local.exists())
+        self.assertFalse(local.with_name(local.name + ".lease.json").exists())
+        self.assertFalse(local.with_name(local.name + ".lock").exists())
+        with self.assertRaises(StopIteration):
+            _ = folders.build_folder_lock_fd(local)
+
+    def test_cli_call_releases_the_locks_it_took_and_keeps_the_callers(self) -> None:
+        kept = folders.create_build_folder(folders.UniqueBuildFolder("kept-cli-"))
+        self.addCleanup(_release_folder, kept)
+        locks = cast(dict[int, Path], getattr(folders, "_locks"))
+        before = dict(locks)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(folders.main(["unique", "--prefix", "main-cli-"]), 0)
+        created = Path(output.getvalue().strip())
+        self.assertTrue(created.is_dir())
+        self.assertEqual(locks, before)
+        self.assertEqual(folders.build_folder_state(created), "free")
+        self.assertEqual(folders.build_folder_state(kept), "held")
+        self.assertEqual(folders.main(["remove", str(created)]), 0)
+        self.assertFalse(created.exists())
+
+    def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
+        spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
+                                       repository="repo", owner="unit", purpose="race", suffix="fixed")
+        path = folders.build_folder_path(spec)
+        mkdir = os.mkdir
+
+        def collision(name: str, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            mkdir(name, mode, dir_fd=dir_fd)
+            if name == path.name:
+                _ = (path / "keep").write_text("another creator")
+                raise FileExistsError(name)
+
+        with mock.patch.object(os, "mkdir", side_effect=collision):
+            with self.assertRaises(FileExistsError):
+                _ = folders.create_build_folder(spec)
+        self.assertEqual((path / "keep").read_text(), "another creator")
+        self.assertTrue(path.with_name(path.name + ".lock").is_file())
+        self.assertEqual(json.loads(path.with_name(path.name + ".lease.json").read_text())["purpose"], "race")
+        self.assertEqual(folders.build_folder_state(path), "free")
+
+    def test_stable_lease_stays_complete_when_publication_stops(self) -> None:
+        request = folders.StableOwnerFolder("lease-owner", folders.ExplicitBuildParent(self.root))
+        path = folders.create_build_folder(request)
+        self.addCleanup(_release_folder, path)
+        lease = path.with_name(path.name + ".lease.json")
+        before = lease.read_text()
+        for target in ("json.dumps", "os.replace"):
+            with self.subTest(target=target):
+                with mock.patch(target, side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = folders.create_build_folder(request)
+                self.assertEqual(lease.read_text(), before)
+                self.assertEqual(set(self.root.iterdir()), {path, lease, path.with_name(path.name + ".lock")})
+        self.assertTrue(path.is_dir())
+        self.assertTrue(path.with_name(path.name + ".lock").is_file())
+        self.assertEqual(lease.read_text(), before)
+        self.assertEqual(json.loads(lease.read_text())["pid"], os.getpid())
+        self.assertEqual(folders.build_folder_state(path), "held")
+
+    def test_tool_lock_files_do_not_keep_a_temporary_folder(self) -> None:
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("rust-project-")) as path:
+            _ = (path / "Cargo.lock").write_text("version = 4\n")
+            git = path / ".git"
+            git.mkdir()
+            _ = (git / "index.lock").write_text("tool lock")
+            _ = (git / "orphan.lease.json").write_text("unpaired record")
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name(path.name + ".lock").exists())
+        self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+
+    def test_outer_cleanup_removes_a_free_nested_record(self) -> None:
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("outer-free-")) as outer:
+            inner = folders.create_build_folder(folders.UniqueBuildFolder(
+                "inner-free-", folders.ExplicitBuildParent(outer)))
+            _ = (inner / "output").write_text("temporary output")
+            _release_folder(inner)
+            self.assertEqual(folders.build_folder_state(inner), "free")
+            self.assertTrue(inner.with_name(inner.name + ".lock").is_file())
+            self.assertTrue(inner.with_name(inner.name + ".lease.json").is_file())
+        for path in (outer, inner):
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + ".lock").exists())
+            self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+
+    def test_cancelled_collision_keeps_another_requests_reused_descriptor(self) -> None:
+        registry: dict[int, Path] = {}
+        collision = self.root / "collision"
+        collision.mkdir()
+        closed: list[int] = []
+        open_lock = build_folder_lock.open_lock
+
+        def remember(path: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path, directory, create=create)
+            closed.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(folders, "_locks", registry):
+            other = folders.create_build_folder(folders.StableOwnerFolder(
+                "other", folders.ExplicitBuildParent(self.root)))
+            original = folders.build_folder_lock_fd(other)
+
+            def cancel_after_reuse(spec: folders.BuildFolderSpec) -> Path:
+                del spec
+                if not closed:
+                    return collision
+                reused = os.dup2(original, closed[0])
+                self.assertEqual(reused, closed[0])
+                registry[reused] = other
+                _ = registry.pop(original)
+                os.close(original)
+                raise KeyboardInterrupt()
+
+            try:
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
+                        mock.patch.object(folders, "build_folder_path", side_effect=cancel_after_reuse):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = folders.create_build_folder(folders.UniqueBuildFolder("collision-"))
+                self.assertEqual(registry.get(closed[0]), other)
+                self.assertEqual(folders.build_folder_lock_fd(other), closed[0])
+                _ = os.fstat(closed[0])
+                self.assertEqual(folders.build_folder_state(other), "held")
+                self.assertTrue(collision.is_dir())
+            finally:
+                _release_folder(other)
+
+    def test_interrupted_collision_close_keeps_another_requests_reused_descriptor(self) -> None:
+        registry: dict[int, Path] = {}
+        collision = self.root / "close-collision"
+        collision.mkdir()
+        collided: list[int] = []
+        reused: list[int] = []
+        open_lock = build_folder_lock.open_lock
+        close = os.close
+
+        def remember(path: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path, directory, create=create)
+            collided.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(folders, "_locks", registry):
+            other = folders.create_build_folder(folders.StableOwnerFolder(
+                "close-other", folders.ExplicitBuildParent(self.root)))
+            original = folders.build_folder_lock_fd(other)
+
+            def cancel_close(descriptor: int) -> None:
+                close(descriptor)
+                if collided and descriptor == collided[0] and not reused:
+                    replacement = os.dup2(original, descriptor)
+                    self.assertEqual(replacement, descriptor)
+                    reused.append(replacement)
+                    registry[replacement] = other
+                    _ = registry.pop(original)
+                    close(original)
+                    raise KeyboardInterrupt()
+
+            try:
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
+                        mock.patch.object(folders, "build_folder_path", return_value=collision), \
+                        mock.patch.object(os, "close", side_effect=cancel_close):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = folders.create_build_folder(folders.UniqueBuildFolder("close-collision-"))
+                self.assertEqual(reused, collided)
+                self.assertEqual(registry.get(reused[0]), other)
+                self.assertEqual(folders.build_folder_lock_fd(other), reused[0])
+                _ = os.fstat(reused[0])
+                self.assertEqual(folders.build_folder_state(other), "held")
+                self.assertTrue(collision.is_dir())
+            finally:
+                _release_folder(other)
+
+    def test_release_closes_the_descriptor_when_registry_removal_stops(self) -> None:
+        class InterruptedRegistry(dict[int, Path]):
+            @override
+            def pop(self, key: int, default: object = None) -> Never:
+                _ = super().pop(key, default)
+                raise KeyboardInterrupt()
+
+        registry = InterruptedRegistry()
+        with mock.patch.object(folders, "_locks", registry):
+            path = folders.create_build_folder(folders.UniqueBuildFolder("release-stop-"))
+            descriptor = folders.build_folder_lock_fd(path)
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    _release_folder(path)
+                self.assertNotIn(descriptor, registry)
+                with self.assertRaises(OSError):
+                    _ = os.fstat(descriptor)
+                self.assertEqual(folders.build_folder_state(path), "free")
+            finally:
+                registry.clear()
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_nested_context_removes_its_records_before_the_parent_ends(self) -> None:
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("outer-")) as outer:
+            with folders.temporary_build_folder(folders.UniqueBuildFolder(
+                    "inner-", folders.ExplicitBuildParent(outer))) as inner:
+                self.assertTrue(inner.is_dir())
+            self.assertTrue(outer.is_dir())
+            self.assertFalse(inner.exists())
+            self.assertFalse(inner.with_name(inner.name + ".lease.json").exists())
+            self.assertFalse(inner.with_name(inner.name + ".lock").exists())
+        self.assertFalse(outer.exists())
+
+    def test_direct_allocation_releases_the_hold_when_parent_close_stops(self) -> None:
+        close = os.close
+        descriptors: list[int] = []
+        set_inheritable = os.set_inheritable
+
+        def remember(descriptor: int, inheritable: bool) -> None:
+            descriptors.append(descriptor)
+            set_inheritable(descriptor, inheritable)
+
+        def stop_close(descriptor: int) -> None:
+            directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            close(descriptor)
+            if directory:
+                raise KeyboardInterrupt()
+
+        request = folders.StableOwnerFolder("parent-close", folders.ExplicitBuildParent(self.root))
+        path = self.root / "parent-close"
+        try:
+            with mock.patch.object(os, "set_inheritable", side_effect=remember), \
+                    mock.patch.object(os, "close", side_effect=stop_close):
+                with self.assertRaises(KeyboardInterrupt):
+                    _ = folders.create_build_folder(request)
+            self.assertEqual(len(descriptors), 1)
+            with self.assertRaises(StopIteration):
+                _ = folders.build_folder_lock_fd(path)
+            with self.assertRaises(OSError):
+                _ = os.fstat(descriptors[0])
+            self.assertEqual(folders.build_folder_state(path), "free")
+            self.assertTrue(path.with_name(path.name + ".lease.json").is_file())
+        finally:
+            _release_folder(path)
+
+    def test_temporary_context_rejects_a_missing_explicit_parent(self) -> None:
+        parent = self.root / "missing"
+        request = folders.UniqueBuildFolder("explicit-", folders.ExplicitBuildParent(parent))
+        for temporary in (False, True):
+            with self.subTest(temporary=temporary):
+                with self.assertRaises(FileNotFoundError):
+                    if temporary:
+                        with folders.temporary_build_folder(request):
+                            self.fail("the missing parent was accepted")
+                    else:
+                        _ = folders.create_build_folder(request)
+                self.assertFalse(parent.exists())
+
+    def test_query_retries_another_queries_probe(self) -> None:
+        path = folders.create_build_folder(folders.StableOwnerFolder("probe", folders.ExplicitBuildParent(self.root)))
+        _release_folder(path)
+        flock = fcntl.flock
+        attempts: list[int] = []
+
+        def overlap(descriptor: int, mode: int) -> None:
+            if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                attempts.append(descriptor)
+                if len(attempts) == 1:
+                    raise BlockingIOError()
+            flock(descriptor, mode)
+
+        with mock.patch.object(fcntl, "flock", side_effect=overlap):
+            self.assertEqual(folders.build_folder_state(path), "free")
+        self.assertGreaterEqual(len(attempts), 2)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_fork_inside_nested_contexts_keeps_each_inherited_lock(self) -> None:
+        probe = """import os, pathlib, signal
+from scripts.lib import build_folders as f
+root = pathlib.Path(os.environ['TMPDIR'])
+read, write = os.pipe()
+outer_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='outer')
+inner_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='inner')
+with f.temporary_build_folder(outer_spec) as outer:
+    with f.temporary_build_folder(inner_spec) as inner:
+        with f.temporary_build_folder(outer_spec) as shared:
+            assert shared == outer
+        child = os.fork()
+        if child == 0:
+            signal.alarm(3)
+            assert os.read(read, 1) == b'x'
+            assert outer.is_dir() and inner.is_dir()
+            assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
+    if child == 0:
+        assert not inner.exists() and f.build_folder_state(inner) == 'free'
+        assert outer.is_dir() and f.build_folder_state(outer) == 'held'
+if child == 0:
+    assert not outer.exists() and f.build_folder_state(outer) == 'free'
+    os._exit(0)
+assert outer.is_dir() and inner.is_dir()
+assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'held'
+os.write(write, b'x')
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0, status
+assert not outer.exists() and not inner.exists()
+assert f.build_folder_state(outer) == f.build_folder_state(inner) == 'free'
+print('nested')
+"""
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "nested\n")
+
+    def test_allocation_interrupts_check_the_folder_lock_and_lease(self) -> None:
+        probe = """import errno, fcntl, json, os, pathlib, shutil, signal, stat, sys
+from unittest import mock
+from scripts.lib import build_folders as f
+root = pathlib.Path(os.environ['TMPDIR'])
+stage = sys.argv[1]
+spec = f.BuildFolderSpec(kind='temporary', parent=root, suffix_length=2, repository='repo',
+                       owner='unit', purpose=stage, suffix='fixed')
+path = f.build_folder_path(spec)
+lock = path.with_name(path.name + '.lock')
+lease_path = path.with_name(path.name + '.lease.json')
+armed = [True]
+descriptors = []
+def interrupt():
+    if armed[0]:
+        armed[0] = False
+        if stage not in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
+            assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        os.kill(os.getpid(), signal.SIGINT)
+flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
+unlink, remove_folder = os.unlink, f.remove_folder
+def lock_step(fd, mode):
+    result = flock(fd, mode)
+    if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
+        interrupt()
+    return result
+def mkdir_step(name, mode=0o777, *, dir_fd=None):
+    if name == path.name and dir_fd is not None:
+        assert lease_path.is_file(), 'the folder has no prior lease'
+        result = mkdir(name, mode, dir_fd=dir_fd)
+        interrupt()
+        return result
+    return mkdir(name, mode, dir_fd=dir_fd)
+def lease_step(*args):
+    lease(*args)
+    interrupt()
+def fstat_step(fd):
+    inode = fstat(fd)
+    if stat.S_ISREG(inode.st_mode):
+        descriptors.append(fd)
+        interrupt()
+    return inode
+class PublishStep(dict):
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        interrupt()
+def removal_step(name, *, dir_fd, onexc):
+    os.unlink(str(path / 'partial'))
+    interrupt()
+    return remove(name, dir_fd=dir_fd, onexc=onexc)
+def folder_removed(*args):
+    remove_folder(*args)
+    interrupt()
+def unlink_step(name, *, dir_fd=None):
+    unlink(name, dir_fd=dir_fd)
+    if (stage == 'lease_removed' and str(name).endswith('.lease.json')) or (stage == 'lock_removed' and str(name).endswith('.lock')):
+        interrupt()
+patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
+           'mkdir': mock.patch.object(os, 'mkdir', side_effect=mkdir_step),
+           'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
+           'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
+           'publish': mock.patch.object(f, '_locks', PublishStep()),
+           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
+           'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
+           'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
+           'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}
+with patches[stage]:
+    try:
+        if stage in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
+            with f.temporary_build_folder(spec) as made:
+                (made / 'partial').write_text('remove this')
+        else:
+            f.create_build_folder(spec)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError('SIGINT did not reach the caller')
+    assert not armed[0]
+    assert not getattr(f, '_locks'), 'the interrupted caller retained a descriptor'
+assert path.exists() == (stage in ('mkdir', 'removal')), (stage, path)
+assert lock.exists() == (stage in ('lock', 'fstat', 'mkdir', 'removal', 'folder_removed', 'lease_removed')), (stage, lock)
+assert lease_path.exists() == (stage in ('mkdir', 'removal', 'folder_removed')), (stage, lease_path)
+if path.exists():
+    assert json.loads(lease_path.read_text())['purpose'] == stage
+assert f.build_folder_state(path) == 'free'
+for descriptor in descriptors:
+    try:
+        os.fstat(descriptor)
+    except OSError as error:
+        assert error.errno == errno.EBADF
+    else:
+        raise AssertionError('the interrupted open leaked a descriptor')
+assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+assert f.remove_build_folder(path, lambda: shutil.rmtree(path) if path.exists() else None)
+assert not path.exists() and not lock.exists() and not lease_path.exists()
+print('free')
+"""
+        for stage in ("lock", "fstat", "lease", "mkdir", "publish", "removal", "folder_removed", "lease_removed", "lock_removed"):
+            with self.subTest(stage=stage):
+                result = subprocess.run([sys.executable, "-c", probe, stage], capture_output=True, text=True, timeout=4)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "free\n")
+
+    def test_interrupt_before_stable_mkdir_keeps_existing_output(self) -> None:
+        path = folders.create_build_folder(folders.StableOwnerFolder("existing", folders.ExplicitBuildParent(self.root)))
+        _release_folder(path)
+        _ = (path / "keep").write_text("existing output")
+        with mock.patch("scripts.lib.build_folders._write_lease", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = folders.create_build_folder(folders.StableOwnerFolder(path.name, folders.ExplicitBuildParent(self.root)))
+        self.assertEqual((path / "keep").read_text(), "existing output")
+        self.assertTrue(path.with_name(path.name + ".lock").is_file())
+        self.assertTrue(path.with_name(path.name + ".lease.json").is_file())
+        self.assertEqual(folders.build_folder_state(path), "free")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_fork_during_allocation_inherits_the_kernel_lock(self) -> None:
+        probe = """import fcntl, os, pathlib, signal
+from unittest import mock
+from scripts.lib import build_folders as f
+root = pathlib.Path(os.environ['TMPDIR'])
+path = root / 'fork-lock'
+read, write = os.pipe()
+flock = fcntl.flock
+child = []
+def fork_after_lock(fd, mode):
+    result = flock(fd, mode)
+    if not child and mode == fcntl.LOCK_SH | fcntl.LOCK_NB:
+        pid = os.fork()
+        if pid == 0:
+            signal.alarm(3)
+            assert os.read(read, 1) == b'x'
+            assert path.is_dir() and f.build_folder_state(path) == 'held'
+            os.close(fd)
+            assert path.is_dir() and f.build_folder_state(path) == 'free'
+            os._exit(0)
+        child.append(pid)
+    return result
+with mock.patch.object(fcntl, 'flock', side_effect=fork_after_lock):
+    assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(root))) == path
+getattr(f, '_release_build_folder')(path)
+assert path.is_dir() and f.build_folder_state(path) == 'held'
+os.write(write, b'x')
+_, status = os.waitpid(child[0], 0)
+assert os.waitstatus_to_exitcode(status) == 0, status
+assert path.is_dir() and f.build_folder_state(path) == 'free'
+print('inherited')
+"""
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "inherited\n")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_fork_while_the_main_thread_allocates_keeps_the_callers_signal_handlers(self) -> None:
+        probe = """import fcntl, os, pathlib, signal, threading
+from unittest import mock
+from scripts.lib import build_folders as f
+root = pathlib.Path(os.environ['TMPDIR'])
+path = root / 'main-allocation'
+reached, resume = threading.Event(), threading.Event()
+read, write = os.pipe()
+descriptors, status = [], []
+flock, mkdir = fcntl.flock, os.mkdir
+def record_lock(fd, mode):
+    result = flock(fd, mode)
+    if mode == fcntl.LOCK_SH | fcntl.LOCK_NB:
+        descriptors.append(fd)
+    return result
+def pause_mkdir(name, mode=0o777, *, dir_fd=None):
+    result = mkdir(name, mode, dir_fd=dir_fd)
+    if name == path.name and dir_fd is not None:
+        reached.set()
+        assert resume.wait(4)
+    return result
+def fork_from_worker():
+    assert reached.wait(2)
+    child = os.fork()
+    if child == 0:
+        signal.alarm(3)
+        assert signal.getsignal(signal.SIGINT) == signal.default_int_handler
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except KeyboardInterrupt:
+            pass
+        else:
+            os._exit(2)
+        assert path.is_dir() and f.build_folder_state(path) == 'held'
+        os.close(descriptors[0])
+        assert os.read(read, 1) == b'x'
+        assert path.is_dir() and f.build_folder_state(path) == 'free'
+        os._exit(0)
+    resume.set()
+    _, code = os.waitpid(child, 0)
+    status.append(os.waitstatus_to_exitcode(code))
+worker = threading.Thread(target=fork_from_worker)
+with mock.patch.object(fcntl, 'flock', side_effect=record_lock), mock.patch.object(os, 'mkdir', side_effect=pause_mkdir):
+    worker.start()
+    assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(root))) == path
+getattr(f, '_release_build_folder')(path)
+os.write(write, b'x')
+worker.join(4)
+assert not worker.is_alive() and status == [0], status
+assert path.is_dir() and f.build_folder_state(path) == 'free'
+print('signals')
+"""
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=6)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "signals\n")
+
+    def test_maker_and_cleanup_retry_a_query_that_still_holds_its_lock(self) -> None:
+        for operation in ("maker", "cleanup"):
+            with self.subTest(operation=operation):
+                path = self.root / operation
+                path.with_name(path.name + ".lock").touch()
+                if operation == "cleanup":
+                    path.mkdir()
+                    _ = path.with_name(path.name + ".lease.json").write_text("record")
+                reached, release = threading.Event(), threading.Event()
+                flock = fcntl.flock
+
+                def pause_probe(descriptor: int, mode: int) -> None:
+                    try:
+                        flock(descriptor, mode)
+                    except BlockingIOError:
+                        release.set()
+                        raise
+                    if threading.current_thread().name.startswith("probe") and mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                        reached.set()
+                        if not release.wait(3):
+                            raise AssertionError("the maker did not meet the query")
+
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as workers:
+                    with mock.patch("fcntl.flock", side_effect=pause_probe):
+                        query = workers.submit(folders.build_folder_state, path)
+                        try:
+                            self.assertTrue(reached.wait(3))
+                            if operation == "maker":
+                                made = folders.create_build_folder(folders.StableOwnerFolder(path.name, folders.ExplicitBuildParent(self.root)))
+                                self.assertEqual(made, path)
+                                _release_folder(made)
+                            else:
+                                self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                                self.assertFalse(path.exists())
+                                self.assertFalse(path.with_name(path.name + ".lock").exists())
+                                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                        finally:
+                            release.set()
+                        self.assertEqual(query.result(timeout=3), "free")
+
+    def test_hard_linked_lock_and_lease_keep_the_unrelated_file_intact(self) -> None:
+        for suffix in (".lock", ".lease.json"):
+            with self.subTest(suffix=suffix):
+                parent = self.root / suffix.removeprefix(".")
+                parent.mkdir()
+                outside = parent / "unrelated"
+                _ = outside.write_text("keep this file")
+                os.link(outside, parent / ("owner" + suffix))
+                with self.assertRaises(ValueError):
+                    try:
+                        _ = folders.create_build_folder(folders.StableOwnerFolder("owner", folders.ExplicitBuildParent(parent)))
+                    finally:
+                        self.assertEqual(outside.read_text(), "keep this file")
+
+    def test_lease_failure_removes_only_a_new_allocation_and_releases_its_lock(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                path = self.root / ("existing" if existing else "new")
+                if existing:
+                    path.mkdir()
+                    _ = (path / "keep").write_text("existing output")
+                with mock.patch("scripts.lib.build_folders._write_lease", side_effect=OSError("lease failure")):
+                    with self.assertRaisesRegex(OSError, "lease failure"):
+                        _ = folders.create_build_folder(folders.StableOwnerFolder(path.name, folders.ExplicitBuildParent(self.root)))
+                self.assertEqual(path.exists(), existing)
+                self.assertEqual(folders.build_folder_state(path), "free")
+                if existing:
+                    self.assertEqual((path / "keep").read_text(), "existing output")
+
+    def test_context_uses_one_parent_descriptor_when_the_parent_path_changes(self) -> None:
+        parent = self.root / "parent"
+        parent.mkdir()
+        moved = self.root / "moved"
+        opens: list[Path] = []
+        original = build_folder_lock.folder_parent
+
+        @contextmanager
+        def replace_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
+            with original(path, root, create=create) as descriptor:
+                opens.append(root)
+                if root == parent:
+                    _ = parent.rename(moved)
+                    parent.mkdir()
+                    _ = (parent / "keep").write_text("replacement")
+                yield descriptor
+
+        with mock.patch("scripts.lib.build_folder_lock.folder_parent", side_effect=replace_parent):
+            with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
+                self.assertTrue((moved / path.name).is_dir())
+                self.assertFalse(path.exists())
+        self.assertEqual(opens, [parent])
+        self.assertEqual(list(moved.iterdir()), [])
+        self.assertEqual([entry.name for entry in parent.iterdir()], ["keep"])
+
+    def test_unique_context_retries_held_and_free_collisions_without_deleting_output(self) -> None:
+        for held in (False, True):
+            with self.subTest(held=held):
+                parent = self.root / str(held)
+                parent.mkdir()
+                existing = parent / "proof-aa"
+                existing.mkdir()
+                _ = (existing / "keep").write_text("existing output")
+                lease = existing.with_name(existing.name + ".lease.json")
+                _ = lease.write_text("existing lease")
+                lock = existing.with_name(existing.name + ".lock")
+                with lock.open("w") as descriptor:
+                    if held:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    inode = lock.stat().st_ino
+                    spec = folders.BuildFolderSpec(kind="gate", parent=parent, suffix_length=2, purpose="proof")
+                    with mock.patch("secrets.choice", side_effect=list("aabb")):
+                        with folders.temporary_build_folder(spec) as made:
+                            self.assertEqual(made, parent / "proof-bb")
+                    self.assertEqual(lock.stat().st_ino, inode)
+                    self.assertEqual(lease.read_text(), "existing lease")
+                    self.assertEqual((existing / "keep").read_text(), "existing output")
+                self.assertFalse((parent / "proof-bb").exists())
+
+    def test_explicit_work_with_zero_suffix_length_works_in_the_context(self) -> None:
+        spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=0,
+                                       showrunner="builds", unit="queue", work="fixed", purpose="proof")
+        direct = folders.create_build_folder(spec)
+        _release_folder(direct)
+        self.assertTrue(folders.remove_build_folder(direct, lambda: shutil.rmtree(direct)))
+        with folders.temporary_build_folder(spec) as path:
+            self.assertEqual(path, direct)
+            self.assertEqual(folders.build_folder_state(path), "held")
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name(path.name + ".lock").exists())
+        self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        with self.subTest(request="persistent unique"):
+            config = self.root / "persistent-config"
+            config.mkdir()
+            _ = (config / "build_folders.conf").write_text("""\
+# whole: 1..
+names.suffix_length=12
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+patterns.legacy-unique={purpose}{suffix}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""")
+            request = folders.UniqueBuildFolder("persistent-", folders.ExplicitBuildParent(self.root))
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                with folders.leased_build_folder(request) as persistent:
+                    self.assertTrue(persistent.name.startswith("persistent-"))
+                    self.assertEqual(len(persistent.name.removeprefix("persistent-")), 12)
+                    self.assertEqual(folders.build_folder_state(persistent), "held")
+                    _ = (persistent / "proof").write_text("saved")
+                self.assertEqual(folders.build_folder_state(persistent), "free")
+                self.assertEqual((persistent / "proof").read_text(), "saved")
+
+    def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
+        old_parent = self.root / "old-parent"
+        old_parent.mkdir()
+        (old_parent / "tree.lock").touch()
+        path = self.root / "new-parent" / "tree"
+        (path / "child").mkdir(parents=True)
+        directory = os.open(old_parent, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, directory)
+
+        with ((path / "child.lock").open("wb") as child_lock,
+              mock.patch("scripts.lib.build_folder_lock.folder_parent", return_value=nullcontext(directory))):
+            fcntl.flock(child_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with folders.collector_lease(path, children=True) as free:
+                self.assertFalse(free)
+
+    def test_collector_keeps_the_reservation_when_the_folder_is_absent(self) -> None:
+        path = self.root / "tree"
+        path.with_suffix(".lock").touch()
+
+        with folders.folder_removal_lease(path, children=True) as lease:
+            self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
+
+    def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
+        path = self.root / "absent-parent" / "tree"
+        for result in (True, False, None):
+            with self.subTest(result=result):
+                cleanup = mock.Mock(return_value=result)
+
+                self.assertEqual(folders.remove_build_folder(path, cleanup), result is not False)
+
+                cleanup.assert_called_once_with()
+                self.assertFalse(path.parent.exists())
+        cleanup = mock.Mock(side_effect=FileNotFoundError("cleanup failed"))
+        with self.assertRaisesRegex(FileNotFoundError, "cleanup failed"):
+            _ = folders.remove_build_folder(path, cleanup)
+        cleanup.assert_called_once_with()
+        self.assertFalse(path.parent.exists())
+
+    def test_retry_after_removal_does_not_leave_a_lock(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+        with self.assertRaises(FileNotFoundError):
+            _ = folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+        self.assertFalse(path.with_suffix(".lock").exists())
+
+    def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
+        outcome = folders.FolderPairRelease
+        for name, expected in (("released", outcome.RELEASED), ("present", outcome.FOLDER_PRESENT),
+                               ("held", outcome.LOCK_HELD), ("link", outcome.FOLDER_PRESENT)):
+            with self.subTest(name=name):
+                path = self.root / name
+                lease = path.with_suffix(".lease.json")
+                lock = path.with_suffix(".lock")
+                target = self.root / "link-target"
+                temporary = self.root / f"{name}.lease.json.0123456789abcdef.tmp"
+                _ = lease.write_text("lease\n")
+                _ = lock.write_text("lock\n")
+                _ = temporary.write_text("temporary record\n")
+                if name == "present":
+                    path.mkdir()
+                if name == "link":
+                    _ = target.write_text("target\n")
+                    path.symlink_to(target)
+
+                with lock.open("r+") as descriptor:
+                    if name == "held":
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+                        self.assertIs(folders.release_removed_folder(path), expected)
+
+                if name == "released":
+                    self.assertFalse(lease.exists())
+                    self.assertFalse(lock.exists())
+                else:
+                    self.assertEqual(lease.read_text(), "lease\n")
+                    self.assertEqual(lock.read_text(), "lock\n")
+                self.assertEqual(temporary.read_text(), "temporary record\n")
+                if name == "present":
+                    self.assertTrue(path.is_dir())
+                if name == "link":
+                    self.assertTrue(path.is_symlink())
+                    self.assertEqual(target.read_text(), "target\n")
+
+        path = self.root / "missing" / "tree"
+        self.assertIs(folders.release_removed_folder(path), outcome.PARENT_ABSENT)
+        self.assertFalse(path.parent.exists())
+        path = self.root / "no-pair"
+        before = set(self.root.iterdir())
+        self.assertIs(folders.release_removed_folder(path), outcome.PAIR_ABSENT)
+        self.assertEqual(set(self.root.iterdir()), before)
+
+    def test_release_removed_folder_keeps_pairs_under_a_linked_parent(self) -> None:
+        parent = self.root / "parent"
+        nested = parent / "nested"
+        nested.mkdir(parents=True)
+        linked = self.root / "linked"
+        linked.symlink_to(parent, target_is_directory=True)
+        inside_link = parent / "linked"
+        inside_link.symlink_to(nested, target_is_directory=True)
+        lease = parent / "tree.lease.json"
+        lock = parent / "tree.lock"
+        _ = lease.write_text("lease\n")
+        _ = lock.write_text("lock\n")
+        for path in (linked / "tree", inside_link / ".." / "tree"):
+            with self.subTest(path=path):
+                self.assertIs(folders.release_removed_folder(path), folders.FolderPairRelease.PARENT_LINK)
+                self.assertEqual(lease.read_text(), "lease\n")
+                self.assertEqual(lock.read_text(), "lock\n")
+
+    def test_release_removed_folder_reports_partial_release_when_the_lock_stays(self) -> None:
+        path = self.root / "tree"
+        lease = path.with_suffix(".lease.json")
+        lock = path.with_suffix(".lock")
+        replacement = self.root / "replacement"
+        real_unlink = os.unlink
+        for action in ("replace-lock", "deny-unlink"):
+            with self.subTest(action=action):
+                _ = lease.write_text("lease\n")
+                _ = lock.write_text("original\n")
+                _ = replacement.write_text("replacement\n")
+
+                def unlink(name: str, *, dir_fd: int | None = None) -> None:
+                    if name == lock.name and action == "deny-unlink":
+                        raise PermissionError("cannot unlink the lock")
+                    real_unlink(name, dir_fd=dir_fd)
+                    if name == lease.name and action == "replace-lock":
+                        os.replace(replacement, lock)
+
+                with mock.patch.object(os, "unlink", side_effect=unlink):
+                    self.assertIs(folders.release_removed_folder(path), folders.FolderPairRelease.PARTIAL)
+
+                self.assertFalse(lease.exists())
+                contents = "replacement\n" if action == "replace-lock" else "original\n"
+                self.assertEqual(lock.read_text(), contents)
+
+    def test_explicit_names_and_attribution_do_not_use_session_names(self) -> None:
+        spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=8,
+                                       showrunner="builds", unit="queue", work="bf1", purpose="proof")
+        with folders.temporary_build_folder(spec) as path:
+            self.assertEqual(path, self.root / "builds-queue" / "bf1-proof")
+            self.assertEqual(folders.build_folder_state(path), "held")
+            lease = cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
+            self.assertEqual({key: lease[key] for key in ("showrunner", "unit", "work", "purpose")},
+                             {"showrunner": "builds", "unit": "queue", "work": "bf1", "purpose": "proof"})
+            self.assertEqual(lease["pid"], os.getpid())
+            self.assertTrue(lease["start_time"])
+            descriptor = folders.build_folder_lock_fd(path)
+            self.assertTrue(os.get_inheritable(descriptor))
+            inode = os.fstat(descriptor).st_ino
+            path.rmdir()
+            self.assertEqual(os.fstat(descriptor).st_ino, inode)
+            self.assertEqual(folders.build_folder_state(path), "held")
+        self.assertEqual(folders.build_folder_state(path), "free")
+
+    def test_stable_folder_shares_between_processes_and_excludes_removal(self) -> None:
+        path = folders.create_build_folder(folders.StableOwnerFolder("shared", folders.ExplicitBuildParent(self.root)))
+        self.addCleanup(_release_folder, path)
+        probe = """from pathlib import Path
+import sys
+from scripts.lib import build_folders as f
+path = Path(sys.argv[1])
+assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(path.parent))) == path
+assert f.build_folder_state(path) == 'held'
+assert not f.remove_build_folder(path, lambda: (_ for _ in ()).throw(AssertionError('cleanup ran')))
+print('shared')
+"""
+        result = subprocess.run([sys.executable, "-c", probe, str(path)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "shared\n")
+        self.assertTrue(path.is_dir())
+
+    def test_inherited_descriptor_holds_after_the_parent_releases_it(self) -> None:
+        request = folders.UniqueBuildFolder("inherit-", folders.ExplicitBuildParent(self.root))
+        path = folders.create_build_folder(request)
+        descriptor = folders.build_folder_lock_fd(path)
+        child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                 pass_fds=(descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            assert child.stdout is not None
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            _release_folder(path)
+            self.assertEqual(folders.build_folder_state(path), "held")
+            _ = child.communicate(input="end", timeout=10)
+            self.assertEqual(child.returncode, 0)
+            self.assertEqual(folders.build_folder_state(path), "free")
+        finally:
+            _release_folder(path)
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=10)
+
+    def test_process_death_frees_the_lock_without_reading_the_lease(self) -> None:
+        probe = """import signal
+from scripts.lib import build_folders as f
+path = f.create_build_folder(f.UniqueBuildFolder('death-'))
+print(path, flush=True)
+signal.pause()
+"""
+        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", probe], stdout=subprocess.PIPE, text=True)
+        try:
+            assert process.stdout is not None
+            path = Path(cast(str, process.stdout.readline()).strip())
+            self.assertEqual(folders.build_folder_state(path), "held")
+            _ = path.with_name(path.name + ".lease.json").write_text("invalid attribution")
+            process.kill()
+            _ = process.communicate(timeout=10)
+            self.assertEqual(folders.build_folder_state(path), "free")
+            self.assertTrue(path.is_dir())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=10)
+
+    def test_cli_run_passes_the_lock_to_the_command_and_its_child(self) -> None:
+        probe = """import fcntl, os, pathlib, subprocess, sys
+fd = int(os.environ['BUILD_FOLDER_LOCK_FD'])
+assert os.get_inheritable(fd)
+path = pathlib.Path.cwd()
+assert path.parts[-2:] == ('builds-queue', 'bf1-proof')
+subprocess.run([sys.executable, '-c', 'import os,sys; os.fstat(int(sys.argv[1]))', str(fd)], pass_fds=(fd,), check=True)
+with path.with_name(path.name + '.lock').open('a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(path)
+    else:
+        raise AssertionError('the command has no lock')
+"""
+        result = self.command("run", "--showrunner", "builds", "--unit", "queue", "--work", "bf1",
+                              "--name", "proof", "--", sys.executable, "-c", probe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = Path(result.stdout.strip())
+        self.assertFalse(path.exists())
+        self.assertEqual(folders.build_folder_state(path), "free")
+
+    def test_maker_generates_work_and_records_it_without_parsing_the_path(self) -> None:
+        spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=3,
+                                       showrunner="builds", unit="queue", purpose="proof")
+        with mock.patch("secrets.choice", side_effect=list("abc")), folders.temporary_build_folder(spec) as path:
+            self.assertEqual(path, self.root / "builds-queue" / "abc-proof")
+            lease = cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
+            self.assertEqual(lease["work"], "abc")
+
+    def test_temporary_context_keeps_the_folder_while_a_child_holds_the_lock(self) -> None:
+        child: subprocess.Popen[str] | None = None
+        try:
+            with folders.temporary_build_folder(folders.UniqueBuildFolder("child-")) as path:
+                child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                         pass_fds=(folders.build_folder_lock_fd(path),),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                assert child.stdout is not None
+                self.assertEqual(child.stdout.readline(), "ready\n")
+            self.assertTrue(path.is_dir())
+            lock = path.with_name(path.name + ".lock")
+            lease = path.with_name(path.name + ".lease.json")
+            self.assertTrue(lock.is_file())
+            self.assertTrue(lease.is_file())
+            self.assertEqual(folders.build_folder_state(path), "held")
+            self.assertFalse(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+            self.assertTrue(path.is_dir() and lock.is_file() and lease.is_file())
+            _ = child.communicate(input="end", timeout=10)
+            self.assertEqual(folders.build_folder_state(path), "free")
+            self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+            self.assertFalse(path.exists() or lock.exists() or lease.exists())
+        finally:
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.communicate(timeout=10)
+
+    def test_lock_and_lease_symlinks_cannot_modify_another_file(self) -> None:
+        outside = self.root / "unrelated"
+        _ = outside.write_text("keep")
+        for suffix in (".lock", ".lease.json"):
+            with self.subTest(suffix=suffix):
+                parent = self.root / suffix.removeprefix(".")
+                parent.mkdir()
+                (parent / ("owner" + suffix)).symlink_to(outside)
+                with self.assertRaises(OSError):
+                    _ = folders.create_build_folder(folders.StableOwnerFolder("owner", folders.ExplicitBuildParent(parent)))
+                self.assertEqual(outside.read_text(), "keep")
 
     def test_import_does_not_load_cli_or_owner_modules(self) -> None:
         probe = """import runpy, sys
@@ -50,6 +1847,13 @@ assert not loaded, loaded
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
+
+    def test_tmpfs_parent_uses_only_inherited_tmpfs_paths(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf", "roots.gate=/dev/shm\n")
+        for value, expected in (("/dev/shm/outer/module", Path("/dev/shm/outer/module")),
+                                ("/dev/shm-other", Path("/dev/shm"))):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"TMPDIR": value}):
+                self.assertEqual(folders.tmpfs_temporary_parent(), expected)
 
     def test_inherited_parent_changes_between_allocations(self) -> None:
         first = folders.create_build_folder(folders.UniqueBuildFolder("merge-gate-"))
@@ -99,6 +1903,11 @@ assert not loaded, loaded
         self.assertEqual(paths, [first] * 8)
         self.assertEqual((first / "live.sock.record").read_text(), "keep")
         self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o750)
+
+
+
+
+
 
     def test_stable_owner_file_collision_keeps_the_existing_file(self) -> None:
         occupied = self.root / "owner"
@@ -153,6 +1962,68 @@ assert not loaded, loaded
                 self.assertNotEqual(path, self.root)
                 self.assertFalse(path.exists())
 
+
+    def test_cancellation_during_allocation_or_removal_keeps_any_folder_recorded(self) -> None:
+        def interrupted(number: int, frame: object) -> None:
+            del frame
+            raise KeyboardInterrupt(signal.Signals(number).name)
+
+        for stage in ("allocation", "removal"):
+            with self.subTest(stage=stage):
+                paths: list[Path] = []
+                allocate = folders.create_build_folder
+                remove = shutil.rmtree
+                cancel = threading.Event()
+                sent = threading.Event()
+                release = threading.Event()
+
+                def send_from_thread() -> None:
+                    if cancel.wait(10) and not release.is_set():
+                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+                        sent.set()
+                        _ = release.wait(10)
+
+                worker = threading.Thread(target=send_from_thread)
+                worker.start()
+
+                def allocate_then_cancel(request: folders.BuildFolderRequest | folders.BuildFolderSpec) -> Path:
+                    path = allocate(request)
+                    paths.append(path)
+                    if stage == "allocation":
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return path
+
+                def cancel_then_remove(path: str, *, dir_fd: int,
+                                       onexc: Callable[[Callable[..., object], str, BaseException], object]) -> None:
+                    if stage == "removal":
+                        cancel.set()
+                        self.assertTrue(sent.wait(10), "the worker did not send SIGTERM")
+                    remove(path, dir_fd=dir_fd, onexc=onexc)
+
+                previous = signal.signal(signal.SIGTERM, interrupted)
+                try:
+                    with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
+                          mock.patch.object(shutil, "rmtree", side_effect=cancel_then_remove),
+                          self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM")):
+                        with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
+                            pass
+                    self.assertEqual(len(paths), 1)
+                    path = paths[0]
+                    lock = path.with_name(path.name + ".lock")
+                    lease = path.with_name(path.name + ".lease.json")
+                    if path.exists():
+                        self.assertTrue(lock.is_file())
+                        record = cast(dict[str, object], json.loads(lease.read_text()))
+                        self.assertEqual(record["pid"], os.getpid())
+                        self.assertEqual(record["purpose"], "gate-proof-")
+                    self.assertEqual(folders.build_folder_state(path), "free")
+                finally:
+                    release.set()
+                    cancel.set()
+                    worker.join(timeout=10)
+                    _ = signal.signal(signal.SIGTERM, previous)
+
+
     def test_authority_readers_follow_current_scratch_copy_and_unit_roots(self) -> None:
         for index in range(2):
             scratch_root = self.root / f"scratch-{index}"
@@ -161,7 +2032,7 @@ assert not loaded, loaded
             former_run = self.root / f"delegate-{index}"
             with (mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch_root),
                                                copy_record.COPIES_ENV: str(copies_root)}),
-                  mock.patch.object(unit_runs, "run_roots", return_value=(current_run, former_run))):
+                  mock.patch.object(unit_runs, "new_run_root", return_value=current_run)):
                 parents = (folders.ExplicitBuildParent(copy_record.root()),
                            folders.ExplicitBuildParent(copy_record.copies_root()), folders.UnitRunParent())
                 for parent, expected in zip(parents, (scratch_root, copies_root, current_run), strict=True):
@@ -279,8 +2150,8 @@ assert not loaded, loaded
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
         settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
+            path = scratch.new("gate:folder-test", "checkout", scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)
@@ -288,8 +2159,8 @@ assert not loaded, loaded
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:folder-test")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-        self.assertEqual(scratch.end("gate:folder-test"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:folder-test")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_cli_preserves_spaces_existing_permissions_and_the_one_path_output(self) -> None:
         parent = self.root / "shell parent"
@@ -344,8 +2215,8 @@ assert not loaded, loaded
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:shell-folder")
-        self.assertEqual(scratch.end("gate:shell-folder"), [path])
-        self.assertFalse(path.exists())
+        self.assertEqual([folder.path for folder in scratch.end("gate:shell-folder")], [path])
+        self.assertTrue(path.is_dir())
 
     def test_names_cannot_escape_the_explicit_parent(self) -> None:
         for name in ("..", "../escape", "/absolute", "bad\x00name"):
@@ -360,7 +2231,7 @@ assert not loaded, loaded
         cases: list[tuple[folders.BuildFolderKind, str]] = [
             ("temporary", "hana-key/unit-proof-abcdef"), ("gate", "proof-abcdef"),
             ("standing", "hana-key/unit-gate"), ("editable", "hana-key-unit/proof"),
-            ("mirror", "hana-key/unit-s3"), ("target", "proof"), ("shell-cache", "hana-key"),
+            ("mirror", "hana-key/unit-s3"), ("target", "proof"),
         ]
         for kind, expected in cases:
             with self.subTest(kind=kind):
@@ -383,24 +2254,31 @@ assert not loaded, loaded
         self.assertEqual(first.name, "unit-proof-aa")
         self.assertEqual(second.name, "unit-proof-bb")
 
-    def test_nonvisible_scratch_target_uses_the_shared_name_rule(self) -> None:
+    def test_scratch_target_uses_the_shared_name_rule(self) -> None:
         with (mock.patch.object(scratch, "validate_phase_task"),
               mock.patch.object(scratch, "build_folder_path", wraps=folders.build_folder_path) as naming):
-            path = scratch.target("gate:proof", "tree", False)
+            path = scratch.target("gate:proof", "tree")
         naming.assert_called_once()
         self.assertEqual(path.parent, copy_record.root())
         self.assertRegex(path.name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
-        config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
-        original = config.read_text()
+        copied = self.root / "copied-config"
+        _ = config_environment(copied)
+        config = copied / "build_folders.conf"
         config.unlink()
         environment = config_environment(config.parent)
-        self.assertEqual(environment, {"CONF_DIR": str(config.parent)})
+        self.assertEqual(environment, {"CONF_DIR": str(config.parent),
+                                       "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
+        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
+        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
-            if source.name != "build_admission.conf":
+            if source.name != ADMISSION_CONFIG_FIXTURE.name:
                 self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
+        _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
+        original = config.read_text()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "admit-test-")
         with folders.temporary_build_folder(folders.UniqueBuildFolder("probe-", folders.SystemTemporaryParent())) as path:
             self.assertEqual(path.parent, Path("/tmp"))
@@ -409,6 +2287,11 @@ assert not loaded, loaded
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
         _ = config_environment(config.parent)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
+
+    def test_repository_key_keeps_the_fixed_path_name(self) -> None:
+        self.assertEqual(folders.repository_key(Path("/fixture/hana")), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana", "/fixture/hana"), "hana-e4417bba")
+        self.assertEqual(folders.repository_key_for("hana space%", "/fixture/hana"), "hana space%-e4417bba")
 
     def test_equal_repository_basenames_have_distinct_keys(self) -> None:
         first = self.root / "first" / "hana"
@@ -423,8 +2306,16 @@ assert not loaded, loaded
     def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         original = config.read_text()
+        fallback = self.root / "fallback/build_folders.conf"
+        _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
         config.unlink()
-        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
+        original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return fallback if stem == "build_folders" else original_path(stem)
+
+        with (mock.patch.object(conf, "_repository_path", side_effect=repository_path),
+              mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run"))):
             self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
             path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
         self.assertTrue(path.is_dir())
@@ -483,26 +2374,219 @@ os._exit(0)
         with self.assertRaises(ProcessLookupError):
             os.kill(int(child_pid), 0)
 
-    def test_run_removes_work_after_each_handled_signal(self) -> None:
+    def test_run_group_stop_leaves_only_free_recorded_residue(self) -> None:
         probe = "import os, pathlib, signal; print(str(pathlib.Path.cwd()), os.getpid(), flush=True); signal.pause()"
-        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
             with self.subTest(signal=number):
                 process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
                                             "--name", "proof", "--", sys.executable, "-c", probe],
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                 try:
                     assert process.stdout is not None
                     path, child_pid = cast(str, process.stdout.readline()).split()
-                    process.send_signal(number)
+                    process_group.send_process_group(process.pid, number)
                     stdout, stderr = process.communicate(timeout=10)
-                    self.assertEqual(process.returncode, 128 + number, stdout + stderr)
-                    self.assertFalse(Path(path).exists())
-                    with self.assertRaises(ProcessLookupError):
-                        os.kill(int(child_pid), 0)
+                    self.assertEqual(process.returncode, -number, stdout + stderr)
+                    folder = Path(path)
+                    self.assertEqual(folders.build_folder_state(folder), "free")
+                    if folder.exists():
+                        self.assertTrue(folder.with_name(folder.name + ".lease.json").is_file())
+                    from scripts.lib import process_start
+
+                    try:
+                        descriptor = os.pidfd_open(int(child_pid))
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        try:
+                            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0])
+                        finally:
+                            os.close(descriptor)
+                    self.assertIsInstance(process_start.process_start(int(child_pid)), (process_start.Gone, process_start.Zombie))
+                    folders.sweep_temporary_build_folders(folder.parent)
+                    self.assertFalse(folder.exists())
+                    self.assertFalse(folder.with_name(folder.name + ".lease.json").exists())
+                    self.assertFalse(folder.with_name(folder.name + ".lock").exists())
                 finally:
                     if process.poll() is None:
                         process.kill()
                     _ = process.communicate(timeout=10)
+
+    def test_a_sweep_without_wait_tries_a_held_lock_once(self) -> None:
+        held = folders.create_build_folder(folders.UniqueBuildFolder("sweep-held-"))
+        self.addCleanup(_release_folder, held)
+        free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
+        _release_folder(free)
+        # A free folder that holds a held lease below it is kept.
+        outer = folders.create_build_folder(folders.UniqueBuildFolder("sweep-outer-"))
+        inner = folders.create_build_folder(folders.UniqueBuildFolder(
+            "sweep-inner-", folders.ExplicitBuildParent(outer)))
+        self.addCleanup(_release_folder, inner)
+        _release_folder(outer)
+        # A free folder with an unreadable folder below it is kept, and the sweep goes on to the next folder.
+        unreadable = folders.create_build_folder(folders.UniqueBuildFolder("sweep-a-unreadable-"))
+        _release_folder(unreadable)
+        closed = unreadable / "closed"
+        closed.mkdir(mode=0)
+        self.addCleanup(closed.chmod, 0o700)
+        with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(held.is_dir())
+        self.assertFalse(free.exists())
+        self.assertTrue(inner.is_dir())
+        self.assertTrue(closed.is_dir())
+
+    def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
+        real_open = os.open
+        for action in ("sweep", "create"):
+            with self.subTest(action=action):
+                removed: list[str] = []
+
+                def open_then_remove(name: str | os.PathLike[str], flags: int, mode: int = 0o777, *,
+                                     dir_fd: int | None = None) -> int:
+                    descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+                    if os.fspath(name).endswith(".lock") and not removed:
+                        # Another process removes the free folder's lock between this open and its check.
+                        removed.append(os.fspath(name))
+                        os.unlink(name, dir_fd=dir_fd)
+                    return descriptor
+
+                if action == "sweep":
+                    free = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    _release_folder(free)
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertEqual(removed, [free.name + ".lock"])
+                    folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertFalse(free.exists())
+                else:
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        made = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    self.addCleanup(_release_folder, made)
+                    self.assertEqual(len(removed), 1)
+                    self.assertNotEqual(removed[0], made.name + ".lock")
+                    self.assertTrue(made.is_dir())
+                    self.assertEqual(folders.build_folder_state(made), "held")
+
+    def test_a_lease_replaced_after_its_lookup_is_not_a_fault(self) -> None:
+        request = folders.StableOwnerFolder("replaced-lease", folders.ExplicitBuildParent(self.root))
+        first = folders.create_build_folder(request)
+        real_stat = os.stat
+        replaced: list[str] = []
+
+        def stat_then_replace(name: str | os.PathLike[str], *, dir_fd: int | None = None,
+                              follow_symlinks: bool = True) -> os.stat_result:
+            if not os.fspath(name).endswith(".lease.json") or replaced:
+                return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            # Another holder replaces the lease between this lookup and the read of its link count.
+            descriptor = os.open(name, os.O_RDONLY, dir_fd=dir_fd)
+            try:
+                newer = os.fspath(name) + ".newer"
+                os.close(os.open(newer, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=dir_fd))
+                os.replace(newer, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                replaced.append(os.fspath(name))
+                return os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+        with mock.patch.object(os, "stat", side_effect=stat_then_replace):
+            again = folders.create_build_folder(request)
+        self.assertEqual(replaced, [first.name + ".lease.json"])
+        self.assertEqual(again, first)
+
+    def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
+        for stage in ("folder", "lease", "temporary-lease", "lock"):
+            for held in (False, True):
+                with self.subTest(stage=stage, held=held):
+                    path = folders.create_build_folder(folders.UniqueBuildFolder("sweep-"))
+                    self.addCleanup(_release_folder, path)
+                    lease = path.with_name(path.name + ".lease.json")
+                    temporary = path.with_name(path.name + ".lease.json.0123456789abcdef.tmp")
+                    _ = temporary.write_text("partial lease")
+                    if stage != "folder":
+                        shutil.rmtree(path)
+                    if stage in ("temporary-lease", "lock"):
+                        lease.unlink()
+                    if stage == "lock":
+                        temporary.unlink()
+                    if not held:
+                        _release_folder(path)
+                    folders.sweep_temporary_build_folders(self.root)
+                    if held:
+                        self.assertTrue(path.with_name(path.name + ".lock").is_file())
+                        self.assertEqual(path.exists(), stage == "folder")
+                        self.assertEqual(lease.exists(), stage in ("folder", "lease"))
+                        self.assertEqual(temporary.exists(), stage != "lock")
+                        _release_folder(path)
+                        folders.sweep_temporary_build_folders(self.root)
+                    self.assertFalse(path.exists())
+                    self.assertFalse(lease.exists())
+                    self.assertFalse(temporary.exists())
+                    self.assertFalse(path.with_name(path.name + ".lock").exists())
+
+
+    def test_a_tool_folder_takes_the_tool_name_and_goes_with_its_records(self) -> None:
+        with folders.tool_folder("fast-track") as path:
+            self.assertEqual(path, self.root / "fast-track")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            _ = (path / "output").write_text("x")
+        self.assertEqual(sorted(entry.name for entry in self.root.iterdir()), [])
+
+    def test_a_second_run_at_once_gets_a_number_and_the_name_is_free_again_after(self) -> None:
+        with folders.tool_folder("verify") as first, folders.tool_folder("verify") as second:
+            with folders.tool_folder("verify") as third:
+                self.assertEqual((first.name, second.name, third.name), ("verify", "verify-2", "verify-3"))
+        with folders.tool_folder("verify") as again:
+            self.assertEqual(again, self.root / "verify")
+
+    def test_a_stopped_runs_leftover_is_removed_and_its_name_reused(self) -> None:
+        ended = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True)
+        spec = folders.BuildFolderSpec(kind="tool", parent=self.root, purpose="copies", suffix_length=0,
+                                       owner_pid=int(ended.stdout))
+        leftover = folders.create_build_folder(spec)
+        _ = (leftover / "old").write_text("x")
+        _release_folder(leftover)
+        with folders.tool_folder("copies") as path:
+            self.assertEqual(path, leftover)
+            self.assertEqual(list(path.iterdir()), [])
+
+    def test_a_free_folder_whose_owner_runs_is_passed_over(self) -> None:
+        made = self.command("tool", "--tool", "verify", "--owner-pid", str(os.getpid()))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        with folders.tool_folder("verify") as path:
+            self.assertEqual(path, self.root / "verify-2")
+        self.assertTrue((self.root / "verify").is_dir())
+
+    def test_a_folder_without_a_lease_record_is_kept_and_passed_over(self) -> None:
+        held = self.root / "report"
+        held.mkdir()
+        _ = (held / "kept").write_text("x")
+        with folders.tool_folder("report") as path:
+            self.assertEqual(path, self.root / "report-2")
+        self.assertEqual((held / "kept").read_text(), "x")
+
+    def test_an_error_in_the_tool_run_is_not_taken_as_a_name_clash(self) -> None:
+        with self.assertRaises(FileExistsError), folders.tool_folder("gate"):
+            raise FileExistsError("from the tool")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_a_missing_temporary_parent_is_made_at_the_claim(self) -> None:
+        # A Codex session or a timer can have no session folder; its TMPDIR folder is made on demand.
+        parent = self.root / "session" / "natemerge"
+        with mock.patch.dict(os.environ, {"TMPDIR": str(parent)}), folders.tool_folder("checkpoint-doc") as path:
+            self.assertEqual(path, parent / "checkpoint-doc")
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_cli_tool_prints_the_folder_under_the_named_parent(self) -> None:
+        parent = self.root / "session parent"
+        parent.mkdir()
+        made = self.command("tool", "--tool", "verify", "--parent", str(parent), "--owner-pid", str(os.getpid()))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(made.stdout, f"{parent / 'verify'}\n")
+        self.assertTrue((parent / "verify").is_dir())
+        removed = self.command("remove", str(parent / "verify"))
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(list(parent.iterdir()), [])
 
 
 if __name__ == "__main__":

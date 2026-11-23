@@ -10,21 +10,17 @@ import unittest
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import launches
-import record
-import store
-import test_record as record_tests
-import test_record_rerun as recovery_tests
+from scripts.buildlog import launches
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog import test_record_rerun as recovery_tests
 
-if TYPE_CHECKING:
-    from ..lint import test_invoke_scope as scope_tests
-else:
-    from scripts.lint import test_invoke_scope as scope_tests
+from scripts.lint import test_invoke_scope as scope_tests
 
 
 @dataclass(frozen=True)
@@ -64,7 +60,7 @@ def sample_timeline(root: Path, repository: Path, *, marked: bool = True) -> Sam
     for index, anon in enumerate((9000, 500, 1700, 800)):
         tick = ticks / str(index)
         tick.mkdir()
-        _ = (tick / "memory.stat").write_text(f"anon {anon}\nfile 900000\n")
+        _ = (tick / "memory.stat").write_text(f"anon {anon}\nshmem 0\nfile 900000\n")
         pids = "101\n" if not marked or index == 0 else ("201\n" if index == 1 else "201\n202\n")
         _ = (tick / "cgroup.procs").write_text(pids)
     return SampleTimeline(files, proc, ticks)
@@ -121,7 +117,7 @@ class TestPhasePeakTests(unittest.TestCase):
             HOME=str(self.recovery.fixture.base), BUILDLOG_PROC=str(timeline.proc),
             BUILDLOG_SYNC="1", BUILDLOG_OFF="0", LINT_INVOKE_SOURCED="",
             TEST_PHASE_RECORDER=str(Path(record.__file__).resolve()),
-            CODEX_THREAD_ID="original-step-worker", BUILDLOG_CALLER=caller,
+            **self.recovery.runner_sessions, BUILDLOG_CALLER=caller,
             BUILDLOG_CALL_ID="original-phase-call", USER_ZONE="UTC", TZ="UTC",
         )
 
@@ -375,7 +371,7 @@ BUILDLOG_RECORD=$TEST_PHASE_RECORDER
 scope_path=$1 scope=$2 maximum=$3 ticks=$4 reservation=$5 peak=$6 completion_pipe=$7
 shift 7
 exec 7<>"$completion_pipe"
-LINT_NEXTEST_SHARE="$ticks/share"
+LINT_NEXTEST_POOL="$ticks/pool"
 build_hold_wait_local() { :; }
 build_hold_check_local() { return 0; }
 buildlog_now() { BUILDLOG_NOW=1790942400; }
@@ -390,23 +386,34 @@ buildlog_wait_for_memory() {
     BUILDLOG_MEM_SAMPLING_CONTEXT=$reservation
 }
 buildlog_memory_python() {
-    if [[ "${2:-}" == claim ]]; then
-        printf '8\n'
-    elif [[ "${2:-}" == width ]]; then
-        return 0
-    elif [[ "${2:-}" == release ]]; then
+    if [[ "${2:-}" == release ]]; then
         rm -f "$maximum" "${maximum%.max}.wave"
     else
-        if [[ "${2:-}" == test-phase-context ]]; then printf 'context\n' >> "$ticks/context-calls"; fi
-        "$HOME/.claude/scripts/lib/py" "$@"
+        if [[ "${2:-}" == test-phase-context ]]; then
+            printf 'context %s\n' "${8:-}" >> "$ticks/context-calls"
+            # The sampler starts before the holder; hold its first tick until the width is known.
+            local attempt
+            for attempt in {1..200}; do [[ -s "$LINT_NEXTEST_WIDTH_FILE" ]] && break; command sleep 0.05; done
+        fi
+        "$BUILD_HELPER_ROOT/lib/py" "$@"
     fi
 }
 buildlog_exec() {
+    # Act as nextest_tokens.py: the pool has 8 tokens free for a run 32 wide.
+    local width_file=""
+    [[ "$1" != cargo ]] || return 94
+    while [[ "$1" != -- ]]; do
+        [[ "$1" != --width-file ]] || width_file=$2
+        shift
+    done
+    shift
+    printf '8\n' > "$width_file"
+    set -- "${@:1:4}" 8 "${@:6}"
     printf '%s\n' "$@" > "$ticks/executed-argv"
     local completed
     read -r -t 10 completed <&7 || return 92
     [[ "$completed" == done ]] || return 93
-    "$HOME/.claude/scripts/lib/py" "$TEST_PHASE_RECORDER" test-phase-context "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" > "$ticks/released-reservation.json"
+    "$BUILD_HELPER_ROOT/lib/py" "$TEST_PHASE_RECORDER" test-phase-context "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" > "$ticks/released-reservation.json"
     printf 'fake nextest completed\n'
 }
 sweep_after_step() { :; }
@@ -442,7 +449,8 @@ test ! -e "${maximum%.max}.wave"
         self.assertEqual((timeline.ticks / "executed-argv").read_text().splitlines(), expected_argv)
         released = cast(dict[str, object], json.loads((timeline.ticks / "released-reservation.json").read_text()))
         self.assertEqual(released["test_threads"], 8)
-        self.assertEqual((timeline.ticks / "context-calls").read_text().splitlines(), ["context"])
+        # The first context has the step's width; the context at the test phase start has the tokens' width.
+        self.assertEqual((timeline.ticks / "context-calls").read_text().splitlines(), ["context 32", "context 8"])
         self.assertEqual((timeline.ticks / "observed").read_text().splitlines(),
                          ["0:9000", "1:9000", "2:9000", "3:9000"])
         self.assertFalse(list(timeline.files.maximum.parent.glob("*.reservation")))
@@ -451,7 +459,7 @@ test ! -e "${maximum%.max}.wave"
         self.assertFalse(peak.exists())
         self.assertFalse(Path(str(peak) + ".test-phase.json").exists())
 
-    def test_terminal_and_tee_steps_keep_the_actual_shared_width_after_admission_release(self) -> None:
+    def test_terminal_and_tee_steps_keep_the_token_width_after_admission_release(self) -> None:
         for caller in ("verify", "cargo-port", "validate_ci"):
             for filtered in (False, True):
                 for terminal in (False, True):

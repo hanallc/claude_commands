@@ -1,23 +1,19 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Nextest width selection at the shared cargo invocation boundary."""
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import final, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-if TYPE_CHECKING:
-    from ..build_hold.override_guard import require_checkout
-else:
-    from scripts.build_hold.override_guard import require_checkout
+from scripts.build_hold.override_guard import require_checkout
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 require_checkout(Path(__file__))
 
@@ -65,10 +61,10 @@ class NextestWidthTests(unittest.TestCase):
         buildlog = self.root / "buildlog"
         buildlog.mkdir()
         self.environment = {
-            **os.environ,
+            **memory_gate_shell_environment(),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
             "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -154,50 +150,6 @@ run() {{
         )
 
         self.assert_success(result, "6\n6\n")
-
-    def test_trial_arm_uses_100_minute_block_parity(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                "for epoch in 0 5999 6000 12000; do",
-                '    nextest_width_arm "$epoch"',
-                '    printf "%s\\n" "$LINT_TEST_WIDTH_ARM"',
-                "done",
-            ),
-        )
-
-        self.assert_success(result, "physical\nphysical\nlogical\nphysical\n")
-
-    def test_trial_mode_uses_physical_width_in_an_even_block(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                'nextest_physical_cores "$1"',
-                "unset EPOCHSECONDS",
-                "EPOCHSECONDS=0",
-                "LINT_TEST_WIDTH=trial",
-                "run_nextest --workspace",
-            ),
-            str(self.sysfs),
-        )
-
-        self.assert_success(
-            result,
-            "<cargo><nextest><run><--test-threads><2><--workspace>\n",
-        )
-
-    def test_trial_mode_uses_logical_width_in_an_odd_block(self) -> None:
-        result = self.run_shell(
-            shell_lines(
-                "unset EPOCHSECONDS",
-                "EPOCHSECONDS=6000",
-                "LINT_TEST_WIDTH=trial",
-                "run_nextest --workspace",
-            ),
-        )
-
-        self.assert_success(
-            result,
-            "<cargo><nextest><run><--test-threads><6><--workspace>\n",
-        )
 
     def test_fixed_width_modes_select_the_named_core_count(self) -> None:
         cases = (("physical", "2"), ("logical", "6"))
@@ -298,6 +250,34 @@ run() {{
         )
 
         self.assert_success(result, "<cargo><nextest><run><--workspace>\nstatus=7\n")
+
+    def test_failed_version_check_names_its_first_error_line(self) -> None:
+        refusing_bin = self.root / "refusing-bin"
+        refusing_bin.mkdir()
+        self.write_executable(refusing_bin / "cargo", shell_lines(
+            "#!/usr/bin/env bash",
+            "echo 'mac cargo gate refused: no answer in 10s; run it through mac_queue_run.py' >&2",
+            "echo 'second line' >&2",
+            "exit 125",
+            "",
+        ))
+        path = {"PATH": f"{refusing_bin}{os.pathsep}{self.environment['PATH']}"}
+        result = self.run_shell("require_nextest", extra=path)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        refusal = "mac cargo gate refused: no answer in 10s; run it through mac_queue_run.py"
+        self.assertEqual(result.stderr, f"cargo nextest is required: {refusal}\n")
+
+    def test_version_check_without_error_text_keeps_the_short_message(self) -> None:
+        silent_bin = self.root / "silent-bin"
+        silent_bin.mkdir()
+        self.write_executable(silent_bin / "cargo", shell_lines("#!/usr/bin/env bash", "exit 101", ""))
+        result = self.run_shell("require_nextest", extra={"PATH": f"{silent_bin}{os.pathsep}{self.environment['PATH']}"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "cargo nextest is required\n")
+
+    def test_present_nextest_passes_without_output(self) -> None:
+        self.assert_success(self.run_shell("require_nextest"), "")
 
 
 if __name__ == "__main__":

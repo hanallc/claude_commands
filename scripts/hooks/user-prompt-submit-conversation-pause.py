@@ -2,23 +2,23 @@
 """Pause a session's automatic updates when a conversation begins, and record the user's activity."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
-from types import FrameType
-from typing import NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
+from scripts.hooks.hook_budget import print_hook_error, run_hook_with_budget
 
-HOOK_BUDGET_SECONDS = 5
-
-
-class HookBudgetSpent(Exception):
-    pass
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 
 class PromptPayload(TypedDict, total=False):
@@ -29,12 +29,9 @@ class PromptPayload(TypedDict, total=False):
 
 def _record_typed_prompt() -> None:
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-        import escalate
+        from scripts.message import escalate
 
         escalate.typed()
-    except HookBudgetSpent:
-        raise
     except Exception as error:
         lines = str(error).splitlines()
         detail = lines[0] if lines else ""
@@ -44,15 +41,12 @@ def _record_typed_prompt() -> None:
         )
 
 
-def _record_activity(session_id: str, source: str, prompt: str) -> None:
-    """Send classified activity from a showrunner or unit director session.
-
-    The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
-    """
+def _record_activity(session_id: str, source: str, prompt: str, record: staff.StaffSnapshot) -> None:
+    """Send the session activity without blocking the prompt hook."""
     try:
-        import conversation_pause
+        from scripts.hooks import conversation_pause
 
-        if not conversation_pause.is_showrunner_or_unit_director(session_id):
+        if not conversation_pause.is_showrunner_or_unit_director(session_id, record=record):
             return
         override = os.environ.get("AUTO_SILENCE_COMMAND")
         script = Path(__file__).resolve().parent.parent / "notify" / "auto_silence.py"
@@ -61,16 +55,41 @@ def _record_activity(session_id: str, source: str, prompt: str) -> None:
         _ = subprocess.Popen([*command, "active", "--source", source, "--session-id", session_id,
                               "--pane-id", os.environ.get("HERDR_PANE_ID", ""), "--prompt-hash", digest], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
-    except HookBudgetSpent:
-        raise
     except Exception as error:
         lines = str(error).splitlines()
         detail = lines[0] if lines else ""
         print(f"conversation-pause: auto silence: {type(error).__name__}: {detail}", file=sys.stderr)
 
 
-def main() -> None:
+def _idle_update_context(session_id: str, typed: bool, now: int, record: staff.StaffSnapshot) -> str:
+    """Record nate's typed time, or return the idle update context for any other prompt."""
+    try:
+        from scripts.hooks import conversation_pause, idle_update
+
+        if not idle_update.has_role(record):
+            return ""
+        if typed:
+            idle_update.typed(session_id, now)
+            idle_update.sweep(now, idle_update.limits())
+            return ""
+        if conversation_pause.director_turn(session_id, record=record) is conversation_pause.DirectorTurn.HOLD:
+            return ""
+        return idle_update.context(session_id, now, idle_update.limits())
+    except Exception as error:
+        lines = str(error).splitlines()
+        detail = lines[0] if lines else ""
+        print(f"conversation-pause: idle update: {type(error).__name__}: {detail}", file=sys.stderr)
+        return ""
+
+
+def main(*, budgeted: bool = False) -> None:
     payload = cast(PromptPayload, json.loads(sys.stdin.read()))
+    try:
+        from scripts.hooks.compaction_marker import clear
+
+        clear(payload.get("session_id", ""))
+    except Exception:
+        pass
     if "agent_id" in payload:
         return
     session_id = payload.get("session_id", "")
@@ -78,35 +97,42 @@ def main() -> None:
         return
     prompt = payload.get("prompt", "")
 
-    budget = int(os.environ.get("CONVERSATION_PAUSE_HOOK_BUDGET", HOOK_BUDGET_SECONDS))
-
-    def budget_spent(_signal_number: int, _frame: FrameType | None) -> NoReturn:
-        raise HookBudgetSpent(f"gave up after {budget} seconds")
-
-    _ = signal.signal(signal.SIGALRM, budget_spent)
-    _ = signal.alarm(budget)
-    try:
-        import conversation_pause
+    def process_prompt() -> None:
+        from scripts.hooks import conversation_pause
 
         source = conversation_pause.prompt_source(
             prompt,
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
-        # Classify before matching the declared wait. A timer or unrelated
-        # message does not supply the answer. Read the marker directly so long
-        # waits survive active_run's liveness timeout.
-        from direct_run import marker_path
+        now = conversation_pause.now_epoch()
+        if source in (conversation_pause.PromptSource.PEER, conversation_pause.PromptSource.SCHEDULED):
+            try:
+                kept = conversation_pause.keep_native_review_prompt(session_id, prompt, now)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f"review hold: {error}", file=sys.stderr)
+            else:
+                if kept:
+                    print(json.dumps({
+                        "decision": "block",
+                        "reason": "Kept for the end of the review.",
+                        "hookSpecificOutput": {
+                            "hookEventName": "UserPromptSubmit",
+                            "suppressOriginalPrompt": True,
+                        },
+                    }), flush=True)
+                    return
+        if source is conversation_pause.PromptSource.SCHEDULED:
+            conversation_pause.consume_scheduled_prompt(session_id, prompt)
+        # Read the staff pointer so long waits retain the current run.
+        from scripts.lib import unit_runs
 
-        try:
-            run_text = marker_path(session_id).read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            run_text = ""
-        if run_text:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        record = conversation_pause.session_staff(session_id)
+        run = unit_runs.open_run(session_id, record=record)
+        if run is not None:
             from scripts.direct.progress_history import finish_turn_wait
 
-            finish_turn_wait(Path(run_text), session_id, source=source.name, prompt=prompt)
+            finish_turn_wait(run, session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
         activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
@@ -115,36 +141,58 @@ def main() -> None:
                            conversation_pause.PromptSource.NOTICE: "HarnessNotice"}[source]
         if not prompt.strip():
             activity_source = "UnknownPrompt"
-        _record_activity(session_id, activity_source, prompt)
-        return_question = conversation_pause.is_return_question(prompt)
-        if (source in {conversation_pause.PromptSource.SCHEDULED,
-                       conversation_pause.PromptSource.NOTICE}
-                and not return_question):
-            return
-        if not return_question and not conversation_pause.pauses(source):
-            return
-        reply = conversation_pause.message_arrived(
-            session_id, source, prompt, conversation_pause.now_epoch())
-        if reply is conversation_pause.NoReply.NOTHING:
-            return
-        result: dict[str, object] = {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": reply.context,
-            },
-        }
-        if isinstance(reply, conversation_pause.ShownToUser):
-            result["systemMessage"] = reply.system_message
-        print(json.dumps(result))
-    finally:
-        _ = signal.alarm(0)
+        _record_activity(session_id, activity_source, prompt, record)
+        idle_context = _idle_update_context(session_id, source is conversation_pause.PromptSource.TYPED, now, record)
+        reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
+        mac_context = ""
+        if source is conversation_pause.PromptSource.TYPED and "/Users/" in prompt:
+            try:
+                from scripts.hooks import mac_files
+
+                mac_context = mac_files.context(prompt)
+            except (OSError, ValueError, KeyError):
+                pass
+        emitted = False
+
+        def emit(held_messages: str = "") -> None:
+            nonlocal emitted
+            pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
+            context = "\n\n".join(filter(None, (pause_context, held_messages, mac_context, idle_context)))
+            if not context:
+                return
+            result: dict[str, object] = {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                },
+            }
+            if isinstance(reply, conversation_pause.ShownToUser):
+                result["systemMessage"] = reply.system_message
+            print(json.dumps(result), flush=True)
+            emitted = True
+
+        from scripts.hooks import review_hold_delivery
+        from scripts.message import review_hold
+
+        try:
+            if source is conversation_pause.PromptSource.TYPED:
+                review_hold.record_user_prompt(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
+            else:
+                review_hold.deliver_if_disabled(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"review hold: {error}", file=sys.stderr)
+        if not emitted:
+            emit()
+
+    if budgeted:
+        run_hook_with_budget(process_prompt)
+    else:
+        process_prompt()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(budgeted=True)
     except Exception as error:
-        lines = str(error).splitlines()
-        detail = lines[0] if lines else ""
-        print(f"conversation-pause: {type(error).__name__}: {detail}", file=sys.stderr)
+        print_hook_error(error)
     raise SystemExit(0)

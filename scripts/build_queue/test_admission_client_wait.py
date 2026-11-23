@@ -1,14 +1,15 @@
 """A waiting shell keeps its queue place through client failures."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from scripts.build_queue import admission_records
+
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
-import io
 import json
 import os
 from pathlib import Path
+from selectors import DefaultSelector, SelectorKey
 import subprocess
 import sys
 import time
@@ -16,17 +17,18 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import queue_place as shell_place
+from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
-from scripts.lint import memory_admit as gate
+from scripts.lint.memory_test_support import memory_gate_shell_environment
 
 
 class CheckerCall(TypedDict):
     pid: int
     action: str
-    rows: dict[str, gate.Waiter]
+    rows: dict[str, admission_records.Waiter]
 
 
 def wait_client_main() -> int:
@@ -36,11 +38,20 @@ def wait_client_main() -> int:
     actions = os.environ["TEST_CHECKER_ACTIONS"].split(",")
     clock = FakeClock()
     clock.epoch = time.time()
-    def estimate(argv: list[str], cwd: str, profile: gate.InferFromArgv | gate.StepProfile | gate.ProgramProfile,
-                 now: datetime | Callable[[], datetime], root: Path, policy: gate.AdmissionPolicy, *,
+
+    class CheckerSelector(DefaultSelector):
+        @override
+        def select(self, timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
+            ready = super().select(timeout)
+            if not ready and timeout is not None and timeout > 0:
+                clock.advance(timeout)
+            return ready
+
+    def estimate(argv: list[str], cwd: str, profile: admission_records.InferFromArgv | admission_records.StepProfile | admission_records.ProgramProfile,
+                 now: datetime | Callable[[], datetime], root: Path, policy: admission_records.AdmissionPolicy, *,
                  first_peak_bytes: int,
-                 build_history_generation: Callable[[], gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration]
-                 = gate.no_build_history_generation) -> gate.StepEstimate:
+                 build_history_generation: Callable[[], admission_records.BuildHistoryGeneration | admission_records.NoBuildHistoryGeneration]
+                 = step_estimator.no_build_history_generation) -> step_estimator.StepEstimate:
         _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
@@ -52,15 +63,17 @@ def wait_client_main() -> int:
             raise RuntimeError("promoted checker unavailable" if action == "fail" else "")
         if action == "admit":
             path = Path(os.environ["BUILDLOG_MEMINFO"])
-            _ = path.write_text(f"MemTotal: {60 * gate.GIB // 1024} kB\nMemAvailable: {60 * gate.GIB // 1024} kB\n")
+            _ = path.write_text(f"MemTotal: {60 * admission_records.GIB // 1024} kB\nMemAvailable: {60 * admission_records.GIB // 1024} kB\n")
             _ = Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text("full avg10=0 total=0\nsome avg10=0\n")
-        peak = gate.ExpectedPeak(7 * gate.GIB,
-            cast(gate.NeedSource, "future-source") if action == "unknown" else "measured", 5)
-        return gate.StepEstimate(gate.StepProfile("fixture", "nextest", "tree", peak,
-            estimated_at=clock.now()), gate.ReusableEstimate())
-    with mock.patch.object(client, "CLOCK", clock), mock.patch.object(gate, "step_estimate", side_effect=estimate):
-        with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
-            return client.main()
+        peak = admission_records.ExpectedPeak(7 * admission_records.GIB,
+            cast(admission_records.NeedSource, "future-source") if action == "unknown" else "measured", 5)
+        return step_estimator.StepEstimate(admission_records.StepProfile("fixture", "nextest", "tree", peak,
+            estimated_at=clock.now()), step_estimator.ReusableEstimate())
+    with (mock.patch.object(client, "CLOCK", clock),
+          mock.patch.object(client, "DefaultSelector", CheckerSelector),
+          mock.patch.object(step_estimator, "step_estimate", side_effect=estimate)):
+        with mock.patch.object(sys, "argv", ["queue_place.py", *sys.argv[2:]]):
+            return shell_place.main()
 
 
 class AdmissionClientWaitTests(unittest.TestCase):
@@ -75,17 +88,17 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.admission = self.enterContext(AdmissionFixture())
         self.root = self.admission.root
         self.admission.clock.epoch = time.time()
-        self.admission.free(60 * gate.GIB)
+        self.admission.free(60 * admission_records.GIB)
         _ = (self.root / "pressure").write_text("full avg10=10 total=0\nsome avg10=0\n")
         self.grants = []
         self.grant_charges = []
-        self.environment = {**os.environ,
+        self.environment = {**memory_gate_shell_environment(),
             "TEST_WAIT_ROOT": str(self.root), "BUILDLOG_MEM_CHECK_RETRY_S": "2",
             "BUILDLOG_MEM_WAIT_SINCE": str(int(time.time()) - 1200),
             "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "",
             "BUILDLOG_PEAK": "", "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_HOLD_DIR": str(self.root / "holds"), "BUILD_HOLD_RELEASE_DIR": str(self.root / "releases"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "HOME": str(self.root)}
         from scripts.lint.test_memory_admit import write_memory_config
         write_memory_config(self.root / "build_admission.conf", reconnect_seconds="1", waiting_pass_seconds="0.01")
@@ -95,57 +108,43 @@ class AdmissionClientWaitTests(unittest.TestCase):
                 observations = [cast(CheckerCall, json.loads(line)) for line in calls.read_text().splitlines()]
                 observations[-1]["rows"] = {str(waiting.row["pid"]): waiting.row.copy()
                     for waiting in self.admission.server.waiters.values()}
-                _ = calls.write_text("".join(json.dumps(gate.snapshot_value(row)) + "\n" for row in observations))
+                _ = calls.write_text("".join(json.dumps(codec.snapshot_value(row)) + "\n" for row in observations))
             if isinstance(reply, wire.Admitted):
                 self.grants.append(reply)
                 self.grant_charges.append(tuple((record.reservation_id, record.need)
                     for record in self.admission.server.reservations.values()))
             if isinstance(reply, wire.Wait):
-                return replace(reply, reason=gate.EstimateExpired(self.admission.clock.now()))
+                waiting, = self.admission.server.waiters.values()
+                assert "estimated_at" in waiting.row
+                return replace(reply, reason=admission_records.EstimateExpired(waiting.row["estimated_at"]))
             return reply
         self.admission.server.reply_filter = reply_filter
         _ = self.enterContext(self.admission.serving())
 
     def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
         command = ('set -e; source "$1"; buildlog_memory_python() { '
-            + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
-            + 'shift; python3 "$TEST_WAIT_CLIENT" --wait-client "$@"; else python3 "$@"; fi; }; '
+            + 'if [[ "$1" == "$BUILDLOG_QUEUE_PLACE_SCRIPT" ]]; then '
+            + 'shift; "$TEST_PY" "$TEST_WAIT_CLIENT" --wait-client "$@"; else "$TEST_PY" "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
             + 'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '
             + 'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"')
         return subprocess.run(["bash", "-c", command, "test",
             str(Path(__file__).parents[1] / "lint/memory_gate.sh"), *([] if launch else ["/bin/true"])],
             env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
-                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve())},
+                 "TEST_WAIT_CLIENT": str(Path(__file__).resolve()),
+                 "TEST_PY": str(Path(__file__).resolve().parents[1] / "lib/py")},
             cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
 
     def calls(self) -> list[CheckerCall]:
         return [cast(CheckerCall, json.loads(line))
             for line in (self.root / "calls.jsonl").read_text().splitlines()]
 
-    def test_cap_wait_line_names_the_program_cap_without_a_history_fallback(self) -> None:
-        for program, words in (("merge-gate", "the merge gate's memory cap"),
-                               ("rust-analyzer", "rust-analyzer's memory cap")):
-            with self.subTest(program=program):
-                request = replace(self.admission.request(), profile=gate.ProgramProfile(
-                    program, "repo", "tree", gate.FixedCapSizing(6 * gate.GIB)))
-                with self.admission.loop_turn():
-                    reply = self.admission.server.handle_request(request)[0]
-                assert isinstance(reply, wire.Wait)
-                output = io.StringIO()
-                with redirect_stderr(output):
-                    client.WaitOutput()(reply)
-                self.assertIn(words, output.getvalue())
-                self.assertIn("6.0 GiB", output.getvalue())
-                self.assertNotIn("no history", output.getvalue())
-                self.assertNotIn("fallback", output.getvalue())
-
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
         result = self.run_wait("unknown,fail,hold,admit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Granted\n")
         self.assertNotIn("step refused", result.stderr)
-        self.assertIn("no history, so the fallback", result.stderr)
+        self.assertIn("fixture nextest needs 7.0 GiB; 60.0 GiB free", result.stderr)
         retry = ("memory admission check failed (promoted checker unavailable); trying again, "
                  "the step keeps its place")
         self.assertEqual(result.stderr.splitlines().count(retry), 1)

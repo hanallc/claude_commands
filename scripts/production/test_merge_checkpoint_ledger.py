@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-import sys
+import subprocess
 import unittest
 from pathlib import Path
 from typing import final
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
+from scripts.style.style_reader_test_support import oracle_reader
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
     configure_test_environment()
 
 
@@ -38,18 +40,17 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                          (0, f"hand-off {checkpoint[:7]} already merged as {merge[:7]}\n", ""))
         self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
         self.assertEqual(len(self.events("send.py")), 2)
-    def test_child_handoff_ledger_failure_still_pushes_and_acknowledges(self) -> None:
-        _ = self.child_production()
-        checkpoint = self.checkpoint()
-        self.prepare_handoff_ledger(checkpoint, add_handoff=False)
-        result = self.run_handoff(checkpoint)
+    def test_home_verify_stub_answers_when_bash_runs_it(self) -> None:
+        """The home verify.sh stub accepts a build command from Bash."""
+        verify = self.root / "home/.claude/scripts/direct/verify.sh"
+        # Without a display, a stub that bash reads as shell fails at once and does not wait.
+        environment = {key: value for key, value in self.env.items() if key not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        result = subprocess.run(["bash", str(verify), "build", "sample", "--release", "--attached"],
+                                env=environment, capture_output=True, text=True, check=False,
+                                timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        merge = self.git("rev-parse", "HEAD")
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
-        self.assertEqual(len(self.events("send.py")), 1)
-        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("hand-off ledger:")],
-                         [f"hand-off ledger: stderr: style_ledger: unknown hand-off {checkpoint}"])
+        self.assertEqual(self.events("verify.sh")[-1], ["build", "sample", "--release", "--attached"])
+
     def test_duplicate_child_notice_records_a_ledger_write_missed_at_the_merge(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()

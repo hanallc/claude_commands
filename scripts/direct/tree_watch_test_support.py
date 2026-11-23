@@ -22,6 +22,8 @@ from unittest import mock
 
 from scripts.direct import tree_watch
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 WATCHER = Path(tree_watch.__file__)
@@ -63,11 +65,10 @@ def write_workspace(root: Path) -> dict[str, object]:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content)
-    for args in (["init", "-q"], ["add", "."],
-                 ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                  "commit", "-qm", "workspace fixture"]):
-        _ = subprocess.run(["git", "-C", str(root), *args], check=True,
-                           capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+    environment = verify_test_environment()
+    _ = subprocess.run(["git", "init", "-q", str(root)], env=environment, check=True,
+                       capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+    _ = commit_repository(root, "workspace fixture", env=environment)
     return {"workspace_root": str(root), "workspace_members": [f"{name}-id" for name in
             ("sample", "dep", "unrelated")], "packages": packages,
             "target_directory": str(root / "target"), "metadata": {}}
@@ -163,24 +164,24 @@ class TreeWatchFixture(unittest.TestCase):
         cls.nested_metadata = write_workspace(cls.fixture_root / "rust")
         shutil.rmtree(cls.fixture_root / "rust/.git")
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot.with_name("nested-untracked"))
-        for arguments in (["add", "rust"], ["-c", "user.name=Fixture", "-c",
-                           "user.email=fixture@example.invalid", "commit", "-qm", "nested workspace"]):
-            _ = subprocess.run(["git", *arguments], cwd=cls.fixture_root, check=True,
-                               capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(cls.fixture_root, "nested workspace", "rust", env=verify_test_environment())
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot.with_name("nested-committed"))
         shutil.rmtree(cls.fixture_root)
 
     @override
     def setUp(self) -> None:
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_snapshot, self.root)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root)
         self.metadata = deepcopy(self.fixture_metadata)
-        self.environment = {**os.environ, "PATH": f"{self.root / 'tools'}:{os.environ['PATH']}",
-                            "VERIFY_TREE_WATCH_S": str(WATCH_INTERVAL),
-                            "UNIT_SESSION_DIR": str(self.root / "session"),
-                            "UNIT_RUN_DIR": str(self.root / "session"),
-                            "PYTHONDONTWRITEBYTECODE": "1"}
+        self.environment = verify_test_environment()
+        self.environment.update({
+            "PATH": f"{self.root / 'tools'}:{self.environment['PATH']}",
+            "VERIFY_TREE_WATCH_S": str(WATCH_INTERVAL),
+            "UNIT_SESSION_DIR": str(self.root / "session"),
+            "UNIT_RUN_DIR": str(self.root / "session"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
         _ = self.enterContext(chdir(self.root))
         self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True))
 

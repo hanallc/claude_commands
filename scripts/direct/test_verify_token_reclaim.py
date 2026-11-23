@@ -4,12 +4,53 @@ from __future__ import annotations
 import json
 import subprocess
 from typing import cast
-from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
+    def test_stop_before_reading_the_sleep_pid_leaves_no_live_sleep(self) -> None:
+        gate = self.root / "stop-renewer.sh"
+        _ = gate.write_text('''set -T
+stop_before_sleep_wait() {
+    if [[ "${FUNCNAME[1]:-}" == start_token_renewer &&
+          "$BASH_COMMAND" == 'renew_sleep_pid=$!' ]]; then
+        trap - DEBUG
+        printf '%s\\n' "$BASHPID" > "$TEST_STOPPED_RENEWER"
+        kill -TERM "$BASHPID"
+    fi
+}
+trap stop_before_sleep_wait DEBUG
+''')
+        harness = self.root / "renew-and-stop.sh"
+        _ = harness.write_text("set -eu\n"
+                               + shell_functions(VERIFY, "collect_child", "renew_token", "start_token_renewer")
+                               + '''BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder
+TOKEN_HELD=1 TOKEN_HOLD_S=120 TOKEN_RENEW_S=60
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 120
+start_token_renewer
+wait "$TOKEN_RENEWER_PID"
+bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
+''')
+        stopped = self.root / "stopped-renewer"
+        process = subprocess.Popen(
+            ["bash", str(harness), str(BOARD), str(self.root / "board")],
+            cwd=self.root,
+            env={**self.environment, "BASH_ENV": str(gate), "TEST_STOPPED_RENEWER": str(stopped)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        self.started_groups.add(process.pid)
+        try:
+            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertNotEqual(int(stopped.read_text()), process.pid)
+            self.wait_for_group_exit(process.pid, timeout=5)
+            self.assertEqual(self.live_group_processes(process.pid), [])
+        finally:
+            self.end_group(process.pid)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
         self.write_wait_sleep('''if [ "$1" = 3 ]; then
     printf '%s\\n' "$1" >> "$TEST_RECLAIM_POLLS"
@@ -81,3 +122,48 @@ exit 0
             self.assertEqual(self.live_group_processes(step_group), [])
         finally:
             self.end_group(first.pid)
+
+    def test_old_cleanup_keeps_the_new_grant_in_a_reused_wait_folder(self) -> None:
+        memory_gate = VERIFY.parent.parent / "lint/memory_gate.sh"
+        harness = self.root / "reuse-placement.sh"
+        _ = harness.write_text("set -e\n"
+                               + shell_functions(VERIFY, "placement_once")
+                               + shell_functions(memory_gate, "buildlog_release_memory", "buildlog_wait_for_memory")
+                               + '''
+verify_helper() { :; }
+buildlog_check_nested_step() { :; }
+buildlog_memory_python() { :; }
+
+HOLD_WAIT_DIR=$1
+DOC_REPO_TOP=$PWD DOC_SOURCE_KEY=fixture-tree
+BUILDLOG_FIRST_STEP_REQUEST="$HOLD_WAIT_DIR/request"
+mkdir "$HOLD_WAIT_DIR"
+
+place() {
+    BUILDLOG_CALL_ID=$1 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE=""
+    placement_once
+    printf 'BUILDLOG_MEM_RESERVATION=%s\\n' "$1" > "$PLACEMENT_GRANT_FILE"
+}
+
+place old
+old_grant=$PLACEMENT_GRANT_FILE old_assignment=$PLACEMENT_ASSIGNMENT_FILE
+old_episode=$PLACEMENT_EPISODE
+rm -- "$old_grant"
+place new
+
+BUILDLOG_MEM_RESERVATION=old BUILDLOG_SELECTED_LOCAL_GRANT=$old_grant \\
+    BUILDLOG_PLACEMENT_FILE=$old_assignment BUILDLOG_PLACEMENT_EPISODE=$old_episode \\
+    buildlog_release_memory 0
+
+BUILDLOG_SELECTED_LOCAL_GRANT=$PLACEMENT_GRANT_FILE
+buildlog_wait_for_memory
+[[ "$BUILDLOG_MEM_RESERVATION" == new ]]
+[[ "$PLACEMENT_ASSIGNMENT_FILE" != "$old_assignment" ]]
+[[ ! -e "$PLACEMENT_GRANT_FILE.outcome" ]]
+''')
+        result = subprocess.run(
+            ["bash", str(harness), str(self.root / "wait")], cwd=self.root,
+            env=self.environment, capture_output=True, text=True, check=False,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

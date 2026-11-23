@@ -1,370 +1,193 @@
-"""Versioned admission envelopes; domain values use memory_admit's one codec."""
+"""Admission wire types with the queue records used by view replies."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
-import os
-from pathlib import Path
-from typing import TypeVar, cast
+from dataclasses import dataclass, field
+from typing import cast
 
 from scripts.build_queue.admission_code import (
     ADMISSION_CODE_PATHS as ADMISSION_CODE_PATHS,
     admission_code_version as admission_code_version,
 )
-from scripts.lint import memory_admit as gate
+from scripts.build_queue import admission_records as records
+from scripts.build_queue import cloud_progress, progress_profile
+from scripts.build_queue.placement import (
+    ClaimHolderIdentity as ClaimHolderIdentity,
+    ClaimHolderUnconfirmed as ClaimHolderUnconfirmed,
+    TokenRequired as TokenRequired,
+    TokenHeld as TokenHeld,
+    TokenNotRequired as TokenNotRequired,
+    LocalExecutionPrerequisite as LocalExecutionPrerequisite,
+    NormalStep as NormalStep,
+    SpeculativeCopy as SpeculativeCopy,
+    PlacementPurpose as PlacementPurpose,
+    AttemptRunning as AttemptRunning,
+    AttemptCompleted as AttemptCompleted,
+    PrelaunchRefused as PrelaunchRefused,
+    AttemptDeclined as AttemptDeclined,
+    AttemptCancelled as AttemptCancelled,
+    AttemptOutcomeUnavailable as AttemptOutcomeUnavailable,
+    AttemptOutcome as AttemptOutcome,
+    RetryAt as RetryAt,
+    DoNotRetry as DoNotRetry,
+    RetryDecision as RetryDecision,
+    DispatchPathSettled as DispatchPathSettled,
+    DispatchPathPending as DispatchPathPending,
+)
+from scripts.build_queue.admission_wire import (
+    AdmissionUnavailable as AdmissionUnavailable,
+    UnsupportedVersion as UnsupportedVersion,
+    Owner as Owner,
+    RunIdentity as RunIdentity,
+    NoRun as NoRun,
+    LocalPlace as LocalPlace,
+    CloudPlace as CloudPlace,
+    RunPlace as RunPlace,
+    Identity as Identity,
+    CallerCode as CallerCode,
+    AdmitRequest as AdmitRequest,
+    SessionNotSent as SessionNotSent,
+    ServiceEstimateRequest as ServiceEstimateRequest,
+    RepositorySlotRequest as RepositorySlotRequest,
+    RepositorySlotWaiting as RepositorySlotWaiting,
+    RepositorySlotReady as RepositorySlotReady,
+    RepositorySlotExpired as RepositorySlotExpired,
+    VerifyRunSlotRequest as VerifyRunSlotRequest,
+    VerifyRunSlotWaiting as VerifyRunSlotWaiting,
+    LaunchRequest as LaunchRequest,
+    ReleaseRequest as ReleaseRequest,
+    WidthRequest as WidthRequest,
+    BuildHistoryRequest as BuildHistoryRequest,
+    ViewRequest as ViewRequest,
+    ExplainRequest as ExplainRequest,
+    MineRequest as MineRequest,
+    QueueMoveRequest as QueueMoveRequest,
+    QueueDrop as QueueDrop,
+    QueueHeadDrop as QueueHeadDrop,
+    QueueUndoRequest as QueueUndoRequest,
+    QueueMoved as QueueMoved,
+    QueueMoveConflict as QueueMoveConflict,
+    PrioritySetRequest as PrioritySetRequest,
+    PriorityClearRequest as PriorityClearRequest,
+    TokenWaitRequest as TokenWaitRequest,
+    CloudSlotWait as CloudSlotWait,
+    Wait as Wait,
+    AcquisitionTiming as AcquisitionTiming,
+    CleanupTiming as CleanupTiming,
+    Admitted as Admitted,
+    RunnerExecutionTiming as RunnerExecutionTiming,
+    RunnerAdmitted as RunnerAdmitted,
+    LaunchAdmitted as LaunchAdmitted,
+    Refused as Refused,
+    PLACEMENT_REQUEST_MISSING_REASON as PLACEMENT_REQUEST_MISSING_REASON,
+    Ok as Ok,
+    BuildHistoryReply as BuildHistoryReply,
+    PlacementRequest as PlacementRequest,
+    LocalAdmissionContext as LocalAdmissionContext,
+    LocalAdmissionUnavailable as LocalAdmissionUnavailable,
+    PrerequisiteReport as PrerequisiteReport,
+    CancelPlacement as CancelPlacement,
+    ClaimFailure as ClaimFailure,
+    ConsumePermission as ConsumePermission,
+    ExecutionReport as ExecutionReport,
+    PlacementWait as PlacementWait,
+    PlacementResourceWait as PlacementResourceWait,
+    PlacementEvidenceWait as PlacementEvidenceWait,
+    Assignment as Assignment,
+    LocalPlacementGranted as LocalPlacementGranted,
+    FirstAuthorization as FirstAuthorization,
+    DispatchStatus as DispatchStatus,
+    VERSION as VERSION,
+    NO_RUN as NO_RUN,
+    PROTOCOL_ACQUISITION_TIMING as PROTOCOL_ACQUISITION_TIMING,
+    PROTOCOL_CLEANUP_TIMING as PROTOCOL_CLEANUP_TIMING,
+    CLEANUP_STRING_MAX as CLEANUP_STRING_MAX,
+    CLEANUP_STATUS_MIN as CLEANUP_STATUS_MIN,
+    CLEANUP_STATUS_MAX as CLEANUP_STATUS_MAX,
+    CLEANUP_REQUEST_MAX_BYTES as CLEANUP_REQUEST_MAX_BYTES,
+    Request as Request,
+    Reply as WireReply,
+    admission_socket_path as admission_socket_path,
+    encode_record as encode_record,
+    parse_record as parse_record,
+    encode_envelope,
+    parse_envelope,
+    encode_request as encode_request,
+    parse_request as parse_request,
+    parse_request_envelope as parse_request_envelope,
+    noncleanup_request_started as noncleanup_request_started,
+    REPLY_TYPES,
+)
 
-VERSION = 1
-
-
-class AdmissionUnavailable(RuntimeError):
-    """A bounded queue query has no answer."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason: str = reason
-        super().__init__(reason)
-
-
-class UnsupportedVersion(ValueError):
-    def __init__(self, version: object) -> None:
-        super().__init__(f"client version {version}, service supports 1..{VERSION}")
+Profile = records.StepProfile | records.ProgramProfile
 
 
 @dataclass(frozen=True)
-class Owner:
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
-class RunIdentity:
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
-class NoRun:
-    pass
-
-
-NO_RUN = NoRun()
-
-
-@dataclass(frozen=True)
-class RunPlace:
-    run: RunIdentity
-    since: float
-    first_owner: Owner
-
-
-@dataclass(frozen=True)
-class Identity:
-    session_id: str
-    name: str
-    step: str
-    folder: str
-    unit: str = ""
-
-
-Profile = gate.StepProfile | gate.ProgramProfile
-
-
-@dataclass(frozen=True, kw_only=True)
-class CallerCode:
-    code_version: str = ""
-
-
-@dataclass(frozen=True)
-class AdmitRequest(CallerCode):
-    episode: str
+class CloudRow:
+    """The cloud queue row holds caller identity, placement, progress, and wait state."""
     owner: Owner
-    argv: tuple[str, ...]
-    cwd: str
-    since: float
-    sidecar: str
     identity: Identity
-    call: gate.Call
-    test_width: gate.TestWidth
-    profile: Profile
-    fresh_test: bool
-    token_back_at: float = 0.0
-    run: RunIdentity | NoRun = NO_RUN
+    place: CloudPlace
+    since: float
+    started_at: float
+    progress: cloud_progress.CloudProgress | cloud_progress.NoCloudProgress
+    counter: progress_profile.ProgressCounter | progress_profile.NoCounter
+    wait: CloudSlotWait | records.ReadyForAdmission
 
 
 @dataclass(frozen=True)
-class LaunchRequest(CallerCode):
-    episode: str
+class RepositorySlotRow:
+    """A transient repository slot wait appears beside queued memory waits."""
     owner: Owner
-    since: float
     identity: Identity
-    profile: Profile
+    since: float
+    machine: str
+    wait: RepositorySlotWaiting
 
 
 @dataclass(frozen=True)
-class ReleaseRequest(CallerCode):
-    request_id: str
-    reservation: str
-    status: int
-
-
-@dataclass(frozen=True)
-class WidthRequest(CallerCode):
-    request_id: str
-    reservation: str
-    width: int
-
-
-@dataclass(frozen=True)
-class BuildHistoryRequest(CallerCode):
-    pass
-
-
-@dataclass(frozen=True)
-class ViewRequest(CallerCode):
-    pass
-
-
-@dataclass(frozen=True)
-class ExplainRequest(CallerCode):
-    pass
-
-
-@dataclass(frozen=True)
-class MineRequest(CallerCode):
-    session_id: str
-
-
-@dataclass(frozen=True)
-class AdmitHeadRequest(CallerCode):
-    request_id: str
-    why: str
-    actor: str
-
-
-@dataclass(frozen=True)
-class PrioritySetRequest(CallerCode):
-    request_id: str
-    unit: str
-    why: str
-    actor: str
-
-
-@dataclass(frozen=True)
-class PriorityClearRequest(CallerCode):
-    request_id: str
-    actor: str
-
-
-@dataclass(frozen=True)
-class TokenWaitRequest(CallerCode):
-    request_id: str
-    reservation: str
-
-
-Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest)
-
-
-@dataclass(frozen=True)
-class Wait:
-    reason: gate.WaitReason
-    position: int
-    head: str
-    text: str
-    snapshot: gate.AdmissionWaitSnapshot
-
-
-@dataclass(frozen=True)
-class CleanupTiming:
-    silence_seconds: float
-    reconnect_seconds: float
-
-
-# These protocol intervals permit cleanup before any configuration is usable.
-PROTOCOL_CLEANUP_TIMING = CleanupTiming(120.0, 2.0)
-CLEANUP_STRING_MAX = 4096
-CLEANUP_STATUS_MIN = -(2 ** 63)
-CLEANUP_STATUS_MAX = 2 ** 63 - 1
-
-
-@dataclass(frozen=True)
-class Admitted:
-    reservation: str
-    need: int
-    source: str
-    max_path: str
-    wave_path: str
-    sampling_context: dict[str, object]
-    cleanup_timing: CleanupTiming = PROTOCOL_CLEANUP_TIMING
-
-
-@dataclass(frozen=True)
-class LaunchAdmitted:
-    need: int
-    source: str
-
-
-@dataclass(frozen=True)
-class Refused:
-    reason: str
-
-
-@dataclass(frozen=True)
-class Ok:
-    pass
-
-
-@dataclass(frozen=True)
-class BuildHistoryReply:
-    generation: int
+class CloudQueueRead(records.QueueRead):
+    """The queue reading includes cloud rows, slot capacity, and stale push counts."""
+    cloud: tuple[CloudRow, ...] = ()
+    cloud_slots: int = 0
+    cloud_gate_stale_pushes: int = field(kw_only=True)
+    repository_slots: tuple[RepositorySlotRow, ...] = ()
 
 
 @dataclass(frozen=True)
 class ViewReply:
-    reading: gate.QueueRead
+    """The reply holds the local or cloud queue reading."""
+    reading: records.QueueRead | CloudQueueRead
 
 
 @dataclass(frozen=True)
 class ExplainReply:
-    explanation: gate.QueueExplanation
-    diagnostics: tuple[gate.ConfigurationDiagnostic, ...] = ()
+    """The reply holds the queue explanation and configuration diagnostics."""
+    explanation: records.QueueExplanation
+    diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
 class MineReply:
-    reading: gate.QueueRead
+    """The reply holds the queue reading requested by a session."""
+    reading: records.QueueRead | CloudQueueRead
 
 
-Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
+Reply = WireReply | ViewReply | ExplainReply | MineReply
 
-_REQUESTS: dict[str, type] = {
-    "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
-    "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
-    "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
-    "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
-}
-_REPLIES: dict[str, type] = {
-    "wait": Wait, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
-    "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
-}
-T = TypeVar("T")
+_REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 
 
-def admission_socket_path() -> Path:
-    from scripts.build_hold.override_guard import refuse_overrides
-    refuse_overrides(Path(__file__), "build_queue/admission_protocol.py")
-    return Path(os.environ.get("ADMISSION_SOCKET") or "/run/build-admission/build-admission.sock")
-
-
-def encode_record(value: object) -> str:
-    """State and message payloads have exactly the domain codec's representation."""
-    return json.dumps(gate.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-
-
-def parse_record(text: str, schema: type[T]) -> T:
-    value = cast(object, json.loads(text))
-    return cast(T, gate.parse_snapshot_value(value, schema))
-
-
-def _encode(value: object, variants: dict[str, type], *, main_service: bool = False) -> str:
-    name = next((name for name, schema in variants.items() if type(value) is schema), None)
-    if name is None:
-        raise ValueError("unknown admission message")
-    data = gate.snapshot_value(value)
-    if main_service and isinstance(value, (AdmitRequest, LaunchRequest)):
-        identity = cast(dict[str, object], cast(dict[str, object], data)["identity"])
-        del identity["unit"]
-    # Remove these main-service field omissions after the admission cut-over.
-    omitted: set[str] = {"run"} if isinstance(value, AdmitRequest) and isinstance(value.run, NoRun) else set()
-    if main_service and isinstance(value, CallerCode):
-        omitted.add("code_version")
-    for field_name in omitted:
-        del cast(dict[str, object], data)[field_name]
-    return encode_record({"v": VERSION, "type": name, "data": data}) + "\n"
-
-
-def _parse(line: str | bytes, variants: dict[str, type]) -> object:
-    try:
-        value = cast(object, json.loads(line))
-        if not isinstance(value, dict):
-            raise ValueError("invalid admission envelope")
-        envelope = cast(dict[str, object], value)
-        if type(envelope.get("v")) is not int or envelope["v"] != VERSION:
-            raise UnsupportedVersion(envelope.get("v"))
-        name = envelope.get("type")
-        if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
-            raise ValueError("invalid admission envelope")
-        data = envelope["data"]
-        if variants is _REQUESTS and isinstance(data, dict):
-            data = {"code_version": "", **cast(dict[str, object], data)}
-        if variants[name] is Admitted and isinstance(data, dict):
-            data = {"cleanup_timing": gate.snapshot_value(PROTOCOL_CLEANUP_TIMING), **cast(dict[str, object], data)}
-        if variants[name] is AdmitRequest and isinstance(data, dict) and "run" not in data:
-            data = {**cast(dict[str, object], data), "run": gate.snapshot_value(NO_RUN)}
-        return gate.parse_snapshot_value(cast(object, data), variants[name])
-    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
-        raise ValueError("invalid admission message") from error
-
-
-def _validate_cleanup(request: Request) -> None:
-    if not isinstance(request, (ReleaseRequest, TokenWaitRequest)):
-        return
-    fields = (request.request_id, request.reservation, request.code_version)
-    if any(len(value) > CLEANUP_STRING_MAX for value in fields):
-        raise ValueError(f"cleanup string exceeds {CLEANUP_STRING_MAX} characters")
-    if isinstance(request, ReleaseRequest) and not CLEANUP_STATUS_MIN <= request.status <= CLEANUP_STATUS_MAX:
-        raise ValueError("cleanup status exceeds signed 64-bit range")
-
-
-def encode_request(request: Request, *, main_service: bool = False) -> str:
-    _validate_cleanup(request)
-    return _encode(request, _REQUESTS, main_service=main_service)
-
-
-def parse_request(line: str | bytes) -> Request:
-    request = cast(Request, _parse(line, _REQUESTS))
-    _validate_cleanup(request)
-    return request
-
-
-def noncleanup_request_started(data: bytes) -> bool:
-    """Identify a noncleanup header before its request body is complete."""
-    source = data.decode("utf-8", errors="replace").lstrip()
-    if not source.startswith("{"):
-        return False
-    decoder = json.JSONDecoder()
-    rest = source[1:].lstrip()
-    try:
-        while rest:
-            key, end = cast(tuple[object, int], decoder.raw_decode(rest))
-            rest = rest[end:].lstrip()
-            if not rest.startswith(":"):
-                return False
-            value, end = cast(tuple[object, int], decoder.raw_decode(rest[1:].lstrip()))
-            if key == "type":
-                return isinstance(value, str) and _REQUESTS.get(value) not in (ReleaseRequest, TokenWaitRequest)
-            rest = rest[1:].lstrip()[end:].lstrip()
-            if not rest.startswith(","):
-                return False
-            rest = rest[1:].lstrip()
-    except ValueError:
-        pass
-    return False
-
-
-def encode_reply(reply: Reply) -> str:
-    return _encode(reply, _REPLIES)
+def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
+    if version == 1 and isinstance(reply, (ViewReply, MineReply)) and isinstance(reply.reading, CloudQueueRead):
+        reading = reply.reading
+        local = records.QueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics)
+        reply = type(reply)(local)
+    return encode_envelope(reply, _REPLIES, version)
 
 
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
-    reply = cast(Reply, _parse(line, _REPLIES))
+    reply = cast(Reply, parse_envelope(line, _REPLIES)[1])
     if (isinstance(request, LaunchRequest) and isinstance(reply, Admitted)
-            or isinstance(request, AdmitRequest) and isinstance(reply, LaunchAdmitted)):
+            or isinstance(request, (AdmitRequest, ServiceEstimateRequest)) and isinstance(reply, LaunchAdmitted)):
         raise ValueError("admission outcome does not match request")
     return reply
-
-
-# JSON escapes one character into at most six ASCII bytes; include the newline.
-CLEANUP_REQUEST_MAX_BYTES = max(len(encode_request(ReleaseRequest(
-    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status,
-    code_version="\0" * CLEANUP_STRING_MAX)).encode())
-    for status in (CLEANUP_STATUS_MIN, CLEANUP_STATUS_MAX))

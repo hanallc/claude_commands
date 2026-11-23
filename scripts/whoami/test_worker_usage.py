@@ -7,7 +7,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -18,6 +17,7 @@ from scripts.whoami import worker_usage
 from scripts.usage.test_outcomes import OutcomeFixture
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
@@ -116,7 +116,8 @@ class StoreReadoutTests(OutcomeFixture):
         _ = shutil.copyfile(DAY1_FIXTURES / "mac-shared.jsonl", mac_home / ".codex/sessions/2026/10/10/rollout-shared.jsonl")
         _ = (mac_home / ".local/state/usage-model/agents.jsonl").write_bytes(b"")
         (self.root / "bin").mkdir()
-        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", self.root / "bin/ssh")
+        source = (COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().split("\n", 1)[1]
+        _ = (self.root / "bin/ssh").write_text(f"#!/usr/bin/env {READOUT.parents[1] / 'lib/py'}\n{source}")
         (self.root / "bin/ssh").chmod(0o700)
         (self.root / "outside-checkout").mkdir()
         _ = self.collect()
@@ -142,9 +143,14 @@ class StoreReadoutTests(OutcomeFixture):
         return environment
 
     def readout(self, *, before: tuple[str, str] = BEFORE, explicit_db: bool = True, after: tuple[str, str] = AFTER, script: str = "") -> subprocess.CompletedProcess[str]:
-        command = ([sys.executable, "-c", script] if script else [sys.executable, str(READOUT)])
+        shim = str(READOUT.parents[1] / "lib/py")
+        command = ([shim, "-c", script] if script else [shim, str(READOUT)])
         database = ["--db", str(self.db_path)] if explicit_db else []
-        return subprocess.run([*command, *database, "--before", *before, "--after", *after],
+        arguments = [*database, "--before", *before, "--after", *after]
+        if not script and not process_boundary_for_case(self):
+            return invoke_cli(worker_usage, lambda: worker_usage.main() or 0, arguments,
+                              self.environment(), self.root / "outside-checkout")
+        return subprocess.run([*command, *arguments],
                               env=self.environment(), cwd=self.root / "outside-checkout", capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -175,7 +181,6 @@ class StoreReadoutTests(OutcomeFixture):
         self.assertEqual(result.stdout, self.expected())
         script = f"""
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 from pathlib import Path
 from unittest.mock import patch
 from scripts.usage import collect
@@ -194,7 +199,7 @@ raise SystemExit(result)
     def test_readout_figures_freshness_and_sources_share_one_snapshot_during_a_writer_commit(self) -> None:
         self.mac_pass()
         expected = self.expected()
-        script = f"import sys\nsys.path.insert(0, {str(READOUT.resolve().parents[2])!r})\n" + SNAPSHOT_COMMIT_SCRIPT + """
+        script = "import sys\n" + SNAPSHOT_COMMIT_SCRIPT + """
 from scripts.whoami import worker_usage
 with patch.object(sqlite3, 'connect', snapshot_connect):
     result = worker_usage.run(sys.argv[1:])
@@ -244,9 +249,8 @@ raise SystemExit(result)
     def test_two_weight_cuts_deduplicate_simultaneous_starts_and_last_piece_without_checkpoint_is_unavailable(self) -> None:
         _ = shutil.copyfile(DAY1_FIXTURES / "extra-cuts.jsonl", self.codex_root / "2026/10/10/rollout-extra-cuts.jsonl")
         self.mac_pass()
-        script = f"""
+        script = """
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 from datetime import datetime, timezone
 from scripts.usage import weights
 from scripts.whoami import worker_usage
@@ -258,6 +262,7 @@ raise SystemExit(worker_usage.run(sys.argv[1:]))
 """
         _ = self.assert_readout("expected-two-cuts.md", after=(AFTER[0], "2026-10-10T21:36Z"), script=script)
 
+    @process_boundary
     def test_readout_uses_only_the_store_from_another_directory_without_pythonpath(self) -> None:
         self.mac_pass()
         before = self.db_path.read_bytes()
@@ -306,9 +311,8 @@ raise SystemExit(worker_usage.run(sys.argv[1:]))
 
 
     def function_calls(self) -> ReadoutFunctionCalls:
-        script = f"""
+        script = """
 import sys
-sys.path.insert(0, {str(READOUT.resolve().parents[2])!r})
 import json
 import sqlite3
 from collections import Counter
@@ -351,8 +355,8 @@ with patch.object(sqlite3, 'connect', counting_connect), \\
         result = worker_usage.run(sys.argv[1:])
     assert result == 0, result
     assert '| Before |' in output.getvalue()
-    print(json.dumps({{'calls': dict(calls), 'weighting_registered': registration.called,
-                      'sources_called': sources.call_count}}))
+    print(json.dumps({'calls': dict(calls), 'weighting_registered': registration.called,
+                      'sources_called': sources.call_count}))
 """
         result = self.readout(script=script)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -412,7 +416,7 @@ class StoredSwitchTests(OutcomeFixture):
         environment = os.environ.copy()
         _ = environment.pop("PYTHONPATH", None)
         environment.update(HOME=str(self.root), USAGE_STATE_DIR=str(self.state), PYTHONDONTWRITEBYTECODE="1")
-        result = subprocess.run([sys.executable, str(READOUT), "--db", str(self.db_path),
+        result = subprocess.run([str(READOUT.parents[1] / "lib/py"), str(READOUT), "--db", str(self.db_path),
                                  "--before", start, end, "--after", start, end],
                                 env=environment, cwd=self.root, capture_output=True, text=True,
                                 check=False, timeout=TEST_HANG_GUARD_SECS)

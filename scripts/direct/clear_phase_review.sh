@@ -40,9 +40,12 @@ FILES=(
 )
 
 
-# Select named reviewers from the roster before removing their phase artifacts.
+# Select reviewers from staff before removing their phase files.
+# A file program keeps the working directory off the import path; a failed read stops the script.
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+REVIEWERS="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/phase_reviewers.py" "${SESSION_DIR}")"
 while IFS= read -r worker; do
+  [[ -n "${worker}" ]] || continue
   FILES+=(
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_status"*
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_pid"*
@@ -50,18 +53,7 @@ while IFS= read -r worker; do
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_reply"*
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_agent"*.log
   )
-done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}/mesh_roster.json" <<'PYTHON'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-if path.exists():
-    for name, record in json.loads(path.read_text()).items():
-        if record.get("role") == "review":
-            print(name)
-PYTHON
-)
+done <<< "${REVIEWERS}"
 
 if ((${#FILES[@]})); then
   rm -f -- "${FILES[@]}"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_runtime_id
 
 import json
 import unittest
@@ -21,13 +20,13 @@ from scripts.direct.verify_hold_wait_test_support import (
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_step_failure_with_hold_refusal_text_stays_a_failure(self) -> None:
-        hold_scripts = Path(__file__).resolve().parents[1] / "build_hold"
+        package_root = Path(__file__).resolve().parents[1] / "lib/package_root.py"
         failing_step = f'''if arguments[:2] == ["nextest", "run"]:
     failed = Path(os.environ["TEST_RUNNER_STATE"]) / "failed-once"
     if not failed.exists():
         failed.touch()
-        sys.path.insert(0, {str(hold_scripts)!r})
-        import build_hold
+        with open({str(package_root)!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
+        from scripts.build_hold import build_hold
         from datetime import datetime
         build_hold.start_hold(
             Path(os.environ["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
@@ -51,7 +50,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
     def test_unheld_local_call_needs_no_release(self) -> None:
-        result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
+        result = self.run_unblocked_step("test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("natedev is held", result.stdout + result.stderr)
         self.assertEqual(len(self.fixture.local_runs()), 1)
@@ -63,7 +62,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         for arguments in (("check", "sample"), ("test", "sample", "--local", "local admission test", "--filter", "smoke")):
             with self.subTest(arguments=arguments):
                 starts.unlink(missing_ok=True)
-                result = self.fixture.verify(*arguments)
+                result = self.run_unblocked_step(arguments[0])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.hold_commands(starts), [])
                 self.assertEqual(self.recorded_hold_wait(), 0)
@@ -86,7 +85,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertAlmostEqual(self.recorded_hold_wait(), float(observed["total"]), places=5)
         commands = self.hold_commands(starts)
-        self.assertTrue(any(command[1] == "wait-local" for command in commands))
+        self.assertTrue(any(command[1] == "register-local" for command in commands))
         self.assertFalse(any(command[1] in {"mark", "check-admission", "finish-local"} for command in commands))
 
     def test_held_call_waits_before_compiling_then_runs_on_release(self) -> None:
@@ -106,13 +105,13 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         started, = [row for row in rows if row["event_type"] == "wait_started"]
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         self.assertEqual((started["wait_kind"], started["wait_reason"], started["owner_session"]),
-                         ("WaitingForMemoryOrSlot", "build hold", fixture_runtime_id("thread-impl")))
+                         ("WaitingForMemoryOrSlot", "build hold", self.fixture.environment["CODEX_THREAD_ID"]))
         self.assertEqual(started["wait_id"], finished["wait_id"])
         self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
 
     def test_unreadable_hold_state_starts_no_local_step(self) -> None:
         _ = Path(self.fixture.environment["BUILD_HOLD_DIR"]).write_text("not a directory")
-        result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
+        result = self.run_unblocked_step("test")
         self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
         self.assertIn("hold state cannot be read", result.stdout + result.stderr)
         self.assertEqual(self.fixture.local_runs(), [])

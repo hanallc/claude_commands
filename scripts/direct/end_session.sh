@@ -1,25 +1,17 @@
 #!/usr/bin/env bash
-# end_session.sh — Mark this Claude session's unit run finished.
+# end_session.sh — Mark this director's unit run finished.
 #
 # Usage: end_session.sh
 #
-# Removes the run-active marker written by prepare_session.sh. Until it is gone,
-# stop-direct-continue.py refuses to let the turn end near the auto-compaction
-# threshold, on the assumption that the run still has phases to go.
-#
-# Acts on every run folder this session directs (`unit_runs.py held`): the
-# marker names one, and phases run side by side each keep their own folder,
-# which records its director. A run of another director is never touched.
-#
+# Clears the run pointer that prepare_session.sh stores in staff.
+# Ends each run that this session directs.
+
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
-#
-# Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
-# records (verify_cache/), whose saved time is already in
-# ~/.local/state/verify/saved.jsonl, and every git checkout and cargo target in
-# the run folder, at any depth, except any non-retired worker's live command cwd and
-# its containing checkout. Tracked run scratch follows the same retention rule.
+# Keeps the unit's standing trees and workspaces.
+# Reports retained workspaces, Verify caches, Git checkouts, and Cargo targets.
+# Ends tracked scratch tasks and protects live command working directories.
 #
 # UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
@@ -33,45 +25,52 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.12.
-PY="${HOME}/.claude/scripts/lib/py"
+PY="${BASH_SOURCE[0]%/*}/../lib/py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MESH="${SCRIPT_DIR}/../agents/codex_mesh.py"
 
-if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-  echo "No CLAUDE_CODE_SESSION_ID in the environment — nothing to clear."
+DIRECTOR_SESSION_ID="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+if [[ -z "${DIRECTOR_SESSION_ID}" ]]; then
+  echo "No director session id in the environment; nothing to clear."
   exit 0
 fi
 
-# The marker is under unit/, or delegate/ for a run started before the rename.
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  MARKER="${UNIT_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
-else
-  MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
-  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
-    MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+STATUS=0
+cleanup() {
+  if "$@"; then
+    return 0
+  else
+    echo "end_session: failed: $*" >&2
+    STATUS=1
   fi
-fi
+}
 
-# The marker holds the session directory, which is where the mesh files live.
+# Read the current pointer before and after cleanup.
+read_run_pointer() {
+  "$PY" -c 'import sys; from scripts.lib import unit_runs; run = unit_runs.open_run(sys.argv[1]); print(run if run is not None else "")' "${DIRECTOR_SESSION_ID}"
+}
+
+# Keep the open run available if the run scan fails.
 SESSION_DIR=""
-if [[ -f "${MARKER}" ]]; then
-  SESSION_DIR="$(head -n 1 "${MARKER}")"
+if SESSION_DIR="$(read_run_pointer)"; then
+  :
+else
+  echo "end_session: failed: read run pointer" >&2
+  STATUS=1
 fi
-
-# The marker's run first, kept even when the scan fails, then every other run
-# this session directs.
 RUNS=()
 if [[ -n "${SESSION_DIR}" ]]; then
   RUNS+=("${SESSION_DIR}")
 fi
-HELD_ARGS=(held "${CLAUDE_CODE_SESSION_ID}")
+HELD_ARGS=(held "${DIRECTOR_SESSION_ID}")
 if [[ -n "${UNIT_RUN_ROOT:-}" ]]; then
   HELD_ARGS+=(--root "${UNIT_RUN_ROOT}")
 fi
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  HELD_ARGS+=(--active "${UNIT_ACTIVE_DIR}")
+if HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}")"; then
+  :
+else
+  echo "end_session: failed: unit_runs.py held" >&2
+  STATUS=1
 fi
-HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}" || true)"
 while IFS= read -r run; do
   if [[ -n "${run}" && "${run}" != "${SESSION_DIR}" ]]; then
     RUNS+=("${run}")
@@ -84,21 +83,29 @@ if (( ${#RUNS[@]} > 0 )); then
     REMOVE_ARGS+=(--session-dir "${run}")
   done
   for run in "${RUNS[@]}"; do
-    "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}" || exit 1
+    cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
   done
-  "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
+  cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked --owned-workspaces "${RUNS[@]}"
   for run in "${RUNS[@]}"; do
-    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" ]]; then
-      "$PY" "${MESH}" stop --pause --session-dir "${run}" || true
-    fi
+    cleanup "$PY" "${SCRIPT_DIR}/../production/staff.py" clear-run "${DIRECTOR_SESSION_ID}" "${run}"
   done
-  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
-  # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
+else
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --owned-workspaces
 fi
 
-if [[ -f "${MARKER}" ]]; then
-  rm -f "${MARKER}"
-  echo "Unit run ended; marker cleared."
+if [[ -n "${SESSION_DIR}" ]]; then
+  if CURRENT_RUN="$(read_run_pointer)"; then
+    if [[ -z "${CURRENT_RUN}" ]]; then
+      echo "Unit run ended; run pointer cleared."
+    else
+      echo "Unit run pointer remains."
+    fi
+  else
+    echo "end_session: failed: read run pointer" >&2
+    STATUS=1
+  fi
 else
-  echo "No active unit run marker for this session."
+  echo "No active unit run pointer for this session."
 fi
+exit "${STATUS}"

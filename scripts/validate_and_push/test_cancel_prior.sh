@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
-mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/bin"
+mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/bin" "$TEST_DIR/lib"
 
 # Exercise the real push path with disposable hooks and command stubs.
 cp "$SCRIPT_DIR/validate_and_push.sh" "$SCRIPT_DIR/push_direct.sh" "$TEST_DIR/scripts/"
@@ -17,10 +17,36 @@ cat > "$TEST_DIR/scripts/choose_push_path.sh" <<'STUB'
 set -euo pipefail
 printf '%s\n' '{"push_path":"direct"}'
 STUB
-cat > "$TEST_DIR/scripts/post_push_hook.sh" <<'STUB'
+cat > "$TEST_DIR/lib/py" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-exit "${HOOK_EXIT_STATUS:-0}"
+exec bash "$@"
+STUB
+chmod +x "$TEST_DIR/lib/py"
+cat > "$TEST_DIR/lib/main_push_lock.py" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+shift 3
+exec "$@"
+STUB
+cat > "$TEST_DIR/lib/land_main.py" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+branch=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --branch) branch="$2"; shift 2 ;;
+    --checkout|--commit) shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+git push origin "HEAD:refs/heads/$branch"
+if [ "${HOOK_EXIT_STATUS:-0}" -ne 0 ]; then
+  echo "HookFailed: exit $HOOK_EXIT_STATUS"
+  echo "Rerun: land_main.py --branch $branch" >&2
+else
+  echo HookAbsent
+fi
 STUB
 
 cat > "$TEST_DIR/bin/git" <<'STUB'
@@ -31,6 +57,7 @@ printf '\n' >> "$GIT_CALLS"
 case "$1 $2" in
   'push origin') ;;
   'branch --show-current') printf '%s\n' 'ci-test-branch' ;;
+  'symbolic-ref --quiet') printf '%s\n' 'origin/ci-test-branch' ;;
   'rev-parse HEAD') printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *) printf 'unexpected git call: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -64,6 +91,8 @@ case "$1 $2" in
       fi
       if [[ "${GH_NO_SUCCESSOR:-0}" == 1 ]]; then
         runs='[]'
+      elif [[ "${GH_SUCCESSOR_FAILED:-0}" == 1 ]]; then
+        runs='[{"databaseId":101,"headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"completed","conclusion":"failure","workflowName":"CI","createdAt":"2026-10-04T12:00:00Z"}]'
       else
         runs='[{"databaseId":101,"headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"queued","workflowName":"CI","createdAt":"2026-10-04T12:00:00Z"}]'
       fi
@@ -85,7 +114,7 @@ case "$1 $2" in
     if [[ -n "$filter" ]]; then jq -r "$filter" <<< "$runs"; else printf '%s\n' "$runs"; fi
     ;;
   'run cancel')
-    if [[ "$3" == "${GH_FAIL_CANCEL_ID:-}" ]]; then
+    if [[ "${@: -1}" == "${GH_FAIL_CANCEL_ID:-}" ]]; then
       printf 'simulated cancellation failure\n' >&2
       exit 1
     fi
@@ -105,16 +134,21 @@ failed=0
 
 line_count() { grep -Fxc "$1" "$2" || true; }
 query_line() { printf '%q ' "$@"; }
-cancelled_ids() { awk '$1 == "run" && $2 == "cancel" {print $3}' "$GH_CALLS" | sort -n; }
+cancelled_ids() { awk '$1 == "run" && $2 == "cancel" {print $NF}' "$GH_CALLS" | sort -n; }
 
 run_case() {
   local name="$1" expected_status="$2" actual_status=0
   shift 2
+  local script=validate_and_push.sh expected_pushes=1
+  if [[ "${1:-}" == --follow-published ]]; then
+    script=push_direct.sh
+    expected_pushes=0
+  fi
   : > "$GIT_CALLS"
   : > "$GH_CALLS"
-  bash "$TEST_DIR/scripts/validate_and_push.sh" "$@" > "$TEST_DIR/stdout" 2> "$TEST_DIR/stderr" || actual_status=$?
+  bash "$TEST_DIR/scripts/$script" "$@" > "$TEST_DIR/stdout" 2> "$TEST_DIR/stderr" || actual_status=$?
   if [[ "$actual_status" != "$expected_status" ]] ||
-    [[ "$(line_count 'push origin HEAD:refs/heads/ci-test-branch ' "$GIT_CALLS")" != 1 ]]; then
+    [[ "$(line_count 'push origin HEAD:refs/heads/ci-test-branch ' "$GIT_CALLS")" != "$expected_pushes" ]]; then
     printf 'FAIL %s: push or exit status (got %s, expected %s)\n' "$name" "$actual_status" "$expected_status"
     cat "$GIT_CALLS" "$GH_CALLS" "$TEST_DIR/stdout" "$TEST_DIR/stderr"
     failed=1
@@ -139,6 +173,12 @@ both_older_runs_cancelled() {
     [[ "$(line_count 'cancelled run 102 (bbbbbbb)' "$TEST_DIR/stdout")" == 1 ]] &&
     [[ "$(line_count 'cancelled run 103 (ccccccc)' "$TEST_DIR/stdout")" == 1 ]] &&
     [[ "$(grep -c '^cancelled run ' "$TEST_DIR/stdout" || true)" == 2 ]]
+}
+
+hook_failure_keeps_cancellation() {
+  both_older_runs_cancelled &&
+    grep -Fq "HookFailed: exit $HOOK_EXIT_STATUS" "$TEST_DIR/stdout" &&
+    grep -Fq 'Rerun: land_main.py' "$TEST_DIR/stderr"
 }
 
 live_queries_are_exact() {
@@ -214,12 +254,12 @@ fi
 unset GH_FAIL_QUERY
 
 export HOOK_EXIT_STATUS=7
-if run_case 'target branch hook failure still cancels and retains status' 7 --to ci-test-branch --cancel-prior; then
-  check_case 'target branch hook failure still cancels and retains status' both_older_runs_cancelled
+if run_case 'target branch hook failure reports and still cancels' 0 --to ci-test-branch --cancel-prior; then
+  check_case 'target branch hook failure reports and still cancels' hook_failure_keeps_cancellation
 fi
 export HOOK_EXIT_STATUS=9
-if run_case 'current branch hook failure still cancels and retains status' 9 --cancel-prior; then
-  check_case 'current branch hook failure still cancels and retains status' both_older_runs_cancelled
+if run_case 'current branch hook failure reports and still cancels' 0 --cancel-prior; then
+  check_case 'current branch hook failure reports and still cancels' hook_failure_keeps_cancellation
 fi
 unset HOOK_EXIT_STATUS
 
@@ -235,5 +275,37 @@ if run_case 'missing successor run leaves old runs and explains why' 0 --to ci-t
   fi
 fi
 unset GH_NO_SUCCESSOR
+
+failed_dispatch_reported() {
+  grep -Fxq 'CI run 101 completed with failure (https://github.com/example/repo/actions/runs/101)' "$TEST_DIR/stderr"
+}
+
+dispatch_cancellation_warns() {
+  [[ "$(cancelled_ids)" == $'102\n103' ]] &&
+    grep -Fxq 'warning: failed to cancel run 102' "$TEST_DIR/stderr" &&
+    grep -Fxq 'cancelled run 103 (ccccccc)' "$TEST_DIR/stdout"
+}
+
+dispatch_leaves_old_runs() {
+  [[ -z "$(cancelled_ids)" ]]
+}
+
+export GH_SUCCESSOR_FAILED=1 CI_PUSH_REPO=github.com/example/repo
+dispatch_args=(--follow-published aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa pushed ci.yml workflow_dispatch 'dispatched 0')
+case_name='failed dispatch cancels prior runs and reports failure'
+if CANCEL_PRIOR=true run_case "$case_name" 1 "${dispatch_args[@]}"; then
+  check_case "$case_name" both_older_runs_cancelled
+  check_case 'failed dispatch identifies its run' failed_dispatch_reported
+fi
+
+case_name='failed dispatch keeps its status after a cancellation warning'
+if CANCEL_PRIOR=true GH_FAIL_CANCEL_ID=102 run_case "$case_name" 1 "${dispatch_args[@]}"; then
+  check_case "$case_name" dispatch_cancellation_warns
+fi
+
+case_name='failed dispatch leaves prior runs when cancellation is disabled'
+if CANCEL_PRIOR=false run_case "$case_name" 1 "${dispatch_args[@]}"; then
+  check_case "$case_name" dispatch_leaves_old_runs
+fi
 
 exit "$failed"

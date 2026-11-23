@@ -7,6 +7,10 @@ source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
+export CLAUDE_CONFIG_DIR="$TEST_DIR/claude-config"
+
 MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
@@ -83,15 +87,12 @@ write_test_registry "$TEST_DIR/model.conf" --replace-provided-sections \
     assignments/one=claude \
     assignments/one.work=claude \
     'assignments/two=claude    # trailing comment' \
-    assignments/friend=caller \
     one.codex/work=gpt-test:high \
     one.codex/bare=gpt-test \
     one.claude/work=opus:max \
     one.claude/bare=opus \
     'two.codex/work=gpt-test:medium    # alias: w' \
     two.claude/work=opus:max \
-    friend.codex/work=gpt-test:high \
-    friend.claude/work=opus:max \
     codex.agents/gpt-test=low,medium,high \
     codex.agents/gpt-new=low,medium,high \
     codex.agents/gpt-low=low \
@@ -122,17 +123,11 @@ assert_registry_matches() {
 test_resolve_reads_registry_once() (
     MODELS_CONFIG_FILE="$TEST_DIR/read-once.conf"
     write_fixture "$TEST_DIR/base.conf"
-    # A file counts reads in command substitutions as well as this shell.
-    registry_reader="$(declare -f models_registry_text)"
-    eval "${registry_reader/models_registry_text /test_original_registry_text }"
-    models_registry_text() {
-        printf 'read\n' >> "$TEST_DIR/registry-reads"
-        test_original_registry_text "$@"
-    }
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
     for task in alpha.work alpha.claude_task; do
-        : > "$TEST_DIR/registry-reads"
+        : > "$TEST_REGISTRY_READS"
         agents_resolve "$task" || fail "read-count task did not resolve: $task"
-        read_count="$(wc -l < "$TEST_DIR/registry-reads")"
+        read_count="$(wc -l < "$TEST_REGISTRY_READS")"
         [[ "$read_count" -eq 1 ]] \
             || fail "$task read the registry $read_count times; expected one read per resolve"
         if [[ "$task" == alpha.work ]]; then
@@ -144,6 +139,37 @@ test_resolve_reads_registry_once() (
         fi
     done
     echo "models_config single-read tests passed"
+)
+
+test_inherited_editor_writes_without_catalog_sync() (
+    export MODELS_CONFIG_FILE="$TEST_DIR/inherited-editor.conf"
+    export MODELS_LAUNCH_CONFIGURATION="" MODELS_CONFIG_TIER_ONLY=0
+    export CODEX_CONFIG_FILE="$TEST_DIR/editor-codex.toml"
+    export CODEX_MODELS_CACHE_FILE="$TEST_DIR/editor-models.json"
+    export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/editor-last-success"
+    write_test_registry "$MODELS_CONFIG_FILE"
+    printf '%s\n' 'model = "gpt-test"' > "$CODEX_CONFIG_FILE"
+    printf '%s\n' '{"models":[{"slug":"gpt-test","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]}' > "$CODEX_MODELS_CACHE_FILE"
+    touch -t 200001010000 "$CODEX_CATALOG_SYNC_STATE_FILE"
+    touch -t 200001010001 "$CODEX_CONFIG_FILE" "$CODEX_MODELS_CACHE_FILE"
+    export MODELS_REGISTRY_EDIT_BASE
+    MODELS_REGISTRY_EDIT_BASE="$("$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
+import os, sys
+from pathlib import Path
+with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.lib.models_registry import RegistryEditBase
+path = Path(os.environ["MODELS_CONFIG_FILE"])
+print(RegistryEditBase(path, path.read_text(), ()).environment({})["MODELS_REGISTRY_EDIT_BASE"])
+PYTHON
+    )"
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    bash "$SCRIPT_DIR/default_models.sh" direct.impl gpt-test:medium > "$TEST_DIR/editor-output" \
+        || fail "the inherited editor write failed"
+    # The local save reads under the lock and returns the text it saved.
+    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] \
+        || fail "the inherited editor must read the registry once for the local save: $(cat "$TEST_REGISTRY_READS")"
+    grep -q '^impl=gpt-test:medium$' "$MODELS_CONFIG_FILE" \
+        || fail "the inherited editor did not publish its row"
 )
 
 test_registry_edit_refreshes_readers() (
@@ -179,6 +205,49 @@ test_changed_registry_file_refreshes_readers() (
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
         || fail "switching back to the first registry kept the second file's values"
     echo "models_config file refresh tests passed"
+)
+
+test_spaced_keys_and_shell_quoting() (
+    MODELS_CONFIG_FILE="$TEST_DIR/spaced registry.conf"
+    write_test_registry "$MODELS_CONFIG_FILE" assignments/direct=codex
+    sed 's/^direct=codex$/  direct = codex   # chosen family/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/spaced.conf"
+    mv "$TEST_DIR/spaced.conf" "$MODELS_CONFIG_FILE"
+    cat >> "$MODELS_CONFIG_FILE" <<'EOF'
+
+[empty]
+[quoted]
+key = a 'quoted' $(exit 9) value # keep the source comment
+EOF
+    agents_resolve direct.impl
+    [[ "$AGENT_FAMILY:$AGENT_MODEL:$AGENT_EFFORT" == codex:gpt-test:high ]] \
+        || fail "spaced keys changed the resolved assignment"
+    _models_config_has_section empty || fail "the parser discarded an empty section"
+    [[ "$(_models_registry_get quoted key)" == "a 'quoted' \$(exit 9) value" ]] \
+        || fail "the shell changed a quoted registry value"
+)
+
+test_editor_uses_matching_text_and_values_after_a_concurrent_edit() (
+    MODELS_CONFIG_FILE="$TEST_DIR/editor-base.conf"
+    write_fixture "$TEST_DIR/base.conf"
+    cp "$MODELS_CONFIG_FILE" "$TEST_DIR/editor-before.conf"
+    sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$MODELS_CONFIG_FILE" > "$TEST_DIR/editor-peer.conf"
+    registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
+    parser="$(declare -f _models_registry_parse)"
+    eval "${parser/_models_registry_parse /test_original_registry_parse }"
+    _models_registry_parse() {
+        test_original_registry_parse "$@"
+        cp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE"
+    }
+    validate_editor_base() {
+        models_registry_text > "$TEST_DIR/editor-source.conf"
+        cmp "$TEST_DIR/editor-before.conf" "$TEST_DIR/editor-source.conf" \
+            || fail "editor source text changed after the read"
+        [[ "$(_models_registry_get alpha.codex work)" == gpt-test:high ]] \
+            || fail "editor validation read another generation"
+    }
+    models_registry_edit validate_editor_base
+    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] || fail "editor read more than one base"
+    cmp "$TEST_DIR/editor-peer.conf" "$MODELS_CONFIG_FILE" || fail "editor replaced the concurrent edit"
 )
 
 test_model_families() (
@@ -277,6 +346,71 @@ EOF
         [[ "$cache_state" != unreadable ]] || chmod 600 "$CODEX_MODELS_CACHE_FILE"
     done
     rm -f "$CODEX_MODELS_CACHE_FILE"
+
+    for catalog_case in at-minimum above-minimum below-minimum no-catalog newest-catalog \
+        null-minimum absent-minimum missing-target malformed-catalog; do
+        for word in fable opus sonnet haiku; do
+            export CLAUDE_CONFIG_DIR="$TEST_DIR/claude-$catalog_case-$word"
+            catalog_dir="$CLAUDE_CONFIG_DIR/cache/model-catalog"
+            mkdir -p "$catalog_dir" "$CLAUDE_CONFIG_DIR/bin"
+            cat > "$CLAUDE_CONFIG_DIR/bin/claude" <<'EOF'
+#!/bin/sh
+printf '%s (Claude Code)\n' "$TEST_CLAUDE_VERSION"
+EOF
+            chmod +x "$CLAUDE_CONFIG_DIR/bin/claude"
+            export TEST_CLAUDE_VERSION=2.1.319
+            minimum='"2.1.319"'
+            target="claude-$word-fixture-current"
+            expected_model="$target"
+            case "$catalog_case" in
+                above-minimum) TEST_CLAUDE_VERSION=2.1.1000 ;;
+                below-minimum) TEST_CLAUDE_VERSION=2.1.99; expected_model="$word" ;;
+                no-catalog|missing-target|malformed-catalog) expected_model="$word" ;;
+                null-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
+                absent-minimum) minimum=null; TEST_CLAUDE_VERSION=1.0.0 ;;
+            esac
+            write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
+                assignments/launch=claude \
+                "launch.claude/work=$word:high" \
+                "claude.agents/$word=low,medium,high,max" \
+                "claude.families/$word=$word"
+            if [[ "$catalog_case" != no-catalog ]]; then
+                jq -n --arg word "$word" --arg target "$target" --argjson minimum "$minimum" \
+                    --arg catalog_case "$catalog_case" '
+                    {fetchedAt: 2000, catalog: {config: {
+                        provider_alias_targets: {($word): {default: $target}},
+                        models: [
+                            {id: "claude-unrelated-fixture", min_claude_code_version: "999.0.0"},
+                            ({id: $target, min_claude_code_version: $minimum}
+                             | if $catalog_case == "absent-minimum" then del(.min_claude_code_version) else . end)
+                        ]
+                    }}}' > "$catalog_dir/a-current-cc.json"
+            fi
+            if [[ "$catalog_case" == newest-catalog ]]; then
+                jq --arg word "$word" --arg target "claude-$word-fixture-old" '
+                    .fetchedAt = 1000
+                    | .catalog.config.provider_alias_targets[$word].default = $target
+                    | .catalog.config.models = [{id: $target}]' \
+                    "$catalog_dir/a-current-cc.json" > "$catalog_dir/z-old-cc.json"
+                jq '.fetchedAt = 3000' "$catalog_dir/z-old-cc.json" > "$catalog_dir/newest-web.json"
+            fi
+            if [[ "$catalog_case" == missing-target ]]; then
+                jq --arg word "$word" 'del(.catalog.config.provider_alias_targets[$word])' \
+                    "$catalog_dir/a-current-cc.json" > "$catalog_dir/without-target.json"
+                mv "$catalog_dir/without-target.json" "$catalog_dir/a-current-cc.json"
+            elif [[ "$catalog_case" == malformed-catalog ]]; then
+                printf '%s\n' '{invalid' > "$catalog_dir/a-current-cc.json"
+            fi
+            PATH="$CLAUDE_CONFIG_DIR/bin:$PATH" agents_resolve launch.work \
+                || fail "$catalog_case: $word did not resolve"
+            [[ "$AGENT_FAMILY" == claude && "$AGENT_MODEL" == "$word" && "$AGENT_EFFORT" == high ]] \
+                || fail "$catalog_case: $word did not preserve its family word and effort"
+            resolved_model="$(PATH="$CLAUDE_CONFIG_DIR/bin:$PATH" _agents_model_slug claude "$AGENT_MODEL")" \
+                || fail "$catalog_case: $word did not resolve at launch"
+            [[ "$resolved_model" == "$expected_model" ]] \
+                || fail "$catalog_case: $word resolved to $resolved_model; expected $expected_model"
+        done
+    done
     echo "models_config model-family tests passed"
 )
 
@@ -544,9 +678,8 @@ stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"missing [missing_set.claude]"* ]] \
     || fail "switch-all refusal was not caused by the function with no set"
 
-# A bare agent puts every function on it: fixed assignments switch to the
-# agent's family, every row of that family takes the agent with its effort
-# kept, and a caller function's set for that family moves too.
+# An agent change selects its family for every assignment.
+# Each row in that family uses the agent and keeps its effort.
 write_fixture "$TEST_DIR/model.conf"
 before="$TEST_DIR/model-before.conf"
 expected="$TEST_DIR/model-expected.conf"
@@ -569,8 +702,6 @@ agents_set_model sonnet
 agents_resolve one.work
 [[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "sonnet" && "$AGENT_EFFORT" == "max" ]] \
     || fail "claude agent sweep did not switch and keep effort"
-AGENTS_CALLER_FAMILY=codex agents_resolve friend.work
-[[ "$AGENT_MODEL" == "gpt-new" ]] || fail "claude agent sweep touched the caller function's codex set"
 
 # A kept effort the agent's catalog lacks rejects the whole sweep.
 write_fixture "$TEST_DIR/model.conf"
@@ -591,14 +722,6 @@ agents_set_model gpt-new one
 assert_registry_matches "$expected" || fail "scoped agent sweep changed lines outside its function"
 assert_fails "scoped sweep of an unknown function" agents_set_model gpt-new absent
 
-# A caller function keeps its assignment; only its set for that family moves.
-write_fixture "$TEST_DIR/model.conf"
-awk '/^\[/ { in_sec = ($0 == "[friend.codex]") }
-     in_sec { sub(/=gpt-test/, "=gpt-new") }
-     { print }' "$before" > "$expected"
-agents_set_model gpt-new friend
-assert_registry_matches "$expected" || fail "scoped sweep of a caller function changed its assignment"
-
 AGENT_MODEL="gpt-test"
 AGENT_EFFORT="high"
 [[ "$(agents_codex_args)" == '-m gpt-test -c model_reasoning_effort="high"' ]] || fail "codex args with effort are wrong"
@@ -610,72 +733,6 @@ AGENT_EFFORT="max"
 [[ "$(agents_claude_args)" == "--model opus --effort max" ]] || fail "claude args with effort are wrong"
 AGENT_EFFORT=""
 [[ "$(agents_claude_args)" == "--model opus" ]] || fail "claude args without effort are wrong"
-
-# `caller` resolves through the agent running the shell, never through a switch.
-write_test_registry "$TEST_DIR/caller.conf" --replace-provided-sections --replace-section claude.families \
-    assignments/friend=caller \
-    assignments/plain=codex \
-    friend.codex/work=gpt-test:high \
-    friend.claude/work=opus:max \
-    plain.codex/work=gpt-test:high \
-    plain.claude/work=opus:max \
-    codex.agents/gpt-test=low,medium,high \
-    claude.agents/opus=low,medium,high,max
-write_fixture "$TEST_DIR/caller.conf"
-unset AGENTS_CALLER_FAMILY CODEX_THREAD_ID CLAUDE_CODE_SESSION_ID
-
-AGENTS_CALLER_FAMILY=codex agents_resolve friend.work
-[[ "$AGENT_FAMILY" == "codex" && "$AGENT_MODEL" == "gpt-test" ]] || fail "caller override to codex did not resolve the codex row"
-AGENTS_CALLER_FAMILY=claude agents_resolve friend.work
-[[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" ]] || fail "caller override to claude did not resolve the claude row"
-CODEX_THREAD_ID=t agents_resolve friend.work
-[[ "$AGENT_FAMILY" == "codex" ]] || fail "CODEX_THREAD_ID did not identify a codex caller"
-CLAUDE_CODE_SESSION_ID=s agents_resolve friend.work
-[[ "$AGENT_FAMILY" == "claude" ]] || fail "CLAUDE_CODE_SESSION_ID did not identify a claude caller"
-CODEX_THREAD_ID=t CLAUDE_CODE_SESSION_ID=s agents_resolve friend.work
-[[ "$AGENT_FAMILY" == "codex" ]] || fail "codex did not win when both identity variables are set"
-assert_fails "caller with no detectable agent" agents_resolve friend.work
-stderr_out="$(agents_resolve friend.work 2>&1 >/dev/null || true)"
-[[ "$stderr_out" == *"no calling agent is detectable"* ]] || fail "undetectable caller did not fail as a caller error"
-agents_resolve plain.work
-[[ "$AGENT_FAMILY" == "codex" ]] || fail "a fixed assignment beside a caller stopped resolving"
-
-before="$TEST_DIR/caller-before.conf"
-models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
-assert_fails "switching a caller function" agents_set_assignment friend codex
-assert_registry_matches "$before" || fail "rejected caller switch changed the registry"
-stderr_out="$(agents_set_assignment friend codex 2>&1 >/dev/null || true)"
-[[ "$stderr_out" == *"has no switch"* ]] || fail "caller switch did not explain itself"
-assert_fails "switching a function to caller" agents_set_assignment plain caller
-assert_registry_matches "$before" || fail "rejected switch to caller changed the registry"
-
-expected="$TEST_DIR/caller-expected.conf"
-sed 's/^plain=codex$/plain=claude/' "$before" > "$expected"
-agents_set_all_assignments claude
-assert_registry_matches "$expected" || fail "switch-all moved the caller assignment"
-agents_set_all_assignments codex
-assert_registry_matches "$before" || fail "switch-all reversal around a caller changed registry rows"
-
-function_list="$(AGENTS_CALLER_FAMILY=claude agents_list_function friend)"
-printf '%s\n' "$function_list" | grep -q '^task=friend.work family=claude agent=opus effort=max active=yes tier=-$' \
-    || fail "caller function did not mark the calling family live"
-printf '%s\n' "$function_list" | grep -q '^task=friend.work family=codex agent=gpt-test effort=high active=no tier=inherit$' \
-    || fail "caller function marked the other family live"
-printf '%s\n' "$function_list" | grep -q '^# current family: caller .*claude here' \
-    || fail "caller function did not report the detected family"
-
-assignment_list="$(AGENTS_CALLER_FAMILY=codex agents_list_assignments friend)"
-[[ "$(printf '%s\n' "$assignment_list" | grep -c '^task=friend.work ')" -eq 1 ]] || fail "detectable caller listed more than one family"
-printf '%s\n' "$assignment_list" | grep -q '^task=friend.work family=codex ' || fail "detectable caller listed the wrong family"
-assignment_list="$(agents_list_assignments friend)"
-[[ "$(printf '%s\n' "$assignment_list" | grep -c '^task=friend.work ')" -eq 2 ]] || fail "undetectable caller did not list both families"
-printf '%s\n' "$assignment_list" | grep -q 'none detectable here' || fail "undetectable caller listing did not say so"
-
-AGENTS_CALLER_FAMILY=claude agents_set_row friend.work opus:high
-[[ "$AGENT_ROW_ASSIGNMENT" == "caller" ]] || fail "row edit on a caller function did not expose the raw assignment"
-[[ "$AGENT_ROW_ACTIVE" == "yes" && "$AGENT_ROW_ACTIVE_FAMILY" == "claude" ]] || fail "row edit on a caller function did not report the calling family live"
-AGENTS_CALLER_FAMILY=codex agents_set_row friend.work opus:max
-[[ "$AGENT_ROW_ACTIVE" == "no" ]] || fail "row edit for the other family was reported live under a caller"
 
 # Only a codex row gets a speed tier: Claude's fast mode bills extra usage.
 write_test_registry "$TEST_DIR/tier.conf" --replace-provided-sections \
@@ -708,6 +765,43 @@ assert_fails "unknown service tier" agents_resolve mistyped.work
 stderr_out="$(agents_resolve mistyped.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"Allowed values: fast, flex, default"* ]] || fail "unknown tier error did not list the allowed values"
 
+# A claude task takes its launch account from a models.conf row, never from its name.
+write_test_registry "$TEST_DIR/account.conf" --replace-provided-sections \
+    assignments/own=claude \
+    assignments/rowed=claude \
+    assignments/plain=claude \
+    assignments/wrong=claude \
+    assignments/coded=codex \
+    own.claude/work=opus:max \
+    own.options/claude_account=caller \
+    rowed.claude/work=opus:max \
+    rowed.claude/other=opus:max \
+    rowed.options/claude_account=caller \
+    rowed.options/claude_account.other=workers \
+    plain.claude/work=opus:max \
+    wrong.claude/work=opus:max \
+    wrong.options/claude_account=mine \
+    coded.codex/work=gpt-test:high \
+    coded.options/claude_account=caller \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
+write_fixture "$TEST_DIR/account.conf"
+
+agents_resolve own.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "caller" ]] || fail "a function's claude_account did not reach its row"
+agents_resolve rowed.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "caller" ]] || fail "a row without its own key did not take the function's account"
+agents_resolve rowed.other
+[[ "$AGENT_CLAUDE_ACCOUNT" == "workers" ]] || fail "a row's own claude_account did not beat the function's key"
+agents_resolve plain.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "workers" ]] || fail "a claude task with no claude_account did not take the workers pool"
+agents_resolve coded.work
+[[ -z "$AGENT_CLAUDE_ACCOUNT" ]] || fail "a codex task carried a claude account"
+assert_fails "unknown claude account" agents_resolve wrong.work
+stderr_out="$(agents_resolve wrong.work 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"Allowed values: workers, caller"* ]] || fail "unknown account error did not list the allowed values"
+write_fixture "$TEST_DIR/tier.conf"
+
 # A codex row with no registry tier shows what ~/.codex/config.toml gives it.
 printf 'model = "gpt-test"\nservice_tier = "fast"\n\n[profiles.x]\nservice_tier = "flex"\n' > "$TEST_DIR/codex-fast.toml"
 assignment_list="$(CODEX_CONFIG_FILE="$TEST_DIR/codex-fast.toml" agents_list_assignments untiered)"
@@ -725,20 +819,17 @@ write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
     assignments/kept=codex \
     assignments/bare=codex \
     assignments/resting=claude \
-    assignments/friend=caller \
     assignments/clauded=claude \
     kept.codex/work=gpt-test:high \
     kept.codex/check=gpt-test:high \
     kept.claude/work=opus:max \
     kept.claude/check=opus:max \
-    'kept.options/codex_mesh=1    # another launch flag' \
+    'kept.options/other_flag=1    # another launch flag' \
     'kept.options/codex_service_tier=flex    # tuned' \
     bare.codex/work=gpt-test:high \
     bare.claude/work=opus:max \
     resting.codex/work=gpt-test:high \
     resting.claude/work=opus:max \
-    friend.codex/work=gpt-test:high \
-    friend.claude/work=opus:max \
     clauded.claude/work=opus:max \
     codex.agents/gpt-test=low,medium,high \
     claude.agents/opus=low,medium,high,max
@@ -766,7 +857,7 @@ assert_registry_matches "$expected" || fail "function tier changed rows other th
 sed '/^codex_service_tier=flex/d' "$before" > "$expected"
 agents_set_service_tier inherit kept
 assert_registry_matches "$expected" || fail "inherit removed more than the tier key"
-[[ "$(_models_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
+[[ "$(_models_registry_get kept.options other_flag)" == "1" ]] || fail "inherit dropped another launch flag"
 
 # A row key beats its function's key; inherit on the row falls back to it.
 write_fixture "$TEST_DIR/tierset.conf"
@@ -799,8 +890,8 @@ if grep -q '^codex_service_tier.check=' <(models_registry_text); then fail "func
 write_fixture "$TEST_DIR/tierset.conf"
 agents_set_service_tier default kept.check
 agents_set_service_tier fast
-[[ "$AGENT_TIER_FUNCTIONS" == "kept bare resting friend" ]] || fail "every-function tier covered '$AGENT_TIER_FUNCTIONS'"
-for fn in kept bare resting friend; do
+[[ "$AGENT_TIER_FUNCTIONS" == "kept bare resting" ]] || fail "every-function tier covered '$AGENT_TIER_FUNCTIONS'"
+for fn in kept bare resting; do
     [[ "$(_models_registry_get "$fn.options" codex_service_tier)" == "fast" ]] || fail "every-function tier missed $fn"
 done
 if _models_config_has_section clauded.options; then fail "every-function tier wrote a function with no codex set"; fi
@@ -839,8 +930,6 @@ admin_first_line() {
     || fail "function tier message is wrong"
 [[ "$(admin_first_line resting.work flex)" == "# set [resting.options] codex_service_tier.work=flex — dormant: resting.work runs on claude. Make it live with: default_models.sh resting codex" ]] \
     || fail "dormant row tier message is wrong"
-[[ "$(admin_first_line friend fast)" == "# set [friend.options] codex_service_tier=fast — live whenever a codex session runs friend" ]] \
-    || fail "caller tier message is wrong"
 [[ "$(admin_first_line kept.check inherit)" == "# cleared kept.check's own tier — it follows [kept.options] codex_service_tier: flex" ]] \
     || fail "row inherit message is wrong"
 [[ "$(admin_first_line fast)" == "# set codex_service_tier=fast for every function — dormant for resting: they run on claude" ]] \
@@ -951,5 +1040,8 @@ agents_resolve production.director
 test_registry_edit_refreshes_readers
 test_changed_registry_file_refreshes_readers
 test_resolve_reads_registry_once
+test_inherited_editor_writes_without_catalog_sync
+test_spaced_keys_and_shell_quoting
+test_editor_uses_matching_text_and_values_after_a_concurrent_edit
 
 echo "models_config tests passed"

@@ -1,164 +1,117 @@
-"""Check worker reuse, turn settings, and compaction."""
+"""Check native worker reuse and model settings across assignment retries."""
 from __future__ import annotations
 
-from scripts.lib.test_models_registry import write_registry
-from scripts.lint.memory_test_support import write_config_fixture
-import os
-from pathlib import Path
-from unittest.mock import patch
-import json
-from typing import cast, final
-from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct.assign_launcher_test_support import read_object
+
+from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign_launcher_test_support as launcher_fixture
+from scripts.direct.assign_launcher_test_support import read_object
+from scripts.lib.test_models_registry import write_registry
+from scripts.herdr import herdr, worker_panes
+from scripts.production import staff
+
+setUpModule = codex_fixture.setUpModule
 
 
-setUpModule = mesh_fixture.setUpModule
+class AssignReuseTests(launcher_fixture.FirstDispatchFixture):
+    def test_a_stopped_native_worker_recovers_the_same_thread_for_named_dispatch(self) -> None:
+        self.first_assignment()
+        name, original = next(iter(self.assignment_records().items()))
+        row = staff.by_id(staff.StaffId(str(original["staff_id"])))
+        assert row is not None
+        world = self.native.fixture.world
+        source_pane = self.native.agent.submitted[-1][0]
+        world.add(row, source_pane, family="codex", live=False)
+        _ = self.successful("implement", "--to", name)
+        self.assertEqual(self.assignment_records()[name], original)
+        self.assertEqual(self.turn_starts, 2)
+        self.assertEqual(len(world.locations), 1)
+        destination = world.launches[-1]
+        self.assertEqual(destination, herdr.ExistingPane(source_pane, "terminal-" + source_pane))
+        self.assertNotIn(source_pane, world.locations)
+        self.assertEqual(self.native.agent.submitted[-1][0], source_pane)
+        self.assertEqual(world.closed, [(source_pane, "terminal-" + source_pane)] * 2)
 
+    def test_a_closed_worker_dispatches_again_on_its_recorded_thread(self) -> None:
+        self.first_assignment()
+        name, original = next(iter(self.assignment_records().items()))
+        self.assertIsInstance(worker_panes.close(self.native.fixture.parent.id, staff.WorkerName.parse(name)),
+                              worker_panes.Closed)
+        self.assertEqual(self.assignment_records()[name], original)
+        _ = self.successful("implement", "--to", name)
+        self.assertEqual(self.assignment_records()[name], original)
+        self.assertEqual(self.turn_starts, 2)
+        self.assertEqual(len(self.native.fixture.world.locations), 1)
 
-@final
-class AssignReuseTests(launcher_fixture.AssignLauncherFixture):
+    def test_an_unproved_native_worker_receives_no_replacement_or_assignment(self) -> None:
+        self.first_assignment()
+        name, original = next(iter(self.assignment_records().items()))
+        world = self.native.fixture.world
+        opened = worker_panes.start_or_resume(self.native.fixture.parent.id, staff.WorkerName.parse(name), "impl")
+        self.assertIsInstance(opened, worker_panes.OpenWorker)
+        assert isinstance(opened, worker_panes.OpenWorker)
+        world.unknown[opened.pane] = "native process evidence unavailable"
+        launches = list(world.launches)
+        result = self.launch("implement", "--to", name)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("native process evidence unavailable", (self.session_dir / f"phases/7/{name}_agent.log").read_text())
+        self.assertEqual(self.assignment_records()[name], original)
+        self.assertEqual(world.launches, launches)
+        self.assertEqual(self.turn_starts, 1)
+
     def test_named_dispatch_reuses_a_thread_and_advances_the_manifest_number(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
         _ = self.successful("test", "--to", name)
-        self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
-        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(read_object(self.session_dir / "phases/7/dispatch_2_paths.json")["worker"], name)
 
     def test_explicit_turn_settings_reuse_the_named_worker_without_rewriting_its_identity(self) -> None:
-        _ = self.successful()
+        self.first_assignment()
         name, original = next(iter(self.assignment_records().items()))
-        identity_path = self.identity_path(name)
-        identity = identity_path.read_bytes()
         for options, expected in ((["--model", "gpt-other-sol:high"], ("gpt-other-sol", "high")),
                                   (["--effort", "max"], ("gpt-kept-sol", "max"))):
             with self.subTest(options=options):
                 _ = self.successful("implement", "--to", name, *options)
-                turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-                self.assertEqual((turn["model"], turn["effort"]), expected)
-                record = self.assignment_records()[name]
-                self.assertEqual((record["turn_model"], record["turn_effort"]), expected)
-                self.assertEqual(record["thread_id"], original["thread_id"])
-                self.assertEqual(identity_path.read_bytes(), identity)
+                command = self.native.fixture.world.requests[-1][1]
+                self.assertEqual(command[command.index("--model") + 1], expected[0])
+                self.assertIn(f'model_reasoning_effort="{expected[1]}"', command)
+                self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 3)
-        self.assertEqual(len(self.methods("thread/start")), 1)
 
-    def test_turn_display_fields_never_choose_the_next_named_dispatch_model_or_effort(self) -> None:
-        _ = self.successful("implement")
-        roster = self.assignment_records()
-        name = next(iter(roster))
-        roster[name].update({"turn_model": "gpt-other-sol", "turn_effort": "max"})
-        self.write_pool_roster(dict[str, object](roster))
-        _ = self.successful("implement", "--to", name)
-        turn = cast("dict[str, object]", self.methods("turn/start")[-1]["params"])
-        self.assertEqual((turn["model"], turn["effort"]), ("gpt-kept-sol", "high"))
-
-    def test_a_model_override_reuses_an_idle_worker_and_updates_only_its_turn_display(self) -> None:
-        _ = self.successful()
+    def test_a_model_override_reuses_an_idle_worker_with_the_requested_settings(self) -> None:
+        self.first_assignment()
         name, before = next(iter(self.assignment_records().items()))
         _ = self.successful("implement", "--model", "gpt-other-sol:high")
-        roster = self.assignment_records()
-        self.assertEqual(set(roster), {name})
-        self.assertEqual(roster[name]["thread_id"], before["thread_id"])
-        self.assertEqual((roster[name]["turn_model"], roster[name]["turn_effort"]), ("gpt-other-sol", "high"))
-        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual((turn["model"], turn["effort"]), ("gpt-other-sol", "high"))
-        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.assignment_records(), {name: before})
+        command = self.native.fixture.world.requests[-1][1]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-other-sol")
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertEqual(self.turn_starts, 2)
 
     def test_a_saved_identity_model_is_history_while_the_turn_uses_the_registry(self) -> None:
-        _ = self.successful()
-        name = next(iter(self.assignment_records()))
-        identity_path = self.identity_path(name)
-        identity = read_object(identity_path)
-        identity["model"] = "gpt-other-sol"
-        _ = identity_path.write_text(json.dumps(identity))
+        self.first_assignment()
+        name, original = next(iter(self.assignment_records().items()))
+        identity_path = self.session_dir / f"impl_worker_{name}.json"
+        _ = identity_path.write_text('{"staff_id": "' + str(original["staff_id"]) + '", "model": "gpt-other-sol"}')
+        saved = identity_path.read_bytes()
         _ = self.successful("implement", "--to", name)
-        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual(turn["model"], "gpt-kept-sol")
-        self.assertEqual(read_object(identity_path)["model"], "gpt-other-sol")
+        command = self.native.fixture.world.requests[-1][1]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-kept-sol")
+        self.assertEqual(identity_path.read_bytes(), saved)
+        self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
 
-    def test_a_legacy_roster_without_a_model_uses_registry_changes_on_the_same_thread(self) -> None:
-        _ = self.successful()
-        name, record = next(iter(self.assignment_records().items()))
-        original_thread = record["thread_id"]
-        _ = record.pop("model", None)
-        self.write_pool_roster({name: record})
-        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:high"}}, update=True)
+    def test_changed_model_config_takes_effect_on_the_next_launch(self) -> None:
+        self.first_assignment()
+        name, original = next(iter(self.assignment_records().items()))
+        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:max"}}, update=True)
+        row = staff.by_id(staff.StaffId(str(original["staff_id"])))
+        assert row is not None
+        _ = self.native.fixture.world.stop(row, self.native.fixture.world)
         _ = self.successful("implement", "--to", name)
-        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual(turn["model"], "gpt-other-sol")
-        self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
-        self.assertEqual(len(self.methods("thread/start")), 1)
-        _ = self.successful("implement", "--to", name, "--model", "gpt-kept-sol")
-        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual(turn["model"], "gpt-kept-sol")
-        self.assertEqual(self.turn_starts, 3)
-
-    def test_a_large_named_worker_is_compacted_before_its_next_assignment(self) -> None:
-        _ = self.successful()
-        name, record = next(iter(self.assignment_records().items()))
-        record["context_tokens"] = 200_000
-        self.write_pool_roster({name: record})
-        self.context_sizes = [200_000]
-        _ = self.successful("implement", "--to", name)
-        methods = [request.get("method") for request in self.server.requests]
-        self.assertEqual(methods.count("thread/compact/start"), 1, methods)
-        self.assertLess(methods.index("thread/compact/start"),
-                        max(index for index, method in enumerate(methods) if method == "turn/start"))
+        command = self.native.fixture.world.requests[-1][1]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-other-sol")
+        self.assertIn('model_reasoning_effort="max"', command)
+        self.assertEqual(self.assignment_records()[name], original)
         self.assertEqual(self.turn_starts, 2)
-
-    def test_changed_compaction_config_takes_effect_on_the_next_assignment(self) -> None:
-        config = self.session_dir.parent / "direct.conf"
-        _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
-        with patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
-            _ = self.successful()
-            name, record = next(iter(self.assignment_records().items()))
-            thread = record["thread_id"]
-            record["context_tokens"] = 200_000
-            self.write_pool_roster({name: record})
-            self.context_sizes = [200_000, 200_000]
-            _ = self.successful("implement", "--to", name)
-            self.assertEqual(len(self.methods("thread/compact/start")), 0)
-            _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
-            _ = self.successful("implement", "--to", name)
-        self.assertEqual(len(self.methods("thread/compact/start")), 1)
-        self.assertEqual(self.assignment_records()[name]["thread_id"], thread)
-        self.assertEqual(len(self.methods("thread/start")), 1)
-        self.assertEqual(self.turn_starts, 3)
-
-    def test_a_compaction_roster_conflict_refuses_assignment_before_claim_or_follow(self) -> None:
-        _ = self.successful()
-        name, record = next(iter(self.assignment_records().items()))
-        record["context_tokens"] = 126299
-        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
-        self.write_pool_roster({name: record})
-        before = roster_path.read_bytes()
-        turns_before = self.turn_starts
-        trace = self.session_dir / "compact-refusal.jsonl"
-        # Only the transport's compaction result is injected. The real coordinator
-        # decides whether to claim, follow, alter artifacts or announce continuation.
-        self.instrument_launcher(
-            "import json, subprocess\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
-            f"trace = Path({str(trace)!r})\nreal_call = assign.Dispatch.mesh_call\n" +
-            "def mesh_call(dispatch, verb, *options, **kwargs):\n" +
-            "    with trace.open('a') as handle: handle.write(json.dumps(verb) + '\\n')\n" +
-            "    if verb == 'compact':\n" +
-            "        return subprocess.CompletedProcess(['compact'], 4, '', " +
-            "'codex_mesh: compacted, but the roster changed during compaction (status=paused)\\n')\n" +
-            "    return real_call(dispatch, verb, *options, **kwargs)\n" +
-            "assign.Dispatch.mesh_call = mesh_call\n")
-        result = self.launch("implement", "--to", name,
-                             execution=launcher_fixture.LauncherScript(launcher_fixture.ASSIGN))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("roster changed during compaction", result.stderr)
-        self.assertIn("reopen --to " + name, result.stderr)
-        self.assertEqual([json.loads(line) for line in trace.read_text().splitlines()], ["compact"])
-        self.assertEqual(roster_path.read_bytes(), before)
-        self.assertEqual(self.turn_starts, turns_before)
-        self.assertFalse(list(self.session_dir.glob("impl_claim_*.json")))
-        board = (self.session_dir / "board.log").read_text()
-        self.assertIn("follow-up not sent", board)
-        self.assertNotIn("continuing follow-up", board)

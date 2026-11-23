@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.agents import remote
+
 import io
 import json
 import os
@@ -11,23 +13,25 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from collections.abc import Callable, Generator
 from pathlib import Path
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 from unittest import mock
-import rules
-import style_ledger
-from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-import style_plan
-import style_rules
-import declarations
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.style import rules
+from scripts.style.style_config import StyleUnitAssignment
+from scripts.style import style_ledger
+from scripts.style.approved_renames import AppliedCheck
+from scripts.style import style_rules
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+
+if TYPE_CHECKING:
+    from scripts.style import declarations
 
 
 STYLE_UNIT_NAMES = (
@@ -40,9 +44,30 @@ STYLE_UNIT_NAMES = (
 )
 
 
+DEFAULT_STYLE_ASSIGNMENTS = tuple(StyleUnitAssignment(family, (family,)) for family in (
+    cast(rules.Family, "names"), cast(rules.Family, "values"),
+    cast(rules.Family, "types"), cast(rules.Family, "modules"),
+))
+
+
+def write_style_units(document: Path, assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> None:
+    """Write the fixture's family assignments with the specified staff names."""
+    table = "\n## Style units\n\n| Unit | Families | Open tickets |\n| --- | --- | --- |\n"
+    table += "".join(f"| {row.unit} | {', '.join(row.families)} | {row.open_tickets} |\n" for row in assignments)
+    text = document.read_text()
+    section = re.search(r"(?m)^## Style units\s*$", text)
+    if section:
+        following = re.search(r"(?m)^#{1,2} ", text[section.end():])
+        end = section.end() + following.start() if following else len(text)
+        text = text[:section.start()] + table.lstrip("\n") + "\n" + text[end:]
+    else:
+        text += table
+    _ = document.write_text(text)
+
+
 def style_unit_id(name: str) -> str:
     """Return the native id supplied by the private style backend."""
-    return fixture_runtime_id("style-unit:" + name.removesuffix("-unit"))
+    return fixture_runtime_id("style:" + name)
 
 
 def ticket_owner_id(reference: str) -> str:
@@ -50,68 +75,48 @@ def ticket_owner_id(reference: str) -> str:
     record = staff.initial_snapshot()
     if record.by_id(staff.StaffId(reference)) is not None:
         return reference
-    rows = [row for row in record.find(kind="unit") if row.name == reference.removesuffix("-unit")]
+    rows = [row for row in record.find(kind="unit") if row.name == reference]
     if len(rows) == 1:
         return str(rows[0].id)
     return reference
 
 
+def add_saved_reservation_path(ledger: style_ledger.Ledger, ticket: str, path: str,
+                               role: style_ledger.ReservationRole) -> None:
+    """Add an overlap to a saved plan to test later checks."""
+    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+        _ = connection.execute("UPDATE ticket_reservations SET plan=json_insert(plan,'$.paths[#]',json(?)) WHERE ticket=?",
+                               (json.dumps([path, role]), ticket))
+
+
 @contextmanager
-def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
-    """Create private ticket owners for the copied repository."""
-    with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
-        owner = fixture_member("showrunner", name="sample-style")
-        members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
-            staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
-            for name in STYLE_UNIT_NAMES
-        ))
-        _ = staff.apply_seed(staff.SeedInput(tuple(members)))
-        document = repo / ".git/style-production.md"
-        document.parent.mkdir(exist_ok=True)
-        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
-        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+def legacy_overlapping_tickets() -> Generator[None]:
+    """Seed ticket combinations that an earlier ledger allowed."""
+    with mock.patch.object(style_ledger.Ledger, "_check_reservation_overlap"):
         yield
 
 
-MACHINE_RENAME_BEFORE = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\nfn impl_item_surface_reference(\n"
-                         "    item: &ImplItem,\n) -> bool { inspect(item) }\n")
-MACHINE_RENAME_AFTER = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\n"
-                        "fn impl_item_surface_reference(\n    item: &ImplItem,\n"
-                        ") -> SurfaceReferenceMatch { inspect(item) }\n")
-
-
-def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, repo: Path,
-                           proposal: Path, current: str = MACHINE_RENAME_AFTER,
-                           rule_text: str = TYPE_NAMED_PARAMETER_RULE
-                           ) -> tuple[style_ledger.HeldFinding, str]:
-    """The real return-type/owner-change shape, using normal judgment and filing records."""
-    def git(*arguments: str) -> str:
-        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
-                              text=True, check=True).stdout.strip()
-    _ = definition.path.write_text(rule_text)
-    definition = next(rule for rule in rules.load_rules(repo) if rule.rule_id == definition.rule_id)
-    path = repo / "src/lib.rs"
-    _ = path.write_text(MACHINE_RENAME_BEFORE)
-    _ = git("add", ".")
-    _ = git("commit", "-qm", "old judged parameter")
-    base = git("rev-parse", "HEAD")
-    ledger.set_tip(base)
-    ledger.ticket_add("13001", ticket_owner_id("machine-read"), "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
-    ledger.ticket_assign("13001", "main")
-    _ = ledger.ticket_base("13001")
-    finding = ledger.hold(definition.rule_id, "src/lib.rs", 4, MACHINE_RENAME_BEFORE.splitlines()[3],
-                          "rename", "item", "impl_item", definition.blob, "13001")
-    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="13001",
-                  input_scope=style_ledger.DeclaredInputScope.RULE)
-    _ = proposal.write_text("---\nunit: names-unit\nplan: /tmp/names.md\n---\nApproved rename\n")
-    ledger.file_held(finding.finding_id, proposal)
-    ledger.ticket_drop("13001")
-    _ = path.write_text(current)
-    _ = git("add", ".")
-    _ = git("commit", "-qm", "owner return type changed")
-    tip = git("rev-parse", "HEAD")
-    ledger.set_tip(tip)
-    return ledger.named_held((finding.finding_id,))[0], tip
+@contextmanager
+def style_staff_fixture(root: Path, repo: Path,
+                        assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> Generator[None]:
+    """Create private ticket owners for the copied repository."""
+    with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
+        owner = fixture_member("showrunner", name="sample-style")
+        members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
+            staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
+            for name in dict.fromkeys((*STYLE_UNIT_NAMES, *(row.unit for row in assignments)))
+        ))
+        record = staff.apply_seed(staff.SeedInput(tuple(members)))
+        for row in record.find(kind="unit", parent=owner.id):
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), root / ("unused-" + row.name)),
+                                  expected=row.worktree)
+        document = repo / ".git/style-production.md"
+        document.parent.mkdir(exist_ok=True)
+        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n" +
+                                f"- **Merge branch:** main\n- **Showrunner checkout:** {repo}\n")
+        write_style_units(document, assignments)
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
+        yield
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.
@@ -198,6 +203,7 @@ class LedgerTestCase(unittest.TestCase):
 
     template_repo: Path = Path()
     template_tip: str = ""
+    staff_seed: ClassVar[str] = ""
 
     @classmethod
     @override
@@ -208,6 +214,7 @@ class LedgerTestCase(unittest.TestCase):
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
         _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "maintenance.auto", "false")
         _ = fixture.git("config", "user.name", "Ledger tests")
         _ = fixture.git("config", "user.email", "ledger-tests@example.invalid")
         fixture.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\nresolver = "2"\n')
@@ -223,17 +230,29 @@ class LedgerTestCase(unittest.TestCase):
         fixture.write("crates/alpha/vendor/embedded.rs", "pub fn embedded() {}\n")
         fixture.write("README.md", "A sample workspace\n")
         cls.template_tip = fixture.commit("Create workspace")
+        with style_staff_fixture(cls.template_repo.parent, cls.template_repo):
+            cls.staff_seed = (cls.template_repo.parent / "staff.json").read_text(encoding="utf-8")
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(oracle_reader())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style" / "rust"
         _ = shutil.copytree(self.template_repo, self.repo, symlinks=True)
         self.rule_dir.mkdir(parents=True)
         self.initial_tip = self.template_tip
-        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+        record = cast(dict[str, object], json.loads(self.staff_seed))
+        for member in cast(list[dict[str, object]], record["rows"]):
+            for field in ("doc", "worktree"):
+                if field in member:
+                    location = cast(dict[str, str], member[field])
+                    relative = Path(location["path"]).relative_to(self.template_repo.parent)
+                    location["path"] = str(self.root / relative)
+        _ = (self.root / "staff.json").write_text(json.dumps(record), encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
@@ -267,8 +286,21 @@ class LedgerTestCase(unittest.TestCase):
 
     def cli_command(self, arguments: tuple[str, ...]) -> list[str]:
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
-        return [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
+        return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
+
+    def forget_tips(self) -> None:
+        """Drop the process tip cache, as a new ledger process starts with none."""
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_read_tip"])
+        cast(Callable[[], None], getattr(read_tip, "cache_clear"))()
+
+    @contextmanager
+    def tip_builds(self) -> Generator[mock.MagicMock]:
+        """Spy on each tip build. Drop the process tip cache first, so the spy sees each read."""
+        self.forget_tips()
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+            yield builds
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         # main owns and closes its ledger each call; only argparse's argv is process-global.
@@ -316,7 +348,7 @@ class LedgerTestCase(unittest.TestCase):
         return ledger
 
     def judgment_rows(self, database: Path) -> list[tuple[object, ...]]:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM judgments ORDER BY id").fetchall())
 
     def site_fixture(self, family: rules.Family = "names", *, rule_name: str = "site-rule",
@@ -473,7 +505,7 @@ class LedgerTestCase(unittest.TestCase):
             ledger.record_person_applied({finding_id: style_ledger.ReadByPerson("reader")})
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
 
-    def refill_result(self, database: Path, unit: str = "names-unit") -> tuple[str, str, str, int, int, int, int]:
+    def refill_result(self, database: Path, unit: str = "names") -> tuple[str, str, str, int, int, int, int]:
         with closing(sqlite3.connect(database)) as connection:
             return cast(tuple[str, str, str, int, int, int, int], connection.execute(
                 "SELECT at,outcome,split_at,ready,changed,structure,other FROM refill_results WHERE unit=?", (unit,),
@@ -595,6 +627,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def widen(self, *paths: str, ticket: str = "1", reason: str = "the move needs a new file",
               by: str = "showrunner") -> tuple[int, str]:
+        from scripts.style import style_plan
+
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
             result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
@@ -786,6 +820,8 @@ class LedgerTestCase(unittest.TestCase):
     def renamed_binding(self, ledger: style_ledger.Ledger, built_path: str, before: str, after: str) -> str:
         """A filed rename of the binding ws in fn old, a built rename of fn old at built_path, and a tip that renames
         only the fn. The step follows the finding to fn new."""
+        from scripts.style import declarations
+
         function = "pub fn old() {\n    let ws = 1;\n}\n"
         _ = self.commit_tip(ledger, {PARENT_FILE: function, MOVED_FILE: "pub fn caller() {\n    crate::a::old();\n}\n"})
         _, (finding_id,) = self.judge_parent(ledger, ((2, "let ws = 1;"),), before="ws", after="workspace")
@@ -800,6 +836,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_gone_from_file(self, ledger: style_ledger.Ledger, finding_id: str, approved: Callable[[Path], bool]) -> None:
         """The declaration step leaves the filed finding on struct Parent gone from its file and writes nothing."""
+        from scripts.style import declarations
+
         filed = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))[0]
         before = self.held_rows(ledger.database)
         left, = ledger.follow_declarations([finding_id], ledger.synced_commit(), approved).outcomes
@@ -831,6 +869,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_method_rename_built_in_place(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
         """The step builds the filed rename of Parent::old to Parent::new at fn new in impl Parent in a.rs."""
+        from scripts.style import declarations
+
         filed = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == finding_id)
         renamed, = self.follow_approved(ledger, [finding_id])
         self.assertEqual(renamed, style_ledger.DeclarationRenamed(
@@ -871,44 +911,6 @@ class LedgerTestCase(unittest.TestCase):
     def comment_only_change(self, relative: str) -> None:
         content = (self.repo / relative).read_text()
         self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
-
-    def record_while_stalled(self, stalled: str, write: Callable[[style_ledger.Ledger], object]) -> None:
-        """A second ledger records a verdict before write may leave style_ledger.<stalled>."""
-        original = cast(Callable[..., object], getattr(style_ledger, stalled))
-        started, release = threading.Event(), threading.Event()
-
-        def stall(*arguments: object) -> object:
-            if not started.is_set():
-                started.set()
-                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "stalled writer was not released")
-            return original(*arguments)
-
-        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.5))
-        rule = self.rule("concurrent")
-        recorder = self.ledger()
-        failures: list[BaseException] = []
-
-        def run() -> None:
-            # A connection serves only the thread that opened it.
-            try:
-                with style_ledger.open_ledger(self.repo) as writer:
-                    _ = write(writer)
-            except BaseException as error:
-                failures.append(error)
-
-        with mock.patch.object(style_ledger, stalled, side_effect=stall):
-            thread = threading.Thread(target=run)
-            thread.start()
-            try:
-                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS), "writer did not reach its stalled operation")
-                recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
-                                ticket="27001", worker="test-worker")
-            finally:
-                release.set()
-                thread.join(timeout=TEST_HANG_GUARD_SECS)
-            self.assertFalse(thread.is_alive(), "released writer did not finish")
-        self.assertEqual(failures, [])
-        self.assertEqual(self.states(rule)[self.sources[2]], "current")
 
     def judge_while_loading_rules(self, changes: int) -> tuple[style_ledger.Ledger, str, mock.MagicMock]:
         """A 1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""
@@ -963,7 +965,8 @@ class LedgerTestCase(unittest.TestCase):
         for source in (kept, path):
             self.record(rule, source, self.initial_tip, ticket="1")
         ledger.ticket_add("8001", ticket_owner_id("other-names"), "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("8001", "main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("8001", "main")
         _ = ledger.ticket_base("8001")
         original = (self.repo / path).read_text()
         (self.repo / path).unlink()
@@ -998,7 +1001,7 @@ class LedgerTestCase(unittest.TestCase):
         rule = self.rule(f"structure-{ticket}", "tier: D\nfamily: modules\n")
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add(ticket, ticket_owner_id("modules-unit"), "structure", "modules", "crates/alpha", [], [rule])
+        ledger.ticket_add(ticket, ticket_owner_id("modules"), "structure", "modules", "crates/alpha", [], [rule])
         ledger.ticket_assign(ticket, "main")
         self.record(rule, "crates/alpha", self.initial_tip, "waived", detail="accepted", ticket=ticket)
 
@@ -1012,7 +1015,8 @@ class LedgerTestCase(unittest.TestCase):
                 "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (ticket,)).fetchone())
 
     def yield_proposal(self, kept: tuple[str, str, str, str], freed: tuple[str, str, str, str],
-                       files: dict[str, str] | None = None) -> tuple[str, str, Path]:
+                       files: dict[str, str] | None = None, *,
+                       companions: tuple[tuple[str, str, str, str], ...] = ()) -> tuple[str, str, Path]:
         """Add an assigned proposal ticket 7001 with one finding at each (path, kind, before, after), at a tip
         that adds files; return the kept finding, the finding to yield and the decision."""
         rule = self.rule("decision")
@@ -1022,12 +1026,13 @@ class LedgerTestCase(unittest.TestCase):
         ledger = self.ledger()
         issue = self.root / "issues/decision.md"
         identities: list[str] = []
-        for line, (path, kind, before, after) in enumerate((kept, freed), 1):
+        for line, (path, kind, before, after) in enumerate((kept, freed, *companions), 1):
             finding = ledger.hold(rule, path, line, "change", cast(style_ledger.FindingKind, kind), before, after,
                                   self.blob(rule), "outside")
             ledger.file_held(finding.finding_id, issue)
             identities.append(finding.finding_id)
-        ledger.ticket_add("7001", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
+        paths = sorted({path for path, _, _, _ in (kept, freed, *companions)})
+        ledger.ticket_add("7001", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", paths,
                           [rule], proposal=str(issue), finding_ids=tuple(identities))
         ledger.ticket_assign("7001", "main")
         return identities[0], identities[1], issue

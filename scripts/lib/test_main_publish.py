@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
-from pathlib import Path
+import io
+from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
@@ -13,8 +16,20 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import main_publish
+from scripts.lib import land_main, main_publish, main_sync, waiting_rows
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+@contextmanager
+def pending_rows() -> Generator[list[waiting_rows.WaitingChange]]:
+    with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+        rows = list(pending.changes)
+        rows.extend(waiting_rows.WaitingChange(stem, key, save.value, "", publish_on_main=False, save_order=save.order)
+                    for stem, keys in pending.accepted.items() for key, save in keys.items()
+                    if isinstance(save, waiting_rows.AcceptedSave)
+                    and not any((row.stem, row.key) == (stem, key) for row in pending.changes))
+        yield rows
 
 
 @final
@@ -42,6 +57,7 @@ class PublicationRepository:
             **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
+            "XDG_STATE_HOME": str(root / "xdg"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
@@ -70,6 +86,12 @@ class PublicationRepository:
     def remote_tip(self) -> str:
         return self.git(self.origin, "rev-parse", "refs/heads/main")
 
+    def mac_pulls(self) -> int:
+        """Count the Mac pulls; a live write on the Mac also uses ssh."""
+        if not self.ssh_log.exists():
+            return 0
+        return self.ssh_log.read_text().count("git fetch -q --no-write-fetch-head")
+
     def change(self, value: str = "3") -> str:
         before = self.config.read_text()
         _ = self.config.write_text(before.replace("amount=2", f"amount={value}"))
@@ -89,8 +111,22 @@ class MainPublishTests(PublicationTestCase):
     def setUp(self) -> None:
         self.enterContext(mock.patch.dict(os.environ, self.repository.env, clear=True))
 
+    def test_publish_reports_only_completed_or_failed_hooks(self) -> None:
+        repo = self.repository
+        for hook, detail in (
+                (land_main.HookAbsent(), "origin has it"),
+                (land_main.HookSkipped(), "origin has it"),
+                (land_main.HookDone(), "origin has it; post-push hook: done"),
+                (land_main.HookFailed(9, "retry"), "origin has it; post-push hook: failed (exit 9); rerun: retry")):
+            with self.subTest(hook=hook), mock.patch.object(land_main, "land", return_value=land_main.Landed(
+                    repo.head(), "main", land_main.AlreadyLanded(), hook)):
+                self.assertEqual(main_publish.push(repo.checkout), (True, detail))
+
     def test_commit_and_push_publish_only_the_named_file_and_preserve_other_staged_work(self) -> None:
         repo = self.repository
+        hook = repo.checkout / ".claude/config/post_push.sh"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text('printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         before = repo.change()
         _ = (repo.checkout / "other.txt").write_text("unrelated staged work\n")
         _ = repo.git(repo.checkout, "add", "other.txt")
@@ -103,7 +139,40 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.git(repo.checkout, "diff", "--cached", "--name-only"), "other.txt")
         pushed, detail = main_publish.push(repo.checkout)
         self.assertTrue(pushed, detail)
+        self.assertIn("post-push hook: done", detail)
         self.assertEqual(repo.remote_tip(), repo.head())
+        expected_hooks = [repo.head()]
+        self.assertEqual((repo.checkout / ".git/hook-runs").read_text().splitlines(), expected_hooks)
+
+        for pusher in ("python", "shell"):
+            with self.subTest(pusher=pusher, holder="another process"):
+                row = repo.checkout / "publication-row.txt"
+                _ = row.write_text(pusher + "\n")
+                _ = repo.git(repo.checkout, "add", "publication-row.txt")
+                _ = repo.git(repo.checkout, "commit", "--only", "-m", "tune(example): publication row",
+                             "--", "publication-row.txt")
+                if pusher == "python":
+                    command = [sys.executable, "-c", "from pathlib import Path; from scripts.lib import main_publish; "
+                               + "ok, detail = main_publish.push(Path.cwd()); print(detail); raise SystemExit(0 if ok else 1)"]
+                else:
+                    command = ["bash", str(Path(__file__).resolve().parents[1] / "validate_and_push/push_direct.sh"),
+                               "--publish-only", repo.head()]
+                _ = publish_after_contender(self, repo.checkout, repo.origin, command, repo.env, cwd=repo.checkout)
+                self.assertEqual(repo.remote_tip(), repo.head())
+                expected_hooks.append(repo.head())
+                self.assertEqual((repo.checkout / ".git/hook-runs").read_text().splitlines(), expected_hooks)
+
+        for handoff in ("explicit", "plain"):
+            with self.subTest(pusher="shell entry", holder="the parent process", handoff=handoff):
+                child = subprocess.run(
+                    [sys.executable, "-c", "from pathlib import Path; import sys; "
+                     + "from scripts.lib.main_push_lock_test_support import child_lock_handoff; "
+                     + "raise SystemExit(child_lock_handoff(Path(sys.argv[1]), sys.argv[2]))",
+                     str(repo.checkout), handoff],
+                    cwd=Path(__file__).resolve().parents[2], env=repo.env,
+                    capture_output=True, text=True, check=False, timeout=min(TEST_HANG_GUARD_SECS, 15),
+                )
+                self.assertEqual(child.returncode, 23, child.stdout + child.stderr)
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository
@@ -130,6 +199,69 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.config.read_text(), before)
         self.assertEqual(repo.head(), head)
         self.assertEqual(repo.remote_tip(), head)
+
+    def test_failed_commit_restores_config_when_another_file_commit_moves_head(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        head = repo.head()
+        other = repo.checkout / "other.txt"
+        _ = other.write_text("concurrent zone change\n")
+        real_git = shutil.which("git")
+        assert real_git is not None
+        lock = repo.checkout / ".git/index.lock"
+        self.addCleanup(lock.unlink, missing_ok=True)
+        wrapper = repo.programs / "git"
+        _ = wrapper.write_text(
+            '#!/bin/sh\nset -e\nif [ "$3" = commit ]; then\n'
+            + f'  {shlex.quote(real_git)} -C "$2" commit -q --only '
+            + '-m "zone(UTC): concurrent change" -- other.txt\n'
+            + f'  touch {shlex.quote(str(lock))}\nfi\n'
+            + f'exec {shlex.quote(real_git)} "$@"\n',
+        )
+        wrapper.chmod(0o755)
+        errors = io.StringIO()
+
+        with redirect_stderr(errors), self.assertRaisesRegex(main_publish.Refusal, r"index\.lock.*unchanged"):
+            _ = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(repo.git(repo.checkout, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"),
+                         "other.txt")
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:other.txt"), "concurrent zone change")
+        self.assertEqual(repo.config.read_text(), before)
+        self.assertEqual(repo.git(repo.checkout, "diff", "HEAD", "--", str(repo.config)), "")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(repo.remote_tip(), head)
+
+    def test_rerere_failure_after_commit_keeps_the_new_file_and_allows_push(self) -> None:
+        repo = self.repository
+        before = repo.change()
+        changed = repo.config.read_text()
+        head = repo.head()
+        _ = repo.git(repo.checkout, "config", "rerere.enabled", "true")
+        lock = repo.checkout / ".git/MERGE_RR.lock"
+        lock.touch()
+        errors = io.StringIO()
+
+        with redirect_stderr(errors):
+            short_head = main_publish.commit(
+                repo.checkout, repo.config, "tune(example): amount 2 -> 3",
+                main_publish.ExistingFile(before), subject_prefix="tune(", unchanged="unchanged",
+            )
+
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(short_head, repo.git(repo.checkout, "rev-parse", "--short", "HEAD"))
+        self.assertEqual(repo.config.read_text(), changed)
+        self.assertEqual(repo.git(repo.checkout, "show", "HEAD:config/example.conf"), changed.strip())
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: git commit: fatal: Unable to create '{lock}': File exists.; the commit exists",
+        ])
+        pushed, detail = main_publish.push(repo.checkout)
+        self.assertTrue(pushed, detail)
+        self.assertEqual(repo.remote_tip(), repo.head())
 
     def test_push_publishes_mixed_tune_and_zone_commits_in_either_order(self) -> None:
         repo = self.repository
@@ -225,6 +357,40 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.head(), repo.remote_tip())
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "remote work\n")
 
+    def test_ready_refuses_a_target_computed_before_claude_sync_advances_head(self) -> None:
+        repo = self.repository
+        peer = self.other_writer()
+        _ = repo.git(peer, "commit", "--allow-empty", "-qm", "First peer commit")
+        stale = repo.git(peer, "rev-parse", "HEAD")
+        _ = repo.git(peer, "push", "-q", "origin", "main")
+        move_to = waiting_rows.move_to
+
+        def advance(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
+            self.assertEqual(target, stale)
+            _ = repo.git(peer, "commit", "--allow-empty", "-qm", "Second peer commit")
+            _ = repo.git(peer, "push", "-q", "origin", "main")
+            self.assertEqual(main_sync.sync(checkout).state, main_sync.ADVANCED)
+            move_to(checkout, target, fast_forward=fast_forward, expected_head=expected_head)
+
+        with mock.patch.object(waiting_rows, "move_to", advance):
+            with self.assertRaisesRegex(main_publish.Refusal, "HEAD changed while the publisher prepared the move"):
+                main_publish.ready(repo.checkout)
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertNotEqual(repo.head(), stale)
+
+    def test_ready_keeps_a_waiting_value_live_when_origin_changes_the_same_file(self) -> None:
+        repo = self.repository
+        clone = self.other_writer()
+        path = clone / "config/example.conf"
+        _ = path.write_text(path.read_text().replace("mode=fast", "mode=slow"))
+        _ = repo.git(clone, "commit", "-qam", "tune(example): mode fast -> slow")
+        _ = repo.git(clone, "push", "-q", "origin", "main")
+        _ = repo.change()
+        main_publish.ready(repo.checkout)
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertEqual(repo.config.read_text(), "# whole: 1..10\namount=3\n# one of: fast, slow\nmode=slow\n")
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "M config/example.conf")
+
     def other_writer(self) -> Path:
         repo = self.repository
         clone = repo.root / "other-writer"
@@ -256,10 +422,11 @@ class MainPublishTests(PublicationTestCase):
         _ = hook.write_text("#!/bin/sh\necho fixture-rejected >&2\nexit 1\n")
         hook.chmod(0o755)
         first = self.retry_tune()
-        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-        self.assertIn("not pushed", first.stdout)
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertIn("not pushed", first.stderr)
+        self.assertIn("amount=3 stays live", first.stderr)
         self.assertNotEqual(repo.head(), repo.remote_tip())
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         hook.unlink()
         return repo.git(repo.checkout, "log", "-1", "--format=%B")
 
@@ -279,7 +446,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("User-Approved: yes set 3", approval)
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "another writer's work\n")
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
         head = repo.head()
         again = self.retry_tune()
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
@@ -292,7 +459,9 @@ class MainPublishTests(PublicationTestCase):
         clone = self.other_writer()
         config = clone / "config/example.conf"
         _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
-        _ = repo.git(clone, "commit", "-qam", "approved value from another writer")
+        _ = shutil.copyfile(repo.checkout / waiting_rows.ORDER_PATH, clone / waiting_rows.ORDER_PATH)
+        _ = repo.git(clone, "add", "config/example.conf", waiting_rows.ORDER_PATH)
+        _ = repo.git(clone, "commit", "-qm", "approved value from another writer")
         advanced = self.advance_origin(clone)
         count = repo.git(repo.origin, "rev-list", "--count", "main")
 
@@ -303,7 +472,26 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual((repo.head(), repo.remote_tip()), (advanced, advanced))
         self.assertEqual(repo.git(repo.checkout, "rev-list", "--count", "HEAD"), count)
         self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
-        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
+
+    def test_same_value_retry_publishes_only_the_order_when_the_peer_commits_the_value(self) -> None:
+        repo = self.repository
+        _ = self.rejected_tune()
+        clone = self.other_writer()
+        config = clone / "config/example.conf"
+        _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
+        _ = repo.git(clone, "commit", "-qam", "approved value from another writer")
+        advanced = self.advance_origin(clone)
+
+        repeated = self.retry_tune()
+
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout, "already amount=3\n")
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertEqual(repo.git(repo.checkout, "rev-parse", "HEAD^"), advanced)
+        self.assertEqual(repo.git(repo.checkout, "diff", "--name-only", advanced, "HEAD"), waiting_rows.ORDER_PATH)
+        self.assertEqual(waiting_rows.published_orders(repo.checkout, "HEAD"), {"example": {"amount": 1}})
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
 
     def test_ready_rebases_tune_zone_and_installed_zone_commits_in_order(self) -> None:
         repo = self.repository
@@ -413,13 +601,37 @@ class MainPublishTests(PublicationTestCase):
         self.assertIsInstance(main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh)), main_publish.MacPulled)
         arguments = repo.ssh_log.read_text()
         self.assertIn("mac\n", arguments)
-        self.assertIn(f"git pull -q --ff-only natedev:{shlex.quote(str(repo.checkout))} main", arguments)
+        self.assertIn(f"tip=$(git ls-remote natedev:{shlex.quote(str(repo.checkout))} refs/heads/main | cut -f1)", arguments)
+        self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{shlex.quote(str(repo.checkout))} main", arguments)
+        self.assertIn('git merge -q --ff-only "$tip"', arguments)
         _ = (repo.root / "OFFLINE").write_text("")
         outcome = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh))
         self.assertIsInstance(outcome, main_publish.MacPullFailed)
         if not isinstance(outcome, main_publish.MacPullFailed):
             self.fail("an asleep Mac did not return a failure reason")
         self.assertIn("Mac asleep", outcome.reason)
+
+        mac = repo.root / "Mac checkout"
+        _ = repo.git(repo.root, "clone", "-q", str(repo.checkout), str(mac))
+        fetch_head = mac / ".git/FETCH_HEAD"
+        previous_tip = repo.head()
+        fetch_text = f"{previous_tip}\t\tfirst fetch\n{previous_tip}\t\tsecond fetch\n"
+        _ = fetch_head.write_text(fetch_text)
+        refs = repo.git(mac, "show-ref")
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "advance main")
+        _ = (repo.root / "OFFLINE").unlink()
+        _ = repo.ssh.write_text('#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n')
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
+                                          "GIT_CONFIG_VALUE_0": "natedev:"}):
+            for attempt in ("first pull", "repeat pull"):
+                with self.subTest(attempt=attempt):
+                    pulled = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh), mac=PurePosixPath(str(mac)))
+                    self.assertIsInstance(pulled, main_publish.MacPulled)
+                    self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), repo.head())
+                    self.assertEqual(fetch_head.read_text(), fetch_text)
+                    self.assertEqual(repo.git(mac, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"),
+                                     "\n".join(line for line in refs.splitlines() if " refs/remotes/" in line))
 
     def test_remote_git_failure_returns_a_named_failure_after_a_successful_ssh_connection(self) -> None:
         repo = self.repository
@@ -455,7 +667,7 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(main_publish.queue_path(), queue_path)
         self.assertEqual(main_publish.read_queue(), change)
         result = subprocess.run(
-            [sys.executable, "-c", "from scripts.lib import main_publish; "
+            [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", "from scripts.lib import main_publish; "
              + "value = main_publish.read_queue(); print(value)"],
             cwd=Path(__file__).resolve().parents[2], env=repo.env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
@@ -464,6 +676,22 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("example.amount=3", result.stdout)
         self.assertIn("approved change", result.stdout)
         self.assertIn("Mac asleep", result.stdout)
+        with self.subTest(queue="zone notice"):
+            main_publish.queue_pull_only("example.amount", "still asleep")
+            waiting = main_publish.PendingMacPull(change.label, change.text, change.since, "still asleep")
+            self.assertEqual(main_publish.read_queue(), waiting)
+            main_publish.clear_pull_only()
+            waiting = main_publish.PendingMacPull(waiting.label, waiting.text, waiting.since, waiting.reason, ())
+            self.assertEqual(main_publish.read_queue(), waiting)
+        with self.subTest(queue="pull only"):
+            queue_path.unlink()
+            main_publish.queue_pull_only("example.amount", "Mac asleep")
+            pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual((pending.label, pending.text, pending.reason), ("example.amount", "", "Mac asleep"))
+            main_publish.clear_pull_only()
+            self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
 
 if __name__ == "__main__":

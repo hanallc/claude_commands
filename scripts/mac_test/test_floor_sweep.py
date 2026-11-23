@@ -8,22 +8,35 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
-from typing import TYPE_CHECKING, TextIO, cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import offload
-import conf
-import sweep
-from offload_test_support import OffloadCommandFixture
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import config_environment, write_config_fixture
-else:
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import eligibility, offload
+from scripts.lib import conf
+from scripts.lint import sweep
+from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+
+class MacDiskFloorTests(unittest.TestCase):
+    def test_free_space_above_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(120, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(120))
+
+    def test_free_space_equal_to_the_floor(self) -> None:
+        result = offload.check_mac_disk_floor(offload.ProbeSnapshot(100, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskReady(100))
+
+    def test_free_space_below_the_floor_starts_no_sweep_or_command(self) -> None:
+        with (mock.patch.object(offload, "ensure_mac_disk_floor") as sweep_floor,
+              mock.patch.object(subprocess, "Popen") as command):
+            result = offload.check_mac_disk_floor(offload.ProbeSnapshot(99, "fake-mac"), 100)
+        self.assertEqual(result, offload.MacDiskShort(99, 100))
+        sweep_floor.assert_not_called()
+        command.assert_not_called()
 
 
 class FloorSweepTests(unittest.TestCase):
@@ -32,7 +45,7 @@ class FloorSweepTests(unittest.TestCase):
         self.root: Path = Path()
         self.settings: Path = Path()
         self.controller: offload.ProcessController = offload.ProcessController()
-        self.repository: offload.KnownRepository = offload.KnownRepository("hana")
+        self.repository: eligibility.KnownRepository = eligibility.KnownRepository("hana")
         self.before: offload.ProbeSnapshot = offload.ProbeSnapshot(50, "fake-mac")
 
     @override
@@ -42,13 +55,14 @@ class FloorSweepTests(unittest.TestCase):
             **config_environment(self.root), "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
         self.settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(self.settings, "free_floor_gib=100\nfloor_sweep_timeout_s=9\n")
+        _ = write_config_fixture(self.settings, "host=mac\nfree_floor_gib=100\nfloor_sweep_timeout_s=9\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
         self.controller = offload.ProcessController()
-        self.repository = offload.KnownRepository("hana")
+        self.repository = eligibility.KnownRepository("hana")
         self.before = offload.ProbeSnapshot(50, "fake-mac")
 
     def sweep(self) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
-        return offload.ensure_mac_disk_floor(self.controller, offload.read_config(self.settings), self.repository, self.before)
+        return offload.ensure_mac_disk_floor(self.controller, eligibility.read_config(self.settings), self.repository, self.before)
 
     def test_two_callers_share_one_sweep_and_both_read_after_it(self) -> None:
         entered = threading.Event()
@@ -88,7 +102,7 @@ class FloorSweepTests(unittest.TestCase):
         self.assertEqual(probe.call_count, 2)
 
     def test_sweep_uses_live_timeout_and_holds_no_claim_lock(self) -> None:
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         _ = write_config_fixture(self.settings, "floor_sweep_timeout_s=3\n")
         state = self.root / "state"
         state.mkdir()
@@ -142,7 +156,7 @@ class FloorSweepTests(unittest.TestCase):
                     _ = sweep.mac_floor_settings(conf.read(self.settings))
 
     def test_selector_rejects_its_assignment_text_and_near_miss_paths(self) -> None:
-        configured = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root")
+        configured = "~/.fixture-mirrors"
         for root in (configured, "~/fixture-mirrors"):
             _ = write_config_fixture(self.settings, f"mirror_root={root}\n")
             relative = root.removeprefix("~/")
@@ -150,7 +164,7 @@ class FloorSweepTests(unittest.TestCase):
             for scope in (offload.ALL_MIRRORS, self.repository):
                 with self.subTest(root=root, scope=type(scope).__name__):
                     script = offload.mirror_selector_script(scope)
-                    suffix = "/hana" if isinstance(scope, offload.KnownRepository) else ""
+                    suffix = "/hana" if isinstance(scope, eligibility.KnownRepository) else ""
                     candidates = (script, f"cargo /Users/test/{near}{suffix}/Cargo.toml")
                     # Use the generated selector with the same regular expression engine as pgrep.
                     commands = r'''
@@ -219,7 +233,8 @@ select_leftovers
             if needle in path.read_text():
                 found.append(str(path.relative_to(repository)))
         self.assertEqual(found, [])
-        configured = conf.read(repository / "config/mac_test.conf").text("mirror_root")
+        _ = write_config_fixture(self.settings, f"mirror_root=~/{needle}\n")
+        configured = conf.read(self.settings).text("mirror_root")
         self.assertEqual(configured, "~/" + needle)
         root = "~/fixture-mirrors"
         _ = write_config_fixture(self.settings,

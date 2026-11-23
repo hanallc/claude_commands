@@ -2,51 +2,104 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import chdir, closing, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, tzinfo
+from decimal import Decimal
 import io
+import json
 import os
 from pathlib import Path
 import re
+import select
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, Self, override
+from threading import Event
+import time
+from typing import TYPE_CHECKING, BinaryIO, Self, cast, override
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import conf, file_lock
+from scripts.aws_target import ledger
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
-    from ..buildlog import parse, record, repository, store
-    from ..buildlog.index import index_path_in
-    from ..buildlog.test_index import call, configure_cleanup, encode, step
-    from ..lib.rerun_test_support import initialize_repository
-    from ..lint.memory_test_support import write_config_fixture
-    from ..production.gate_modules import discover_test_modules
-    from . import gate_record, show
-    from .gate_record import GateRun, ModuleRun, TestTime
-    from .gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.buildlog import parse, record, repository, store
+    from scripts.buildlog.index import index_path_in
+    from scripts.buildlog.test_index import call, configure_cleanup, encode, step
+    from scripts.lib.rerun_test_support import initialize_repository
+    from scripts.lint.memory_test_support import write_config_fixture
+    from scripts.production.gate_modules import discover_test_modules
+    from scripts.test_times import gate_record, show
+    from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 else:
-    # Import show first because it adds the build log folder to the import path.
     from scripts.test_times import gate_record, show
     from scripts.buildlog import parse, record, repository, store
-    from index import index_path_in
-    from test_index import call, configure_cleanup, encode, step
+    from scripts.buildlog.index import index_path_in
+    from scripts.buildlog.test_index import call, configure_cleanup, encode, step
     from scripts.lib.rerun_test_support import initialize_repository
     from scripts.lint.memory_test_support import write_config_fixture
     from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import GateRun, ModuleRun, TestTime
-    from scripts.test_times.gate_record_test_support import gate_run, remove_run_measurements
+    from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, remove_run_measurements
 
 EPOCH = datetime(2026, 11, 3, 14, 30, tzinfo=UTC).timestamp()
 HOST = store.host_name()
+REPORT_PRINT_WAIT_SECS = 60
 REPORT_COMMANDS = (("top",), ("suites",), ("suite", "tools"),
                    ("module", "tools/test_alpha.py"), ("test", "target"))
+
+REPORT_PROCESS = """\
+import os
+from pathlib import Path
+import runpy
+import socket
+import sys
+report = runpy.run_path(str(Path(sys.argv[1]) / 'scripts/test_times/show.py'))
+main = report['main']
+main.__globals__['TOOL_REPOSITORY'] = Path(sys.argv[2])
+report_datetime = report['datetime']
+class ReportTime(report_datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fromtimestamp(float(os.environ['TEST_REPORT_EPOCH']), tz)
+main.__globals__['datetime'] = ReportTime
+index = report['index']
+if sys.argv[3]:
+    table = sys.argv[3]
+    columns, key, description = index.TABLES[table]
+    index.TABLES[table] = (columns + [('fixture_column', 'TEXT', 'fixture column')], key, description)
+event = socket.socket(fileno=int(sys.argv[4]))
+parent = os.getpid()
+update = index.update
+if os.environ.get('TEST_LOCKED_INDEX'):
+    from contextlib import contextmanager
+    update_lock = index.update_lock_in
+    @contextmanager
+    def report_update_lock(root):
+        if os.getpid() == parent:
+            event.sendall(b'U')
+        with update_lock(root):
+            yield
+    index.update_lock_in = report_update_lock
+def refresh():
+    if os.getpid() != parent:
+        event.sendall(b'S')
+        event.recv(1)
+    return update()
+index.update = refresh
+status = main(sys.argv[5:])
+os.close(1)
+os.close(2)
+os.waitpid(-1, 0)
+os._exit(status)
+"""
 
 
 class ReportTime(datetime):
@@ -57,11 +110,46 @@ class ReportTime(datetime):
 
 
 def run(*arguments: str) -> tuple[int, str, str]:
+    # These report assertions use a complete snapshot. Process tests cover refreshes.
+    _ = show.index.update()
+    return report_without_update(*arguments)
+
+
+def report_without_update(*arguments: str) -> tuple[int, str, str]:
     output = io.StringIO()
     errors = io.StringIO()
-    with redirect_stdout(output), redirect_stderr(errors):
+    with redirect_stdout(output), redirect_stderr(errors), mock.patch.object(show, "refresh_after_report"):
         status = show.main(list(arguments))
     return status, output.getvalue(), errors.getvalue()
+
+
+def write_trend_ledger(directory: Path, reservations: Sequence[ledger.GateReservation]) -> None:
+    book = ledger.CostLedger(directory)
+    book.record_inventory(ledger.ResourceInventory(int(EPOCH),
+        (ledger.PricedResource("storage", Decimal(0)),), "fixture inventory"))
+    document = cast(dict[str, object], json.loads(book.path.read_text()))
+    document["gate_reservations"] = [
+        {"attempt": row.attempt, "at": row.at, "expires": row.expires,
+         "usd_per_hour": str(row.usd_per_hour), "allowance_usd": str(row.allowance_usd),
+         "applied_usd_per_hour": str(row.rate.usd_per_hour), "rate_source": row.rate.source,
+         "instance_type": row.instance_type,
+         "state": {"kind": "terminated", "at": row.state.at, "instance_id": row.state.instance_id},
+         **({"booked_allowance": {"usd": str(row.booked_allowance.usd), "source": row.booked_allowance.source}}
+            if isinstance(row.booked_allowance, ledger.GateAllowance) else {})}
+        for row in reservations if isinstance(row.state, ledger.GateTerminated)]
+    _ = book.path.write_text(json.dumps(document))
+
+
+def trend_tables(output: str) -> dict[str, list[list[str]]]:
+    tables: dict[str, list[list[str]]] = {}
+    heading = ""
+    for line in output.splitlines():
+        if line.endswith((" merge gates", " targeted tests")):
+            heading = line
+            tables[heading] = []
+        elif not re.fullmatch(r"\d+ of \d+ runs have no cost record\.", line):
+            tables[heading].append(re.split(r"  +", line.strip()))
+    return tables
 
 
 def module_run(module: str, wall_s: float, *, suite: str = "tools", attempt: int = 1,
@@ -72,6 +160,7 @@ def module_run(module: str, wall_s: float, *, suite: str = "tools", attempt: int
         "wall_s": wall_s, "cpu_s": wall_s / 2, "peak_mib": 12.0, "status": status,
         "tests_run": 0 if missing else 13, "failures": int(status != 0), "errors": 0, "skipped": 0,
         "tests_s": 0.0 if missing else wall_s / 4, "tests": list(tests), "restart": restart, "times_missing": missing,
+        "log": "",
     }
 
 
@@ -99,9 +188,12 @@ class TestTimesTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.log), "CONF_DIR": str(self.config),
             "HOME": str(self.root / "home"), "USER_ZONE": "America/New_York",
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "targets"),
         }))
         _ = configure_cleanup(self, self.log)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7")
+        _ = write_config_fixture(self.config / "test_times.conf",
+                                 "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7\nNEXTEST_SLOW_TEST_S=1.0\n"
+                                 + "TREND_SETTLE_MINUTES=45\n")
         _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
@@ -152,12 +244,288 @@ class TestTimesTests(unittest.TestCase):
         }
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
-            gate_record.write_gate_run(run)
+            gate_record.write_gate_run(run, fixture_executions(run))
 
     def report(self, *arguments: str) -> str:
         status, output, errors = run(*arguments)
         self.assertEqual(status, 0, output + errors)
         return output
+
+    @contextmanager
+    def report_process(self, changed_table: str = "", *arguments: str,
+                       wait_for_refresh: bool = True) -> Generator[tuple[subprocess.Popen[bytes], socket.socket]]:
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        process = subprocess.Popen(
+            [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", REPORT_PROCESS, str(Path(__file__).resolve().parents[2]),
+             str(self.repo), changed_table, str(child_event.fileno()),
+             *(arguments or ("top", "--repo", str(self.repo)))],
+            cwd=self.root, env={**os.environ, "TEST_REPORT_EPOCH": str(EPOCH + 300)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(child_event.fileno(),),
+        )
+        child_event.close()
+        try:
+            if wait_for_refresh:
+                self.assertEqual(event.recv(1), b"S")
+            yield process, event
+        finally:
+            try:
+                event.sendall(b"F")
+            except BrokenPipeError:
+                pass
+            event.close()
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0)
+
+    def report_pipe(self, pipe: BinaryIO) -> str:
+        chunks: list[bytes] = []
+        while True:
+            ready, _, _ = select.select([pipe], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ready, "The report pipe stayed open during the refresh")
+            chunk = os.read(pipe.fileno(), 65536)
+            if not chunk:
+                return b"".join(chunks).decode()
+            chunks.append(chunk)
+
+    def test_first_report_closes_its_pipe_before_refresh_and_later_report_has_new_rows(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(EPOCH),)).close()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process() as (process, event):
+            first = self.report_pipe(cast(BinaryIO, process.stdout))
+            errors = self.report_pipe(cast(BinaryIO, process.stderr))
+            self.assertIn("tools/test_alpha.py", first)
+            self.assertNotIn("tools/test_beta.py", first.split("unmeasured:")[0])
+            self.assertEqual(errors, "rows as of 09:30 EST\n")
+            self.assertIsNone(process.poll(), "The supervisor must still wait for its refresh child")
+            event.sendall(b"F")
+        with self.report_process() as (process, event):
+            later = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", later.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_reads_complete_rows_during_a_refresh_larger_than_five_mib(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        program = """
+import socket
+import sys
+from scripts.buildlog import index
+with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
+    connection = index.open_for_update(index.index_path())
+    try:
+        connection.execute("BEGIN IMMEDIATE").close()
+        connection.execute("UPDATE gate_modules SET times_missing=?", ("x" * (6 * 1024 * 1024),)).close()
+        event.sendall(b"W")
+        event.recv(1)
+        connection.execute("ROLLBACK").close()
+    finally:
+        connection.close()
+"""
+        event, child_event = socket.socketpair()
+        with event, child_event:
+            event.settimeout(TEST_HANG_GUARD_SECS)
+            writer = subprocess.Popen(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
+                 str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(event.recv(1), b"W")
+                with self.report_process(wait_for_refresh=False) as (process, refresh):
+                    try:
+                        ready, _, _ = select.select([cast(BinaryIO, process.stdout)], [], [], REPORT_PRINT_WAIT_SECS)
+                        self.assertTrue(ready, "The list must print while the refresh holds its changed rows")
+                        output = self.report_pipe(cast(BinaryIO, process.stdout))
+                        self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])
+                        self.assertEqual(refresh.recv(1), b"S")
+                    finally:
+                        event.sendall(b"F")
+                        output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(writer.returncode, 0, output + errors)
+            finally:
+                if writer.poll() is None:
+                    writer.terminate()
+                    _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_report_reads_an_older_index_while_a_non_gate_schema_builds(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("steps") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_alpha.py", output)
+            self.assertNotIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_keeps_index_only_rows_after_an_exclusive_lock_exceeds_the_read_wait(self) -> None:
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05")
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as connection, connection:
+            connection.execute("UPDATE gate_modules SET module='test_beta.py'").close()
+        program = """
+import socket
+import sys
+from scripts.buildlog import index
+with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
+    connection = index.open_for_update(index.index_path())
+    try:
+        connection.execute("PRAGMA locking_mode = EXCLUSIVE").close()
+        connection.execute("BEGIN EXCLUSIVE").close()
+        event.sendall(b'W')
+        event.recv(1)
+        connection.execute("COMMIT").close()
+    finally:
+        connection.close()
+"""
+        event, child_event = socket.socketpair()
+        with event, child_event:
+            event.settimeout(TEST_HANG_GUARD_SECS)
+            writer = subprocess.Popen(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program, str(Path(__file__).resolve().parents[2]),
+                 str(child_event.fileno())], env=dict(os.environ), pass_fds=(child_event.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(event.recv(1), b"W")
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
+                with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
+                        self.report_process(wait_for_refresh=False) as (process, refresh):
+                    try:
+                        self.assertEqual(refresh.recv(1), b"U")
+                    finally:
+                        event.sendall(b"F")
+                        output, errors = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(writer.returncode, 0, output + errors)
+                    output = self.report_pipe(cast(BinaryIO, process.stdout))
+                    self.assertIn("tools/test_beta.py", output.split("unmeasured:")[0])
+                    self.assertEqual(refresh.recv(1), b"S")
+                with closing(show.index.read_only()) as reader:
+                    self.assertEqual(reader.execute("SELECT module FROM gate_modules").fetchall(),
+                                     [("test_beta.py",)])
+            finally:
+                if writer.poll() is None:
+                    writer.terminate()
+                    _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_report_waits_for_an_exclusive_lock_taken_after_index_selection(self) -> None:
+        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01")
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        select_index = show.index.complete_gate_index_in
+        selected = Event()
+        locked = Event()
+        reader_checked = Event()
+
+        def hold_lock_after_selection() -> None:
+            self.assertTrue(selected.wait(TEST_HANG_GUARD_SECS))
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("PRAGMA locking_mode = EXCLUSIVE").close()
+                writer.execute("BEGIN EXCLUSIVE").close()
+                locked.set()
+                self.assertTrue(reader_checked.wait(TEST_HANG_GUARD_SECS))
+                # Hold the lock longer than the selection timeout.
+                time.sleep(0.2)
+                writer.execute("COMMIT").close()
+
+        def select_before_writer(root: Path) -> Path | show.index.NoCompleteGateIndex:
+            path = select_index(root)
+            selected.set()
+            self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
+            try:
+                with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
+                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                        reader.execute("SELECT COUNT(*) FROM gate_modules").close()
+            finally:
+                reader_checked.set()
+            return path
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            writer = pool.submit(hold_lock_after_selection)
+            try:
+                with mock.patch.object(show.index, "complete_gate_index_in", select_before_writer):
+                    status, output, errors = report_without_update("top")
+            finally:
+                selected.set()
+                reader_checked.set()
+                writer.result(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(status, 0, errors)
+        self.assertIn("tools/test_alpha.py", output.split("unmeasured:")[0])
+
+    def test_report_builds_before_reading_when_gate_sql_changes(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        self.write_run([module_run("test_beta.py", 9.0)], epoch=EPOCH + 60)
+        with self.report_process("gate_runs") as (process, event):
+            output = self.report_pipe(cast(BinaryIO, process.stdout))
+            self.assertIn("tools/test_beta.py", output.split("unmeasured:")[0])
+            event.sendall(b"F")
+
+    def test_report_keeps_its_rows_and_timestamp_from_the_same_update(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            _ = show.index.update()
+        self.write_run([module_run("test_alpha.py", 9.0)], epoch=EPOCH + 60)
+        report_module = show.module
+        committing = Event()
+        open_writer = show.index.open_for_update
+
+        def writer_with_commit_signal(path: Path) -> sqlite3.Connection:
+            writer = open_writer(path)
+            def trace(statement: str) -> None:
+                if statement == "COMMIT":
+                    committing.set()
+            writer.set_trace_callback(trace)
+            return writer
+
+        def publish_after_rows(connection: sqlite3.Connection, host: str, subject: str, runs: int) -> None:
+            report_module(connection, host, subject, runs)
+            _ = pool.submit(show.index.update)
+            self.assertTrue(committing.wait(TEST_HANG_GUARD_SECS))
+
+        with ThreadPoolExecutor(max_workers=1) as pool, \
+                mock.patch.object(time, "time", return_value=EPOCH + 60), \
+                mock.patch.object(show.index, "open_for_update", writer_with_commit_signal), \
+                mock.patch.object(show, "module", publish_after_rows):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertNotIn("11-03 09:31", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+        with closing(show.index.read_only()) as reader:
+            self.assertEqual(reader.execute("SELECT count(*) FROM gate_runs").fetchone(), (2,))
+            self.assertEqual(reader.execute("SELECT value FROM meta WHERE key='updated_at'").fetchone(),
+                             (str(EPOCH + 60),))
+
+    def test_report_replaces_an_invalid_current_completion_time(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+            writer.execute("UPDATE meta SET value='invalid' WHERE key='updated_at'").close()
+        with mock.patch.object(time, "time", return_value=EPOCH):
+            status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertIn("11-03 09:30", output)
+        self.assertEqual(errors, "rows as of 09:30 EST\n")
+
+    def test_freshness_line_dates_updates_from_another_local_day(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8.0)])
+        _ = show.index.update()
+        for completed, expected in ((EPOCH, "09:30 EST"), (EPOCH - 86400, "11-02 09:30 EST")):
+            with self.subTest(completed=completed):
+                with closing(sqlite3.connect(index_path_in(self.log))) as writer, writer:
+                    writer.execute("UPDATE meta SET value=? WHERE key='updated_at'", (str(completed),)).close()
+                status, output, errors = report_without_update("module", "tools/test_alpha.py")
+                self.assertEqual(status, 0, errors)
+                self.assertIn("11-03 09:30", output)
+                self.assertEqual(errors, f"rows as of {expected}\n")
 
     def line(self, output: str, subject: str) -> str:
         lines = [line for line in output.splitlines() if subject in line]
@@ -173,9 +541,13 @@ class TestTimesTests(unittest.TestCase):
         else:
             self.fail(f"The report has no {header} column: {output}")
         index = names.index(header)
-        start = headings[index].start()
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(row)
-        return row[start:end].strip()
+        # Use both lines because a number can be wider than its header.
+        width = max(len(line), len(row))
+        layout = "".join(label if label != " " else value
+                         for label, value in zip(line.ljust(width), row.ljust(width), strict=True))
+        cells = list(re.finditer(r"\S.*?(?= {2,}|$)", layout))
+        self.assertEqual(len(cells), len(names), output)
+        return row[cells[index].start():cells[index].end()].strip()
 
     def test_every_gate_discovered_timing_module_loads_tests(self) -> None:
         repo = Path(__file__).resolve().parents[2]
@@ -190,16 +562,31 @@ class TestTimesTests(unittest.TestCase):
 
     def test_top_ranks_live_local_modules_by_the_first_completed_attempt_and_recent_median(self) -> None:
         for offset, wall in enumerate((100.0, 8.0, 4.0)):
-            self.write_run([module_run("test_alpha.py", wall)], epoch=EPOCH + offset * 60)
+            self.write_run([module_run("test_alpha.py", wall), type_job(wall + 10)], epoch=EPOCH + offset * 60)
         slow: TestTime = {"test": "Alpha.test_slow", "s": 1.25, "status": "pass"}
         types = type_job(3.0)
+        beta_run = module_run("test_beta.py", 1.0)
+        beta_run["cpu_s"] = 3.5
         self.write_run([
             module_run("test_alpha.py", 1000.0, restart="hold", status=-15),
             module_run("test_alpha.py", 2.0, attempt=2, tests=[slow]),
             module_run("test_alpha.py", 0.01, attempt=3),
-            module_run("test_beta.py", 7.0), module_run("test_removed.py", 999.0), types,
+            beta_run, module_run("test_removed.py", 999.0), types,
         ], epoch=EPOCH + 180)
-        self.write_run([module_run("test_alpha.py", 9999.0)], host="other-host", epoch=EPOCH + 240)
+        self.write_run([module_run("test_alpha.py", 9999.0), type_job(9999.0)],
+                       host="other-host", epoch=EPOCH + 240)
+        failed_type = type_job(900.0)
+        failed_type["status"] = 1
+        restarted_type = type_job(800.0)
+        restarted_type["restart"] = "hold"
+        for type_run, epoch, aborted, checkout in (
+            (failed_type, EPOCH + 240, False, str(self.repo)),
+            (restarted_type, EPOCH + 240, False, str(self.repo)),
+            (type_job(700.0), EPOCH + 240, True, str(self.repo)),
+            (type_job(600.0), EPOCH + 300 - 7 * 86400 - 1, False, str(self.repo)),
+            (type_job(500.0), EPOCH + 240, False, str(self.root / "other")),
+        ):
+            self.write_run([type_run], epoch=epoch, aborted=aborted, checkout=checkout)
 
         output = self.report("top", "--repo", str(self.repo))
         beta = self.line(output, "tools/test_beta.py")
@@ -207,19 +594,24 @@ class TestTimesTests(unittest.TestCase):
         type_line = self.line(output, "types/basedpyright")
         self.assertLess(output.index(beta), output.index(alpha))
         self.assertLess(output.index(alpha), output.index(type_line))
+        self.assertEqual(type_line, "types/basedpyright runs nightly, so it is not ranked: last run 1.500 CPU s, 3.000 s")
+        self.assertNotRegex(output, r"(?m)^\s*\d+\s+types/basedpyright\b")
         self.assertNotIn("test_removed.py", output)
         self.assertNotIn("9999", output)
         self.assertIn("Alpha.test_slow", alpha)
         numbers = [float(match.group()) for match in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", alpha)]
-        self.assertEqual(numbers, [2, 4, 2, 2, 13, 1.25, 3], alpha)
-        self.assertRegex(self.line(output, "sum of medians"), r"3 modules; sum of medians 14(?:\.0+)? s")
+        self.assertEqual(numbers, [2, 2, 4, 2, 13, 1.25, 3], alpha)
+        self.assertRegex(self.line(output, "sum of median CPU"), r"2 modules; sum of median CPU 5\.5(?:0+)? s")
+        self.assertLess(output.index("sum of median CPU"), output.index(type_line))
+        self.assertLess(output.index(type_line), output.index("unmeasured:"))
         self.assertEqual(self.report(), output)
         limited = self.report("top", "--limit", "1", "--repo", str(self.repo))
         self.assertIn("tools/test_beta.py", limited)
         self.assertNotIn("tools/test_alpha.py", limited)
+        self.assertIn(type_line, limited)
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         changed = self.report("top", "--repo", str(self.repo))
-        self.assertLess(changed.index("types/basedpyright"), changed.index("tools/test_alpha.py"))
+        self.assertLess(changed.index("tools/test_alpha.py"), changed.index("types/basedpyright"))
 
     def test_top_ranks_only_the_working_repository_on_the_current_host_within_the_age_limit(self) -> None:
         hana = self.repository("hana")
@@ -367,6 +759,23 @@ class TestTimesTests(unittest.TestCase):
                                  ("median CPU s", "2.000"), ("runs counted", "1")):
             self.assertEqual(self.cell(output, alpha, header), expected, output)
 
+    def test_top_aws_host_ranks_every_aws_gate_host_from_the_aws_checkout(self) -> None:
+        gate = self.root / "gate-trial"
+        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={gate}")
+        self.write_run([module_run("test_alpha.py", 4.0)], host="ip-10-0-0-1.us-east-2.compute.internal",
+                       checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 8.0)], host="ip-10-0-0-2.us-east-2.compute.internal",
+                       epoch=EPOCH + 60, checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 900.0)], host="ip-10-0-0-3.us-east-2.compute.internal",
+                       epoch=EPOCH + 120)
+        # A gate host runs this test, so the run off the AWS hosts names its host.
+        self.write_run([module_run("test_alpha.py", 700.0)], host="natedev", epoch=EPOCH + 180, checkout=str(gate))
+        output = self.report("top", "--host", "aws", "--repo", str(self.repo))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "median s"), "6.000", output)
+        self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
+        self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
+
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
@@ -396,10 +805,16 @@ class TestTimesTests(unittest.TestCase):
         self.write_run([module_run("test_alpha.py", 4.0), module_run("test_beta.py", 6.0),
                         module_run("nested/test_deep.py", 10.0, status=1)])
         output = self.report("top", "--limit", "1", "--repo", str(self.repo))
+        self.assertNotIn("types/basedpyright", output)
         self.assertEqual(self.line(output, "unmeasured:"),
                          "unmeasured: 2 live modules: tools/nested/test_deep.py, tools/test_missing.py")
-        self.write_run([module_run("nested/test_deep.py", 3.0), module_run("test_missing.py", 2.0)])
-        self.assertNotIn("unmeasured:", self.report("top", "--limit", "1", "--repo", str(self.repo)))
+        self.write_run([module_run("nested/test_deep.py", 3.0), module_run("test_missing.py", 2.0), type_job(100.0)])
+        measured = self.report("top", "--limit", "1", "--repo", str(self.repo))
+        self.assertNotIn("unmeasured:", measured)
+        self.assertEqual(self.line(measured, "types/basedpyright"),
+                         "types/basedpyright runs nightly, so it is not ranked: last run 50.000 CPU s, 100.000 s")
+        self.assertRegex(self.line(measured, "tools/test_beta.py"), r"^ {3}1\s+tools/test_beta\.py\b")
+        self.assertRegex(self.line(measured, "sum of median CPU"), r"1 modules; sum of median CPU 3(?:\.0+)? s")
 
     def test_missing_times_and_type_jobs_do_not_show_test_measurements(self) -> None:
         types = type_job(37.0)
@@ -410,8 +825,8 @@ class TestTimesTests(unittest.TestCase):
         self.assertEqual(missing_line.count("times missing"), 2, missing_line)
         type_line = self.line(output, "types/basedpyright")
         self.assertNotIn("times missing", type_line)
-        self.assertEqual(self.cell(output, type_line, "tests run"), "")
-        self.assertEqual(self.cell(output, type_line, "slowest kept test"), "")
+        self.assertEqual(type_line,
+                         "types/basedpyright runs nightly, so it is not ranked: last run 18.500 CPU s, 37.000 s")
         output = self.report("module", "tools/test_missing.py")
         self.assertIn("times missing: runner ended early", output)
         type_history = self.report("module", "types/basedpyright")
@@ -557,14 +972,18 @@ class TestTimesTests(unittest.TestCase):
             "no gate runs recorded for module tools/test_alpha.py", "no tests recorded matching target",
         ), strict=True):
             with self.subTest(arguments=arguments):
-                self.assertEqual(self.report(*arguments), expected + "\n")
+                status, output, errors = report_without_update(*arguments)
+                self.assertEqual(status, 0, errors)
+                self.assertEqual(output, expected + "\n")
 
     def test_reports_rebuild_a_dropped_gate_table_from_recorded_runs(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
         before = self.report("module", "tools/test_alpha.py")
         with closing(sqlite3.connect(index_path_in(self.log))) as connection:
             _ = connection.execute("DROP TABLE gate_modules")
-        self.assertEqual(self.report("module", "tools/test_alpha.py"), before)
+        status, output, errors = report_without_update("module", "tools/test_alpha.py")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(output, before)
 
     def test_reports_name_a_missing_gate_table_without_a_traceback(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
@@ -573,7 +992,7 @@ class TestTimesTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE gate_modules")
         for arguments in REPORT_COMMANDS:
             with self.subTest(arguments=arguments), mock.patch.object(show.index, "update", return_value=0):
-                status, output, errors = run(*arguments)
+                status, output, errors = report_without_update(*arguments)
                 self.assertEqual(status, 1)
                 self.assertEqual(output, "")
                 self.assertEqual(errors.splitlines(), [
@@ -592,17 +1011,340 @@ class TestTimesTests(unittest.TestCase):
 
         with mock.patch.object(show, "open_report_index", remove_table_after_probe), \
                 self.assertRaisesRegex(sqlite3.OperationalError, "no such table: gate_modules"):
-            _ = run("top", "--repo", str(self.repo))
+            _ = report_without_update("top", "--repo", str(self.repo))
+
+    def test_trend_groups_passing_runs_by_place_selection_and_local_day(self) -> None:
+        # The first attempt is a hold restart. It still uses CPU.
+        self.write_run([module_run("test_alpha.py", 120, restart="hold", status=-15),
+                        module_run("test_alpha.py", 100, attempt=2)], host="natedev")
+        for cpu in range(1, 20):
+            self.write_run([module_run("test_alpha.py", cpu * 2)], host="natedev")
+        for host, aborted, status, modules, epoch in (
+                ("natedev", True, 0, [module_run("test_alpha.py", 9999)], EPOCH),
+                ("natedev", False, 1, [module_run("test_alpha.py", 9999)], EPOCH),
+                ("natedev", False, 0, [], EPOCH),
+                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 9 * 86400),
+                ("builder", False, 0, [module_run("test_alpha.py", 10)], EPOCH),
+                ("natedev", False, 0, [module_run("test_alpha.py", 12)], EPOCH - 10 * 3600)):
+            self.write_run(modules, host=host, aborted=aborted, status=status, epoch=epoch)
+        self.write_run([module_run("test_alpha.py", 8), module_run("test_beta.py", 12)], host="natedev")
+        affected = f"history-{self.next_id}"
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_runs SET selection='affected', wall_s=40 WHERE id=?", (affected,)).close()
+            writer.execute("UPDATE gate_runs SET wall_s=100 WHERE id='history-1'").close()
+            writer.commit()
+        status, output, errors = report_without_update("trend", "--days", "8")
+        self.assertEqual(status, 0, errors)
+        tables = trend_tables(output)
+        self.assertEqual(list(tables), ["builder merge gates", "natedev merge gates", "natedev targeted tests"])
+        self.assertEqual(tables["natedev merge gates"][1:], [
+            ["2026-11-02", "1", "6", "6", "30", "30", "—", "—", "—"],
+            ["2026-11-03", "20", "15", "19", "34", "30", "—", "—", "—"],
+        ])
+        self.assertEqual(tables["builder merge gates"][1:], [
+            ["2026-11-03", "1", "5", "5", "30", "30", "—", "—", "—"]])
+        self.assertEqual(tables["natedev targeted tests"], [
+            ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
+             "cost mean", "cost p95", "cost total", "median modules run"],
+            ["2026-11-03", "1", "10", "10", "40", "40", "—", "—", "—", "2"]])
+        self.assertEqual(tables["natedev merge gates"][0], tables["builder merge gates"][0])
+
+    def test_trend_joins_cloud_cost_to_the_attempt_and_uses_the_applied_rate(self) -> None:
+        from scripts.build_targets import target_config
+
+        state = target_config.ssh_target_state_directory("aws")
+        reservations: list[ledger.GateReservation] = []
+        for ordinal, host, selection, hours, rate, booked_allowance in (
+                (1, "ip-10-1-1-1.compute.internal", "full", 1, "0.3",
+                 ledger.GateAllowance(Decimal("0.01"), "AWS bill 2026-11-03")),
+                (2, "ip-10-1-1-2", "full", 2, "0.5",
+                 ledger.GateAllowance(Decimal(0), "AWS bill 2026-11-03")),
+                (3, "ip-10-1-1-3.compute.internal", "affected", 1, "0.1", ledger.GateAllowanceUnpriced())):
+            self.write_run([module_run("test_alpha.py", ordinal * 10)], host=host)
+            _ = show.index.update()
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("UPDATE gate_modules SET run_id=? WHERE run_id=?",
+                               (f"gate-attempt-{ordinal}", f"history-{self.next_id}")).close()
+                writer.execute("UPDATE gate_runs SET id=?, selection=? WHERE id=?",
+                               (f"gate-attempt-{ordinal}", selection, f"history-{self.next_id}")).close()
+                writer.commit()
+            reservations.append(ledger.GateReservation(
+                f"attempt-{ordinal}", int(EPOCH), int(EPOCH) + 10000, Decimal("9"), Decimal("0.02"),
+                ledger.GateTerminated(int(EPOCH) + hours * 3600, f"i-{ordinal}"), "m7a.4xlarge",
+                ledger.BoxRate(Decimal(rate), "applied price"), booked_allowance=booked_allowance))
+        # A different reservation must not affect any run's cost.
+        reservations.append(ledger.GateReservation("unrelated", int(EPOCH), int(EPOCH) + 10000,
+            Decimal("100"), Decimal("100"), ledger.GateTerminated(int(EPOCH) + 3600, "i-other"),
+            rate=ledger.BoxRate(Decimal("100"), "applied price")))
+        state.mkdir(parents=True)
+        write_trend_ledger(state, reservations)
+        status, output, errors = report_without_update("trend")
+        self.assertEqual(status, 0, errors)
+        tables = trend_tables(output)
+        self.assertEqual(list(tables), ["aws merge gates", "aws targeted tests"])
+        self.assertEqual(tables["aws merge gates"][1:], [
+            ["2026-11-03", "2", "8", "10", "30", "30", "$0.655", "$1.000", "$1.310"]])
+        self.assertEqual(tables["aws targeted tests"][1:], [
+            ["2026-11-03", "1", "15", "15", "30", "30", "$0.120", "$0.120", "$0.120", "1"]])
+
+        for name, host, source in (
+                ("custom", "aws-build", "applied price"),
+                ("unpriced", "aws-unpriced", "not priced"),
+                ("missing", "ip-10-1-1-4", "missing")):
+            self.write_run([module_run("test_alpha.py", 8)], host=host)
+            _ = show.index.update()
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("UPDATE gate_modules SET run_id=? WHERE run_id=?",
+                               (f"gate-{name}", f"history-{self.next_id}")).close()
+                writer.execute("UPDATE gate_runs SET id=? WHERE id=?",
+                               (f"gate-{name}", f"history-{self.next_id}")).close()
+                writer.commit()
+            if source != "missing":
+                reservations.append(ledger.GateReservation(name, int(EPOCH), int(EPOCH) + 10000,
+                    Decimal("9"), Decimal("0.02"), ledger.GateTerminated(int(EPOCH) + 3600, f"i-{name}"),
+                    rate=ledger.BoxRate(Decimal("0.3") if source == "applied price" else Decimal(0), source)))
+        write_trend_ledger(state, reservations)
+        status, output, errors = report_without_update("trend")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["aws merge gates"][1:], [
+            ["2026-11-03", "5", "5", "10", "30", "30", "$0.543", "$1.000", "$1.630"]])
+        self.assertEqual(output.count("2 of 5 runs have no cost record."), 1)
+        self.assertNotIn("aws-build merge gates", output)
+        self.assertNotIn("aws-unpriced merge gates", output)
+
+    def test_trend_updates_missing_cost_on_an_open_day_and_caches_it_after_settling(self) -> None:
+        from scripts.build_targets import target_config
+
+        self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-1")
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET run_id='gate-pending'").close()
+            writer.execute("UPDATE gate_runs SET id='gate-pending'").close()
+            writer.commit()
+        status, output, errors = report_without_update("trend", "--days", "1")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["—", "—", "—"])
+        state = target_config.ssh_target_state_directory("aws")
+        state.mkdir(parents=True)
+        write_trend_ledger(state, [ledger.GateReservation(
+            "pending", int(EPOCH - 86400), int(EPOCH), Decimal("0.4"), Decimal("0.02"),
+            ledger.GateTerminated(int(EPOCH - 82800), "i-ready"),
+            rate=ledger.BoxRate(Decimal("0.2"), "applied price"))])
+        status, output, errors = report_without_update("trend", "--days", "1")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.220", "$0.220", "$0.220"])
+
+        self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-2", epoch=EPOCH - 86400)
+        _ = show.index.update()
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET run_id='gate-history-2' WHERE run_id='history-2'").close()
+            writer.execute("UPDATE gate_runs SET id='gate-history-2' WHERE id='history-2'").close()
+            writer.commit()
+        _ = self.report("trend", "--days", "2")
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=999 WHERE run_id=?",
+                           (f"gate-history-{self.next_id}",)).close()
+            writer.commit()
+        queries: list[str] = []
+        with closing(show.open_report_index()) as reader:
+            reader.set_trace_callback(queries.append)
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                show.trend(reader, 2)
+        output = output_buffer.getvalue()
+        self.assertEqual(trend_tables(output)["aws merge gates"][1],
+                         ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"])
+        self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
+        self.assertIn("1 of 2 runs have no cost record.", output)
+
+        for attempt in ("settled-pending", "settled-priced"):
+            self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-3", epoch=EPOCH - 2 * 86400)
+            _ = show.index.update()
+            with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+                writer.execute("UPDATE gate_modules SET run_id=? WHERE run_id=?",
+                               ("gate-" + attempt, f"history-{self.next_id}")).close()
+                writer.execute("UPDATE gate_runs SET id=? WHERE id=?",
+                               ("gate-" + attempt, f"history-{self.next_id}")).close()
+                writer.commit()
+        reservations = list(ledger.CostLedger(state).read_snapshot().gate_reservations)
+        reservations.append(ledger.GateReservation(
+            "settled-priced", int(EPOCH - 2 * 86400), int(EPOCH), Decimal("0.4"), Decimal("0.02"),
+            ledger.GateTerminated(int(EPOCH - 2 * 86400 + 3600), "i-priced"),
+            rate=ledger.BoxRate(Decimal("0.1"), "bill A")))
+        write_trend_ledger(state, reservations)
+        status, output, errors = report_without_update("trend", "--days", "3")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.120", "$0.120", "$0.120"])
+        self.assertIn("2 of 4 runs have no cost record.", output)
+
+        reservations = reservations[:1]
+        for attempt in ("settled-pending", "settled-priced", "history-2"):
+            reservations.append(ledger.GateReservation(
+                attempt, int(EPOCH - 2 * 86400), int(EPOCH), Decimal("0.4"), Decimal("0.02"),
+                ledger.GateTerminated(int(EPOCH - 2 * 86400 + 3600), "i-" + attempt),
+                rate=ledger.BoxRate(Decimal("0.4"), "bill B")))
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=999 WHERE run_id LIKE 'gate-settled-%'").close()
+            writer.commit()
+        write_trend_ledger(state, reservations)
+        queries.clear()
+        with closing(show.open_report_index()) as reader:
+            reader.set_trace_callback(queries.append)
+            output_buffer = io.StringIO()
+            with redirect_stdout(output_buffer):
+                show.trend(reader, 3)
+        output = output_buffer.getvalue()
+        self.assertEqual(trend_tables(output)["aws merge gates"][1],
+                         ["2026-11-01", "2", "4", "4", "30", "30", "$0.420", "$0.420", "$0.840"])
+        self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
+        self.assertNotIn("2026-11-01", "".join(queries))
+        self.assertNotIn("runs have no cost record.", output)
+
+    def test_trend_computes_only_open_days_and_rebuilds_an_unreadable_or_old_cache(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
+        self.write_run([module_run("test_alpha.py", 12)], host="natedev")
+        first = self.report("trend", "--days", "2")
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=99").close()
+            writer.commit()
+        queries: list[str] = []
+        with closing(show.open_report_index()) as reader:
+            reader.set_trace_callback(queries.append)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                show.trend(reader, 2)
+        tables = trend_tables(output.getvalue())
+        self.assertEqual(tables["natedev merge gates"][1:], [
+            ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"],
+            ["2026-11-03", "1", "99", "99", "30", "30", "—", "—", "—"]])
+        self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
+        self.assertIn("2026-11-03T05:00:00", "".join(queries))
+        self.assertNotEqual(output.getvalue(), first)
+        path = self.log / show.TREND_CACHE_NAME
+        document = cast(dict[str, object], json.loads(path.read_text()))
+        for damaged in ("not JSON", json.dumps({**document, "version": 3})):
+            with self.subTest(cache=damaged):
+                _ = path.write_text(damaged)
+                status, output, errors = report_without_update("trend", "--days", "2")
+                self.assertEqual(status, 0, errors)
+                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["99", "99"])
+
+    def test_trend_settles_only_after_a_complete_refresh_starts_beyond_the_delay(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
+        # The first delay ends one second after the fixed report time.
+        delay = (ReportTime.now().timestamp() - (EPOCH - 9.5 * 3600)) / 60
+        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay + 1 / 60}")
+        _ = self.report("trend", "--days", "2")
+        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay}")
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=11").close()
+            writer.commit()
+        status, output, errors = report_without_update("trend", "--days", "2")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
+        with closing(sqlite3.connect(index_path_in(self.log))) as writer:
+            writer.execute("UPDATE gate_modules SET cpu_s=22").close()
+            writer.commit()
+        status, output, errors = report_without_update("trend", "--days", "2")
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
+
+    def test_trend_writers_preserve_days_and_a_newer_refresh_from_another_writer(self) -> None:
+        self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
+        _ = self.report("trend", "--days", "2")
+        program = """
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+import os
+import socket
+import sys
+import runpy
+runpy.run_path(str(Path(sys.argv[1]) / 'scripts/lib/python_startup/sitecustomize.py'), run_name='_trend_python_startup')["select_checkout"](sys.argv)
+from scripts.test_times import show
+from scripts.lib import file_lock
+class FixedTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls.fromtimestamp(float(sys.argv[4]), tz)
+show.datetime = FixedTime
+event = socket.socket(fileno=int(sys.argv[2]))
+read = show.read_trend_cache
+def observed_read():
+    value = read()
+    show.read_trend_cache = read
+    event.sendall(b'R')
+    event.recv(1)
+    return value
+show.read_trend_cache = observed_read
+exclusive = file_lock.exclusive
+@contextmanager
+def observed_lock(path, **options):
+    if path.name == show.TREND_CACHE_NAME + '.lock':
+        event.sendall(b'L')
+    with exclusive(path, **options) as held:
+        yield held
+file_lock.exclusive = observed_lock
+if sys.argv[3] == 'report':
+    with show.open_report_index() as connection:
+        show.trend(connection, 2)
+elif sys.argv[3] == 'refresh':
+    show.refresh_trend_index()
+else:
+    status = show.main(['trend', '--days', '2'])
+    os.waitpid(-1, 0)
+    sys.exit(status)
+"""
+        for action in ("report", "refresh", "initialize"):
+            with self.subTest(writer=action):
+                cache = show.read_trend_cache()
+                previous = cache.days["2026-11-02"][0]
+                cache.days["2026-11-02"] = [show.TrendDay(previous.place, previous.selection,
+                    (*previous.cells[:2], "4", "4", *previous.cells[4:]), previous.run_ids)]
+                cache.completed_refresh_started_at = 0 if action == "initialize" else EPOCH + 300
+                show.write_trend_cache(cache)
+                event, child_event = socket.socketpair()
+                event.settimeout(TEST_HANG_GUARD_SECS)
+                with event, child_event:
+                    with file_lock.exclusive(self.log / (show.TREND_CACHE_NAME + ".lock")):
+                        process = subprocess.Popen([sys.executable, "-c", program,
+                            str(Path(__file__).resolve().parents[2]), str(child_event.fileno()), action,
+                            str(ReportTime.now().timestamp())], pass_fds=(child_event.fileno(),),
+                            env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        child_event.close()
+                        self.assertIn(event.recv(1), (b'L', b'R'))
+                        current = show.read_trend_cache()
+                        current.days["2026-11-02"] = [show.TrendDay(previous.place, previous.selection,
+                            (*previous.cells[:2], "77", "77", *previous.cells[4:]), previous.run_ids)]
+                        newer = EPOCH + 1200
+                        current.completed_refresh_started_at = newer
+                        show.write_trend_cache(current)
+                    event.sendall(b'G')
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 0, output + errors)
+                self.assertEqual(show.read_trend_cache().completed_refresh_started_at, newer)
+                status, output, errors = report_without_update("trend", "--days", "2")
+                self.assertEqual(status, 0, errors)
+                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["77", "77"])
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])
-        completed = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
-            cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+        event, child_event = socket.socketpair()
+        event.settimeout(TEST_HANG_GUARD_SECS)
+        try:
+            completed = subprocess.run(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("show.py")), "module", "tools/test_alpha.py"],
+                cwd=self.root, env=dict(os.environ), capture_output=True, text=True, check=False,
+                pass_fds=(child_event.fileno(),), timeout=TEST_HANG_GUARD_SECS,
+            )
+            child_event.close()
+            self.assertEqual(event.recv(1), b"", "The refresh must end before fixture cleanup")
+        finally:
+            child_event.close()
+            event.close()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stderr, "")
+        self.assertRegex(completed.stderr, r"^rows as of \d\d:\d\d (EST|EDT)\n$")
         self.assertIn("11-03 09:30", completed.stdout)
 
 

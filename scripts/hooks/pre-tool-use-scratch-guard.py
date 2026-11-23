@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Refuse a Bash command or file write that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude,
-~/rust or ~/rust/scratch.
+"""Refuse a Bash command or file write that makes a new loose folder in ~, /tmp, $TMPDIR, /tmp/claude,
+~/rust, ~/rust/scratch, the session root (/session on natedev) or the folder that holds the scratch and
+copies roots (/tmp/claude).
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
@@ -10,11 +11,13 @@ The commands judged are mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/
 cargo new/init, and tar extraction (-C or the working folder); a Write or NotebookEdit judges its
 file's path. A command is refused when it makes a folder directly in one of the roots that does not
 exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
-/tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session) and the two
-scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session or run root still permits ordinary temporary files.
-Repository copies under those roots require `build_folders.py run`.
-The hook restores the session temp folder from the hook input's session id.
-~/worktrees is no root, and a make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
+/tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session), the scratch roots
+(build_folders.conf roots.scratch, /tmp/claude/scratch) and the copies roots (roots.copies, /tmp/claude/copies). A TMPDIR inside a session or run root still permits ordinary temporary files.
+In ~ no new folder is allowed (resources, 2026-11-15: gate_tree.sh once cloned 45 GiB into ~/port-gate-tree-test*).
+In the session root only the session-start hook makes folders (scripts/lib/session_folder.py).
+Use worktrees.py make for editable checkouts. Use copies.py run for fixed commits.
+The hook restores the session folder from the hook input's session id.
+The hook checks creation under the configured source and build roots. A path it cannot follow (a variable other
 than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed: the
 hourly tmp sweep is the backstop.
 
@@ -23,8 +26,12 @@ from a PreToolUse hook, so an allow is an exit 0 with no output.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-import importlib
+import functools
 import io
 import json
 import os
@@ -33,19 +40,12 @@ import shlex
 import sys
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypedDict, cast, override
+from typing import TypedDict, cast, override
 
 
-class SessionTempPaths(Protocol):
-    """The session-start hook's path and session id rules."""
-
-    SESSION_ID: re.Pattern[str]
-
-    def temp_root(self, session_id: str) -> Path: ...
-
-
-SESSION_TEMP = cast(SessionTempPaths, cast(object, importlib.import_module("session-start-temp-root")))
+from scripts.lib import build_folders, copy_record, git_files, session_folder
 
 PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -95,17 +95,31 @@ def real(path: str) -> Path:
     return Path(os.path.realpath(os.path.expanduser(path)))
 
 
+@functools.cache
+def session_root() -> Path:
+    """The configured session root, as a real path, whether or not it exists yet."""
+    return real(str(session_folder.configured_root()))
+
+
 def own_temp(temp: str) -> bool:
     """Whether TMPDIR is this session's or run's own: in a session temp root, a run folder or a
     scratchpad (a sandbox can point it there)."""
     path = real(temp)
     return (any(real(parent) in path.parents for parent in OWN_TEMP_PARENTS)
+            or session_root() in path.parents
             or any(SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts))
+
+
+@functools.cache
+def configured_roots() -> tuple[Path, Path]:
+    """The configured scratch and copies roots, as real paths."""
+    return real(str(copy_record.root())), real(str(copy_record.copies_root()))
 
 
 def roots() -> list[Path]:
     """The folders in which a new loose folder is refused, as real paths, nested ones included."""
-    found = [real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch")]
+    found = [real("~"), real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"), session_root(),
+             *(root.parent for root in configured_roots())]
     temp = os.environ.get("TMPDIR")
     if temp and not own_temp(temp):
         found.append(real(temp))
@@ -118,7 +132,7 @@ def allowed(top: Path) -> bool:
         return True
     if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session", "copies"):
         return True
-    return top == real("~/rust/repro")
+    return top in configured_roots()
 
 
 def loose_folder(path: Path) -> Path | None:
@@ -129,6 +143,34 @@ def loose_folder(path: Path) -> Path | None:
         top = root / path.relative_to(root).parts[0]
         if not allowed(top) and not os.path.lexists(top):
             return top
+    return None
+
+
+def managed_creation(path: Path, *, repository_copy: bool = False) -> Path | None:
+    """Find creation that must go through the worktree or copy tool."""
+    source, build = copy_record.worktree_root(), copy_record.build_root()
+    if path.is_relative_to(source):
+        parts = path.relative_to(source).parts
+        if len(parts) >= 3 and not repository_copy:
+            try:
+                checkout = source / Path(*parts[:3])
+                expected = build_folders.worktree_path(*parts[:3]).resolve()
+                git = git_files.at(checkout)
+                if (checkout == expected and git.git_dir.parent == git.common_dir / "worktrees"
+                        and (git.git_dir / (git.git_dir / "gitdir").read_text().strip()).resolve()
+                        == checkout / ".git"):
+                    return None
+            except (OSError, ValueError, RuntimeError):
+                pass
+        if not repository_copy and copy_record.copy_folder(path) is not None:
+            return None
+        return path if repository_copy or not path.exists() else None
+    if path.is_relative_to(build):
+        scratch = copy_record.root().resolve()
+        if (scratch != build and path.is_relative_to(scratch)
+                or path.is_relative_to(build / "session")):
+            return None
+        return path if repository_copy or not path.exists() else None
     return None
 
 
@@ -393,51 +435,65 @@ def repository_copy(words: list[str], cwd: Path) -> bool:
 
 def nested_build_copy(path: Path) -> bool:
     """Refuse repository copies below unit and session temporary roots."""
-    parents = [real(parent) for parent in OWN_TEMP_PARENTS]
-    configured_session = os.environ.get("SESSION_TEMP_ROOT")
-    if configured_session:
-        parents.append(real(configured_session))
+    parents = [*(real(parent) for parent in OWN_TEMP_PARENTS), session_folder.former_root().resolve(),
+               session_root(), copy_record.build_root() / "session"]
     return any(parent in path.parents for parent in parents) or any(
         SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts[:-1])
 
 
-def loose_folders(text: str, cwd: Path) -> list[Path]:
-    """Every new loose folder the command makes, following `cd` between its commands."""
-    found: list[Path] = []
+@dataclass(frozen=True)
+class CreationTarget:
+    """A resolved creation path and its repository-copy rule."""
+
+    path: Path
+    repository_copy: bool
+
+
+def creation_targets(text: str, cwd: Path) -> Iterator[CreationTarget]:
+    """Resolve creation targets while following environment words and working folders."""
+    found: list[CreationTarget] = []
     for words in commands(text):
         while words and ENVIRONMENT_WORD.fullmatch(words[0]):
             words = words[1:]
         if not words:
             continue
         verb = Path(words[0]).name
-        if verb.startswith("make_a_worktree"):
-            return []
         if verb == "cd":
             moved = expanded(words[1], cwd) if len(words) > 1 else real("~")
             if moved is None:
-                return found
+                break
             cwd = moved
             continue
         copying = repository_copy(words, cwd)
         for path in targets(words, cwd):
-            top = (path if copying and nested_build_copy(path) else loose_folder(path)) if path is not None else None
-            if top is not None and top not in found:
-                found.append(top)
+            if path is not None:
+                found.append(CreationTarget(path, copying))
+    yield from found
+
+
+def loose_folders(text: str, cwd: Path) -> list[Path]:
+    """Every new loose folder the command makes, following `cd` between its commands."""
+    found: list[Path] = []
+    for target in creation_targets(text, cwd):
+        top = (target.path if target.repository_copy and nested_build_copy(target.path) else
+               managed_creation(target.path, repository_copy=target.repository_copy) or loose_folder(target.path))
+        if top is not None and top not in found:
+            found.append(top)
     return found
 
 
 def refusal(folders: list[Path]) -> str:
     shown = ", ".join(str(folder) for folder in folders)
     return (
-        f"Refused: this makes a new loose folder ({shown}). Nothing removes a loose folder in "
-        + "/tmp, /tmp/claude, ~/rust or ~/rust/scratch, so they piled up.\n"
-        + "For a build experiment, use build_folders.py run --owner O --name N -- CMD...; it removes the build folder.\n"
+        f"Refused: this makes a new loose folder ({shown}).\n"
+        + "Make an editable worktree with worktrees.py make <repo> <unit> <short-name>.\n"
+        + "Run a fixed commit with copies.py run.\n"
         + "Make scratch that belongs to a task, and it goes when the task ends:\n"
         + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new [--task <run:<id> | "
         + "phase:<unit>/<phase> | gate:<id> | row:<showrunner>-C<n>> | --until <YYYY-MM-DD [HH:MM]>] "
-        + "[--name <word>] [--visible]\n"
+        + "[--name <word>]\n"
         + "With no task it lasts 24 h. It prints the folder to use. For temp files, use $TMPDIR (mktemp -d "
-        + "with no path); a new project goes through its own command (add_unit, ~/worktrees)."
+        + "with no path). Use add_unit for a new unit."
     )
 
 
@@ -452,6 +508,8 @@ def written_folders(raw: str) -> list[Path]:
     if not isinstance(file_path, str) or not file_path:
         return []
     path = real(file_path)
+    if parent := managed_creation(path.parent):
+        return [parent]
     top = loose_folder(path)
     # A file directly in a root makes no folder.
     return [top] if top is not None and top != path else []
@@ -477,24 +535,14 @@ def bash_input(raw: str) -> tuple[str, Path] | None:
 
 
 def remake_session_temp(raw: str) -> None:
-    """Restore only the input session's temp folder; an error leaves the call allowed."""
+    """Restore only the input session's folder; an error leaves the call allowed."""
     try:
         hook_input = cast(HookInput, json.loads(raw))
         session_id = hook_input.get("session_id")
     except (ValueError, AttributeError):
         return
-    if not isinstance(session_id, str) or not SESSION_TEMP.SESSION_ID.fullmatch(session_id):
-        return
-    path = SESSION_TEMP.temp_root(session_id)
-    try:
-        _ = os.stat(path)
-    except FileNotFoundError:
-        try:
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
-            pass
-    except OSError:
-        pass
+    if isinstance(session_id, str) and session_folder.SESSION_ID.fullmatch(session_id):
+        session_folder.restore(session_id)
 
 
 def main() -> None:

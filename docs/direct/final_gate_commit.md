@@ -1,9 +1,32 @@
 # Close the run
 
 Read at the point of use from `/unit:direct`. Defines `<FinalGateCommit/>`,
-`<RunAsBuilt/>`, and `<AsBuiltCommit/>` in full.
+`<RunAsBuilt/>`, `<AsBuiltCommit/>`, `<FinalGate/>`, and `<RunSummary/>` in full.
 
-**Read when:** `<FinalGate/>` is green, or a `single` task finishes.
+**Read when:** the run reaches its final gate, or a `single` task finishes.
+
+<FinalGate>
+Loop/verbose only after plan exhaustion:
+
+1. Launch one final gate under <BackgroundVerificationContract/>. With a root
+   `Cargo.toml`, run `verify.sh final` for the workspace all-targets check and
+   full tests. Without a root `Cargo.toml`, run the repository's unit gate.
+   For `~/.claude`, use
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>`.
+2. If either gate fails, create a synthetic phase `final` / `Final verification` once:
+   capture a new baseline, run `start-phase`, reset review and smoke state, open
+   the concrete failures in the ledger, then use its gate plus <FixDispatch/>.
+   Later repairs do not repeat those resets. After closure convergence, run
+   applicable smoke and return here; do not run phase review or a phase
+   checkpoint for the synthetic phase. Rerun the selected gate after each repair.
+3. Batch all deferred smoke actions after the gate is green. Ask the user once;
+   route discovered defects through the synthetic fix path. If declined, carry
+   them as outstanding rather than blocking run completion.
+4. Finish the synthetic phase when applicable, run <FinalGateCommit/>, and
+   record the final result.
+
+Single mode and early endings skip this gate and state why in <RunSummary/>.
+</FinalGate>
 
 <FinalGateCommit>
 Loop and verbose only, at most once per run, after <FinalGate/> is green. It
@@ -113,3 +136,39 @@ this and reports the doc edits as uncommitted.
    release. Run <PushCheckpoint/>, then report `As-built <short hash> — <n>
    docs.` with its push note, if any.
 </AsBuiltCommit>
+
+<RunSummary>
+Emit on every multi-phase ending:
+
+```
+## Run Summary
+
+| Phase | Commit | Fix passes | Notes |
+| --- | --- | --- | --- |
+
+**Final gate:** [result or skipped reason]
+**As-built:** [docs created or updated, and the commit that carried them; in
+`single`, that they are uncommitted; or the reason the run never ran it]
+**Style review:** [each phase's reviewed range and result, including Off or a skipped reason]
+**Smoke checks still unperformed:** [phase + exact action, or none]
+**Deferred decisions still open:** [phase + decision, or none]
+**Add-ons awaiting review:** [count, or none]
+**CI points:** [each point from `ci_points.log` with its result, the CI branch
+merged or kept, or not applicable — fewer than five phases or `single`]
+**Reservation disposition:** [checkpointed and outstanding, retained with the
+reason this run stopped, or coordination not active]
+**Why the run stopped:** [complete, user stop, pending decision, or error]
+```
+
+Apply <UserFacingText/> and <RetainPhaseReservation/> for every ending
+that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
+`completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
+when needed. Run this command on every exit, without a pipe:
+
+```sh
+bash ~/.claude/scripts/direct/end_session.sh
+```
+
+Report a non-zero exit and the failed step. Then run
+<ReviewPendingAddOns/>; the summary and its commits never wait on it.
+</RunSummary>

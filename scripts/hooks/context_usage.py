@@ -9,15 +9,17 @@ never drift onto different thresholds.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
@@ -221,7 +223,7 @@ def parse_window(text: str) -> int | None:
         multiplier, value = 1_000_000, value[:-1]
     try:
         number = int(float(value) * multiplier)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     # Bare small numbers are the CLI's k-shorthand ("200" means 200k).
     if multiplier == 1 and number < 10_000:

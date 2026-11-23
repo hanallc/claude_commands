@@ -13,30 +13,30 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, read_production, review
 from scripts.production.cli_fixture import production_paths
-import showrunner_tree
+from scripts.production import showrunner_tree
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
     def test_new_object_question_requires_full_text_but_log_remains_a_parser(self) -> None:
+        pending = self.question_instance() / "pending_reviewed.json"
         state = self.question_state([{"text": "Choose layout"}])
         parsed = registration.judgment_state(state, "log")
         self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
         with self.assertRaisesRegex(registration.RegistrationFailure, "a new question needs its full text"):
             _ = self.run_questions(state)
         self.assertFalse(self.outstanding().exists())
-        self.assertFalse((self.state / "notifier/showrunner-example/pending_reviewed.json").exists())
+        self.assertFalse(pending.exists())
 
     def test_held_question_batch_writes_no_records_and_rerun_accepts_reviewed_text(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"Existing reminder"}]')
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "text": "Earlier"}) + "\n")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        _ = self.question_instance()
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text(json.dumps({"items": [{"kind": "reviewed", "text": "Earlier", "reviewed": "Earlier question?"}]}))
         before = [path.read_bytes() for path in (outstanding, history, pending)]
         full = "Build 42 failed.\nRetry (recommended) or stop?"
@@ -66,8 +66,7 @@ class RegistrationTests(RegistrationFixture):
         _ = outstanding.write_text("[]")
         history = outstanding.with_suffix(".history.jsonl")
         _ = history.write_text("")
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        pending.parent.mkdir(parents=True)
+        pending = self.question_instance() / "pending_reviewed.json"
         _ = pending.write_text('{"items":[]}')
         paths = (outstanding, history, pending)
         before = [path.read_bytes() for path in paths]
@@ -131,7 +130,7 @@ class RegistrationTests(RegistrationFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunner_tree, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
-            registration.open_items(read_production(self.doc))
+            registration.open_items(read_production("example"))
         self.assertIn(full, output.getvalue())
         self.assertIn(unavailable, output.getvalue())
         self.assertIn("Reminder", output.getvalue())
@@ -178,9 +177,9 @@ class RegistrationTests(RegistrationFixture):
                 self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
                 rows = self.read_items()
                 self.assertEqual(len(rows), 1)
-                self.assertIsInstance(rows[0], dailies_render.ReviewUnavailableOutstandingQuestion)
+                self.assertIsInstance(rows[0], registration.ReviewUnavailableOutstandingQuestion)
                 row = rows[0]
-                assert isinstance(row, dailies_render.ReviewUnavailableOutstandingQuestion)
+                assert isinstance(row, registration.ReviewUnavailableOutstandingQuestion)
                 self.assertEqual(row.question, question)
                 self.assertIn("rewrite needs nonempty text", row.reason)
                 self.assertIn("reviewed question: " + question, output)
@@ -192,7 +191,7 @@ class RegistrationTests(RegistrationFixture):
             output = self.run_questions(state)
         self.assertIn("reviewed question: " + question, output)
         rows = self.read_items()
-        self.assertIsInstance(rows[0], dailies_render.ReviewedOutstandingQuestion)
+        self.assertIsInstance(rows[0], registration.ReviewedOutstandingQuestion)
         self.assertFalse((self.state / "notifier/showrunner-example").exists())
         self.assertEqual(showrunners.registered_showrunners(self.state / "notifier"), [])
 

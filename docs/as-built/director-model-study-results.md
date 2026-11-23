@@ -171,7 +171,6 @@ organon: Sonnet continuation n 0 → 0; median change —% → —%.
 Pooled switched: median change then -12.89%, now -15.16%.
 recommendation unchanged
 
-## How to re-run
+## Archived results
 
-Run `python3 scripts/model_study/model_study.py results`.
-Per-request rows live in `~/.local/state/model-study/turns.jsonl`, not in git.
+Phase 405 removed the study tools. This report preserves the results.

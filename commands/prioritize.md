@@ -25,7 +25,7 @@ Bands are rated internally against each other; different bands are only comparab
 
 ## Workflow
 
-1. **Preflight.** Run `/usr/bin/python3 ~/.claude/scripts/prioritize/renumber.py` (dry-run). Require canonical state and a healthy watcher last-status in `/tmp/hanadocs-prioritize/`. List any issues reported as needing prioritization; they lack rubric values and can only be rated by the user (offer to survey them as in `/issue`), never invented.
+1. **Preflight.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/prioritize/renumber.py` (dry-run). Require canonical state and a healthy watcher last-status in `/tmp/hanadocs-prioritize/`. List any issues reported as needing prioritization; they lack rubric values and can only be rated by the user (offer to survey them as in `/issue`), never invented.
 2. **Enumerate the band** from `backlog-rankings.jsonl` plus each member's current `backlog_goal`, `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort` frontmatter.
 3. **Read every band issue in full.** No sampling. Note duplicate or overlapping scope between issues while reading.
 4. **Propose comparative ratings.** Re-rate `backlog_alignment` and `backlog_impact` relative to the band, using the full one-to-five-star range — the strongest few issues in the band take five stars. Adjust `backlog_urgency` or `backlog_effort` only on explicit evidence in the note; their anchors stay absolute. Change `backlog_goal` only when the note clearly serves a different goal.
@@ -65,7 +65,7 @@ Bands are rated internally against each other; different bands are only comparab
 - Dry-run is the default; `--apply` is required to write. It preserves unrelated frontmatter, note content, permissions, APFS creation time, and the modification calendar date (a ~1 ms mtime nudge invalidates Obsidian's metadata cache without changing the date `obsidian_knife` sees).
 - An open issue with missing or invalid rubric inputs loses any stale score/rank, is reported as needing prioritization, and never blocks ranking of valid issues.
 - It refuses to apply when ranks would not be unique and contiguous, a file changed after discovery, or a write cannot complete safely.
-- `strip_generated.py` is the vault's git clean filter: committed issue blobs carry no `backlog_score`/`backlog_rank`, so global re-ranks cause no per-file churn in git history. The working tree keeps the fields for Obsidian Base views.
+- `strip_generated.py` is the vault's git clean filter: committed issue blobs carry no `backlog_score`/`backlog_rank`, so global re-ranks cause no per-file churn in git history. The working tree keeps the fields for Obsidian Base views. With no arguments it cleans one file from stdin (`filter.hanadocs-strip-generated.clean`). With `--process` it is a Git long-running filter (`filter.hanadocs-strip-generated.process`): one Python process cleans every file of a Git command.
 
 ### Automatic ranking watcher
 

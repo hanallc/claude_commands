@@ -12,6 +12,8 @@
 !keybindings.json
 !.claude/
 !.claude/settings.local.json
+!.claude/config/
+!.claude/config/post_push.sh
 !commands/
 !commands/**
 !config/

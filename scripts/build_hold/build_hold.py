@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""One holder file per session; decide when builds are quiet and may resume."""
+"""Keep one hold per staff member and decide when builds may resume."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -20,34 +25,38 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
+from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-from sessions import addressed, live_sessions  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from process_failure import failure_detail
-from user_zone import user_zone
-import unit_runs
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import ConfigError, SshTarget, read_targets
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.user_zone import user_zone
+from scripts.build_hold import owning_session as session_owner
+from scripts.build_hold import override_guard
+from scripts.build_hold.override_guard import require_hold_write as require_hold_write
+from scripts.build_hold.shared_state_defaults import (
+    DEFAULT_HOLDER_DIRECTORY as DEFAULT_HOLDER_DIRECTORY,
+    DEFAULT_RELEASE_DIRECTORY as DEFAULT_RELEASE_DIRECTORY,
+    DEFAULT_PROC_ROOT,
+    StopStatus as StopStatus,
+    holder_directory as holder_directory,
+    read_stop_confirmation,
+    release_directory as release_directory,
+    stop_confirmation_path as stop_confirmation_path,
+    write_stop_confirmation,
+)
+from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import session_send
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
+
 if TYPE_CHECKING:
-    from ..build_queue import admission_service
-    from ..buildlog import store
-    from ..message import session_send
-else:
-    from scripts.build_queue import admission_service
-    from scripts.buildlog import store
-    from scripts.message import session_send
+    from scripts.production import staff
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
-PROC_ROOT = Path("/proc")
+PROC_ROOT = DEFAULT_PROC_ROOT
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # Retry a failed session lookup before reporting an undelivered release notice.
@@ -56,23 +65,32 @@ LOOKUP_RETRY_S = 1.0
 RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
                   "their memory gate orders them. No answer is needed.")
 
-DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
+DeliveryOutcome = Literal[
+    "NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "WorkerClosed", "DeliveryFailed",
+]
+DELIVERY_OUTCOMES = frozenset(cast(tuple[object, ...], get_args(DeliveryOutcome)))
 
 
-@dataclass(frozen=True)
-class OwningSession:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class NoOwningSession:
-    pass
+class StoppedRun(TypedDict):
+    id: str
+    label: str
+    staff_id: str
+    director_dir: str
 
 
 class ReleaseEntry(TypedDict):
     session_id: str
     name: str
     delivery: DeliveryOutcome
+    run: NotRequired[StoppedRun]
+
+
+
+
+class StopRequest(TypedDict):
+    id: str
+    entry: ReleaseEntry
+    runner_record: NotRequired[str]
 
 
 class HoldCycle(TypedDict):
@@ -82,6 +100,7 @@ class HoldCycle(TypedDict):
     recipients: dict[str, str]
     entries: list[ReleaseEntry]
     release_started_at: str
+    stop_logs: NotRequired[list[str]]
 
 
 class ReleaseRecordReadError(ValueError):
@@ -97,6 +116,8 @@ class CycleReleaseNotices(TypedDict):
     kind: Literal["cycle"]
     cycle_id: str
     recipients: dict[str, str]
+    runs: NotRequired[list[ReleaseEntry]]
+    stop_requests: NotRequired[list[StopRequest]]
 
 
 class BroadcastReleaseNotice(TypedDict):
@@ -106,6 +127,8 @@ class BroadcastReleaseNotice(TypedDict):
 class ReleaseIntent(TypedDict):
     holder_key: str
     holder_name: str
+    holder_purpose: NotRequired[str]
+    cycle_holders: NotRequired[dict[str, dict[str, str]]]
     holder_since: str
     holder_directory: str
     released_at: str
@@ -139,6 +162,7 @@ class ReleaseRecordsForChange:
 class CycleNoticesToSend:
     cycle: HoldCycle
     entries: list[ReleaseEntry]
+    unresolved_stops: int
 
 
 class ReleaseNoticeReadError(ReleaseRecordReadError):
@@ -179,7 +203,23 @@ class ReleaseQueued:
 
 
 @dataclass(frozen=True)
+class ReleaseWorkerClosed:
+    """The sender found a closed or stopped worker with no route."""
+
+
+@dataclass(frozen=True)
 class ReleaseSendFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class HolderMessageSent:
+    """The sender delivered or queued the holder's message."""
+
+
+@dataclass(frozen=True)
+class HolderMessageFailed:
+    """The sender could not deliver or queue the holder's message."""
     reason: str
 
 
@@ -197,6 +237,14 @@ ReleaseEta = KnownReleaseEta | UnknownReleaseEta
 
 
 @dataclass(frozen=True)
+class CurrentTime:
+    """Read the current time at the rendering entry point."""
+
+
+CURRENT_TIME = CurrentTime()
+
+
+@dataclass(frozen=True)
 class NoReleaseEta:
     pass
 
@@ -207,7 +255,13 @@ class ClockReleaseEta:
     zone: ZoneInfo
 
 
-ReleaseRequest = NoReleaseEta | ClockReleaseEta
+@dataclass(frozen=True)
+class DatedReleaseEta:
+    """The request names a release date and time in its zone."""
+    when: datetime
+
+
+ReleaseRequest = NoReleaseEta | ClockReleaseEta | DatedReleaseEta
 
 
 @dataclass(frozen=True)
@@ -270,27 +324,12 @@ class MacHoldResult:
 
 def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult:
     script = Path(__file__).resolve().parent.parent / "mac_test" / "mac_test.py"
-    result = subprocess.run([sys.executable, str(script), *arguments, "--target", target], capture_output=True, text=True)
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), *arguments, "--target", target], capture_output=True, text=True)
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
-def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
-    def unblock(holder: str) -> MacHoldResult:
-        arguments = ["unblock", "--holder", holder]
-        return run_mac_hold(arguments, target)
-
-    result = unblock(identity.name)
-    prefix = "blocked by "
-    line = result.stdout.rstrip("\n")
-    if result.status != 1 or not line.startswith(prefix):
-        return result
-    holder = line[len(prefix):]
-    no_former_names: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions()
-                   if record["sessionId"] == identity.key), no_former_names)
-    if holder != identity.name and holder in (identity.name, given, *former):
-        return unblock(holder)
-    return result
+def release_mac_hold(identity: HolderIdentity, target: str = "mac") -> MacHoldResult:
+    return run_mac_hold(["unblock", "--holder", identity.key], target)
 
 
 def print_mac_hold_result(result: MacHoldResult) -> int:
@@ -301,14 +340,15 @@ def print_mac_hold_result(result: MacHoldResult) -> int:
 
 @dataclass(frozen=True)
 class Holder:
-    # The holder's name now when it is a live Claude session, else the name the hold was taken under.
+    # The current staff name, or the text given for a holder outside staff.
     name: str
     since: datetime
     purpose: str
     release: ReleaseEta
-    # The hold file's name: the holder's Claude session id, or its name when it is no Claude session.
+    # The fixed staff ID, or the text given for a holder outside staff.
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
+    start_recorded: bool = True
 
 
 @dataclass(frozen=True)
@@ -364,32 +404,6 @@ class Busy:
     reasons: tuple[str, ...]
 
 
-def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
-    run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
-           or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
-    if run:
-        markers: list[Path] = []
-        for active in unit_runs.active_dirs(
-            environment.get("UNIT_ACTIVE_DIR") or environment.get("PLAN_DELEGATE_ACTIVE_DIR") or None
-        ):
-            try:
-                markers.extend(active.iterdir())
-            except OSError:
-                continue
-        matches: list[tuple[int, str]] = []
-        for marker in markers:
-            try:
-                if marker.is_file() and marker.read_text().strip() == run:
-                    matches.append((marker.stat().st_mtime_ns, marker.name))
-            except (OSError, UnicodeError):
-                continue
-        if matches:
-            return OwningSession(max(matches)[1])
-    session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
-    return OwningSession(session_id) if session_id else NoOwningSession()
-
-
 def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
     if pid <= 0:
         return ""
@@ -407,6 +421,31 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
+class LiveClaims:
+    """Name the processes that a hold must not stop.
+
+    `routed` names the identities that only a step record routed off natedev claims. A drain does not keep them:
+    a later natedev step of that call waits for the release.
+    """
+    identities: frozenset[ProcessIdentity]
+    routed: frozenset[ProcessIdentity] = frozenset()
+    remote_waiters: frozenset[ProcessIdentity] = frozenset()
+
+
+@dataclass(frozen=True)
+class ClaimsUnreadable:
+    reason: str
+
+
+class PidNamespaceRelation(Enum):
+    """Describe the process PID namespace relative to the auditor."""
+
+    SAME = auto()
+    DIFFERENT = auto()
+    UNREADABLE = auto()
+
+
+@dataclass(frozen=True)
 class AuditProcess:
     identity: ProcessIdentity
     parent_pid: int
@@ -419,10 +458,16 @@ class AuditProcess:
     tty_nr: int = 0
     executable: str = ""
     desktop_app: bool = False
+    pid_namespace: PidNamespaceRelation = PidNamespaceRelation.UNREADABLE
 
 
 @dataclass(frozen=True)
 class FullBuildAudit:
+    pass
+
+
+@dataclass(frozen=True)
+class DrainBuildAudit:
     pass
 
 
@@ -432,10 +477,11 @@ class HoldBuildCandidates:
 
 
 FULL_BUILD_AUDIT = FullBuildAudit()
+DRAIN_BUILD_AUDIT = DrainBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
-BuildClass = Literal["holder", "admitted", "other_session", "no_session"]
+BuildClass = Literal["holder", "admitted", "claimed", "remote_waiter", "other_session", "no_session"]
 AUDIT_COMMANDS = frozenset({"cargo-tile-real", "cargo", "cargo-nextest", "rustc", "rustdoc"})
 CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 
@@ -443,16 +489,16 @@ CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 @dataclass(frozen=True)
 class AuditedBuild:
     process: AuditProcess
-    owner: OwningSession | NoOwningSession
+    owner: session_owner.OwningSession | session_owner.NoOwningSession
     classification: BuildClass
     children: tuple[ProcessIdentity, ...]
 
 
 def read_audit_processes(
-    proc_root: Path, selection: FullBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
+    proc_root: Path, selection: FullBuildAudit | DrainBuildAudit | HoldBuildCandidates = FULL_BUILD_AUDIT,
     cgroup_root: Path = SYSTEM_CGROUP_ROOT,
 ) -> dict[int, AuditProcess]:
-    """Read the table once; an enforcer reads details only for candidates and ancestors."""
+    """Read process details for the selected audit. Only the drain reads PID namespaces."""
     processes: dict[int, AuditProcess] = {}
     desktop_pids: set[int] = set()
     if isinstance(selection, HoldBuildCandidates):
@@ -488,13 +534,19 @@ def read_audit_processes(
                                       uid, tty_nr, executable, pid in desktop_pids)
     details: set[int] = set()
     for pid, process in processes.items():
-        if (isinstance(selection, FullBuildAudit) or process.uid == selection.uid and
+        if (not isinstance(selection, HoldBuildCandidates) or process.uid == selection.uid and
                 any(name in AUDIT_COMMANDS | {"pytest", "py.test", "sccache", "bash", "sh", "dash", "zsh",
-                                             "verify.sh", "merge_gate.py", "clippy-driver", "rust-analyzer",
+                                             "verify.sh", "merge_gate.py", "gate.py", "clippy-driver", "rust-analyzer",
                                              "basedpyright", "node", "nodejs"}
                     or name.startswith("python") for name in (process.command, process.executable))):
             details.add(pid)
             details.update(parent.identity.pid for parent in audit_ancestors(process, processes))
+    auditor_namespace = None
+    if isinstance(selection, DrainBuildAudit):
+        try:
+            auditor_namespace = (proc_root / "self/ns/pid").readlink()
+        except OSError:
+            pass
     for pid in details:
         process = processes[pid]
         directory = proc_root / str(pid)
@@ -512,10 +564,19 @@ def read_audit_processes(
             cwd = str((directory / "cwd").readlink())
         except OSError:
             cwd = ""
+        pid_namespace = PidNamespaceRelation.UNREADABLE
+        if auditor_namespace is not None:
+            try:
+                namespace = (directory / "ns/pid").readlink()
+                pid_namespace = (PidNamespaceRelation.SAME if namespace == auditor_namespace
+                                 else PidNamespaceRelation.DIFFERENT)
+            except OSError:
+                pass
         in_build_scope = False
-        if isinstance(selection, FullBuildAudit):
+        if not isinstance(selection, HoldBuildCandidates):
             try:
                 in_build_scope = any("/builds.slice/" in line
+                                     and "/builds.slice/builds-detached.slice/" not in line
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass
@@ -524,7 +585,7 @@ def read_audit_processes(
             continue
         processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
                                       environment, in_build_scope, process.uid, process.tty_nr,
-                                      process.executable, process.desktop_app)
+                                      process.executable, process.desktop_app, pid_namespace=pid_namespace)
     return processes
 
 
@@ -547,57 +608,85 @@ def audit_command(process: AuditProcess) -> str:
     return executable if executable in AUDIT_COMMANDS | {"claude", "codex"} else process.command
 
 
-def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> OwningSession | NoOwningSession:
+@dataclass(frozen=True)
+class RunAgent:
+    """The agent that runs this command receives its release notice."""
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoRunAgent:
+    """The command and its ancestors identify no agent."""
+
+
+def run_agent(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> RunAgent | NoRunAgent:
+    """Find the nearest agent independently of the unit director that owns the run."""
+    for item in (process, *ancestors):
+        thread_id = item.environment.get("CODEX_THREAD_ID", "")
+        if thread_id:
+            return RunAgent(f"codex:{thread_id}")
+        session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
+        if session_id:
+            return RunAgent(session_id)
+    return NoRunAgent()
+
+
+def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> session_owner.OwningSession | session_owner.NoOwningSession:
     for item in (process, *ancestors):
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
         if session_id:
-            return OwningSession(session_id)
-        owner = owning_session(item.environment)
-        if isinstance(owner, OwningSession):
+            return session_owner.OwningSession(session_id)
+        owner = session_owner.owning_session(item.environment)
+        if isinstance(owner, session_owner.OwningSession):
             return owner
         if item.environment.get("CODEX_THREAD_ID"):
-            return OwningSession(item.environment["CODEX_THREAD_ID"])
+            return session_owner.OwningSession(item.environment["CODEX_THREAD_ID"])
     for parent in ancestors:
         if audit_command(parent) in {"claude", "codex"}:
-            owner = owning_session(parent.environment)
-            if isinstance(owner, OwningSession):
+            owner = session_owner.owning_session(parent.environment)
+            if isinstance(owner, session_owner.OwningSession):
                 return owner
-            return OwningSession(parent.environment.get("CODEX_THREAD_ID")
+            return session_owner.OwningSession(parent.environment.get("CODEX_THREAD_ID")
                                  or f"{audit_command(parent)}:{parent.identity.pid}:{parent.identity.start_time}")
-    return NoOwningSession()
+    return session_owner.NoOwningSession()
 
 
-def admitted_processes() -> frozenset[ProcessIdentity]:
-    """Read durable grants, which precede replies and the next decision pass."""
-    try:
-        state = admission_service.read_state(store.root() / "admission")
-    except (OSError, ValueError) as error:
-        raise OSError(f"admission state unavailable: {error}") from error
-    return frozenset(ProcessIdentity(record.owner.pid, record.owner.start_time)
-                     for record in state.reservations.values())
-
-
-def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
-    return (isinstance(owner, OwningSession) and bool(holders)
-            and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders))
+def owner_is_sole_holder(owner: session_owner.OwningSession | session_owner.NoOwningSession, holders: Sequence[Holder]) -> bool:
+    return (isinstance(owner, session_owner.OwningSession) and bool(holders)
+            and all(holder.key == holder_path(Path(), holder_of(owner.session_id).key).name for holder in holders))
 
 
 class HoldEnforcer(Protocol):
+    def admitted_processes(self) -> frozenset[ProcessIdentity]: ...
+    def claimed_processes(self, proc_root: Path = PROC_ROOT) -> LiveClaims | ClaimsUnreadable: ...
+    def holds_claim(self, process: AuditProcess, processes: Mapping[int, AuditProcess],
+                    claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
+    def clear_queued_runs(self, proc_root: Path) -> None: ...
+    def record_clear_cutoff(self, identity: HolderIdentity, since: datetime) -> None: ...
+    def drain_identities(self, proc_root: Path, identity: HolderIdentity) -> tuple[ProcessIdentity, ...]: ...
+    def wait_for_kept_runs(self, holder: Holder, proc_root: Path) -> int: ...
+    def ci_placement_lines(self, proc_root: Path) -> list[str]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
-    def report(self, proc_root: Path, directory: Path) -> list[str]: ...
+    def report(self, proc_root: Path, directory: Path, *, drain: bool = False) -> list[str]: ...
 
 
 def hold_enforcer() -> HoldEnforcer:
     # The enforcer uses these audit types; load it after this module is ready.
     import importlib
-    return cast(HoldEnforcer, cast(object, importlib.import_module("hold_enforcer")))
+    return cast(HoldEnforcer, cast(object, importlib.import_module('scripts.build_hold.hold_enforcer')))
 
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = admitted_processes()
+    admitted = hold_enforcer().admitted_processes()
+    claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
+    if isinstance(claims, ClaimsUnreadable):
+        print(f"claims unreadable: {claims.reason}", file=sys.stderr)
+    # A remote waiter does not grant its local build children an audit exemption.
+    claimed: frozenset[ProcessIdentity] = (claims.identities - claims.remote_waiters
+        if isinstance(claims, LiveClaims) else frozenset())
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -617,11 +706,16 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
             continue
         owner = audit_owner(process, ancestors)
         classification: BuildClass
-        if owner_is_sole_holder(owner, holders):
+        if (isinstance(claims, LiveClaims)
+                and process.identity in claims.remote_waiters):
+            classification = "remote_waiter"
+        elif hold_enforcer().holds_claim(process, processes, claimed):
+            classification = "claimed"
+        elif owner_is_sole_holder(owner, holders):
             classification = "holder"
         elif process.in_build_scope or any(item.identity in admitted for item in (process, *ancestors)):
             classification = "admitted"
-        elif isinstance(owner, OwningSession):
+        elif isinstance(owner, session_owner.OwningSession):
             classification = "other_session"
         else:
             classification = "no_session"
@@ -638,9 +732,10 @@ def audit_lines(builds: Sequence[AuditedBuild], *, beginning: bool = False) -> l
     for build in builds:
         if build.classification == "no_session":
             continue
-        owner = build.owner.session_id if isinstance(build.owner, OwningSession) else ""
+        owner = build.owner.session_id if isinstance(build.owner, session_owner.OwningSession) else ""
         command = shlex.join(build.process.argv) or build.process.command
-        lines.append(f"  {build.classification}: {owner}, pid {build.process.identity.pid}: {command}"
+        reason = "holds a live Mac or AWS claim" if build.classification == "claimed" else build.classification
+        lines.append(f"  {reason}: {owner}, pid {build.process.identity.pid}: {command}"
                      + (f" ({len(build.children)} build children)" if build.children else ""))
     if len(lines) == 1:
         lines.append("  No session-owned builds are running.")
@@ -655,14 +750,14 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
         holders = state.holders if isinstance(state, ActiveHolders) else ()
     builds = audit_builds(proc_root, holders)
     for build in builds:
-        if build.classification in {"holder", "admitted"}:
+        if build.classification in {"holder", "admitted", "claimed", "remote_waiter"}:
             continue
         for holder in holders:
             hold_enforcer().record_build(build, holder, proc_root, "audit")
     return builds
 
 
-def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = False) -> None:
+def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = False, drain: bool = False) -> None:
     try:
         builds = audit_hold(directory, proc_root)
     except (OSError, ValueError) as error:
@@ -670,14 +765,10 @@ def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = Fals
         return
     print("\n".join(audit_lines(builds, beginning=beginning)))
     try:
-        for line in hold_enforcer().report(proc_root, directory):
+        for line in hold_enforcer().report(proc_root, directory, drain=drain):
             print(line)
     except (OSError, ValueError) as error:
         print(f"Hold enforcer report unavailable: {error}")
-
-
-def holder_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
 
 
 def holder_path(directory: Path, name: str) -> Path:
@@ -688,35 +779,66 @@ def holder_path(directory: Path, name: str) -> Path:
 
 
 def holder_of(given: str | None) -> HolderIdentity:
-    """The key a holder's hold is kept under, and the holder's name now.
+    """Resolve a fixed staff key and its current display name."""
+    from scripts.production import staff
 
-    The key is the Claude session id of the session `given` means, or of the caller when no name is
-    given, so a rename between hold and release loses nothing. A holder that is no live Claude
-    session keeps `given` as its key.
-    """
-    records = live_sessions()
+    try:
+        membership = staff.snapshot()
+    except staff.StaffAbsent:
+        membership = staff.StaffSnapshot(())
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("give --holder: this is not a live Claude session")
-        return HolderIdentity(session["sessionId"], session["name"])
-    session = addressed(given, records)
-    return HolderIdentity(given, given) if session is None else HolderIdentity(session["sessionId"], session["name"])
+        member = membership.by_current_session(own) if own else None
+        if member is None:
+            raise ValueError("give --holder: this caller has no staff row")
+        return HolderIdentity(member.id, member.name)
+    from scripts.message.sessions import staff_recipient
+
+    member = membership.by_member_reference(given)
+    resolved = member if member is not None else staff_recipient(given, membership)
+    return HolderIdentity(resolved.id, resolved.name) if isinstance(resolved, staff.StaffRow) else HolderIdentity(given, given)
+
+
+def holder_address(key: str) -> str:
+    """Use a staff ID directly; preserve native session addresses for other keys."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return key if member is not None else f"session:{key}"
+
+
+def send_holder_message(key: str, text: str) -> HolderMessageSent | HolderMessageFailed:
+    """Send one holder message within the configured timeout."""
+    from scripts.lib import conf
+
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
+        result = subprocess.run(session_send.send_argv("--to", holder_address(key), "--text", text),
+                                capture_output=True, text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        return HolderMessageFailed(f"send timed out after {error.timeout:g} seconds")
+    except (OSError, conf.Unusable) as error:
+        return HolderMessageFailed(str(error))
+    if result.returncode in (0, 1):
+        return HolderMessageSent()
+    return HolderMessageFailed(failure_detail(result))
+
+
+def holder_session(key: str) -> str:
+    """Use a staff holder's current session; keep a native session key as it is."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return member.current_session if member is not None else key
 
 
 def held_key(directory: Path, given: str | None) -> str:
-    """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
-    kept by session id is found by the name given, the session's name now, and each name it once had."""
+    """Find only the resolved holder's fixed key."""
     identity = holder_of(given)
-    key, name = identity.key, identity.name
-    none: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions() if record["sessionId"] == key), none)
-    candidates: list[str] = [key, given or name, name, *former]
-    found = next((one for one in candidates if holder_path(directory, one).is_file()), None)
-    if found is None:
-        raise ValueError(f"{given or name} held nothing")
-    return found
+    if not holder_path(directory, identity.key).is_file():
+        raise ValueError(f"{given or identity.name} held nothing")
+    return identity.key
 
 
 def aware_instant(value: str) -> datetime:
@@ -728,13 +850,15 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
+    from scripts.production import staff
+
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
         content = path.read_text().strip()
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError):
-        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         raw = cast(object, json.loads(content))
         if isinstance(raw, dict):
@@ -745,7 +869,8 @@ def read_holder(path: Path) -> Holder:
             release = fields.get("release_eta")
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
                 eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
-                now = next((record["name"] for record in live_sessions() if record["sessionId"] == path.name), name)
+                member = staff.initial_snapshot().by_id(staff.StaffId(path.name))
+                now = member.name if member is not None else name
                 keep: list[ProcessIdentity] = []
                 values = fields.get("keep", [])
                 if isinstance(values, list):
@@ -760,11 +885,12 @@ def read_holder(path: Path) -> Holder:
         pass
     match = INSTANT.search(content)
     if match is None:
-        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         since = aware_instant(match.group())
     except ValueError:
-        since = fallback
+        return Holder(path.name, fallback, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name,
+                      start_recorded=False)
     return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name)
 
 
@@ -810,18 +936,84 @@ def natedev_holds(directory: Path) -> NatedevHolds:
     return NatedevHolds(holders.holders)
 
 
+def caller_processes(proc_root: Path, pid: int) -> frozenset[ProcessIdentity]:
+    """Read the caller and its live ancestors without scanning other processes."""
+    lineage: set[ProcessIdentity] = set()
+    seen: set[int] = set()
+    child_start = float("inf")
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            start = fields[19]
+            if fields[0] == "Z" or int(start) > child_start:
+                break
+            identity = ProcessIdentity(pid, start)
+            if process_start_time(pid, proc_root) != start:
+                break
+            lineage.add(identity)
+            pid, child_start = int(fields[1]), int(start)
+        except (OSError, ValueError, IndexError):
+            break
+    return frozenset(lineage)
+
+
 def release_eta_text(release: ReleaseEta) -> str:
     if isinstance(release, UnknownReleaseEta):
         return "unknown"
     return release.at.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def holder_text(holder: Holder) -> str:
-    return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)})"
+def release_overdue(release: ReleaseEta, now: datetime) -> bool:
+    """A known release is overdue at or after its instant."""
+    return (isinstance(release, KnownReleaseEta)
+            and release.at.astimezone(timezone.utc) <= now.astimezone(timezone.utc))
+
+
+def holder_text(holder: Holder, now: datetime | CurrentTime = CURRENT_TIME) -> str:
+    instant = datetime.now(timezone.utc) if isinstance(now, CurrentTime) else now
+    overdue = ", overdue" if release_overdue(holder.release, instant) else ""
+    return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)}{overdue})"
+
+
+def live_kept_runs(holder: Holder, proc_root: Path = PROC_ROOT) -> tuple[ProcessIdentity, ...]:
+    """Count only kept identities whose process start times still match."""
+    return tuple(item for item in dict.fromkeys(holder.keep)
+                 if process_start_time(item.pid, proc_root) == item.start_time)
+
+
+def holder_state(holder: Holder, proc_root: Path = PROC_ROOT) -> str:
+    remaining = len(live_kept_runs(holder, proc_root))
+    return f"draining ({remaining} runs left)" if remaining else "held"
+
+
+def ci_process(pid: int, start_time: str, proc_root: Path) -> bool:
+    """Recognize a CI worker lineage without reading private process details."""
+    lineage = caller_processes(proc_root, pid)
+    if ProcessIdentity(pid, start_time) not in lineage:
+        return False
+    for identity in lineage:
+        directory = proc_root / str(identity.pid)
+        try:
+            if (directory / "comm").read_text().strip() == "Runner.Worker":
+                return True
+        except OSError:
+            pass
+        try:
+            if pwd.getpwuid(directory.stat().st_uid).pw_name == "hana-linux":
+                return True
+        except (OSError, KeyError):
+            pass
+    return False
+
+
+def ci_placement_lines(proc_root: Path) -> list[str]:
+    return hold_enforcer().ci_placement_lines(proc_root)
 
 
 def resume_refusal(holders: tuple[Holder, ...]) -> str:
-    return ("a hold is in force (" + "; ".join(holder_text(holder) for holder in holders)
+    now = datetime.now(timezone.utc)
+    return ("a hold is in force (" + "; ".join(holder_text(holder, now) for holder in holders)
             + "); --resume only continues a release already begun. Release that hold without --resume.")
 
 
@@ -832,12 +1024,15 @@ def release_request(release_time: str | None, zone_name: str | None) -> ReleaseR
         return NoReleaseEta()
     if zone_name is None:
         raise ValueError("--zone goes with --release-eta")
-    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", release_time):
-        raise ValueError("release ETA must be HH:MM")
+    dated = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d", release_time))
+    if not dated and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", release_time):
+        raise ValueError("release ETA must be HH:MM or YYYY-MM-DDTHH:MM")
     try:
         zone = ZoneInfo(zone_name)
     except ZoneInfoNotFoundError:
         raise ValueError(f"unknown IANA zone: {zone_name}") from None
+    if dated:
+        return DatedReleaseEta(datetime.fromisoformat(release_time).replace(tzinfo=zone))
     hour, minute = map(int, release_time.split(":"))
     return ClockReleaseEta(ClockTime(hour, minute), zone)
 
@@ -853,31 +1048,37 @@ HoldFileRecord = TypedDict("HoldFileRecord", {
 
 
 def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = ()) -> str:
+               keep: Sequence[ProcessIdentity] = (), *,
+               before_publish: Callable[[], None] | None = None) -> str:
     """Keep a hold under its resolved key and display name."""
+    path = holder_path(directory, identity.key)
+    temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
+    require_hold_write(directory, temporary)
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
     if isinstance(request, NoReleaseEta):
         release_eta = "unknown"
     else:
-        release = datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone)
-        if release <= now:
-            raise ValueError("release ETA has already passed today")
+        release = (request.when if isinstance(request, DatedReleaseEta)
+                   else datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone))
+        if release.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
+            raise ValueError("release ETA has already passed")
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
-    path = holder_path(directory, identity.key)
     previous = read_holder(path).keep if path.is_file() else ()
     record: HoldFileRecord = {
         "holder": identity.name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta,
         "keep": [{"pid": item.pid, "start_time": item.start_time} for item in dict.fromkeys((*previous, *keep))],
     }
-    temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    if before_publish is not None:
+        before_publish()
     os.replace(temporary, path)
-    return (f"natedev is held for {purpose.strip()}. verify.sh waits by itself; an app launch is refused until the release, "
-            "so launch again after it. Tests that can run on the Mac keep running there. "
-            "Every other test and build is stopped with the reason, including runs already started. "
-            "Use --keep <pid> to keep a run and its children. Stopped sessions get a release notice; run again then. "
+    return (f"natedev is held for {purpose.strip()}. "
+            "Existing queued runs and running work outside the allow rules stop. "
+            "New natedev work waits until release. "
+            "Kept runs and their children continue. Eligible tests can use the Mac. "
+            "Stopped sessions get a release notice. Repeat stopped work after release. "
             "No release after 2 h: ask me.")
 
 
@@ -909,7 +1110,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 def start_hold_recorder(event: NatedevHoldEvent) -> None:
     until = event.holder.release.at.isoformat() if isinstance(event.holder.release, KnownReleaseEta) else ""
-    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
                "hold-event", event.kind, "natedev", event.holder.key, event.holder.name, event.holder.purpose,
                event.at.astimezone(timezone.utc).isoformat(), until]
     start_recorder(command)
@@ -933,6 +1134,7 @@ def record_hold_event(event: Literal["began", "ended"], holder: Holder, at: date
 
 
 def release_hold(directory: Path, holder: Holder) -> str:
+    require_hold_write(directory)
     path = directory / holder.key
     now = datetime.now(timezone.utc)
     try:
@@ -943,42 +1145,65 @@ def release_hold(directory: Path, holder: Holder) -> str:
     state = read_holders(directory)
     if isinstance(state, NoHolders):
         return "released, builds may resume."
-    return "released; still held by " + "; ".join(holder_text(holder) for holder in state.holders)
+    return "released; still held by " + "; ".join(holder_text(holder, now) for holder in state.holders)
 
 
-def release_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_RELEASE_DIR", str(Path.home() / ".local/state/build-hold-release")))
+@dataclass(frozen=True)
+class ReleaseLockHeld:
+    """The release lock covers these validated holder and release directories."""
+    holders: Path
+    releases: Path
+    lock: TextIO
+
+    def require(self, *paths: Path) -> None:
+        if self.lock.closed:
+            raise ValueError("the release lock is no longer held")
+        require_hold_write(*paths)
+        if holder_directory().resolve() != self.holders or release_directory().resolve() != self.releases:
+            raise ValueError("the release lock directories changed")
+        if any(not path.resolve().is_relative_to(self.releases) for path in paths):
+            raise ValueError("the release record is outside the locked release directory")
 
 
 @contextmanager
-def release_lock() -> Generator[None]:
+def release_lock(*directories: Path) -> Generator[ReleaseLockHeld]:
+    require_hold_write(*directories)
     directory = release_directory()
+    require_hold_write(directory / "release.lock")
     directory.mkdir(parents=True, exist_ok=True)
     with record_after_unlock(), (directory / "release.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            yield
+            yield ReleaseLockHeld(holder_directory().resolve(), directory.resolve(), lock)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def cycle_path() -> Path | None:
+def cycle_path() -> Path | NoCycle:
     current = release_directory() / "current"
     try:
         cycle_id = current.read_text().strip()
     except FileNotFoundError:
-        return None
+        return NoCycle()
     if not re.fullmatch(r"[0-9a-f]{32}", cycle_id):
         raise ValueError("invalid current hold cycle")
     return release_directory() / cycle_id / "cycle.json"
 
 
-def read_cycle() -> HoldCycle | None:
+def read_cycle() -> HoldCycle | NoCycle:
     try:
         path = cycle_path()
     except (OSError, ValueError) as error:
         raise ReleaseRecordReadError(str(error)) from error
-    return None if path is None else read_hold_cycle(path)
+    return path if isinstance(path, NoCycle) else read_hold_cycle(path)
+
+
+def read_stopped_run(value: object) -> StoppedRun:
+    match value:
+        case {"id": str(run_id), "label": str(label), "staff_id": str(staff_id), "director_dir": str(directory)} if run_id and label:
+            return {"id": run_id, "label": label, "staff_id": staff_id, "director_dir": directory}
+        case _:
+            raise ValueError("invalid stopped run in release record")
 
 
 def read_hold_cycle(path: Path) -> HoldCycle:
@@ -1007,6 +1232,13 @@ def read_hold_cycle(path: Path) -> HoldCycle:
         if any(not isinstance(name, str) or not isinstance(session_id, str)
                for session_id, name in cast(dict[object, object], recipients).items()):
             raise ValueError("invalid recipients: expected string names and session IDs")
+        if "stop_logs" in cycle:
+            logs = cycle["stop_logs"]
+            if not isinstance(logs, list) or any(
+                not isinstance(name, str) or not re.fullmatch(r"hold-builds-[0-9a-f]{64}\.jsonl", name)
+                for name in cast(list[object], logs)
+            ):
+                raise ValueError("invalid hold stop logs")
         entries = cycle.get("entries")
         if not isinstance(entries, list):
             raise ValueError("invalid entries: expected list")
@@ -1030,40 +1262,45 @@ def read_hold_cycle(path: Path) -> HoldCycle:
                 delivery = (old_delivery.get("outcome", "NotAttempted")
                             if old_delivery.get("generation") == cycle.get("holder_generation", 1)
                             else "NotAttempted")
-            if delivery not in {"NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"}:
+            if delivery not in DELIVERY_OUTCOMES:
                 raise ValueError(f"invalid delivery for entry {index}")
-            normalized.append({"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)})
+            item: ReleaseEntry = {"session_id": session_id, "name": name, "delivery": cast(DeliveryOutcome, delivery)}
+            if "run" in entry:
+                item["run"] = read_stopped_run(entry["run"])
+            normalized.append(item)
         cycle["entries"] = normalized
         return cast(HoldCycle, cast(object, cycle))
     except (OSError, ValueError, TypeError, KeyError) as error:
         raise ReleaseRecordReadError(str(error)) from error
 
 
-def set_aside_damaged_record(path: Path) -> DamagedRecordSetAside:
+def set_aside_damaged_record(held: ReleaseLockHeld, path: Path) -> DamagedRecordSetAside:
     """Preserve a damaged record under release.lock without replacing an earlier copy."""
+    held.require(path.parent)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     destination = path.with_name(f"{path.name}.damaged-{timestamp}")
     suffix = 2
     while destination.exists() or destination.is_symlink():
         destination = path.with_name(f"{path.name}.damaged-{timestamp}-{suffix}")
         suffix += 1
+    held.require(destination)
     _ = path.rename(destination)
     return DamagedRecordSetAside(destination)
 
 
-def read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside:
+def read_cycle_for_change(held: ReleaseLockHeld) -> HoldCycle | NoCycle | DamagedRecordSetAside:
     """Read a cycle while release.lock is held, setting damage aside if found."""
+    held.require()
     try:
-        cycle = read_cycle()
-        return NoCycle() if cycle is None else cycle
+        return read_cycle()
     except ReleaseRecordReadError as error:
         current = release_directory() / "current"
         try:
             path = cycle_path()
         except (OSError, ValueError):
-            path = None
-        damaged = path if path is not None and (path.is_symlink() or path.exists()) else current
-        saved = set_aside_damaged_record(damaged)
+            path = NoCycle()
+        damaged = path if isinstance(path, Path) and (path.is_symlink() or path.exists()) else current
+        saved = set_aside_damaged_record(held, damaged)
         current.unlink(missing_ok=True)
         print(f"release record {damaged} could not be read ({error}); set aside as {saved.path}; this hold now releases every session at once", flush=True)
         return saved
@@ -1071,8 +1308,9 @@ def read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside:
 
 def save_cycle(cycle: HoldCycle) -> None:
     path = release_directory() / cycle["id"] / "cycle.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
+    require_hold_write(path, temporary)
+    path.parent.mkdir(parents=True, exist_ok=True)
     _ = temporary.write_text(json.dumps(cycle, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
 
@@ -1103,6 +1341,24 @@ def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
             for key, value in cast(dict[object, object], recipients).items()
         ):
             raise ValueError("invalid release intent: recipients")
+        runs = notice_fields.get("runs", [])
+        if not isinstance(runs, list):
+            raise ValueError("invalid release intent: stopped runs")
+        for entry in cast(list[object], runs):
+            _ = read_restart_entry(entry)
+        requests = notice_fields.get("stop_requests", [])
+        if not isinstance(requests, list):
+            raise ValueError("invalid release intent: stop requests")
+        for request in cast(list[object], requests):
+            fields_by_name = cast(dict[str, object], request) if isinstance(request, dict) else {}
+            match fields_by_name:
+                case {"id": str(request_id), "entry": entry} if re.fullmatch(r"[0-9a-f]{32}", request_id):
+                    _ = read_restart_entry(entry)
+                    runner_record = fields_by_name.get("runner_record", "")
+                    if not isinstance(runner_record, str) or runner_record and not Path(runner_record).is_absolute():
+                        raise ValueError("invalid release intent: runner record path")
+                case _:
+                    raise ValueError("invalid release intent: stop request")
     elif notice_fields.get("kind") != "broadcast":
         raise ValueError("invalid release intent: notice kind")
     return cast(ReleaseIntent, cast(object, fields))
@@ -1110,6 +1366,7 @@ def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
 
 def save_release_intent(intent: ReleaseIntent) -> None:
     path = release_directory() / "pending-release.json"
+    require_hold_write(path, Path(intent["holder_directory"]))
     temporary = path.with_suffix(".tmp")
     _ = temporary.write_text(json.dumps(intent, ensure_ascii=False) + "\n")
     retain_release_record(path)
@@ -1118,15 +1375,18 @@ def save_release_intent(intent: ReleaseIntent) -> None:
 
 def retain_release_record(path: Path) -> None:
     """Move a prior pending release out of the current slot without dropping its notices."""
+    require_hold_write(path)
     if path.is_file():
         destination = release_directory() / "releases" / uuid.uuid4().hex / path.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(path, destination)
 
 
-def complete_release_record(record: RecordedRelease) -> None:
+def complete_release_record(held: ReleaseLockHeld, record: RecordedRelease) -> None:
     """Keep the holder's latest release receipt after its notices are done."""
     receipt = holder_path(release_directory() / "receipts", record.intent["holder_key"]) / "completed-release.json"
+    held.require(record.path, receipt)
+    require_hold_write(Path(record.intent["holder_directory"]))
     receipt.parent.mkdir(parents=True, exist_ok=True)
     previous = read_release_intent(receipt)
     if (isinstance(previous, NoReleaseIntent)
@@ -1148,13 +1408,37 @@ def pending_release_paths() -> list[Path]:
             *sorted((release_directory() / "releases").glob("*/pending-release.json"))]
 
 
-def release_entries(cycle: HoldCycle, recipients: Mapping[str, str]) -> list[ReleaseEntry]:
-    """Use the first recorded entry for each session, as the sender has always done."""
+def first_release_entries(cycle: HoldCycle) -> dict[str, ReleaseEntry]:
+    """Use the first recorded entry for each session."""
     first: dict[str, ReleaseEntry] = {}
     for entry in cycle["entries"]:
-        _ = first.setdefault(entry["session_id"], entry)
-    return [first[session_id] if session_id in first else new_entry(session_id, name)
-            for session_id, name in recipients.items()]
+        if "run" not in entry:
+            _ = first.setdefault(entry["session_id"], entry)
+    return first
+
+
+def stopped_run_entries(entries: Sequence[ReleaseEntry]) -> dict[str, ReleaseEntry]:
+    runs: dict[str, ReleaseEntry] = {}
+    for entry in entries:
+        if "run" in entry:
+            _ = runs.setdefault(entry["run"]["id"], entry)
+    return runs
+
+
+def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
+                    saved_runs: Sequence[ReleaseEntry] = ()) -> list[ReleaseEntry]:
+    first = first_release_entries(cycle)
+    runs = stopped_run_entries([*cycle["entries"], *saved_runs])
+    owners = {entry["session_id"].removeprefix("codex:") for entry in runs.values()}
+    return [*runs.values(), *(first[session_id] if session_id in first else new_entry(session_id, name)
+                             for session_id, name in recipients.items() if session_id.removeprefix("codex:") not in owners)]
+
+
+def release_notice_pending(entry: ReleaseEntry) -> bool:
+    delivery = entry["delivery"]
+    # An absent Claude session can skip a generic notice before the sender runs.
+    return (delivery in ("NotAttempted", "DeliveryFailed", "QueuedUnconfirmed", "WorkerClosed")
+            or (delivery == "RecipientGone" and ("run" in entry or entry["session_id"].startswith("codex:"))))
 
 
 def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
@@ -1169,8 +1453,19 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
             raise ValueError("release intent does not match its hold cycle")
     except (OSError, ValueError) as error:
         raise ReleaseNoticeReadError(path, str(error)) from error
-    return CycleNoticesToSend(cycle, [entry for entry in release_entries(cycle, notices["recipients"])
-                                      if entry["delivery"] in ("NotAttempted", "DeliveryFailed")])
+    runs = list(notices.get("runs", []))
+    unresolved = 0
+    for request in notices.get("stop_requests", []):
+        match stop_request_status(request):
+            case "stopped":
+                runs.append(request["entry"])
+            case None:
+                unresolved += 1
+            case "not_stopped":
+                pass
+    entries = [entry for entry in release_entries(cycle, notices["recipients"], runs)
+               if release_notice_pending(entry)]
+    return CycleNoticesToSend(cycle, entries, unresolved)
 
 
 def pending_release_status_lines() -> list[str]:
@@ -1183,9 +1478,12 @@ def pending_release_status_lines() -> list[str]:
                 continue
             pending = release_notices(intent)
             notices = intent["notices"]
-            unsent = (", ".join(notices["recipients"][entry["session_id"]] for entry in pending.entries) or "none"
+            unsent = (", ".join(entry["run"]["label"] if "run" in entry else notices["recipients"][entry["session_id"]]
+                               for entry in pending.entries) or "none"
                       if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
                       else "every session (broadcast)")
+            if isinstance(pending, CycleNoticesToSend) and pending.unresolved_stops:
+                unsent += f". Pending stop confirmations: {pending.unresolved_stops}"
         except (OSError, ValueError) as error:
             if isinstance(error, ReleaseNoticeReadError):
                 path = error.path
@@ -1196,18 +1494,19 @@ def pending_release_status_lines() -> list[str]:
     return lines
 
 
-def recorded_releases() -> list[RecordedRelease]:
-    return release_records_for_change().records
+def recorded_releases(held: ReleaseLockHeld) -> list[RecordedRelease]:
+    return release_records_for_change(held).records
 
 
-def release_records_for_change() -> ReleaseRecordsForChange:
+def release_records_for_change(held: ReleaseLockHeld) -> ReleaseRecordsForChange:
     """Read releases under the lock, preserving damaged pending records and continuing."""
+    held.require()
     # Migrate old receipts once; later releases read only one receipt per holder.
     for path in [release_directory() / "completed-release.json",
                  *sorted((release_directory() / "releases").glob("*/completed-release.json"))]:
         intent = read_release_intent(path)
         if not isinstance(intent, NoReleaseIntent):
-            complete_release_record(RecordedRelease(path, intent, "completed"))
+            complete_release_record(held, RecordedRelease(path, intent, "completed"))
     records: list[RecordedRelease] = []
     set_aside: list[DamagedRecordSetAside] = []
     for state in ("pending", "completed"):
@@ -1221,7 +1520,7 @@ def release_records_for_change() -> ReleaseRecordsForChange:
             except (OSError, ValueError) as error:
                 if state != "pending":
                     raise
-                saved = set_aside_damaged_record(path)
+                saved = set_aside_damaged_record(held, path)
                 set_aside.append(saved)
                 print(f"release pending: {path} could not be read: {error}; set aside as {saved.path}", flush=True)
                 continue
@@ -1232,8 +1531,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
-    with release_lock():
-        # A receipt for a former name must never shadow a live session-id hold.
+    with release_lock(directory) as held:
+        # A completed release must never hide a current hold.
         if given is None and resume:
             if has_holder_file(directory):
                 return NoReleaseIntent()
@@ -1244,7 +1543,7 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
                 pass
             else:
                 return NoReleaseIntent()
-        recovered = release_records_for_change()
+        recovered = release_records_for_change(held)
         for record in recovered.records:
             intent = record.intent
             if intent["holder_directory"] != str(directory.resolve()):
@@ -1252,12 +1551,8 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
             if given is None and resume:
                 return HolderIdentity(intent["holder_key"], intent["holder_name"])
             identity = holder_of(given)
-            no_former_names: list[str] = []
-            former = next((record["formerNames"] for record in live_sessions()
-                           if record["sessionId"] == identity.key), no_former_names)
-            candidates = (identity.key, identity.name, given or identity.name, *former)
-            if any(holder_path(directory, candidate).name == intent["holder_key"] for candidate in candidates):
-                return HolderIdentity(intent["holder_key"], intent["holder_name"])
+            if holder_path(directory, identity.key).name == intent["holder_key"]:
+                return identity
         if recovered.set_aside and not has_holder_file(directory):
             for record in recovered.records:
                 if record.state == "pending" and record.intent["holder_directory"] == str(directory.resolve()):
@@ -1266,18 +1561,20 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
     return NoReleaseIntent()
 
 
-def finish_release_intent(intent: ReleaseIntent) -> str:
+def finish_release_intent(held: ReleaseLockHeld, intent: ReleaseIntent) -> str:
     """Drain all unfinished releases for this holder directory under release.lock."""
     directory = Path(intent["holder_directory"])
+    held.require()
+    require_hold_write(directory)
     state = read_holders(directory)
     if isinstance(state, ActiveHolders):
         raise ValueError(resume_refusal(state.holders))
     result = "released, builds may resume."
     failures: list[str] = []
-    for record in recorded_releases():
+    for record in recorded_releases(held):
         if record.state == "pending" and record.intent["holder_directory"] == intent["holder_directory"]:
             try:
-                result += finish_recorded_notices(record)
+                result += finish_recorded_notices(held, record)
             except Exception as error:
                 # A failed record must not stop notices for another release.
                 failures.append(f"{record.intent['holder_name']}: {error}")
@@ -1286,9 +1583,14 @@ def finish_release_intent(intent: ReleaseIntent) -> str:
     return result
 
 
-def finish_recorded_notices(record: RecordedRelease) -> str:
+def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> str:
     intent = record.intent
     directory = Path(intent["holder_directory"])
+    held.require()
+    require_hold_write(directory)
+    released_hold = {"name": intent["holder_name"], "purpose": intent.get("holder_purpose", ""),
+                     "since": intent["holder_since"], "released_at": intent["released_at"]}
+    released_holds = intent.get("cycle_holders", {intent["holder_key"]: released_hold})
     try:
         pending = release_notices(intent)
     except ReleaseNoticeReadError as error:
@@ -1296,25 +1598,29 @@ def finish_recorded_notices(record: RecordedRelease) -> str:
         # rebuild only that release's delivery state; an uncertain send can repeat.
         # A stop after the rename leaves the intent, so a missing cycle also recovers.
         if error.path.exists() or error.path.is_symlink():
-            saved = set_aside_damaged_record(error.path)
+            saved = set_aside_damaged_record(held, error.path)
             print(f"release pending: {error.path} could not be read: {error}; set aside as {saved.path}", flush=True)
         notices = intent["notices"]
         assert notices["kind"] == "cycle"
         save_cycle({"id": notices["cycle_id"], "opened_at": intent["holder_since"],
-                    "holders": {intent["holder_key"]: {"since": intent["holder_since"], "released_at": intent["released_at"]}},
+                    "holders": released_holds,
                     "recipients": dict(notices["recipients"]), "entries": [], "release_started_at": intent["released_at"]})
         pending = release_notices(intent)
     if not isinstance(pending, CycleNoticesToSend):
         # The pending record is the broadcast entry. Keep it until the send returns.
-        send_release_broadcast()
+        send_release_broadcast(release_notice(released_holds))
         result = " No hold cycle: broadcast this release to every session."
     else:
         cycle = pending.cycle
         notices = intent["notices"]
         assert notices["kind"] == "cycle"
         changed = False
+        # A gone entry outside the cycle's recipients marks a quiet skip.
+        first = first_release_entries(cycle)
         for session_id, name in notices["recipients"].items():
-            if session_id not in cycle["recipients"]:
+            entry = first.get(session_id)
+            if (session_id not in cycle["recipients"]
+                    and (entry is None or entry["delivery"] != "RecipientGone" or release_notice_pending(entry))):
                 cycle["recipients"][session_id] = name
                 changed = True
         for key, instants in cycle["holders"].items():
@@ -1328,7 +1634,11 @@ def finish_recorded_notices(record: RecordedRelease) -> str:
         if changed:
             save_cycle(cycle)
         result = send_cycle_notices(cycle, pending.entries)
-    complete_release_record(record)
+        if pending.unresolved_stops:
+            return result + f" Pending stop confirmations: {pending.unresolved_stops}."
+        if any(release_notice_pending(entry) for entry in pending.entries):
+            return result
+    complete_release_record(held, record)
     return result
 
 
@@ -1342,15 +1652,17 @@ def open_cycle(now: datetime) -> HoldCycle:
 
 
 def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = ()) -> str:
-    with release_lock():
+               keep: Sequence[ProcessIdentity] = (), *,
+               before_publish: Callable[[], None] | None = None) -> str:
+    with release_lock(directory) as held:
         at = datetime.now(timezone.utc)
         new_hold = not holder_path(directory, identity.key).is_file()
         if isinstance(read_holders(directory), NoHolders):
             cycle = open_cycle(now)
         else:
-            cycle = read_cycle_for_change()
-        notice = write_hold(directory, identity, purpose, request, now, keep)
+            cycle = read_cycle_for_change(held)
+        notice = write_hold(directory, identity, purpose, request, now, keep,
+                            before_publish=before_publish)
         if new_hold:
             record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1358,7 +1670,8 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
                 cycle["release_started_at"] = ""
                 for entry in cycle["entries"]:
                     entry["delivery"] = "NotAttempted"
-            cycle["holders"][identity.key] = {"since": now.isoformat(), "released_at": ""}
+            cycle["holders"][identity.key] = {"name": identity.name, "purpose": purpose,
+                                              "since": now.isoformat(), "released_at": ""}
             save_cycle(cycle)
         return notice
 
@@ -1366,17 +1679,17 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
 def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
     if not has_holder_file(holder_directory()):
         return
-    with release_lock():
+    with release_lock() as held:
         if isinstance(read_holders(holder_directory()), NoHolders):
             return
-        cycle = read_cycle_for_change()
+        cycle = read_cycle_for_change(held)
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return
         for name, session_id in recipients:
             if session_id:
                 cycle["recipients"][session_id] = name
                 for entry in cycle["entries"]:
-                    if entry["session_id"] == session_id:
+                    if "run" not in entry and entry["session_id"] == session_id:
                         entry["name"] = name
         save_cycle(cycle)
 
@@ -1390,13 +1703,86 @@ def register_wait(session_id: str, name: str = "") -> str:
         if isinstance(read_holders(holder_directory()), NoHolders):
             return "no build hold"
         cycle = read_cycle()
-        if cycle is None:
+        if isinstance(cycle, NoCycle):
             return "no hold cycle: wait for the release broadcast"
         _ = cycle["recipients"].setdefault(session_id, name or session_id)
-        if not any(entry["session_id"] == session_id for entry in cycle["entries"]):
+        if session_id not in first_release_entries(cycle):
             cycle["entries"].append(new_entry(session_id, cycle["recipients"][session_id]))
         save_cycle(cycle)
         return f"registered {session_id}; wait for release before building"
+
+
+def track_stop_log(held: ReleaseLockHeld, name: str) -> None:
+    """Track the log even when its holder leaves before the cycle ends."""
+    cycle = read_cycle_for_change(held)
+    if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+        return
+    logs = cycle.setdefault("stop_logs", [])
+    if name not in logs:
+        logs.append(name)
+        save_cycle(cycle)
+
+
+def save_stop_confirmation(held: ReleaseLockHeld, request_id: str, status: StopStatus) -> None:
+    """Save the signal outcome before the audit update."""
+    path = stop_confirmation_path(request_id)
+    held.require(path)
+    write_stop_confirmation(path, status)
+
+
+def stop_request_status(request: StopRequest) -> StopStatus | None:
+    status = read_stop_confirmation(request["id"])
+    if status is not None:
+        return status
+    runner_record = request.get("runner_record")
+    run = request["entry"].get("run")
+    if runner_record and run is not None:
+        from scripts.agents import detached_runs
+
+        if detached_runs.confirms_hold_stop(Path(runner_record), run["id"], request["id"]):
+            return "stopped"
+        # Prune can copy the confirmation and remove the record during this read.
+        return read_stop_confirmation(request["id"])
+    return None
+
+
+def read_restart_entry(value: object) -> ReleaseEntry:
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    match fields:
+        case {"session_id": str(session_id), "name": str(name), "delivery": "NotAttempted", "run": run}:
+            return {**new_entry(session_id, name), "run": read_stopped_run(run)}
+        case _:
+            raise ValueError("invalid release intent: stopped run notice")
+
+
+def collect_stop_notices(cycle: HoldCycle, notices: CycleReleaseNotices) -> None:
+    """Save confirmed notices and unresolved requests in the release intent."""
+    from scripts.buildlog import store
+
+    runs = stopped_run_entries(cycle["entries"])
+    pending: list[StopRequest] = []
+    logs = cycle.get("stop_logs", [])
+    if logs:
+        folder = store.root() / store.host_name()
+        for name in logs:
+            for row in store.locked_rows(folder / name):
+                restart, status = row.get("restart"), row.get("stop_status")
+                if row.get("kind") != "hold_build" or status not in ("stopped", "requested") or not isinstance(restart, dict):
+                    continue
+                entry = read_restart_entry(cast(dict[str, object], restart))
+                if status == "stopped":
+                    run = entry.get("run")
+                    assert run is not None
+                    _ = runs.setdefault(run["id"], entry)
+                elif isinstance(request_id := row.get("stop_request_id"), str):
+                    request: StopRequest = {"id": request_id, "entry": entry}
+                    if isinstance(runner_record := row.get("runner_record"), str):
+                        request["runner_record"] = runner_record
+                    pending.append(request)
+    if runs:
+        notices["runs"] = [{**entry, "delivery": "NotAttempted"} for entry in runs.values()]
+    if pending:
+        notices["stop_requests"] = pending
 
 
 def new_entry(session_id: str, name: str) -> ReleaseEntry:
@@ -1410,7 +1796,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
         if attempt:
             time.sleep(LOOKUP_RETRY_S)
         try:
-            result = subprocess.run([sys.executable, str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
+            result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "socket", f"session:{session_id}"], capture_output=True, text=True)
         except OSError as error:
             reason = str(error)
             continue
@@ -1422,23 +1808,91 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
     return RecipientLookupFailed(reason)
 
 
-def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
+    """Name each released hold in the user's time zone."""
+    descriptions: list[str] = []
+    zone = user_zone()
+    for key, holder in holders.items():
+        name = holder.get("name", key)
+        purpose = holder.get("purpose", "")
+        work = f" for {purpose}" if purpose else ""
+        started = aware_instant(holder["since"]).astimezone(zone).strftime("%H:%M:%S %Z")
+        descriptions.append(f"{name} hold{work}, from {started}")
+    return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
+
+
+ReleaseNoticeResult = ReleaseDelivered | ReleaseQueued | ReleaseWorkerClosed | RecipientGone | ReleaseSendFailed
+
+
+def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseNoticeResult:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
+    return send_release_to(entry, f"uds:{socket}", notice)
+
+
+def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNoticeResult:
+    """Send the same release text to a session socket or a Codex thread."""
+    notice = f"{notice} Session {entry['session_id']}."
     try:
-        result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
+        options = ("--skip-closed",) if address.startswith("codex:") else ()
+        result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
+                                capture_output=True, text=True)
     except OSError as error:
         return ReleaseSendFailed(str(error))
     if result.returncode == 0:
         return ReleaseDelivered()
     if result.returncode == 1:
         return ReleaseQueued()
+    if options and result.returncode == SEND_CLOSED_EXIT:
+        return ReleaseWorkerClosed()
+    if options and result.returncode == SEND_ABSENT_EXIT:
+        return RecipientGone()
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
-def send_release_broadcast() -> None:
+def send_session_release(entry: ReleaseEntry, notice: str) -> ReleaseNoticeResult:
+    session_id = entry["session_id"]
+    if session_id.startswith("codex:"):
+        return send_release_to(entry, session_id, notice)
+    recipient = socket_for(session_id)
+    if isinstance(recipient, RecipientLive):
+        return send_release(entry, recipient.socket, notice)
+    return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
+
+
+def send_stopped_run_release(entry: ReleaseEntry, run: StoppedRun, notice: str,
+                             membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
+    from scripts.production import staff, worker_admission
+
+    worker = (membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
+              if membership is not None else None)
+    name = worker.name if worker is not None else entry["name"]
+    notice += f" Restart the stopped run {run['label']} for {name}."
+    notice += f" Run ID {run['id']}."
+    if worker is None:
+        result = send_session_release(entry, notice)
+    elif worker.kind == "worker" and (
+        entry["session_id"].startswith("codex:")
+        or membership is not None and isinstance(membership.backends.get(worker.id), staff.CodexBackend)
+    ):
+        result = send_release_to(entry, f"codex:{worker.current_session}", notice)
+    else:
+        result = send_release_to(entry, str(worker.id), notice)
+    if not isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
+        return result
+    if membership is None:
+        return ReleaseSendFailed("staff membership is unavailable")
+    director = membership.parent_of(worker) if worker is not None else None
+    if director is None and run["director_dir"]:
+        try:
+            director = worker_admission.parent(membership, run=Path(run["director_dir"]))
+        except (worker_admission.RunOwnerUnavailable, staff.StaffUnreadable) as error:
+            return ReleaseSendFailed(str(error))
+    return result if director is None else send_release_to(entry, str(director.id), notice)
+
+
+def send_release_broadcast(notice: str) -> None:
     script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
-    result = subprocess.run([sys.executable, str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", notice],
                             capture_output=True, text=True)
     if result.returncode:
         raise OSError(f"release broadcast: {failure_detail(result)}")
@@ -1453,17 +1907,20 @@ def cycle_status_lines(cycle: HoldCycle) -> list[str]:
 
 
 def not_reached_detail(cycle: HoldCycle) -> str:
-    outcomes = {"RecipientGone": "session gone", "DeliveryFailed": "send failed",
-                "QueuedUnconfirmed": "queued, delivery unconfirmed"}
-    missing = [f"{entry['name']} ({outcomes[entry['delivery']]})" for entry in cycle["entries"]
-               if entry["session_id"] in cycle["recipients"] and entry["delivery"] in outcomes]
-    return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
+    entries = release_entries(cycle, cycle["recipients"])
+    missing = [f"{entry['name']} (session gone)" for entry in entries
+               if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)]
+    pending = [entry["name"] for entry in entries if release_notice_pending(entry)]
+    failed = " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
+    if not pending:
+        return failed
+    return failed + ("." if failed else "") + " Release notices still pending for " + ", ".join(pending) + "."
 
 
 def notify_release(cycle: HoldCycle) -> str:
     with release_lock():
         current = read_cycle()
-        if (current is None or current["id"] != cycle["id"]
+        if (isinstance(current, NoCycle) or current["id"] != cycle["id"]
                 or not current["release_started_at"]
                 or current["release_started_at"] != cycle["release_started_at"]):
             return ""
@@ -1476,9 +1933,23 @@ def notify_released_cycle(cycle: HoldCycle) -> str:
 
 
 def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str:
+    from scripts.production import staff
+
     # The release lock prevents a same-session re-hold between this check and a send.
     if has_holder_file(holder_directory()):
         return ""
+    if not entries:
+        return not_reached_detail(cycle)
+
+    without_staff: set[str] = set()
+    try:
+        membership = staff.initial_snapshot()
+    except staff.StaffUnreadable:
+        # An unreadable snapshot cannot prove that a staff row is absent.
+        membership = None
+    else:
+        without_staff = {entry["session_id"] for entry in entries
+                         if membership.by_member_reference(entry["session_id"].removeprefix("codex:")) is None}
     for entry in entries:
         if has_holder_file(holder_directory()):
             break
@@ -1488,41 +1959,48 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         # Save the pending entry before sending, and the outcome only after return.
         # A stop at any point between these saves may cause a harmless second notice.
         save_cycle(cycle)
-        recipient = socket_for(entry["session_id"])
-        if isinstance(recipient, RecipientGone):
+        session_id = entry["session_id"]
+        codex = session_id.startswith("codex:")
+        notice = release_notice(cycle["holders"])
+        run = entry.get("run")
+        result = (send_session_release(entry, notice) if run is None
+                  else send_stopped_run_release(entry, run, notice, membership))
+        if isinstance(result, ReleaseDelivered):
+            entry["delivery"] = "Delivered"
+        elif isinstance(result, ReleaseQueued):
+            entry["delivery"] = "QueuedUnconfirmed"
+        elif isinstance(result, ReleaseWorkerClosed):
+            entry["delivery"] = "WorkerClosed" if run is None else "RecipientGone"
+        elif isinstance(result, RecipientGone):
             entry["delivery"] = "RecipientGone"
-        elif isinstance(recipient, RecipientLive):
-            result = send_release(entry, recipient.socket)
-            if isinstance(result, ReleaseDelivered):
-                entry["delivery"] = "Delivered"
-            elif isinstance(result, ReleaseQueued):
-                entry["delivery"] = "QueuedUnconfirmed"
-            else:
-                entry["delivery"] = "DeliveryFailed"
+            if not release_notice_pending(entry) and session_id in without_staff:
+                _ = cycle["recipients"].pop(session_id, None)
         else:
             entry["delivery"] = "DeliveryFailed"
+            if run is not None or codex:
+                print(f"build_hold: release notice for {entry['session_id']}: {result.reason}", file=sys.stderr)
         save_cycle(cycle)
     return not_reached_detail(cycle)
 
 
 def release_cycle(directory: Path, name: str, *, resume: bool = False,
                   clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> str:
-    with release_lock():
+    with release_lock(directory) as held:
         path = holder_path(directory, name)
         if not path.is_file():
-            for record in recorded_releases():
+            for record in recorded_releases(held):
                 intent = record.intent
                 if (intent["holder_directory"] != str(directory.resolve())
                         or intent["holder_key"] != path.name):
                     continue
                 if record.state == "completed":
                     if not has_holder_file(directory):
-                        detail = finish_release_intent(intent).removeprefix("released, builds may resume.")
+                        detail = finish_release_intent(held, intent).removeprefix("released, builds may resume.")
                         return "hold is already released." + detail
                     return "hold is already released."
-                return finish_release_intent(intent)
+                return finish_release_intent(held, intent)
             raise ValueError(f"{name} held nothing")
-        cycle = read_cycle_for_change()
+        cycle = read_cycle_for_change(held)
         if resume and not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             holds = live_holds(cycle, directory)
             if holds:
@@ -1534,9 +2012,12 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             notices: CycleReleaseNotices | BroadcastReleaseNotice = {"kind": "broadcast"}
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
-            intent = {"holder_key": holder.key, "holder_name": holder.name,
+                collect_stop_notices(cycle, notices)
+            intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}
+            if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                intent["cycle_holders"] = {key: dict(fields) for key, fields in cycle["holders"].items()}
             save_release_intent(intent)
         result = release_hold(directory, holder)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1549,15 +2030,16 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
                 return result
             if isinstance(intent, NoReleaseIntent):
                 raise ValueError("last holder has no release intent")
-            return finish_release_intent(intent)
+            return finish_release_intent(held, intent)
         remaining = live_holds(cycle, directory)
         if remaining:
-            return "released; still held by " + "; ".join(holder_text(other) for other in remaining)
+            now = clock()
+            return "released; still held by " + "; ".join(holder_text(other, now) for other in remaining)
         cycle["release_started_at"] = clock().isoformat()
         save_cycle(cycle)
         if isinstance(intent, NoReleaseIntent):
             raise ValueError("last holder has no release intent")
-        return finish_release_intent(intent)
+        return finish_release_intent(held, intent)
 
 
 def quiet_verdict(processes: Sequence[Process], user: str) -> Quiet | Busy:
@@ -1649,24 +2131,30 @@ def wait_for_quiet(
 
 def main(arguments: list[str]) -> int:
     override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
-    if arguments[:1] in (["hold"], ["release"]) and len(arguments) >= 3 and arguments[-2] == "target":
-        arguments = [*arguments[:-2], "--target", arguments[-1]]
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    hold = commands.add_parser("hold")
-    _ = hold.add_argument("--holder")
-    _ = hold.add_argument("--for", dest="purpose", required=True)
-    _ = hold.add_argument("--release-eta")
-    _ = hold.add_argument("--zone")
-    _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
-    _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
-    _ = hold.add_argument("--keep", type=int, action="append", default=[])
+    clear = commands.add_parser("clear")
+    _ = clear.add_argument("--holder")
+    _ = clear.add_argument("--for", dest="purpose", required=True)
+    _ = clear.add_argument("--release-eta")
+    _ = clear.add_argument("--zone")
+    _ = clear.add_argument("target", nargs="?")
+    _ = clear.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+    _ = clear.add_argument("--keep", type=int, action="append", default=[])
+    drain = commands.add_parser("drain")
+    _ = drain.add_argument("--holder")
+    _ = drain.add_argument("--for", dest="purpose", required=True)
+    _ = drain.add_argument("--release-eta")
+    _ = drain.add_argument("--zone")
+    _ = drain.add_argument("target", nargs="?")
+    _ = drain.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+    _ = drain.add_argument("--keep", type=int, action="append", default=[])
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
     _ = release.add_argument("--holder")
     _ = release.add_argument("--resume", action="store_true")
-    _ = release.add_argument("--target", type=parse_hold_target, default="natedev")
+    _ = release.add_argument("target", nargs="?")
     _ = commands.add_parser("wait")
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
@@ -1677,8 +2165,16 @@ def main(arguments: list[str]) -> int:
     options = parser.parse_args(arguments)
     try:
         action = cast(str, options.action)
-        if action in {"hold", "release"}:
-            target = cast(HoldTarget, options.target)
+        if action in {"clear", "drain", "release"}:
+            try:
+                target_name = command_target_name(cast(str | None, options.target))
+            except (ConfigError, OSError, UnicodeError) as error:
+                print(f"target configuration cannot be read: {error}")
+                return 2
+            if target_name != "natedev":
+                print(f"{action} {target_name} is not supported yet")
+                return 2
+            target = parse_hold_target(target_name)
             if isinstance(target, UnknownHoldTarget):
                 print(f"unknown target {target.name}; configured targets: {', '.join(target.configured)}")
                 return 2
@@ -1687,8 +2183,11 @@ def main(arguments: list[str]) -> int:
                 return 2
             if isinstance(target, (MacHoldTarget, ConfiguredSshHoldTarget)):
                 target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
+                if action == "drain":
+                    print(f"drain is not supported with --target {target_name}")
+                    return 2
                 refused: list[str] = []
-                if action == "hold":
+                if action == "clear":
                     if cast(list[int], options.keep):
                         refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
@@ -1701,14 +2200,49 @@ def main(arguments: list[str]) -> int:
                     print(f"{refused[0]} is not supported with --target {target_name}")
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
-                if action == "hold":
-                    command = ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]
+                if action == "clear":
+                    command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
                     result = run_mac_hold(command, target_name)
                 else:
-                    given = cast(str | None, options.holder) or identity.name
-                    result = release_mac_hold(identity, given, target_name)
+                    result = release_mac_hold(identity, target_name)
                 return print_mac_hold_result(result)
-        if action == "hold":
+        if action in {"clear", "drain"} and cast(str | None, options.release_eta) is None:
+            print("build_hold: give --release-eta HH:MM --zone <IANA zone> for a natedev hold")
+            return 2
+        if action == "drain":
+            request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
+            identity = holder_of(cast(str | None, options.holder))
+            proc_root = cast(Path, options.proc_root)
+            kept: list[ProcessIdentity] = []
+            for pid in cast(list[int], options.keep):
+                start = process_start_time(pid, proc_root)
+                if not start:
+                    raise ValueError(f"--keep {pid}: no live process with a start time")
+                kept.append(ProcessIdentity(pid, start))
+            kept.extend(hold_enforcer().drain_identities(proc_root, identity))
+            purpose = cast(str, options.purpose)
+            now = datetime.now(timezone.utc)
+            publication_bound = 0
+
+            def record_publication_bound() -> None:
+                nonlocal publication_bound
+                publication_bound = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+
+            _ = start_hold(holder_directory(), identity, purpose, request, now, kept,
+                           before_publish=record_publication_bound)
+            kept = [run for run in hold_enforcer().drain_identities(proc_root, identity)
+                    if int(run.start_time) < publication_bound]
+            with release_lock():
+                if not holder_path(holder_directory(), identity.key).is_file():
+                    print("the hold was released; drain ends", flush=True)
+                    return 0
+                _ = write_hold(holder_directory(), identity, purpose, request, now, kept)
+            print(f"natedev is draining for {purpose}. Existing runs finish; new natedev work waits until release.",
+                  flush=True)
+            hold_enforcer().start()
+            return hold_enforcer().wait_for_kept_runs(
+                read_holder(holder_path(holder_directory(), identity.key)), proc_root)
+        elif action == "clear":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
             keep: list[ProcessIdentity] = []
@@ -1718,10 +2252,16 @@ def main(arguments: list[str]) -> int:
                 if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
                 keep.append(ProcessIdentity(pid, start))
+            now = datetime.now(timezone.utc)
+
+            def record_clear_cutoff() -> None:
+                hold_enforcer().record_clear_cutoff(identity, now)
+
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
-                             datetime.now(timezone.utc), keep))
+                             now, keep, before_publish=record_clear_cutoff))
             hold_enforcer().start()
-            print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
+            print_hold_audit(holder_directory(), proc_root, beginning=True)
+            hold_enforcer().clear_queued_runs(proc_root)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):
@@ -1741,8 +2281,8 @@ def main(arguments: list[str]) -> int:
             if isinstance(recorded, HolderIdentity) and not holder_path(holder_directory(), recorded.key).is_file():
                 name = recorded.key
             if name is None and given is None and resume_requested:
-                with release_lock():
-                    cycle = read_cycle_for_change()
+                with release_lock() as held:
+                    cycle = read_cycle_for_change(held)
                     if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                         name = next((key for key, instants in cycle["holders"].items()
                                      if instants["released_at"] and holder_path(holder_directory(), key).is_file()
@@ -1764,32 +2304,39 @@ def main(arguments: list[str]) -> int:
             # Use the local gate's hold and caller check; recording a notice recipient permits no build.
             import importlib
             check_local_hold = cast(Callable[[], int], getattr(
-                importlib.import_module("build_targets"), "command_check_local"))
+                importlib.import_module('scripts.build_targets.build_targets'), "command_check_local"))
             return check_local_hold()
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         elif action == "audit":
             print("\n".join(audit_lines(audit_hold(holder_directory(), cast(Path, options.proc_root)))))
         else:
+            now = datetime.now(timezone.utc)
             state = read_holders(holder_directory())
             if isinstance(state, NoHolders):
                 print("no build hold")
             else:
                 for holder in state.holders:
-                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}")
-                    for run in holder.keep:
+                    overdue = ", overdue" if release_overdue(holder.release, now) else ""
+                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}{overdue} - {holder_state(holder, cast(Path, options.proc_root))}")
+                    for run in live_kept_runs(holder, cast(Path, options.proc_root)):
                         print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
+                for line in ci_placement_lines(cast(Path, options.proc_root)):
+                    print(line)
                 try:
                     cycle = read_cycle()
                 except ReleaseRecordReadError as error:
                     print(release_record_error_line(error))
                 else:
-                    if cycle is not None:
+                    if not isinstance(cycle, NoCycle):
                         for line in cycle_status_lines(cycle):
                             print(line)
                 print_hold_audit(holder_directory(), cast(Path, options.proc_root))
             for line in pending_release_status_lines():
                 print(line)
+    except override_guard.SharedStateWriteRefused as error:
+        print(f"build_hold: {error}", file=sys.stderr)
+        return 2
     except (ValueError, OSError) as error:
         print(f"build_hold: {error}", file=sys.stderr)
         return 1
@@ -1797,6 +2344,6 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    # The enforcer must use this CLI's domain types, not a second module instance.
-    _ = sys.modules.setdefault("build_hold", sys.modules[__name__])
+    # The enforcer and this CLI must use the same domain types.
+    _ = sys.modules.setdefault("scripts.build_hold.build_hold", sys.modules[__name__])
     sys.exit(main(sys.argv[1:]))

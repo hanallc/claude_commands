@@ -12,7 +12,7 @@ Run:
 bash ~/.claude/scripts/agents/default_models.sh $ARGUMENTS
 ```
 
-**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(agents): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
+**Always run `default_models.sh` with `dangerouslyDisableSandbox: true`.** Edits atomically update shared `config/models.conf`, then commit only that file as `config(models): …` and push to origin. The writer fetches and fast-forwards before editing; a rejected push replays the row change, up to three tries. Unrelated work stays in place. Status can also publish catalog additions. There is no local override file.
 
 Relay the script's stdout and stderr exactly, except status output — see below. If it exits non-zero, stop; do not invent a correction.
 
@@ -24,11 +24,14 @@ No arguments prints every function's active family and resolved rows (one `task=
 
 Family resolution and catalog sync read the cache through `scripts/lib/codex_models_cache.py`. Missing, empty or malformed files retry for two seconds, then report `the models cache could not be read` with the path. `no Codex model` means a complete cache lacks the requested model.
 
-## Functions assigned `caller`
-
-`ask_a_friend` is assigned `caller` rather than a family: it runs on the family of the agent asking, because only a like-to-like pair can talk both ways. `/default_models ask_a_friend` shows both row sets with `active=yes` on the family this session runs as, and its comment line reads `# current family: caller — the calling agent's family (claude here)`; render it as plain text like any other `#` line. `/default_models ask_a_friend <family>` is rejected — there is no switch — and the error names the row edit to use instead; `/default_models <family>` leaves it alone. Row edits work as for any function, and the `# updated …` line reads `— live whenever a <family> session runs ask_a_friend`.
+## Pinned functions
 
 A function with only one family set is pinned to it. Every-function family and agent switches keep its assignment and rows and print `# kept <function> on <family>: its only set` after the switch line. Switching that function alone or editing its row with an agent from the other family is refused. `production` has only `[production.claude]`; `/default_models production.director sonnet:xhigh` changes unit director launches.
+
+Style units use `production.director` for their directors.
+Each assigned ticket gets its own Codex worker through `assign.sh`, using the `direct.impl` row.
+The production document's `Style units` table sets family ownership and ticket capacity.
+These model settings do not set the number of style units or tickets.
 
 ## Switch a function's family
 
@@ -55,9 +58,16 @@ On success it prints `# switched every function to <family>` followed by the no-
 /default_models <function> <agent>
 ```
 
-An agent name in place of a family puts every switchable function (or just `<function>`) on that agent. Each row keeps its effort. The agent names its family, so every fixed assignment in scope also switches to that family, exact-task overrides included. A `caller` function keeps its assignment; its row set for that family takes the agent. A one-family function is kept during every-function changes. It is validated wholesale first: a kept effort the agent's catalog lacks rejects the whole change and leaves the registry untouched. Name the agent alone — `:<effort>` is rejected.
+An agent name selects that agent for every switchable function or one named function.
+Each row keeps its effort.
+Every assignment in scope switches to the agent's family, including exact-task overrides.
+Every-function changes preserve functions with only one family set.
+The script validates every row before writing.
+An unsupported effort rejects the change and leaves the registry unchanged.
+Name the agent without an effort suffix.
 
-On success it prints `# switched every function to <agent> (<family>), efforts kept` (or `# switched <function> to <agent> (<family>), efforts kept`; for a `caller` function, `# set [<function>.<family>] to <agent>, efforts kept — live whenever a <family> session runs <function>`), then the matching status output and usage. Render the `#` line as plain text first, then the rows per the Status rules above.
+Success prints `# switched every function to <agent> (<family>), efforts kept` or `# switched <function> to <agent> (<family>), efforts kept`.
+Render this line before the status table and usage.
 
 ## Edit a row
 
@@ -77,7 +87,7 @@ On success the edit prints a `# updated [<function>.<family>] <task> — live|do
 /default_models <function>.<subtask> <fast|flex|default|pace|inherit>
 ```
 
-`pace` lets `~/.claude/scripts/whoami/codex_pacer.py` choose fast or default at each launch, so the Codex quota reaches every weekly reset with 5% left; it shows as `pace(<current choice>)`. Any other tier takes it back. `python3 ~/.claude/scripts/whoami/codex_pacer.py status` explains the plan — relay it as-is when asked how pacing stands.
+`pace` lets `~/.claude/scripts/whoami/codex_pacer.py` choose fast or default at each launch, so the Codex quota reaches every weekly reset with 5% left; it shows as `pace(<current choice>)`. Any other tier takes it back. `~/.claude/scripts/lib/py ~/.claude/scripts/whoami/codex_pacer.py status` explains the plan — relay it as-is when asked how pacing stands.
 
 Writes `codex_service_tier` (or `codex_service_tier.<subtask>`, which beats it) in `[<function>.options]`, for every function with a codex set, one function, or one row. `inherit` deletes the key: a row then follows its function, a function `~/.codex/config.toml`. A wider level clears the row keys beneath it. Claude rows never take a tier — Claude fast mode bills extra usage — so a tier on a function running claude is stored dormant.
 
@@ -93,7 +103,7 @@ It prints a `# set …` or `# cleared …` line, then `/default_models <function
 /default_models direct sol                         /unit:direct on the newest sol, efforts kept
 /default_models direct claude                      /unit:direct switches to the claude family
 /default_models direct.review sol:max              set agent and effort for one subtask
-/default_models cli.commit_prep sonnet              set agent, keep the CLI default effort
+/default_models cli.merge_branch sonnet             set agent, keep the CLI default effort
 /default_models direct fast                        every codex worker row on the fast tier
 /default_models direct.review inherit              review follows direct's tier again
 ```

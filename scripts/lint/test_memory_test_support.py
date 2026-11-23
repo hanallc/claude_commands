@@ -1,10 +1,14 @@
 """Check complete configuration fixtures and successive value changes."""
 
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
@@ -58,3 +62,74 @@ class ConfigFixtureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+def git(folder: Path, *arguments: str, environment: dict[str, str] | None = None) -> str:
+    return subprocess.run(["git", "-C", str(folder), *arguments], check=True, capture_output=True, text=True,
+                          env=environment if environment is not None else isolated_git_environment(),
+                          timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+
+
+def isolated_git_environment() -> dict[str, str]:
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    return environment | {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def other_repository(root: Path) -> Path:
+    repository = root / "other"
+    repository.mkdir()
+    _ = git(repository, "init", "-q")
+    _ = git(repository, "-c", "user.name=Other", "-c", "user.email=other@example.invalid",
+            "commit", "-q", "--allow-empty", "-m", "other start")
+    return repository
+
+
+class CommitConfigFixtureTests(unittest.TestCase):
+    def test_a_caller_git_dir_never_receives_the_fixture_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            other = other_repository(root)
+            head, config = git(other, "rev-parse", "HEAD"), (other / ".git/config").read_text()
+            folder = root / "conf"
+            folder.mkdir()
+            path = folder / "build_admission.conf"
+            _ = path.write_text("value=1\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other),
+                                              "GIT_INDEX_FILE": str(other / ".git/index")}):
+                commit_config_fixture(path)
+            self.assertEqual(git(other, "rev-parse", "HEAD"), head)
+            self.assertEqual((other / ".git/config").read_text(), config)
+            self.assertEqual(git(folder, "log", "--format=%an %s"), "Config fixture known good configuration")
+            self.assertEqual(git(folder, "ls-files"), "build_admission.conf")
+
+    def test_a_folder_inside_a_repository_or_outside_the_temporary_root_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            other = other_repository(root)
+            head = git(other, "rev-parse", "HEAD")
+            inside = other / "conf"
+            inside.mkdir()
+            path = inside / "build_admission.conf"
+            _ = path.write_text("value=1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigFixtureRefused, "inside the git repository"):
+                commit_config_fixture(path)
+            self.assertEqual(git(other, "rev-parse", "HEAD"), head)
+            self.assertEqual(git(other, "status", "--porcelain"), "?? conf/")
+            outside = root / "outside"
+            outside.mkdir()
+            with mock.patch.object(tempfile, "gettempdir", return_value=str(root / "private")):
+                with self.assertRaisesRegex(ConfigFixtureRefused, "not a private folder"):
+                    commit_config_fixture(outside / "build_admission.conf")
+            self.assertFalse((outside / ".git").exists())
+            with self.assertRaisesRegex(ConfigFixtureRefused, "not a private folder"):
+                commit_config_fixture(Path(tempfile.gettempdir()) / "build_admission.conf")
+
+    def test_a_second_commit_in_the_same_folder_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "build_admission.conf"
+            _ = path.write_text("value=1\n", encoding="utf-8")
+            commit_config_fixture(path)
+            _ = path.write_text("value=2\n", encoding="utf-8")
+            commit_config_fixture(path)
+            self.assertEqual(len(git(Path(directory), "log", "--format=%s").splitlines()), 2)
+

@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 SCRIPT = Path(__file__).with_name("astra_work.py")
 
@@ -40,8 +40,11 @@ class AstraWorkTests(unittest.TestCase):
     def write_progress(self) -> None:
         _ = (self.run_directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": "durable-run-id", "history_file": str(self.history),
-            "open_phases": [{"id": "3", "instance_id": "instance-three", "status": "open"}],
-            "phase": {"id": "4", "instance_id": "instance-four", "status": "active"},
+            "open_phases": [
+                {"id": "3", "instance_id": "instance-three", "status": "active"},
+                {"id": "4", "instance_id": "instance-four", "status": "active"},
+            ],
+            "phase": {"id": "5", "instance_id": "instance-five", "status": "completed"},
         }), encoding="utf-8")
 
     def brief(self, phase: str = "4") -> subprocess.CompletedProcess[str]:
@@ -67,6 +70,10 @@ class AstraWorkTests(unittest.TestCase):
                 self.assertEqual(str(work.history_file), str(self.history))
                 self.assertEqual(work.phase_id, phase)
                 self.assertEqual(work.phase_instance_id, instance)
+
+    def test_phase_resolution_ignores_the_last_finished_phase(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not resolve to one open phase"):
+            _ = astra_work.phase_work(self.run_directory, "5")
 
     def test_unresolved_phase_and_missing_or_invalid_progress_are_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -101,6 +108,17 @@ class AstraWorkTests(unittest.TestCase):
             rewritten = self.root / "round-trip.md"
             _ = rewritten.write_text(astra_work.header_line(saved) + "\n", encoding="utf-8")
             self.assertEqual(astra_work.read_header(rewritten), saved)
+
+    def test_brief_rerun_after_creation_before_body_finishes_the_assignment(self) -> None:
+        arguments = ["brief", "--run-directory", str(self.run_directory), "--phase", "4",
+                     "--member", "fixture-designer", "--document", str(self.document),
+                     "--round", "2", "--text-file", str(self.text_file)]
+        with stop_once(astra_work, "header_line", when="before"), self.assertRaises(InjectedStop):
+            _ = astra_work.main(arguments)
+        self.assertEqual(astra_work.main(arguments), 0)
+        path = self.run_directory / "design/phase4/round2_brief.md"
+        self.assertIsInstance(astra_work.read_header(path), astra_work.AstraWork)
+        self.assertEqual(path.read_text().split("\n", 1)[1], self.text_file.read_text())
 
     def test_brief_refuses_overwrite_and_does_not_touch_an_existing_reply(self) -> None:
         first = self.brief()

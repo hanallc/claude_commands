@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from scripts.production.fake_unit_host import labeled as labeled_host
+from scripts.herdr import herdr_types
 
 import json
 import math
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -19,27 +19,26 @@ from scripts.lib.script_envelope import script_prompt
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 from scripts.lib.socket_test_support import short_socket_directory
-import session_pane
-import herdr
-import sessions
-import unit_lookup
-from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
-from fake_herdr import CommandResponse
-import fake_unit_host
-from sessions import SessionRecord
+from scripts.production import session_pane
+from scripts.herdr import herdr
+from scripts.message import sessions
+from scripts.production import unit_lookup
+from scripts.herdr.herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production import fake_unit_host
+from scripts.message.sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.production.cli_fixture import invoke_cli
-from scripts.message import sessions as runtime_sessions
+from scripts.message import session_records
 from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("session_pane.py")
 
 
 class SessionPaneTests(unittest.TestCase):
+    owner_socket: Path = Path()
     root: Path = Path()
     records: Path = Path()
     environment: dict[str, str] = {}
@@ -58,13 +57,13 @@ class SessionPaneTests(unittest.TestCase):
             yield submit
 
     def test_source_record_failure_prevents_pane_input(self) -> None:
-        import script_prompts
+        from scripts.lib import script_prompts
 
         with (mock.patch.object(script_prompts, "record", side_effect=OSError("record failed")),
               self.prompt_submission() as submit):
             with self.assertRaisesRegex(OSError, "record failed"):
                 session_pane.type_place(HerdrPlace("native", "w1:p1"), "/resume",
-                                        target=unit_membership("show", "herdr-unit").current_session)
+                                        target=unit_membership("show", "herdr").current_session)
         submit.assert_not_called()
 
     def test_queued_script_input_stays_non_typed_after_six_hours(self) -> None:
@@ -73,7 +72,7 @@ class SessionPaneTests(unittest.TestCase):
         for text in ("Continue the review", "/resume"):
             with self.subTest(text=text), self.prompt_submission() as submit:
                 session_pane.type_place(HerdrPlace("native", "w1:p1"), text,
-                                        target=unit_membership("show", "herdr-unit").current_session)
+                                        target=unit_membership("show", "herdr").current_session)
                 sent = script_prompt(text)
                 submit.assert_called_once_with("agent", "prompt", "w1:p1", sent)
                 for path in (self.root / "conversation-pause" / "script-prompts").glob("*"):
@@ -98,27 +97,31 @@ class SessionPaneTests(unittest.TestCase):
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        _ = unit_membership("show", "herdr-unit")
+        _ = unit_membership("show", "herdr")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         original_start = sessions.process_start
         original_running = sessions.running_session
         original_live = sessions.live_session
 
         def started(pid: int) -> str | None:
-            return "fixture-start" if pid == 998042 else original_start(pid)
+            return "fixture-start" if pid in (998042, 991010, 991011) else original_start(pid)
 
         def running(record: SessionRecord) -> bool:
-            return record["pid"] == 998042 or original_running(record)
+            return record["pid"] in (998042, 991010, 991011) or original_running(record)
 
         def live(record: SessionRecord) -> bool:
             return record["pid"] == 998042 or original_live(record)
 
-        for module in (sessions, runtime_sessions):
+        for module in (sessions, session_records):
             _ = self.enterContext(mock.patch.object(module, "process_start", side_effect=started))
             _ = self.enterContext(mock.patch.object(module, "running_session", side_effect=running))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", side_effect=live))
         _ = self.enterContext(mock.patch.object(session_pane, "live_session", side_effect=live))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")))
+        self.owner_socket = Path(self.enterContext(short_socket_directory())) / "owner.sock"
+        owner_socket = socket.socket(socket.AF_UNIX)
+        owner_socket.bind(str(self.owner_socket))
+        owner_socket.listen(128)
+        self.addCleanup(owner_socket.close)
         self.responses()
 
     def responses(self, *, blocked: bool = False, failed: bool = False) -> None:
@@ -133,15 +136,15 @@ class SessionPaneTests(unittest.TestCase):
         }
         _ = (self.root / "responses.json").write_text(json.dumps(responses))
         fake_unit_host.write(self.environment, [
-            labeled_host("native", "w1:p1", "herdr-unit", slug="show", screen="native screen\n"),
+            labeled_host("native", "w1:p1", "herdr", production_name="show", screen="native screen\n"),
             fake_unit_host.HostedUnit("native", "w1:p2", {}, "native screen\n")])
-        owner = unit_membership("show", "herdr-unit")
+        owner = unit_membership("show", "herdr")
         fake_unit_host.process(self.environment, 998042, 991001, ["claude"], {
             "HERDR_SESSION": "native", "HERDR_PANE_ID": "w1:p1",
-            ('' + 'SHOWRUNNER_' + 'UNIT'): "show", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-unit"})
+            ('' + 'SHOWRUNNER_' + 'UNIT'): "show", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr"})
         _ = (self.records / "998042.json").write_text(json.dumps({
             "pid": 998042, "sessionId": owner.current_session, "name": "fixture", "updatedAt": 1,
-            "procStart": "fixture-start", "messagingSocketPath": "", "tmux": "", "formerNames": []}))
+            "procStart": "fixture-start", "messagingSocketPath": str(self.owner_socket), "tmux": "", "formerNames": []}))
         responses = cast(dict[str, CommandResponse], json.loads((self.root / "responses.json").read_text()))
         responses["--session native pane process-info --pane w1:p1"] = {
             "code": 0, "stdout": json.dumps({"result": {"process_info": {
@@ -192,7 +195,7 @@ class SessionPaneTests(unittest.TestCase):
                     responses[" ".join(command)] = {"stdout": output, "code": 0}
                     _ = path.write_text(json.dumps(responses))
                     options = ("--ansi",) if ansi else ()
-                    result = self.run_cli("read", "unit", "show", "herdr-unit", "--lines", "3", *options)
+                    result = self.run_cli("read", "unit", "show", "herdr", "--lines", "3", *options)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, output)
                     self.assertEqual(self.log("herdr")[-1], command)
@@ -202,7 +205,7 @@ class SessionPaneTests(unittest.TestCase):
         reply = subprocess.CompletedProcess(["fixture"], 0,
             '{"result":{"agents":[{"pane_id":"w1:p1","agent":"claude","agent_status":"blocked"}]}}', "")
         with (mock.patch.object(time, "monotonic", return_value=100.0),
-              mock.patch("herdr.run_program", return_value=reply) as program):
+              mock.patch("scripts.herdr.herdr.run_program", return_value=reply) as program):
             for deadline, expected in ((100.5, 0.5), (float("inf"), 10.0)):
                 with self.subTest(deadline=deadline):
                     self.assertEqual(session_pane.read_place(place, deadline=deadline), reply.stdout)
@@ -211,14 +214,14 @@ class SessionPaneTests(unittest.TestCase):
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
             with self.subTest(deadline=99.0):
                 program.reset_mock()
-                with self.assertRaises(herdr.HerdrFailure):
+                with self.assertRaises(herdr_types.HerdrFailure):
                     _ = session_pane.read_place(place, deadline=99.0)
-                with self.assertRaises(herdr.HerdrFailure):
+                with self.assertRaises(herdr_types.HerdrFailure):
                     _ = session_pane.agent_status(place, deadline=99.0)
                 program.assert_not_called()
 
     def test_every_verb_targets_the_units_herdr_pane(self) -> None:
-        target = ("unit", "show", "herdr-unit")
+        target = ("unit", "show", "herdr")
         found = self.run_cli("where", *target)
         self.assertEqual((found.returncode, found.stdout), (0, "herdr:native:w1:p1\n"), found.stderr)
         read = self.run_cli("read", *target, "--lines", "400", "--joined", "--ansi")
@@ -242,7 +245,7 @@ class SessionPaneTests(unittest.TestCase):
 
     def test_nested_tmux_session_cannot_receive_input_through_the_outer_herdr_pane(self) -> None:
         inherited = {"HERDR_PANE_ID": "w1:p1", ('' + 'SHOWRUNNER_' + 'UNIT'): "show",
-                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr-unit"}
+                     ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "herdr"}
         self.process(991020, 991001, ["tmux: server"], inherited)
         nested = {**inherited, "TMUX_PANE": "%7"}
         self.process(991021, 991020, ["zsh"], nested)
@@ -259,30 +262,81 @@ class SessionPaneTests(unittest.TestCase):
         self.assertEqual(self.log("herdr"), [])
 
     def test_record_place_keeps_its_pid_while_session_lookup_chooses_the_newest(self) -> None:
-        older = SessionRecord(pid=991010, sessionId="conversation", name="older", updatedAt=1,
-            messagingSocketPath="", tmux="", formerNames=[])
-        newer = SessionRecord(pid=991011, sessionId="conversation", name="newer", updatedAt=2,
-            messagingSocketPath="", tmux="", formerNames=[])
+        identity = fixture_runtime_id("record-place-conversation")
+        older = SessionRecord(pid=991010, sessionId=identity, name="older", updatedAt=1,
+            procStart="fixture-start", messagingSocketPath="", tmux="", formerNames=[])
+        newer = SessionRecord(pid=991011, sessionId=identity, name="newer", updatedAt=2,
+            procStart="fixture-start", messagingSocketPath="", tmux="", formerNames=[])
         self.process(991010, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
         self.process(991011, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p2"})
+        fake_unit_host.pane_foreground(self.environment, "native", "w1:p1", 991001, 991010, "claude")
+        fake_unit_host.pane_foreground(self.environment, "native", "w1:p2", 991002, 991011, "claude")
         for saved in (older, newer):
             _ = (self.records / f"{saved['pid']}.json").write_text(json.dumps(saved))
         with mock.patch.object(session_pane, "live_session", return_value=True):
             self.assertEqual(session_pane.record_place(older), HerdrPlace("native", "w1:p1"))
             self.assertEqual(session_pane.record_place(newer), HerdrPlace("native", "w1:p2"))
-            self.assertEqual(session_pane.session_place("conversation"), HerdrPlace("native", "w1:p2"))
+            self.assertEqual(session_pane.session_place(identity), HerdrPlace("native", "w1:p2"))
+
+    def test_unproved_unit_cannot_route_any_command(self) -> None:
+        from scripts.production import session_staff
+
+        place = HerdrPlace("native", "w1:p1")
+        unit = unit_lookup.LabeledSession("herdr", unit_lookup.ClaudeUnknown("process read denied"),
+                                          place, identity=session_staff.UnprovedPaneIdentity())
+        with (mock.patch.object(session_pane, "checked_unit", return_value=unit_lookup.UnknownUnit("process read denied")),
+              mock.patch.object(session_pane, "read_place") as read,
+              mock.patch.object(session_pane, "type_place") as prompt,
+              mock.patch.object(session_pane, "keys_place") as keys):
+            for verb, args in (("where", ()), ("read", ()), ("type", ("hello",)), ("keys", ("Enter",))):
+                with self.subTest(verb=verb):
+                    result = self.run_cli(verb, "unit", "show", "herdr", *args)
+                    self.assertEqual(result.returncode, 3)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("process read denied", result.stderr)
+        read.assert_not_called()
+        prompt.assert_not_called()
+        keys.assert_not_called()
+        self.assertNotIsInstance(unit.identity, session_staff.NoSession)
+
+    def test_registered_claude_child_cannot_select_the_codex_pane(self) -> None:
+        record = self.record({"HERDR_PANE_ID": "w1:p1"}, 991000)
+        place = HerdrPlace("native", "w1:p1")
+        owner = herdr.ProvedCodexForeground(991012, ["codex"], str(self.root), ())
+        with (mock.patch.object(herdr, "process_placement", return_value=place),
+              mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {}}),
+              mock.patch.object(herdr, "foreground_pane_owner", return_value=owner),
+              mock.patch.object(session_pane, "read_place") as read):
+            result = self.run_cli("read", "session", record["sessionId"])
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("foreground Claude owner", result.stderr)
+        read.assert_not_called()
+
+    def test_replaced_conversation_cannot_read_the_same_claude_process(self) -> None:
+        record = self.record({"HERDR_PANE_ID": "w1:p1"}, 991000)
+        owner = herdr.ProvedClaudeForeground(record["pid"], ["claude"], str(self.root))
+        replacement = herdr.NativeAgentProcess(herdr.EnvironmentThread(fixture_runtime_id("replacement")), "1", {})
+        with (mock.patch.object(herdr, "foreground_pane_owner", return_value=owner),
+              mock.patch.object(herdr, "read_foreground_pane_owner", return_value=replacement),
+              mock.patch.object(session_pane, "read_place") as read):
+            result = self.run_cli("read", "session", record["sessionId"])
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("different session", result.stderr)
+        read.assert_not_called()
 
     def test_blocked_type_exits_four_and_sends_no_followup_key(self) -> None:
         self.responses(blocked=True)
-        result = self.run_cli("type", "unit", "show", "herdr-unit", "hello")
+        result = self.run_cli("type", "unit", "show", "herdr", "hello")
         self.assertEqual((result.returncode, result.stderr.strip()),
-                         (4, "unit show herdr-unit: blocked at a prompt; nothing typed"))
+                         (4, "unit show herdr: blocked at a prompt; nothing typed"))
         actions = [row for row in self.log("herdr") if row[2:4] not in (
             ["session", "list"], ["pane", "list"], ["pane", "process-info"])]
         self.assertEqual(actions, [["--session", "native", "agent", "prompt", "w1:p1", script_prompt("hello")]])
         with self.assertRaises(AgentBlocked):
             session_pane.type_place(HerdrPlace("native", "w1:p1"), "hello",
-                                    target=unit_membership("show", "herdr-unit").id)
+                                    target=unit_membership("show", "herdr").id)
 
     def test_replacement_session_receives_no_text_or_keys_for_the_selected_session(self) -> None:
         selected, replacement = "selected-session", "replacement-session"
@@ -304,14 +358,14 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(replacement), "replacement-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(replacement), "replacement-generation", {})
 
         with (mock.patch.object(session_pane, "Herdr", return_value=client),
               mock.patch.object(client, "run", side_effect=transport),
               mock.patch.object(herdr, "native_process", side_effect=native)):
             for verb in ("type", "keys"):
                 with self.subTest(verb=verb), self.assertRaisesRegex(
-                        herdr.HerdrFailure, "does not run session selected-session"):
+                        herdr_types.HerdrFailure, "does not run session selected-session"):
                     if verb == "type":
                         session_pane.type_place(place, "message for A", target=selected)
                     else:
@@ -321,7 +375,7 @@ class SessionPaneTests(unittest.TestCase):
             ("pane", "list"), ("pane", "process-info", "--pane", place.pane)])
 
     def test_a_staff_row_id_never_redirects_input_or_closure_to_its_replacement(self) -> None:
-        row = unit_membership("show", "herdr-unit")
+        row = unit_membership("show", "herdr")
         selected = row.id
         replacement = staff.native_id(fixture_runtime_id("replacement-conversation"))
         row = staff.update_current_session(row.current_session, replacement)
@@ -346,7 +400,7 @@ class SessionPaneTests(unittest.TestCase):
 
         def native(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (998042, "claude"))
-            return herdr.NativeAgentProcess(herdr.RolloutThread(observed), "private-generation", {})
+            return herdr.NativeAgentProcess(herdr.EnvironmentThread(observed), "private-generation", {})
 
         def send(verb: str, target: str) -> None:
             if verb == "type":
@@ -361,7 +415,7 @@ class SessionPaneTests(unittest.TestCase):
               mock.patch.object(herdr, "native_process", side_effect=native)):
             for verb in ("type", "keys", "close"):
                 with self.subTest(verb=verb), self.assertRaisesRegex(
-                        herdr.HerdrFailure, f"does not run session {selected}") as refused:
+                        herdr_types.HerdrFailure, f"does not run session {selected}") as refused:
                     send(verb, selected)
                 self.assertEqual(refused.exception.code, "wrong_target")
             self.assertFalse(any(command[:2] in (
@@ -377,15 +431,27 @@ class SessionPaneTests(unittest.TestCase):
                 self.assertIn(("pane", "close", place.pane), commands)
 
 
+    def test_missing_registry_folder_returns_an_error(self) -> None:
+        with mock.patch.dict(self.environment, {"NOTIFIER_SESSIONS_DIR": str(self.root / "absent")}):
+            result = self.run_cli("where", "session", "missing")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (3, "", "session missing: one or more session records could not be read\n"))
+
+    def test_denied_registry_folder_returns_an_error(self) -> None:
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(self.records)):
+            result = self.run_cli("where", "session", "missing")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (3, "", "session missing: one or more session records could not be read\n"))
+
     def test_usage_missing_targets_and_unreadable_hosts_have_distinct_exits(self) -> None:
-        for args in ((), ("keys", "unit", "show", "herdr-unit"),
-                     ("read", "unit", "show", "herdr-unit", "--lines", "0"),
-                     ("type", "unit", "show", "herdr-unit", "one", "two")):
+        for args in ((), ("keys", "unit", "show", "herdr"),
+                     ("read", "unit", "show", "herdr", "--lines", "0"),
+                     ("type", "unit", "show", "herdr", "one", "two")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
         self.assertEqual(self.run_cli("where", "unit", "show", "missing").returncode, 1)
         self.assertEqual(self.run_cli("where", "session", "missing").returncode, 1)
         self.responses(failed=True)
-        self.assertEqual(self.run_cli("read", "unit", "show", "herdr-unit").returncode, 3)
+        self.assertEqual(self.run_cli("read", "unit", "show", "herdr").returncode, 3)
         _ = (self.records / "broken.json").write_text("{")
         self.assertEqual(self.run_cli("where", "session", "missing").returncode, 3)
 

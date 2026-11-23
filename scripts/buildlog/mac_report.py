@@ -5,19 +5,21 @@ from __future__ import annotations
 import math
 import re
 import sqlite3
-import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum, auto
-from typing import Literal, TypeVar, cast
+from typing import Literal, TypeVar, assert_never, cast
 
-import index
-import holds
-import record
-import store
-from offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
-from mac_outcome import (
+from scripts.buildlog import index
+from scripts.buildlog import holds
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.mac_test.offload import (
+    KnownMacJob, LostRunLeftovers, MacHolder, MirrorBusyCheck, RecordedMirrorSession, UnreadableMacHolder,
+    holder_from_value, holder_value,
+)
+from scripts.buildlog.mac_outcome import (
     COUNTED_AGAINST_SHARE, NOT_USABLE_REASONS, CacheReuse, LocalReasonNotRecorded,
     LocalRunRequested, MacRunCompleted, MacRunLost, MacRunMatchedNoTest,
     NoOffloadRecord, OffloadDeclined, OffloadDeclineReason, OffloadRecord,
@@ -25,9 +27,7 @@ from mac_outcome import (
     UsableShare, is_mac_candidate, is_mac_step, offload_record, share_of_records,
 )
 
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 LOCAL_MAC_UNAVAILABLE_PATTERNS = (
     r"\bmac\b.*\b(?:unavailable|busy|blocked|unreachable|offline|not available|not reachable)\b",
@@ -59,21 +59,21 @@ RecordedBusyHolder = MacHolder | MacHolderNotRecorded
 def recorded_busy_holder(value: object) -> RecordedBusyHolder:
     if not isinstance(value, str) or not value:
         return MacHolderNotRecorded.VALUE
-    if value == "leftovers":
-        return LostRunLeftovers()
-    if value == "unreadable":
-        return UnreadableMacHolder()
-    return KnownMacJob(value)
+    return holder_from_value(value)
 
 
 def holder_text(holder: RecordedBusyHolder) -> str:
-    if isinstance(holder, KnownMacJob):
-        return holder.what
-    if isinstance(holder, LostRunLeftovers):
-        return "lost-run leftovers"
-    if isinstance(holder, UnreadableMacHolder):
-        return "holder unreadable"
-    return holder.value
+    match holder:
+        case UnreadableMacHolder(mirror_check=MirrorBusyCheck.UNREPORTED):
+            return "holder unreadable"
+        case KnownMacJob() | RecordedMirrorSession() | UnreadableMacHolder():
+            return holder_value(holder)
+        case LostRunLeftovers():
+            return "lost-run leftovers"
+        case MacHolderNotRecorded.VALUE:
+            return holder.value
+        case _:
+            assert_never(holder)
 
 
 @dataclass(frozen=True)
@@ -452,7 +452,7 @@ def mac_report(connection: sqlite3.Connection, now: datetime, hours: float = 24)
 
 
 def main(args: list[str]) -> int:
-    from number_option import positive_window
+    from scripts.buildlog.number_option import positive_window
 
     window = positive_window(args, "--hours", 24, "mac-report")
     if window is None:

@@ -1,7 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Load and validate global and repository style rule metadata."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import atexit
@@ -17,10 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
-from git_process import GitReadFailed, run_git
+from scripts.lib import git_files
+from scripts.lib.git_blob import git_blob_id
+from scripts.style.git_process import GitBlob, read_batch_blob
 
-import style_rules
-from candidate_generators import CandidatesSpec
+from scripts.style import style_rules
+from scripts.style.candidate_generators import CandidatesSpec
 
 Tier = Literal["A", "B", "C", "D", "E"]
 Family = Literal["names", "values", "types", "modules"]
@@ -36,7 +42,7 @@ class NotStyleUnit:
 def style_family(unit: str) -> Family | NotStyleUnit:
     families: tuple[Family, ...] = ("names", "values", "types", "modules")
     for family in families:
-        suffix = f"{family}-unit"
+        suffix = family
         if unit == suffix or unit.endswith("-" + suffix):
             return family
     return NotStyleUnit()
@@ -231,14 +237,11 @@ class ValidatedRuleHistory:
                     responses = cast(BinaryIO, self.process.stdout)
                     _ = requests.write(blob.encode() + b"\n")
                     requests.flush()
-                    header = responses.readline().split()
-                    if len(header) == 3:
-                        content = responses.read(int(header[2]))
-                        separator = responses.read(1)
-                        if header[1] == b"blob" and len(content) == int(header[2]) and separator == b"\n":
-                            identity = _rule_from_text(
-                                rule.path, rule.origin, rule.path.parent, rule.reach, content, blob,
-                            ).judgment_identity
+                    reply = read_batch_blob(responses)
+                    if isinstance(reply, GitBlob):
+                        identity = _rule_from_text(
+                            rule.path, rule.origin, rule.path.parent, rule.reach, reply.content, blob,
+                        ).judgment_identity
                 except (OSError, ValueError):
                     pass
                 self.identities[key] = identity
@@ -254,15 +257,10 @@ class RuleRepositoryIdentity:
 
     @classmethod
     def at(cls, repo: Path) -> RuleRepositoryIdentity:
-        git_dir = repo / ".git"
-        if git_dir.is_file():
-            marker = git_dir.read_text().strip()
-            if not marker.startswith("gitdir: "):
-                raise OSError("unreadable Git directory marker")
-            git_dir = repo / marker.removeprefix("gitdir: ")
-        git_dir = git_dir.resolve(strict=True)
-        common = git_dir / "commondir"
-        common_dir = (git_dir / common.read_text().strip()).resolve(strict=True) if common.is_file() else git_dir
+        try:
+            common_dir = git_files.at(repo).common_dir
+        except git_files.GitFilesError as error:
+            raise OSError(str(error)) from error
         objects = (common_dir / "objects").resolve(strict=True)
         object_stat = objects.stat()
         return cls(common_dir, (object_stat.st_dev, object_stat.st_ino))
@@ -425,7 +423,7 @@ def _rule_from_text(path: Path, origin: RuleOrigin, rule_root: Path, reach: Repo
 
 def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach | MemberReach) -> Rule:
     text = path.read_bytes()
-    blob = run_git(("git", "hash-object", "--stdin"), input=text).stdout.decode().strip()
+    blob = git_blob_id(text)
     return _rule_from_text(path, origin, rule_root, reach, text, blob)
 
 
@@ -496,9 +494,13 @@ def workspace_members(manifests: dict[str, str]) -> tuple[WorkspaceMember, ...]:
     return tuple(sorted(members, key=lambda member: (-len(PurePosixPath(member.directory).parts), member.directory)))
 
 
-def _member_reach(repo_root: Path, member: str, rule_path: Path) -> MemberReach:
+def _repository_members(repo_root: Path) -> tuple[WorkspaceMember, ...]:
     manifests = {path.relative_to(repo_root).as_posix(): path.read_text() for path in repo_root.rglob("Cargo.toml") if path.is_file()}
-    for candidate in workspace_members(manifests):
+    return workspace_members(manifests)
+
+
+def _member_reach(members: tuple[WorkspaceMember, ...], repo_root: Path, member: str, rule_path: Path) -> MemberReach:
+    for candidate in members:
         if (repo_root / candidate.directory).resolve().name == member or candidate.package_name == member:
             return MemberReach(member, Path(candidate.directory))
     raise RuleValidationError(rule_path, f"member-local rule names no workspace member {member}")
@@ -523,13 +525,15 @@ def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     if repo_root is not None:
         repo_root = repo_root.expanduser().resolve()
         docs = repo_root / "docs"
-        directories = [docs / "style", *sorted(docs.glob("*/style"))]
-        for directory in directories:
+        member_directories = sorted(docs.glob("*/style"))
+        # Every member rule resolves against one read of the repository's manifests.
+        members = _repository_members(repo_root) if member_directories else ()
+        for directory in [docs / "style", *member_directories]:
             rules.extend(
                 _load_rule(
                     path.resolve(), "local", repo_root,
                     RepoReach() if directory == docs / "style"
-                    else _member_reach(repo_root, directory.parent.name, path),
+                    else _member_reach(members, repo_root, directory.parent.name, path),
                 )
                 for path in sorted(directory.glob("*.md")) if path.is_file()
             )
@@ -559,7 +563,7 @@ def main() -> None:
     args = parser.parse_args(namespace=ListArguments())
     try:
         rules = load_rules(Path(args.repo) if args.repo else None)
-    except (RuleValidationError, OSError, GitReadFailed) as error:
+    except (RuleValidationError, OSError) as error:
         parser.exit(2, f"rules: {error}\n")
     rows: list[RuleListing] = [
         {

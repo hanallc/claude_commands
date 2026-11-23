@@ -14,26 +14,18 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import auto_silence
-import silence
+from scripts.notify import auto_silence
+from scripts.notify import silence
 
-if TYPE_CHECKING:
-    from ..lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
-    from ..lib import relaunch
-    from ..lib.resume_message import resume_message
-    from ..production import session_staff
-    from ..shutdown import pane_record
-    from ..hooks import conversation_pause
-else:
-    from scripts.lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
-    from scripts.lib import relaunch
-    from scripts.lib.resume_message import resume_message
-    from scripts.production import session_staff
-    from scripts.shutdown import pane_record
-    from scripts.hooks import conversation_pause
+from scripts.lib.prompt_activity import UserTypedPrompt, PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt
+from scripts.lib import relaunch
+from scripts.lib import resume_message
+from scripts.production import session_staff, staff
+from scripts.agents import pane_record
+from scripts.hooks import conversation_pause
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "The build passed.", "detail": "", "key": "", "text_id": ""}
@@ -49,7 +41,11 @@ class AutoSilenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": folder})))
+        records = Path(folder) / "pane-records"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "NOTIFY_STATE_DIR": folder, "STAFF_FILE": str(Path(folder) / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(records)})))
+        _ = cast(object, self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", records)))
         self.commands, self.pushes, self.posted, self.now = [], [], [], START
         registry = Path(folder) / "sessions"
         registry.mkdir()
@@ -66,20 +62,30 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("check")
         before = silence.state_file().read_bytes()
 
-        def historical_resume(cause: str) -> str:
+        def historical_resume(cause: str, *,
+                              move: resume_message.NoAccountMove | resume_message.AccountMove = resume_message.NO_ACCOUNT_MOVE,
+                              workers: resume_message.ResumeWorkers = resume_message.NO_WORKERS,
+                              context: str = "",
+                              own_pass: resume_message.BusyPass | resume_message.NoOwnPass = resume_message.NO_OWN_PASS,
+                              unit: staff.StaffRow | None = None) -> str:
             self.assertEqual(cause, "you were stopped and resumed")
-            return resume_message("the herdr server restarted")
+            return resume_message.resume_message("the herdr server restarted", move=move,
+                                                  workers=workers, context=context, own_pass=own_pass, unit=unit)
 
-        for name, identity in (("devtools-unit", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
-                               ("models-unit", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
+        for name, identity in (("devtools", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
+                               ("models", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
             with self.subTest(session=name):
                 entry = pane_record.launch("w1:p1", identity, "/fixture", {}, ["claude"])
+                self.assertNotIn("staff_id", entry)
                 environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}
                 with (mock.patch.object(pane_record, "matching_launch", return_value=entry),
                       mock.patch.object(session_staff, "record_membership", return_value=entry),
                       mock.patch.object(relaunch, "resume_message", historical_resume),
-                      mock.patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(silence.state_dir() / "prompts")})):
+                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                      mock.patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(silence.state_dir() / "prompts")}),
+                      redirect_stderr(io.StringIO()) as errors):
                     arguments, _ = relaunch.restored_launch(["claude", "--resume", identity], environment)
+                self.assertEqual(errors.getvalue(), "")
                 prompt = arguments[-1]
                 self.assertIn("You were stopped and resumed because the herdr server restarted.", prompt)
                 source = conversation_pause.prompt_source(prompt, lambda: frozenset(), lambda: ())
@@ -167,7 +173,7 @@ class AutoSilenceTests(unittest.TestCase):
         record = silence.read_state()
         self.assertIsNotNone(record)
         self.assertTrue(record and record["auto"])
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.Kept("until you are back"))
+        self.assertEqual(silence.keep_here(PUSH), silence.Kept("until you are back"))
         self.now += 3600
         _ = self.main("check")
         self.assertEqual(len(self.pushes), 1)
@@ -193,7 +199,7 @@ class AutoSilenceTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(auto_silence.check(lambda: self.now, sender), 0)
                 for index in range(count):
-                    _ = silence.keep({**PUSH, "title": f"Build {index} done"}, "Linux")
+                    _ = silence.keep_here({**PUSH, "title": f"Build {index} done"})
                 events.clear()
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner, deliver, UserTypedPrompt("typed")), 0)
@@ -265,7 +271,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         before = auto_silence.config_file().read_bytes()
         for source in (PeerPrompt, ScriptPrompt, HarnessNotice, UnknownPrompt):
             with self.subTest(source=source.__name__):
@@ -282,7 +288,7 @@ class AutoSilenceTests(unittest.TestCase):
         self.now += 3000
         _ = self.main("check")
         start = self.events()[0]
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
 
         def sender(argv: Sequence[str]) -> int:
             event = self.events()[-1]
@@ -302,7 +308,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         state, kept = silence.state_file().read_bytes(), silence.kept_file().read_bytes()
         with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
               redirect_stderr(io.StringIO())):
@@ -325,7 +331,7 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("45min")
         self.now += 3000
         _ = self.main("check")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with redirect_stdout(io.StringIO()):
             self.assertEqual(auto_silence.active(lambda: self.now, self.sender, self.runner,
                 lambda _push: 1, UserTypedPrompt("typed")), 1)

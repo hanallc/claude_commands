@@ -1,46 +1,57 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lib import cancellation, test_phase
+
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
-from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
-from dataclasses import replace
-import json
+from dataclasses import dataclass, replace
+import errno
+import math
 import os
+import json
 from pathlib import Path
 import select
+from selectors import EVENT_READ, EVENT_WRITE
 import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
 import uuid
 from unittest import mock
-from typing import TYPE_CHECKING, cast, override
+from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
-if TYPE_CHECKING:
-    from ..buildlog import store
-else:
-    import store
-
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
-from scripts.build_queue.queue_fixture import write_process
-from scripts.lib.test_hang_guard import LauncherHangGuard
-from scripts.lib import build_folders
+from scripts.build_queue import placement
+from scripts.mac_test import claim_state, mac_test
+from scripts.build_hold import build_hold
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+from scripts.build_targets import build_targets
+from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
-GIB = gate.GIB
-DEFAULT_WIDTH = gate.RequestedTestWidth(8)
-DEFAULT_CALL = gate.CallRecord("call-1")
+GIB = records.GIB
+DEFAULT_WIDTH = records.RequestedTestWidth(8)
+DEFAULT_CALL = test_phase.CallRecord("call-1")
+FIXTURE_POLICY = admission_policy_fixture()
+SERVING_POLL_SECONDS = 0.05
 
 
 class FakeClock:
@@ -118,11 +129,36 @@ class ScopeEvents:
 class ObservedAdmissionServer(service.AdmissionServer):
     """Expose loop instrumentation only at the shared test fixture boundary."""
 
+    _source_path_cache: ClassVar[tuple[Path, int, set[Path]]] = (Path(), -1, set())
+
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
-                 check_access: Callable[[str], None]) -> None:
+                 check_access: Callable[[str], None], before_admission: Callable[[], None],
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
         self.check_access: Callable[[str], None] = check_access
-        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path)
+        self.before_admission: Callable[[], None] = before_admission
+        self.wake_lock: threading.Lock = threading.Lock()
+        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe)
+
+    @override
+    def close(self) -> None:
+        with self.wake_lock:
+            super().close()
+
+    def wake_loop(self) -> None:
+        with self.wake_lock:
+            if not self.closed:
+                os.eventfd_write(self.priority_events, 1)
+
+    @override
+    def _source_paths(self) -> set[Path]:
+        key = (self.source_root, len(sys.modules))
+        root, module_count, paths = ObservedAdmissionServer._source_path_cache
+        if (root, module_count) == key:
+            return set(paths)
+        paths = super()._source_paths()
+        ObservedAdmissionServer._source_path_cache = (*key, set(paths))
+        return paths
 
     @override
     def persist(self) -> None:
@@ -153,10 +189,29 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def handle_request(self, request: wire.Request,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
         self.check_access("handle_request")
-        if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and isinstance(self.proc, TestProcesses):
-            self.proc.register(request.owner)
+        if isinstance(request, wire.PlacementRequest) and isinstance(self.proc, TestProcesses):
+            self.before_admission()
+            self.proc.register(wire.Owner(request.owner.pid, request.owner.start_time))
+            if isinstance(request.run, wire.RunIdentity):
+                self.proc.register(wire.Owner(request.run.pid, request.run.start_time))
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
+            self.before_admission()
+            if isinstance(self.proc, TestProcesses):
+                self.proc.register(request.owner)
         return super().handle_request(request, connection)
 
+    def caller_live(self, scenery: set[str]) -> bool:
+        """Use the service lifetime rules for caller reservations, waiters, and slots."""
+        for record in self.reservations.values():
+            if (record.reservation_id not in scenery
+                    and not isinstance(self.proc.lifetime(service.reservation_row(record), self._live(record.owner)), gate.EndedStep)):
+                return True
+        if any(self._live(waiting.request.owner) for waiting in self.waiters.values()):
+            return True
+        return any(gate.between_steps(slot).reservation not in scenery
+                   and gate.slot_in_force(slot, self.clock.now())
+                   and self._run_alive(gate.between_steps(slot).run)
+                   for slot in self.slots.values())
 
     @contextmanager
     def silent_replies(self) -> Generator[None]:
@@ -200,7 +255,7 @@ class TestProcesses:
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
-        start = gate.process_start_time(child.pid)
+        start = records.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -217,25 +272,28 @@ class TestProcesses:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
-        start = self.fixture_owners[pid] if pid in self.fixture_owners else gate.process_start_time(pid)
+        start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
+
+    def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        return service.linux_owner_process(pid, Path("/proc"))
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
 
-    def lifetime(self, row: gate.Reservation, owner_live: bool) -> gate.PopulatedStepScope | gate.LiveOwnerProcess | gate.EndedStep:
+    def lifetime(self, row: records.Reservation, owner_live: bool) -> gate.StepLifetime:
         return gate.reservation_lifetime(row, owner_live)
 
     def kill(self, owner: wire.Owner) -> None:
         child = next(child for child in self.children if child.pid == owner.pid)
         child.kill()
-        _ = child.wait(timeout=2)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def close(self) -> None:
         for child in self.children:
             if child.poll() is None:
                 child.kill()
-            _ = child.wait(timeout=2)
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
 class PrivateReadings:
@@ -245,24 +303,28 @@ class PrivateReadings:
         self.host_path: Path = root / "meminfo"
         self.counts: Counter[str] = Counter()
 
-    def host(self) -> gate.HostMemory | gate.ReadingUnavailable:
+    def host(self) -> records.HostMemory | records.ReadingUnavailable:
         self.counts["host"] += 1
         try:
             return gate.read_meminfo(self.host_path)
         except Exception as error:
-            return gate.ReadingUnavailable(str(error))
+            return records.ReadingUnavailable(str(error))
 
-    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure | gate.PressureUnavailable:
+    def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure_reading(host, policy=policy)
+        return gate.read_pressure(host, policy=policy)
 
-    def compilers(self) -> list[gate.StepMemory]:
+    def build_space(self, floor: int) -> records.NoBuildSpaceHold:
+        self.counts[f"build_space:{floor}"] += 1
+        return records.NoBuildSpaceHold()
+
+    def compilers(self) -> list[records.StepMemory]:
         self.counts["compilers"] += 1
         return gate.sccache_memory()
 
-    def reservation(self, path: Path, row: gate.Reservation, now: datetime,
+    def reservation(self, path: Path, row: records.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path,
-                    policy: gate.AdmissionPolicy) -> gate.StepMemory:
+                    policy: records.AdmissionPolicy) -> records.StepMemory:
         self.counts[f"reservation:{row['pid']}"] += 1
         return gate.reservation_memory(path, row, now, processes, proc, policy)
 
@@ -297,53 +359,87 @@ class SocketPeer:
         self.socket.close()
 
 
+class RefillMark(threading.local):
+    clear_pending: bool = False
+
+
+class GaplessRefill:
+    """A patch.dict exit calls clear() and then update(); the clear waits for that update, so no reader sees an empty environment."""
+    def __init__(self, environ: MutableMapping[str, str]) -> None:
+        self.environ: MutableMapping[str, str] = environ
+        self.mark: RefillMark = RefillMark()
+
+    def clear(self) -> None:
+        """The clear waits for the next update() from this thread, so a direct os.environ.clear() keeps the environment while a fixture is open."""
+        self.mark.clear_pending = True
+
+    def update(self, values: Mapping[str, str] | Iterable[tuple[str, str]] = (), /, **keywords: str) -> None:
+        cleared, self.mark.clear_pending = self.mark.clear_pending, False
+        target = dict(values, **keywords)
+        for key, value in target.items():
+            self.environ[key] = value
+        if cleared:
+            for key in [key for key in self.environ if key not in target]:
+                # Another thread can remove the same key first.
+                with suppress(KeyError):
+                    del self.environ[key]
+
+
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
-    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None) -> None:
+    def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
+                 state_dir: Path | None = None, skip_idle_spacing: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
-        self.root: Path = root if root is not None else self.enter_context(
-            build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
-        # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
-        self.socket_dir: Path = Path(self.enter_context(
-            short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
-        self.state_dir: Path = (log_dir if log_dir is not None else self.root / "log") / "admission"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.socket_path: Path = self.socket_dir / "admission.sock"
-        self.scenery_reservations: set[str] = set()
-        self.clock: FakeClock = FakeClock()
-        self.fault: Faults = Faults()
-        self.proc: TestProcesses = TestProcesses(self.root / "proc")
-        _ = self.callback(self.proc.close)
-        pressure = self.root / "pressure"
-        if not pressure.exists():
-            write_pressure_reading(pressure)
-        memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
-                   "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
-                  if (self.root / "meminfo").exists() else fake_memory_readings(
-                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-        environment = {**gate_isolation_environment(self.root), **memory,
-            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
-            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
-            "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
-            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.state_dir.parent),
-            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
-            "BUILDLOG_RUN": "",
-            "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root)}
-        self.enter_context(mock.patch.dict(os.environ, environment))
-        if not (self.root / "build_admission.conf").exists():
-            write_memory_config(self.root / "build_admission.conf")
-        self.readings: PrivateReadings = PrivateReadings(self.root)
-        self.loop_access: threading.RLock = threading.RLock()
-        self.serving_active: threading.Event = threading.Event()
-        self.loop_permission: threading.local = threading.local()
+        self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         try:
+            self.temporary: Path = self.root / "tmp"
+            self.temporary.mkdir(parents=True, exist_ok=True)
+            # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
+            self.socket_dir: Path = Path(self.enter_context(
+                short_socket_directory()))
+            logs = log_dir if log_dir is not None else self.root / "log"
+            self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self.socket_path: Path = self.socket_dir / "admission.sock"
+            self.scenery_reservations: set[str] = set()
+            self.skip_idle_spacing: bool = skip_idle_spacing
+            self.clock: FakeClock = FakeClock()
+            self.fault: Faults = Faults()
+            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            _ = self.callback(self.proc.close)
+            pressure = self.root / "pressure"
+            if not pressure.exists():
+                write_pressure_reading(pressure)
+            memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+                       "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
+                      if (self.root / "meminfo").exists() else fake_memory_readings(
+                          self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
+            environment = {**gate_isolation_environment(self.root), **memory,
+                "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
+                "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
+                "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
+                "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
+                "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+                "BUILDLOG_RUN": "",
+                "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
+                "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
+                "HOME": str(self.root), "TMPDIR": str(self.temporary),
+                **interpreter_cache_environment(self.root / "cache")}
+            refill = GaplessRefill(os.environ)
+            _ = self.enter_context(mock.patch.object(os.environ, "clear", refill.clear))
+            _ = self.enter_context(mock.patch.object(os.environ, "update", refill.update))
+            self.enter_context(mock.patch.dict(os.environ, environment))
+            if not (self.root / "build_admission.conf").exists():
+                write_memory_config(self.root / "build_admission.conf")
+            self.readings: PrivateReadings = PrivateReadings(self.root)
+            self.turn_gate: threading.Lock = threading.Lock()
+            self.loop_access: threading.RLock = threading.RLock()
+            self.serving_active: threading.Event = threading.Event()
+            self.loop_permission: threading.local = threading.local()
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
             self.close()
@@ -352,10 +448,14 @@ class AdmissionFixture(ExitStack):
 
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
-                                         fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn)
+                                         fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn,
+                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider)
         if start:
             server.start()
         return server
+
+    def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        return placement.HostEvidenceUnavailable(key, self.clock.now(), "the fixture has no provider transport")
 
     def restart(self) -> None:
         self.server.close()
@@ -370,6 +470,7 @@ class AdmissionFixture(ExitStack):
         real_monotonic = time.monotonic
 
         def serve() -> None:
+            self.loop_permission.serves_loop = True
             previous = real_monotonic()
             try:
                 while not stopped.is_set():
@@ -377,22 +478,26 @@ class AdmissionFixture(ExitStack):
                     self.clock.advance(current - previous)
                     previous = current
                     with self.loop_turn():
-                        self.server.run_once(0.01)
+                        self.server.run_once(SERVING_POLL_SECONDS)
             except BaseException as error:
                 failures.append(error)
                 stopped.set()
 
         worker = threading.Thread(target=serve, name="private-admission-loop")
         self.serving_active.set()
-        worker.start()
         try:
+            cancellation.start_masked_thread(worker)
             yield self
         finally:
             stopped.set()
-            worker.join(timeout=3)
-            if worker.is_alive():
-                raise AssertionError("the private admission loop did not stop")
-            self.serving_active.clear()
+            try:
+                if worker.ident is not None:
+                    self.server.wake_loop()
+                    worker.join(timeout=TEST_HANG_GUARD_SECS)
+                    if worker.is_alive():
+                        raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
+            finally:
+                self.serving_active.clear()
             if failures:
                 raise failures[0]
 
@@ -410,9 +515,18 @@ class AdmissionFixture(ExitStack):
 
     @contextmanager
     def loop_turn(self) -> Generator[None]:
-        if not self.loop_access.acquire(timeout=3):
-            raise AssertionError("the private admission loop did not yield within 3 seconds")
-        self.loop_permission.depth = getattr(self.loop_permission, "depth", 0) + 1
+        depth = getattr(self.loop_permission, "depth", 0)
+        if depth == 0 and not self.turn_gate.acquire(timeout=TEST_HANG_GUARD_SECS):
+            raise AssertionError(f"the private admission loop did not yield within {TEST_HANG_GUARD_SECS} seconds")
+        try:
+            if depth == 0 and self.serving_active.is_set() and not getattr(self.loop_permission, "serves_loop", False):
+                self.server.wake_loop()
+            if not self.loop_access.acquire(timeout=TEST_HANG_GUARD_SECS):
+                raise AssertionError(f"the private admission loop did not yield within {TEST_HANG_GUARD_SECS} seconds")
+        finally:
+            if depth == 0:
+                self.turn_gate.release()
+        self.loop_permission.depth = depth + 1
         try:
             yield
         finally:
@@ -475,9 +589,7 @@ class AdmissionFixture(ExitStack):
         self.allow_next_start()
         with self.loop_turn():
             granted = only_admitted(self.server.handle_request(request))
-            replies = self.server.handle_request(wire.ReleaseRequest(f"finish-{request.episode}", granted.reservation, 0))
-        if replies != [wire.Ok()]:
-            raise AssertionError(f"step release failed: {replies!r}")
+            self.release(granted)
         if end_owner:
             self.end_owner(request.owner)
         return granted
@@ -499,24 +611,24 @@ class AdmissionFixture(ExitStack):
             with mock.patch.object(self.server, "epoll", events):
                 self.server.run_once(0)
 
-    def build_history_generation(self) -> gate.BuildHistoryGeneration:
+    def build_history_generation(self) -> records.BuildHistoryGeneration:
         with self.loop_turn():
             reply, = self.server.handle_request(wire.BuildHistoryRequest())
         assert isinstance(reply, wire.BuildHistoryReply)
-        return gate.BuildHistoryGeneration(reply.generation)
+        return records.BuildHistoryGeneration(reply.generation)
 
     def request(self, *, need: int = 8 * GIB, owner: wire.Owner | None = None,
                 episode: str = "", since: float | None = None, age: float = 0,
-                width: gate.TestWidth = DEFAULT_WIDTH,
-                call: gate.Call = DEFAULT_CALL, step: str = "nextest",
+                width: records.TestWidth = DEFAULT_WIDTH,
+                call: records.Call = DEFAULT_CALL, step: str = "nextest",
                 run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
         from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
 
         owner = owner or self.proc.spawn()
-        generation: gate.BuildHistoryGeneration | gate.NoBuildHistoryGeneration = gate.NoBuildHistoryGeneration()
+        generation: records.BuildHistoryGeneration | records.NoBuildHistoryGeneration = records.NoBuildHistoryGeneration()
         if step == "build":
             generation = self.build_history_generation()
-        profile = gate.StepProfile("fixture", step, "tree", gate.ExpectedPeak(need, "measured", 5),
+        profile = records.StepProfile("fixture", step, "tree", records.ExpectedPeak(need, "measured", 5),
             estimated_at=self.clock.now() - age, build_history_generation=generation)
         return wire.AdmitRequest(episode or f"episode-{owner.pid}", owner, ("cargo", step),
             str(self.root), self.clock.now() if since is None else since, "",
@@ -528,10 +640,47 @@ class AdmissionFixture(ExitStack):
         return wire.LaunchRequest(request.episode, request.owner, request.since,
                                   request.identity, request.profile, code_version=request.code_version)
 
+    def service_request(self, *, runner: str = "runner-a", job: str = "compile",
+                        owner: wire.Owner | None = None) -> wire.ServiceEstimateRequest:
+        """Request a service estimate without a client profile or history read."""
+        from scripts.build_queue.admission_client import LOADED_ADMISSION_CODE_VERSION
+
+        owner = owner or self.proc.spawn()
+        sidecar = self.root / f"runner-{owner.pid}.cgroup"
+        _ = sidecar.write_text("")
+        return wire.ServiceEstimateRequest(f"uid:{os.getuid()}:ci-{owner.pid}", owner,
+            ("cargo", "build"), str(self.root), self.clock.now(), str(sidecar),
+            records.RepositoryIdentity("fixture-repository", "fixture"), str(self.root), runner, job,
+            code_version=LOADED_ADMISSION_CODE_VERSION)
+
+    def account_owner(self, uid: int) -> wire.Owner:
+        """Supply an account identity through the private process status reader."""
+        owner = self.proc.spawn()
+        status = self.proc.path / str(owner.pid) / "status"
+        _ = status.write_text(status.read_text() + f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        return owner
+
+    @contextmanager
+    def peer_account(self, uid: int) -> Generator[None]:
+        """Select credentials at the socket boundary without a real runner account."""
+        with mock.patch.object(service, "peer_uid", return_value=uid):
+            yield
+
     def connect(self, request: wire.Request | str) -> SocketPeer:
         peer = SocketPeer(self, request)
         _ = self.callback(peer.close)
         return peer
+
+    def completed_queue_change(self, request: wire.Request) -> list[wire.Reply]:
+        """Run the private loop until this change replies through its socket."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.connect(str(self.socket_path))
+            peer.sendall(wire.encode_request(request).encode())
+            with self.loop_turn():
+                while not select.select([peer], [], [], 0)[0]:
+                    self.server.run_once(float("inf"))
+            with peer.makefile("rb") as stream:
+                return [wire.parse_reply(stream.readline())]
 
     def occupy_host(self) -> wire.Admitted:
         """Keep one measured run active without another memory keep-aside."""
@@ -554,15 +703,33 @@ class AdmissionFixture(ExitStack):
         with self.loop_turn():
             return not self.server.waiters and not self.caller_reservations()
 
-    def hold_starts(self) -> None:
+    def hold_starts(self, *, unreadable: bool = False) -> None:
         """Hold new starts without creating a running reservation."""
-        _ = (self.root / "pressure").write_text("full avg10=99\nsome avg10=0\n")
+        path = self.root / "pressure"
+        if unreadable:
+            path.unlink()
+        else:
+            write_pressure_reading(path, full_avg10=99)
+
+    def release(self, grant: wire.Admitted) -> None:
+        """Release one grant through the private service loop."""
+        with self.loop_turn():
+            replies = self.server.handle_request(wire.ReleaseRequest(
+                f"release-{grant.reservation}", grant.reservation, 0))
+        if replies != [wire.Ok()]:
+            raise AssertionError(replies)
 
     def allow_next_start(self) -> None:
         """Move the fake clock to the next permitted new start."""
-        spacing = self.server.recovery
-        if isinstance(spacing, gate.NextStartAt) and spacing.at > self.clock.now():
-            self.clock.advance(spacing.at - self.clock.now())
+        with self.loop_turn():
+            spacing = self.server.spacing
+            if isinstance(spacing, records.NextStartAt) and spacing.at > self.clock.now():
+                self.clock.advance(spacing.at - self.clock.now())
+
+    def advance_idle_spacing(self) -> None:
+        """Skip the delay between starts without changing the clock when no caller remains live."""
+        if self.skip_idle_spacing and not self.server.caller_live(self.scenery_reservations):
+            self.server.spacing = records.ReadyToStart()
 
     def free(self, available: int) -> None:
         _ = fake_memory_readings(self.root, available_kib=available // 1024,
@@ -571,34 +738,15 @@ class AdmissionFixture(ExitStack):
     def compiler(self, used: int) -> None:
         path = self.root / "builds.slice/sccache.service/memory.stat"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(f"anon {used}\ninactive_file 0\n")
+        _ = path.write_text(f"anon {used}\nshmem 0\ninactive_file 0\n")
         _ = (path.parent / "memory.current").write_text(str(used))
 
     def history(self) -> list[dict[str, object]]:
-        path = self.state_dir / "anon_peaks.jsonl"
-        return list(gate.anonymous_history_rows(path))
+        from scripts.build_queue import step_estimator
 
-    def legacy_token_wait(self) -> tuple[wire.AdmitRequest, Path, gate.Waiter]:
-        """Prepare a scoped legacy reservation with a sampled peak and a token intent."""
-        self.server.close()
-        (self.state_dir / "state.json").unlink()
-        request = self.request()
-        reservation = self.state_dir / "retry.reservation"
-        sidecar = self.scope(request.owner)
-        _ = reservation.with_suffix(".max").write_text(str(GIB))
-        _ = reservation.write_text(json.dumps({
-            "pid": request.owner.pid, "start_time": request.owner.start_time,
-            "need": GIB, "repo": "fixture", "step": "check", "worktree": "tree",
-            "sidecar": str(sidecar), "admitted_at": store.utc_iso(self.clock.now()),
-            "test_threads": None, "call_id": None,
-        }))
-        intent = self.state_dir / "retry.token-wait"
-        waiter: gate.Waiter = {
-            "pid": request.owner.pid, "start_time": request.owner.start_time,
-            "need": GIB, "since": request.since, "token_left_at": self.clock.now(),
-        }
-        _ = intent.write_text(json.dumps({"reservation": str(reservation), "waiter": waiter}))
-        return request, intent, waiter
+        path = self.state_dir / "anon_peaks.jsonl"
+        return list(step_estimator.anonymous_history_rows(path))
+
 
     def state_text(self) -> str:
         return (self.state_dir / "state.json").read_text()
@@ -610,7 +758,8 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen([
+            "systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", f"--unit={unit}",
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,
@@ -628,7 +777,7 @@ class AdmissionFixture(ExitStack):
         if not line.isdigit():
             raise unittest.SkipTest("user systemd refused the transient scope")
         pid = int(line)
-        start = gate.process_start_time(pid)
+        start = records.process_start_time(pid)
         if start is None:
             raise RuntimeError("scope shell exited before the test")
         query = subprocess.run(["systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],
@@ -641,12 +790,8 @@ class AdmissionFixture(ExitStack):
     def scope(self, owner: wire.Owner, *, folder: str = "", members: tuple[int, ...] | None = None,
               current: int = GIB, anonymous: int = GIB, swap: int = 0) -> Path:
         directory = self.root / (folder or f"scope-{owner.pid}")
-        directory.mkdir(parents=True, exist_ok=True)
-        pids = (owner.pid,) if members is None else members
-        for name, text in {"cgroup.procs": "\n".join(map(str, pids)), "cgroup.events": "populated 1\n",
-                           "memory.current": str(current), "memory.stat": f"anon {anonymous}\ninactive_file 0\n",
-                           "memory.swap.current": str(swap)}.items():
-            _ = (directory / name).write_text(text)
+        write_scope(directory, members=(owner.pid,) if members is None else members,
+                    current=current, anonymous=anonymous, swap=swap)
         sidecar = self.root / f"sample-{owner.pid}.cgroup"
         _ = sidecar.write_text(str(directory))
         return sidecar
@@ -672,9 +817,14 @@ class TimedChunk:
 class Exchange:
     """One peer connection's sends, silence, closure or connect failure."""
     def __init__(self, *events: bytes | TimedChunk | Exception,
-                 connect_error: OSError | None = None) -> None:
+                 connect_error: OSError | None = None,
+                 answer: Callable[[wire.Request], wire.Reply] | None = None,
+                 after_send: dict[int, tuple[bytes | TimedChunk | Exception, ...]] | None = None) -> None:
         self.events: list[bytes | TimedChunk | Exception] = list(events)
         self.connect_error: OSError | None = connect_error
+        self.answer: Callable[[wire.Request], wire.Reply] | None = answer
+        self.after_send: dict[int, tuple[bytes | TimedChunk | Exception, ...]] = after_send or {}
+        self.writable: bool = True
 
 
 class ScriptSocket:
@@ -682,6 +832,13 @@ class ScriptSocket:
         self.transport: ScriptedTransport = transport
         self.exchange: Exchange = exchange
         self.timeout: float = 0
+        self.closed: bool = False
+        self.ready_fd: int | None = None
+        self.nonblocking: bool = False
+        self.sent: bool = False
+        self.send_count: int = 0
+        self.timed_event: TimedChunk | None = None
+        self.ready_at: float = math.inf
 
     def __enter__(self) -> ScriptSocket:
         return self
@@ -693,29 +850,144 @@ class ScriptSocket:
         self.timeout = timeout
         self.transport.timeouts.append(timeout)
 
+    def setblocking(self, blocking: bool) -> None:
+        self.nonblocking = not blocking
+
+    def connect_ex(self, path: str) -> int:
+        try:
+            self.connect(path)
+        except FileNotFoundError:
+            return errno.ENOENT
+        except ConnectionRefusedError:
+            return errno.ECONNREFUSED
+        except OSError as error:
+            return error.errno or errno.EIO
+        return 0
+
+    def getsockopt(self, _level: int, _option: int) -> int:
+        return 0
+
+    def send(self, data: bytes) -> int:
+        self.sendall(data)
+        return len(data)
+
     def connect(self, path: str) -> None:
         self.transport.paths.append(path)
         if self.exchange.connect_error is not None:
             raise self.exchange.connect_error
 
     def sendall(self, data: bytes) -> None:
-        self.transport.requests.append(wire.parse_request(data))
+        self.sent = True
+        request = wire.parse_request(data)
+        self.transport.requests.append(request)
+        self.send_count += 1
+        self.exchange.events.extend(self.exchange.after_send.get(self.send_count, ()))
+        if self.exchange.answer is not None:
+            self.exchange.events.append(reply_bytes(self.exchange.answer(request)))
+        if self.nonblocking:
+            _ = self.next_read()
 
-    def recv(self, _size: int) -> bytes:
+    def next_read(self) -> float:
+        if not self.sent or not self.exchange.events:
+            return math.inf
+        event = self.exchange.events[0]
+        if isinstance(event, TimeoutError):
+            return math.inf
+        now = self.transport.clock.monotonic()
+        if not isinstance(event, TimedChunk):
+            return now
+        if event is not self.timed_event:
+            self.timed_event = event
+            self.ready_at = now + event.seconds
+        return self.ready_at
+
+    def recv(self, size: int) -> bytes:
         if not self.exchange.events:
-            raise AssertionError("client made an unexpected extra read")
+            raise BlockingIOError(errno.EWOULDBLOCK, "no input ready")
+        now = self.transport.clock.monotonic()
+        ready_at = self.next_read()
+        if self.nonblocking and ready_at > now:
+            raise BlockingIOError(errno.EWOULDBLOCK, "no input ready")
         event = self.exchange.events.pop(0)
+        self.timed_event = None
         if isinstance(event, TimedChunk):
-            self.transport.clock.advance(event.seconds)
-            return event.data
+            if not self.nonblocking:
+                self.transport.clock.advance(max(0, ready_at - now))
+            event = event.data
         if isinstance(event, TimeoutError):
             self.transport.clock.advance(self.timeout)
         if isinstance(event, Exception):
             raise event
-        return event
+        if len(event) > size:
+            self.exchange.events.insert(0, event[size:])
+        if self.nonblocking:
+            _ = self.next_read()
+        return event[:size]
 
     def close(self) -> None:
-        pass
+        if self.ready_fd is not None:
+            os.close(self.ready_fd)
+            self.ready_fd = None
+        self.closed = True
+
+    def fileno(self) -> int:
+        if self.ready_fd is None:
+            self.ready_fd, write_fd = os.pipe()
+            os.close(write_fd)
+        return self.ready_fd
+
+
+class ScriptedSelector:
+    def __init__(self, transport: ScriptedTransport) -> None:
+        self.transport: ScriptedTransport = transport
+        self.readers: dict[ScriptSocket, int] = {}
+
+    def __enter__(self) -> ScriptedSelector:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.readers.clear()
+
+    def register(self, reader: ScriptSocket, events: int) -> None:
+        self.readers[reader] = events
+
+    def modify(self, reader: ScriptSocket, events: int) -> None:
+        self.readers[reader] = events
+
+    def unregister(self, reader: ScriptSocket) -> None:
+        del self.readers[reader]
+
+    def select(self, timeout: float) -> list[tuple[ScriptedSelectorKey, int]]:
+        now = self.transport.clock.monotonic()
+        ready_at = now + max(0, timeout)
+        for reader, events in self.readers.items():
+            if events & EVENT_READ:
+                ready_at = min(ready_at, reader.next_read())
+            if events & EVENT_WRITE and reader.exchange.writable:
+                ready_at = now
+        self.transport.clock.advance(ready_at - now)
+        ready = [
+            (ScriptedSelectorKey(reader), mask)
+            for reader, events in self.readers.items()
+            if (mask := ((events & EVENT_READ if reader.next_read() <= ready_at else 0)
+                         | (events & EVENT_WRITE if reader.exchange.writable else 0)))
+        ]
+        if not ready and timeout > 0:
+            for reader in self.readers:
+                if reader.exchange.events and isinstance(reader.exchange.events[0], TimeoutError):
+                    _ = reader.exchange.events.pop(0)
+                    _ = reader.next_read()
+            self.transport.selector_timeouts.append(timeout)
+            self.transport.on_selector_timeout()
+        return ready
+
+
+@dataclass(frozen=True)
+class ScriptedSelectorKey:
+    fileobj: ScriptSocket
 
 
 class ScriptedTransport:
@@ -726,33 +998,62 @@ class ScriptedTransport:
         self.requests: list[wire.Request] = []
         self.paths: list[str] = []
         self.timeouts: list[float] = []
+        self.selector_timeouts: list[float] = []
+        self.on_selector_timeout: Callable[[], None] = lambda: None
         self.attempts: list[float] = []
+        self.sockets: list[ScriptSocket] = []
 
     def socket(self, *_args: object, **_kwargs: object) -> ScriptSocket:
         self.attempts.append(self.clock.monotonic())
         if not self.exchanges:
             raise AssertionError("client made an unexpected extra connection")
-        return ScriptSocket(self, self.exchanges.pop(0))
+        connection = ScriptSocket(self, self.exchanges.pop(0))
+        self.sockets.append(connection)
+        return connection
+
+    def selector(self) -> ScriptedSelector:
+        return ScriptedSelector(self)
 
 
 def reply_bytes(reply: wire.Reply) -> bytes:
     return wire.encode_reply(reply).encode()
 
 
-def wait_reply(reason: gate.WaitReason, position: int = 1, head: str = "head",
+def queue_decision(available: int, total: int | records.UnknownHostTotal, need: int,
+                   running: list[records.StepMemory], pressure: records.Pressure = records.NO_PRESSURE_HOLD,
+                   *, policy: records.AdmissionPolicy = FIXTURE_POLICY) -> records.AdmissionDecision:
+    """Check a queued request while a held slot prevents the alone exception."""
+    steps: list[records.RunningStep] = []
+    reservations: list[records.Reservation] = []
+    for index, memory in enumerate(running, 1):
+        promise = (memory.bytes if isinstance(memory, records.PromisedMemory) else
+                   memory.promise.bytes if isinstance(memory, records.MeasuredMemory)
+                   and not isinstance(memory.promise, records.NoPromise) else 0)
+        step = records.RunningStep(str(index), "fixture", "check", "/fixture", promise, memory, pid=index)
+        steps.append(step)
+        if gate.running_has_reservation(step):
+            reservations.append(fixture_reservation(index, promise))
+    slots = () if reservations else (blocking_slot(NOW),)
+    row: records.Waiter = {"pid": 1000, "start_time": "1000", "need": need, "since": NOW}
+    inputs = records.QueueInputs([(Path("1000.waiting"), row)], tuple(steps), tuple(reservations),
+        records.HostMemory(available, total), pressure, records.ReadyToStart(), NOW, slots=slots)
+    return gate.admission_pass(inputs, NOW, policy).rows[0].decision
+
+
+def wait_reply(reason: records.WaitReason, position: int = 1, head: str = "head",
                text: str = "free memory") -> wire.Wait:
     """Build a held reply with the same decision fields as a real pass."""
-    peak = gate.ExpectedPeak(8 * GIB, "fallback", 0)
-    decision = gate.decide(0, 60 * GIB, peak.bytes, [], limits=gate.AdmissionLimits(3 * GIB))
-    snapshot = gate.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
+    peak = records.ExpectedPeak(8 * GIB, "fallback", 0)
+    decision = queue_decision(0, 60 * GIB, peak.bytes, [], policy=admission_policy_fixture())
+    snapshot = records.AdmissionWaitSnapshot(decision, peak, (), 0, "repo", "nextest",
                                          admission_policy_fixture(), ())
     return wire.Wait(reason, position, head, text, snapshot)
 
 
-def snapshot_with_head_cause(snapshot: gate.AdmissionWaitSnapshot,
-                             cause: gate.HeadCause) -> gate.AdmissionWaitSnapshot:
+def snapshot_with_head_cause(snapshot: records.AdmissionWaitSnapshot,
+                             cause: records.HeadCause) -> records.AdmissionWaitSnapshot:
     """Supply the cause that a real admission pass captures."""
-    status = gate.HeadAdmissionStatus(snapshot.decision, snapshot.peak.bytes,
+    status = records.HeadAdmissionStatus(snapshot.decision, snapshot.peak.bytes,
                                       snapshot.available, cause=cause)
     return replace(snapshot, head_reason=status)
 
@@ -765,25 +1066,227 @@ def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "ne
 
 
 _caller_services: dict[str, AdmissionFixture] = {}
+PRIVATE_HOST_ALLOWED = placement.AllowedHost()
 
 
-def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str]) -> AdmissionFixture:
+@dataclass(frozen=True)
+class PrivateHostEvidence(placement.FreshHostEvidence):
+    """Identify the claim that supplies the holder, including a claim before adoption."""
+
+    holder_claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+
+
+def _register_real_ancestry(fixture: AdmissionFixture, pid: int) -> None:
+    """Copy a real claim holder and its real ancestors below the test process into the private table.
+
+    The service proves a holder descends from its submitting coordinator. A holder
+    started through a launcher sits several processes below that coordinator.
+    """
+    while pid > 1 and pid != os.getpid():
+        start = records.process_start_time(pid)
+        if start is None:
+            return
+        fixture.proc.register(wire.Owner(pid, start))
+        parent = int(Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[1])
+        write_process(fixture.proc.path, pid, parent=parent, start=start)
+        pid = parent
+
+
+def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvidenceKey,
+                              paths: claim_state.StatePaths,
+                              eligibility: placement.HostEligibility = PRIVATE_HOST_ALLOWED) -> PrivateHostEvidence:
+    """Read only the fixture's provider records and checked local process identities."""
+    adopted: list[placement.AdoptedProviderClaim] = []
+    cleanup: list[placement.RetainedCleanupClaim] = []
+    with claim_state.locked(paths.lock):
+        claims = claim_state.read_claims(paths)
+    holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
+    holder_claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+    diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
+    scope = None
+    if key.destination.provider == "local":
+        directory = fixture.root / "build-hold"
+        owner = key.local_hold_owner
+        lineage = (build_targets.read_caller_lineage(fixture.proc.path, owner.pid, owner.start_time)
+                   if isinstance(owner, placement.SubmittingOwner) and owner.host == fixture.server.host
+                   else build_targets.UnavailableCallerLineage("the local caller identity is unavailable"))
+        blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
+        if not isinstance(blocking, build_targets.NoBlockingHold):
+            eligibility = placement.TemporaryExclusion("blocked")
+            try:
+                _ = uuid.UUID(blocking.key)
+            except ValueError:
+                holder = placement.ResourceHolderUnit(blocking.name)
+            else:
+                holder = placement.ResourceHolderSession(blocking.key)
+    else:
+        block = mac_test.blocking_claim_block(paths, key.session)
+        if not isinstance(block, mac_test.NoMacBlock):
+            eligibility = placement.TemporaryExclusion("blocked")
+        scope = claim_state.target_claim_scope(paths, key.repository)
+    generation = ""
+    controller = paths.directory / "controller.json"
+    if controller.exists():
+        document = cast(dict[str, object], json.loads(controller.read_text()))
+        generation = str(document.get("generation", ""))
+    for held in claims:
+        record = held.record
+        supplies_holder = (scope is not None and isinstance(holder_claim, placement.NoProviderClaim)
+                           and mac_test.scopes_overlap(held.scope, scope) and mac_test.run_is_live(record))
+        if not supplies_holder and "remote_host" not in record:
+            continue
+        reference = placement.ProviderClaimReference(key.destination.provider, key.destination.target,
+            held.scope, record["claim_id"], record["episode"], record["attempt"])
+        if supplies_holder:
+            holder_claim = reference
+            if isinstance(eligibility, placement.AllowedHost) and not mac_test.run_is_kept(record):
+                eligibility = placement.TemporaryExclusion("busy")
+            if isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy":
+                diagnostic = placement.BusyProviderDiagnostic(key.destination.target, record["what"], record["since"])
+            if session_id := record.get("holder_session") or record["submitting_session"]:
+                holder = placement.ResourceHolderSession(session_id)
+        if "remote_host" not in record:
+            continue
+        if record.get("cleanup_pending", False):
+            cleanup.append(placement.RetainedCleanupClaim(reference, "private cleanup remains unresolved"))
+            continue
+        pid = record["pid"]
+        start = records.process_start_time(pid)
+        if start is not None and start == record["proc_start"]:
+            _register_real_ancestry(fixture, pid)
+        session_id = record["submitting_session"]
+        adopted.append(placement.AdoptedProviderClaim(reference,
+            placement.ClaimHolderIdentity(fixture.server.host, pid, record["proc_start"]),
+            OwningSession(session_id) if session_id else NoOwningSession(),
+            record["remote_host"], record.get("instance_generation", "")))
+    return PrivateHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup),
+        holder=holder, provider_diagnostic=diagnostic, holder_claim=holder_claim)
+
+
+class CallerProviderControls:
+    """Control private provider evidence without choosing a placement."""
+
+    def __init__(self, fixture: AdmissionFixture) -> None:
+        self.fixture: AdmissionFixture = fixture
+        self.reader: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = fixture.server.host_probe
+        self.hosts: dict[str, placement.HostEligibility] = {}
+        self.starting: dict[str, Path] = {}
+        self.observations: list[placement.HostEvidenceKey] = []
+
+    def read(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        self.observations.append(key)
+        evidence = self.reader(key)
+        supplied = isinstance(evidence, placement.FreshHostEvidence)
+        if not isinstance(evidence, placement.FreshHostEvidence):
+            if key.destination.target not in self.hosts:
+                return evidence
+            evidence = private_provider_evidence(self.fixture, key, self.claim_paths(key.destination.target),
+                                                self.hosts[key.destination.target])
+        elif key.destination.provider == "local":
+            evidence = private_provider_evidence(self.fixture, key, claim_state.StatePaths(self.fixture.root / "local-provider"),
+                                                evidence.eligibility)
+        eligibility = self.hosts.get(key.destination.target, evidence.eligibility) if supplied else evidence.eligibility
+        marker = self.starting.get(key.destination.target)
+        if marker is not None and marker.exists():
+            eligibility = placement.TemporaryExclusion("starting")
+        return replace(evidence, eligibility=eligibility)
+
+    def set_host(self, target: str, eligibility: placement.HostEligibility) -> None:
+        with self.fixture.loop_turn():
+            self.hosts[target] = eligibility
+            for reader in self.fixture.server.host_readers.values():
+                if reader.key.destination.target == target and isinstance(reader.latest, placement.FreshHostEvidence):
+                    self.fixture.server.publish_host_evidence(replace(reader.latest, eligibility=eligibility))
+
+    def advance(self, seconds: float) -> None:
+        with self.fixture.loop_turn():
+            self.fixture.clock.advance(seconds)
+            self.fixture.server.next_pass = self.fixture.clock.monotonic()
+
+    def claim_paths(self, target: str) -> claim_state.StatePaths:
+        directory = (self.fixture.root / "mac-state" if target == "mac" else
+                     self.fixture.root / "home/.local/state/build-targets" / target)
+        return claim_state.StatePaths(directory, target, platform="macos" if target == "mac" else "linux")
+
+    def claims(self, target: str) -> tuple[claim_state.HeldClaim, ...]:
+        paths = self.claim_paths(target)
+        with claim_state.locked(paths.lock):
+            return tuple(claim_state.read_claims(paths))
+
+    def memory_waits(self) -> tuple[wire.Wait, ...]:
+        with self.fixture.loop_turn():
+            return tuple(waiting.last_reply for waiting in self.fixture.server.waiters.values()
+                         if isinstance(waiting.last_reply, wire.Wait))
+
+
+_caller_controls: dict[str, CallerProviderControls] = {}
+
+
+def private_caller_provider(fixture: AdmissionFixture, environment: dict[str, str],
+                            key: placement.HostEvidenceKey) -> placement.HostEvidence:
+    """Read provider controls from private caller files."""
+    eligibility: placement.HostEligibility = placement.AllowedHost()
+    if key.destination.provider != "local":
+        busy = environment.get("TEST_RUNNER_BUSY_UNTIL", "")
+        state = Path(environment.get("TEST_RUNNER_STATE", str(fixture.root / "runner-state")))
+        available = state / "available-gib"
+        attempts = state / "runner-events.jsonl"
+        allow_refusal = environment.get("TEST_PROVIDER_ALLOW_RUNNER_REFUSALS") == "1"
+        if environment.get("TEST_FREE_NOW_ONCE"):
+            allow_refusal = not attempts.exists() or len(attempts.read_text().splitlines()) < 2
+        if available.exists() and float(available.read_text()) == 0:
+            eligibility = placement.TemporaryExclusion("disk")
+        elif busy and not Path(busy).exists() and not allow_refusal:
+            eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_BUSY_REASON", "busy"))
+        elif environment.get("TEST_RUNNER_MAC") == "declined" and not allow_refusal:
+            eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_REASON") or "busy")
+    directory = (fixture.root / "local-provider" if key.destination.provider == "local" else
+                 Path(environment["MAC_TEST_STATE_DIR"]) if key.destination.provider == "mac" else
+                 Path(environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
+    paths = claim_state.StatePaths(directory, key.destination.target,
+        platform="macos" if key.destination.provider == "mac" else "linux")
+    return private_provider_evidence(fixture, key, paths, eligibility)
+
+
+def caller_provider_controls(test: unittest.TestCase, fixture: AdmissionFixture) -> CallerProviderControls:
+    """Share provider controls across the caller fixture and its observers."""
+    key = str(fixture.socket_path)
+    controls = _caller_controls.get(key)
+    if controls is None:
+        controls = CallerProviderControls(fixture)
+        _caller_controls[key] = controls
+        test.addCleanup(_caller_controls.pop, key)
+        fixture.server.host_probe = controls.read
+    return controls
+
+
+def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str],
+                     *, skip_idle_spacing: bool = True) -> AdmissionFixture:
     """Use the one server for existing caller fixtures and their child processes."""
     existing = _caller_services.get(environment.get("ADMISSION_SOCKET", ""))
     if existing is not None and existing.root == root and not existing.server.closed:
+        if not skip_idle_spacing:
+            existing.skip_idle_spacing = False
         return existing
     _ = test.enterContext(LauncherHangGuard(test.id()).protect())
-    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"])))
+    fixture = test.enterContext(AdmissionFixture(root=root, log_dir=Path(environment["BUILDLOG_DIR"]),
+                                               skip_idle_spacing=skip_idle_spacing))
     _caller_services[str(fixture.socket_path)] = fixture
     test.addCleanup(_caller_services.pop, str(fixture.socket_path))
     fixture.clock.epoch = time.time()
-    launcher = Path.home() / ".claude/scripts/lib/py"
-    launcher.parent.mkdir(parents=True, exist_ok=True)
-    if not launcher.exists():
-        launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
+    def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        if key.destination.provider == "local":
+            return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+        return placement.HostEvidenceUnavailable(
+            key, fixture.clock.now(), "the caller fixture has no provider transport")
+
+    fixture.server.host_probe = provider
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
-                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+    if not records.owner_given(environment):
+        # A child process with no owner says the fixture started it, so the queue never refuses it.
+        environment["CLAUDE_SESSION_NAME"] = FIXTURE_OWNER
+    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())
     return fixture

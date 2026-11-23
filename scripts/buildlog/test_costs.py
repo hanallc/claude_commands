@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import os
 import io
 import time
 import subprocess
-import sys
 from contextlib import closing, redirect_stderr
 from datetime import timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import costs
-import index
-import moments
-import record
-import test_moments as fixtures
-from test_index import Record, call, ci_job, ci_run
-from test_holds import hold_event
+from scripts.buildlog import costs
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import moments
+from scripts.buildlog import record
+from scripts.buildlog import store
+from scripts.buildlog import test_moments as fixtures
+from scripts.buildlog.test_index import Record, call, ci_job, ci_run
+from scripts.buildlog.test_holds import hold_event
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 class CostTests(unittest.TestCase):
@@ -51,7 +53,8 @@ class CostTests(unittest.TestCase):
             finish = fixtures.START.timestamp() + number + 10
             common: Record = {"phase_instance_id": f"phase-{number}", "working_dir": directory}
             events.extend(({**common, "event_type": "phase_started", "timestamp_epoch": finish - seconds},
-                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds}))
+                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds,
+                            "phase_active_seconds": seconds}))
         self.fixture.progress(events)
 
     def test_first_source_uses_a_recorded_event_instead_of_a_month_boundary(self) -> None:
@@ -76,13 +79,33 @@ class CostTests(unittest.TestCase):
             reading = costs.read_costs(connection, fixtures.START, fixtures.END)
         self.assertNotIn("aws", reading.first_sources)
 
+    def test_cloud_gate_files_count_as_one_aws_machine(self) -> None:
+        started = (fixtures.START + timedelta(seconds=10)).isoformat()
+        for folder, status in (("box-one.fixture.internal", 1), ("box-two.fixture.internal", 0), ("aws", 1)):
+            path = self.fixture.fixture.root/folder/"2026-10.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({
+                "kind": "gate_run", "v": record.RECORD_VERSION, "id": f"gate-{folder}", "host": folder,
+                "started_at": started, "ended_at": started, "wall_s": 600, "status": status,
+                "source": store.CLOUD_GATE_SOURCE, "suites": [], "modules": []}) + "\n")
+        with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
+            reading = costs.read_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(set(reading.first_sources) - {"natedev"}, {"aws"})
+        # Gate runs are the AWS place's only events, so they observe it and count its failed runs.
+        self.assertIn("aws", {observation.machine for observation in reading.observations})
+        result = costs.aggregate_costs(reading, fixtures.START, fixtures.END)
+        self.assertEqual([(row.machine, row.cause, row.seconds) for row in result.ranked if row.machine == "aws"],
+                         [("aws", "Failed runs", 1200)])
+
     def test_phase_score_uses_matched_wall_time_and_nearest_rank_p90(self) -> None:
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
         with closing(self.fixture.connection()) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
-        lines = costs.render_costs(result).splitlines()
-        self.assertEqual(lines[1], "Hana phases: 3 finished; median 120 s/phase; p90 180 s/phase.")
-        self.assertEqual(lines[2], "All phases: 4 finished; median 120 s/phase; p90 240 s/phase.")
+        durations = [phase.active_s for phase in result.phases if isinstance(phase.active_s, float)]
+        hana = [phase.active_s for phase in result.phases
+                if moments.hana_name(phase.working_dir) and isinstance(phase.active_s, float)]
+        self.assertEqual((len(hana), moments.nearest_rank(hana, 50), moments.nearest_rank(hana, 90)), (3, 120, 180))
+        self.assertEqual((len(durations), moments.nearest_rank(durations, 50), moments.nearest_rank(durations, 90)), (4, 120, 240))
         self.assertEqual(len(result.phases), 4)
 
     def test_missing_start_preserves_finished_count_without_inventing_duration(self) -> None:
@@ -91,13 +114,13 @@ class CostTests(unittest.TestCase):
         self.fixture.progress([event, event, {**event, "phase_instance_id": "outside", "timestamp_epoch": fixtures.END.timestamp()}])
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertIsInstance(phases[0].wall_s, moments.PhaseStartUnavailable)
-        self.assertIn("1 finished; median unavailable; p90 unavailable", costs.phase_line("All phases", phases))
+        self.assertIsInstance(phases[0].active_s, moments.PhaseStartUnavailable)
 
-    def test_finish_wall_time_needs_no_start_event_or_event_field_substring(self) -> None:
+    def test_finish_time_needs_no_start_event_or_event_field_substring(self) -> None:
         self.fixture.progress([
             {"event_type": "phase_finished", "phase_instance_id": "kept", "working_dir": "/r/hana",
-             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590},
+             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590,
+             "phase_active_seconds": 3600},
             {"event_type": "unrelated", "phase_started_at": 1, "phase_instance_id": "noise"},
         ])
         self.fixture.progress([
@@ -106,7 +129,7 @@ class CostTests(unittest.TestCase):
         ], filename="old.jsonl")
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertEqual(phases[0].wall_s, 3600)
+        self.assertEqual(phases[0].active_s, 3600)
 
     def test_costs_rank_all_hosts_and_divide_by_all_finished_phases(self) -> None:
         self.progress([("/r/hana", 60), ("/r/other", 120)])
@@ -120,16 +143,14 @@ class CostTests(unittest.TestCase):
             ("natedev", "Memory wait", 21600), ("natedev", "Failed runs", 10800),
             ("aws-builder-1", "Cold rebuilds", 7200),
         ])
-        lines = costs.render_costs(result).splitlines()
-        self.assertIn("aws-builder-1: Cold rebuilds: 1.00 h/day; 1.000 h/phase.", lines)
-        self.assertLess(lines.index("natedev: Memory wait: 3.00 h/day; 3.000 h/phase."),
-                        lines.index("natedev: Failed runs: 1.50 h/day; 1.500 h/phase."))
+        self.assertEqual(len(result.phases), 2)
+        self.assertEqual(result.ranked[2].seconds / len(result.phases), 3600)
 
-    def test_no_phases_prints_unknown_cost_per_phase_instead_of_zero(self) -> None:
+    def test_costs_preserve_an_empty_phase_denominator(self) -> None:
         with closing(self.fixture.connection(fixtures.build("wait", 10, mem_wait_s=7200))) as connection:
-            text = costs.render_costs(costs.collect_costs(connection, fixtures.START, fixtures.END))
-        self.assertIn("All phases: 0 finished; median unavailable; p90 unavailable.", text)
-        self.assertIn("1.00 h/day; unavailable h/phase (no finished phases)", text)
+            result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(result.phases, ())
+        self.assertEqual(result.ranked[0], costs.RankedCost("natedev", "Memory wait", 7200))
 
     def test_passed_tree_cost_requires_the_same_tree_build_input_and_worker(self) -> None:
         records = [
@@ -171,15 +192,15 @@ class CostTests(unittest.TestCase):
             hold_event("ended", "held", fixtures.END.isoformat(), "mac"),
         )):
             pass
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import costs,holds,index; "
+        command = ("import sys; from scripts.buildlog import costs, holds, index; "
                    + "from datetime import UTC,datetime; "
                    + "assert costs.machine_name('mac','replacement',{}) == 'mac'; "
                    + "current=holds.CurrentHolds('',holds.NatedevHoldsNow(()),holds.MacHoldsNow(())); "
                    + "connection=index.read_only(); "
                    + "history=holds.read_hold_history(connection,current,datetime.now(UTC)); "
                    + "connection.close(); assert len(history.intervals) == 1; "
-                   + "assert not any(name in sys.modules for name in ('record','targets','build_hold','mac_test'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.build_targets.targets', 'scripts.build_hold.build_hold', 'scripts.mac_test.mac_test'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -192,17 +213,6 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([(row.machine, row.cause, row.seconds) for row in result.ranked], [("CI", "Cancelled CI", 3600)])
 
-    def test_cli_reads_fixture_index_without_changing_it(self) -> None:
-        with closing(self.fixture.connection(fixtures.build("record", 10, mem_wait_s=3600))):
-            pass
-        result = fixtures.read_only_cli(self, ["costs", "--days", "7"])
-        self.assertIn("Build costs: 7 days", result.stdout)
-        self.assertLess(len(result.stdout.splitlines()), 25)
-
-    def test_cli_rejects_invalid_windows_before_reading_the_index(self) -> None:
-        for args in (["--days", "0"], ["--days", "-1"], ["--days", "seven"], ["7"], ["--days", "999999999999999999"]):
-            with self.subTest(args=args), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
-                self.assertEqual(costs.main(args), 2)
 
     def test_recorded_target_wins_and_configured_legacy_hosts_map_to_each_target(self) -> None:
         config = self.fixture.fixture.root / "targets.conf"
@@ -210,7 +220,8 @@ class CostTests(unittest.TestCase):
         _ = config.write_text("targets=natedev,mac,aws\nkind.natedev=local\nplatform.natedev=linux\n"
                               + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                               + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
-                              + "sync.hosts.mac=replacement-mac\nsync.hosts.aws=cloud-host\nsync.hosts.natedev=local-host\n")
+                              + "sync.hosts.mac=replacement-mac\nsync.hosts.aws=cloud-host\nsync.hosts.natedev=local-host\n"
+                              + UNREACHABLE_WAIT_FIXTURE)
         _ = config.with_name("mac_test.conf").write_text("host=fixture\n")
         _ = config.with_name("aws.conf").write_text("host=fixture\n")
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), closing(self.fixture.connection(
@@ -236,7 +247,6 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Mac idle while natedev waits"], [1800])
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Memory wait"], [7200])
-        self.assertIn("minus Mac execution and recorded holds", costs.render_costs(result))
 
     def test_missing_outcome_never_seeds_a_passed_tree_repeat(self) -> None:
         with closing(self.fixture.connection(
@@ -272,10 +282,6 @@ class CostTests(unittest.TestCase):
                 self.assertEqual([(row.seconds, row.unknown_seconds) for row in result.ranked
                                   if row.cause == "Mac idle while natedev waits"], [(upper_bound, unknown)])
                 self.assertEqual(result.mac_idle, costs.MacIdleEstimate(3600, 0, held, upper_bound, unknown))
-                idle_line = next(line for line in costs.render_costs(result).splitlines()
-                                 if line.startswith("mac: Mac idle while natedev waits:"))
-                self.assertIn("upper bound", idle_line)
-                self.assertIn("h/day unknown", idle_line)
 
     def test_sql_instants_treat_unzoned_times_as_utc(self) -> None:
         self.addCleanup(time.tzset)
@@ -290,20 +296,33 @@ class CostTests(unittest.TestCase):
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual([row.seconds for row in result.ranked if row.cause == "Reruns after a pass"], [120])
 
-    def test_both_window_options_reject_overflow_before_opening_the_index(self) -> None:
-        import mac_report
+    def test_mac_window_rejects_overflow_before_opening_the_index(self) -> None:
+        from scripts.buildlog import mac_report
 
         with mock.patch.object(index, "update", side_effect=AssertionError("index updated")):
             self.assertEqual(mac_report.main(["--hours", "1e300"]), 2)
-        errors = io.StringIO()
-        with redirect_stderr(errors):
-            self.assertEqual(costs.main(["--days", "9" * 400]), 2)
-        self.assertIn("usage: buildlog costs", errors.getvalue())
+
+    def test_unknown_commands_and_help_do_not_read_the_index(self) -> None:
+        cases: tuple[tuple[list[str], str, int], ...] = (
+            (["costs"], "buildlog: unknown command 'costs'; type buildlog to see the commands\n", 2),
+            (["charts"], "buildlog: unknown command 'charts'; type buildlog to see the commands\n", 2),
+            (["not-a-command"], "buildlog: unknown command 'not-a-command'; type buildlog to see the commands\n", 2),
+            ([], f"{cli.__doc__}\n", 2),
+            (["help"], f"{cli.__doc__}\n", 0),
+            (["-h"], f"{cli.__doc__}\n", 0),
+            (["--help"], f"{cli.__doc__}\n", 0),
+        )
+        for argv, expected, status in cases:
+            with self.subTest(argv=argv):
+                errors = io.StringIO()
+                with redirect_stderr(errors), mock.patch.object(index, "read_only", side_effect=AssertionError("index opened")):
+                    self.assertEqual(cli.main(argv), status)
+                self.assertEqual(errors.getvalue(), expected)
 
     def test_cli_help_does_not_import_collectors_or_the_report(self) -> None:
-        command = ("import sys; sys.path.insert(0, sys.argv[1]); import cli; cli.main(['help']); "
-                   + "assert not any(name in sys.modules for name in ('record','report','costs','launches'))")
-        result = subprocess.run([sys.executable, "-c", command, str(Path(__file__).resolve().parent)], env=dict(os.environ),
+        command = ("import sys; from scripts.buildlog import cli; cli.main(['help']); "
+                   + "assert not any(name in sys.modules for name in ('scripts.buildlog.record', 'scripts.buildlog.report', 'scripts.buildlog.costs', 'scripts.buildlog.launches'))")
+        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", command], env=dict(os.environ),
                                 capture_output=True, text=True, check=False, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -316,13 +335,12 @@ class CostTests(unittest.TestCase):
                                       moments.window_parameters(fixtures.START, fixtures.END)).fetchall()
         self.assertEqual(rows, [(120.0,)])
 
-    def test_output_limits_many_machines_without_hiding_the_omission(self) -> None:
+    def test_ranking_keeps_every_machine(self) -> None:
         with closing(self.fixture.connection(*(fixtures.build(f"row-{number}", number, host=f"host-{number}", mem_wait_s=number + 1)
                                       for number in range(30)))) as connection:
-            text = costs.render_costs(costs.collect_costs(connection, fixtures.START, fixtures.END))
-        self.assertLess(len(text.splitlines()), 25)
-        self.assertIn("16 smaller machine/cause costs omitted.", text)
-        self.assertIn("host-29: Memory wait:", text)
+            result = costs.collect_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(len(result.ranked), 30)
+        self.assertEqual(result.ranked[0], costs.RankedCost("host-29", "Memory wait", 30))
 
     def test_partial_mac_coverage_splits_residual_waits_without_using_individual_events(self) -> None:
         origin = fixtures.START.timestamp()
@@ -350,7 +368,6 @@ class CostTests(unittest.TestCase):
         )) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual(result.mac_idle, costs.MacIdleEstimate(3600, 900, 900, 1800, 1800))
-        self.assertIn("upper bound", costs.render_costs(result))
 
 
 if __name__ == "__main__":

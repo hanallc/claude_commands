@@ -1,19 +1,65 @@
 """Environment proof and executable boundary, using only a stub direnv."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import cast, override
+import tempfile
+from typing import Literal, cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import copy_record, nix_env, scratch
-from scripts.lib.nix_env_test_support import HELPER, NixFixture
+from scripts.buildlog.store import host_name
+from scripts.copies import copies
+from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env, scratch
+from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
+
+
+class GeneratedSourceTests(NixFixture):
+    def test_numbered_copy_requires_copy_proof_before_home_root_trust(self) -> None:
+        build = self.home / "worktrees/build"
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            f"roots.build={build}\nroots.build.{host_name()}={build}\n"
+            + f"roots.workspace={self.home / 'worktrees'}\n")
+        numbered = build_folders.copy_path("hana", "demo", 1)
+        envrc = self.envrc(numbered)
+        _ = (numbered / copy_record.RECORD).write_text('{"task":"gate:fixture","generated_source":true}')
+        self.assertTrue(nix_env.trusted_root(envrc))
+        self.assertFalse(nix_env.trusted_envrc(envrc))
+        with patch.dict(os.environ, {copy_record.ROOT_ENV: str(numbered.parent)}):
+            self.assertFalse(nix_env.generated_source(numbered))
+
+    def test_generated_source_requires_a_readable_registered_record_with_true_field(self) -> None:
+        with patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.root / 'scratch')}):
+            folder = scratch.new('gate:generated-source', 'proof')
+            self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+            self.assertTrue(nix_env.generated_source(folder))
+            outside = self.root / 'outside'
+            outside.mkdir()
+            _ = (outside / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(outside))
+            nested = folder / 'nested'
+            nested.mkdir()
+            _ = (nested / copy_record.RECORD).write_bytes((folder / copy_record.RECORD).read_bytes())
+            self.assertFalse(nix_env.generated_source(nested))
+            with patch.object(copy_record, 'read_record', return_value=copy_record.UnreadableRecord('unreadable')):
+                self.assertFalse(nix_env.generated_source(folder))
+            with patch.object(copy_record, 'read_record', side_effect=OSError('read failed')):
+                self.assertFalse(nix_env.generated_source(folder))
+            _ = scratch.update_record(folder, lambda record: {
+                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': 1})
+            self.assertFalse(nix_env.generated_source(folder))
+            (folder / copy_record.RECORD).unlink()
+            self.assertFalse(nix_env.generated_source(folder))
 
 
 class EnsureTests(NixFixture):
@@ -91,10 +137,15 @@ class EnsureTests(NixFixture):
 
     def test_timeout_is_a_refusal_with_last_stderr_line(self) -> None:
         _ = self.envrc(self.work)
-        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("direnv", 600, stderr=b"progress\ntimed out detail\n")) as run:
+        timeout = 7
+        settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n")
+        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(
+            "direnv", timeout, stderr=b"progress\ntimed out detail\n"
+        )) as run:
             result = nix_env.ensure(self.work, self.env)
         self.assertEqual(result, nix_env.Refused(f"nix_env: {self.work}: timed out detail"))
-        self.assertEqual(run.call_args.kwargs["timeout"], 600)
+        self.assertEqual(run.call_args.kwargs["timeout"], timeout)
 
     def test_no_envrc_preserves_environment_without_direnv(self) -> None:
         result = nix_env.ensure(self.work, self.env)
@@ -117,7 +168,7 @@ class EnsureTests(NixFixture):
         self.assertEqual(self.direnv_calls(), [])
 
     def cli(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(HELPER), *arguments], cwd=self.work,
+        return subprocess.run([str(ROOT / "scripts/lib/py"), str(HELPER), *arguments], cwd=self.work,
                               env={**self.env, **(extra or {})}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
@@ -181,7 +232,7 @@ class EnsureTests(NixFixture):
 
     def test_no_envrc_cli_import_budget(self) -> None:
         result = subprocess.run(
-            [sys.executable, "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
+            [str(ROOT / "scripts/lib/py"), "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
             cwd=self.work, env=self.env, capture_output=True, text=True, check=False,
             timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -237,6 +288,8 @@ class RegisteredWorktreeTests(GitNixFixture):
             {"args": ["export", "json"], "cwd": str(checkout)}])
         with patch.object(subprocess, "run", side_effect=AssertionError("trust checks must only read files")):
             self.assertTrue(nix_env.registered_worktree(checkout))
+        _ = (checkout / ".envrc").write_text("edited worktree envrc\n", encoding="utf-8")
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
 
     def test_clone_of_trusted_repository_still_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -309,6 +362,12 @@ class RegisteredCopyTests(GitNixFixture):
         self.env[copy_record.COPIES_ENV] = str(self.root / "copies")
         os.environ[copy_record.COPIES_ENV] = self.env[copy_record.COPIES_ENV]
 
+    @override
+    def repository(self, directory: Path) -> Path:
+        repository = super().repository(directory)
+        _ = self.git(repository, "remote", "add", "origin", str(self.root / "unused-origin" / directory.name))
+        return repository
+
     def clone(self, repository: Path) -> Path:
         checkout = copy_record.copies_root() / "pair/copy"
         checkout.parent.mkdir(parents=True)
@@ -322,41 +381,112 @@ class RegisteredCopyTests(GitNixFixture):
             source_commit=commit, copy_commit=commit, target_mode="shared", seed_source=str(repository),
             borrows_from=str(repository / ".git"))
 
+    @contextmanager
+    def registered_checkout(self, repository: Path, *,
+                            kind: Literal["copy", "numbered", "trusted-numbered"]) -> Generator[Path]:
+        """Yield a copy under a private legacy or numbered root."""
+        if kind == "copy":
+            checkout = self.clone(repository)
+            self.register(repository, checkout)
+            yield checkout
+            return
+        private = private_slot_config(self.root, repository=repository.name)
+        nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
+        if kind == "trusted-numbered":
+            build = self.home / "worktrees/build"
+            _ = write_config_fixture(private.settings, f"roots.build={build}\nroots.build.{host_name()}={build}\n")
+        with (patch.dict(os.environ, private.environment), patch.dict(self.env, private.environment),
+              patch.object(tempfile, "tempdir", str(self.root)),
+              copies.standing("nix-env-proof", repository, copies.CommittedSource("HEAD")) as checkout):
+            yield checkout
+
     def test_registered_shared_copy_with_unchanged_envrc_is_approved_and_loads(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        search_path = list(sys.path)
-        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
-        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
-        self.assertEqual(sys.path, search_path)
-        # Approval is tied to the recorded commit, not the source's current file.
-        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
-        outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
-        self.assertIsInstance(outcome, nix_env.Loaded)
-        if not isinstance(outcome, nix_env.Loaded):
-            self.fail(str(outcome))
-        self.assertEqual(outcome.env["IN_NIX_SHELL"], "impure")
-        self.assertEqual(self.direnv_calls(), [
-            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
-            {"args": ["export", "json"], "cwd": str(checkout)}])
+        for kind in ("copy", "numbered", "trusted-numbered"):
+            with (self.subTest(kind=kind), self.registered_checkout(repository, kind=kind) as checkout):
+                Path(self.env["DIRENV_LOG"]).unlink(missing_ok=True)
+                Path(self.env["DIRENV_APPROVAL"]).unlink(missing_ok=True)
+                search_path = list(sys.path)
+                record = copy_record.record_path(checkout)
+                if kind != "copy":
+                    self.assertTrue(checkout.with_name(checkout.name + ".lease.json").is_file())
+                    self.assertEqual(copies.main_checkout(checkout), repository)
+                else:
+                    self.assertEqual(record, checkout / copy_record.RECORD)
+                self.assertEqual(copy_record.source_of(checkout),
+                                 copy_record.RecordedCopySource(repository, self.git(repository, "rev-parse", "HEAD")))
+                self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+                self.assertEqual(sys.path, search_path)
+                # The commit determines approval after source edits.
+                _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+                outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
+                self.assertIsInstance(outcome, nix_env.Loaded)
+                if not isinstance(outcome, nix_env.Loaded):
+                    self.fail(str(outcome))
+                self.assertEqual(outcome.env["IN_NIX_SHELL"], "impure")
+                self.assertEqual(self.direnv_calls(), [
+                    {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+                    {"args": ["export", "json"], "cwd": str(checkout)}])
 
-        # The standalone helper must find scratch even when started in the copy.
-        Path(self.env["DIRENV_APPROVAL"]).unlink()
-        result = subprocess.run(
-            [sys.executable, "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
-            env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
-            timeout=TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        environment = cast(dict[str, str], json.loads(result.stdout))
-        self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+                # A separate process must prove the checkout's envrc.
+                Path(self.env["DIRENV_APPROVAL"]).unlink()
+                child_env = {**self.env, "DIRENV_DENY": "1"}
+                if kind != "copy":
+                    key = build_folders.NUMBERED_COPY_LOCK_ENV
+                    child_env[key] = os.environ[key]
+                result = subprocess.run(
+                    [str(ROOT / "scripts/lib/py"), "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
+                    env=child_env, capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS, check=False, pass_fds=copies.COMMAND_LOCKS.get())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                environment = cast(dict[str, str], json.loads(result.stdout))
+                self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+            if kind != "copy":
+                self.assertTrue(checkout.exists())
+                self.assertEqual(build_folders.build_folder_state(checkout), "free")
+
+    def test_ensure_holds_an_idle_copy_during_proof_and_refuses_a_busy_copy(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        private = private_slot_config(self.root, repository=repository.name)
+        nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
+        _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
+        with patch.dict(os.environ, private.environment):
+            with build_slots.take_copy(repository, "HEAD", showrunner="maker", unit="demo", work="test",
+                                       purpose="test envrc") as copy:
+                checkout = copy.path
+            proof = nix_env.trusted_envrc
+
+            def check_proof(envrc: Path) -> bool:
+                self.assertEqual(build_folders.build_folder_state(checkout), "held")
+                return proof(envrc)
+
+            with (patch.object(nix_env, "trusted_envrc", side_effect=check_proof) as checked,
+                  patch.object(subprocess, "run", wraps=subprocess.run) as run):
+                outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
+                self.assertIsInstance(outcome, nix_env.Loaded)
+                checked.assert_called_once_with(checkout / ".envrc")
+                direnv = [call for call in run.call_args_list if call.args[0][0] == "direnv"]
+                self.assertEqual([call.args[0][1] for call in direnv], ["allow", "export"])
+                descriptors = cast(tuple[int, ...], direnv[0].kwargs["pass_fds"])
+                self.assertEqual(len(descriptors), 1)
+                self.assertEqual(direnv[1].kwargs["pass_fds"], descriptors)
+            self.assertEqual(build_folders.build_folder_state(checkout), "free")
+            with build_folders.numbered_copy_use_lease(checkout) as lease:
+                self.assertIsInstance(lease, build_folders.NumberedCopyUseLease)
+                with patch.object(subprocess, "run") as run:
+                    refused = nix_env.ensure(checkout, self.env)
+                    self.assertIsInstance(refused, nix_env.Refused)
+                    run.assert_not_called()
 
     def test_registered_copy_with_edited_envrc_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
-        self.assert_explicit_approval_required(checkout)
+        for kind in ("copy", "numbered", "trusted-numbered"):
+            with (self.subTest(kind=kind), self.registered_checkout(repository, kind=kind) as checkout):
+                _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+                self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assert_explicit_approval_required(checkout)
 
     def test_copy_without_record_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -385,24 +515,25 @@ class RegisteredCopyTests(GitNixFixture):
 
     def test_registered_copy_requires_regular_envrc_even_when_symlink_bytes_match(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        envrc = checkout / ".envrc"
-        self.assertTrue(nix_env.trusted_envrc(envrc))
-        target = self.envrc(self.root / "outside")
-        envrc.unlink()
-        envrc.symlink_to(target)
-        self.assertFalse(nix_env.registered_copy(envrc))
-        self.assert_explicit_approval_required(checkout)
-        envrc.unlink()
-        _ = envrc.write_bytes(target.read_bytes())
-        self.assertTrue(nix_env.trusted_envrc(envrc))
+        for kind in ("copy", "numbered", "trusted-numbered"):
+            with (self.subTest(kind=kind), self.registered_checkout(repository, kind=kind) as checkout):
+                envrc = checkout / ".envrc"
+                self.assertTrue(nix_env.trusted_envrc(envrc))
+                target = self.envrc(self.root / "outside")
+                envrc.unlink()
+                envrc.symlink_to(target)
+                self.assertFalse(nix_env.registered_copy(envrc))
+                self.assert_explicit_approval_required(checkout)
+                envrc.unlink()
+                _ = envrc.write_bytes(target.read_bytes())
+                self.assertTrue(nix_env.trusted_envrc(envrc))
 
     def test_copy_from_untrusted_source_requires_explicit_approval(self) -> None:
         repository = self.repository(self.root / "outside/repo")
-        checkout = self.clone(repository)
-        self.register(repository, checkout)
-        self.assert_explicit_approval_required(checkout)
+        for kind in ("copy", "numbered", "trusted-numbered"):
+            with (self.subTest(kind=kind), self.registered_checkout(repository, kind=kind) as checkout):
+                self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+                self.assert_explicit_approval_required(checkout)
 
     def test_source_commit_without_envrc_requires_explicit_approval(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -423,25 +554,181 @@ class RegisteredCopyTests(GitNixFixture):
         self.assert_explicit_approval_required(outside)
 
 
+class RegisteredCloneTests(GitNixFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        locations = {copy_record.ROOT_ENV: str(self.root / "scratch"),
+                     copy_record.COPIES_ENV: str(self.root / "copies")}
+        self.env.update(locations)
+        os.environ.update(locations)
+
+    def clone(self, repository: Path, task_folder: Path | None = None) -> Path:
+        # The task folder is the checkout, as copies.clone makes it.
+        checkout = task_folder if task_folder is not None else copy_record.root() / "task"
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        fields = {"task": "gate:nix-env", "test_hana_clone": True,
+                  "source_path": str(repository), "source_commit": self.git(checkout, "rev-parse", "HEAD")}
+        _ = (checkout / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")
+        scratch.exclude_copy_metadata(checkout)
+        return checkout
+
+    def assert_clone_refused(self, checkout: Path) -> None:
+        self.assertFalse(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+        self.assert_explicit_approval_required(checkout)
+
+    def test_registered_clone_with_unchanged_envrc_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.assertEqual(copy_record.record_path(checkout), checkout / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+        self.assertIsInstance(nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"}), nix_env.Loaded)
+        self.assertEqual(self.direnv_calls(), [
+            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+            {"args": ["export", "json"], "cwd": str(checkout)}])
+
+    def test_task_clone_parent_with_matching_envrc_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        parent = checkout.parent
+        _ = (parent / ".envrc").write_bytes((checkout / ".envrc").read_bytes())
+        self.assertIsNone(copy_record.record_path(parent))
+        self.assertFalse(nix_env.registered_copy(parent / ".envrc"))
+        self.assertFalse(nix_env.trusted_envrc(parent / ".envrc"))
+        self.assert_explicit_approval_required(parent)
+
+    def test_registered_clone_with_edited_envrc_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_source_commit_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["source_commit"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assert_clone_refused(checkout)
+
+    def test_checkout_outside_scratch_root_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"), self.root / "outside/task")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_without_test_hana_clone_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        path = checkout / copy_record.RECORD
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["test_hana_clone"]
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        self.assertIsNone(copy_record.record_path(checkout))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_from_untrusted_source_requires_explicit_approval(self) -> None:
+        checkout = self.clone(self.repository(self.root / "outside/repo"))
+        self.assert_clone_refused(checkout)
+
+    def test_clone_under_symlink_scratch_root_is_approved(self) -> None:
+        physical = self.root / "physical-scratch"
+        physical.mkdir()
+        copy_record.root().symlink_to(physical, target_is_directory=True)
+        checkout = self.clone(self.repository(self.home / "rust/repo"))
+        self.assertEqual(copy_record.record_path(checkout), checkout.resolve() / copy_record.RECORD)
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+
+
+class RunSnapshotTests(GitNixFixture):
+    """A `copies.py run` snapshot proves its envrc by the source commit its binding names."""
+
+    @contextmanager
+    def snapshot(self, repository: Path) -> Generator[Path]:
+        with (patch.object(tempfile, "tempdir", str(self.root)),
+              copies.requested_source(repository, copies.CommittedSource("HEAD"), copies.NO_MERGE) as tree):
+            yield tree
+
+    def assert_snapshot_refused(self, tree: Path) -> None:
+        self.assertFalse(nix_env.trusted_envrc(tree / ".envrc"))
+        self.assert_explicit_approval_required(tree)
+
+    def test_snapshot_of_a_trusted_repository_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        with self.snapshot(repository) as tree:
+            self.assertEqual(copy_record.source_of(tree),
+                             copy_record.RecordedCopySource(repository, self.git(repository, "rev-parse", "HEAD")))
+            self.assertTrue(nix_env.trusted_envrc(tree / ".envrc"))
+            self.assertIsInstance(nix_env.ensure(tree, {**self.env, "DIRENV_DENY": "1"}), nix_env.Loaded)
+            self.assertEqual(self.direnv_calls(), [
+                {"args": ["allow", str(tree / ".envrc")], "cwd": str(tree)},
+                {"args": ["export", "json"], "cwd": str(tree)}])
+
+    def test_snapshot_with_edited_envrc_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            _ = (tree / ".envrc").write_text("use another flake\n", encoding="utf-8")
+            self.assert_snapshot_refused(tree)
+
+    def test_snapshot_of_an_untrusted_repository_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.root / "outside/repo")) as tree:
+            self.assert_snapshot_refused(tree)
+
+    def test_binding_for_another_checkout_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            self.rewrite_binding(tree, checkout=str(tree.parent / "other"))
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+            self.assert_snapshot_refused(tree)
+
+    def rewrite_binding(self, tree: Path, **changes: str) -> None:
+        binding = tree.parent / copy_record.SNAPSHOT_ORIGIN
+        fields = cast(dict[str, object], json.loads(binding.read_text()))
+        _ = binding.write_text(json.dumps({**fields, **changes}), encoding="utf-8")
+
+    def test_binding_with_a_revision_name_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            self.rewrite_binding(tree, source_commit="HEAD")
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+            self.assert_snapshot_refused(tree)
+
+    def test_binding_in_a_shared_folder_requires_explicit_approval(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            mode = tree.parent.stat().st_mode
+            tree.parent.chmod(mode | 0o020)
+            try:
+                self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+                self.assert_snapshot_refused(tree)
+            finally:
+                tree.parent.chmod(mode)
+
+    def test_deeply_nested_binding_reads_as_no_source(self) -> None:
+        with self.snapshot(self.repository(self.home / "rust/repo")) as tree:
+            _ = (tree.parent / copy_record.SNAPSHOT_ORIGIN).write_text("[" * 100000, encoding="utf-8")
+            self.assertEqual(copy_record.source_of(tree), copy_record.NoRecordedCopySource())
+
+
 class NixConfigTests(NixFixture):
     def test_direnv_commands_read_the_timeout_setting_at_use(self) -> None:
         _ = self.envrc(self.work)
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
-        original = settings.read_text()
-        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("direnv", 600)) as run:
-            self.assertEqual(nix_env.ensure(self.work), nix_env.Refused(f"nix_env: {self.work}: direnv timed out after 600 s"))
-            self.assertEqual(run.call_args.kwargs["timeout"], 600)
-            _ = settings.write_text(original.replace("command_timeout_seconds=600", "command_timeout_seconds=2"))
-            self.assertEqual(nix_env.ensure(self.work), nix_env.Refused(f"nix_env: {self.work}: direnv timed out after 2 s"))
-            self.assertEqual(run.call_args.kwargs["timeout"], 2)
+        for timeout in (9, 2):
+            _ = write_config_fixture(settings, f"command_timeout_seconds={timeout}\n")
+            with self.subTest(timeout=timeout), patch.object(
+                subprocess, "run", side_effect=subprocess.TimeoutExpired("direnv", timeout)
+            ) as run:
+                self.assertEqual(nix_env.ensure(self.work),
+                                 nix_env.Refused(f"nix_env: {self.work}: direnv timed out after {timeout} s"))
+                self.assertEqual(run.call_args.kwargs["timeout"], timeout)
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/nix_env.conf")
-        for key, expected in {'trusted_home_folders': 'rust worktrees', 'trusted_home_prefix': '.claude', 'heal_state_directory': '~/.local/state/nix-heal', 'session_directory_glob': '.claude*/sessions'}.items():
+    def test_shipped_config_supplies_the_settings_used_by_nix_and_heal(self) -> None:
+        path = ROOT / "config/nix_env.conf"
+        settings = conf.read(path)
+        values = settings.values()
+        for key in ("trusted_home_folders", "trusted_home_prefix", "heal_state_directory", "session_directory_glob"):
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
-        for key, expected in {'command_timeout_seconds': 600.0, 'restart_interval_seconds': 3600.0, 'relaunch_launch_seconds': 90.0, 'relaunch_confirmation_seconds': 30.0, 'alert_timeout_seconds': 30.0}.items():
+                self.assertEqual(settings.text(key), values[key])
+        for key in ("command_timeout_seconds", "restart_interval_seconds", "relaunch_launch_seconds",
+                    "relaunch_confirmation_seconds", "alert_timeout_seconds"):
             with self.subTest(key=key):
-                self.assertEqual(settings.number(key), expected)
+                self.assertEqual(settings.number(key), float(values[key]))

@@ -4,11 +4,9 @@ description: Review decisions one at a time.
 
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
-**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.** It owns
-the principle every rule here derives from — you do the reconstruction, not the
-user — plus the build order, the naming rules, the banned vocabulary, the
-comprehension gate, the choice-line format, and what to do when an explanation
-fails to land. This file adds only what is specific to walking a list.
+**Read `~/.claude/docs/user_facing_explanation.md` first and follow it.**
+Explain how the parts relate so the user can assess each item.
+Follow its build order, naming rules, comprehension gate, choice-line format, and steps for clarifying an item.
 
 **Read `~/.claude/docs/type_design.md` too and follow it.** When an item concerns
 types, APIs, stored state, or optional values, use that contract to evaluate the
@@ -30,7 +28,6 @@ count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
-Before the first item, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/review_pause.py" pause` and show each line it prints. In a showrunner session this pauses current dailies and records whether it changed them. The record outlives compaction and session resume; a repeated `pause` keeps it. In a session no production targets, the command prints nothing and the review continues normally.
 
 By default the review gets a transient doc: a new file at the working repo's root, excluded from git with `bash ~/.claude/scripts/exclude/exclude.sh <path>` (the scratchpad does not survive compaction), headed with today's date and where the items came from. It holds each decision and any action the decision leaves pending, and is deleted in Step 5. Create it without asking, and open the first item with one line: `N items; decisions in <path>, deleted when the review ends.` An item may also be acted on as soon as it is decided; the doc then records that it was done.
 
@@ -40,6 +37,8 @@ Ask first only when an obvious doc is in scope that the user did not name, a fil
 Wait for that answer before continuing. Never write "existing path": name the doc. If the user names a path that doesn't exist, create it with the same one-line header.
 
 ## Step 3: Build the todo list
+
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the item count.
 
 If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order, each with a short label and status `pending`. If not, keep an inline numbered checklist and refer to items by number.
 
@@ -109,6 +108,9 @@ For each item, in order:
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
+After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
+Run it again when the user returns to a closed item; include that item in the count.
+
 ### Decision frame
 
 Use this order by default:
@@ -150,19 +152,18 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 
 ## Step 5: Wrap up
 
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
+The command output names the held messages file. Read the file at your own pace.
+Each release in the file lists its messages oldest first.
+
 When every item is done:
 
-Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/review_pause.py" status`. When its records say the review paused dailies, ask one line: `Turn dailies back on? (yes / leave off)`. Wait for the answer. Then run the same script with `resume dailies` for `yes` or `resume none` for `leave off`. If the records say nothing was paused, run `resume none` without asking. The records outlive compaction and session resume, so Step 5 applies after a resumed review too. When `status` prints nothing, continue without a question.
 
 - Transient doc: summarize inline, one line per item — `1. <label> → <decision>` — then every action still pending (or `none pending`), then delete the doc.
 - A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.
 - Ensure every task has a terminal status.
 
 ## Rules
-
-`~/.claude/docs/user_facing_explanation.md` carries the explanation rules — build
-order, naming, banned vocabulary, comprehension gate, choice format, repair when
-an item does not land. These are the ones specific to walking a list.
 
 - **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct summary followed by the inline choice line from Step 4. Keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.

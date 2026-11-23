@@ -1,0 +1,144 @@
+"""Classify a staff member for the accounts board and the units table."""
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from importlib import import_module
+from pathlib import Path
+from typing import Literal, Protocol, cast
+
+from scripts.lib.unit_runs import LauncherRunDirectories
+from scripts.production import staff
+
+SessionState = Literal["busy", "idle", "paused", "exited"]
+StaffState = Literal["active", "paused", "exited"]
+
+
+@dataclass(frozen=True)
+class LiveActivity:
+    status: str
+
+
+@dataclass(frozen=True)
+class NoLiveSession:
+    """No live session was observed for this member."""
+
+
+@dataclass(frozen=True)
+class UnrecordedStaff:
+    """The observed session has no staff row."""
+
+
+def staff_state(member: staff.StaffRow | UnrecordedStaff) -> StaffState:
+    """Read the member's recorded hold for the style table and session classifier."""
+    if isinstance(member, staff.StaffRow):
+        if isinstance(member.exited, staff.Exited):
+            return "exited"
+        if isinstance(member.paused, staff.Paused):
+            return "paused"
+    return "active"
+
+
+@dataclass(frozen=True)
+class RunningDetachedWork:
+    staff_ids: frozenset[staff.StaffId] = frozenset()
+    inputs: tuple[Path, ...] = ()
+    labels: Mapping[staff.StaffId, tuple[str, ...]] = field(default_factory=lambda: dict[staff.StaffId, tuple[str, ...]]())
+    launcher_runs: LauncherRunDirectories = field(default_factory=lambda: LauncherRunDirectories({}, {}))
+    unreadable_workers: frozenset[staff.StaffId] = frozenset()
+
+
+NO_DETACHED_WORK = RunningDetachedWork()
+
+
+# An import of detached_runs here would close an import cycle.
+class RunReadError(Protocol):
+    @property
+    def staff_ids(self) -> frozenset[staff.StaffId]: ...
+
+
+class RunEvidence(Protocol):
+    @property
+    def runs(self) -> Sequence[Mapping[str, object]]: ...
+
+    @property
+    def read_errors(self) -> Sequence[RunReadError]: ...
+
+    def report_errors(self) -> None: ...
+
+
+def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = (),
+                          worker_runs: LauncherRunDirectories | None = None) -> RunningDetachedWork:
+    """Read each run folder once and only the records that live supervisors name."""
+    from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
+
+    live_runs = cast(Callable[[Mapping[Path, frozenset[staff.StaffId]]], Sequence[Mapping[str, object]]],
+                     import_module("scripts.agents.detached_runs").live_runs_in_folders)
+    live_evidence = cast(Callable[..., RunEvidence],
+                         import_module("scripts.agents.detached_runs").live_run_evidence_in_folders)
+    worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
+                              import_module("scripts.herdr.worker_panes").worker_run_directories)
+
+    # Workers of one parent share folders; resolve each folder once.
+    resolved: dict[Path, Path] = {}
+
+    def owned(folder: Path) -> set[staff.StaffId]:
+        real = resolved.get(folder)
+        if real is None:
+            real = resolved[folder] = folder.resolve()
+        return owners.setdefault(real, set())
+
+    owners: dict[Path, set[staff.StaffId]] = {}
+    if worker_runs is None:
+        for row in record.rows:
+            if isinstance(row.run, staff.OpenRun):
+                owned(row.run.path).add(row.id)
+    directories = worker_directories(record) if worker_runs is None else worker_runs
+    for identity, folders in directories.by_worker.items():
+        for folder in folders:
+            owned(folder).add(identity)
+    identities = directories.by_worker.keys()
+    for folder in additional_runs:
+        owned(folder).update(identities)
+    busy: set[staff.StaffId] = set()
+    labels: dict[staff.StaffId, list[str]] = {}
+    # A start or a finish adds or renames a record, so each folder's change shows on the folder.
+    inputs = {folder / DETACHED_RUNS_DIR for folder in owners}
+    folders = {folder: frozenset(identities) for folder, identities in owners.items()}
+    unreadable_workers: frozenset[staff.StaffId] = frozenset()
+    if worker_runs is None:
+        runs = live_runs(folders)
+    else:
+        names = {row.id: row.name for row in record.find(kind="worker")}
+        evidence = live_evidence(folders, staff_names=names)
+        evidence.report_errors()
+        unreadable_workers = frozenset(identity for error in evidence.read_errors for identity in error.staff_ids)
+        runs = evidence.runs
+    for run in runs:
+        row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
+        if row is not None:
+            busy.add(row.id)
+            label = run.get("label")
+            if isinstance(label, str):
+                labels.setdefault(row.id, []).append(label)
+    return RunningDetachedWork(frozenset(busy), tuple(sorted(inputs)),
+                               {identity: tuple(items) for identity, items in labels.items()}, directories, unreadable_workers)
+
+
+def classify(member: staff.StaffRow | UnrecordedStaff,
+             activity: LiveActivity | NoLiveSession, *,
+             detached: RunningDetachedWork = NO_DETACHED_WORK) -> SessionState:
+    """Staff exit and pause records take precedence; a start, a background shell or a detached run counts as busy.
+
+    Claude Code writes `shell` when the turn has ended and a background command still runs.
+    """
+    hold = staff_state(member)
+    if hold != "active":
+        return hold
+    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting", "shell"):
+        return "busy"
+    if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
+        return "busy"
+    if isinstance(activity, NoLiveSession):
+        return "exited"
+    return "idle"

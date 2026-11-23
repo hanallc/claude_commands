@@ -6,20 +6,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from scripts.lib.transcript_test_support import compressed_copy
+from typing import cast, override
 
-import launches
-from test_index import Record, point_root_at
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
+from scripts.buildlog import launches
+from scripts.buildlog.test_index import Record, point_root_at
+from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 ENDED = "2026-10-02T16:40:18+00:00"
@@ -108,7 +105,7 @@ class LaunchTests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CLI), *args], env=self.environment, capture_output=True,
+            [str(CLI.resolve().parents[1] / "lib/py"), str(CLI), *args], env=self.environment, capture_output=True,
             text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -127,6 +124,23 @@ class LaunchTests(unittest.TestCase):
             },
         }
         _ = (self.root / launches.STATE_NAME).write_text(json.dumps(state))
+
+    def test_compressed_transcripts_keep_launches_and_their_resume_cursor(self) -> None:
+        entry = cast(Record, json.loads(result_line("session-one", "font_features", self.worktree)))
+        del entry["sessionId"]
+        _ = self.transcript.write_text(json.dumps(entry) + "\n")
+        first = self.run_cli("launches")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        records = self.records()
+        self.assertEqual(records[0]["session"], "session-one")
+        _ = compressed_copy(self.transcript)
+        second = self.run_cli("launches")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.records(), records)
+        (self.root / launches.STATE_NAME).unlink()
+        third = self.run_cli("launches")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(self.records(), records)
 
     def test_launches_record_nested_result_and_only_new_complete_lines(self) -> None:
         first = result_line("session-one", "font_features", self.worktree, duration_ms=1_468_425)

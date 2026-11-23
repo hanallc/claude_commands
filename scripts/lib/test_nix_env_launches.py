@@ -2,49 +2,55 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
-import re
-import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING, cast, override
-from unittest.mock import Mock, patch
+from typing import cast, override
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
-for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
-    sys.path.insert(0, str(ROOT / "scripts" / dependency))
-sys.path.insert(0, str(ROOT))
-if TYPE_CHECKING:
-    from scripts.herdr import herdr, herdr_sessions, pane_launch
-    from scripts.production import add_unit, add_showrunner
-    from scripts.shutdown import pane_restore, pane_record
-    from scripts.notify import review
-    from scripts.notify.user_action import NoActionRequired
-else:
-    import herdr
-    import add_unit
-    import add_showrunner
-    import pane_restore
-    import pane_record
-    import herdr_sessions
-    import pane_launch
-    import review
-    from user_action import NoActionRequired
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
+from scripts.herdr import herdr, herdr_sessions
+from scripts.herdr import herdr_types
+from scripts.production import add_unit, add_showrunner
+from scripts.notify import review
+from scripts.notify.user_action import NoActionRequired
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
+from scripts.direct import test_claude_worker
 from scripts.accounts import accounts
 from scripts.lib import nix_env
+from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff
 from scripts.production.production_doc import Production
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-from scripts.shutdown.remote import local_machine
+from scripts.agents.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class AgentExecEnvironmentTests(NixFixture):
+    def test_exec_removes_operation_configuration_after_the_worktree_environment_load(self) -> None:
+        _ = self.envrc(self.work)
+        restored = {"KEEP": "loaded", "IN_NIX_SHELL": "impure",
+                    "MODELS_LAUNCH_CONFIGURATION": "stale launch", "MODELS_REGISTRY_EDIT_BASE": "stale editor"}
+        with (chdir(self.work), patch.dict(os.environ, {"DIRENV_DIFF": json.dumps(restored)}),
+              patch.object(os, "execvpe", side_effect=SystemExit(0)) as execute):
+            with self.assertRaises(SystemExit):
+                _ = nix_env.main(["exec", sys.executable, "--version"])
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[:2], (sys.executable, [sys.executable, "--version"]))
+        environment = cast(dict[str, str], execute.call_args.args[2])
+        self.assertEqual(environment["KEEP"], "loaded")
+        self.assertEqual(environment["NIX_ENV_ENVRC"], str(self.work / ".envrc"))
+        self.assertNotIn("MODELS_LAUNCH_CONFIGURATION", environment)
+        self.assertNotIn("MODELS_REGISTRY_EDIT_BASE", environment)
 
 
 class HerdrLaunchTests(NixFixture):
@@ -53,6 +59,7 @@ class HerdrLaunchTests(NixFixture):
         super().setUp()
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="fixture-server"))
         _ = self.enterContext(patch.object(herdr, "start_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = self.enterContext(patch.object(os, "execvp", side_effect=AssertionError("unexpected fixture attach")))
         _ = self.enterContext(patch.object(account, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")}))
 
@@ -88,17 +95,22 @@ class HerdrLaunchTests(NixFixture):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture")
         self.assertIsInstance(result, herdr.AgentLaunched)
         self.assertEqual(opened.call_args.args[3], str(self.work))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "NIX_LDFLAGS": "-Lfixture",
+            "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
         started.assert_called_once()
         _ = self.continued(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
     def production(self) -> Production:
-        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+        return Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"),
+                          staff.StaffRow(staff.StaffId(""), "showrunner", "child", staff.StaffRoot(),
+                                         current_session=staff.StaffId("")))
 
     def test_choke_point_keeps_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
               patch.object(herdr, "open_tab", return_value="new-pane"),
-              patch.object(herdr, "start_agent", side_effect=herdr.HerdrFailure("start refused")),
+              patch.object(herdr, "start_agent", side_effect=herdr_types.HerdrFailure("start refused")),
               patch.object(herdr, "close_agent") as close):
             result = herdr.launch_agent("host", "space", "title", str(self.work), {}, "codex", [],
                                         herdr.NoOpeningPrompt(), 100, agent="fixture")
@@ -159,7 +171,9 @@ class HerdrLaunchTests(NixFixture):
             _ = herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [],
                                    herdr.NoOpeningPrompt(), 100, agent="fixture", unset_environment=frozenset({"REMOVE_ME"}))
         self.assertNotIn("REMOVE_ME", cast(dict[str, str], ensure.call_args.args[1]))
-        self.assertEqual(opened.call_args.args[4], {"IN_NIX_SHELL": "pure"})
+        self.assertEqual(opened.call_args.args[4], {
+            "IN_NIX_SHELL": "pure", "PYTHONPATH": str(ROOT / "scripts/lib/session_python_startup"),
+        })
 
     def test_add_unit_uses_session_cwd_before_opening(self) -> None:
         request = add_unit.UnitLaunch(production=self.production(), identity=add_unit.UnitIdentity("unit", "worker"),
@@ -203,20 +217,6 @@ class HerdrLaunchTests(NixFixture):
             self.assertEqual(Path(cast(str | Path, ensure.call_args.args[0])), self.work)
             self.assertEqual(cast(dict[str, str], opened.call_args.args[4])["NIX_LDFLAGS"], "-Lloaded")
 
-    def test_pane_restore_refusal_preserves_the_old_pane(self) -> None:
-        client = Mock()
-        client.configure_mock(**{"pane_activity.return_value": herdr.PaneAtShell(),
-                                 "close_tab_confirmed.return_value": False})
-        entry = pane_record.launch("pane", "sid", str(self.work), {"CLAUDE_CONFIG_DIR": str(self.home / ".claude3")},
-                                   ["claude", "-n", "worker"])
-        invoke = cast(Callable[..., object], getattr(pane_restore, "_resume"))
-        with (patch.object(pane_restore, "named_account_environment", return_value={}),
-              patch.object(pane_launch, "resume_attempt",
-                           side_effect=herdr.HerdrFailure("fixture publication is unavailable")),
-              self.assertRaisesRegex(herdr.HerdrFailure, "fixture publication is unavailable")):
-            _ = self.continued(lambda: invoke("host", client, herdr.TabSession("pane", "worker", "space", "sid"), entry))
-        cast(Mock, client.close_tab_of).assert_not_called()
-
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
         reason = "nix_env: fixture: missing shell"
         output = io.StringIO()
@@ -247,24 +247,15 @@ class ShellLaunchTests(NixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.scripts = self.home / ".claude/scripts"
-        _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh"):
-            destination = self.scripts / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
-                destination.symlink_to(ROOT / "scripts" / relative)
-            else:
-                _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
-        (self.scripts / "direct").symlink_to(ROOT / "scripts/direct", target_is_directory=True)
-        py = self.scripts / "lib/py"
-        _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
-        py.chmod(0o755)
+        self.scripts = copy_helpers(self.home, *VERIFY_HELPERS, "scripts/accounts", "scripts/maintenance",
+                                    "scripts/astra", "scripts/usage", "scripts/cli_agent", "scripts/make_a_worktree")
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
-        _ = (self.scripts / "agents/models_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
-agents_claude_args() { echo '--model fixture'; }
-''')
+        _ = (self.scripts / "agents/models_config.sh").write_text(
+            (ROOT / "scripts/agents/models_config.sh").read_text()
+            + "\nagents_resolve() { AGENT_FAMILY=claude; AGENT_MODEL=fixture; AGENT_CLAUDE_ACCOUNT=workers; }\n"
+            + "agents_claude_args() { echo '--model fixture'; }\n")
+        registry = write_registry(self.root / "models.conf")
+        self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
         self.started = self.root / "started.jsonl"
         self.script(self.bin / "claude", '''import json, os, sys
 from pathlib import Path
@@ -280,8 +271,12 @@ print('{"type":"result","result":"fixture completed"}')
 
     def run_script(self, relative: str, args: list[str], directory: Path) -> subprocess.CompletedProcess[str]:
         command, environment = ["bash", str(self.scripts / relative), *args], self.env
-        if relative in ("agents/agent_bg.sh", "agents/agent_exec.sh"):
-            command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
+        if relative == "direct/claude_worker.py":
+            run, name, cwd, prompt, summary, log = args
+            command = test_claude_worker.worker_command(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log))
+        if relative == "agents/agent_exec.sh":
+            with patch("scripts.direct.assign_launcher_test_support.ASSIGN", self.scripts / "direct/assign.sh"):
+                command, environment = backend_fixture_command(self.root / "assign-parent", command, environment)
         return subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS, check=False)
 
@@ -312,100 +307,20 @@ print('{"type":"result","result":"fixture completed"}')
     def test_cli_agent(self) -> None:
         self.launch_contract("cli_agent/cli_agent.sh", [], self.work)
 
-    def test_agent_bg(self) -> None:
-        (self.scripts / "production").symlink_to(ROOT / "scripts/production", target_is_directory=True)
+    def test_claude_worker(self) -> None:
+        _ = (self.home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        self.env["CLAUDE_CONFIG_DIR"] = ""
         with isolated_staff_file(self.root / "staff.json", self.env):
             owner = unit_membership("child", "unit")
             self.env["CODEX_THREAD_ID"] = owner.id
-            self.env["AGENT_BG_ROLE"] = "impl"
-            self.launch_contract("agents/agent_bg.sh", ["--run", str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
+            self.launch_contract("direct/claude_worker.py", [str(self.root / "run"), "fixture", str(self.work), str(self.root / "prompt"),
                 str(self.root / "result"), str(self.root / "launch.log")], self.work)
         rows = [cast(dict[str, object], json.loads(line)) for line in self.started.read_text().splitlines()]
         arguments = cast(list[str], rows[0]["args"])
         settings = cast(dict[str, dict[str, str]], json.loads(arguments[arguments.index("--settings") + 1]))
         self.assertEqual(settings["env"]["IN_NIX_SHELL"], "impure")
         self.assertEqual(settings["env"]["NIX_LDFLAGS"], "-Lfixture")
-
-    def test_berth_fix(self) -> None:
-        directory = self.home / "rust/berth-fix"
-        directory.mkdir(parents=True)
-        self.launch_contract("berth_fix/launch.sh", ["--here"], directory)
-
-    def test_berth_fix_reuses_reserved_id_until_its_account_transcript_exists(self) -> None:
-        home = self.home.rename(self.root / "home.with_under score")
-        self.scripts = home / ".claude/scripts"
-        self.env["HOME"] = str(home)
-        directory = home / "rust/berth-fix"
-        _ = self.envrc(directory)
-        config = home / ".claude3"
-        self.env["CLAUDE_CONFIG_DIR"] = str(config)
-        self.env["DIRENV_DIFF"] = "{}"
-        failed = self.run_script("berth_fix/launch.sh", ["--here"], directory)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertFalse(self.started.exists())
-        record = home / ".claude/state/berth-fix/session.json"
-        reserved = cast(dict[str, str], json.loads(record.read_text()))["session_id"]
-        del self.env["DIRENV_DIFF"]
-        project = re.sub(r"[^a-zA-Z0-9]", "-", str(directory))
-        # Another account's transcript must not turn the reserved id into a resume.
-        other_account = home / ".claude/projects" / project
-        other_account.mkdir(parents=True)
-        _ = (other_account / f"{reserved}.jsonl").write_text("fixture transcript\n")
-        recovered = self.run_script("berth_fix/launch.sh", ["--here"], directory)
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        first = cast(dict[str, object], json.loads(self.started.read_text().splitlines()[0]))
-        arguments = cast(list[str], first["args"])
-        self.assertEqual(arguments[arguments.index("--session-id") + 1], reserved)
-        self.assertNotIn("-r", arguments)
-        own_history = config / "projects" / project
-        own_history.mkdir(parents=True)
-        _ = (own_history / f"{reserved}.jsonl").write_text("fixture transcript\n")
-        resumed = self.run_script("berth_fix/launch.sh", ["--here"], directory)
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        last = cast(dict[str, object], json.loads(self.started.read_text().splitlines()[-1]))
-        arguments = cast(list[str], last["args"])
-        self.assertEqual(arguments[arguments.index("-r") + 1], reserved)
-        self.assertNotIn("--session-id", arguments)
-
-    def test_berth_fix_rerun_moves_account_history_after_an_interrupted_worktree_move(self) -> None:
-        repository = self.home / "rust/cargo-liner"
-        _ = self.envrc(repository)
-        legacy = self.home / "rust/cargo-liner-berth-fix"
-        directory = self.home / "rust/berth-fix"
-        for arguments in (["init"], ["add", ".envrc"], ["commit", "-m", "fixture"],
-                          ["worktree", "add", "-b", "fix/berth", str(legacy)]):
-            result = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
-                                    cwd=repository, env=self.env, capture_output=True, text=True,
-                                    timeout=TEST_HANG_GUARD_SECS, check=False)
-            self.assertEqual(result.returncode, 0, result.stderr)
-        config = self.home / ".claude3"
-        self.env["CLAUDE_CONFIG_DIR"] = str(config)
-        old_name = re.sub(r"[^a-zA-Z0-9]", "-", str(legacy))
-        new_name = re.sub(r"[^a-zA-Z0-9]", "-", str(directory))
-        old_history, new_history = config / "projects" / old_name, config / "projects" / new_name
-        old_history.mkdir(parents=True)
-        _ = (old_history / "fixture.jsonl").write_text("conversation survives\n")
-        default_history = self.home / ".claude/projects" / old_name
-        default_history.mkdir(parents=True)
-        _ = (default_history / "other-account.jsonl").write_text("other account\n")
-        self.script(self.bin / "mv", 'import sys\nprint("fixture stopped before history move", file=sys.stderr)\nraise SystemExit(19)\n')
-        interrupted = self.run_script("berth_fix/launch.sh", ["--here"], self.work)
-        self.assertNotEqual(interrupted.returncode, 0)
-        self.assertTrue(directory.is_dir())
-        self.assertFalse(legacy.exists())
-        self.assertTrue(old_history.is_dir())
-        self.assertFalse(new_history.exists())
-        self.assertFalse(self.started.exists())
-        (self.bin / "mv").unlink()
-        recovered = self.run_script("berth_fix/launch.sh", ["--here"], self.work)
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        self.assertFalse(old_history.exists())
-        self.assertEqual((new_history / "fixture.jsonl").read_text(), "conversation survives\n")
-        self.assertTrue(default_history.is_dir())
-        self.assertTrue(self.started.exists())
-        # Once repaired, another launch leaves the destination history intact.
-        self.assertEqual(self.run_script("berth_fix/launch.sh", ["--here"], self.work).returncode, 0)
-        self.assertEqual((new_history / "fixture.jsonl").read_text(), "conversation survives\n")
 
     def test_direnv_allow_is_a_failing_helper_call_not_a_warning(self) -> None:
         _ = self.envrc(self.work)

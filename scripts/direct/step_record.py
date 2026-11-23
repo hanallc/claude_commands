@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Share the location and state of one live verify call."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -8,31 +12,31 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TextIO, cast
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.lib import process_start as process_identity
+from scripts.lib import process_start as process_identity
+
+from scripts.lib.boot_identity import boot_identity
 
 
+# verify.sh names each call v<UTC stamp>-<its pid>-<random>.
+CALL_ID_PID = re.compile(r"v\d{8}T\d{6}-(\d+)-\d+")
 KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 STATES = ("waiting_hold", "waiting_mac", "waiting_ssh", "on_ssh", "on_mac", "on_natedev", "local_noncompiling")
 # Each rule holds the argument name, requirement, default and choices.
 COMMAND_ARGUMENTS: dict[str, tuple[tuple[str, bool, str, tuple[str, ...]], ...]] = {
     "start": (("pid", True, "", ()),),
     "write": tuple(("--" + name, True, "", ()) for name in ("call-id", "pid", "kind", "runs-on", "state"))
-        + (("--repo", False, os.getcwd(), ()),)
+        + (("--repo", False, "", ()),)
         + tuple(("--" + name, False, "", ()) for name in
-                ("package", "reason", "eligible-targets", "mac-targets", "pinned-target")),
-    "state": (("--call-id", True, "", ()), ("--target", False, "", ()), ("state", True, "", STATES)),
-    "remove": (("--call-id", True, "", ()),),
+                ("package", "reason", "eligible-targets", "mac-targets", "mac-disk-exclusions", "pinned-target")),
     "stopped": (("--call-id", True, "", ()), ("--consumed", True, "", ())),
+    "disk-exclusions": (("--call-id", True, "", ()), ("--targets", True, "", ())),
 }
 
 
@@ -41,7 +45,7 @@ class UseArgumentParser:
 
 
 def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
-    if not arguments or arguments[0] not in ("write", "state", "remove", "stopped"):
+    if not arguments or arguments[0] not in ("write", "stopped", "disk-exclusions"):
         return UseArgumentParser()
     verb = arguments[0]
     rules = COMMAND_ARGUMENTS[verb]
@@ -49,12 +53,14 @@ def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
     positional = [name for name, _, _, _ in rules if not name.startswith("--")]
     values = {name.removeprefix("--").replace("-", "_"): default
               for name, required, default, _ in rules if not required}
+    if verb == "write":
+        values["repo"] = os.getcwd()
     values["command"] = verb
     index = 1
     while index < len(arguments):
         token = arguments[index]
-        if verb == "write" and token == "--clock-offset":
-            values["clock_offset"] = "1"
+        if verb == "write" and token == "--report":
+            values["report"] = "1"
             index += 1
             continue
         if token.startswith("--"):
@@ -86,23 +92,28 @@ def execute_cli(args: dict[str, str]) -> int:
             print(process_start(int(args["pid"])))
             return 0
         call_id = args["call_id"]
-        if command == "remove":
-            remove(call_id)
-        elif command == "stopped":
+        if command == "stopped":
             return 0 if consume_stopped_build(call_id, Path(args["consumed"])) else 1
-        elif command == "state":
-            state_fields(call_id, args["state"], args["target"])
+        elif command == "disk-exclusions":
+            expected = sys.stdin.read()
+            path = record_path(call_id)
+            if path.read_text() != expected:
+                raise ValueError("record missing or changed")
+            row = validated_fields(cast(object, json.loads(expected)), call_id)
+            row["mac_disk_exclusions"] = list(filter(None, args["targets"].split(",")))
+            write_fields(call_id, row)
+            print(path.read_text(), end="")
         else:
             pid, kind, location = int(args["pid"]), args["kind"], args["runs_on"]
-            if kind not in KINDS or location not in ("mac_allowed", "natedev_only", "ssh_allowed"):
+            if kind not in KINDS or location not in ("any_target", "natedev_only"):
                 raise ValueError("invalid step kind or run location")
             if location == "natedev_only" and not args["reason"]:
                 raise ValueError("natedev-only step needs a reason")
             if args["state"] not in STATES:
                 raise ValueError("invalid step state")
             runs_on: dict[str, object] = {"kind": location}
-            eligible = ["mac", "natedev"] if location == "mac_allowed" else ["natedev"]
-            if location == "ssh_allowed":
+            eligible = ["natedev"]
+            if location == "any_target":
                 eligible = list(filter(None, args["eligible_targets"].split(",")))
                 runs_on["mac_targets"] = list(filter(None, args["mac_targets"].split(",")))
             elif location == "natedev_only":
@@ -110,12 +121,15 @@ def execute_cli(args: dict[str, str]) -> int:
             row: dict[str, object] = dict(v=1, call_id=call_id, pid=pid, proc_start=process_start(pid),
                 repo=str(Path(args["repo"]).resolve()), kind=kind, package=args["package"] or None,
                 eligible_targets=eligible, selected_target="", runs_on=runs_on, state=args["state"],
+                mac_disk_exclusions=list(filter(None, args["mac_disk_exclusions"].split(","))),
                 updated=datetime.now(timezone.utc).isoformat())
             if args["pinned_target"]:
                 row["pinned_target"] = args["pinned_target"]
             write_fields(call_id, row)
-            if args.get("clock_offset"):
+            if args.get("report"):
                 print((time.time_ns() - time.monotonic_ns()) // 1000)
+                print(record_path(call_id))
+                print(state_path(call_id))
     except (OSError, ValueError, IndexError) as error:
         print(f"step record: {error}; step refused", file=sys.stderr)
         return 2
@@ -130,6 +144,10 @@ def record_path(call_id: str) -> Path:
     if not call_id or Path(call_id).name != call_id or call_id in (".", ".."):
         raise ValueError("invalid call id")
     return record_directory() / f"{call_id}.json"
+
+
+def state_path(call_id: str) -> Path:
+    return record_path(call_id).with_suffix(".state")
 
 
 def process_start(pid: int) -> str:
@@ -165,9 +183,7 @@ def validated_fields(value: object, call_id: str) -> dict[str, object]:
     if not isinstance(target, dict):
         raise ValueError("invalid run location")
     location = cast(dict[str, object], target)
-    if location.get("kind") == "mac_allowed":
-        eligible = ["mac", "natedev"]
-    elif location.get("kind") == "ssh_allowed":
+    if location.get("kind") == "any_target":
         targets, macs = row.get("eligible_targets"), location.get("mac_targets", [])
         if (not isinstance(targets, list) or not isinstance(macs, list)
                 or not all(isinstance(item, str) and item for item in cast(list[object], targets))
@@ -184,17 +200,13 @@ def validated_fields(value: object, call_id: str) -> dict[str, object]:
         raise ValueError("invalid selected target")
     if not isinstance(pinned, str):
         raise ValueError("invalid pinned target")
-    if pinned and pinned not in (eligible if location["kind"] == "ssh_allowed" else ["mac"]):
+    if pinned and pinned not in eligible:
         raise ValueError("pinned target is not eligible")
     for field in ("proc_start", "repo", "updated"):
         _ = _text(row.get(field))
     if _text(row.get("state")) not in STATES:
         raise ValueError("invalid step state")
     return {**row, "eligible_targets": eligible, "selected_target": selected, "package": package or None}
-
-
-def read_fields(call_id: str) -> dict[str, object]:
-    return validated_fields(cast(object, json.loads(record_path(call_id).read_text())), call_id)
 
 
 def write_fields(call_id: str, row: Mapping[str, object]) -> None:
@@ -215,22 +227,6 @@ def write_fields(call_id: str, row: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def state_fields(call_id: str, next_state: str, target: str = "") -> None:
-    try:
-        row = read_fields(call_id)
-        if process_start(cast(int, row["pid"])) != row["proc_start"]:
-            raise ValueError("stale step record")
-    except (OSError, ValueError, IndexError) as error:
-        raise ValueError(f"cannot update step record: {error}") from error
-    selected = target or ("mac" if next_state == "on_mac" else "natedev" if next_state == "on_natedev" else "")
-    write_fields(call_id, {**row, "state": next_state, "selected_target": selected,
-                           "updated": datetime.now(timezone.utc).isoformat()})
-
-
-def remove(call_id: str) -> None:
-    record_path(call_id).unlink(missing_ok=True)
-
-
 def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     """Read this call's new enforcer stops, including stops before a release."""
     root = Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")))
@@ -238,7 +234,7 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
     if sys.platform == "darwin":
         return False  # The Linux build enforcer does not run on Darwin.
-    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
+    boot_id = boot_identity(proc)
     seen: set[str]
     try:
         seen = set(consumed.read_text().splitlines())
@@ -252,6 +248,7 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
                 continue
             row = cast(dict[str, object], value)
             if (row.get("kind") != "hold_build" or row.get("action") != "stopped"
+                    or row.get("stop_status", "stopped") != "stopped"
                     or row.get("call_id") != call_id or row.get("boot_id") != boot_id):
                 continue
             pid, start = row.get("pid"), row.get("proc_start")
@@ -272,11 +269,12 @@ if __name__ == "__main__":
 
 
 from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class MacAllowed:
-    pass
+from scripts.direct.step_selection import (
+    Pinned as Pinned,
+    ROUTED as ROUTED,
+    Routed as Routed,
+    TargetSelection as TargetSelection,
+)
 
 
 @dataclass(frozen=True)
@@ -285,26 +283,12 @@ class NatedevOnly:
 
 
 @dataclass(frozen=True)
-class SshAllowed:
+class AnyTarget:
     targets: tuple[str, ...]
     mac_targets: tuple[str, ...] = ()
 
 
-RunsOn = MacAllowed | NatedevOnly | SshAllowed
-
-
-@dataclass(frozen=True)
-class Routed:
-    pass
-
-
-@dataclass(frozen=True)
-class Pinned:
-    target: str
-
-
-TargetSelection = Routed | Pinned
-ROUTED = Routed()
+RunsOn = NatedevOnly | AnyTarget
 
 
 @dataclass(frozen=True)
@@ -320,8 +304,8 @@ class NamedPackage:
 PackageSelection = WorkspacePackages | NamedPackage
 
 
-def package_selection(value: PackageSelection | str | None) -> PackageSelection:
-    return value if isinstance(value, (WorkspacePackages, NamedPackage)) else NamedPackage(value) if value else WorkspacePackages()
+def package_selection(value: str | None) -> PackageSelection:
+    return NamedPackage(value) if value else WorkspacePackages()
 
 
 def package_name(value: PackageSelection) -> str:
@@ -329,8 +313,8 @@ def package_name(value: PackageSelection) -> str:
 
 
 def mac_eligible(record: StepRecord) -> bool:
-    return isinstance(record.runs_on, MacAllowed) or (
-        isinstance(record.runs_on, SshAllowed) and bool(record.runs_on.mac_targets))
+    """Read fixed Mac permission without using diagnostic disk exclusions."""
+    return isinstance(record.runs_on, AnyTarget) and bool(record.runs_on.mac_targets)
 
 
 class StepState(str, Enum):
@@ -343,7 +327,7 @@ class StepState(str, Enum):
     LOCAL_NONCOMPILING = "local_noncompiling"
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class StepRecord:
     call_id: str
     pid: int
@@ -357,22 +341,13 @@ class StepRecord:
     v: int = 1
     selected_target: str = ""
     selection: TargetSelection = ROUTED
-
-    def __init__(self, call_id: str, pid: int, proc_start: str, repo: Path, kind: str,
-                 package: PackageSelection | str | None, runs_on: RunsOn, state: StepState,
-                 updated: str, v: int = 1, selected_target: str = "",
-                 selection: TargetSelection = ROUTED) -> None:
-        for name, value in (("call_id", call_id), ("pid", pid), ("proc_start", proc_start),
-                            ("repo", repo), ("kind", kind), ("package", package_selection(package)),
-                            ("runs_on", runs_on), ("state", state), ("updated", updated),
-                            ("v", v), ("selected_target", selected_target), ("selection", selection)):
-            object.__setattr__(self, name, value)
+    mac_disk_exclusions: tuple[str, ...] = ()
 
     @property
     def eligible_targets(self) -> tuple[str, ...]:
-        if isinstance(self.runs_on, SshAllowed):
+        if isinstance(self.runs_on, AnyTarget):
             return self.runs_on.targets
-        return ("mac", "natedev") if isinstance(self.runs_on, MacAllowed) else ("natedev",)
+        return ("natedev",)
 
 
 @dataclass(frozen=True)
@@ -397,39 +372,92 @@ ReadResult = StepRecord | MissingRecord | StaleRecord | UnreadableRecord
 def _decode(value: object, call_id: str) -> StepRecord:
     row = validated_fields(value, call_id)
     location = cast(dict[str, object], row["runs_on"])
-    if location["kind"] == "mac_allowed":
-        runs_on: RunsOn = MacAllowed()
-    elif location["kind"] == "ssh_allowed":
-        runs_on = SshAllowed(tuple(cast(list[str], row["eligible_targets"])),
+    runs_on: RunsOn
+    if location["kind"] == "any_target":
+        runs_on = AnyTarget(tuple(cast(list[str], row["eligible_targets"])),
                             tuple(cast(list[str], location.get("mac_targets", []))))
     else:
         runs_on = NatedevOnly(_text(location["reason"]))
     pinned = cast(str, row.get("pinned_target", ""))
     return StepRecord(call_id, cast(int, row["pid"]), _text(row["proc_start"]), Path(_text(row["repo"])),
-                      _text(row["kind"]), cast(str | None, row["package"]), runs_on,
+                      _text(row["kind"]), package_selection(cast(str | None, row["package"])), runs_on,
                       StepState(_text(row["state"])), _text(row["updated"]),
-                      selected_target=cast(str, row["selected_target"]), selection=Pinned(pinned) if pinned else ROUTED)
+                      selected_target=cast(str, row["selected_target"]), selection=Pinned(pinned) if pinned else ROUTED,
+                      mac_disk_exclusions=tuple(cast(list[str], row.get("mac_disk_exclusions", []))))
+
+
+def recorded_caller(value: object, call_id: str) -> tuple[int, str] | tuple[int, None] | None:
+    """Name the verify process that wrote a record: its pid and start, or only the pid in its call id.
+
+    A damaged record still names its pid in the call id, so a dead writer reads as stale.
+    """
+    if isinstance(value, dict):
+        row = cast(dict[str, object], value)
+        pid, start = row.get("pid"), row.get("proc_start")
+        if type(pid) is int and pid > 0 and isinstance(start, str) and start:
+            return pid, start
+    match = CALL_ID_PID.fullmatch(call_id)
+    return (int(match.group(1)), None) if match else None
 
 
 def read(call_id: str) -> ReadResult:
+    # Open the state before the record: cleanup removes the record first, so an open state keeps its last word.
     try:
-        path = record_path(call_id)
-        value = cast(object, json.loads(path.read_text()))
+        state_file = state_path(call_id).open()
+    except FileNotFoundError:
+        state_file = None
+    except (OSError, ValueError) as error:
+        return UnreadableRecord(call_id, str(error))
+    try:
+        return _read_open(call_id, state_file)
+    finally:
+        if state_file is not None:
+            state_file.close()
+
+
+def _read_open(call_id: str, state_file: TextIO | None) -> ReadResult:
+    try:
+        text = record_path(call_id).read_text()
     except FileNotFoundError:
         return MissingRecord(call_id)
     except (OSError, ValueError) as error:
         return UnreadableRecord(call_id, str(error))
     try:
-        record = _decode(value, call_id)
-    except (ValueError, TypeError) as error:
-        return UnreadableRecord(call_id, str(error))
+        value = cast(object, json.loads(text))
+    except ValueError as error:
+        value = error
+    caller = recorded_caller(value, call_id)
+    if caller is not None:
+        pid, recorded_start = caller
+        try:
+            start = process_start(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return StaleRecord(call_id)
+        except (OSError, IndexError) as error:
+            return UnreadableRecord(call_id, str(error))
+        if recorded_start is not None and start != recorded_start:
+            return StaleRecord(call_id)
+    if isinstance(value, ValueError):
+        return UnreadableRecord(call_id, str(value))
     try:
-        start = process_start(record.pid)
-    except (FileNotFoundError, ProcessLookupError):
-        return StaleRecord(call_id)
-    except (OSError, IndexError) as error:
+        if state_file is not None:
+            words = state_file.read().split()
+            updated = datetime.fromtimestamp(os.fstat(state_file.fileno()).st_mtime, timezone.utc).isoformat()
+            if not isinstance(value, dict):
+                raise ValueError("record must be an object")
+            row = cast(dict[str, object], value)
+            value = row
+            if words and words[0] == "writes_tree":
+                row["runs_on"] = {"kind": "natedev_only", "reason": "step writes the tree"}
+                if row.get("pinned_target"):
+                    row["pinned_target"] = "natedev"
+                words = words[1:]
+            word = words[0] if words else ""
+            selected = words[1] if len(words) > 1 else "mac" if word == "on_mac" else "natedev" if word == "on_natedev" else ""
+            row.update(state=word, selected_target=selected, updated=updated)
+        return _decode(value, call_id)
+    except (OSError, ValueError, TypeError) as error:
         return UnreadableRecord(call_id, str(error))
-    return record if start == record.proc_start else StaleRecord(call_id)
 
 
 def live_records() -> list[StepRecord]:
@@ -438,21 +466,17 @@ def live_records() -> list[StepRecord]:
 
 
 def write(record: StepRecord) -> None:
-    location = ({"kind": "mac_allowed"} if isinstance(record.runs_on, MacAllowed)
-                else {"kind": "ssh_allowed", "mac_targets": list(record.runs_on.mac_targets)}
-                if isinstance(record.runs_on, SshAllowed)
+    location = ({"kind": "any_target", "mac_targets": list(record.runs_on.mac_targets)}
+                if isinstance(record.runs_on, AnyTarget)
                 else {"kind": "natedev_only", "reason": record.runs_on.reason})
     row = dict(v=record.v, call_id=record.call_id, pid=record.pid, proc_start=record.proc_start,
                repo=str(record.repo), kind=record.kind, package=package_name(record.package) or None,
                eligible_targets=list(record.eligible_targets), selected_target=record.selected_target,
+               mac_disk_exclusions=list(record.mac_disk_exclusions),
                runs_on=location, state=record.state.value, updated=record.updated)
     if isinstance(record.selection, Pinned):
         row["pinned_target"] = record.selection.target
     write_fields(record.call_id, row)
-
-
-def state(call_id: str, next_state: StepState, target: str = "") -> None:
-    state_fields(call_id, next_state.value, target)
 
 
 def main() -> int:
@@ -464,12 +488,12 @@ def main() -> int:
         command = commands.add_parser(verb)
         for name, required, default, choices in rules:
             if name.startswith("--"):
-                _ = command.add_argument(name, required=required, default=default, choices=choices or None)
+                _ = command.add_argument(name, required=required, default=os.getcwd() if name == "--repo" else default, choices=choices or None)
             else:
                 _ = command.add_argument(name, choices=choices or None)
         if verb == "write":
-            _ = command.add_argument("--clock-offset", action="store_const", const="1", default="",
-                                     help="print the wall-clock offset in microseconds")
+            _ = command.add_argument("--report", action="store_const", const="1", default="",
+                                     help="print the clock offset, record path and state path")
     arguments = vars(parser.parse_args())
     return execute_cli(cast(dict[str, str], arguments))
 

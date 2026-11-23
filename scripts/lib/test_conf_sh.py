@@ -12,6 +12,7 @@ import tempfile
 from typing import override
 import unittest
 
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SHELL_READER = Path(__file__).with_name("conf.sh")
@@ -30,14 +31,18 @@ class ShellConfTests(unittest.TestCase):
         self.config.mkdir()
         programs = self.root / "bin"
         programs.mkdir()
+        (programs / "bash").symlink_to("/bin/bash")
         python = programs / "python3"
         _ = python.write_text(
             '#!/bin/bash\nprintf "python\\n" >> "$FORK_LOG"\n'
             + f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
         python.chmod(0o755)
+        cache = self.root / "cache"
+        seed_interpreter_cache(cache, interpreter=python)
         self.env = {
             "PATH": str(programs), "HOME": str(self.root / "home"),
+            "XDG_CACHE_HOME": str(cache),
             "CONF_DIR": str(self.config), "HOSTNAME": socket.gethostname(),
             "FORK_LOG": str(self.root / "python.log"),
             "SUBSHELL_LOG": str(self.root / "subshell.log"),
@@ -62,6 +67,52 @@ class ShellConfTests(unittest.TestCase):
             env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_config_reads_append_with_builtins(self) -> None:
+        self.write("count=4\nmode=fast\n")
+        log = self.root / "reads"
+        self.env["CONF_READ_LOG"] = str(log)
+        for key in ("count", "mode", "count"):
+            result = self.run_reader(key, trace=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(log.is_file(), "The shell reader must record its config reads")
+        self.assertEqual(log.read_text().splitlines(), ["example"] * 3)
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
+        with self.subTest(read_log="empty"):
+            log.unlink()
+            self.env["CONF_READ_LOG"] = ""
+            result = self.run_reader("count", trace=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "4\n")
+            self.assertEqual(result.stderr, "")
+            self.assertFalse(log.exists())
+        _ = log.write_text("")
+        for destination in (str(log), "", None):
+            with self.subTest(conf_record=destination):
+                environment = {**self.env}
+                if destination is None:
+                    _ = environment.pop("CONF_READ_LOG", None)
+                else:
+                    environment["CONF_READ_LOG"] = destination
+                before = log.read_text().splitlines()
+                result = subprocess.run(
+                    [*self.shell, "-c", 'source "$1"; conf_record raw_reader; printf done',
+                     "record-test", str(SHELL_READER)], env=environment,
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done", ""))
+                self.assertEqual(log.read_text().splitlines(), before + (["raw_reader"] if destination else []))
+
+    def test_comments_preserve_hex_values_and_fragments_without_python(self) -> None:
+        self.write("# color=red\n  # color=blue\n"
+                   + "color=#a0522d # comment\nname=brown\t# comment\nfragment=path#part\n")
+        for key, expected in (("color", "#a0522d"), ("name", "brown"), ("fragment", "path#part")):
+            with self.subTest(key=key):
+                result = self.run_reader(key, trace=True)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected + "\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
 
     def test_normal_integer_enum_and_text_reads_use_no_child_process(self) -> None:
         self.write("# whole: -2..4\ncount=4\n# one of: fast, slow\nmode=fast\npath=a=b\n")

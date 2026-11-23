@@ -8,18 +8,15 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-if TYPE_CHECKING:
-    from . import decision_priority
-else:
-    import decision_priority
-import silence
-import pushover
-import push_texts
-import review
-from user_action import ActionRequired
+from scripts.notify import decision_priority
+from scripts.notify import silence
+from scripts.notify import pushover
+from scripts.notify import push_texts
+from scripts.notify import review
+from scripts.notify.user_action import ActionRequired
 
 
 class DecisionPriorityTests(unittest.TestCase):
@@ -96,7 +93,7 @@ class DecisionPriorityTests(unittest.TestCase):
         found = review.held_for("owner")
         assert isinstance(found, review.LiveHold)
         self.assertEqual(found.hold.draft.due, due)
-        with patch.object(silence, "keep", return_value=silence.Kept("until off")) as keep:
+        with patch.object(silence, "keep_here", return_value=silence.Kept("until off")) as keep:
             self.assertEqual(pushover.deliver(found.hold.best_version), 0)
         kept = cast(silence.KeptPush, keep.call_args.args[0])
         self.assertEqual(kept.get("due"), due)

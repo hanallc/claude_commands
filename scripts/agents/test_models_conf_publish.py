@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import configparser
+import fcntl
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Literal, final, override
+from typing import ClassVar, Literal, final, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import models_registry, atomic_file  # noqa: E402
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import models_registry, atomic_file, registry_rows  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 AGENTS = Path(__file__).resolve().parent
 REPO = AGENTS.parents[1]
@@ -81,13 +85,13 @@ class RegistryFixture(unittest.TestCase):
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
-        self.environment = {**os.environ, "HOME": str(self.home),
+        self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
                             "MODELS_CONFIG_FILE": str(self.registry),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
                             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
                             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "catalog-state"),
-                            "PYTHONPATH": str(REPO), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                            "PYTHONPATH": str(REPO / "scripts/lib/python_startup"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Registry Test",
                             "GIT_AUTHOR_EMAIL": "registry@example.invalid", "GIT_COMMITTER_NAME": "Registry Test",
                             "GIT_COMMITTER_EMAIL": "registry@example.invalid"}
@@ -121,7 +125,55 @@ class SharedRegistryTests(RegistryFixture):
     def setUp(self) -> None:
         self.set_up_registry("models.conf")
 
+    def test_store_reports_its_published_configuration_after_a_peer_replaces_the_file(self) -> None:
+        before = self.root / "before"
+        after = self.root / "after"
+        _ = before.write_text(DEFAULTS)
+        published = DEFAULTS.replace("impl=gpt-a:high", "impl=gpt-b:max")
+        peer = published.replace("impl=gpt-b:max", "impl=gpt-a:low")
+        _ = after.write_text(published)
+        store = models_registry.store_registry
+
+        def store_then_peer_write(registry: Path, before: str, after: str, description: str, *,
+                                  additive_catalog: bool = False) -> str:
+            # The real writer releases its lock before the peer writes.
+            result = store(registry, before, after, description, additive_catalog=additive_catalog)
+            _ = self.registry.write_text(peer)
+            return result
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment), redirect_stdout(output),
+              mock.patch.object(models_registry, "store_registry", side_effect=store_then_peer_write),
+              mock.patch.object(sys, "argv", ["models_registry.py", "store", "--registry", str(self.registry),
+                                             "--before", str(before), "--after", str(after)])):
+            self.assertEqual(models_registry.main(), 0)
+        shell = self.command("bash", "-c", output.getvalue() +
+                             'printf "%s\\0" "$MODELS_REGISTRY_BASE" "${_models_table_values[@]}"')
+        self.assert_ok(shell)
+        reported = shell.stdout.split("\0")
+        self.assertEqual(reported[0], published)
+        self.assertIn("gpt-b:max", reported[1:])
+        self.assertNotIn("gpt-a:low", reported[1:])
+        self.assertEqual(self.registry.read_text(), peer)
+
     def test_shell_setters_do_not_replay_an_intermediate_unrelated_row(self) -> None:
+        hook = self.root / "read-hook"
+        hook.mkdir()
+        _ = (hook / "sitecustomize.py").write_text('''import os
+from pathlib import Path
+from scripts.lib import conf_reads
+read_text = conf_reads.read_text
+def read_then_edit(path, *arguments, **keywords):
+    text = read_text(path, *arguments, **keywords)
+    path = Path(path)
+    if str(path) == os.environ["MODELS_CONFIG_FILE"] and "note=original" in text:
+        peer = path.with_suffix(".peer")
+        peer.write_text(text.replace("note=original", "note=intermediate"))
+        peer.replace(path)
+    return text
+conf_reads.read_text = read_then_edit
+''')
+        self.environment["PYTHONPATH"] = self.environment["PYTHONPATH"] + os.pathsep + str(hook)
         operations = ("agents_set_row direct.impl gpt-b:max",
                       "agents_set_assignment direct claude", "agents_set_all_assignments claude",
                       "agents_set_model gpt-b direct", "agents_set_service_tier fast direct")
@@ -129,13 +181,6 @@ class SharedRegistryTests(RegistryFixture):
             with self.subTest(operation=operation):
                 _ = write_registry(self.registry, {"direct.options": {"note": "original"}}, base_text=DEFAULTS)
                 result = self.bash('''
-cat() {
-    command cat "$@"
-    if [[ "$1" == "$MODELS_CONFIG_FILE" ]]; then
-        sed 's/note=original/note=intermediate/' "$1" > "$1.peer"
-        mv "$1.peer" "$1"
-    fi
-}
 eval "$(declare -f models_registry_store | sed '1s/models_registry_store/saved_registry_store/')"
 models_registry_store() {
     sed 's/note=intermediate/note=latest/' "$MODELS_CONFIG_FILE" > "$MODELS_CONFIG_FILE.peer"
@@ -226,10 +271,42 @@ class RegistryPublishingTests(RegistryFixture):
     checkout: Path = Path()
     competitor: Path = Path()
     remote: Path = Path()
-    initial: str = ""
+    initial: ClassVar[str]
+    publication_root: ClassVar[Path]
+    publication_seed: ClassVar[Path]
+    publication_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls(methodName="runTest")
+        cls.addClassCleanup(builder.doCleanups)
+        cls.initial = builder.build_publication_fixture()
+        cls.publication_root = builder.root
+        cls.publication_environment = dict(builder.environment)
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="agents-publication-seed-")))
+        cls.publication_seed = seed_root / "case"
+        _ = shutil.copytree(builder.root, cls.publication_seed, symlinks=True)
+        shutil.rmtree(builder.root)
 
     @override
     def setUp(self) -> None:
+        self.root = self.publication_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.publication_seed, self.root, symlinks=True)
+        self.home = self.root / "home"
+        self.registry = self.home / ".claude/config/models.conf"
+        self.checkout = self.home / ".claude"
+        self.command_directory = self.checkout
+        self.competitor = self.root / "competitor"
+        self.remote = self.root / "origin.git"
+        self.environment = dict(self.publication_environment)
+        refreshed = self.command(GIT, "update-index", "--refresh")
+        self.assertEqual(refreshed.returncode, 1, refreshed.stdout + refreshed.stderr)
+        _ = self.git("update-index", "--refresh", cwd=self.competitor)
+
+    def build_publication_fixture(self) -> str:
         self.set_up_registry("home/.claude/config/models.conf", publishing=True)
         self.checkout = self.home / ".claude"
         self.command_directory = self.checkout
@@ -244,11 +321,12 @@ class RegistryPublishingTests(RegistryFixture):
         _ = self.git("remote", "add", "origin", str(self.remote))
         _ = self.git("push", "--set-upstream", "origin", "main")
         _ = self.git("clone", str(self.remote), str(self.competitor), cwd=self.root)
-        self.initial = self.git("rev-parse", "HEAD").strip()
+        initial = self.git("rev-parse", "HEAD").strip()
         _ = (self.checkout / "dirty.txt").write_text("uncommitted dirty edit\n")
         _ = (self.checkout / "staged.txt").write_text("staged user edit\n")
         _ = self.git("add", "staged.txt")
         _ = (self.checkout / "staged.txt").write_text("staged user edit plus unstaged edit\n")
+        return initial
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = self.command(GIT, *arguments, cwd=cwd)
@@ -263,13 +341,18 @@ class RegistryPublishingTests(RegistryFixture):
                 self.git("diff", "--cached", "--", "dirty.txt", "staged.txt"),
                 self.git("ls-files", "--stage", "dirty.txt", "staged.txt"))
 
+    def assert_live_only(self, before: bytes) -> None:
+        """A refused publication keeps the edited row live and changes no other row."""
+        edits = registry_rows.changes(before.decode(), self.registry.read_text())
+        self.assertEqual([(edit.key, edit.replacement) for edit in edits], [("impl", "impl=gpt-b:max")])
+
     def assert_published(self, before: tuple[str, str, str], expected: str = "impl=gpt-b:max") -> None:
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.git("rev-parse", "origin/main").strip())
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(),
                          self.git("rev-parse", "HEAD").strip())
         self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines(),
                          ["config/models.conf"])
-        self.assertTrue(self.git("log", "-1", "--format=%s").startswith("config(agents): "))
+        self.assertTrue(self.git("log", "-1", "--format=%s").startswith("config(models): "))
         self.assertIn(expected, self.registry.read_text())
         self.assertEqual(self.dirty_state(), before)
         self.assertFalse(self.registry.with_name("agents.local.conf").exists())
@@ -283,6 +366,23 @@ class RegistryPublishingTests(RegistryFixture):
 
     def test_a_row_writer_publishes_only_the_registry_and_preserves_dirty_and_staged_files(self) -> None:
         self.assert_writer_publishes("agents_set_row direct.impl gpt-b:max", "impl=gpt-b:max")
+
+    def test_publication_uses_models_prefixes_for_its_private_git_indexes(self) -> None:
+        binaries = self.root / "git-probe"
+        binaries.mkdir()
+        captured = self.root / "index-paths"
+        wrapper = binaries / "git"
+        _ = wrapper.write_text('#!/bin/bash\n'
+                               + 'if [[ -n "${GIT_INDEX_FILE:-}" ]]; then\n'
+                               + '  printf "%s\\n" "$GIT_INDEX_FILE" >> "$TEST_INDEX_PATHS"\n'
+                               + 'fi\nexec "$TEST_REAL_GIT" "$@"\n')
+        wrapper.chmod(0o755)
+        self.environment.update(PATH=str(binaries) + os.pathsep + self.environment["PATH"],
+                                TEST_INDEX_PATHS=str(captured), TEST_REAL_GIT=GIT)
+        self.assert_writer_publishes("agents_set_row direct.impl gpt-b:max", "impl=gpt-b:max")
+        paths = captured.read_text().splitlines()
+        self.assertTrue(paths)
+        self.assertTrue(all(Path(path).parent.name.startswith("models-") for path in paths), paths)
 
     def test_an_assignment_writer_publishes_only_the_registry(self) -> None:
         self.assert_writer_publishes("agents_set_assignment direct claude", "direct=claude")
@@ -312,6 +412,14 @@ class RegistryPublishingTests(RegistryFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_published(before)
         self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")
+
+        with self.subTest(holder="another process"):
+            program = ("from scripts.lib import models_registry; "
+                       "p=models_registry.registry_path(); before=p.read_text(); "
+                       "models_registry.store_registry(p,before,before.replace('review=gpt-a:high','review=gpt-b:max'),'row edit')")
+            _ = publish_after_contender(self, self.checkout, self.remote, [sys.executable, "-c", program],
+                                    self.environment, cwd=self.checkout)
+            self.assert_published(before, expected="review=gpt-b:max")
 
     def test_identical_edit_publishes_after_interruption_following_the_atomic_write(self) -> None:
         before = self.dirty_state()
@@ -361,18 +469,52 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assert_ok(self.edit())
         self.assert_published(before)
 
+    def publish_pending(self) -> str:
+        program = ("from scripts.lib import models_registry; "
+                   + "print(models_registry.publish_pending(models_registry.registry_path()))")
+        result = self.command(sys.executable, "-c", program)
+        self.assert_ok(result)
+        return result.stdout.strip()
+
+    def test_a_later_edit_is_live_while_main_is_locked_and_publishes_when_main_is_free(self) -> None:
+        before = self.dirty_state()
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+        with (common / "main-push.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.environment["MODELS_CONFIG_PUBLISH"] = "later"
+            self.assert_ok(self.edit("agents_set_assignment direct claude"))
+            self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+            self.assertEqual(self.value("assignments", "direct"), "claude")
+            self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+            self.assertEqual(self.publish_pending(), "False")
+            self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, expected="direct=claude")
+        self.assertEqual(self.publish_pending(), "False")
+
+    def test_pending_rows_publish_onto_another_writers_registry_commit(self) -> None:
+        self.environment["MODELS_CONFIG_PUBLISH"] = "later"
+        self.assert_ok(self.edit("agents_set_assignment direct claude"))
+        self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+        path = self.competitor / "config/models.conf"
+        _ = path.write_text(path.read_text().replace("review=gpt-a:high", "review=gpt-b:max"))
+        _ = self.git("commit", "-am", "peer review row", cwd=self.competitor)
+        _ = self.git("push", "origin", "main", cwd=self.competitor)
+        before = self.dirty_state()
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, expected="direct=claude")
+        self.assertIn("review=gpt-b:max", self.git("show", "HEAD:config/models.conf"))
+
     def assert_obstructed_fast_forward_is_refused(self, obstruction: str, *, accepted_push: bool,
                                                 directory_obstruction: bool = False) -> None:
         if accepted_push:
             program = '''
-from scripts.lib import models_registry
-git = models_registry._git
-def interrupted(repo, *arguments, **keywords):
-    result = git(repo, *arguments, **keywords)
-    if arguments[0] == 'push':
-        raise SystemExit(17)
-    return result
-models_registry._git = interrupted
+from scripts.lib import land_main, models_registry
+land = land_main.land
+def interrupted(*arguments, **keywords):
+    _ = land(*arguments, **keywords)
+    raise SystemExit(17)
+models_registry.land_main.land = interrupted
 p = models_registry.registry_path()
 text = p.read_text()
 models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gpt-b:max'), 'row edit')
@@ -404,8 +546,13 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         obstruction_bytes = local_obstruction.read_bytes()
         refused = self.edit()
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("registry edit refused before writing", refused.stdout + refused.stderr)
-        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertIn("the rows are live; main does not have them yet: registry publication refused",
+                      refused.stdout + refused.stderr)
+        if accepted_push:
+            # The interrupted edit already wrote the row live.
+            self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        else:
+            self.assert_live_only(registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(local_obstruction.read_bytes(), obstruction_bytes)
@@ -451,10 +598,11 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
 
     def test_the_showrunner_effort_writer_publishes_the_director_launch_row(self) -> None:
         before = self.dirty_state()
-        program = ("import sys; sys.path.insert(0,sys.argv[1]); import unit_effort; "
-                   + "problem=unit_effort.set_row('opus','max'); "
+        program = ("from scripts.production import unit_effort; import os, sys; "
+                   + "from scripts.lib import models_registry; "
+                   + "problem=unit_effort.set_row('opus','max',models_registry.edit_base(os.environ)); "
                    + "print(problem); sys.exit(bool(problem))")
-        result = self.command(sys.executable, "-c", program, str(REPO / "scripts/production"))
+        result = self.command(str(REPO / "scripts/lib/py"), "-c", program)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_published(before, "director=opus:max")
         self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")
@@ -477,6 +625,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
                          (snapshot.st_ino, snapshot.st_mtime_ns))
         self.assertEqual(self.dirty_state(), before)
 
+    @unittest.skipUnless(sys.platform == "linux", "the Mac publishes its catalog rows in place")
+    def test_catalog_rows_are_live_at_once_on_natedev_and_the_notes_pass_publishes_them(self) -> None:
+        prepare_catalog(self.root, self.environment)
+        _ = self.environment.pop("MODELS_CONFIG_PUBLISH")
+        before = self.dirty_state()
+        self.assert_ok(self.command("bash", str(AGENTS / "sync_codex_catalog.sh")))
+        self.assertIn("gpt-new=high", self.registry.read_text())
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, "gpt-new=high")
+
     def test_a_behind_checkout_fast_forwards_before_applying_the_row_edit(self) -> None:
         path = self.competitor / "config/models.conf"
         _ = path.write_text(path.read_text().replace("review=gpt-a:high", "review=gpt-b:low"))
@@ -496,23 +657,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         _ = self.git("commit", "--only", "-m", "local work", "--", "local-commit.txt")
         return self.git("rev-parse", "HEAD").strip()
 
-    def test_an_ahead_checkout_publishes_one_registry_commit_on_its_local_tip(self) -> None:
+    def test_an_ahead_checkout_keeps_the_row_live_and_never_pushes_its_local_commits(self) -> None:
         local_head = self.commit_local_work()
-        self.assertEqual(self.git("rev-parse", "origin/main").strip(), self.initial)
-        before = self.dirty_state()
-        unrelated_index = self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf")
+        registry = self.registry.read_bytes()
         unrelated_files = {name: (self.checkout / name).read_bytes()
                            for name in ("dirty.txt", "staged.txt", "local-commit.txt")}
 
-        self.assert_ok(self.edit())
+        result = self.edit()
 
-        self.assert_published(before)
-        self.assertEqual(self.git("rev-parse", "HEAD^").strip(), local_head)
-        self.assertEqual(self.git("rev-list", "--count", f"{local_head}..HEAD").strip(), "1")
-        self.assertEqual(self.git("--git-dir", str(self.remote), "show", "main:local-commit.txt"),
-                         "local history\n")
-        self.assertEqual(self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf"),
-                         unrelated_index)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("commits that are not on origin/main", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.assert_live_only(registry)
         for name, contents in unrelated_files.items():
             self.assertEqual((self.checkout / name).read_bytes(), contents)
 
@@ -527,6 +684,28 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assertEqual(self.registry.read_bytes(), registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+
+    def test_another_fetch_between_the_fetch_and_the_read_does_not_change_the_target(self) -> None:
+        _ = self.git("checkout", "-b", "phases", cwd=self.competitor)
+        _ = (self.competitor / "phases.txt").write_text("another branch\n")
+        _ = self.git("add", "phases.txt", cwd=self.competitor)
+        _ = self.git("commit", "-m", "another branch", cwd=self.competitor)
+        _ = self.git("push", "origin", "phases", cwd=self.competitor)
+        program = "\n".join((
+            "from pathlib import Path",
+            "from scripts.lib import models_registry",
+            "real = models_registry._git",
+            "def peer(repo, *arguments, **options):",
+            "    output = real(repo, *arguments, **options)",
+            "    if arguments[:1] == ('fetch',):",
+            "        _ = real(repo, 'fetch', 'origin', 'phases')",
+            "    return output",
+            "models_registry._git = peer",
+            "print(models_registry._fetch(Path.cwd(), 'main'))",
+        ))
+        result = self.command(sys.executable, "-c", program)
+        self.assert_ok(result)
+        self.assertEqual(result.stdout.strip(), self.initial)
 
     def assert_unfinished_merge_is_refused(self, *, ahead: bool, unmerged: bool,
                                           merge_head_present: bool = True) -> None:
@@ -553,8 +732,9 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         refused = self.edit()
 
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("registry edit refused before writing", refused.stdout + refused.stderr)
-        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertIn("the rows are live; main does not have them yet: registry publication refused",
+                      refused.stdout + refused.stderr)
+        self.assert_live_only(registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main"), remote)
@@ -579,7 +759,7 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
     def test_unmerged_index_entries_refuse_publication_even_without_merge_head(self) -> None:
         self.assert_unfinished_merge_is_refused(ahead=False, unmerged=True, merge_head_present=False)
 
-    def test_divergence_refuses_before_writing_the_registry_or_touching_other_changes(self) -> None:
+    def test_divergence_refuses_publication_and_keeps_only_the_row_live(self) -> None:
         _ = (self.checkout / "local-commit.txt").write_text("local history\n")
         _ = self.git("add", "local-commit.txt")
         _ = self.git("commit", "--only", "-m", "local divergence", "--", "local-commit.txt")
@@ -592,7 +772,7 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         result = self.edit()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout + result.stderr, "(?i)fast.forward|diverg")
-        self.assertEqual(self.registry.read_bytes(), contents)
+        self.assert_live_only(contents)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.dirty_state(), before)
 
@@ -641,7 +821,7 @@ def advance_peer(accepted=False):
     if obstruction:
         (peer / obstruction).write_text("peer work\\n")
         paths.append(obstruction)
-    subject = "config(agents): later peer edit" if accepted else "concurrent row edits"
+    subject = "config(models): later peer edit" if accepted else "concurrent row edits"
     for command in (["add", *paths], ["commit", "-m", subject], ["push", "origin", "main"]):
         subprocess.run([real, *command], cwd=peer, check=True, capture_output=True)
 if "push" in arguments:
@@ -687,7 +867,7 @@ os.execv(real, [real, *arguments])
 
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
         self.assertIn(f"{self.registry} is shared, but local reconciliation failed", refused.stderr)
-        self.assertNotIn("refused before writing", refused.stderr)
+        self.assertNotIn("registry publication refused", refused.stderr)
         self.assertEqual(count.read_text(), "1")
         snapshot = self.root / "after-push"
         index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
@@ -733,7 +913,7 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "1", refused.stdout + refused.stderr)
         expected = "is shared, but local reconciliation failed" if accepted else "is edited but not shared"
         self.assertIn(expected, refused.stdout + refused.stderr)
-        self.assertNotIn("refused before writing", refused.stdout + refused.stderr)
+        self.assertNotIn("registry publication refused", refused.stdout + refused.stderr)
         snapshot = self.root / "before-retry"
         index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
         self.assertEqual(self.registry.read_bytes(), (snapshot / "models.conf").read_bytes())
@@ -777,21 +957,6 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "3")
         self.assertRegex(result.stdout + result.stderr, "(?i)edited.*not shared")
         self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
-        self.assertEqual(self.dirty_state(), before)
-
-    def test_an_ahead_checkout_keeps_its_local_parent_when_retrying_a_rejected_push(self) -> None:
-        local_head = self.commit_local_work()
-        count = self.install_push_race(always_refuse=True)
-        before = self.dirty_state()
-
-        refused = self.edit()
-
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertEqual(count.read_text(), "3")
-        self.assertIn("is edited but not shared", refused.stdout + refused.stderr)
-        self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
         self.assertEqual(self.dirty_state(), before)
 

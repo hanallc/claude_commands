@@ -18,11 +18,12 @@ class FinalPassTests(FinalPassFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         folder = Path(self.environment["HOME"]) / "changed/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         _ = shutil.copyfile(VERIFY.parent / "final_pass.py", folder / "final_pass.py")
         changed = folder / "verify.sh"
         _ = changed.write_text(VERIFY.read_text() + "\n# Test script change.\n")
-        answer = subprocess.run(["bash", str(changed), "final-pass"], cwd=self.root,
+        answer = subprocess.run(["bash", str(changed), "final", "--saved"], cwd=self.root,
                                 env=self.environment, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(answer.returncode, 1, answer.stdout + answer.stderr)
         self.assertIn("verify.sh differs", answer.stderr)
@@ -46,9 +47,11 @@ class FinalPassTests(FinalPassFixture):
                 self.assertGreaterEqual(int(cpu_ms), 0)
         # The final command starts its proof before the gate and finishes it on exit.
         self.assertEqual(names.count("final_pass.py"), 2, rows)
-        self.assertEqual(names.count("verify_metadata.py"), 1, rows)
+        calls = Path(str(trace) + ".calls").read_text().splitlines()
+        metadata_calls = [row for row in calls if row.split("\t")[0] == "verify_metadata.py"]
+        self.assertEqual(len(metadata_calls), 1, calls)
 
-        query = self.verify("final-pass")
+        query = self.verify("final", "--saved")
         self.assertEqual(query.returncode, 0, query.stdout + query.stderr)
         appended = trace.read_text().splitlines()
         self.assertEqual(appended[:len(rows)], rows)
@@ -59,7 +62,7 @@ class FinalPassTests(FinalPassFixture):
 
         trace.unlink()
         del self.environment["VERIFY_PY_TRACE"]
-        untraced = self.verify("final-pass")
+        untraced = self.verify("final", "--saved")
         self.assertEqual(untraced.returncode, 0, untraced.stdout + untraced.stderr)
         self.assertEqual(untraced.stdout, query.stdout)
         self.assertEqual(untraced.stderr, query.stderr)
@@ -68,6 +71,7 @@ class FinalPassTests(FinalPassFixture):
     def test_python_trace_records_sigterm_and_preserves_signal_status(self) -> None:
         folder = self.root.parent / "terminated/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         changed = folder / "verify.sh"
         _ = shutil.copyfile(VERIFY, changed)
@@ -75,7 +79,7 @@ class FinalPassTests(FinalPassFixture):
             "import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n")
         trace = self.root.parent / "terminated.tsv"
         environment = {**self.environment, "VERIFY_PY_TRACE": str(trace)}
-        result = subprocess.run(["bash", str(changed), "final-pass"], cwd=self.root,
+        result = subprocess.run(["bash", str(changed), "final", "--saved"], cwd=self.root,
                                 env=environment, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
         self.assertTrue(trace.exists(), "SIGTERM lost the helper trace")

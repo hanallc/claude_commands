@@ -6,7 +6,6 @@ import io
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import tomllib
 import unittest
@@ -15,10 +14,10 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import detection_rules
-import herdr
+from scripts.herdr import detection_rules
+from scripts.herdr import herdr_types
+from scripts.herdr import herdr
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 REMOTE = """id = "claude"
@@ -139,7 +138,7 @@ class RefreshTests(unittest.TestCase):
     def test_failed_herdr_reload_is_retried_without_reloading_confirmed_sessions(self) -> None:
         self.write_remote(REMOTE)
         errors = io.StringIO()
-        with patch.object(herdr.Herdr, "run", side_effect=["", herdr.HerdrFailure("not ready"), ""]) as run:
+        with patch.object(herdr.Herdr, "run", side_effect=["", herdr_types.HerdrFailure("not ready"), ""]) as run:
             with redirect_stderr(errors):
                 self.assertTrue(detection_rules.refresh({"agents", "probe"}, herdr.reload_agent_rules))
             self.assertIn("probe: detection rules not reloaded: not ready", errors.getvalue())

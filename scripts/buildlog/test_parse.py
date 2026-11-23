@@ -11,27 +11,24 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import index
-import parse
-import repository
-import test_record as record_tests
-from store import UNKNOWN_IDENTITY
-from test_index import use_test_log
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.build_hold import cargo_folder
+from scripts.buildlog import index
+from scripts.buildlog import parse
+from scripts.buildlog import repository
+from scripts.buildlog import test_record as record_tests
+from scripts.buildlog.store import UNKNOWN_IDENTITY
+from scripts.buildlog.test_index import use_test_log
 
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
+from scripts.lib import test_hang_guard
+from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault
 
 use_test_log()
 
@@ -96,6 +93,13 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(parse.toolchain(["env", "RUSTC_WRAPPER=", "cargo", "+stable", "mend"]), "+stable")
         self.assertIsNone(parse.toolchain(["cargo", "clippy", "--workspace"]))
         self.assertIsNone(parse.toolchain(["rustup", "+nightly"]))
+
+    def test_global_options_before_the_subcommand_are_skipped(self) -> None:
+        self.assertEqual(parse.step_name(["cargo", "-q", "nextest", "run"]), "nextest")
+        self.assertEqual(parse.step_name(["cargo", "--color", "always", "clippy"]), "clippy")
+        self.assertEqual(parse.step_name(["cargo", "+nightly", "--locked", "-Z", "x", "fmt"]), "fmt")
+        self.assertEqual(parse.step_name(["cargo", "--config=term.color=never", "t"]), "t")
+        self.assertEqual(parse.step_name(["cargo", "--version"]), "cargo")
 
     def test_sweep_and_other_programs(self) -> None:
         sweep = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py", "--dry-run"]
@@ -200,6 +204,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["tests_skipped"], 0)
         self.assertEqual(result["tests_flaky"], 1)
         self.assertEqual(result["tests_retried"], 2)
+        self.assertEqual(result.get("observed_tests"), {
+            "by_binary": {
+                "alpha": ["tests::fails", "tests::adds", "tests::flaky", "tests::slow"],
+                "beta": ["tests::doubles"],
+            },
+            "complete": True,
+        })
         # The warning cargo repeats for the lib test target counts once.
         self.assertEqual(result["warnings"], 1)
         rows = {row["test"]: row for row in result["tests"] or []}
@@ -216,6 +227,7 @@ class FixtureTests(unittest.TestCase):
         tests = {row["test"] for row in result["tests"] or []}
         self.assertEqual(tests, {"tests::fails", "tests::flaky", "tests::slow"})
         self.assertEqual(result["tests_run"], 5)
+        self.assertEqual(result.get("observed_tests"), facts("nextest", "nextest").get("observed_tests"))
 
     def test_mend_times_and_fixes(self) -> None:
         result = facts("mend", "mend")
@@ -242,9 +254,7 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = record_tests.RecordTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, record_tests.RecordTests())
         self.enterContext(mock.patch.dict(os.environ))
         if "CARGO_TARGET_DIR" in os.environ:
             del os.environ["CARGO_TARGET_DIR"]
@@ -314,15 +324,15 @@ class StepBuildIdentityRecordingTests(unittest.TestCase):
         source = """\
 import json
 from pathlib import Path
+import os
 import runpy
 import sys
 
-mode, script, arguments = sys.argv[1:]
+mode, script, checkout, arguments = sys.argv[1:]
 path = Path(script)
-sys.path.insert(0, str(path.parents[2]))
-sys.path.insert(0, str(path.parent))
 arguments = json.loads(arguments)
 if mode == "script":
+    os.chdir(checkout)
     sys.argv = [script, *arguments]
     try:
         runpy.run_path(script, run_name="__main__")
@@ -330,6 +340,7 @@ if mode == "script":
         assert result.code == 0, result.code
 else:
     from scripts.buildlog import record
+    os.chdir(checkout)
     assert record.main(arguments) == 0
 conf_path = path.parents[1] / "lib/conf.py"
 modules = {name: module for name, module in sys.modules.copy().items()
@@ -343,8 +354,8 @@ assert len({id(module) for module in modules.values()}) == 1, list(modules)
                 arguments = ["step", "0", str(record_tests.START), str(record_tests.START + 1),
                              "0", str(handoff), "", *record_tests.NEXTEST]
                 result = subprocess.run(
-                    [sys.executable, "-c", source, mode, str(record_tests.SCRIPT), json.dumps(arguments)],
-                    cwd=self.fixture.repo, env=self.fixture.environment(), capture_output=True, text=True,
+                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", source, mode, str(record_tests.SCRIPT), str(self.fixture.repo), json.dumps(arguments)],
+                    cwd=Path(__file__).resolve().parents[2], env=self.fixture.environment(), capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -381,8 +392,9 @@ class NextestFormTests(unittest.TestCase):
             _ = write_config_fixture(config / "test_times.conf")
             _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
-                self.assertEqual((rows, summaries), ([], []))
+                result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((result.timing_rows, result.summaries), ([], []))
+                self.assertEqual(result.observed, {"by_binary": {}, "complete": False})
                 with self.assertRaises(ValueError):
                     _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
 
@@ -415,6 +427,32 @@ class NextestFormTests(unittest.TestCase):
         result = parse.log_facts("nextest", "  TRY 1 FAIL [   0.003s] (───) alpha tests::fails\n")
         self.assertIsNone(result["tests_run"])
         self.assertEqual([row["test"] for row in result["tests"] or []], ["tests::fails"])
+        self.assertEqual(result.get("observed_tests"), {"by_binary": {"alpha": ["tests::fails"]}, "complete": False})
+
+
+class CargoSubcommandTests(unittest.TestCase):
+    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
+        self.assertEqual(parse.CARGO_BUILD_VERBS, cargo_folder.wrapper_words("build_subcommands"))
+        for verb in parse.CARGO_BUILD_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
+            with self.subTest(verb=verb):
+                self.assertEqual(parse.cargo_subcommand(("+nightly", "--config=term.color=never", verb)), verb)
+        self.assertEqual(parse.cargo_subcommand(("+stable", "-v")), "")
+
+    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
+        for option in parse.CARGO_VALUE_OPTIONS:
+            with self.subTest(option=option):
+                self.assertEqual(parse.cargo_subcommand((option, "build", "metadata")), "metadata")
+                self.assertEqual(parse.cargo_subcommand((option, "metadata", "check")), "check")
+        self.assertEqual(parse.cargo_subcommand(("--config",)), "")
+
+    def test_cargo_front_call_splits_front_options_from_cargo_words(self) -> None:
+        for words, call in (
+                (("--front", "/f/cargo", "--shared-folder", "/run/x", "--cargo", "/c", "--", "build"),
+                 parse.CargoFrontCall("/f/cargo", "/run/x", "/c", ("build",))),
+                (("--front", "/f/cargo", "--", "--front", "test"), parse.CargoFrontCall("/f/cargo", "", "", ("--front", "test"))),
+                (("check",), parse.CargoFrontCall("", "", "", ("check",)))):
+            with self.subTest(words=words):
+                self.assertEqual(parse.cargo_front_call(words), call)
 
 
 if __name__ == "__main__":

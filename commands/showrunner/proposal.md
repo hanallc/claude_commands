@@ -57,17 +57,13 @@ A user approval replaces a showrunner approval.
 A showrunner approval preserves a user approval.
 Readers show current staff names.
 
+The Review page's Approve sends this command to the owner showrunner with the user's words.
+The words can change a ranking value.
+The page's Decline stores the declined answer and asks the owner to close the issue with `/close_issue`.
+The page keeps its log in the `review_log` front matter list and its mark in `review_state`.
+
 Use `unapprove <issue> [--dry-run]` from the approving showrunner to remove a showrunner approval.
 Only the user's decline removes a user approval.
 Use `decline-answer <issue> --words '<user words>'` for a style decision's declined answer.
 Use `style_proposals.py complete` after each merge to close completed style decisions.
 Use `reopen <issue>` to reopen a closed decision with its recorded answer.
-
-## Migrate
-
-Run `scripts/production/migrate_proposals.py <issues folder>` on each machine with proposal files.
-Include the archive folder in the migration.
-Use `--limit 1` for the interrupted-run proof.
-Resolve reported references before the live migration continues.
-An unresolved reference preserves the whole issue file.
-A completed rerun changes no bytes and exits 0.

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Show one staff member without changing its records or its session."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import shlex
@@ -11,12 +15,10 @@ from pathlib import Path
 from typing import cast
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from scripts.production import staff, unit_config
-from scripts.shutdown import remote
-import herdr
+from scripts.herdr import herdr_types
+from scripts.agents import remote
+from scripts.herdr import herdr
 
 
 NOT_APPLICABLE = "not applicable"
@@ -72,9 +74,9 @@ def read_tab(row: staff.StaffRow) -> str:
             if kind not in ("claude", "codex"):
                 if isinstance(client.pane_activity(pane_id), herdr.PaneAtShell):
                     continue
-                raise herdr.HerdrFailure("the foreground process identity is unknown")
+                raise herdr_types.HerdrFailure("the foreground process identity is unknown")
             identity = client.native_session(pane_id, kind, herdr.PROGRAM_TIMEOUT_SECONDS)
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError):
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
             unknown.append(" ".join(name.split()))
             continue
         if identity == row.current_session:
@@ -103,10 +105,10 @@ def local_details(row: staff.StaffRow, holder: staff.StaffRow) -> MemberDetails:
         else:
             plan = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
         if isinstance(holder.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
-            if (isinstance(holder.worktree, staff.RemovedWorktree) and not holder.worktree.path.exists()
-                    and isinstance(config, unit_config.UnitConfig)
-                    and isinstance(config.retired, unit_config.RetiredSession)):
-                branch = config.retired.branch.value + " (parked)"
+            if isinstance(holder.worktree, staff.RemovedWorktree):
+                branch = (holder.worktree.branch.value + " (parked)"
+                          if isinstance(holder.worktree.branch, staff.ParkedBranch)
+                          else unavailable("the parked branch is not recorded in staff"))
             else:
                 try:
                     branch = read_branch(holder.worktree.path)
@@ -120,7 +122,7 @@ def local_details(row: staff.StaffRow, holder: staff.StaffRow) -> MemberDetails:
         plan = unavailable("the plan document is not recorded")
     try:
         tab = read_tab(row)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         tab = unavailable(error)
     return MemberDetails(branch, plan, tab)
 
@@ -141,13 +143,12 @@ def read_details(row: staff.StaffRow, holder: staff.StaffRow, machine: str) -> M
     if machine != destination:
         return unavailable_details(row, holder, f"machine {machine} has no configured connection")
     code = (
-        "import sys,json; from pathlib import Path; from dataclasses import asdict; "
-        "sys.path.insert(0,str(Path.home()/'.claude')); "
+        "import sys,json; from dataclasses import asdict; "
         "from scripts.production.unit_command import staff,local_details; "
         "rows=json.load(sys.stdin); "
         "print(json.dumps(asdict(local_details(*(staff.StaffRow.from_json(row) for row in rows)))))"
     )
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination,
+    command = ["ssh", "-o", "BatchMode=yes", destination,
                "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)]
     try:
         result = subprocess.run(command, input=json.dumps([row.to_json(), holder.to_json()]),

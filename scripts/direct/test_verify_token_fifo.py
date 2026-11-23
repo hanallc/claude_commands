@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
+
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenFifoTests(VerifyTokenWaitFixture):
@@ -16,7 +18,7 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
         waiters = board / "token_waiters"
         waiters.mkdir(parents=True)
         older = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "verify.sh",
-                                  str(TEST_HANG_GUARD_SECS)], stdin=subprocess.PIPE,
+                                  str(TEST_HANG_GUARD_SECS)], env=verify_test_environment(), stdin=subprocess.PIPE,
                                  start_new_session=True)
         self.started_groups.add(older.pid)
         older_entry = waiters / f"peer.0123456789abcdef.1000000.{older.pid}.again"
@@ -34,7 +36,14 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
             self.assertFalse((board / "locks" / "cargo.d").exists(), "the newer call took the token")
             self.end_group(older.pid)
             _ = older.wait(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(call.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
+            try:
+                status = call.wait(timeout=TEST_HANG_GUARD_SECS)
+            except FixtureHang as error:
+                raise FixtureHang(
+                    f"{error}\nCall output:\n{output.read_text(errors='replace')}"
+                    + f"\nQueue files: {sorted(path.name for path in waiters.iterdir())}"
+                ) from error
+            self.assertEqual(status, 0, output.read_text())
         finally:
             if older.stdin is not None:
                 older.stdin.close()
@@ -51,12 +60,7 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
         home = self.root / "busy-home"
         direct_dir = home / ".claude/scripts/direct"
         direct_dir.mkdir(parents=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "direct":
-                (direct_dir.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
-        for source in VERIFY.parent.iterdir():
-            if source.name != "board.sh":
-                (direct_dir / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         _ = (direct_dir / "board.sh").write_text('''#!/bin/bash
 if [[ "$1" == acquire ]]; then
     count=$(( $(cat "$TEST_ACQUIRES" 2>/dev/null || echo 0) + 1 ))

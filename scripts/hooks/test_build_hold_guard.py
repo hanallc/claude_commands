@@ -9,6 +9,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from typing import cast, override
 from unittest import mock
 
@@ -20,7 +22,10 @@ HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
-MERGE_GATE_COMMANDS = (
+GATE_COMMANDS = (
+    "python3 gate.py --tests-only",
+    "python3.13 -u '/work tree/gate.py' --affected",
+    "scripts/lib/py scripts/production/gate.py --affected",
     "python3 merge_gate.py --tests-only",
     "/usr/bin/python3 scripts/production/merge_gate.py --promote-only",
     "python3.13 -u '/work tree/merge_gate.py' --repo /repo",
@@ -32,7 +37,7 @@ MERGE_GATE_COMMANDS = (
     "bash -lc 'python3 merge_gate.py --tests-only'",
     "env CHECK=1 python3 -W ignore -X dev -- merge_gate.py --help",
 )
-MERGE_GATE_REFUSAL = REFUSAL + " The merge gate waits for the hold to end. Run it after the release."
+GATE_REFUSAL = REFUSAL + " This run waits for the hold to end. Run it after the release."
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):
@@ -51,9 +56,13 @@ class BuildHoldGuardTest(TemporaryGuardTest):
     def codex_unit(self, owner: str, inherited_session: str) -> None:
         run = self.root / "codex-run"
         run.mkdir()
-        active = self.root / "active"
-        active.mkdir()
-        _ = (active / owner).write_text(str(run) + "\n")
+        with isolated_staff_file(self.root / "staff.json", {}):
+            row = fixture_member("showrunner", name=owner)
+            _ = staff.set_run(row.id, staff.OpenRun(run))
+        os.environ["STAFF_FILE"] = str(self.root / "staff.json")
+        holder = self.holders / owner
+        if holder.exists():
+            _ = holder.rename(self.holders / row.current_session)
         os.environ.update({"UNIT_RUN_DIR": str(run), "UNIT_TEAM_ROLE": "impl",
                            "CODEX_THREAD_ID": "codex-thread", "CLAUDE_CODE_SESSION_ID": inherited_session})
 
@@ -70,7 +79,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         # The marker must take priority even when the worker inherits the holder's id.
         self.codex_unit("another-director", "other")
         for command, reason in ((["cargo", "check"], REFUSAL),
-                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], MERGE_GATE_REFUSAL)):
+                                (["python3", "scripts/production/merge_gate.py", "--tests-only"], GATE_REFUSAL)):
             with self.subTest(command=command):
                 response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command, session="codex-thread")))
                 self.assertEqual(response, {"hookSpecificOutput": {
@@ -80,18 +89,18 @@ class BuildHoldGuardTest(TemporaryGuardTest):
 
     def test_merge_gate_launch_forms_are_refused_during_another_hold(self) -> None:
         self.hold()
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
-                self.assert_denied(command, MERGE_GATE_REFUSAL)
+                self.assert_denied(command, GATE_REFUSAL)
 
     def test_merge_gate_launch_forms_are_allowed_without_a_hold(self) -> None:
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
 
     def test_merge_gate_launch_forms_are_allowed_for_the_sole_holder(self) -> None:
         self.hold("caller")
-        for command in MERGE_GATE_COMMANDS:
+        for command in GATE_COMMANDS:
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
 
@@ -107,6 +116,11 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             "python3 other.py merge_gate.py",
             "python3 -W merge_gate.py other.py",
             "python3 merge_gate.py.bak",
+            "python3 cloud_gate.py --tests-only",
+            "python3 gate_box.py --tests-only",
+            "python3 gate.py.bak",
+            "python3 -m scripts.production.cloud_gate",
+            "python3 -m scripts.production.gate_box",
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command), "", command)
@@ -138,7 +152,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                 _ = record.write_text(json.dumps({
                     "v": 1, "call_id": "verify-call", "pid": 10, "proc_start": "11000",
                     "repo": str(self.root), "kind": "check", "package": None,
-                    "runs_on": {"kind": "mac_allowed"}, "state": state,
+                    "eligible_targets": ["mac", "natedev"], "runs_on": {"kind": "any_target", "mac_targets": ["mac"]}, "state": state,
                     "updated": "2026-10-28T12:00:00+00:00",
                 }))
             for verb in ("check", "lint", "build", "doc", "clippy", "test", "example", "final"):

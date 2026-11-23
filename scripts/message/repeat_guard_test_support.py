@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import os
 import select
 import shutil
 import socket
-import importlib
 import subprocess
 import sys
 import tempfile
@@ -20,21 +20,18 @@ from types import SimpleNamespace
 from threading import Thread
 from unittest.mock import patch
 
+from scripts.message import repeat_guard
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 
-CHILD_TEST_SETUP = '''import importlib, os, runpy, sys
-from importlib.machinery import PathFinder
-
-# Preserve the system setup before applying the test budget.
-folder = os.path.dirname(os.path.abspath(__file__))
-paths = [entry for entry in sys.path if os.path.abspath(entry) != folder]
-original = PathFinder.find_spec('sitecustomize', paths)
-if original is not None and original.origin is not None:
-    runpy.run_path(original.origin, run_name='_system_sitecustomize')
-for name in ('repeat_guard', 'scripts.message.repeat_guard'):
-    importlib.import_module(name).GUARD_IO_CEILING_SECONDS = {budget}
+CHILD_TEST_SETUP = '''import runpy, sys
+startup = runpy.run_path({startup!r}, run_name='_repeat_python_startup')
+startup['select_checkout'](sys.argv)
+startup['next_sitecustomize'](__file__)
+from scripts.message import repeat_guard
+repeat_guard.GUARD_IO_CEILING_SECONDS = {budget}
+startup['finish_startup'](__file__, sys.argv)
 '''
 
 
@@ -42,18 +39,34 @@ def install_guard_test_budget() -> None:
     """Give this module and its child interpreters the shared test hang limit."""
     root = Path(__file__).resolve().parents[2]
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
-        sys, "path", [str(root / "scripts/message"), str(root), *sys.path])))
-    for name in ("repeat_guard", "scripts.message.repeat_guard"):
-        module = importlib.import_module(name)
-        _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
-            module, "GUARD_IO_CEILING_SECONDS", TEST_HANG_GUARD_SECS)))
+        repeat_guard, "GUARD_IO_CEILING_SECONDS", TEST_HANG_GUARD_SECS)))
     folder = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = (folder / "sitecustomize.py").write_text(CHILD_TEST_SETUP.format(budget=TEST_HANG_GUARD_SECS))
-    paths = [str(folder), str(root), str(root / "scripts/message")]
-    if existing := os.environ.get("PYTHONPATH"):
-        paths.append(existing)
+    _ = (folder / "sitecustomize.py").write_text(CHILD_TEST_SETUP.format(
+        budget=TEST_HANG_GUARD_SECS, startup=str(root / "scripts/lib/python_startup/sitecustomize.py")))
+    from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+    paths = [str(folder), *inherited_paths(os.environ.get("PYTHONPATH", ""))]
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(
         os.environ, {"PYTHONPATH": os.pathsep.join(paths)})))
+
+
+def run_guard_in_process() -> None:
+    """Run guard storage in this interpreter when this module does not test the worker process.
+
+    The real worker decode and storage run. Child interpreters keep the process boundary.
+    """
+    _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
+        repeat_guard, "isolated", guard_worker_in_process)))
+
+
+def guard_worker_in_process(command: list[str], request: str, _budget: float) -> repeat_guard.Decision:
+    """Answer as the worker's `__main__` does: a fault admits delivery with one warning."""
+    try:
+        with patch.object(sys, "stdin", io.StringIO(request)):
+            return repeat_guard.worker(command[-1])
+    except Exception as error:
+        repeat_guard.warn(str(error))
+        return repeat_guard.Decision()
 
 
 def install_notice_test_config(home: Path) -> Path:
@@ -93,6 +106,28 @@ def wait_for_notice_readiness(path: Path, runner: subprocess.Popen[bytes]) -> No
                     raise AssertionError(f"delivery runner exited {runner.returncode} before readiness")
         if received != b"ready\n":
             raise AssertionError(f"delivery descendants reported invalid readiness: {received!r}")
+
+
+def wait_for_notice_exit(pid: int) -> None:
+    """Wait for death without sending a signal or changing the process state."""
+    try:
+        with LauncherHangGuard("delivery descendant exit").protect():
+            if sys.platform == "linux":
+                descriptor = os.pidfd_open(pid)
+                try:
+                    _ = select.select([descriptor], [], [])
+                finally:
+                    os.close(descriptor)
+            else:
+                queue = select.kqueue()
+                try:
+                    event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                          flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+                    _ = queue.control([event], 1)
+                finally:
+                    queue.close()
+    except ProcessLookupError:
+        pass  # The process exited before the event subscription.
 
 
 @dataclass

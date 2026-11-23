@@ -11,63 +11,104 @@ import shutil
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
-from contextlib import redirect_stderr
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
 from scripts.whoami.account_test_support import create_claude_account
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import quota_alert
-from push_texts import RenderedPush
+from scripts.whoami import quota_alert
+from scripts.notify.push_texts import RenderedPush
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
-import agent_notes
+from scripts.whoami import agent_notes
 from scripts.whoami import session_table
 from scripts.whoami import note_file
 from scripts.whoami import account
 from scripts.whoami import usage_store
-from agent_notes import local_reset
+from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-import send
-# send puts scripts/notify on the path.
-from user_action import ActionRequired, UserAction, parse_user_action
+from scripts.message import send
+from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
 REGISTRY = registry_text({
     'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
-                              'design_roles': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+                              'design_roles': 'codex   # a trailing comment'}),
     'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
     'direct.claude': ExactRows({'impl': 'opus:high'}),
-    'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
-    'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
+    'cli.codex': ExactRows({'merge_branch': 'gpt-6-sol:high'}),
+    'cli.claude': ExactRows({'merge_branch': 'sonnet:high'}),
     'design_roles.codex': ExactRows({'reviewer': 'gpt-6-sol:xhigh'}),
     'design_roles.claude': ExactRows({'reviewer': 'opus:max'}),
-    'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
-    'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
     'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
     'claude.agents': ExactRows({'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}),
 })
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user
+REAL_SWAP = accounts.swap
+REAL_LAUNCH_WORKER_MOVES = cast(Callable[[str, str], None], getattr(accounts, "_launch_worker_moves"))
 REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account codex1."
+
+
+class WorkerModeRequests(list[list[str]]):
+    """Notice requests; `stops` holds the requests that stop the Codex workers, `fyi` each producer copy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stops: list[list[str]] = []
+        self.fyi: list[tuple[str, str]] = []
+
+
+@contextmanager
+def worker_mode_broadcasts() -> Generator[WorkerModeRequests]:
+    """Record notice and worker stop requests without starting transient units."""
+    sent = WorkerModeRequests()
+
+    def record(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if "--no-block" in arguments:
+            script = arguments.index("--") + 2
+            if Path(arguments[script]).name == "send.py":
+                sent.fyi.append((arguments[arguments.index("--to") + 1], arguments[arguments.index("--text") + 1]))
+            elif "--from" in arguments:
+                sent.append(arguments[arguments.index("--from"):])
+            else:
+                sent.stops.append([Path(arguments[script]).name, *arguments[script + 1:]])
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        return run(arguments, **options)
+
+    class NoticeProcesses:
+        @staticmethod
+        def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            return record(arguments, **options)
+
+        def __getattr__(self, name: str) -> object:
+            return cast(object, getattr(subprocess, name))
+
+    with mock.patch.object(quota_alert, "subprocess", NoticeProcesses()):
+        yield sent
 
 
 def running(*names: str) -> list[quota_alert.Showrunner]:
     """Running showrunners called `names`, as their update timers and session records would give them."""
-    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", slug=name.replace(" ", "-"),
+    return [quota_alert.Showrunner(session=name, socket=f"/{name}.sock", name=name,
                                    zone="America/Los_Angeles", doc="") for name in names]
 
 
@@ -85,6 +126,27 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
+def fixture_configuration(root: Path) -> dict[str, str]:
+    """Copy the config and set the worker-mode messages that these tests assert."""
+    configuration = root / "config"
+    environment = config_environment(configuration)
+    _ = write_config_fixture(configuration / "accounts.conf",
+        "no_worker_mode_on=Codex workers have no capacity. Send no assign. Do your current work yourself: "
+        + "write the code, run the tests and do the reviews directly. Keep to this rule until the workers-back notice arrives.\n"
+        + "no_worker_mode_off=Codex workers are up again. Use workers again. This notice ends no-worker mode.\n"
+        + "no_worker_mode_fyi=morty dwight\nusage_stale_minutes=10\nrefusal_reset_wait_minutes=20\n"
+        + "half_point_pace_minutes=30\nhold_default_minutes=40\n")
+    return environment
+
+
+def select_fixture_registry(test: unittest.TestCase, root: Path) -> Path:
+    """Select the fixture registry for both Python and shell readers."""
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, fixture_configuration(root))))
+    registry = root / "models.conf"
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+    return registry
+
+
 class QuotaReminderFixture(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -96,20 +158,30 @@ class QuotaReminderFixture(unittest.TestCase):
         self.push_errors: list[quota_alert.PushDelivery] = []
         self.pushed: list[tuple[str, str, quota_alert.Ask]] = []
         self.noted: list[RenderedPush] = []
+        self.broadcasts: WorkerModeRequests = WorkerModeRequests()
+        self.credits: set[str] = set()
 
     @override
     def setUp(self) -> None:
         self.root = self.fixture_root()
+        self.credits = hold_credit_accounts(self)
+        _ = self.enterContext(mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST))
+        self.broadcasts = self.enterContext(worker_mode_broadcasts())
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
+        registry = select_fixture_registry(self, self.root)
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+            "XDG_STATE_HOME": str(self.root / "state"),
         })))
         del environment_context
         self.prepare_files()
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.conf"
-        registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -142,8 +214,6 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=natedev
@@ -191,13 +261,13 @@ always=natedev
             _ = deliver()
         sends: dict[str, tuple[str, UserAction]] = {}
         for command in commands:
-            self.assertEqual(command[:2], [sys.executable, str(quota_alert.SEND)])
+            self.assertEqual(command[:2], [sys.executable, str(session_send.SEND_SCRIPT)])
             with redirect_stderr(io.StringIO()) as refusal:
                 try:
                     options = send.parse(command[2:])
                 except SystemExit:
                     self.fail(f"send.py refused {command[2:]}: {refusal.getvalue().strip().splitlines()[-1]}")
-            from push_texts import render
+            from scripts.notify.push_texts import render
             values = dict(value.split("=", 1) for value in command[command.index("--text-id") + 2:] if "=" in value)
             push = render(command[command.index("--text-id") + 1], **values)
             options = options._replace(summary=push.title, action=push.action)
@@ -316,6 +386,7 @@ class SeededQuotaReminderFixture(QuotaReminderFixture):
         root = Path(directory.name).resolve()
         cls.seed, cls.case = root / "seed", root / "case"
         cls.seed.mkdir()
+        _ = fixture_configuration(cls.seed)
         builder = cls()
         builder.root = cls.seed
         QuotaReminderFixture.prepare_files(builder)
@@ -332,9 +403,15 @@ class SeededQuotaReminderFixture(QuotaReminderFixture):
         pass
 
 
+def complete_worker_moves(readings: quota_alert.CodexAlertPassReadings,
+                          now: datetime) -> quota_alert.CodexAlertPassReadings:
+    """Run the private detached move, then let the next pass consume its result."""
+    _ = accounts.move_workers(role_map.read_role_map().workers, follow_role=True)
+    return quota_alert.run_workers_next_moves(readings, now)
+
+
 class CodexZeroEpisodeFixture(unittest.TestCase):
     root: Path = Path()
-
     now: datetime = datetime.now(timezone.utc)
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -342,13 +419,24 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.phone: mock.MagicMock = mock.MagicMock()
         self.relay: mock.MagicMock = mock.MagicMock()
         self.swap: mock.MagicMock = mock.MagicMock()
+        self.credits: set[str] = set()
+        self.broadcasts: WorkerModeRequests = WorkerModeRequests()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.broadcasts = self.enterContext(worker_mode_broadcasts())
+        self.credits = hold_credit_accounts(self)
+        _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
+        _ = fixture_member("producer", name="director")
+        _ = fixture_member("showrunner", name="runner")
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = select_fixture_registry(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
+            "XDG_STATE_HOME": str(self.root / "state"),
             "CODEX_CONFIG_FILE": str(self.root / "absent"), "CODEX_MODELS_CACHE_FILE": str(self.root / "absent"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "synced"),
         })))
@@ -360,13 +448,10 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes=5
 faults_to=director
 always=director
 """))
-        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
@@ -378,7 +463,7 @@ always=director
         _ = self.enterContext(mock.patch.object(quota_alert, "showrunners_now", return_value=running("runner")))
         self.phone = self.enterContext(mock.patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         self.relay = self.enterContext(mock.patch.object(quota_alert, "relay", return_value=None))
-        self.swap = self.enterContext(mock.patch.object(accounts, "swap", return_value=["workers move to codex2"]))
+        self.swap = self.enterContext(mock.patch.object(accounts, "swap", autospec=True, return_value=accounts.WorkersSwapStarted(())))
         _ = self.enterContext(mock.patch.object(agent_accounts, "prepare_codex_home", return_value=agent_accounts.CodexHomePrepared()))
         for number, folder in ((1, ".codex1"), (2, ".codex"), (3, ".codex3")):
             home = self.root / folder
@@ -392,8 +477,9 @@ always=director
         path = self.root / f"codex{number}.md"
         _ = path.write_text(f"---\nlogin: account{number}@example.invalid\nrole: worker\nsessions: 0\n"
             + f"weekly_remaining_usage: {left}\ncredit_balance: 6370\n"
-            + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n"
-            + (f"use_credits: {setting}\n" if setting else "") + "---\n")
+            + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n---\n")
+        if setting:
+            set_credits(self.credits, f"codex{number}", setting)
         note = read_note(path)
         assert isinstance(note, note_file.Note)
         return note
@@ -445,6 +531,12 @@ always=director
         return [push for call in self.phone.call_args_list
                 if (push := cast(RenderedPush, call.args[0])).id != "quota.codex_next_move"]
 
+    def select_units(self, label: str) -> None:
+        """Write the role map's units selection."""
+        path = role_map.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": label}) + "\n", encoding="utf-8")
+
     def relayed_texts(self) -> list[str]:
         return [cast(str, call.args[1]) for call in self.relay.call_args_list]
 
@@ -468,7 +560,7 @@ always=director
             self.assertIn("codex1", push.body)
             for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
                 self.assertNotIn(forbidden, push.body)
-            from push_texts import render
+            from scripts.notify.push_texts import render
             self.assertEqual(push, render("quota.paid_credits_queued", **push.values))
             self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill"})
             self.assertIn("workers stop and wait for your queued move", push.body)
@@ -488,11 +580,32 @@ class CodexRerunFixture(CodexZeroEpisodeFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
-            "direct": "codex", "design_roles": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+            "direct": "codex", "design_roles": "codex", "cli": "claude"}))
         _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
         _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
         _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
             accounts.SelectableCodexAccount(self.root / ".codex3", "account3@example.invalid", "codex3")))
+
+    @override
+    def note(self, number: int, setting: str = "off", *, left: int = 0) -> quota_alert.AgentNote:
+        """Keep credits off so zero allowance tests a real fallback and its recovery."""
+        return super().note(number, setting, left=left)
+
+    @override
+    def readings(self, now: datetime, *, selected: int = 1, left: int = 0,
+                 balance: str | None = "6370", spare_left: int = 0,
+                 spare_accounts: tuple[tuple[int, int, str], ...] = (),
+                 spare_five_hour: tuple[tuple[int, int], ...] = ()) -> quota_alert.CodexAlertPassReadings:
+        """Give recovery passes a current window after the original fixture window expires."""
+        readings = super().readings(now, selected=selected, left=left, balance=balance, spare_left=spare_left,
+                                    spare_accounts=spare_accounts, spare_five_hour=spare_five_hour)
+        checked_homes: list[quota_alert.CodexHomeReading] = []
+        for checked in readings.checked_homes:
+            quotas = [replace(window, resets_at=now + timedelta(days=2))
+                      if window.resets_at is not None and window.resets_at <= now else window
+                      for window in checked.report.quotas]
+            checked_homes.append(replace(checked, report=replace(checked.report, quotas=quotas)))
+        return replace(readings, checked_homes=tuple(checked_homes))
 
     def read_assignments(self) -> dict[str, str]:
         return cast(dict[str, str], json.loads((self.root / "rerun-assignments.json").read_text()))

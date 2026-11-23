@@ -1,26 +1,27 @@
-"""Keep slash-command evidence until the prompt hook consumes its hash.
+"""Keep script prompt evidence until the prompt hook consumes its hash.
 
-Each submission has one record without time expiry.
+Each recorded submission has one record without time expiry.
 The configured count limit removes the oldest evidence and records its cause.
 """
 from __future__ import annotations
 
 import hashlib
-import fcntl
+import math
 import os
 import json
 import socket
+import time
 import uuid
 from datetime import datetime, timezone
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from scripts.agents import worker_lifecycle
+from scripts.lib import conf
+from scripts.lib.script_envelope import SCRIPT_ENVELOPE_START
 
-if TYPE_CHECKING:
-    from . import conf
-else:
-    from scripts.lib import conf
+_KEY_MARKS = "keys"
 
 
 def root() -> Path:
@@ -33,18 +34,51 @@ def _path(pane: str, text: str) -> Path:
     return root() / hashlib.sha256(f"{pane}\0{words}".encode()).hexdigest()
 
 
+def _key_mark_path(pane: str) -> Path:
+    return root() / _KEY_MARKS / hashlib.sha256(pane.encode()).hexdigest()
+
+
+def mark_keys(pane: str) -> None:
+    """Save the time of printable key input for the pane."""
+    path = _key_mark_path(pane)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600)
+
+
+def keys_since(pane: str, since: datetime) -> bool:
+    """Check for printable key input at or after the given time."""
+    try:
+        modified = _key_mark_path(pane).stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return datetime.fromtimestamp(modified, timezone.utc) >= since
+
+
 @contextmanager
-def locked() -> Generator[None]:
+def locked(deadline: float = math.inf) -> Generator[None]:
     folder = root()
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / ".lock").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            worker_lifecycle.acquire_flock(stream, deadline=deadline)
+        except worker_lifecycle.OperationDeadlineExpired as error:
+            raise TimeoutError("script prompt record lock deadline elapsed") from error
         yield
 
 
 def _matching(pane: str, text: str) -> list[Path]:
     path = _path(pane, text)
     return [*([path] if path.is_file() else []), *root().glob(path.name + ".*")]
+
+
+def _oldest_first(paths: list[Path]) -> list[Path]:
+    records: list[tuple[int, Path]] = []
+    for path in paths:
+        try:
+            records.append((path.stat().st_mtime_ns, path))
+        except FileNotFoundError:
+            continue
+    return [path for _, path in sorted(records)]
 
 
 def _evict(path: Path) -> None:
@@ -57,20 +91,50 @@ def _evict(path: Path) -> None:
         _ = stream.write(json.dumps(event) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-    path.unlink()
+    path.unlink(missing_ok=True)
+
+
+def needs_record(text: str) -> bool:
+    text = text.lstrip()
+    return bool(text) and not text.startswith(SCRIPT_ENVELOPE_START)
 
 
 def record(pane: str, text: str) -> None:
-    if not text.lstrip().startswith("/"):
+    if not needs_record(text):
         return
-    limit = conf.read("script_prompts").whole("max_records")
-    with locked():
-        records = sorted((item for item in root().iterdir() if item.name != ".lock"),
-                         key=lambda item: (item.stat().st_mtime_ns, item.name))
-        while len(records) >= limit:
-            _evict(records.pop(0))
-        path = _path(pane, text)
-        path.with_name(path.name + "." + uuid.uuid4().hex).touch()
+    prepared = prepare_record(pane, text, deadline=math.inf)
+    prepared.publish()
+    prepared.trim()
+
+
+@dataclass(frozen=True)
+class PreparedRecord:
+    path: Path
+    limit: int
+    deadline: float
+
+    def publish(self) -> None:
+        with locked(self.deadline):
+            self._check_deadline()
+            self.path.touch()
+
+    def trim(self) -> None:
+        with locked(self.deadline):
+            records = _oldest_first([item for item in root().iterdir() if item.name not in (".lock", _KEY_MARKS)])
+            for old in records[:max(0, len(records) - self.limit)]:
+                self._check_deadline()
+                _evict(old)
+
+    def _check_deadline(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("script prompt record deadline elapsed")
+
+
+def prepare_record(pane: str, text: str, *, deadline: float) -> PreparedRecord:
+    """Prepare the record without writing it or evicting another record."""
+    path = _path(pane, text)
+    limit = conf.read_or_repository("script_prompts").whole("max_records")
+    return PreparedRecord(path.with_name(path.name + "." + uuid.uuid4().hex), limit, deadline)
 
 
 def typed_by_script(pane: str, text: str) -> bool:
@@ -86,8 +150,11 @@ def typed_here(text: str) -> bool:
     with locked():
         matched = False
         for identity in set(identities) - {""}:
-            paths = _matching(identity, text)
-            if paths:
-                min(paths, key=lambda path: path.stat().st_mtime_ns).unlink()
+            for path in _oldest_first(_matching(identity, text)):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
                 matched = True
+                break
         return matched

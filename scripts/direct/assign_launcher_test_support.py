@@ -1,30 +1,152 @@
-"""Share assignment setup with the recorder and loopback server."""
+"""Private native workers for assignment command tests."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
-import sys
 import subprocess
+import sys
+import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast, override
+from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
-from scripts.direct import assign
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.direct import assign, phase_table
+from scripts.direct.assign_claude_test_support import direct_launcher_helpers
+from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.lib.git_test_support import commit_repository
+from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
-from scripts.production import staff, unit_config
+from scripts.message import process_table
+from scripts.production import staff, unit_config, test_worker, worker
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import fixture_worker_records
-
+from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
+
+ASSIGNMENT_SETTINGS = {
+    "direct": """\
+# whole: 1..
+MIN_REPAIR_BUDGET=3
+# range: 5e-324..
+REPAIR_ROUNDS_PER_FINDING=0.5
+# whole: 1..
+RUNAWAY_ROUNDS=5
+# whole: 1..
+MAX_FIX_ATTEMPTS=2
+# whole: 1..
+MAX_REOPENS=2
+# whole: 1..
+STALLED_ROUNDS=4
+# whole: 1..
+MAX_CONSECUTIVE_SAME_KIND_PASSES=4
+# whole: 1..
+MAX_REVIEW_CANCELLATIONS=1
+# whole: 1..
+UNIT_COMPACT_ABOVE_TOKENS=200000
+# whole: 1..
+ROUTING_FROM_ROUND=4
+# whole: 1..
+ASTRA_AFTER_FAILED_FIXES=2
+# range: 0.1..0.9
+WORKER_SPLIT_RATIO=0.667
+WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+# range: 1..600
+WORKER_FIRST_TURN_SECONDS=120
+# range: 1..600
+WORKER_SETTLE_SECONDS=30
+# range: 1..1800
+WORKER_COMPACT_SECONDS=300
+# range: 1..600
+PANE_AGENT_START_SECONDS=90
+# range: 0.01..600
+WORKER_PUBLISH_LOCK_SECONDS=15
+""",
+    "build_folders": """\
+# whole: 1..
+names.suffix_length=11
+# whole: 1..64
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+roots.system=/tmp
+roots.temporary=${TMPDIR}/builds
+roots.gate=/dev/shm
+roots.build=~/build
+roots.scratch=~/scratch
+roots.copies=~/copies
+roots.workspace=~/worktrees
+roots.session=~/session
+patterns.named={showrunner}-{unit}/{work}-{purpose}
+patterns.legacy-stable={purpose}
+patterns.legacy-unique={purpose}{suffix}
+patterns.scratch={purpose}-{suffix}
+patterns.tool={purpose}{suffix}
+prefixes.style-review={owner}-
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""",
+    "scratch": """\
+holds_file=~/.local/state/scratch/holds.json
+# whole: 1..
+default_life_seconds=86400
+# whole: 1..
+repo_depth=3
+# whole: 1..
+suffix_length=6
+repo_skip=target node_modules .git
+# whole: 1..
+record_lock_attempts=3
+# whole: 1..
+removal_remote_timeout_seconds=30
+""",
+    "send": """\
+# range: 0.001..
+waits_review_seconds=30
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# range: 0.001..
+caller_margin_seconds=15
+# range: 0.001..
+remote_transport_seconds=30
+""",
+    "staff": """\
+# range: 0.001..
+OPERATION_LOCK_SECONDS=30
+# range: 0.001..
+REMOTE_SECONDS=20
+PRODUCER_WORKSPACE=producers
+PRODUCER_FOLDER_ROOT=~/productions
+""",
+    "copies": """\
+remote_registry=~/.local/state/copies/remote-mirrors
+wait_seconds=1
+git_timeout_seconds=600
+guard_timeout_seconds=10
+guard_choice_limit=32
+""",
+    "lint": "style_review=off\n",
+    "showrunners": """\
+# range: 0..100
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+faults_to=00000000-0000-4000-8000-000000000001
+always=00000000-0000-4000-8000-000000000001
+""",
+}
 
 
 def backend_fixture_command(directory: Path, command: list[str],
@@ -43,132 +165,172 @@ def backend_fixture_command(directory: Path, command: list[str],
         f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
     )) + "\n")
     child_environment = dict(environment)
-    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
-    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT / "scripts/lib/python_startup"))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(directory)))
     return ["bash", str(ASSIGN)], child_environment
 
 
 @dataclass(frozen=True)
 class InProcessAssignment:
-    """Call the assignment entry point in this process."""
+    """Run the real command with private native process boundaries."""
 
 
 @dataclass(frozen=True)
 class LauncherScript:
-    """Run an assignment shell script in a separate process."""
-
     path: Path
 
 
 AssignmentExecution = InProcessAssignment | LauncherScript
-# Worker admission requires the actual assignment process.
-DEFAULT_ASSIGNMENT_EXECUTION = LauncherScript(ASSIGN)
+DEFAULT_ASSIGNMENT_EXECUTION = InProcessAssignment()
+
+
+def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    with patch.object(assign, "require_live_director"):
+        return invoke_cli(assign, assign.main, arguments, environment, ROOT)
+
+
+@contextmanager
+def assignment_environment(bytecode_setting: str) -> Generator[None]:
+    """Pin settings and use only the fixture's Git configuration."""
+    config = Path(os.environ["CONF_DIR"])
+    for stem, settings in ASSIGNMENT_SETTINGS.items():
+        _ = (config / f"{stem}.conf").write_text(settings)
+    cache = Path.home() / ".cache"
+    seed_interpreter_cache(cache)
+    environment = {
+        **fixture_git_environment(config),
+        "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache),
+        "PYTHONDONTWRITEBYTECODE": bytecode_setting,
+        "STAFF_CONFIG": str(config / "staff.conf"),
+        "COPIES_CONFIG": str(config / "copies.conf"),
+        "LINT_CONFIG_FILE": str(config / "lint.conf"),
+        "USER_ZONE": "America/New_York",
+        "PROCESS_TABLE_PS": "sh -c :",
+    }
+    with patch.dict(os.environ, environment, clear=True), patch.object(process_table, "PS", ["sh", "-c", ":"]):
+        yield
+
+
+@contextmanager
+def assignment_helpers(bytecode_setting: str) -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    with assignment_environment(bytecode_setting), direct_launcher_helpers():
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(command[1]).resolve() if len(command) > 1 else Path()
+            if path not in (ROOT / "scripts/direct/phase_table.py", ROOT / "scripts/direct/findings.py"):
+                return run_process(command, **options)
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            directory = Path(cast(str | Path, options.get("cwd") or Path.cwd()))
+            result = (invoke_findings(command[2:], environment, directory) if path.name == "findings.py" else
+                      invoke_cli(phase_table, phase_table.main, command[2:], environment, directory))
+            if not options.get("capture_output"):
+                if options.get("stdout") is None:
+                    print(result.stdout, end="")
+                if options.get("stderr") is None:
+                    print(result.stderr, end="", file=sys.stderr)
+            if options.get("check"):
+                result.check_returncode()
+            return result
+
+        with patch.object(subprocess, "run", side_effect=run):
+            yield
 
 
 def read_object(path: Path) -> dict[str, object]:
-    with path.open() as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-        records = cast(dict[str, object], json.load(handle))
-    if path.name == codex_mesh.ROSTER_FILE:
-        records = fixture_worker_records(records, staff.local_snapshot())
-        assignments = codex_mesh.task_assignments()
-        for raw in records.values():
-            entry = cast(dict[str, object], raw)
-            role = codex_mesh.task_role(str(entry.get("thread_id", "")), assignments)
-            if isinstance(role, codex_mesh.AssignedWorkerRole):
-                entry["role"] = role.role
-    return records
+    return cast(dict[str, object], json.loads(path.read_text()))
 
 
-class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
-    project: Path = Path()
-    history: Path = Path()
-    paths: Path = Path()
-    prompt: Path = Path()
-    registry: Path = Path()
-    hang_guard: LauncherHangGuard  # pyright: ignore[reportUninitializedInstanceVariable]
-    claims: list[dict[str, object]]
-    reservations: list[dict[str, object]]
-
+class AssignLauncherFixture(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.claims = []
-        self.reservations = []
+        self.native: test_worker.WorkerCommandTests = test_worker.WorkerCommandTests("runTest")
+        self.project: Path = Path()
+        self.session_dir: Path = Path()
+        self.history: Path = Path()
+        self.paths: Path = Path()
+        self.prompt: Path = Path()
+        self.registry: Path = Path()
+        self.home: Path = Path()
+        self.hang_guard: LauncherHangGuard = LauncherHangGuard(self.id())
+        self.injections: list[str] = []
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.lifecycle_clock.freeze()
-        self.hang_guard = LauncherHangGuard(self.id())
-        self.server.hang_guard = self.hang_guard
-        self.project = self.session_dir.parent / "project"
-        self.project.mkdir()
-        _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True,
-                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        _ = unit_config.write(self.project, unit_config.UnitConfig(
-            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
-        owner = staff.by_id(staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
+        _ = set_up_fixture(self.addCleanup, self.native)
+        _ = self.enterContext(assignment_helpers(bytecode_setting))
+        self.home = Path.home().resolve()
+        model = model_worktree_environment(self.home, Path(os.environ["CONF_DIR"]))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, model)))
+        self.session_dir = self.native.run_dir
+        self.project = self.home / "rust" / "project"
+        self.project.mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
+        self.commit_project()
+        self.project = make_fixture_worktree(self.project, "fixture", "project")
+        # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
+        _ = unit_config.write(self.project, unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")),
+                                                                unit_config.NoAppPort(), ()))
+        owner = staff.by_id(self.native.fixture.parent.id)
         assert owner is not None
         parent = staff.local_snapshot().parent_of(owner)
         assert parent is not None
         _ = staff.rename(parent.id, "fixture-production")
         owner = staff.rename(owner.id, "fixture")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree("natedev", self.project), expected=owner.worktree)
-        _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.project), expected=owner.worktree)
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
         self.prompt = self.session_dir.parent / "assignment.txt"
         self.write_phase_prompt("7", "Assignment core", "Implement the assigned change.")
-        self.registry = self.session_dir.parent / "models.conf"
+        self.registry = self.native.fixture.root / "conf/models.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
-        checkpoint = self.session_dir.parent / "catalog-current"
-        checkpoint.touch()
-        self.patches.enter_context(patch.dict(os.environ, {
-            "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
-            "UNIT_HISTORY_DIR": str(self.history),
-            "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
-            **config_environment(self.session_dir.parent),
-            "MODELS_CONFIG_FILE": str(self.registry), "MODELS_CONFIG_PUBLISH": "0",
-            "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
-            "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
-            "SHUTDOWN_STATE_DIR": str(self.session_dir.parent / "shutdown"),
-            "UNIT_SYNC_WRITES": "0",
-            "PYTHONPATH": str(ROOT), "TMPDIR": "/tmp",
-        }))
-        (self.session_dir / "progress_history_state.json").unlink(missing_ok=True)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "UNIT_HISTORY_DIR": str(self.history), 
+            "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
+            "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
+            "PYTHONPATH": str(ROOT / "scripts/lib/python_startup"), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
+        })))
+        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
+            _ = os.environ.pop(key, None)
+        original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(command[1]).resolve() if len(command) > 1 else Path()
+            environment = cast(dict[str, str], options.get("env", os.environ.copy()))
+            if path == ROOT / "scripts/production/worker.py" and Path(command[0]).resolve() == ROOT / "scripts/lib/py":
+                result = invoke_cli(worker, lambda: worker.main(command[2:]), command[2:], environment, self.project)
+            elif path in (ROOT / "scripts/direct/progress_history.py", ROOT / "scripts/direct/pass_record.py"):
+                result = invoke_recorder(command[2:], environment, self.project)
+            else:
+                return original(command, **options)
+            output = options.get("stdout")
+            if output is not None:
+                stream = cast(TextIO, output)
+                _ = stream.write(result.stdout + result.stderr)
+            elif not options.get("capture_output"):
+                print(result.stdout, end="")
+                print(result.stderr, end="", file=sys.stderr)
+            return result
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
+        (self.session_dir / "progress_history_state.json").unlink()
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",
                     "--main-session-id", owner.current_session)
-        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture-unit")
+        self.record("set-unit", "--production", "fixture-production", "--unit", "fixture")
         self.record("start-phase", "--phase-id", "7", "--phase-title", "Assignment core")
-        self.claims = []
-        self.reservations = []
-        original = self.server.respond
 
-        @self.hang_guard.callback
-        def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
-            roster_path = self.session_dir / codex_mesh.ROSTER_FILE
-            if roster_path.exists() and roster_path.stat().st_size:
-                for value in read_object(roster_path).values():
-                    record = cast(dict[str, object], value)
-                    if record.get("allocation_pending"):
-                        owner = record.get("allocation_owner_pid")
-                        if isinstance(owner, int):
-                            os.kill(owner, 0)
-                        self.reservations.append(record.copy())
-            if request.get("method") == "turn/start":
-                self.claims.extend(cast(dict[str, object], entry).copy() for entry in
-                                   read_object(self.session_dir / codex_mesh.ROSTER_FILE).values())
-            frames = original(request)
-            params = cast(dict[str, object], request.get("params", {}))
-            thread = params.get("threadId")
-            if frames is not None and isinstance(thread, str) and thread != mesh_fixture.THREAD_ID:
-                return cast(list[dict[str, object]], json.loads(
-                    json.dumps(frames).replace(mesh_fixture.THREAD_ID, thread)))
-            return frames
+    @property
+    def turn_starts(self) -> int:
+        return len(self.native.agent.submitted)
 
-        self.server.respond = observe
+    @property
+    def turn_inputs(self) -> list[str]:
+        return [text for text in (entry[1] for entry in self.native.agent.submitted)]
 
     def write_phase_prompt(self, phase: str, title: str, task: str = "Review the assigned change.") -> None:
         _ = self.prompt.write_text(f"Phase {phase} — {title}\n{task}\n")
@@ -178,48 +340,37 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
                                  os.environ.copy(), self.project)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def launch(self, role: str = "implement", *options: str,
-               paths: bool = True, session: bool = True,
+    def launch(self, role: str = "implement", *options: str, paths: bool = True, session: bool = True,
                execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
-        arguments = ["--role", role, "--cwd", str(self.project),
-                     "--phase", "7", "--prompt", str(self.prompt)]
+        arguments = ["--role", role, "--cwd", str(self.project), "--phase", "7", "--prompt", str(self.prompt)]
         if session:
             arguments.extend(["--session-dir", str(self.session_dir)])
         if paths and role in {"implement", "test", "fix"}:
             arguments.extend(["--paths", str(self.paths)])
         arguments.extend(options)
-        if isinstance(execution, InProcessAssignment):
-            return invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
-        return self.run_launcher(["bash", str(execution.path), *arguments])
+        if not any(option in options for option in ("--to", "--new-worker")):
+            arguments.extend(["--new-worker", "impl" if role == "implement" else role])
+        if isinstance(execution, LauncherScript):
+            return self.run_launcher(["bash", str(execution.path), *arguments])
+        return invoke_assignment(arguments, os.environ.copy())
 
     def run_launcher(self, arguments: list[str], *, family: str = "codex",
                      isolate_ancestors: bool = False) -> subprocess.CompletedProcess[str]:
         director = self.session_dir.parent / family
         if not director.exists():
             director.symlink_to(sys.executable)
-        completion = self.session_dir.parent / "launcher-exit"
-        script = "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))"
+        command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))", *arguments]
         if isolate_ancestors:
-            completion.unlink(missing_ok=True)
-            script = "\n".join((
-                "import os, select, subprocess, sys",
-                "from pathlib import Path",
-                "starter = os.pidfd_open(os.getpid())",
-                "if os.fork(): os._exit(0)",
-                # The pidfd becomes readable after the kernel reparents the child.
-                "select.select([starter], [], [])",
-                "os.close(starter)",
-                f"Path({str(completion)!r}).write_text(str(subprocess.call(sys.argv[1:])))",
-            ))
-        command = [str(director), "-c", script, *arguments]
+            command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", *command]
+        result = self.run_command(command)
+        return subprocess.CompletedProcess(arguments, result.returncode, result.stdout, result.stderr)
+
+    def run_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run the command in a process group that the test owns."""
         with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              start_new_session=True) as child:
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
             output, errors = communicate_launcher(child)
-            if isolate_ancestors:
-                self.assertTrue(completion.exists(), output + errors)
-            code = int(completion.read_text()) if isolate_ancestors else child.returncode
-            return subprocess.CompletedProcess(arguments, code, output, errors)
+            return subprocess.CompletedProcess(command, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
@@ -227,33 +378,23 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def review_launcher(self, option: str, name: str, pass_number: str) -> None:
-        _ = self.successful("review", option, name, "--lens", "contract", "--pass", pass_number)
-
     def assignment_records(self) -> dict[str, dict[str, object]]:
-        return cast(dict[str, dict[str, object]], read_object(self.session_dir / codex_mesh.ROSTER_FILE))
-
-    def identity_path(self, name: str) -> Path:
-        reference = self.assignment_records()[name]["staff_id"]
-        return next(path for path in self.session_dir.glob("impl_worker_*.json")
-                    if read_object(path).get("staff_id") == reference)
+        record = staff.local_snapshot()
+        return {row.name: {"staff_id": row.id, "thread_id": row.current_session}
+                for row in record.find(kind="worker", parent=self.native.fixture.parent.id)}
 
     def commit_project(self, message: str = "Initial fixture") -> None:
-        _ = subprocess.run(["git", "init", "-q"], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        _ = commit_repository(self.project, message)
+        _ = commit_repository(self.project, message, allow_empty=True)
 
     def prepare_style_project(self) -> None:
         self.commit_project()
-        config = self.session_dir.parent / "lint.conf"
-        _ = write_config_fixture(config, "style_review=on\n")
-        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent)})))
+        _ = Path(os.environ["LINT_CONFIG_FILE"]).write_text("style_review=on\n")
 
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
 
     def instrument_launcher(self, code: str) -> None:
-        """Instrument boundaries inside the actual coordinator process."""
         directory = self.session_dir.parent / "instrument"
         directory.mkdir(exist_ok=True)
         injection = directory / "injection.py"
@@ -267,20 +408,42 @@ class AssignLauncherFixture(mesh_fixture.MeshCommandFixture):
             f"        runpy.run_path({str(injection)!r})",
             f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
         )))
-        self.patches.enter_context(patch.dict(os.environ, {"PYTHONPATH": f"{directory}{os.pathsep}{ROOT}"}))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{ROOT / 'scripts/lib/python_startup'}{os.pathsep}{directory}"})))
+        self.injections.append(code)
+        saved = vars(assign).copy()
+        exec(code, {})
+        def restore() -> None:
+            for name in saved:
+                setattr(assign, name, cast(object, saved[name]))
+        self.addCleanup(restore)
 
     def prepare_launcher(self) -> Path:
         prepared = self.session_dir.parent / "prepare-called"
-        self.instrument_launcher("\n".join((
-            "import subprocess",
-            "from pathlib import Path",
-            "from scripts.direct import assign",
-            "real_call = assign.call",
-            "def call(command, env, **options):",
-            "    if command[1] == str(assign.SCRIPTS / 'prepare_session.sh'):",
-            f"        Path({str(prepared)!r}).touch()",
-            f"        return subprocess.CompletedProcess(command, 0, {str(self.session_dir)!r} + '\\n', '')",
-            "    return real_call(command, env, **options)",
-            "assign.call = call",
-        )))
+        original = assign.call
+        def call(command: list[str], env: dict[str, str], *, capture: bool = False,
+                 check: bool = True) -> subprocess.CompletedProcess[str]:
+            if command[1] == str(assign.SCRIPTS / "prepare_session.sh"):
+                prepared.touch()
+                env["CODEX_THREAD_ID"] = self.native.fixture.parent.current_session
+                return subprocess.CompletedProcess(command, 0, str(self.session_dir) + "\n", "")
+            return original(command, env, capture=capture, check=check)
+        _ = self.enterContext(patch.object(assign, "call", side_effect=call))
         return prepared
+
+
+class HookAssignmentFixture(AssignLauncherFixture):
+    """Deliver native completion events after the launcher returns."""
+
+    @override
+    def launch(self, role: str = "implement", *options: str, paths: bool = True, session: bool = True,
+               execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:
+        result = super().launch(role, *options, paths=paths, session=session, execution=execution)
+        if result.returncode == 0 and self.native.agent.submitted:
+            row = self.native.agent.row(self.native.agent.submitted[-1][0])
+            _ = self.native.finish(row.name)
+        return result
+
+
+class FirstDispatchFixture(HookAssignmentFixture):
+    def first_assignment(self, role: str = "implement", *options: str) -> None:
+        _ = self.successful(role, *options)

@@ -1,37 +1,47 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Show repository test times and gate module times for the current host."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+import json
+import math
+import os
 from pathlib import Path
 import sqlite3
 import statistics
 import sys
 from typing import TYPE_CHECKING, Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 if TYPE_CHECKING:
-    from ..buildlog import index as index, parse, store, treekey
-    from ..buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    from scripts.buildlog import index as index, parse, store, treekey
+    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 else:
-    import index
-    import parse
-    import store
-    import treekey
-    from mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
+    from scripts.buildlog import index
+    from scripts.buildlog import parse
+    from scripts.buildlog import store
+    from scripts.buildlog import treekey
+    from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
 TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(TOOL_REPOSITORY))
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
-from scripts.production.gate_modules import discover_test_modules, test_module_name
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
+# Each AWS gate host name starts with this prefix; `top --host aws` selects every such host.
+AWS_HOST_PREFIX = "ip-"
+AWS_HOST_PATTERN = f"{AWS_HOST_PREFIX}%"
+AWS_HOSTS = "aws"
 
 
 def query(connection: sqlite3.Connection, sql: str,
@@ -131,26 +141,32 @@ def mebibytes(value: float) -> str:
 
 
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
+    from scripts.production.gate_modules import discover_test_modules, test_module_name
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     modules = {(suite, test_module_name(repo, suite, path))
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
     count = config.whole("TOP_RUNS")
-    checkout = Path(config.text("TOP_CHECKOUT")).expanduser().resolve()
+    host_test, host_value, checkout_key = (("LIKE", AWS_HOST_PATTERN, "TOP_AWS_CHECKOUT") if host == AWS_HOSTS
+                                           else ("=", host, "TOP_CHECKOUT"))
+    checkout = Path(config.text(checkout_key)).expanduser().resolve()
     checkouts = [str(row["checkout"]) for row in query(connection,
-                 "SELECT DISTINCT checkout FROM gate_runs WHERE host = ?", (host,))
+                 f"SELECT DISTINCT checkout FROM gate_runs WHERE host {host_test} ?", (host_value,))
                  if Path(str(row["checkout"])).expanduser().resolve() == checkout]
     checkout_parameters = ", ".join(["?"] * len(checkouts))
     oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
     histories: list[list[ModuleAttempt]] = []
+    type_history: list[ModuleAttempt] = []
     for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
         history: list[ModuleAttempt] = []
         seen: set[str] = set()
         for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + f"""
-            WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.restart = ''
+            WHERE m.suite = ? AND m.module = ? AND m.host {host_test} ? AND m.restart = ''
               AND m.status = 0 AND r.aborted = 0 AND r.checkout IN ({checkout_parameters})
               AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
-        """, (folder, filename, host, *checkouts, oldest)):
+        """, (folder, filename, host_value, *checkouts, oldest)):
             attempt = ModuleAttempt.from_row(row)
             if attempt.run_id in seen:
                 continue
@@ -158,32 +174,36 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             history.append(attempt)
             if len(history) == count:
                 break
-        if history:
+        if (folder, filename) == TYPE_CHECK_JOB:
+            type_history = history
+        elif history:
             histories.append(history)
     unmeasured = [f"{folder}/{filename}"
                   for folder, filename in sorted(modules - {history[0].key for history in histories})]
-    ranked = sorted(((statistics.median(attempt.wall_s for attempt in history), history)
+    ranked = sorted(((statistics.median(attempt.cpu_s for attempt in history), history)
                      for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
     for rank, (median, history) in enumerate(ranked, 1):
         last = history[0]
         tests_run = str(last.tests_run)
         slowest = ""
-        if last.key == TYPE_CHECK_JOB:
-            tests_run = ""
-        elif last.times_missing:
+        if last.times_missing:
             tests_run = slowest = "times missing"
         else:
             tests = kept_tests(connection, last)
             if tests:
                 slowest = f"{tests[0].test} {seconds(tests[0].duration_s)} s"
-        output.append([str(rank), last.name, seconds(median), seconds(last.wall_s),
-                       seconds(statistics.median(attempt.cpu_s for attempt in history)),
+        output.append([str(rank), last.name, seconds(median),
+                       seconds(statistics.median(attempt.wall_s for attempt in history)), seconds(last.wall_s),
                        tests_run, slowest, str(len(history))])
-    print_table(["rank", "suite/module", "median s", "last s", "median CPU s", "tests run",
+    print_table(["rank", "suite/module", "median CPU s", "median s", "last s", "tests run",
                  "slowest kept test", "runs counted"], output, "no modules recorded yet")
     if output:
-        print(f"{len(output)} modules; sum of medians {seconds(sum(item[0] for item in ranked))} s")
+        print(f"{len(output)} modules; sum of median CPU {seconds(sum(item[0] for item in ranked))} s")
+    if type_history:
+        last_type = type_history[0]
+        print(f"{last_type.name} runs nightly, so it is not ranked: "
+              + f"last run {seconds(last_type.cpu_s)} CPU s, {seconds(last_type.wall_s)} s")
     if unmeasured:
         print(f"unmeasured: {len(unmeasured)} live modules: {', '.join(unmeasured)}")
 
@@ -275,6 +295,8 @@ def suite(connection: sqlite3.Connection, host: str, folder: str, days: int) -> 
 
 
 def module(connection: sqlite3.Connection, host: str, name: str, runs: int) -> None:
+    from scripts.test_times.gate_record import TYPE_CHECK_JOB
+
     folder, filename = name.split("/", 1)
     attempts = [ModuleAttempt.from_row(row) for row in query(connection, MODULE_ATTEMPTS_QUERY + """
         WHERE m.host = ? AND m.suite = ? AND m.module = ?
@@ -352,6 +374,175 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
                 output, f"no tests recorded matching {text}")
 
 
+TREND_CACHE_VERSION = 4
+TREND_CACHE_NAME = "gate-trend.json"
+TREND_HEADERS = ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
+                 "cost mean", "cost p95", "cost total"]
+
+
+@dataclass(frozen=True)
+class CostNotRecorded:
+    """The run has no confirmed lifetime and rate in the cost ledger."""
+
+
+@dataclass(frozen=True)
+class TrendRun:
+    cpu_s: float
+    wall_s: float
+    modules: int
+    run_id: str
+
+
+@dataclass(frozen=True)
+class TrendDay:
+    place: str
+    selection: str
+    cells: tuple[str, ...]
+    run_ids: tuple[str, ...]
+
+
+@dataclass
+class TrendCache:
+    zone: str
+    completed_refresh_started_at: float = 0.0
+    days: dict[str, list[TrendDay]] = field(default_factory=dict)
+
+
+def read_trend_cache() -> TrendCache:
+    zone = str(user_zone())
+    try:
+        document = cast(dict[str, object], json.loads((store.root() / TREND_CACHE_NAME).read_text()))
+        if document["version"] != TREND_CACHE_VERSION or document["zone"] != zone:
+            return TrendCache(zone)
+        days = cast(dict[str, list[dict[str, object]]], document["days"])
+        return TrendCache(zone, float(str(document["completed_refresh_started_at"])), {
+            day: [TrendDay(str(row["place"]), str(row["selection"]),
+                           tuple(cast(list[str], row["cells"])), tuple(cast(list[str], row["run_ids"]))) for row in rows]
+            for day, rows in days.items()})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return TrendCache(zone)
+
+
+def write_trend_cache(cache: TrendCache) -> None:
+    write_text_atomic(store.root() / TREND_CACHE_NAME, json.dumps({
+        "version": TREND_CACHE_VERSION, "zone": cache.zone,
+        "completed_refresh_started_at": cache.completed_refresh_started_at,
+        "days": {day: [{"place": row.place, "selection": row.selection, "cells": row.cells, "run_ids": row.run_ids}
+                       for row in rows] for day, rows in cache.days.items()},
+    }, sort_keys=True) + "\n")
+
+
+def refresh_trend_index() -> None:
+    """Certify the start only after the index update completes."""
+    started = datetime.now(UTC).timestamp()
+    _ = index.update()
+    with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+        if (store.root() / TREND_CACHE_NAME).exists():
+            cache = read_trend_cache()
+            cache.completed_refresh_started_at = max(cache.completed_refresh_started_at, started)
+            write_trend_cache(cache)
+
+
+def gate_costs() -> dict[str, Decimal | CostNotRecorded]:
+    """Join reservations to runs and price confirmed lifetimes with applied rates."""
+    from scripts.aws_target import ledger
+    from scripts.build_targets import target_config
+
+    try:
+        evidence = ledger.CostLedger(target_config.ssh_target_state_directory("aws")).read_snapshot()
+    except ledger.LedgerUnavailable:
+        return {}
+    return {"gate-" + row.attempt:
+            row.rate.usd_per_hour * Decimal(row.state.at - row.at) / Decimal(3600) + ledger.gate_allowance(row).usd
+            if isinstance(row.state, ledger.GateTerminated) and row.rate.source != "not priced" else CostNotRecorded()
+            for row in evidence.gate_reservations}
+
+
+def nearest_rank(values: Sequence[float] | Sequence[Decimal]) -> float | Decimal:
+    return sorted(values)[math.ceil(len(values) * 0.95) - 1]
+
+
+def trend_day(connection: sqlite3.Connection, day: date,
+              costs: dict[str, Decimal | CostNotRecorded]) -> list[TrendDay]:
+    """Sum all module attempts before grouping the passing runs."""
+    zone = user_zone()
+    start = datetime.combine(day, datetime.min.time(), zone)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), zone)
+    groups: dict[tuple[str, str], list[TrendRun]] = defaultdict(list)
+    for row in query_rows(connection, """
+        SELECT r.id, r.host, r.selection, r.wall_s, r.modules_run,
+               (SELECT sum(m.cpu_s) FROM gate_modules m WHERE m.run_id = r.id) AS cpu_s
+        FROM gate_runs r
+        WHERE r.started_at >= ? AND r.started_at < ? AND r.status = 0
+          AND coalesce(r.aborted, 0) = 0 AND r.modules_run > 0
+          AND r.selection IN ('full', 'affected')
+    """, (start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+          end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"))):
+        if row["cpu_s"] is None:
+            continue
+        host = str(row["host"])
+        place = "aws" if str(row["id"]) in costs or host.startswith(AWS_HOST_PREFIX) or "compute.internal" in host else host
+        groups[place, str(row["selection"])].append(TrendRun(
+            float(str(row["cpu_s"])), float(str(row["wall_s"])), int(str(row["modules_run"])), str(row["id"])))
+    output: list[TrendDay] = []
+    for (place, selection), runs in sorted(groups.items()):
+        cpu = [run.cpu_s for run in runs]
+        wall = [run.wall_s for run in runs]
+        cells = [day.isoformat(), str(len(runs)), f"{statistics.mean(cpu):.0f}", f"{nearest_rank(cpu):.0f}",
+                 f"{statistics.mean(wall):.0f}", f"{nearest_rank(wall):.0f}"]
+        if selection == "affected":
+            cells.append(f"{statistics.median(run.modules for run in runs):g}")
+        output.append(TrendDay(place, selection, tuple(cells), tuple(run.run_id for run in runs)))
+    return output
+
+
+def trend(connection: sqlite3.Connection, days: int) -> None:
+    """Read finished days from the cache and compute the other days."""
+    today = datetime.now(user_zone()).date()
+    settle = conf.read("test_times").number("TREND_SETTLE_MINUTES") * 60
+    costs = gate_costs()
+    rows: list[TrendDay] = []
+    with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+        cache = read_trend_cache()
+        for offset in range(days - 1, -1, -1):
+            day = today - timedelta(days=offset)
+            key = day.isoformat()
+            if key in cache.days:
+                rows.extend(cache.days[key])
+                continue
+            daily = trend_day(connection, day, costs)
+            rows.extend(daily)
+            end = datetime.combine(day + timedelta(days=1), datetime.min.time(), user_zone()).timestamp()
+            if cache.completed_refresh_started_at >= end + settle:
+                cache.days[key] = daily
+        write_trend_cache(cache)
+    groups: dict[tuple[str, str], list[TrendDay]] = defaultdict(list)
+    for row in rows:
+        groups[row.place, row.selection].append(row)
+    if not groups:
+        print("no gate runs recorded yet")
+    for (place, selection), daily_rows in sorted(
+            groups.items(), key=lambda item: (item[0][0], item[0][1] != "full")):
+        label = "targeted tests" if selection == "affected" else "merge gates"
+        print(f"{place} {label}")
+        headers = TREND_HEADERS + (["median modules run"] if selection == "affected" else [])
+        rendered: list[tuple[str, ...]] = []
+        uncosted = 0
+        for row in daily_rows:
+            charged = [cost for run_id in row.run_ids
+                       if place == "aws" and isinstance(cost := costs.get(run_id), Decimal)]
+            costs_text = ("—", "—", "—")
+            if charged:
+                total = sum(charged, Decimal(0))
+                costs_text = (f"${total / len(charged):.3f}", f"${nearest_rank(charged):.3f}", f"${total:.3f}")
+            if place == "aws":
+                uncosted += len(row.run_ids) - len(charged)
+            rendered.append((*row.cells[:6], *costs_text, *row.cells[6:]))
+        print_table(headers, rendered)
+        if uncosted:
+            print(f"{uncosted} of {sum(int(row.cells[1]) for row in daily_rows)} runs have no cost record.")
+
+
 def positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -359,7 +550,7 @@ def positive(value: str) -> int:
     return number
 
 
-ReportCommand = Literal["top", "suites", "suite", "module", "test"]
+ReportCommand = Literal["top", "suites", "suite", "module", "test", "trend"]
 
 
 @dataclass(init=False)
@@ -376,10 +567,12 @@ class ReportRequestArguments(argparse.Namespace):
 def arguments(argv: list[str]) -> ReportRequestArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    top_parser = subcommands.add_parser("top", help="rank repository tests or gate modules by median time")
+    top_parser = subcommands.add_parser("top", help="rank gate modules by median CPU or nextest tests by median time")
     _ = top_parser.add_argument("--limit", type=positive, default=20)
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
+    trend_parser = subcommands.add_parser("trend", help="show daily CPU, wall time and cost for targeted tests and merge gates")
+    _ = trend_parser.add_argument("--days", type=positive, default=conf.read("test_times").whole("TREND_DAYS"))
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)
     suite_parser = subcommands.add_parser("suite", help="show one folder suite")
@@ -400,9 +593,14 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
 
 
 def open_report_index() -> sqlite3.Connection:
-    """Update the index and check the report tables before returning the connection."""
-    _ = index.update()
-    connection = index.read_only()
+    """Read a complete index and build one only when none qualifies."""
+    path = index.complete_gate_index_in(store.root())
+    if isinstance(path, index.NoCompleteGateIndex):
+        _ = index.update()
+        path = index.index_path()
+    connection = sqlite3.connect(index.read_only_path_uri(path), uri=True,
+                                 timeout=index.BUSY_TIMEOUT_MS / 1000)
+    _ = connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute(f"SELECT 1 FROM {', '.join(index.GATE_TABLES)} LIMIT 0").close()
     except BaseException:
@@ -411,8 +609,49 @@ def open_report_index() -> sqlite3.Connection:
     return connection
 
 
+def rows_as_of(connection: sqlite3.Connection) -> None:
+    """Show the time of the last row change in the user's zone."""
+    completed = cast(tuple[str] | None, connection.execute(
+        "SELECT value FROM meta WHERE key = 'updated_at'"
+    ).fetchone())
+    if completed is not None:
+        zone = user_zone()
+        moment = datetime.fromtimestamp(float(completed[0]), zone)
+        stamp = moment.strftime("%H:%M %Z" if moment.date() == datetime.now(zone).date() else "%m-%d %H:%M %Z")
+        print(f"rows as of {stamp}", file=sys.stderr)
+
+
+def refresh_after_report() -> None:
+    """Refresh in a detached child after the report releases its output."""
+    _ = sys.stdout.flush()
+    _ = sys.stderr.flush()
+    if os.fork():
+        return
+    status = 1
+    try:
+        _ = os.setsid()
+        descriptor = os.open(os.devnull, os.O_RDWR)
+        for target in (0, 1, 2):
+            _ = os.dup2(descriptor, target)
+        if descriptor > 2:
+            os.close(descriptor)
+        refresh_trend_index()
+        status = 0
+    finally:
+        os._exit(status)
+
+
 def main(argv: list[str] | None = None) -> int:
     request = arguments(sys.argv[1:] if argv is None else argv)
+    if request.command == "trend":
+        store.root().mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+            cache = read_trend_cache()
+            if not cache.completed_refresh_started_at:
+                started = datetime.now(UTC).timestamp()
+                _ = index.update()
+                cache.completed_refresh_started_at = started
+                write_trend_cache(cache)
     try:
         connection = open_report_index()
     except sqlite3.OperationalError as error:
@@ -421,13 +660,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test times unavailable: {error}; run `buildlog reindex`", file=sys.stderr)
         return 1
     with closing(connection):
+        connection.execute("BEGIN").close()
         host = store.host_name()
         match request.command:
             case "top":
-                if TYPE_CHECKING:
-                    from ..buildlog import repository
-                else:
-                    import repository
+                from scripts.buildlog import repository
 
                 repo = request.repo.expanduser().resolve()
                 repo = Path(treekey.worktree(str(repo)) or str(repo))
@@ -439,6 +676,8 @@ def main(argv: list[str] | None = None) -> int:
                     top(connection, request.host, request.limit, repo)
                 else:
                     nextest_top(connection, request.host, request.limit, repo, identity)
+            case "trend":
+                trend(connection, request.days)
             case "suites":
                 suites(connection, host, request.days)
             case "suite":
@@ -447,6 +686,8 @@ def main(argv: list[str] | None = None) -> int:
                 module(connection, host, request.subject, request.runs)
             case "test":
                 test(connection, host, request.subject, request.runs)
+        rows_as_of(connection)
+    refresh_after_report()
     return 0
 
 

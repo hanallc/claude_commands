@@ -2,66 +2,35 @@
 """Read configured build targets and their recorded holds and runs."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
-from decimal import Decimal
-from calendar import monthrange
-import json
-from typing import cast
-import time
-from typing import TYPE_CHECKING
+
+from dataclasses import dataclass
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-import sys
+from typing import TYPE_CHECKING
 
-
-SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint", "lib"):
-    sys.path.insert(0, str(SCRIPTS / directory))
-import build_hold
-import mac_test
-import offload
-from target_config import (
+from scripts.build_targets.target_config import (
+    AnyEligibleTarget as AnyEligibleTarget,
+    LocalRequired as LocalRequired,
+    Routing as Routing,
+    ANY_ELIGIBLE_TARGET as ANY_ELIGIBLE_TARGET,
+    EligibleTarget as EligibleTarget,
+    ExcludedTarget as ExcludedTarget,
     ConfigError as ConfigError,
     LocalTarget as LocalTarget,
     Platform as Platform,
     SshTarget as SshTarget,
     Target as Target,
     read_targets as read_targets,
-    is_aws_target,
 )
 
+
 if TYPE_CHECKING:
-    from ..aws_target import ledger as cost_ledger, measurement
-    from ..buildlog import record
-else:
-    from scripts.aws_target import ledger as cost_ledger, measurement
-    import record
-
-
-@dataclass(frozen=True)
-class AnyEligibleTarget:
-    """The test may run on any target that supports its repository and package."""
-
-
-@dataclass(frozen=True)
-class LocalRequired:
-    reason: str
-
-
-Routing = AnyEligibleTarget | LocalRequired
-ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
-
-
-@dataclass(frozen=True)
-class EligibleTarget:
-    target: Target
-
-
-@dataclass(frozen=True)
-class ExcludedTarget:
-    target: Target
-    reason: str
+    from scripts.mac_test import eligibility, mac_test
 
 
 @dataclass(frozen=True)
@@ -75,21 +44,27 @@ class ReleaseEstimated:
 
 
 @dataclass(frozen=True)
+class ReleaseOverdue:
+    when: datetime
+
+
+@dataclass(frozen=True)
 class UntilReleased:
+    pass
+
+
+@dataclass(frozen=True)
+class ExpiryNotRecorded:
     pass
 
 
 @dataclass(frozen=True)
 class AwaitingBlockRemoval:
     """A block remains enforced after its requested expiry."""
+    requested_expiry: datetime | ExpiryNotRecorded = ExpiryNotRecorded()
 
 
-HoldEnd = ExpiresAt | ReleaseEstimated | UntilReleased | AwaitingBlockRemoval
-
-
-@dataclass(frozen=True)
-class Free:
-    pass
+HoldEnd = ExpiresAt | ReleaseEstimated | ReleaseOverdue | UntilReleased | AwaitingBlockRemoval
 
 
 @dataclass(frozen=True)
@@ -124,6 +99,21 @@ NO_HOLDER_SESSION = NoHolderSession()
 
 
 @dataclass(frozen=True)
+class KeptClaim:
+    """A remote claim kept for cleanup. Its owner process ended, and it holds no work."""
+
+    what: str
+    repository: str
+    since: datetime
+    holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
+
+
+@dataclass(frozen=True)
+class Free:
+    kept_claims: tuple[KeptClaim, ...] = ()
+
+
+@dataclass(frozen=True)
 class RunningJob:
     """One live Mac claim: a job for one repository, or for the whole Mac."""
 
@@ -135,18 +125,27 @@ class RunningJob:
 
 @dataclass(frozen=True)
 class Running:
-    """Every live Mac claim, oldest first."""
+    """Every live Mac claim that holds work, oldest first, and the claims kept for cleanup."""
 
     jobs: tuple[RunningJob, ...]
+    kept_claims: tuple[KeptClaim, ...] = ()
+
+
+@dataclass(frozen=True)
+class StartNotRecorded:
+    pass
 
 
 @dataclass(frozen=True)
 class Held:
+    """A natedev hold or a Mac block, and the Mac claims kept for cleanup while it lasts."""
+
     holder: str
     reason: str
-    since: datetime
+    since: datetime | StartNotRecorded
     end: HoldEnd
     holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
+    kept_claims: tuple[KeptClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -159,178 +158,209 @@ class StateUnreadable:
     reason: str
 
 
-@dataclass(frozen=True)
-class RepositorySlots:
-    """Occupied capacity belongs to one repository, including retained remote ownership."""
-
-    repository: str
-    capacity: int
-    active: int
-    retained: int
-
-
-    @property
-    def occupied(self) -> int:
-        return self.active + self.retained
+TargetState = Free | Running | Held | Unreachable | StateUnreadable
 
 
 @dataclass(frozen=True)
-class RemovalComplete:
-    """No incomplete removal record remains."""
-
-
-@dataclass(frozen=True)
-class RemovalPending:
-    resources: tuple[str, ...]
-    storage_usd_per_day: Decimal
-
-
-REMOVAL_COMPLETE = RemovalComplete()
-
-
-@dataclass(frozen=True)
-class AwsStatusRow:
-    target: str
-    state: str
-    evidence_at: int
-    reason: str
-    spending: str
-    decision_at: int
-    monthly_usd: Decimal | measurement.MeasurementUnavailable
-    monthly_limit_usd: Decimal | measurement.MeasurementUnavailable
-    slots: tuple[RepositorySlots, ...]
-    results: tuple[record.AttemptResult, ...]
-    notices: tuple[cost_ledger.LimitEvent, ...]
-    starting_at: int
-    recovery: measurement.ControllerRecovery
-    removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
-
-
-def read_aws_status(target: SshTarget) -> AwsStatusRow | StateUnreadable:
-    """Read local controller, ledger, claim, and result evidence without probes or writes."""
-    try:
-        paths = mac_test.state_paths(target.name)
-        snapshot = measurement.read_status_measurement(target.settings, paths.directory, int(time.time()))
-        if isinstance(snapshot, measurement.MeasurementUnavailable):
-            return StateUnreadable(snapshot.reason)
-        claims = tuple(claim for claim in mac_test.read_claims(paths) if mac_test.run_is_live(claim.record))
-        repositories: dict[mac_test.ClaimScope, list[mac_test.HeldClaim]] = {}
-        for claim in claims:
-            scope = replace(claim.scope, slot=0) if isinstance(claim.scope, mac_test.RepositoryScope) else claim.scope
-            repositories.setdefault(scope, []).append(claim)
-        slots: list[RepositorySlots] = []
-        for scope, held in repositories.items():
-            active = sum(1 for claim in held if not mac_test.run_is_kept(claim.record)
-                         and not claim.record.get('cleanup_pending'))
-            capacity = mac_test.slot_capacity(paths, scope)
-            name = scope.name if isinstance(scope, mac_test.RepositoryScope) else 'unknown'
-            slots.append(RepositorySlots(name, capacity, active, len(held) - active))
-        slots.sort(key=lambda row: row.repository)
-        permission = snapshot.permission
-        spending = cost_ledger.permission_status(permission) if snapshot.enabled else 'disabled'
-        costs = snapshot.costs
-        monthly = costs.monthly.usd if isinstance(costs, cost_ledger.CostEstimate) else measurement.MeasurementUnavailable(costs.reason)
-        reason = snapshot.controller.reason
-        if not isinstance(permission, cost_ledger.PermissionAllowed):
-            reason = '; '.join(filter(None, (reason, permission.reason)))
-        removal: RemovalComplete | RemovalPending = REMOVAL_COMPLETE
-        removal_path = paths.directory / 'down.json'
-        if removal_path.exists():
-            value = cast(object, json.loads(removal_path.read_text()))
-            if not isinstance(value, dict):
-                raise ValueError('down.json: expected a removal record')
-            saved = cast(dict[str, object], value)
-            resources = tuple(str(saved[key]) for key in ('volume', 'budget') if saved.get(key))
-            inventory = cost_ledger.CostLedger(paths.directory).read_snapshot().inventories
-            names = ('retained_storage_usd_per_month', 'gp3_iops_usd_per_month', 'gp3_throughput_usd_per_month')
-            monthly_storage = sum((r.usd_per_month for r in inventory[-1].resources if r.name in names), Decimal(0)) if inventory else Decimal(0)
-            now = datetime.fromtimestamp(time.time(), timezone.utc)
-            removal = RemovalPending(resources, monthly_storage / monthrange(now.year, now.month)[1])
-        return AwsStatusRow(target.name, snapshot.controller.state, snapshot.controller.at, reason, spending,
-                            permission.at, monthly, snapshot.monthly_limit_usd, tuple(slots),
-                            record.read_attempt_results(target.name), snapshot.events, snapshot.controller.starting_at, snapshot.controller.recovery, removal)
-    except (OSError, ValueError, mac_test.StateReadError, ConfigError) as error:
-        return StateUnreadable(str(error))
-
-
-TargetState = Free | Running | Held | Unreachable | StateUnreadable | AwsStatusRow
+class TargetSnapshot:
+    target: Target
+    states: tuple[TargetState, ...]
+    claims: tuple[mac_test.HeldClaim, ...]
+    backoff: eligibility.BackoffState
 
 
 def target_eligibility(
     repo_root: Path, package: str, routing: Routing
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Keep configured order while excluding Mac targets the test cannot use."""
+    configured = read_targets()
+    if all(target.platform == "linux" for target in configured):
+        return tuple(EligibleTarget(target) for target in configured)
+    return mac_policy_eligibility(repo_root, package, routing, configured)
+
+
+def mac_policy_eligibility(
+    repo_root: Path, package: str, routing: Routing, configured: tuple[Target, ...]
+) -> tuple[EligibleTarget | ExcludedTarget, ...]:
+    """Read repository policy when a configured target uses macOS."""
+    from scripts.mac_test import eligibility
+
     results: list[EligibleTarget | ExcludedTarget] = []
-    repository = offload.repository_identity(repo_root)
-    for target in read_targets():
+    repository = eligibility.repository_identity(repo_root)
+    for target in configured:
         if target.platform == "linux":
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
             results.append(ExcludedTarget(target, routing.reason))
-        elif isinstance(repository, offload.UnknownRepository):
+        elif isinstance(repository, eligibility.UnknownRepository):
             results.append(ExcludedTarget(target, "repo"))
         else:
-            config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
-            key = f"linux_only.{repository.name}"
-            if key not in config.values:
-                results.append(ExcludedTarget(target, "repo"))
-            elif package in offload.comma_values(config.values[key]):
-                results.append(ExcludedTarget(target, "linux_only"))
-            else:
-                results.append(EligibleTarget(target))
+            config = eligibility.read_target_settings(target.settings) if isinstance(target, SshTarget) else eligibility.read_target_settings()
+            policy = eligibility.linux_only_policy(config, repository, repo_root, package, kind="")
+            results.append(ExcludedTarget(target, policy.reason) if isinstance(policy, eligibility.IneligibleMacStep)
+                           else EligibleTarget(target))
     return tuple(results)
 
 
 def utc_now() -> datetime:
+
     return datetime.now(timezone.utc)
 
 
 def running_job(claim: mac_test.HeldClaim) -> RunningJob:
+    from scripts.mac_test import mac_test
+
     record = claim.record
     since = mac_test.aware_timestamp(record["since"], claim.path, "since")
-    session_id = record.get("holder_session", "")
-    holder = HolderSession(session_id) if session_id else NO_HOLDER_SESSION
+    holder = holder_session(record)
     if "idle_since" not in record:
         return RunningJob(record["what"], since, NOT_SEEN_IDLE, holder)
     idle = mac_test.aware_timestamp(record["idle_since"], claim.path, "idle_since")
     return RunningJob(record["what"], since, IdleSince(idle), holder)
 
 
-def target_state(target: Target) -> TargetState:
-    """Read state without probing a host or changing coordination files."""
+def holder_session(record: mac_test.RunRecord) -> HolderSession | NoHolderSession:
+    session_id = record.get("holder_session", "")
+    return HolderSession(session_id) if session_id else NO_HOLDER_SESSION
+
+
+def kept_claim(claim: mac_test.HeldClaim) -> KeptClaim:
+    from scripts.mac_test import mac_test
+
+    record = claim.record
+    repository = claim.scope.name if isinstance(claim.scope, mac_test.RepositoryScope) else Path(record["worktree"]).name
+    return KeptClaim(record["what"], repository, mac_test.aware_timestamp(record["since"], claim.path, "since"),
+                     holder_session(record))
+
+
+def kept_claim_text(kept: KeptClaim, owner: str, zone: tzinfo) -> str:
+    """Name a kept claim with its owner and start: the holder session name when known, else the repository."""
+    return f"kept for cleanup: {owner or kept.repository} {kept.what} since {kept_since_text(kept.since, zone)}"
+
+
+def kept_since_text(since: datetime, zone: tzinfo) -> str:
+    """A kept claim can stay for days, so a start before today shows its date."""
+    from scripts.lib.user_zone import shown_time
+
+    return (clock(since, zone) if since.astimezone(zone).date() == utc_now().astimezone(zone).date()
+            else shown_time(since, zone, labeled=True))
+
+
+def status_claims(target: SshTarget, claims: tuple[mac_test.HeldClaim, ...]) -> tuple[mac_test.HeldClaim, ...]:
+    """The claims that status names under the target.
+
+    A guest claim is in the Mac claim folder (eligibility.MAC_LINUX_CLAIM_TARGET), but status names it under mac-linux.
+    """
+    from scripts.mac_test import eligibility, mac_test
+
+    if target.name == eligibility.MAC_LINUX_TARGET:
+        guest = mac_test.read_claims(mac_test.state_paths(eligibility.MAC_LINUX_CLAIM_TARGET))
+        return (*claims, *(claim for claim in guest if mac_test.claim_kind(claim.record) is mac_test.MacClaimKind.GUEST))
+    return tuple(claim for claim in claims if mac_test.claim_kind(claim.record) is not mac_test.MacClaimKind.GUEST)
+
+
+def local_hold_state() -> TargetState:
+    return local_hold_states()[0]
+
+
+def local_hold_states() -> tuple[TargetState, ...]:
+    """Read the local hold without importing remote claim readers."""
+    from scripts.build_hold import build_hold
+
     try:
-        if isinstance(target, LocalTarget):
-            holds = build_hold.natedev_holds(build_hold.holder_directory())
-            if not holds.in_force:
-                return Free()
-            holder = holds.in_force[0]
-            end = (
-                ReleaseEstimated(holder.release.at)
-                if isinstance(holder.release, build_hold.KnownReleaseEta)
-                else UntilReleased()
-            )
-            return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+        holds = build_hold.natedev_holds(build_hold.holder_directory())
+        if not holds.in_force:
+            return (Free(),)
+        now = utc_now()
+        return tuple(Held(holder.name, holder.purpose,
+            holder.since if holder.start_recorded else StartNotRecorded(),
+            (ReleaseOverdue(holder.release.at) if build_hold.release_overdue(holder.release, now)
+             else ReleaseEstimated(holder.release.at))
+            if isinstance(holder.release, build_hold.KnownReleaseEta) else UntilReleased(),
+            HolderSession(build_hold.holder_session(holder.key))) for holder in holds.in_force)
+    except build_hold.ReleaseRecordReadError as error:
+        return (StateUnreadable(build_hold.release_record_error_line(error)),)
+    except (OSError, UnicodeError, ConfigError) as error:
+        return (StateUnreadable(str(error)),)
+
+
+def ssh_target_state(target: SshTarget) -> TargetState:
+    return ssh_target_snapshot(target).states[0]
+
+
+def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
+    """Read remote claim, block and backoff records once, without probing the target."""
+    from scripts.build_hold import build_hold
+    from scripts.mac_test import eligibility, mac_test
+
+    claims: tuple[mac_test.HeldClaim, ...] = ()
+    backoff: eligibility.BackoffState = eligibility.NO_BACKOFF
+
+    def snapshot(state: TargetState) -> TargetSnapshot:
+        return TargetSnapshot(target, (state,), claims, backoff)
+
+    try:
         paths = mac_test.state_paths(target.name)
-        claims = mac_test.read_claims(paths)
+        claims = tuple(mac_test.read_claims(paths))
         block = mac_test.read_claim_block(paths)
+        backoff = eligibility.read_backoff(utc_now().timestamp(), target.name, strict=True)
+        shown = status_claims(target, claims)
+        kept = tuple(kept_claim(claim) for claim in shown if mac_test.run_is_kept(claim.record))
         if not isinstance(block, mac_test.NoMacBlock):
-            block_end = (
-                ExpiresAt(block.expires)
-                if block.expires > utc_now()
-                else AwaitingBlockRemoval()
-            )
+            block_end = ExpiresAt(block.expires) if block.expires > utc_now() else AwaitingBlockRemoval(block.expires)
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
-            return Held(block.holder, block.reason, block.since, block_end, session)
-        if is_aws_target(target):
-            return read_aws_status(target)
-        jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
+            return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session, kept))
+        if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
+            return snapshot(Unreachable("failed probe"))
+        jobs = tuple(running_job(claim) for claim in shown if mac_test.run_holds_work(claim.record))
         if jobs:
-            return Running(jobs)
-        if isinstance(offload.read_backoff(utc_now().timestamp(), target.name), offload.ActiveBackoff):
-            return Unreachable("retry backoff")
-        return Free()
+            return snapshot(Running(jobs, kept))
+        if isinstance(backoff, eligibility.UnreadableBackoff):
+            return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return snapshot(Unreachable("retry backoff"))
+        return snapshot(Free(kept))
     except build_hold.ReleaseRecordReadError as error:
-        return StateUnreadable(build_hold.release_record_error_line(error))
+        return snapshot(StateUnreadable(build_hold.release_record_error_line(error)))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
-        return StateUnreadable(str(error))
+        return snapshot(StateUnreadable(str(error)))
+
+
+def target_snapshots() -> tuple[TargetSnapshot, ...]:
+    """Read coordination evidence once for one page reading."""
+    from scripts.mac_test import eligibility
+
+    return tuple(TargetSnapshot(target, local_hold_states(), (), eligibility.NO_BACKOFF)
+                 if isinstance(target, LocalTarget) else ssh_target_snapshot(target)
+                 for target in read_targets())
+
+
+def start_text(since: datetime | StartNotRecorded, zone: tzinfo) -> str:
+    """Name a hold's recorded start, or say that none was recorded."""
+    return "start not recorded" if isinstance(since, StartNotRecorded) else "since " + clock(since, zone)
+
+
+def end_text(end: HoldEnd, zone: tzinfo) -> str:
+    """Name a fixed expiry, an estimated release, an open hold or an expired block."""
+    if isinstance(end, ExpiresAt):
+        return "until " + clock(end.when, zone)
+    if isinstance(end, ReleaseEstimated):
+        return "expected release " + clock(end.when, zone)
+    if isinstance(end, ReleaseOverdue):
+        return "release overdue since " + clock(end.when, zone)
+    if isinstance(end, AwaitingBlockRemoval):
+        expiry = end.requested_expiry
+        return "awaiting unblock" + (f"; requested expiry was {clock(expiry, zone)}" if isinstance(expiry, datetime) else "")
+    return "until released"
+
+
+def clock(instant: datetime, zone: tzinfo) -> str:
+    return instant.astimezone(zone).strftime("%H:%M %Z")
+
+
+def target_state(target: Target) -> TargetState:
+    """Read state without probing a host or changing coordination files."""
+    if isinstance(target, LocalTarget):
+        return local_hold_state()
+    return ssh_target_state(target)

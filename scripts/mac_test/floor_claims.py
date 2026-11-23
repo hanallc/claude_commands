@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Keep Mac claim admission locked while the floor sweep removes idle output."""
+"""Read Mac claims without holding admission locks during a sweep."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import hashlib
 from importlib import import_module
 import json
 import os
@@ -13,7 +18,6 @@ from pathlib import Path
 import select
 import shlex
 import subprocess
-import sys
 from typing import Protocol, cast
 
 
@@ -36,30 +40,118 @@ class ClaimReader(Protocol):
 
 
 MIRROR_MARK = ".mac-test-mirror"
+MIRROR_RECORD = ".copy-record.json"
+MIRROR_SESSION = ".copy-session"
+MIRROR_METADATA = (MIRROR_SESSION, MIRROR_MARK, MIRROR_RECORD)
+MIRROR_REMOVAL_SUFFIX = ".copy-removing.json"
+MIRROR_LEASE_FDS = "COPIES_MIRROR_LEASE_FDS"
+
+
+def inherited_mirror_descriptors() -> tuple[int, ...]:
+    """Carry the mirror lease through a remote Python entry point."""
+    return tuple(int(value) for value in os.environ.get(MIRROR_LEASE_FDS, "").split(",") if value)
+
+
+def read_mirror_record(path: Path) -> dict[str, object]:
+    """Read mirror metadata or removal authority through the same decoder."""
+    return cast(dict[str, object], json.loads(path.read_text()))
+
+
+def mirror_local_path(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.home() / candidate
+    return candidate.absolute()
+
+
+def mirror_lock_path(tree: Path) -> Path:
+    # A sibling lock survives replacement or removal of the mirror itself.
+    return tree.parent / ("." + tree.name + ".copy-lease")
+
+
+def mirror_parent_lock_path(tree: Path) -> Path:
+    """Keep the mirror lease outside a task parent that removal can delete."""
+    real = tree.resolve()
+    identity = hashlib.sha256(str(real).encode()).hexdigest()
+    return real.parent.parent / (".copy-parent-lease-" + identity)
+
+
+def removal_authority_path(tree: Path) -> Path:
+    return tree.parent / ("." + tree.name + MIRROR_REMOVAL_SUFFIX)
+
+
+def record_lock_path(tree: Path) -> Path:
+    return tree.parent / ("." + tree.name + ".copy-record.lock")
 
 
 @dataclass(frozen=True)
-class LockedClaims:
-    """Claims remain valid while every admission lock process remains alive."""
+class MirrorIdentity:
+    """The host and configured path identify one mirror lease."""
+
+    host: str
+    path: str
+
+
+@dataclass(frozen=True)
+class HeldMirror:
+    identity: MirrorIdentity
+    session: str
+
+
+@dataclass(frozen=True)
+class NoMirrorExemption:
+    """Every active mirror lease protects its target."""
+
+
+NO_MIRROR_EXEMPTION = NoMirrorExemption()
+
+
+@dataclass(frozen=True)
+class ClaimSnapshot:
+    """Claims and mirror leases observed during one read."""
 
     repositories: frozenset[str]
-    processes: tuple[subprocess.Popen[str], ...] = ()
+    mirrors: tuple[HeldMirror, ...] = ()
 
-    def holds(self, target: str, mirror: Path) -> bool:
-        if "*" in self.repositories or any(process.poll() is not None for process in self.processes):
+    def holds(self, target: str, mirror: Path, *,
+              exemption: MirrorIdentity | NoMirrorExemption = NO_MIRROR_EXEMPTION) -> bool:
+        if "*" in self.repositories:
             return True
         try:
             path = Path(target).resolve(strict=True)
-            return any(path.is_relative_to((mirror / name).resolve(strict=True)) for name in self.repositories)
+            for held in self.mirrors:
+                if held.identity == exemption:
+                    continue
+                if isinstance(exemption, MirrorIdentity) and held.identity.host != exemption.host:
+                    continue
+                remote = mirror_local_path(held.identity.path)
+                if path.is_relative_to(remote.resolve()):
+                    return True
+            for parent in (path, *path.parents):
+                record = parent / MIRROR_RECORD
+                if record.exists():
+                    try:
+                        fields = read_mirror_record(record)
+                        return fields.get("repo") in self.repositories
+                    except (OSError, ValueError):
+                        return True
+            for name in self.repositories:
+                try:
+                    claimed = (mirror / name).resolve(strict=True)
+                except FileNotFoundError:
+                    continue
+                if path.is_relative_to(claimed):
+                    return True
+            return False
         except (OSError, RuntimeError):
             return True
 
 
-@contextmanager
-def locked_claims(timeout: float) -> Generator[LockedClaims]:
-    """Lock local and natedev claim admission; unreadable ownership keeps every target."""
+def read_claims(timeout: float) -> ClaimSnapshot:
+    """Read local and natedev claims; release each admission lock before the caller continues."""
     processes: list[subprocess.Popen[str]] = []
     names: set[str] = set()
+    mirrors: list[HeldMirror] = []
     remote_source = Path(__file__).read_text().replace(
         "from __future__ import annotations",
         "from __future__ import annotations\n"
@@ -67,7 +159,7 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
         1,
     )
     commands = (
-        [sys.executable, str(Path(__file__).resolve()), "--serve"],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "--serve"],
         ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}",
          "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "natedev",
          "~/.claude/scripts/lib/py -c " + shlex.quote(remote_source)],
@@ -75,21 +167,35 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
     try:
         try:
             for command in commands:
-                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                            stderr=subprocess.DEVNULL, text=True)
                 processes.append(process)
                 if process.stdout is None or not select.select([process.stdout], [], [], timeout)[0]:
                     raise ValueError("claim reply unavailable")
                 value = cast(object, json.loads(cast(str, process.stdout.readline())))
-                if not isinstance(value, list):
+                if process.wait(timeout=timeout) != 0:
+                    raise ValueError("claim reader failed")
+                if not isinstance(value, dict):
                     raise ValueError("claim reply invalid")
-                for name in cast(list[object], value):
+                reply = cast(dict[str, object], value)
+                repositories = reply.get("repositories")
+                leases = reply.get("mirrors")
+                if not isinstance(repositories, list) or not isinstance(leases, list):
+                    raise ValueError("claim reply invalid")
+                for lease in cast(list[object], leases):
+                    if not isinstance(lease, dict):
+                        raise ValueError("mirror lease invalid")
+                    fields = cast(dict[str, object], lease)
+                    host, path, session = fields.get("host"), fields.get("path"), fields.get("session")
+                    if not isinstance(host, str) or not isinstance(path, str) or not isinstance(session, str):
+                        raise ValueError("mirror lease invalid")
+                    mirrors.append(HeldMirror(MirrorIdentity(host, path), session))
+                for name in cast(list[object], repositories):
                     if not isinstance(name, str) or (name != "*" and (Path(name).name != name or name in (".", ".."))):
                         raise ValueError("claim scope invalid")
                     names.add(name)
-        except (OSError, ValueError):
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             names = {"*"}
-        yield LockedClaims(frozenset(names), tuple(processes))
     finally:
         for process in processes:
             if process.stdin is not None:
@@ -103,12 +209,12 @@ def locked_claims(timeout: float) -> Generator[LockedClaims]:
                 _ = process.wait()
             if process.stdout is not None:
                 process.stdout.close()
+    return ClaimSnapshot(frozenset(names), tuple(mirrors))
 
 
 def serve() -> int:
     """Use the claim writer's lock and decoder without deleting stale records."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    mac_test = cast(ClaimReader, cast(object, import_module("mac_test")))
+    mac_test = cast(ClaimReader, cast(object, import_module('scripts.mac_test.mac_test')))
 
     paths = mac_test.state_paths()
     with mac_test.locked(paths.lock):
@@ -116,6 +222,10 @@ def serve() -> int:
             with os.scandir(paths.claims) as entries:
                 _ = list(entries)
         names: set[str] = set()
+        held_remote_mirrors = cast(Callable[[], tuple[HeldMirror, ...]],
+            import_module("scripts.copies.copies").held_remote_mirrors)
+        mirrors = [{"host": held.identity.host, "path": held.identity.path, "session": held.session}
+                   for held in held_remote_mirrors()]
         for claim in mac_test.read_claims(paths):
             record = claim.record
             # A kept remote job can outlive its owner. Unreadable local liveness also keeps it.
@@ -131,8 +241,8 @@ def serve() -> int:
             if live:
                 name: object = getattr(claim.scope, "name", "*")
                 names.add(name if isinstance(name, str) else "*")
-        print(json.dumps(sorted(names)), flush=True)
-        _ = sys.stdin.read()
+        reply = {"repositories": sorted(names), "mirrors": mirrors}
+    print(json.dumps(reply), flush=True)
     return 0
 
 

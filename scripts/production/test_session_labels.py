@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import io
 import json
+from contextlib import redirect_stderr
 import shlex
 import subprocess
 import sys
@@ -10,20 +12,30 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.production import session_labels, session_staff, staff, unit_config
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 
 class NativeSessionLabelTests(StaffTestCase):
+    def test_labels_use_staff_without_reading_an_unreadable_timer_document(self) -> None:
+        fixture = self.row_production()
+        fixture.doc.unlink()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            labels = session_labels.StaffLabels.for_record(staff.snapshot())
+        self.assertEqual(labels.environment({}, fixture.unit.current_session),
+                         {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session})
+        self.assertEqual(errors.getvalue(), "")
+
     def test_runtime_identity_selects_the_current_member_and_removes_copied_labels(self) -> None:
         _, unit, worker = self.tree()
         current = staff.native_id(fixture_runtime_id("label-unit-after-clear"))
         unit = staff.update_current_session(unit.current_session, current)
         self.assertNotEqual(unit.id, unit.current_session)
-        labels = session_labels.StaffLabels(staff.snapshot(), {}, {})
-        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models-unit"}
+        labels = session_labels.StaffLabels(staff.snapshot())
+        environment = {"STAFF_ID": worker.id, "SHOWRUNNER_" + "UNIT_ID": "models"}
         selected = labels.environment(environment, unit.current_session)
         self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": unit.current_session})
         self.assertEqual(labels.environment(environment, worker.current_session),
@@ -31,16 +43,18 @@ class NativeSessionLabelTests(StaffTestCase):
         self.assertEqual(labels.environment(environment, unit.id), {})
 
     def test_retained_reference_projects_the_current_session_without_copied_identity(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
+        from scripts.agents.launch_names import LaunchNames
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
-        membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, ()))
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
+        names = LaunchNames(staff.snapshot())
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
             {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
             ["claude"])
         before = self.staff_file.read_bytes()
-        selected = membership.environment(launch)
+        selected = names.environment(launch)
         self.assertEqual(selected, {"CLAUDE_CODE_SESSION_ID": fixture.unit.current_session,
                                     "ENABLE_TOOL_SEARCH": "true"})
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -48,7 +62,7 @@ class NativeSessionLabelTests(StaffTestCase):
     def test_unknown_runtime_is_not_assigned_by_its_unique_folder_or_display_name(self) -> None:
         runner, unit, _ = self.tree()
         located = replace(unit, worktree=staff.PresentWorktree("natedev", self.root))
-        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)), {}, {})
+        labels = session_labels.StaffLabels(staff.StaffSnapshot((runner, located)))
         before = self.staff_file.read_bytes()
         selected = labels.environment({"STAFF_ID": unit.id}, fixture_runtime_id("unpublished"))
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", selected)
@@ -59,21 +73,19 @@ class NativeSessionLabelTests(StaffTestCase):
 
 class RowResolverTests(StaffTestCase):
     def test_retired_worker_keeps_its_fixed_inbox_path_for_cleanup_retries(self) -> None:
-        _, _, worker = self.tree()
-        run = self.root / "run"
-        run.mkdir()
-        roster = run / "mesh_roster.json"
-        write_text_atomic(roster, json.dumps({worker.name: {"staff_id": worker.id, "status": "ended"}}))
-        before = session_staff.worker_inbox_path(str(run), worker.name)
-        self.assertEqual(before, session_staff.inbox_path(worker.id))
+        worker = self.tree()[2]
+        before = session_staff.inbox_path(worker.id)
+        before.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(before, json.dumps({"messages": ["cleanup evidence"]}))
         evidence = before.read_bytes()
-        _ = staff.retire(worker.id)
+        retired = staff.retire(worker.id)
+        self.assertEqual(retired, worker)
         self.assertIsNone(staff.by_id(worker.id))
-        for _ in range(2):
-            after = session_staff.worker_inbox_path(str(run), worker.name)
-            self.assertEqual(after, before)
-            self.assertEqual(after.read_bytes(), evidence)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                after = session_staff.inbox_path(worker.id)
+                self.assertEqual(after, before)
+                self.assertEqual(after.read_bytes(), evidence)
 
     def test_unit_and_worker_read_the_row_location_config_and_git_from_one_snapshot(self) -> None:
         fixture = self.row_production()
@@ -89,7 +101,7 @@ class RowResolverTests(StaffTestCase):
                 ("shared-fixture",)))
             self.assertEqual(resolver.unit_config(fixture.worker), resolver.unit_config(fixture.unit))
             self.assertEqual(resolver.production_doc(fixture.unit),
-                             session_staff.ProductionDoc("natedev", fixture.doc))
+                             session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(fixture.unit), session_staff.Branch("merge-from-git"))
             self.assertIsInstance(resolver.unit_state(fixture.unit), session_staff.ActiveUnit)
             self.assertEqual(resolver.member_by_folder("natedev", fixture.worktree),
@@ -101,7 +113,8 @@ class RowResolverTests(StaffTestCase):
         worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
         resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, fixture.unit, worker)))
         self.assertIsInstance(resolver.unit_config(worker), session_staff.NoUnitConfig)
-        self.assertEqual(resolver.production_doc(worker), session_staff.ProductionDoc("natedev", fixture.doc))
+        self.assertEqual(resolver.production_doc(worker),
+                         session_staff.ProductionDoc("natedev", fixture.doc, fixture.runner, "# Production\n"))
 
     def test_unfilled_locations_keep_explicit_incomplete_outcomes(self) -> None:
         runner, unit, worker = self.tree()
@@ -114,17 +127,18 @@ class RowResolverTests(StaffTestCase):
 
     def test_removed_worktree_reads_only_parked_branch_and_configuration_without_cleanup(self) -> None:
         fixture = self.row_production()
-        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
+        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree, staff.ParkedBranch("parked-branch")))
         parked = unit_config.parked_path(removed.id)
         parked.parent.mkdir(parents=True)
         write_text_atomic(parked, 'plan = "permanent"\nport = 8712\nresponsibilities = ["parked"]\n'
                           + '[retired]\ndate = "2026-11-01"\n'
-                          + f'session = "{removed.current_session}"\nfolder = "{fixture.worktree}"\n'
-                          + 'branch = "parked-branch"\n')
+                          + f'session = "{removed.current_session}"\n')
         abandoned = parked.with_name(f".{parked.name}.99999999.fixture.tmp")
         write_text_atomic(abandoned, "retained recovery bytes")
         before = parked.read_bytes(), parked.stat().st_mtime_ns, abandoned.read_bytes()
-        resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
+        dependencies: list[Path] = []
+        resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)),
+                                             dependencies=dependencies.append)
         with mock.patch.object(unit_config, "read", side_effect=AssertionError("removed worktree read")):
             self.assertEqual(resolver.unit_branch(removed), session_staff.Branch("parked-branch"))
             config = resolver.unit_config(removed)
@@ -134,23 +148,29 @@ class RowResolverTests(StaffTestCase):
         self.assertEqual(config.port, unit_config.AppPort(8712))
         self.assertEqual(config.responsibilities, ("parked",))
         self.assertIsInstance(resolver.unit_state(removed), session_staff.RetiredUnit)
+        self.assertEqual(parked, self.staff_file.parent / "units" / f"{removed.id}.toml")
+        self.assertIn(parked, dependencies)
         self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns, abandoned.read_bytes()), before)
 
     def test_missing_or_malformed_parked_facts_never_use_the_present_folder(self) -> None:
         fixture = self.row_production()
-        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
-        path = unit_config.parked_path(removed.id)
+        path = unit_config.parked_path(fixture.unit.id)
         path.parent.mkdir(parents=True)
         for malformed in (False, True):
-            with self.subTest(malformed=malformed):
-                if malformed:
-                    write_text_atomic(path, "plan = [invalid")
-                resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
-                branch = resolver.unit_branch(removed)
-                self.assertIsInstance(branch, session_staff.RetiredFactsUnavailable)
-                assert isinstance(branch, session_staff.RetiredFactsUnavailable)
-                self.assertIn(str(path), branch.reason)
-                self.assertNotEqual(branch, session_staff.Branch("branch-from-git"))
+            for retained in (staff.BranchUnrecorded(), staff.ParkedBranch("parked-branch")):
+                with self.subTest(malformed=malformed, retained=retained):
+                    if malformed:
+                        write_text_atomic(path, "plan = [invalid")
+                    removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree, retained))
+                    resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
+                    branch = resolver.unit_branch(removed)
+                    if isinstance(retained, staff.ParkedBranch):
+                        self.assertEqual(branch, session_staff.Branch(retained.value))
+                    else:
+                        self.assertIsInstance(branch, session_staff.RetiredFactsUnavailable)
+                        assert isinstance(branch, session_staff.RetiredFactsUnavailable)
+                        self.assertIn("staff", branch.reason)
+                    self.assertNotEqual(branch, session_staff.Branch("branch-from-git"))
 
     def test_an_unreadable_git_worktree_is_not_a_confirmed_retirement(self) -> None:
         fixture = self.row_production()
@@ -195,9 +215,9 @@ class RowResolverTests(StaffTestCase):
 
         def transport(arguments: list[str], *, input: str, capture_output: bool,
                       text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(arguments[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "mac"])
+            self.assertEqual(arguments[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
             transports.append(arguments)
-            command = shlex.split(arguments[6])
+            command = shlex.split(arguments[4])
             return real_run([sys.executable, *command[1:]], input=input, capture_output=capture_output,
                             text=text, check=check)
 
@@ -211,7 +231,8 @@ class RowResolverTests(StaffTestCase):
             self.assertIsInstance(config, unit_config.UnitConfig)
             assert isinstance(config, unit_config.UnitConfig)
             self.assertEqual(config.plan, unit_config.StandbyPlan())
-            self.assertEqual(resolver.production_doc(first), session_staff.ProductionDoc("mac", fixture.doc))
+            self.assertEqual(resolver.production_doc(first),
+                             session_staff.ProductionDoc("mac", fixture.doc, runner, "# Production\n"))
             self.assertEqual(resolver.merge_branch(first), session_staff.Branch("merge-from-git"))
         self.assertEqual(len(transports), 1)
 
@@ -239,7 +260,7 @@ class RowResolverTests(StaffTestCase):
     def test_stored_references_keep_the_member_after_a_session_change_without_a_name_match(self) -> None:
         fixture = self.row_production()
         record = staff.snapshot()
-        selector = session_staff.ObservedUnit("unrelated-unit", session_staff.NoSession())
+        selector = session_staff.ObservedUnit("unrelated", session_staff.NoSession())
         self.assertEqual(session_staff.unit_match(selector, record,
                          session_staff.StoredReference(fixture.unit.id)), session_staff.MemberFound(fixture.unit))
         self.assertEqual(session_staff.unit_match(selector, record,

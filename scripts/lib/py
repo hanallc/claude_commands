@@ -1,28 +1,21 @@
 #!/usr/bin/env bash
-# Find a python3 new enough for this repo, then exec it with our arguments.
-#
-# This repo uses Python 3.12 syntax (type parameter lists and type statements),
-# so it needs Python >= 3.12.
-# On macOS the `python3` on PATH is Apple's
-# /usr/bin/python3, which is 3.9 -- which is why the hooks used to hardcode
-# /opt/homebrew/bin/python3. That path does not exist on Linux, so every hook
-# silently failed there. Choosing by VERSION rather than by path works on both.
-#
-# Order: explicit override first, then PATH -- correct on NixOS, and on a Mac
-# whose PATH puts homebrew ahead of /usr/bin -- then the nix-darwin system and
-# per-user profiles (a session started before nix reached PATH still finds
-# them), then homebrew's usual locations for a Mac whose PATH does not.
-#
-# Resolution costs a python3 spawn per candidate tried, and the hooks come
-# through here several times a second -- the prioritize watcher alone accounted
-# for ~100 a minute, every one re-asking a question whose answer cannot change
-# while the interpreter stays put. So the winner is remembered by absolute path
-# and revalidated with a stat instead. A garbage-collected nix store path, or a
-# homebrew python that has been uninstalled, fails -x and falls through to a
-# full resolution; the cache key carries the version floor, so raising
-# NEED_MINOR invalidates it. CLAUDE_PYTHON is an explicit override and skips
-# the cache in both directions.
+# Select Python 3.12 or newer. Cache its absolute path unless CLAUDE_PYTHON is set.
+# Set the package root without another process or a working directory change.
 set -uo pipefail
+
+shim="${BASH_SOURCE[0]}"
+[[ "$shim" == /* ]] || shim="$PWD/$shim"
+# Normalize parent segments without a process or a directory change.
+IFS=/ read -r -a shim_parts <<< "$shim"
+shim=""
+for part in ${shim_parts[@]+"${shim_parts[@]}"}; do
+    case "$part" in
+        ''|.) ;;
+        ..) shim="${shim%/*}" ;;
+        *) shim="$shim/$part" ;;
+    esac
+done
+root="${shim%/*/*/*}"
 
 NEED_MAJOR=3
 NEED_MINOR=12
@@ -34,6 +27,106 @@ elif [[ ${OSTYPE:-} == darwin* ]]; then
 else
     cache_dir="$HOME/.cache/claude"
 fi
+# --cache-folder prints the folder of the python path cache, which this file then reads and runs.
+if [[ "${1:-}" == --cache-folder ]]; then
+    printf '%s\n' "$cache_dir"
+    exit 0
+fi
+
+python_options=()
+file_separator=()
+mode=stdin
+target=""
+if [[ "${1:-}" == --isolated ]]; then
+    python_options+=(-I)
+    shift
+fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|-m)
+            mode="${1#-}"
+            if [[ $# -lt 2 ]]; then
+                echo "Argument expected for the $1 option" >&2
+                exit 2
+            fi
+            target="$2"
+            shift 2
+            break ;;
+        -c*|-m*) mode="${1:1:1}"; target="${1:2}"; shift; break ;;
+        -) target=-; shift; break ;;
+        --)
+            file_separator=(--)
+            shift
+            if [[ $# -gt 0 ]]; then mode=file; target="$1"; shift; fi
+            break ;;
+        -W|-X|--check-hash-based-pycs)
+            python_options+=("$1")
+            shift
+            if [[ $# -gt 0 ]]; then python_options+=("$1"); shift; fi ;;
+        -*) python_options+=("$1"); shift ;;
+        *) mode=file; target="$1"; shift; break ;;
+    esac
+done
+# Add the root to this interpreter only. Keep native interpreter options.
+bootstrap='
+def launch():
+    import os, sys
+    root, mode, target = sys.argv[1:4]
+    arguments = sys.argv[4:]
+    import runpy
+    sys.argv = [target if mode in {"file", "m"} else "-c", *arguments]
+    runpy.run_path(os.path.join(root, "scripts/lib/python_startup/sitecustomize.py"), run_name="_shim_python_startup")["start_process"](sys.argv)
+    namespace = sys.modules["__main__"].__dict__
+    builtins = namespace["__builtins__"]
+    namespace.clear()
+    namespace.update(__name__="__main__", __package__=None, __spec__=None,
+                     __builtins__=builtins)
+    if mode == "m":
+        import runpy
+        sys.argv = [target, *arguments]
+        runpy._run_module_as_main(target)
+    elif mode == "file":
+        import runpy
+        if not sys.flags.isolated:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(target)))
+        sys.argv = [target, *arguments]
+        namespace.update(runpy.run_path(target, run_name="__main__"))
+    else:
+        sys.argv = ["-c" if mode == "c" else target, *arguments]
+        if mode == "c":
+            exec(compile(target, "<string>", "exec"), namespace)
+        elif sys.stdin.isatty():
+            if not sys.flags.interactive:
+                import code
+                code.interact(local=namespace)
+        else:
+            exec(compile(sys.stdin.read(), "<stdin>", "exec"), namespace)
+launch()
+'
+startup="$root/scripts/lib/python_startup"
+native=1
+for option in ${python_options[@]+"${python_options[@]}"}; do
+    case "$option" in
+        --*|-W*|-X*) ;;
+        -*I*|-*E*|-*S*) native=0 ;;
+    esac
+done
+if [[ "$native" == 1 ]]; then
+    export PYTHONPATH="$startup${PYTHONPATH+:$PYTHONPATH}"
+    case "$mode" in
+        c|m) set -- ${python_options[@]+"${python_options[@]}"} -P "-$mode" "$target" "$@" ;;
+        file) set -- ${python_options[@]+"${python_options[@]}"} ${file_separator[@]+"${file_separator[@]}"} "$target" "$@" ;;
+        *)
+            if [[ "$target" == - ]]; then
+                set -- ${python_options[@]+"${python_options[@]}"} -P - "$@"
+            else
+                set -- ${python_options[@]+"${python_options[@]}"} -P "$@"
+            fi ;;
+    esac
+else
+    set -- ${python_options[@]+"${python_options[@]}"} -P -c "$bootstrap" "$root" "$mode" "$target" "$@"
+fi
+
 cache_file="$cache_dir/python3-$NEED_MAJOR.$NEED_MINOR"
 
 if [[ -z "${CLAUDE_PYTHON:-}" && -r "$cache_file" ]]; then
@@ -45,7 +138,7 @@ fi
 
 new_enough() {
     command -v "$1" >/dev/null 2>&1 || [ -x "$1" ] || return 1
-    "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
+    "$1" -I -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
 }
 
 # Written through a temp file and renamed, so two hooks resolving at once can

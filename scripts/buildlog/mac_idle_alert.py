@@ -4,20 +4,16 @@ from __future__ import annotations
 import json
 import math
 import os
-import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-if TYPE_CHECKING:
-    from . import store
-    from ..lib import conf
-else:
-    from scripts.buildlog import store
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    import conf
+from scripts.buildlog import store
+from scripts.lib import conf
 
 
 @dataclass(frozen=True)
@@ -63,6 +59,7 @@ class SavedAlert(TypedDict):
     written: float
     state: Literal["busy", "idle", "unreachable", "unreadable"]
     since: float
+    changed: float
     waiting: int
     cause: Literal["blocked", "claim_idle", "free", "disk", ""]
     holder: str
@@ -71,6 +68,7 @@ class SavedAlert(TypedDict):
     messaged: bool
     pushed: bool
     admission_error: NotRequired[str]
+    kept_claims: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -80,6 +78,7 @@ class NoSavedAlert:
 
 @dataclass(frozen=True)
 class UnreadableAlert:
+    """The reason explains why the idle alert cannot be read."""
     reason: str
 
 
@@ -95,7 +94,7 @@ def read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert:
     row = cast(dict[str, object], raw)
     if type(row.get("version")) is not int or row["version"] != 1:
         return UnreadableAlert("invalid version")
-    for field in ("written", "since", "until"):
+    for field in ("written", "since", "changed", "until"):
         if not nonnegative_time(row.get(field)):
             return UnreadableAlert(f"invalid {field}")
     if row.get("state") not in ("busy", "idle", "unreachable", "unreadable"):
@@ -105,6 +104,9 @@ def read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert:
     waiting = row.get("waiting")
     if type(waiting) is not int or waiting < 0:
         return UnreadableAlert("invalid waiting")
+    kept_claims = row.get("kept_claims", 0)
+    if type(kept_claims) is not int or kept_claims < 0:
+        return UnreadableAlert("invalid kept_claims")
     for field in ("holder", "detail"):
         if not isinstance(row.get(field), str):
             return UnreadableAlert(f"invalid {field}")
@@ -128,7 +130,32 @@ def clock_text(at: float, zone: ZoneInfo, *, include_zone: bool = False) -> str:
         return "unknown time"
 
 
-def alert_line(path: Path, now: float, zone: ZoneInfo) -> str | None:
+class BlockText(Enum):
+    """The Builds page shows a Mac block in its own card, so its alert keeps only the diagnostics."""
+
+    SHOWN = auto()
+    OMITTED = auto()
+
+
+def kept_claims_text(count: int) -> str:
+    """Name retained claims without reporting running work."""
+    noun = "claim" if count == 1 else "claims"
+    return f"{count} {noun} kept for cleanup"
+
+
+def waiting_steps_text(count: int) -> str:
+    """Use the count to select the noun and verb."""
+    return f"{count} step waits" if count == 1 else f"{count} steps wait"
+
+
+def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN,
+               live_agrees: Callable[[SavedAlert], bool] | None = None) -> str | None:
+    """Format the saved reading.
+
+    A view passes `live_agrees`, and a Mac condition line shows only when the live Mac state agrees with it.
+    The watch passes None, because it formats the reading that it just wrote from the live state.
+    A view calls `mac_idle.view_alert_line`, never this function directly.
+    """
     saved = read_alert(path)
     if isinstance(saved, NoSavedAlert):
         return None
@@ -144,22 +171,31 @@ def alert_line(path: Path, now: float, zone: ZoneInfo) -> str | None:
         return f"MAC IDLE WATCH: Mac state unreadable: {display_field(saved['detail'])}."
     admission_error = saved.get("admission_error", "")
     query_reason = f"admission query failed: {display_field(admission_error)}" if admission_error else ""
+    quiet = f"MAC IDLE WATCH: {query_reason}." if query_reason else None
     if saved["state"] == "busy" or saved["waiting"] == 0:
-        return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
+        return quiet
     waiting = saved["waiting"]
     if saved["state"] == "unreachable":
-        return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting} steps wait for the Mac."
+        if live_agrees is not None and not live_agrees(saved):
+            return quiet
+        return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting_steps_text(waiting)} for the Mac."
     elapsed = now - saved["since"]
-    if elapsed < settings.alert_seconds:
-        return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
+    if elapsed < settings.alert_seconds or (saved["cause"] == "blocked" and block is BlockText.OMITTED):
+        return quiet
+    if live_agrees is not None and not live_agrees(saved):
+        return quiet
     holder, detail = display_field(saved["holder"]), display_field(saved["detail"])
+    suffix = f"; {query_reason}" if query_reason else ""
     if saved["cause"] == "blocked":
-        cause = f"Blocked by {holder} since {clock_text(saved['since'], zone)} ({detail}); /build:mac unblock clears it"
-    elif saved["cause"] == "claim_idle":
+        return (f"MAC BLOCKED by {holder} since {clock_text(saved['since'], zone)} ({detail}): {waiting_steps_text(waiting)} "
+                f"for the Mac, idle {int(elapsed // 60)} min; /build:mac unblock clears it{suffix}.")
+    if saved["cause"] == "claim_idle":
         cause = f"Claim of {holder} ({detail}) runs no build or test on the Mac"
     elif saved["cause"] == "disk":
         cause = "Mac disk exclusion keeps these steps on natedev"
     else:
-        cause = "No block and no claim; the waiting steps do not take the Mac"
-    suffix = f"; {query_reason}" if query_reason else ""
-    return f"MAC IDLE {int(elapsed // 60)} min: {waiting} steps wait for the Mac. {cause}{suffix}."
+        kept_claims = saved.get("kept_claims", 0)
+        cause = (f"No block; {kept_claims_text(kept_claims)}. Kept claims hold no work; "
+                 if kept_claims else "No block and no claim; ")
+        cause += "the waiting steps do not take the Mac"
+    return f"MAC IDLE {int(elapsed // 60)} min: {waiting_steps_text(waiting)} for the Mac. {cause}{suffix}."

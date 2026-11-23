@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
+from unittest import mock
 
-import mechanical_classes
-import style_footprint
-from approved_renames import BindingRename
+
+from scripts.style import mechanical_classes
+from scripts.style import style_footprint
+from scripts.style.approved_renames import BindingRename
+from scripts.style.style_plan_test_support import private_class_catalog
 
 DOC = Path(__file__).resolve().parents[2] / "docs/style_production.md"
 ENTRY = 'name = "{name}"\nproof = "{proof}"\nrules = [{rules}]\nsummary = "{summary}"\n'
@@ -32,7 +37,9 @@ class LoaderTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "classes.toml"
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = root / "classes.toml"
+        _ = self.enterContext(private_class_catalog(root))
 
     def load(self, text: str) -> tuple[mechanical_classes.MechanicalClass, ...]:
         _ = self.path.write_text(text)
@@ -88,6 +95,13 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(listed[2].rules, ("prefer-type-named-fields-and-bindings",))
         self.assertIs(mechanical_classes.classes(), listed)
 
+    def test_the_private_catalog_rejects_a_wrong_rule_in_the_class_list(self) -> None:
+        _ = self.path.write_text(entry(rules='"missing-rule"'))
+        with (mock.patch.object(mechanical_classes, "CLASSES", self.path),
+              private_class_catalog(self.path.parent / "wrong-rule")):
+            with self.assertRaisesRegex(mechanical_classes.ClassListError, "rule not in the catalog: missing-rule"):
+                _ = mechanical_classes.classes()
+
     def test_the_doc_lists_each_class_of_the_toml_by_name(self) -> None:
         names = [item.name for item in mechanical_classes.classes()]
         text = DOC.read_text()
@@ -103,21 +117,42 @@ class LoaderTests(unittest.TestCase):
 class MechanicalProofTests(unittest.TestCase):
     repo: Path = Path()
     base: str = ""
+    repository_seed: Path = Path()
+    seed_base: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mechanical-seed-")))
+        cls.repository_seed = root / "sample"
+        cls.repository_seed.mkdir()
+        home = root / "home"
+        home.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Class tests")
+            _ = fixture.git("config", "user.email", "classes@example.invalid")
+            _ = fixture.git("config", "commit.gpgsign", "false")
+            # Detached maintenance can write objects after a test ends.
+            _ = fixture.git("config", "maintenance.auto", "false")
+            _ = fixture.git("config", "gc.auto", "0")
+            fixture.write("Cargo.toml", MANIFEST)
+            fixture.write("src/lib.rs", "mod other;\n\npub fn read() -> usize { 1 }\n\n" + TESTS)
+            fixture.write("src/other.rs", "pub(crate) fn more() -> usize { 2 }\n")
+            cls.seed_base = fixture.commit()
 
     @override
     def setUp(self) -> None:
-        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-classes-")))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Class tests")
-        _ = self.git("config", "user.email", "classes@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
-        # A detached auto maintenance after a commit can still write objects while the folder is removed.
-        _ = self.git("config", "maintenance.auto", "false")
-        _ = self.git("config", "gc.auto", "0")
-        self.write("Cargo.toml", MANIFEST)
-        self.write("src/lib.rs", "mod other;\n\npub fn read() -> usize { 1 }\n\n" + TESTS)
-        self.write("src/other.rs", "pub(crate) fn more() -> usize { 2 }\n")
-        self.base = self.commit()
+        home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-home-")))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)})))
+        _ = self.enterContext(private_class_catalog(home))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-classes-")))
+        self.repo = root / "sample"
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
+        self.base = self.seed_base
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],

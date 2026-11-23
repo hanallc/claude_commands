@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ledger_test_support import ticket_owner_id
+from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import sqlite3
@@ -10,9 +10,9 @@ from contextlib import closing
 from pathlib import Path
 from typing import cast, final
 
-import rules
-import style_ledger
-from ledger_test_support import LedgerTestCase
+from scripts.style import rules
+from scripts.style import style_ledger
+from scripts.style.ledger_test_support import LedgerTestCase
 
 
 @final
@@ -88,6 +88,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
                     with self.assertRaisesRegex(style_ledger.LedgerError, finding.finding_id):
                         ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket=ticket)
                     self.assertEqual(ledger.database.read_bytes(), before)
+                ledger.ticket_drop(ticket)
 
     def test_newer_clean_with_changed_inputs_records_and_withdraws(self) -> None:
         for index, changed in enumerate(("file", "rule"), 1):

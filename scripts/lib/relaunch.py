@@ -2,25 +2,31 @@
 """Keep a terminal available while its Claude child stops and resumes."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from types import FrameType
+from queue import SimpleQueue
+from threading import Lock, Thread
 from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.herdr import herdr
-from scripts.production import session_staff
-from scripts.shutdown import pane_record
+from scripts.production import staff, worker
+from scripts.agents import pane_record
+from scripts.agents.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
-from scripts.lib.resume_message import resume_message
+from scripts.lib.models_registry import agent_environment, claude_arguments
+from scripts.lib.resume_message import NO_WORKERS, ResumeWorkers, WorkersHeld, resume_message, worker_mode
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
 POLL_SECONDS = 0.5
@@ -39,10 +45,21 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     entry = pane_record.matching_launch(place, identity)
     if entry is None:
         return argv, environment
-    entry = session_staff.record_membership(entry)
-    restored = {**environment, **entry["environment"]}
+    restored = {**environment, **LaunchNames.read().environment(entry)}
+    restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
-        argv = [*argv, resume_message("you were stopped and resumed")]
+        workers: ResumeWorkers | WorkersHeld = NO_WORKERS
+        row: staff.StaffRow | None = None
+        try:
+            record = staff.snapshot()
+            row = record.by_current_session(identity)
+            if row is not None:
+                workers = worker_mode()
+                if not isinstance(workers, WorkersHeld):
+                    workers = worker.resume_workers(row.id, record)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row)]
     return argv, restored
 
 
@@ -134,40 +151,50 @@ def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str
     argv, environment = restored_launch(argv, environment)
     if program:
         argv = [program, *argv[1:]]
+    if argv and Path(argv[0]).name == "claude":
+        argv = [argv[0], *claude_arguments(argv[1:], environment)]
     return argv, environment
 
 
 def run(argv: list[str]) -> int:
     """Run a child on this terminal, then consume a restart or wait under a hold."""
     argv, environment = child_launch(argv, dict(os.environ))
-    child: subprocess.Popen[bytes] | None = None
+    environment = agent_environment({**environment, "RELAUNCH_SUPERVISED": "1"})
+    launch: SimpleQueue[bool] = SimpleQueue()
+    finished = Lock()
+    _ = finished.acquire()
+    result: list[int | BaseException] = []
 
-    def ignore(_number: int, _frame: FrameType | None) -> None:
-        pass
+    def launch_and_wait() -> None:
+        try:
+            if launch.get():
+                child = subprocess.Popen(argv, env=environment, restore_signals=False)
+                result.append(child.wait())
+        except BaseException as error:
+            result.append(error)
+        finally:
+            finished.release()
 
-    def forward(number: int, _frame: FrameType | None) -> None:
-        if child is not None:
-            try:
-                child.send_signal(number)
-            except ProcessLookupError:
-                pass
-
-    previous = {number: signal.getsignal(number) for number in (
-        signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP, signal.SIGTERM, signal.SIGHUP,
-    )}
+    # Python raises KeyboardInterrupt in the main thread. The other thread owns the child.
     try:
-        # A caught handler becomes the default on exec; SIG_IGN would also make
-        # the child ignore keyboard signals.
-        for number in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
-            _ = signal.signal(number, ignore)
-        for number in (signal.SIGTERM, signal.SIGHUP):
-            _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env={**environment, "RELAUNCH_SUPERVISED": "1"})
-        code = child.wait()
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
-    code = code if code >= 0 else 128 - code
+        Thread(target=launch_and_wait, daemon=True).start()
+    except BaseException:
+        launch.put(False)
+        raise
+    published = False
+    # SIGINT can interrupt the retry jump, and the worker takes only one token even if publication repeats.
+    while not result:
+        try:
+            if not published:
+                launch.put(True)
+                published = True
+            _ = finished.acquire()
+        except KeyboardInterrupt:
+            continue
+    status, = result
+    if isinstance(status, BaseException):
+        raise status
+    code = status if status >= 0 else 128 - status
     request = request_path(os.getpid())
     hold = hold_path(os.getpid())
     announced = False

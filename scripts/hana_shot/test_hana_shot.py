@@ -1,7 +1,8 @@
-"""hana_shot run as a subprocess against a stdlib fake BRP server: one still camera, a few entities and tools."""
+"""Test screenshot commands with a local BRP server and isolated CLI calls."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -26,12 +27,16 @@ import unittest
 from unittest import mock
 import zlib
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
-from scripts.lib import conf
+from scripts.lib import conf, process_group
+from scripts.lib import scratch as scratch_folders
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
@@ -161,10 +166,27 @@ class Fake:
         ]
         self.named_entity_snapshots: list[list[SceneEntityFixture]] = []
         self.tool_entities: list[tuple[int, str, int, str]] = list(TOOLS)
+        self.drawn_by_show_registered: bool = False
+        self.ray_cast_backfaces_registered: bool = False
         self.fit_moves_camera: bool = False
+        self.fit_animation_reads: int = 0
         self.camera_yaw: float = 0.0
         self.camera_pitch: float = 0.3
         self.camera_radius: float = 6.0
+        self.camera_moving_reads: int = 0
+        self.pointer_moved_during_animation: bool = False
+        self.pointer_frame_stall_seconds: float = 0.0
+        self.frame_stalled_until: float = 0.0
+        self.hold_next_frame_sample: bool = False
+        self.tooltip_visibility: dict[int, list[str]] = {}
+        # Hana spawns some help only while the pointer is on its target.
+        self.tooltips_on_hover: dict[int, list[int]] = {}
+        self.hover_point: list[float] = [320.0, 180.0]
+        self.pointer_on_target: bool = False
+        self.tooltips_error_on_target: bool = False
+        self.tooltip_read_frames: list[int] = []
+        self.capture_frames: list[int] = []
+        self.camera_viewport: object = None
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
@@ -183,6 +205,16 @@ class Fake:
         with self.lock:
             return [call["params"] for call in self.calls if call["method"] == method]
 
+    def camera_components(self) -> dict[str, object]:
+        components = camera_components(self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
+                                       self.camera_yaw, self.camera_pitch, self.camera_radius)
+        camera = cast(hana_shot.CameraValue, components[hana_shot.CAMERA])
+        camera["viewport"] = self.camera_viewport
+        if self.camera_moving_reads:
+            self.camera_moving_reads -= 1
+            cast(hana_shot.OrbitCamValue, components[ORBIT_CAM])["update_request"] = "Animating"
+        return components
+
     def answer(self, method: str, params: dict[str, object]) -> dict[str, object]:
         with self.lock:
             self.calls.append({"method": method, "params": params})
@@ -192,6 +224,20 @@ class Fake:
                 self.camera_yaw = cast(float, fit["yaw"])
                 self.camera_pitch = cast(float, fit["pitch"])
                 self.camera_radius = 6.0 * (1.0 + cast(float, fit["margin"]))
+                self.camera_moving_reads = self.fit_animation_reads
+            if method == "brp_extras/move_mouse":
+                if self.camera_moving_reads:
+                    self.pointer_moved_during_animation = True
+                self.pointer_on_target = params.get("position") == self.hover_point
+                if self.pointer_on_target:
+                    for row in self.named_entities:
+                        if row["entity"] in self.tooltips_on_hover:
+                            row["components"][hana_shot.TOOLTIPS] = self.tooltips_on_hover[row["entity"]]
+                if self.pointer_frame_stall_seconds:
+                    self.frame_stalled_until = time.monotonic() + self.pointer_frame_stall_seconds
+                    self.pointer_frame_stall_seconds = 0.0
+            if method == "brp_extras/screenshot":
+                self.capture_frames.append(self.frame)
             if method == "world.mutate_components" and params.get("component") == WINDOW:
                 width, height = self.window_physical_size
                 if params.get("path") == ".resolution.physical_width":
@@ -207,7 +253,9 @@ class Fake:
                         return {"error": {"code": -32603, "message": "restore refused"}}
                     self.window_level = level
             if method == "brp_extras/get_diagnostics":
-                self.frame += 1
+                if not self.hold_next_frame_sample and time.monotonic() >= self.frame_stalled_until:
+                    self.frame += 1
+                self.hold_next_frame_sample = False
                 return {"result": {"frame_time_ms": {"current": 8.0}, "frame_count": float(self.frame)}}
         if method == "world.query":
             return {"result": query(self, params)}
@@ -215,22 +263,36 @@ class Fake:
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
             entity = params["entity"]
-            components = camera_components(
-                self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
-                self.camera_yaw, self.camera_pitch, self.camera_radius,
-            ) if entity == CAMERA_ENTITY else next(
+            components = self.camera_components() if entity == CAMERA_ENTITY else next(
                 (row["components"] for row in self.named_entities if row["entity"] == entity), dict[str, object](),
             )
             requested = cast(list[str], params["components"])
+            if self.tooltips_error_on_target and self.pointer_on_target and hana_shot.TOOLTIPS in requested:
+                return {"error": {"code": -32603, "message": "tooltips read failed"}}
+            if hana_shot.VISIBILITY in requested and entity in self.tooltip_visibility:
+                with self.lock:
+                    visibility = self.tooltip_visibility[cast(int, entity)]
+                    value = visibility.pop(0) if len(visibility) > 1 else visibility[0]
+                    self.tooltip_read_frames.append(self.frame)
+                    self.hold_next_frame_sample = True
+                components = {**components, hana_shot.VISIBILITY: value}
             return {"result": {
                 "components": {path: components[path] for path in requested if path in components}, "errors": {},
             }}
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
-                return {"result": [NAME, AABB, GRAYSCALE, BLUR]}
+                registered = [NAME, AABB, *(tool[1] for tool in self.tool_entities)]
+                if self.drawn_by_show_registered:
+                    registered.append(hana_shot.DRAWN_BY_SHOW)
+                if self.ray_cast_backfaces_registered:
+                    registered.append(hana_shot.RAY_CAST_BACKFACES)
+                return {"result": list(dict.fromkeys(registered))}
             if entity == EXTRA_ENTITY:
                 return {"result": [NAME]}
+            for row in self.named_entities:
+                if row["entity"] == entity:
+                    return {"result": list(row["components"])}
             return {"error": {"code": -23402, "message": f"entity {entity} not found"}}
         if method == "brp_extras/screenshot":
             self.screenshot_started.set()
@@ -261,11 +323,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
     data = cast(dict[str, list[str]], params.get("data") or {})
     rows: list[SceneEntityFixture]
     if EDITOR_CAMERA in with_types:
-        rows = [{"entity": CAMERA_ENTITY, "components": camera_components(
-            fake.window_physical_size,
-            fake.window_scale_factor_override or fake.window_scale_factor,
-            fake.camera_yaw, fake.camera_pitch, fake.camera_radius,
-        )}]
+        rows = [{"entity": CAMERA_ENTITY, "components": fake.camera_components()}]
     elif PRIMARY_WINDOW in with_types:
         width, height = fake.window_physical_size
         rows = [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
@@ -279,7 +337,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
             for entity, path, tool_id, definition in fake.tool_entities
         ]
-    elif NAME in data.get("components", []) or GLOBAL_TRANSFORM in data.get("components", []):
+    elif any(path in data.get("components", []) for path in (NAME, GLOBAL_TRANSFORM, CHILD_OF, hana_shot.DRAWN_BY_SHOW)):
         if fake.named_entity_snapshots:
             fake.named_entities = fake.named_entity_snapshots.pop(0)
         rows = fake.named_entities
@@ -336,15 +394,24 @@ class BuildLogIsolatedTest(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        settings = "capture_timeout_seconds=1\n"
+        self.scratch = Path(tempfile.mkdtemp(prefix="hana-shot-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.scratch)
+        settings = "capture_timeout_seconds=1\nhost=127.0.0.1\ndirty_path_limit=10\n"
         if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
             settings += "resend_seconds=0.05\n"
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)
+        environment = fixture_git_environment(self.scratch)
+        for name in ("BASH_ENV", "STAFF_CONFIG"):
+            _ = environment.pop(name, None)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **environment,
             **config_environment(self.scratch / "config"),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
-        })))
+            "HOME": str(self.scratch / "home"),
+            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "SCRATCH_ROOT": str(self.scratch / "scratch-root"),
+            "SESSION_TEMP_ROOT": str(self.scratch / "session-root"),
+        }, clear=True)))
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -397,38 +464,42 @@ class HanaShotTest(BuildLogIsolatedTest):
         return [cast(dict[str, object], json.loads(line)) for line in self.timings.read_text().splitlines()]
 
     def script_environment(self, session_variables: dict[str, str] | None = None) -> dict[str, str]:
+        cache_home = self.scratch / "cache"
         environment = {
             **os.environ,
-            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "XDG_CACHE_HOME": str(cache_home),
             # RemoteTests puts its fake scp and ssh here.
             "PATH": f"{self.scratch / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         }
+        # Keep the blocked cache in the timing-write failure test.
+        if not cache_home.exists() or cache_home.is_dir():
+            environment.update(interpreter_cache_environment(cache_home))
         for name in ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             _ = environment.pop(name, None)
         if session_variables is not None:
             environment.update(session_variables)
         return environment
 
-    def run_python(
-        self, program: Path, *args: str, session_variables: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(program), *args],
-            cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
-            timeout=TEST_HANG_GUARD_SECS, check=False,
-        )
-
     def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        return self.run_python(SCRIPT, *args, session_variables=session_variables)
-
-    def start_python(self, program: Path, *args: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [sys.executable, str(program), *args],
-            cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+        if process_boundary_for_case(self):
+            return subprocess.run(
+                [str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
+                cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS, check=False,
+            )
+        arguments = list(args)
+        with (
+            ThreadPoolExecutor(max_workers=conf.read("hana_shot").whole("workers")) as pool,
+            mock.patch.object(hana_shot, "worker_pool", return_value=pool),
+        ):
+            return invoke_cli(hana_shot, lambda: hana_shot.main(arguments), arguments,
+                              self.script_environment(session_variables), self.scratch)
 
     def start_script(self, *args: str) -> subprocess.Popen[str]:
-        return self.start_python(SCRIPT, *args)
+        return subprocess.Popen(
+            [str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
+            cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
 
     def stop_script(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
@@ -457,6 +528,27 @@ def face_transforms() -> dict[str, list[float]]:
             13, -7, 21,
         ],
     }
+
+
+class ByPathImportTests(unittest.TestCase):
+    def test_help_prepares_the_recorder_import_from_an_unrelated_folder(self) -> None:
+        source = """import runpy, sys
+sys.argv = [sys.argv[1], "--help"]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+except SystemExit as error:
+    if error.code:
+        raise
+import scripts.buildlog.record
+"""
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        root = Path(tempfile.mkdtemp(prefix="hana-shot-import-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        with tempfile.TemporaryDirectory(dir=root) as folder:
+            result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.resolve())],
+                                    cwd=folder, env=environment, capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class FaceAngleTests(BuildLogIsolatedTest):
@@ -894,7 +986,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         ])
 
     def test_non_git_root_does_not_block_launch_check(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=self.scratch) as directory:
             self.assertEqual(hana_shot.uncommitted_build_paths(Path(directory), self.executable), [])
 
     def test_git_timeout_or_unavailable_git_does_not_block_launch_check(self) -> None:
@@ -931,13 +1023,13 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             self.assertIn("so this Hana runs that code:", diagnostics.getvalue())
             return cast(subprocess.Popen[bytes], process)
 
-        def make_scratch(*, prefix: str) -> str:
-            self.assertEqual(prefix, "hana-shot-15797-")
+        def make_scratch(*, word: str) -> Path:
+            self.assertEqual(word, "hana-shot-15797")
             # Git status has already run; replace only the subsequent Hana start.
             _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=start_stub))
-            scratch = self.root / "scratch"
-            scratch.mkdir()
-            return str(scratch)
+            scratch = Path(os.environ["SCRATCH_ROOT"]) / word
+            scratch.mkdir(parents=True)
+            return scratch
 
         with (
             redirect_stderr(diagnostics),
@@ -945,7 +1037,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "wait_ready"),
             mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
-            mock.patch.object(tempfile, "mkdtemp", side_effect=make_scratch),
+            mock.patch.object(scratch_folders, "new", side_effect=make_scratch),
         ):
             state, _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
@@ -979,8 +1071,8 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         _ = self.executable.write_bytes(b"fixture binary; never execute")
 
     def launch_without_starting_hana(self, *, owner: str = "") -> hana_shot.LaunchState:
-        launch_scratch = self.scratch / "new-launch-scratch"
-        launch_scratch.mkdir()
+        launch_scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        launch_scratch.mkdir(parents=True)
         process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242))
 
         def start(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
@@ -991,7 +1083,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
         with (
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
-            mock.patch.object(tempfile, "mkdtemp", return_value=str(launch_scratch)),
+            mock.patch.object(scratch_folders, "new", return_value=launch_scratch),
             mock.patch.object(subprocess, "Popen", side_effect=start),
             mock.patch.object(hana_shot, "wait_ready"),
             redirect_stderr(io.StringIO()),
@@ -1023,7 +1115,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
     def test_caller_without_a_staff_row_launches_with_an_empty_owner(self) -> None:
         self.stop_fake_listener()
         self.enterContext(isolated_staff_file(self.scratch / "staff.json", {}))
-        _ = fixture_member("agent", name="another-caller")
+        _ = fixture_member("producer", name="another-caller")
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("missing-caller")}):
             _ = self.launch_without_starting_hana()
         self.assertIn("HANA_TEST_OWNER=", self.launch_command)
@@ -1042,45 +1134,28 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
     def shutdown_command(self) -> tuple[int, str]:
         diagnostics = io.StringIO()
-        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        try:
-            with redirect_stderr(diagnostics):
-                exit_code = hana_shot.main(["shutdown", "--port", str(self.port)])
-        finally:
-            for number, handler in handlers.items():
-                _ = signal.signal(number, handler)
+        with redirect_stderr(diagnostics):
+            exit_code = hana_shot.main(["shutdown", "--port", str(self.port)])
         return exit_code, diagnostics.getvalue()
 
-    def test_launch_and_cleanup_keep_real_buildlog_unchanged(self) -> None:
+    def test_launch_and_cleanup_leave_the_default_buildlog_absent(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch / "home")}))
         isolated_root = store.root()
         self.assertTrue(isolated_root.is_relative_to(self.scratch))
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("BUILDLOG_DIR", None)
-            real_root = store.root()
-        real_paths = (real_root / store.ERRORS_NAME, real_root / store.host_name())
+            default_root = store.root()
 
-        def real_log_metadata() -> dict[Path, tuple[int, int]]:
-            metadata: dict[Path, tuple[int, int]] = {}
-            for base in real_paths:
-                for path in (base, *base.rglob("*")):
-                    try:
-                        reading = path.stat()
-                    except FileNotFoundError:
-                        continue
-                    metadata[path] = (reading.st_size, reading.st_mtime_ns)
-            return metadata
-
-        before = real_log_metadata()
         self.stop_fake_listener()
         state = self.launch_without_starting_hana()
         self.restart_fake_listener()
         with mock.patch.object(hana_shot, "process_alive", return_value=False):
             exit_code, diagnostics = self.shutdown_command()
 
-        self.assertEqual(real_log_metadata(), before)
+        self.assertFalse(default_root.exists())
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertFalse(self.state_path.exists())
-        self.assertFalse(Path(state["scratch"]).exists())
+        self.assertTrue(Path(state["scratch"]).is_dir())
         rows = list((isolated_root / store.host_name()).glob("*.jsonl"))
         if rows:
             self.assertIn(str(self.executable), "".join(path.read_text() for path in rows))
@@ -1144,6 +1219,7 @@ class LaunchRecordRecoveryTests(HanaShotTest):
             ):
                 _ = self.launch_without_starting_hana()
 
+        self.assertFalse((Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}").exists())
         self.assertEqual(list(self.state_path.parent.iterdir()), [])
         self.restart_fake_listener()
         exit_code, diagnostics = self.shutdown_command()
@@ -1166,7 +1242,104 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertTrue(other_port.exists())
         self.assertTrue(unrelated.exists())
 
-    def test_whole_launch_record_still_waits_for_pid_and_removes_scratch(self) -> None:
+    def test_shutdown_archives_other_temporary_records_and_never_signals_their_pid(self) -> None:
+        current = self.scratch / "current-launch"
+        different = self.scratch / "different-launch"
+        current.mkdir()
+        different.mkdir()
+        state: hana_shot.LaunchState = {
+            "pid": 424242, "binary": str(self.executable), "log": str(current / "hana.log"),
+            "scratch": str(current), "port": self.port, "started": "2026-10-29T00:00:00+00:00",
+        }
+        _ = self.state_path.write_text(json.dumps(state))
+        same = self.state_path.with_name(f".{self.state_path.name}.same.tmp")
+        _ = same.write_text(json.dumps(state))
+        incomplete = self.state_path.with_name(f".{self.state_path.name}.incomplete.tmp")
+        _ = incomplete.write_text('{"pid": 1, "po')
+        other_state = json.dumps({**state, "pid": 111111, "scratch": str(different),
+                                   "log": str(different / "hana.log")})
+        kept = [self.state_path.with_name(f".{self.state_path.name}.{suffix}.tmp") for suffix in ("one", "two")]
+        for path in kept:
+            _ = path.write_text(other_state)
+
+        with mock.patch.object(hana_shot, "process_alive", return_value=False) as alive:
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        alive.assert_called_once_with(state["pid"])
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(same.exists())
+        self.assertFalse(incomplete.exists())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(different.is_dir())
+        for path in kept:
+            self.assertFalse(path.exists())
+        retained = self.state_path.parent / "retained"
+        records = [path.read_text() for path in retained.glob("*.json")]
+        self.assertCountEqual(records, [json.dumps(state), other_state, other_state])
+        notice = f"kept for a manual removal list: {different} (hana_shot, temporary launch record kept)"
+        self.assertEqual(diagnostics.splitlines().count(notice), 1)
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", side_effect=hana_shot.Failure("no listener")),
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot, "process_alive", return_value=True) as live,
+            mock.patch.object(hana_shot, "same_binary", return_value=True) as identity,
+            mock.patch.object(process_group, "send_process_group") as send,
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 21.0]),
+            mock.patch.object(time, "sleep"),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertIn(f"no Hana answered on port {self.port}", diagnostics)
+        live.assert_not_called()
+        identity.assert_not_called()
+        send.assert_not_called()
+        self.assertCountEqual([path.read_text() for path in retained.glob("*.json")], records)
+
+    def test_instance_removes_the_folder_of_its_own_launch(self) -> None:
+        self.stop_fake_listener()
+        state = self.launch_without_starting_hana(owner="fixture")
+        folder = Path(state["scratch"])
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=state["pid"], poll=mock.Mock(return_value=0)))
+        with (mock.patch.object(hana_shot, "launch", return_value=(state, process)),
+              mock.patch.object(hana_shot.Brp, "call", return_value={}),
+              redirect_stderr(io.StringIO())):
+            with hana_shot.instance(self.port, True, True, str(self.root), str(self.executable)):
+                self.assertTrue(folder.is_dir())
+        self.assertFalse(folder.exists())
+        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+
+    def test_shutdown_keeps_canaries_and_each_launch_record(self) -> None:
+        home = Path.home()
+        owned = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        for parent in (home, home / "rust", home / "worktrees", home / ".claude", owned.parent):
+            with self.subTest(parent=parent):
+                folder = parent / owned.name
+                folder.mkdir(parents=True)
+                note = folder / "keep"
+                _ = note.write_text("fixture data")
+                _ = self.state_path.write_text(json.dumps({
+                    "pid": 424242, "binary": str(self.executable), "log": str(folder / "hana.log"),
+                    "scratch": str(folder),
+                }))
+                with (mock.patch.object(hana_shot.Brp, "call", return_value={}),
+                      mock.patch.object(hana_shot, "process_alive", return_value=False),
+                      redirect_stderr(io.StringIO()) as error):
+                    hana_shot.shutdown(self.port)
+                lines = [line for line in error.getvalue().splitlines()
+                         if line.startswith("kept for a manual removal list:")]
+                self.assertEqual(lines, [f"kept for a manual removal list: {folder} (hana_shot, Hana shut down)"])
+                self.assertEqual(note.read_text(), "fixture data")
+                self.assertFalse(self.state_path.exists())
+        retained = self.state_path.parent / "retained"
+        records = [cast(dict[str, object], json.loads(path.read_text())) for path in retained.glob("*.json")]
+        self.assertCountEqual([record["scratch"] for record in records],
+                              [str(parent / owned.name) for parent in
+                               (home, home / "rust", home / "worktrees", home / ".claude", owned.parent)])
+
+    def test_whole_launch_record_waits_for_pid_and_keeps_scratch(self) -> None:
         self.stop_fake_listener()
         state = self.launch_without_starting_hana()
         self.restart_fake_listener()
@@ -1189,14 +1362,14 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
         self.assertEqual(exit_code, 0, diagnostics)
         self.assertEqual(pid_checks, [state["pid"], state["pid"]])
-        self.assertFalse(scratch.exists())
+        self.assertTrue(scratch.is_dir())
         self.assertFalse(self.state_path.exists())
         self.assertIn("fixture panic: preserved diagnostic", diagnostics)
         self.assertNotIn("unreadable", diagnostics)
 
     def test_shutdown_recovers_newest_whole_temporary_record_and_checks_binary_before_killing(self) -> None:
-        scratch = self.scratch / "interrupted-launch"
-        scratch.mkdir()
+        scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        scratch.mkdir(parents=True)
         log = scratch / "hana.log"
         _ = log.write_text("temporary launch panic: kept diagnostic\n")
         state: hana_shot.LaunchState = {
@@ -1236,14 +1409,36 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
         alive.assert_called_once_with(state["pid"])
         self.assertEqual(signals, [(state["pid"], signal.SIGTERM), (state["pid"], signal.SIGKILL)])
-        self.assertFalse(scratch.exists())
-        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+        self.assertTrue(scratch.is_dir())
+        self.assertEqual(list(self.state_path.parent.iterdir()), [self.state_path.parent / "retained"])
         self.assertIn("temporary launch panic: kept diagnostic", diagnostics)
+
+    def test_parent_that_exits_on_sigterm_still_gets_sigkill_for_its_group(self) -> None:
+        pid = 424242
+        process = cast(subprocess.Popen[bytes], mock.Mock(
+            pid=pid,
+            wait=mock.Mock(side_effect=[subprocess.TimeoutExpired("fixture Hana", 20), 0]),
+        ))
+        signals: list[tuple[int, int]] = []
+
+        def signal_group(group: int, number: int) -> None:
+            signals.append((group, number))
+
+        with (
+            mock.patch.object(hana_shot.Brp, "call", return_value={}),
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(process_group, "send_process_group", side_effect=signal_group),
+            mock.patch.object(time, "sleep"),
+            redirect_stderr(io.StringIO()),
+        ):
+            hana_shot.shutdown(self.port, process)
+
+        self.assertEqual(signals, [(pid, signal.SIGTERM), (pid, signal.SIGKILL)])
 
     def test_shutdown_never_kills_recovered_pid_when_binary_identity_changed(self) -> None:
         self.stop_fake_listener()
-        scratch = self.scratch / "reused-pid-scratch"
-        scratch.mkdir()
+        scratch = Path(os.environ["SCRATCH_ROOT"]) / f"hana-shot-{self.port}"
+        scratch.mkdir(parents=True)
         temporary = self.state_path.with_name(f".{self.state_path.name}.whole.tmp")
         _ = temporary.write_text(json.dumps({
             "pid": 424242, "binary": str(self.executable),
@@ -1261,8 +1456,36 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertEqual(exit_code, 0, diagnostics)
         identity.assert_called_once_with(424242, str(self.executable))
         self.assertFalse(temporary.exists())
-        self.assertFalse(scratch.exists())
+        self.assertTrue(scratch.is_dir())
         self.assertIn(f"Hana on port {self.port} shut down", diagnostics)
+
+        sleep_binary = shutil.which("sleep")
+        if sleep_binary is None:
+            self.fail("The sleep command is required for the process identity rows.")
+        live = subprocess.Popen([sleep_binary, "300"])
+        self.addCleanup(live.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(live.kill)
+        dead = subprocess.Popen([sleep_binary, "0"])
+        self.addCleanup(dead.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(dead.kill)
+        _ = dead.wait(timeout=TEST_HANG_GUARD_SECS)
+        for platform in ("linux", "darwin"):
+            if platform == "linux" and not Path("/proc/self/cmdline").exists():
+                continue
+            for case, pid, binary, expected in (
+                ("live", live.pid, sleep_binary, True),
+                ("prefix", live.pid, sleep_binary[:-1], False),
+                ("dead", dead.pid, sleep_binary, False),
+            ):
+                with self.subTest(platform=platform, case=case), mock.patch.object(sys, "platform", platform):
+                    self.assertEqual(hana_shot.same_binary(pid, binary), expected)
+        for error in (FileNotFoundError, ProcessLookupError):
+            with (
+                self.subTest(read_error=error.__name__),
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch.object(Path, "read_bytes", side_effect=error),
+            ):
+                self.assertFalse(hana_shot.same_binary(live.pid, sleep_binary))
 
     def test_shutdown_without_launch_or_listener_reports_no_answer_and_allows_relaunch(self) -> None:
         self.stop_fake_listener()
@@ -1307,7 +1530,7 @@ class PortGuardTests(HanaShotTest):
         environment = self.script_environment()
         _ = environment.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [sys.executable, "-B", "-E", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "--isolated", "-B", str(SCRIPT.resolve()), "targets", "--port", str(self.port)],
             cwd=self.scratch, env=environment, capture_output=True, text=True,
             timeout=TEST_HANG_GUARD_SECS, check=False,
         )
@@ -1341,6 +1564,507 @@ class PortGuardTests(HanaShotTest):
         result = self.run_script("shot", "--port", "80", "--mode", "home")
         self.assertEqual(result.returncode, 2)
         self.assertIn("1024 to 65535", result.stderr)
+
+
+class LocateTests(HanaShotTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake.window_scale_factor = 2.0
+        self.fake.tool_entities = [(100, hana_shot.TOOL_PREFIX + "hana::Shape>", 1, "hana.shape"),
+                                   (200, hana_shot.TOOL_PREFIX + "hana::Show>", 2, "hana.show")]
+        self.fake.named_entities = [
+            {"entity": 100, "components": {NAME: "Shape"}},
+            {"entity": 200, "components": {NAME: "Show"}},
+            self.box(101, "Tool body", (0, 2, 0), (1.5, 1.5, 0), parent=100),
+        ]
+
+    def box(self, entity: int, name: str, center: hana_shot.Vec3, half: hana_shot.Vec3, *, parent: int = 0) -> SceneEntityFixture:
+        components: dict[str, object] = {
+            NAME: name, GLOBAL_TRANSFORM: [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, *center],
+            AABB: {"center": [0.0, 0.0, 0.0], "half_extents": list(half)},
+        }
+        if parent:
+            components[CHILD_OF] = parent
+        return {"entity": entity, "components": components}
+
+    def locate(self, selector: str = "tool:Shape#1", *options: str) -> subprocess.CompletedProcess[str]:
+        return self.run_script("locate", "--port", str(self.port), "--target", selector, *options)
+
+    def test_locate_prints_logical_pixels_and_json_without_a_move_capture_or_timing(self) -> None:
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "tool:Shape#1 240.0 135.0 160.0 90.0 320.0 180.0 scale 2.0\n")
+        encoded = self.locate("tool:Shape#1", "--json")
+        self.assertEqual(encoded.returncode, 0, encoded.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(encoded.stdout))
+        self.assertEqual(reply, {
+            "selector": "tool:Shape#1", "entity": 100,
+            "rect": {"x": 240.0, "y": 135.0, "width": 160.0, "height": 90.0},
+            "click": {"x": 320.0, "y": 180.0}, "scale_factor": 2.0,
+            "window": {"width": 640.0, "height": 360.0}, "clipped": False, "occluded": False,
+        })
+        for method in ("world.trigger_event", "world.mutate_components", "brp_extras/screenshot", "hana/invoke_command"):
+            self.assertEqual(self.fake.methods(method), [])
+        self.assertFalse(self.timings.exists())
+
+    def test_hover_shot_waits_for_help_after_the_camera_settles(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.named_entities[-1]["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        help_mesh = self.box(2001, "Help", (2.5, 2, 0), (0.5, 1, 0))
+        help_mesh["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities.append(help_mesh)
+        for owner, visibility, error in (
+            (101, ["Hidden", "Inherited"], ""),
+            (100, ["Hidden", "Inherited"], ""),
+            (100, ["Hidden"], "did not become ready to capture within"),
+            (0, [], "has no tooltip controller"),
+        ):
+            with self.subTest(owner=owner, visibility=visibility):
+                self.fake.calls.clear()
+                self.fake.tooltip_read_frames.clear()
+                self.fake.capture_frames.clear()
+                self.fake.fit_moves_camera = True
+                self.fake.fit_animation_reads = 3
+                self.fake.camera_radius = 6.0
+                self.fake.pointer_moved_during_animation = False
+                for row in self.fake.named_entities:
+                    _ = row["components"].pop(hana_shot.TOOLTIPS, None)
+                    if row["entity"] == owner:
+                        row["components"][hana_shot.TOOLTIPS] = [2001]
+                self.fake.tooltip_visibility = {2001: list(visibility)} if visibility else {}
+                result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body", "--crop", "entity")
+                captures = self.fake.methods("brp_extras/screenshot")
+                moves = self.fake.methods("brp_extras/move_mouse")
+                if error:
+                    self.assertEqual(result.returncode, 1 if owner else 2, result.stderr)
+                    self.assertIn(error, result.stderr)
+                    self.assertIn("name:Tool body", result.stderr)
+                    self.assertEqual(captures, [])
+                    if not owner:
+                        self.assertEqual(moves[-1]["position"], [320.0, 180.0])
+                        self.assertIn("within 0.5 s", result.stderr)
+                    continue
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.fake.pointer_moved_during_animation)
+                self.assertGreater(len(moves), 2)
+                start_x, start_y = cast(list[float], moves[0]["position"])
+                self.assertFalse(240 <= start_x <= 400 and 135 <= start_y <= 225)
+                self.assertEqual(moves[-1]["position"], [320.0, 180.0])
+                calls = self.fake.calls
+                move_at = max(index for index, call in enumerate(calls) if call["method"] == "brp_extras/move_mouse")
+                fit_at = next(index for index, call in enumerate(calls) if call["method"] == "world.trigger_event")
+                capture_at = next(index for index, call in enumerate(calls) if call["method"] == "brp_extras/screenshot")
+                reads = [index for index, call in enumerate(calls) if call["method"] == "world.get_components"
+                         and call["params"].get("entity") == 2001]
+                self.assertGreaterEqual(len(reads), len(visibility))
+                self.assertLess(fit_at, move_at)
+                self.assertLess(move_at, reads[0])
+                self.assertLess(reads[-1], capture_at)
+                self.assertIn("brp_extras/get_diagnostics", [call["method"] for call in calls[reads[-1] + 1:capture_at]])
+                frames = self.fake.tooltip_read_frames
+                self.assertTrue(all(after > before for before, after in zip(frames, frames[1:])))
+                [capture_frame] = self.fake.capture_frames
+                self.assertGreater(capture_frame, frames[-1])
+                [capture] = captures
+                self.assertNotIn("entity", capture)
+                rect = cast(hana_shot.RectValue, capture["rect"])
+                self.assertLessEqual(rect["x"], 480)
+                self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+                self.assertLess(rect["width"], self.fake.window_physical_size[0])
+
+    def test_hover_finds_help_that_spawns_only_on_hover(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.named_entities[-1]["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        help_mesh = self.box(2001, "Help", (2.5, 2, 0), (0.5, 1, 0))
+        help_mesh["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities.append(help_mesh)
+        self.fake.fit_moves_camera = True
+        self.fake.tooltips_on_hover = {101: [2001]}
+        self.fake.tooltip_visibility = {2001: ["Hidden", "Inherited"]}
+
+        result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body", "--crop", "entity")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.fake.calls
+        hovered_at = max(index for index, call in enumerate(calls) if call["method"] == "brp_extras/move_mouse")
+        reads = [index for index, call in enumerate(calls) if call["method"] == "world.get_components"
+                 and call["params"].get("entity") == 2001]
+        self.assertLess(hovered_at, reads[0])
+        self.assertEqual(len(reads), 2)
+        [capture] = self.fake.methods("brp_extras/screenshot")
+        rect = cast(hana_shot.RectValue, capture["rect"])
+        self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+
+    def test_hover_reports_a_failed_help_read_as_it_is(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.fit_moves_camera = True
+        self.fake.tooltips_error_on_target = True
+
+        result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("tooltips read failed", result.stderr)
+        self.assertNotIn("has no tooltip controller", result.stderr)
+        self.assertEqual(self.fake.methods("brp_extras/move_mouse")[-1]["position"], [320.0, 180.0])
+
+    def test_hover_shows_an_error_reply_that_comes_after_the_deadline(self) -> None:
+        self.fake.pointer_on_target = True
+        self.fake.tooltips_error_on_target = True
+        deadline = hana_shot.HoverDeadline("name:Tool body", 0.5, time.monotonic() + 0.5)
+        brp = hana_shot.Brp(self.port, hover_deadline=deadline)
+        # The deadline passes while the error reply is on its way.
+        with mock.patch.object(hana_shot.HoverDeadline, "remaining", side_effect=[0.5, deadline.expired()]):
+            with self.assertRaisesRegex(hana_shot.BrpCallError, "tooltips read failed"):
+                _ = brp.components(101, [hana_shot.TOOLTIPS])
+
+    def test_hover_deadline_stops_a_pointer_step_when_frames_stall(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        for has_help in (True, False):
+            with self.subTest(has_help=has_help):
+                self.fake.calls.clear()
+                self.fake.tooltip_read_frames.clear()
+                if has_help:
+                    self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
+                else:
+                    _ = self.fake.named_entities[-1]["components"].pop(hana_shot.TOOLTIPS, None)
+                self.fake.tooltip_visibility = {2001: ["Inherited"]}
+                # The stall from the subtest before must not reach this one's camera settle.
+                self.fake.frame_stalled_until = 0.0
+                self.fake.pointer_frame_stall_seconds = 1.0
+
+                result = self.shot("--mode", "home", "--hover", "name:Tool body")
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("help for name:Tool body did not become ready", result.stderr)
+                self.assertNotIn("has no tooltip controller", result.stderr)
+                self.assertEqual(len(self.fake.methods("brp_extras/move_mouse")), 1)
+                self.assertEqual(self.fake.tooltip_read_frames, [])
+                self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_hover_approaches_the_tooltip_owner_from_a_window_edge(self) -> None:
+        for half_width in (3.0, 7.0):
+            with self.subTest(half_width=half_width):
+                self.fake.calls.clear()
+                owner = self.box(100, "Shape", (0, 2, 0), (half_width, half_width, 0))
+                owner["components"][hana_shot.PICKABLE] = {"should_block_lower": False, "is_hoverable": False}
+                owner["components"][hana_shot.TOOLTIPS] = [2001]
+                self.fake.named_entities[0] = owner
+                self.fake.tooltip_visibility = {2001: ["Inherited"]}
+
+                result = self.shot("--mode", "home", "--hover", "name:Tool body")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                moves = self.fake.methods("brp_extras/move_mouse")
+                positions = [cast(list[float], move["position"]) for move in moves]
+                self.assertTrue(all(0 <= x < 640 and 0 <= y < 360 for x, y in positions))
+                start_x, start_y = positions[0]
+                if half_width == 3.0:
+                    self.assertFalse(160 <= start_x <= 480 and 90 <= start_y <= 270)
+                else:
+                    self.assertTrue(start_x <= 1 or start_x >= 639 or start_y <= 1 or start_y >= 359)
+
+    def test_hover_crop_keeps_the_separate_target_aabb(self) -> None:
+        crop_target = self.box(104, "Crop mesh", (2.5, 2, 0), (0.5, 0.5, 0))
+        crop_target["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
+        self.fake.named_entities.extend([crop_target, self.box(2001, "Help", (-2.5, 2, 0), (0.5, 1.0, 0))])
+        self.fake.tooltip_visibility = {2001: ["Inherited"]}
+        args = ("--target", "name:Crop mesh", "--mode", "home", "--crop", "entity")
+        before = self.shot(*args)
+        self.assertEqual(before.returncode, 0, before.stderr)
+        [ordinary] = self.fake.methods("brp_extras/screenshot")
+        self.assertEqual(ordinary["entity"], 104)
+
+        hovered = self.shot(*args, "--hover", "name:Tool body")
+
+        self.assertEqual(hovered.returncode, 0, hovered.stderr)
+        _, capture = self.fake.methods("brp_extras/screenshot")
+        rect = cast(hana_shot.RectValue, capture["rect"])
+        self.assertLessEqual(rect["x"], 320)
+        self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+        self.assertLess(rect["width"], self.fake.window_physical_size[0])
+
+    def test_scoped_selectors_choose_the_jack_under_the_named_tool_for_locate_and_shot(self) -> None:
+        self.fake.named_entities.extend([
+            {"entity": 110, "components": {NAME: "Rear Shape Jack", CHILD_OF: 100}},
+            self.box(111, "Jack mesh", (-2, 2, 0), (0.5, 0.5, 0), parent=110),
+            {"entity": 210, "components": {NAME: "Rear Shape Jack", CHILD_OF: 200}},
+            self.box(211, "Jack mesh", (2, 2, 0), (0.5, 0.5, 0), parent=210),
+        ])
+        selector = "tool:Show#1/name:Rear Shape Jack"
+        result = self.locate(selector, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+        self.assertEqual(reply["entity"], 210)
+        self.assertAlmostEqual(reply["click"]["x"], 426.6666667)
+        shot = self.shot("--target", selector, "--mode", "hana-frame")
+        self.assertEqual(shot.returncode, 0, shot.stderr)
+        self.assertIn({"event": ZOOM_TO_TARGET, "value": {"entity": 210}}, self.fake.methods("world.trigger_event"))
+
+    def test_show_scopes_include_their_beamed_parts_and_the_parts_children(self) -> None:
+        self.fake.drawn_by_show_registered = True
+        show_type = hana_shot.TOOL_PREFIX + "hana::Show>"
+        self.fake.tool_entities = [(200, show_type, 17, "hana.show"), (400, show_type, 39, "hana.show")]
+        self.fake.named_entities = [
+            {"entity": 200, "components": {NAME: "First Show"}},
+            {"entity": 400, "components": {NAME: "Second Show"}},
+            {"entity": 900, "components": {NAME: "Stage"}},
+            {"entity": 310, "components": {NAME: "Shown geometry part", CHILD_OF: 900, hana_shot.DRAWN_BY_SHOW: 200}},
+            {"entity": 410, "components": {NAME: "Shown geometry part", hana_shot.DRAWN_BY_SHOW: 400}},
+            self.box(311, "Beam detail", (-2, 2, 0), (0.5, 0.5, 0), parent=310),
+            self.box(411, "Beam detail", (2, 2, 0), (0.5, 0.5, 0), parent=410),
+        ]
+        for index, part, detail in ((1, 310, 311), (2, 410, 411)):
+            for name, entity in (("Shown geometry part", part), ("Beam detail", detail)):
+                with self.subTest(index=index, name=name):
+                    before = len(self.fake.methods("world.list_components"))
+                    result = self.locate(f"tool:Show#{index}/name:{name}", "--json")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertEqual(reply["entity"], entity)
+                    self.assertEqual(len(self.fake.methods("world.list_components")) - before, 1)
+        queries = self.fake.methods("world.query")
+        self.assertTrue(any(query.get("data") == {"components": [hana_shot.DRAWN_BY_SHOW]} for query in queries))
+
+    def test_unregistered_show_links_explain_missing_parts_and_keep_child_scope(self) -> None:
+        self.fake.named_entities.append({
+            "entity": 310, "components": {NAME: "Shown geometry part", hana_shot.DRAWN_BY_SHOW: 200},
+        })
+        result = self.locate("tool:Show#1/name:Shown geometry part")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must name exactly one entity; found nothing", result.stderr)
+        self.assertIn("; this Hana does not reflect DrawnByShow, so a Show scope reaches only its children", result.stderr)
+        self.assertEqual(len(self.fake.methods("world.list_components")), 1)
+        self.assertFalse(any(query.get("data") == {"components": [hana_shot.DRAWN_BY_SHOW]}
+                             for query in self.fake.methods("world.query")))
+        self.fake.named_entities.append(self.box(211, "Child mesh", (2, 2, 0), (0.5, 0.5, 0), parent=200))
+        child = self.locate("tool:Show#1/name:Child mesh", "--json")
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(cast(hana_shot.LocateReply, json.loads(child.stdout))["entity"], 211)
+
+    def test_scoped_selector_failures_name_both_parts_and_keep_the_single_entity_error(self) -> None:
+        self.fake.named_entities.extend([
+            {"entity": 110, "components": {NAME: "Jack", CHILD_OF: 100}},
+            {"entity": 111, "components": {NAME: "Jack", CHILD_OF: 100}},
+        ])
+        for selector in ("name:Missing/name:Jack", "name:Jack/name:Tool body", "entity:100/name:Missing", "entity:100/name:Jack"):
+            with self.subTest(selector=selector):
+                result = self.locate(selector)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(selector, result.stderr)
+                self.assertIn("must name exactly one entity; found", result.stderr)
+
+    def test_locate_clips_window_edges_and_drops_behind_camera_corners(self) -> None:
+        for center, half in (((6, 2, 0), (1.5, 1.5, 0)), ((0, 2, 6), (1, 1, 1))):
+            with self.subTest(center=center):
+                self.fake.named_entities[-1] = self.box(101, "Tool body", center, half, parent=100)
+                if center[2] == 6:
+                    self.fake.ray_cast_backfaces_registered = True
+                    self.fake.named_entities[-1]["components"][hana_shot.RAY_CAST_BACKFACES] = {}
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertTrue(reply["clipped"])
+                self.assertGreater(reply["rect"]["width"], 0)
+                self.assertLessEqual(reply["rect"]["x"] + reply["rect"]["width"], 640)
+                self.assertLessEqual(reply["rect"]["y"] + reply["rect"]["height"], 360)
+                if center[2] == 0:
+                    self.assertEqual(reply["rect"], {"x": 560.0, "y": 135.0, "width": 80.0, "height": 90.0})
+
+    def test_scoped_selector_runs_setup_before_resolving_a_missing_outer(self) -> None:
+        answer = self.fake.answer
+
+        def spawn_outer(method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "hana/invoke_command":
+                self.fake.named_entities.extend([
+                    {"entity": 300, "components": {NAME: "Outer"}},
+                    self.box(301, "Inner", (0, 2, 0), (1, 1, 0), parent=300),
+                ])
+            return answer(method, params)
+
+        with mock.patch.object(self.fake, "answer", side_effect=spawn_outer):
+            result = self.shot("--target", "name:Outer/name:Inner", "--mode", "hana-frame", "--setup", "scene::spawn")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("hana/invoke_command"), [{"command": "scene::spawn"}])
+        self.assertIn({"event": ZOOM_TO_TARGET, "value": {"entity": 301}}, self.fake.methods("world.trigger_event"))
+
+    def test_missing_scoped_outer_names_the_outer_in_the_final_error(self) -> None:
+        result = self.locate("name:Outer/name:Inner")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("name:Outer/name:Inner: outer name:Outer found nothing", result.stderr)
+
+    def test_locate_skips_zero_scale_boxes_for_other_entities_and_the_target(self) -> None:
+        for parent in (0, 100):
+            with self.subTest(parent=parent):
+                box = self.box(300, "Zero scale", (0, 2, 3), (1, 1, 1), parent=parent)
+                cast(list[float], box["components"][GLOBAL_TRANSFORM])[:9] = [0.0] * 9
+                self.fake.named_entities = self.fake.named_entities[:3] + [box]
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                self.assertFalse(reply["occluded"])
+
+    def test_locate_prints_a_fractional_scale_without_rounding_it(self) -> None:
+        self.fake.window_scale_factor = 1.25
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "tool:Shape#1 384.0 216.0 256.0 144.0 512.0 288.0 scale 1.25\n")
+
+    def test_locate_reports_missing_visible_bounds_with_the_parent_hint(self) -> None:
+        self.fake.named_entities.append({"entity": 102, "components": {NAME: "Leaf", CHILD_OF: 101}})
+        result = self.locate("name:Leaf")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: the target has no visible mesh bounds"
+                         + "; nearest ancestor with an AABB: --target entity:101 (Tool body)\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_reports_no_clear_point_when_grid_and_center_miss_visible_boxes(self) -> None:
+        self.fake.named_entities = self.fake.named_entities[:2] + [
+            self.box(101, "First tip", (-1, 1, 0), (0.001, 0.001, 0), parent=100),
+            self.box(102, "Last tip", (1, 3, 0), (0.001, 0.001, 0), parent=100),
+        ]
+        result = self.locate()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: no clear click point on tool:Shape#1\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_reports_targets_behind_the_camera_or_off_screen(self) -> None:
+        for center, reason in (((0, 2, 8), "behind the camera"), ((20, 2, 0), "off screen")):
+            with self.subTest(reason=reason):
+                self.fake.named_entities[-1] = self.box(101, "Tool body", center, (0.5, 0.5, 0.5), parent=100)
+                result = self.locate()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, f"hana_shot: {reason}\n")
+                self.assertEqual(result.stdout, "")
+
+    def test_locate_moves_the_click_point_when_a_nearer_box_covers_the_center(self) -> None:
+        self.fake.named_entities.append(self.box(300, "Cover", (0, 2, 3), (0.3, 0.3, 0)))
+        result = self.locate("tool:Shape#1", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+        self.assertTrue(reply["occluded"])
+        self.assertFalse(reply["clipped"])
+        click = reply["click"]
+        self.assertFalse(288 <= click["x"] <= 352 and 162 <= click["y"] <= 198)
+        self.assertGreaterEqual(click["x"], 240)
+        self.assertLessEqual(click["x"], 400)
+        self.assertGreaterEqual(click["y"], 135)
+        self.assertLessEqual(click["y"], 225)
+        text = self.locate()
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertTrue(text.stdout.endswith(" scale 2.0 occluded\n"))
+
+    def test_locate_ignores_a_pass_through_cover_but_keeps_a_pass_through_target(self) -> None:
+        cover = self.box(300, "Pass-through cover", (0, 2, 3), (1.5, 1.5, 0))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": False, "is_hoverable": False}
+        self.fake.named_entities.append(cover)
+        for target_passes_through in (False, True):
+            with self.subTest(target_passes_through=target_passes_through):
+                self.fake.named_entities[2]["components"][hana_shot.PICKABLE] = {
+                    "should_block_lower": not target_passes_through, "is_hoverable": False,
+                }
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                self.assertFalse(reply["occluded"])
+
+    def test_locate_keeps_a_cover_that_blocks_lower_hits(self) -> None:
+        cover = self.box(300, "Blocking cover", (0, 2, 3), (1.5, 1.5, 0))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": True, "is_hoverable": False}
+        self.fake.named_entities.append(cover)
+        result = self.locate()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: covered by Blocking cover\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_ignores_an_enclosing_cover_unless_it_casts_backfaces(self) -> None:
+        cover = self.box(300, "Enclosing case", (0, 2, 4), (3, 3, 3))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": True}
+        self.fake.named_entities.append(cover)
+        for registered, present in ((False, True), (True, False), (True, True)):
+            with self.subTest(registered=registered, present=present):
+                self.fake.ray_cast_backfaces_registered = registered
+                if present:
+                    cover["components"][hana_shot.RAY_CAST_BACKFACES] = {}
+                else:
+                    del cover["components"][hana_shot.RAY_CAST_BACKFACES]
+                before = len(self.fake.methods("world.query"))
+                result = self.locate("tool:Shape#1", "--json")
+                if registered and present:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr, "hana_shot: covered by Enclosing case\n")
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                    self.assertFalse(reply["occluded"])
+                queries = self.fake.methods("world.query")[before:]
+                boxes = [cast(dict[str, list[str]], query["data"]) for query in queries
+                         if AABB in cast(dict[str, list[str]], query.get("data", {})).get("components", [])]
+                self.assertEqual(len(boxes), 1)
+                self.assertEqual(hana_shot.RAY_CAST_BACKFACES in boxes[0]["has"], registered)
+
+    def test_locate_applies_backface_culling_to_target_members(self) -> None:
+        self.fake.ray_cast_backfaces_registered = True
+        self.fake.named_entities[-1] = self.box(101, "Tool body", (0, 2, 6), (1, 1, 1), parent=100)
+        for backfaces in (False, True):
+            with self.subTest(backfaces=backfaces):
+                self.fake.named_entities[-1]["has"] = {hana_shot.RAY_CAST_BACKFACES: backfaces}
+                result = self.locate("tool:Shape#1", "--json")
+                if backfaces:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertFalse(reply["occluded"])
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr, "hana_shot: no clear click point on tool:Shape#1\n")
+
+    def test_locate_names_the_covering_box_or_its_entity_when_every_grid_point_is_covered(self) -> None:
+        cover = self.box(300, "Cover", (0, 2, 3), (1.5, 1.5, 0))
+        self.fake.named_entities.append(cover)
+        for label in ("Cover", "entity:300"):
+            with self.subTest(label=label):
+                if label == "entity:300":
+                    del cover["components"][NAME]
+                result = self.locate()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, f"hana_shot: covered by {label}\n")
+                self.assertEqual(result.stdout, "")
+
+    def test_locate_waits_for_a_moving_camera_without_moving_it(self) -> None:
+        self.fake.camera_moving_reads = 1
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(len(self.fake.methods("world.get_components")), 1)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [])
+        self.assertEqual(self.fake.methods("world.trigger_event"), [])
+        self.assertFalse(self.timings.exists())
+
+    def test_locate_refuses_a_viewport_and_requires_a_target(self) -> None:
+        self.fake.camera_viewport = {"physical_position": [0, 0], "physical_size": [640, 360]}
+        result = self.locate()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("the camera has a viewport", result.stderr)
+        missing = self.run_script("locate", "--port", str(self.port))
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--target", missing.stderr)
+
+    def test_shared_projection_keeps_crop_padding_and_the_full_window_for_a_behind_camera_corner(self) -> None:
+        state = hana_shot.camera_state(camera_components())
+        box = self.fake.named_entities[-1]["components"]
+        transform = cast(list[float], box[GLOBAL_TRANSFORM])
+        aabb = cast(hana_shot.AabbValue, box[AABB])
+        bounds = hana_shot.Bounds({101: 100}, {101: (transform, aabb)})
+        self.assertEqual(hana_shot.hierarchy_rect(bounds, 100, state, 8, hana_shot.TargetEvidence()),
+                         hana_shot.Rect(472, 262, 336, 196))
+        transform[11] = 6
+        aabb["half_extents"][2] = 1
+        self.assertEqual(hana_shot.hierarchy_rect(bounds, 100, state, 8, hana_shot.TargetEvidence()),
+                         hana_shot.Rect(0, 0, 1280, 720))
 
 
 class SelectorTests(HanaShotTest):
@@ -1378,6 +2102,30 @@ class SelectorTests(HanaShotTest):
                     continue
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(triggers, [{"event": ZOOM_TO_TARGET, "value": {"entity": entity}}])
+
+    def test_negative_tool_indices_select_from_the_highest_tool_id(self) -> None:
+        self.fake.tool_entities = [(30, GRAYSCALE, 35, "hana.effect.grayscale"),
+                                   (20, GRAYSCALE, 13, "hana.effect.grayscale"),
+                                   (50, GRAYSCALE, 40, "hana.effect.grayscale")]
+        for index, entity in ((-1, 50), (-2, 30), (-3, 20), (1, 20), (3, 50)):
+            with self.subTest(index=index):
+                before = len(self.fake.methods("world.trigger_event"))
+                result = self.shot("--target", f"tool:Grayscale#{index}", "--mode", "hana-frame")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.fake.methods("world.trigger_event")[before:],
+                                 [{"event": ZOOM_TO_TARGET, "value": {"entity": entity}}])
+
+    def test_tool_indices_past_either_end_keep_the_missing_target_error(self) -> None:
+        self.fake.tool_entities = [(30, GRAYSCALE, 35, "hana.effect.grayscale"),
+                                   (20, GRAYSCALE, 13, "hana.effect.grayscale"),
+                                   (50, GRAYSCALE, 40, "hana.effect.grayscale")]
+        for index in (-4, 4):
+            with self.subTest(index=index):
+                selector = f"tool:Grayscale#{index}"
+                result = self.shot("--target", selector, "--mode", "hana-frame")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{selector} must name exactly one entity; found nothing", result.stderr)
+        self.assertEqual(self.fake.methods("world.trigger_event"), [])
 
     def test_ambiguous_and_missing_targets_fail(self) -> None:
         for selector, found in (("name:Twin", "Twin"), ("tool:Grayscale#5", "nothing"), ("entity:999", "nothing")):
@@ -1508,16 +2256,11 @@ class FailureGuidanceTests(HanaShotTest):
     def in_process_shot(self, *args: str) -> subprocess.CompletedProcess[str]:
         argv = ["shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"), *args]
         stdout, stderr = io.StringIO(), io.StringIO()
-        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        try:
-            with (
-                mock.patch.dict(os.environ, self.script_environment(), clear=True),
-                redirect_stdout(stdout), redirect_stderr(stderr),
-            ):
-                returncode = hana_shot.main(argv)
-        finally:
-            for number, handler in handlers.items():
-                _ = signal.signal(number, handler)
+        with (
+            mock.patch.dict(os.environ, self.script_environment(), clear=True),
+            redirect_stdout(stdout), redirect_stderr(stderr),
+        ):
+            returncode = hana_shot.main(argv)
         return subprocess.CompletedProcess(argv, returncode, stdout.getvalue(), stderr.getvalue())
 
     def assert_recorded_error(self, result: subprocess.CompletedProcess[str]) -> str:
@@ -1609,32 +2352,6 @@ class FailureGuidanceTests(HanaShotTest):
 
 
 class ViewsTests(HanaShotTest):
-    def test_signal_after_a_failed_view_preserves_its_reason_and_appends_signal_text(self) -> None:
-        views_path = self.scratch / "views.toml"
-        _ = views_path.write_text(
-            '[views.missing]\ntarget = "name:Absent"\nmode = "hana-frame"\n'
-            + '[views.held]\nmode = "home"\n',
-        )
-        self.fake.screenshot = "hold"
-        process = self.start_script(
-            "views", "check", "--port", str(self.port), "--views-file", str(views_path),
-            "--out", str(self.scratch / "check"),
-        )
-        self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the second view never reached capture")
-        process.send_signal(signal.SIGTERM)
-        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-
-        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
-        self.assertEqual(line["failure_reason"], "no_target")
-        error = cast(str, line["error"])
-        self.assertIn("name:Absent", error)
-        self.assertRegex(error.splitlines()[-1], r"SIGTERM$")
-        [attempt] = cast(list[dict[str, object]], line["attempts"])
-        self.assertEqual(attempt["failure_reason"], "no_target")
-
     def test_empty_registry_records_a_refused_invocation(self) -> None:
         _ = (self.scratch / "views.toml").write_text("")
         shot = self.run_script(
@@ -1758,8 +2475,8 @@ class ShotTests(HanaShotTest):
 
     def test_brp_reads_host_and_timeout_once_per_instance(self) -> None:
         with (
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.text", side_effect=conf.read("hana_shot").text) as text,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             brp = hana_shot.Brp(self.port)
             first = brp.diagnostics()
@@ -1781,7 +2498,7 @@ class ShotTests(HanaShotTest):
         with (
             mock.patch.object(time, "sleep", side_effect=tick),
             mock.patch.object(brp, "diagnostics", side_effect=diagnostics) as readings,
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
         ):
             hana_shot.wait_ready(brp, process, log)
         self.assertEqual(readings.call_count, 3)
@@ -1792,7 +2509,7 @@ class ShotTests(HanaShotTest):
             mock.patch.object(hana_shot.Brp, "call", return_value=None),
             mock.patch.object(hana_shot, "port_answers", side_effect=[True, True, False]) as answers,
             mock.patch.object(time, "sleep"),
-            mock.patch("scripts.hana_shot.hana_shot.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
+            mock.patch("scripts.lib.conf.ConfigRead.number", side_effect=conf.read("hana_shot").number) as number,
             redirect_stderr(io.StringIO()),
         ):
             hana_shot.shutdown(self.port)
@@ -1849,6 +2566,7 @@ class ShotTests(HanaShotTest):
                 self.assertRegex(result.stderr, r"0\.1\s*=\s*10%")
         self.assertEqual(self.fake.calls, [])
 
+    @process_boundary
     def test_unhandled_filesystem_failure_records_its_exception_type_and_diagnostic(self) -> None:
         result = self.shot("--view", "front", "--views-file", str(self.scratch))
 
@@ -1927,6 +2645,7 @@ class ShotTests(HanaShotTest):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.timing_lines()[-1]["session"], expected)
 
+    @process_boundary
     def test_timed_out_screenshot_is_never_resent(self) -> None:
         self.fake.screenshot = "hang"
         result = self.shot("--mode", "home")
@@ -1948,6 +2667,7 @@ class ShotTests(HanaShotTest):
         self.assertEqual(len(sent), 2)
         self.assertTrue((self.scratch / "shot.png").exists())
 
+    @process_boundary
     def test_screenshot_busy_past_the_resend_limit_fails(self) -> None:
         self.fake.screenshot = "busy-always"
         result = self.shot("--mode", "home")
@@ -2115,37 +2835,7 @@ class RemoteTests(HanaShotTest):
             return []
         return [cast(list[str], json.loads(line)) for line in self.ssh_log.read_text().splitlines()]
 
-    def hana_shot_driver(self, name: str, setup: str) -> Path:
-        driver = self.scratch / name
-        _ = driver.write_text("\n".join([
-            "import os",
-            "import signal",
-            "import sys",
-            f"sys.path.insert(0, {str(SCRIPT.parent.resolve())!r})",
-            "import hana_shot",
-            "",
-            setup,
-            "",
-            "raise SystemExit(hana_shot.main(sys.argv[1:]))",
-            "",
-        ]))
-        return driver
-
-    def interrupt_held_remote_mac_shot(self, signal_number: int, program: Path = SCRIPT) -> tuple[int, str]:
-        _ = self.fake_remote(copies=True, system="Darwin")
-        self.fake.window_level = "AlwaysOnBottom"
-        self.fake.screenshot = "hold"
-        process = self.start_python(
-            program,
-            "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
-            "--mode", "home", "--remote", REMOTE_HOST,
-        )
-        self.addCleanup(self.stop_script, process)
-        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
-        process.send_signal(signal_number)
-        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        return cast(int, process.returncode), stderr
-
+    @process_boundary
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:
         remote = self.fake_remote(copies=True)
         result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
@@ -2180,6 +2870,7 @@ class RemoteTests(HanaShotTest):
         self.assertFalse((self.scratch / "shot.png").exists())
         self.assertEqual(self.timing_lines()[0]["failure_reason"], "copy_failed")
 
+    @process_boundary
     def test_remote_mac_shot_raises_the_window_and_holds_the_display_awake_for_the_run(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
@@ -2197,6 +2888,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
 
+    @process_boundary
     def test_remote_mac_shot_restores_an_always_on_bottom_window(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2210,6 +2902,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
 
+    @process_boundary
     def test_remote_mac_shot_repairs_an_already_always_on_top_window_to_normal(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnTop"
@@ -2223,6 +2916,7 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "Normal")
         self.assertIn(["ended"], self.ssh_calls())
 
+    @process_boundary
     def test_failed_remote_mac_shot_restores_the_window_and_ends_keep_awake(self) -> None:
         _ = self.fake_remote(copies=False, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2236,84 +2930,29 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
 
-    def test_signal_during_close_does_not_interrupt_window_restore(self) -> None:
+    def test_sigint_restores_the_remote_mac_window_and_ends_keep_awake(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
-        driver = self.hana_shot_driver("signal_during_restore.py", """\
-real_mutate = hana_shot.Brp.mutate
-def signal_during_restore(brp, entity, component, path, value, *args, **kwargs):
-    if path == ".window_level" and value != "AlwaysOnTop":
-        os.kill(os.getpid(), signal.SIGTERM)
-    return real_mutate(brp, entity, component, path, value, *args, **kwargs)
-hana_shot.Brp.mutate = signal_during_restore
-""")
-
-        result = self.run_python(
-            driver,
+        self.fake.screenshot = "hold"
+        process = self.start_script(
             "shot", "--port", str(self.port), "--out", str(self.scratch / "shot.png"),
             "--mode", "home", "--remote", REMOTE_HOST,
         )
+        self.addCleanup(self.stop_script, process)
+        self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertIn("KeyboardInterrupt", stderr)
+        self.assertEqual(self.timing_lines()[-1]["exit_code"], 130)
         self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
             "AlwaysOnTop", "AlwaysOnBottom",
         ])
         self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
         self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 0)
 
-    def test_second_signal_during_unwinding_keeps_the_first_exit_and_closes_the_session(self) -> None:
-        driver = self.hana_shot_driver("second_signal_during_close.py", """\
-real_close = hana_shot.Session.close
-def signal_before_close(session):
-    os.kill(os.getpid(), signal.SIGHUP)
-    return real_close(session)
-hana_shot.Session.close = signal_before_close
-""")
-
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM, driver)
-
-        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
-        self.assertEqual([call["value"] for call in self.fake.methods("world.mutate_components")], [
-            "AlwaysOnTop", "AlwaysOnBottom",
-        ])
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
-
-    def test_sigint_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGINT)
-
-        self.assertEqual(return_code, 128 + signal.SIGINT, stderr)
-        self.assertNotIn("KeyboardInterrupt", stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGINT))
-        self.assertIn("SIGINT", cast(str, line["error"]))
-
-    def test_sigterm_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM)
-
-        self.assertEqual(return_code, 128 + signal.SIGTERM, stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGTERM))
-        self.assertIn("SIGTERM", cast(str, line["error"]))
-
-    def test_sighup_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
-        return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGHUP)
-
-        self.assertEqual(return_code, 128 + signal.SIGHUP, stderr)
-        self.assertEqual(self.fake.window_level, "AlwaysOnBottom")
-        self.assertIn(["ended"], self.ssh_calls())
-        [line] = self.timing_lines()
-        self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
-        self.assertIn("SIGHUP", cast(str, line["error"]))
-
+    @process_boundary
     def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.window_level = "AlwaysOnBottom"
@@ -2346,6 +2985,7 @@ hana_shot.Session.close = signal_before_close
         self.assertLess(awake, copy, "the second shot starts only after keep-awake is running")
         self.assertIn(["ended"], calls)
 
+    @process_boundary
     def test_refused_window_restore_reports_once_without_changing_a_success_exit(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
         self.fake.refuse_window_level_restore = True

@@ -1,0 +1,195 @@
+"""The census reader turns cargo-handler census JSON into typed records or one failure."""
+from __future__ import annotations
+
+import json
+import subprocess
+import unittest
+from unittest.mock import patch
+
+from scripts.lib import conf
+from scripts.production import census, staff
+
+WORKER: dict[str, object] = {
+    "staff_id": "handler-impl", "name": "handler-impl", "parent_staff_id": "handler-unit",
+    "machine": "natedev", "status": "busy", "activity": "verify test",
+    "activity_started_at": 1794600060, "pass": {"role": "impl", "phase": "8"}, "pane": "open",
+    "runs": [{"label": "verify test", "started_at": 1794600060, "state": "running", "unknown": None},
+             {"label": "lint", "started_at": None, "state": "missing", "unknown": {"reason": "run has no start time"}}],
+    "unknown": None}
+SAMPLE: dict[str, object] = {
+    "schema": 2,
+    "machines": [{"name": "natedev", "reachable": True, "error": None},
+                 {"name": "mac", "reachable": False, "error": "timed out"}],
+    "directors": [{"staff_id": "handler-unit", "name": "handler-unit", "machine": "natedev",
+                   "current_run_id": "/tmp/claude/unit/54fb1c7e", "status": "busy", "activity": "thinking",
+                   "activity_started_at": 1794600000, "unknown": {"reason": "no open pass"}},
+                  {"staff_id": "quiet-unit", "name": "quiet-unit", "machine": "natedev", "current_run_id": None,
+                   "status": None, "activity": "", "activity_started_at": None, "unknown": None}],
+    "workers": [WORKER,
+                {"staff_id": "handler-test", "name": "handler-test", "parent_staff_id": "handler-unit",
+                 "machine": "natedev", "status": "idle", "activity": "", "activity_started_at": None,
+                 "pass": None, "pane": "closed", "runs": [], "unknown": None},
+                {**WORKER, "staff_id": "handler-review", "name": "handler-review", "runs": None,
+                 "unknown": {"reason": "cannot read detached run record"}}],
+    "sessions": [{"session": "4dbdb78e", "machine": "natedev", "status": "busy", "activity": "impl · waiting",
+                  "pid": 321, "process_start": "30352793",
+                  "shells": [{"name": "Run the AWS gate", "started_at": 1794600100}, {"name": "Watch CI", "started_at": None}]},
+                 {"session": "01a18dbb", "machine": "natedev", "status": None, "activity": None},
+                 {"session": "old-session", "status": "busy"}],
+}
+
+
+class CensusTests(unittest.TestCase):
+    def test_schema_two_parses_into_typed_records(self) -> None:
+        result = census.parse(json.dumps(SAMPLE))
+        self.assertIsInstance(result, census.Census)
+        assert isinstance(result, census.Census)
+        expected = census.Census(
+            (census.CensusMachine("natedev", census.CensusMachineReachability.REACHED),
+             census.CensusMachine("mac", census.CensusMachineReachability.NOT_REACHED)),
+            (census.CensusSession("4dbdb78e", "busy", (census.CensusShell("Run the AWS gate", 1794600100.0),
+                                                       census.CensusShell("Watch CI", None)),
+                                  "natedev", 321, "30352793"),
+             census.CensusSession("01a18dbb", None, machine="natedev", pid=census.CensusProcessUnreported(),
+                                  process_start=census.CensusProcessUnreported()),
+             census.CensusSession("old-session", "busy", pid=census.CensusProcessUnreported(),
+                                  process_start=census.CensusProcessUnreported())),
+            (census.CensusWorker(staff.StaffId("handler-impl"), "handler-impl", staff.StaffId("handler-unit"), "busy", "verify test",
+                                 census.CensusPass("impl", "8"),
+                                 (census.CensusRun("verify test", 1794600060.0, "running"),
+                                  census.CensusRun("lint", None, "missing"))),
+             census.CensusWorker(staff.StaffId("handler-test"), "handler-test", staff.StaffId("handler-unit"), "idle", "",
+                                 census.NoPass(), ()),
+             census.CensusWorker(staff.StaffId("handler-review"), "handler-review", staff.StaffId("handler-unit"), "busy",
+                                 "verify test", census.CensusPass("impl", "8"),
+                                 census.UnknownWorkerRuns("cannot read detached run record"))))
+        self.assertEqual(result, expected)
+        self.assertEqual(result.workers[-1].runs, ())
+
+        machines = census.parse(json.dumps({**SAMPLE, "sessions": [
+            {"session": "legacy"}, {"session": "explicit", "machine": ""}]}))
+        assert isinstance(machines, census.Census)
+        legacy, explicit = machines.sessions
+        self.assertIsInstance(legacy.machine, census.CensusMachineUnreported)
+        self.assertEqual(explicit.machine, "")
+
+        for reachable, expected_state in ((False, census.CensusMachineReachability.NOT_REACHED),
+                                          (True, census.CensusMachineReachability.REACHED)):
+            with self.subTest(reachable=reachable):
+                read = census.parse(json.dumps({**SAMPLE, "sessions": [], "machines": [
+                    {"name": "natedev", "reachable": reachable, "error": "timed out" if not reachable else None}]}))
+                assert isinstance(read, census.Census)
+                self.assertEqual(read.machines, (census.CensusMachine("natedev", expected_state),))
+
+    def test_schema_two_preserves_each_unreported_identity_field(self) -> None:
+        session = {"session": "s", "machine": "natedev", "pid": 321, "process_start": "30352793"}
+        result = census.parse(json.dumps({**SAMPLE, "sessions": [
+            {key: value for key, value in session.items() if key != missing}
+            for missing in ("machine", "pid", "process_start")]}))
+        self.assertIsInstance(result, census.Census)
+        assert isinstance(result, census.Census)
+        no_machine, no_pid, no_start = result.sessions
+        self.assertIsInstance(no_machine.machine, census.CensusMachineUnreported)
+        self.assertEqual((no_machine.pid, no_machine.process_start), (321, "30352793"))
+        self.assertIsInstance(no_pid.pid, census.CensusProcessUnreported)
+        self.assertEqual((no_pid.machine, no_pid.process_start), ("natedev", "30352793"))
+        self.assertIsInstance(no_start.process_start, census.CensusProcessUnreported)
+        self.assertEqual((no_start.machine, no_start.pid), ("natedev", 321))
+
+    def test_bad_output_is_one_failure_with_its_reason(self) -> None:
+        worker = WORKER
+        session = {"session": "s", "machine": "natedev", "status": "busy"}
+        process = {**session, "pid": 321, "process_start": "30352793"}
+        cases: list[tuple[str, str]] = [
+            ("not json", "census output is not JSON"),
+            (json.dumps([]), "census: census is not an object"),
+            (json.dumps({**SAMPLE, "schema": 1}), "census schema 1 is not 2"),
+            (json.dumps({**SAMPLE, "schema": True}), "census schema True is not 2"),
+            (json.dumps({key: value for key, value in SAMPLE.items() if key != "sessions"}),
+             "census: census.sessions is not a list"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": 2}]}),
+             "census: sessions[0].status is not text or null"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy", "shells": {}}]}),
+             "census: sessions[0].shells is not a list"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy", "shells": [{"name": 1}]}]}),
+             "census: sessions[0].shells[0].name is not text"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy",
+                                                 "shells": [{"name": "x", "started_at": "1"}]}]}),
+             "census: sessions[0].shells[0].started_at is not a number or null"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "pid": "321"}]}),
+             "census: sessions[0].pid is not an integer"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "pid": True}]}),
+             "census: sessions[0].pid is not an integer"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "process_start": None}]}),
+             "census: sessions[0].process_start is not text"),
+            (json.dumps({**SAMPLE, "sessions": [{**session, "machine": 123}]}),
+             "census: sessions[0].machine is not text"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "machine": None}]}),
+             "census: sessions[0].machine is not text"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "machine": ""}]}),
+             "census: sessions[0].machine is empty"),
+            (json.dumps({**SAMPLE, "sessions": [{**process, "machine": " \t"}]}),
+             "census: sessions[0].machine is empty"),
+            (json.dumps({**SAMPLE, "sessions": [{**session, "machine": "", "process_start": "30352793"}]}),
+             "census: sessions[0].machine is empty"),
+            (json.dumps({**SAMPLE, "machines": [{"name": "natedev", "reachable": "yes"}]}),
+             "census: machines[0].reachable is not true or false"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "status": 3}]}),
+             "census: workers[0].status is not text or null"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "activity": 3}]}),
+             "census: workers[0].activity is not text or null"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "runs": None}]}),
+             "census: workers[0].unknown is not an object"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": 1, "state": "done"}]}]}),
+             "census: workers[0].runs[0].state is not one of running, finished_queued, missing"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": True,
+                                                                     "state": "running"}]}]}),
+             "census: workers[0].runs[0].started_at is not a number or null"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "pass": {"role": "impl"}}]}),
+             "census: workers[0].pass.phase is not text"),
+        ]
+        for text, reason in cases:
+            with self.subTest(reason=reason):
+                result = census.parse(text)
+                self.assertIsInstance(result, census.CensusFailed)
+                assert isinstance(result, census.CensusFailed)
+                self.assertTrue(result.reason.startswith(reason), result.reason)
+
+    def test_read_runs_the_census_once_within_the_configured_time(self) -> None:
+        done = subprocess.CompletedProcess(list(census.COMMAND), 0, json.dumps(SAMPLE), "")
+        with patch.object(subprocess, "run", return_value=done) as run:
+            result = census.read()
+        self.assertIsInstance(result, census.Census)
+        run.assert_called_once_with(census.COMMAND, capture_output=True, text=True, timeout=10.0, check=False)
+
+    def test_read_failures_name_the_cause(self) -> None:
+        cases: list[tuple[subprocess.CompletedProcess[str] | Exception, str]] = [
+            (subprocess.TimeoutExpired(list(census.COMMAND), 10), "census took longer than 10 s"),
+            (FileNotFoundError(2, "No such file or directory", "cargo-handler"),
+             "census: [Errno 2] No such file or directory: 'cargo-handler'"),
+            (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+             "census: 'utf-8' codec can't decode byte 0xff"),
+            (subprocess.CompletedProcess(list(census.COMMAND), 2, "", "bad config\nsecond line"),
+             "census exited 2: "),
+        ]
+        for outcome, reason in cases:
+            with self.subTest(reason=reason):
+                runner = (patch.object(subprocess, "run", side_effect=outcome) if isinstance(outcome, Exception)
+                          else patch.object(subprocess, "run", return_value=outcome))
+                with runner:
+                    result = census.read()
+                self.assertIsInstance(result, census.CensusFailed)
+                assert isinstance(result, census.CensusFailed)
+                self.assertTrue(result.reason.startswith(reason), result.reason)
+                self.assertNotIn("\n", result.reason)
+
+    def test_an_unusable_time_limit_is_a_failure(self) -> None:
+        with (patch.object(conf, "read_or_repository", side_effect=conf.Unusable("no usable value")),
+              patch.object(subprocess, "run") as run):
+            result = census.read()
+        self.assertEqual(result, census.CensusFailed("census: units_census_seconds: no usable value"))
+        run.assert_not_called()
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

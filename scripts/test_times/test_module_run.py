@@ -2,23 +2,38 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
+
+from contextlib import ExitStack, redirect_stderr
+from io import StringIO
 from dataclasses import dataclass
+import errno
+from itertools import product
 import json
 import math
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 from typing import ClassVar, cast, override
 import unittest
+from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.production import gate
+from scripts.test_times import module_run
 from scripts.test_times.gate_record import ModuleTimes
+from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
 RUNNER = Path(__file__).with_name("module_run.py").resolve()
 
@@ -106,6 +121,48 @@ class DiscoveryBoundaries(unittest.TestCase):
 '''
 
 
+ORPHAN_PROCESS = '''\
+import os
+import select
+import signal
+import sys
+import unittest
+
+class OrphanProcess(unittest.TestCase):
+    def test_orphan(self):
+        reader, writer = os.pipe()
+        intermediate = os.fork()
+        if intermediate == 0:
+            os.close(reader)
+            if os.fork() != 0:
+                os._exit(0)
+            os.setsid()
+            os.write(writer, str(os.getpid()).encode())
+            os.close(writer)
+            for descriptor in (0, 1, 2):
+                os.close(descriptor)
+            while True:
+                signal.pause()
+        os.close(writer)
+        pid = int(os.read(reader, 32))
+        os.close(reader)
+        os.waitpid(intermediate, 0)
+        descriptor = os.pidfd_open(pid)
+        try:
+            print(pid, flush=True)
+            sys.stdin.buffer.read(1)
+            if __REAP__:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                reaped = select.poll()
+                reaped.register(descriptor, select.POLLHUP)
+                self.assertTrue(reaped.poll(__HANG_GUARD_MS__), "The orphan remains unreaped")
+            if __FAIL__:
+                self.fail("fixture failure after orphan launch")
+        finally:
+            os.close(descriptor)
+'''
+
+
 SENDER_REQUEST = '''\
 import os
 from pathlib import Path
@@ -115,15 +172,25 @@ import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, __REPOSITORY__)
 from scripts.message import session_send
 from scripts.message import session_send_test_support
 
 def setUpModule():
+    previous_guard = os.environ.get("TEST_SENDER_GUARD")
+    temporary = Path(os.environ["TMPDIR"])
+    def check_cleanup():
+        assert isinstance(session_send_test_support.refusal_marker, session_send_test_support.SenderGuardNotInstalled)
+        assert os.environ.get("TEST_SENDER_GUARD") == previous_guard
+        assert not list(temporary.glob("sender-guard-*"))
+    unittest.addModuleCleanup(check_cleanup)
     session_send_test_support.forbid_real_sender()
     sys.addaudithook(last_guard)
+    if MODE == "setup_exit":
+        subprocess.run([python, str(real_sender), "--help"], check=False)
+        raise SystemExit(0)
 
 real_sender = Path(session_send.__file__).resolve().with_name("send.py")
+python = str(real_sender.parents[1] / "lib/py")
 
 # This safety hook permits only harmless probes and blocks network delivery.
 def last_guard(event, arguments):
@@ -159,7 +226,7 @@ class SenderRequest(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True).start()
             session_send_test_support.forbid_real_sender()
             self.assertIs(session_send_test_support.refusal_marker, marker)
-            result = subprocess.run([sys.executable, str(real_sender), "--help"],
+            result = subprocess.run([python, str(real_sender), "--help"],
                                     env=child_environment, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertEqual(os.environ, {})
@@ -167,16 +234,16 @@ class SenderRequest(unittest.TestCase):
             self.assertEqual(marker.path.read_text(), "real sender refused\\n")
         elif MODE == "caught":
             with self.assertRaises(subprocess.CalledProcessError):
-                subprocess.run([sys.executable, str(real_sender), "--help"], check=True)
+                subprocess.run([python, str(real_sender), "--help"], check=True)
         else:
             if MODE == "cd":
-                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(sys.executable)} send.py --help"
+                command = f"cd {shlex.quote(str(real_sender.parent))} && {shlex.quote(python)} send.py --help"
                 directory = None
             elif MODE == "module":
-                command = [sys.executable, "-m", "scripts.message.send", "--help"]
+                command = [python, "-m", "scripts.message.send", "--help"]
                 directory = real_sender.parents[2]
             else:
-                command = [sys.executable, str(real_sender), "--help"]
+                command = [python, str(real_sender), "--help"]
                 directory = None
             result = subprocess.run(command, cwd=directory, shell=MODE == "cd", capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -187,10 +254,23 @@ if MODE == "expected_failure":
 
 
 @dataclass(frozen=True)
+class UnwrittenFixtureTimes:
+    """The fixture exited before the runner wrote its times."""
+
+
+@dataclass(frozen=True)
 class FixtureRun:
     timed: subprocess.CompletedProcess[str]
     standard: subprocess.CompletedProcess[str]
-    times: ModuleTimes
+    recorded_times: ModuleTimes | UnwrittenFixtureTimes
+    standard_sender_folders: list[str]
+    timed_sender_folders: list[str]
+
+    @property
+    def times(self) -> ModuleTimes:
+        if isinstance(self.recorded_times, UnwrittenFixtureTimes):
+            raise AssertionError("The fixture exited without a timing report")
+        return self.recorded_times
 
 
 def read_times(path: Path) -> ModuleTimes:
@@ -212,21 +292,307 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     output = root / f"{name}.json"
     _ = output.write_text("stale output\n", encoding="utf-8")
     env = dict(os.environ)
-    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS"):
+    for key in ("TEST_TIMES_OUT", "PYTHONPATH", "PYTHONWARNINGS", "TEST_SENDER_GUARD"):
         _ = env.pop(key, None)
-    env.update({"HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
-                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1"})
-    args = ["discover", "-s", str(folder), "-p", "test_fixture.py"]
+    temporary = root / f"{name}_temporary"
+    temporary.mkdir()
+    env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+                "CONF_DIR": str(root / "config"), "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": os.pathsep.join((str(root), str(folder))), "TMPDIR": str(temporary)})
+    args = [f"{name}.test_fixture"]
     standard = subprocess.run(
-        [sys.executable, "-m", "unittest", *args], cwd=root, env=env,
+        [str(RUNNER.parents[1] / "lib/py"), "-m", "unittest", *args], cwd=root, env=env,
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
+    standard_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     timed = subprocess.run(
-        [sys.executable, str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
+        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_fixture.py"], cwd=root,
         env={**env, "TEST_TIMES_OUT": str(output), "CHECK_REMOVED": "1"},
         capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
     )
-    return FixtureRun(timed, standard, read_times(output))
+    timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
+    times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
+    return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
+
+
+class LiveConfigGuardTests(unittest.TestCase):
+    def test_child_guard_allows_private_cleanup_and_relative_open(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected, private, alias = (root / name for name in ("config", "private", "alias"))
+        protected.mkdir()
+        private.mkdir()
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        child = """
+import os
+import shutil
+
+assert os.open in os.supports_dir_fd
+assert shutil.rmtree.avoids_symlink_attacks
+fd = os.open("../private", os.O_RDONLY)
+os.close(os.open("fixture", os.O_WRONLY | os.O_CREAT, dir_fd=fd))
+os.close(fd)
+shutil.rmtree("../private")
+try:
+    shutil.rmtree("../alias")
+except OSError:
+    pass
+else:
+    raise AssertionError("rmtree accepted a symlink")
+"""
+        with module_run.guard_live_config(protected, root, log):
+            result = subprocess.run([sys.executable, "-c", child], cwd=protected, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(private.exists())
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_child_guard_preserves_checkout_startup_and_next_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        library = RUNNER.parents[1] / "lib"
+        startup = root / "guard"
+        startup.mkdir()
+        following = root / "following"
+        following.mkdir()
+        _ = (following / "sitecustomize.py").write_text(
+            "import os\nos.environ['CONFIG_TEST_NEXT_HOOK'] = 'loaded'\n", encoding="utf-8")
+        child = """
+import os
+import runpy
+import sys
+
+runpy.run_path(sys.argv[1])
+print(os.environ['CONFIG_TEST_NEXT_HOOK'])
+"""
+        environment = {"PYTHONPATH": os.pathsep.join((str(library / "python_startup"), str(following))),
+                       "CLAUDE_PYTHON": sys.executable}
+        with patch.dict(os.environ, environment), module_run.guard_live_config(
+                root / "config", startup, root / "violations"):
+            for program in (sys.executable, str(library / "py")):
+                with self.subTest(program=program):
+                    result = subprocess.run([program, "-c", child, str(library / "package_root.py")], cwd=root,
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "loaded\n")
+                    self.assertEqual(result.stderr, "")
+
+    def test_runner_rejects_a_caught_write_in_a_python_child(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+try:
+    Path(sys.argv[1]).write_text("changed")
+except AssertionError:
+    print("refused")
+"""
+        children: list[subprocess.CompletedProcess[str]] = []
+
+        def fixture_test() -> None:
+            shim = Path(module_run.__file__).resolve().parents[1] / "lib" / "py"
+            for program in (sys.executable, str(shim)):
+                children.append(subprocess.run([program, "-c", child, str(config)], cwd=root,
+                                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS))
+
+        suite = unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+        with (patch.object(Path, "home", return_value=home),
+              patch.dict(os.environ, {"CLAUDE_PYTHON": sys.executable}),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", return_value=suite),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+        self.assertEqual([(child.returncode, child.stdout, child.stderr) for child in children],
+                         [(0, "refused\n", ""), (0, "refused\n", "")])
+        self.assertEqual(config.read_text(), "original\n")
+
+    def test_child_guard_expires_when_the_runner_removes_the_hook(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        child = """
+from pathlib import Path
+import sys
+
+hook, config = map(Path, sys.argv[1:])
+try:
+    config.write_text("blocked")
+except AssertionError:
+    print("refused")
+hook.unlink()
+config.write_text("expired")
+"""
+        log = root / "violations"
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                result = subprocess.run([sys.executable, "-c", child, str(root / "sitecustomize.py"), str(config)],
+                                        cwd=root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "refused\n")
+        self.assertEqual(config.read_text(), "expired")
+        self.assertFalse((root / "sitecustomize.py").exists())
+
+    def test_guard_allows_mkdir_on_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            alias.mkdir(exist_ok=True)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_file_exists_for_a_private_link_target(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+        source = root / "source"
+        source.touch()
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.symlink(source, alias)
+            with self.assertRaises(FileExistsError):
+                os.link(source, alias)
+        self.assertEqual(alias.readlink(), protected)
+        self.assertFalse(log.exists())
+
+    def test_guard_resolves_symlinks_before_parent_traversal(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        private = root / "private"
+        nested = private / "nested"
+        nested.mkdir(parents=True)
+        (private / protected.name).mkdir()
+        alias = root / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        through_alias = alias / ".." / protected.name
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            _ = (through_alias / "file").write_text("private")
+            (through_alias / "directory").mkdir()
+        self.assertEqual((private / protected.name / "file").read_text(), "private")
+        self.assertTrue((private / protected.name / "directory").is_dir())
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_nofollow_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(OSError) as error:
+                os.close(os.open(alias, os.O_WRONLY | os.O_NOFOLLOW))
+            self.assertEqual(error.exception.errno, errno.ELOOP)
+        self.assertFalse(log.exists())
+
+    def test_guard_preserves_exclusive_create_error_for_a_private_symlink(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        config.touch()
+        alias = root / "alias"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            with self.assertRaises(FileExistsError):
+                os.close(os.open(alias, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        self.assertFalse(log.exists())
+
+    def test_guard_allows_rename_and_removal_of_a_private_link_to_live_config(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("original\n")
+        private = root / "private"
+        private.mkdir()
+        alias = private / "console.conf"
+        alias.symlink_to(config)
+        log = root / "violations"
+        with module_run.guard_live_config(protected, root, log):
+            renamed = private / "renamed"
+            _ = alias.rename(renamed)
+            self.assertTrue(renamed.is_symlink())
+            renamed.unlink()
+            renamed.symlink_to(config)
+            _ = alias.write_text("private")
+            _ = alias.replace(renamed)
+            self.assertEqual(renamed.read_text(), "private")
+            renamed.unlink()
+            private.rmdir()
+        self.assertFalse(os.path.lexists(alias))
+        self.assertFalse((root / "sitecustomize.py").exists())
+        self.assertFalse(log.exists())
+        directory_alias = root / "alias"
+        directory_alias.symlink_to(protected, target_is_directory=True)
+        empty = protected / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with module_run.guard_live_config(protected, root, log):
+                with self.assertRaises(AssertionError):
+                    _ = (directory_alias / config.name).rename(root / "moved")
+                with self.assertRaises(AssertionError):
+                    _ = directory_alias.rename(protected / "moved")
+                with self.assertRaises(AssertionError):
+                    (directory_alias / config.name).unlink()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / empty.name).rmdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-directory").mkdir()
+                with self.assertRaises(AssertionError):
+                    (directory_alias / "new-link").symlink_to(config)
+        self.assertEqual(config.read_text(), "original\n")
+        self.assertTrue(empty.is_dir())
+
+    def test_runner_refuses_live_config_writes_even_if_the_test_catches_them(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / "fixture-home"
+        protected = home / ".claude" / "config"
+        protected.mkdir(parents=True)
+        console = protected / "console.conf"
+        _ = console.write_text("page.list.owner=original\n")
+        private = root / "private.conf"
+        alias = root / "alias"
+        alias.symlink_to(protected, target_is_directory=True)
+
+        def fixture_test() -> None:
+            _ = private.write_text("page.list.owner=fixture\n")
+            with self.assertRaises(AssertionError):
+                _ = private.replace(console)
+
+        def discover(_names: list[str]) -> unittest.TestSuite:
+            with self.assertRaises(AssertionError):
+                _ = (alias / "console.conf").write_text("page.list.owner=fixture\n")
+            return unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+
+        with (patch.object(Path, "home", return_value=home),
+              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", side_effect=discover),
+              redirect_stderr(StringIO())):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+
+        self.assertEqual(console.read_text(), "page.list.owner=original\n")
+        self.assertEqual(private.read_text(), "page.list.owner=fixture\n")
 
 
 class ModuleRunnerTests(unittest.TestCase):
@@ -251,11 +617,188 @@ class ModuleRunnerTests(unittest.TestCase):
         env = {**os.environ, "TEST_TIMES_OUT": str(cls.discovery_output),
                "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1"}
-        _ = env.pop("PYTHONPATH", None)
+        env["PYTHONPATH"] = os.pathsep.join((str(root), str(folder)))
         cls.discovery_result = subprocess.run(
-            [sys.executable, str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
+            [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_boundaries.py"], cwd=root, env=env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_config_reads_include_python_and_shell_children(self) -> None:
+        from scripts.lib import build_folders
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
+            config = root / "config"
+            config.mkdir()
+            for stem in ("alpha", "beta", "gamma"):
+                _ = (config / (stem + ".conf")).write_text("value=one\n")
+            repository = RUNNER.parents[2]
+            source = f"""import os, subprocess, sys, unittest
+from scripts.lib import conf
+conf.read('alpha').text('value')
+class Reads(unittest.TestCase):
+    def test_reads(self):
+        conf.read('alpha').text('value')
+        subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
+                       env={{**os.environ, 'PYTHONPATH': {str(repository / 'scripts/lib/python_startup')!r}}}, check=True)
+        subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
+                       {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
+"""
+            with self.subTest(runner="standalone"):
+                fixture = run_fixture(root, "config_reads", source)
+                self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.times.get("config_reads"), ["alpha", "beta", "gamma"])
+
+            for gate_case in ("absolute", "relative with read-only scratch"):
+                with self.subTest(runner=gate_case), ExitStack() as cleanup:
+                    parent = root / "jobs"
+                    parent.mkdir(exist_ok=True)
+                    module = cleanup.enter_context(build_folders.tool_folder("test-module", parent))
+                    relative = gate_case != "absolute"
+                    gate_root = Path(os.path.relpath(module)) if relative else module
+                    fixture_path = root / "test_gate_reads.py"
+                    _ = fixture_path.write_text(source + f"""
+        import json
+        from pathlib import Path
+        module = Path(os.environ['TMPDIR'])
+        self.assertNotIn('GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
+        self.assertNotIn('MERGE_GATE_MODULE_DIR', os.environ)
+        paths = [Path(os.environ[name]) for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR', 'CONF_READ_LOG')]
+        scratch, review, config_log = paths
+        for folder in (scratch, review):
+            folder.mkdir()
+            (folder / 'output').write_text('module output')
+            self.assertEqual((folder / 'output').read_text(), 'module output')
+        self.assertEqual(set(config_log.read_text().splitlines()), {{'alpha', 'beta', 'gamma'}})
+        self.assertEqual(list(module.glob('*.lease.json')), [])
+        print('runner files ' + json.dumps([str(path.relative_to(module)) for path in paths]))
+        if {relative!r}:
+            retained = module / 'scratch' / 'nested'
+            retained.mkdir(parents=True)
+            (retained / 'output').write_text('read-only scratch output')
+            retained.chmod(0o500)
+""", encoding="utf-8")
+                    extra = {**os.environ, **interpreter_cache_environment(root / "cache"),
+                             "CONF_DIR": str(config), "PYTHONPATH": str(root)}
+                    env = gate.test_module_environment(gate_root, extra)
+                    shim = gate.python_shim(repository)
+                    job = gate.start_gate_job(
+                        "test_times", fixture_path, [str(shim), str(RUNNER), str(root), fixture_path.name],
+                        repository, env, gate_root / "output.log")
+                    try:
+                        status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        gate.kill_job_group(job)
+                        raise
+                    runner_entries = sorted(path.name for path in module.glob("test-run-roots*"))
+                    runner_entries.extend(path.name for path in module.glob("config-reads*"))
+                    retained = module / "scratch" / "nested" / "output"
+                    scratch_output = retained.read_text() if relative and status == 0 else ""
+                    job.folder_cleanup = cleanup.pop_all()
+                    result = gate.finish_gate_job(job, status)
+                    self.assertEqual(status, 0, result.output)
+                    self.assertEqual(result.returncode, 0, result.output)
+                    self.assertIn("runner files ", result.output)
+                    self.assertEqual(runner_entries, [])
+                    if relative:
+                        self.assertEqual(scratch_output, "read-only scratch output")
+                    self.assertIsInstance(result.times, dict)
+                    self.assertEqual(cast(ModuleTimes, result.times).get("config_reads"), ["alpha", "beta", "gamma"])
+                    self.assertEqual(list(parent.iterdir()), [])
+
+    def test_folder_scans_record_repository_listings_and_skip_imports_and_children(self) -> None:
+        cases: tuple[tuple[str, str, list[str]], ...] = (
+            ("scandir", "with os.scandir(ROOT / 'listed') as entries: list(entries)", ["listed"]),
+            ("listdir", "os.listdir(ROOT / 'listed')", ["listed"]),
+            ("bytes", "os.listdir(os.fsencode(ROOT / 'listed'))", ["listed"]),
+            ("relative", "os.listdir('listed')", ["listed"]),
+            ("root", "os.listdir(ROOT)", ["."]),
+            ("read file", """(ROOT / 'listed/item.txt').read_text()
+with open(ROOT / 'listed/item.txt', 'rb') as source: source.read()
+descriptor = os.open(ROOT / 'listed/item.txt', os.O_RDONLY)
+try:
+    os.read(descriptor, 16)
+finally:
+    os.close(descriptor)""", []),
+            ("read outside", "(OUTSIDE / 'outside.txt').read_text()", []),
+            ("read config", "(ROOT / 'config/limits.conf').read_text()", []),
+            ("read cache", "(ROOT / '__pycache__/saved.bin').read_bytes()", []),
+            ("write modes", """for mode in ('a', 'w', 'r+'):
+    with open(ROOT / 'listed/item.txt', mode) as target: target.write('fixture')""", []),
+            ("child read", "subprocess.run([sys.executable, '-c', \"from pathlib import Path; Path('listed/item.txt').read_text()\"], cwd=ROOT, check=True)", []),
+            ("patch isolation", """listed = str(ROOT / 'listed')
+outside = str(OUTSIDE)
+with mock.patch.object(os.path, 'realpath', wraps=os.path.realpath) as realpath, \\
+     mock.patch.object(os.path, 'join', wraps=os.path.join) as join, \\
+     mock.patch.object(os.path, 'dirname', wraps=os.path.dirname) as dirname:
+    os.listdir(listed)
+    os.listdir(outside)
+    self.assertEqual(realpath.call_count, 0)
+    self.assertEqual(join.call_count, 0)
+    self.assertEqual(dirname.call_count, 0)""", ["listed"]),
+            ("listdir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    os.listdir(descriptor)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("scandir descriptor", """descriptor = os.open(ROOT / 'listed', os.O_RDONLY)
+try:
+    with os.scandir(descriptor) as entries: list(entries)
+finally:
+    os.close(descriptor)""", ["listed"]),
+            ("outside removal", """path = OUTSIDE / 'removal-probe'
+path.mkdir()
+shutil.rmtree(path)""", []),
+            ("git prefixes", "subprocess.check_output(['git', 'ls-files', '-z', '--', 'scripts/', 'commands/', 'docs/'], cwd=ROOT)",
+             ["commands/", "docs/", "scripts/"]),
+            ("git C", "subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--', 'docs/'], cwd=OUTSIDE)", ["docs/"]),
+            ("git subdirectory", "subprocess.check_output(['git', '-C', str(ROOT / 'listed'), 'ls-files', '--', '../docs/'])", ["docs/"]),
+            ("git all", "subprocess.check_output(['git', 'ls-files'], cwd=ROOT)", ["/"]),
+            ("git root magic", "subprocess.check_output(['git', 'ls-files', '--', ':/docs'], cwd=ROOT)", ["/"]),
+            ("git empty magic", "subprocess.check_output(['git', 'ls-files', '--', ':'], cwd=ROOT)", ["/"]),
+            ("git exclude magic", "subprocess.check_output(['git', 'ls-files', '--', ':!docs'], cwd=ROOT)", ["/"]),
+            ("import system", "import import_only", []),
+            ("outside", "os.listdir(OUTSIDE)", []),
+            ("child", "subprocess.run([sys.executable, '-c', \"import os; os.listdir('listed')\"], cwd=ROOT, check=True)", []),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory)
+            root = outside / "checkout"
+            library = root / "scripts/lib"
+            runner = root / "scripts/test_times/module_run.py"
+            copy_test_runner(root)
+            for package in (root / "scripts", library, root / "tests", root / "import_only"):
+                package.mkdir(exist_ok=True)
+                _ = (package / "__init__.py").write_text("")
+            for folder in ("listed", "commands", "docs"):
+                target = root / folder
+                target.mkdir()
+                _ = (target / "item.txt").write_text("fixture\n")
+            _ = (root / "config/limits.conf").write_text("value=fixture\n")
+            (root / "__pycache__").mkdir()
+            _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
+            _ = (outside / "outside.txt").write_text("fixture\n")
+            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
+                           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+            for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
+                _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            for name, action, expected in cases:
+                with self.subTest(case=name):
+                    output = outside / "times.json"
+                    source = ("import os, shutil, subprocess, sys, unittest\nfrom pathlib import Path\nfrom unittest import mock\n"
+                              + f"ROOT = Path({str(root)!r})\nOUTSIDE = Path({str(outside)!r})\n"
+                              + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
+                              + textwrap.indent(action, "        ") + "\n")
+                    _ = (root / "tests/test_listing.py").write_text(source)
+                    result = subprocess.run([sys.executable, str(runner), str(root / "tests"), "test_listing.py"],
+                                            cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
+                                            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(read_times(output).get("folder_scans"), expected)
+                    self.assertEqual(read_times(output).get("content_reads"), ["listed/item.txt"] if name == "read file" else [])
 
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:
@@ -263,8 +806,13 @@ class ModuleRunnerTests(unittest.TestCase):
             config = root / "config"
             config.mkdir()
             _ = (config / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
-            source = SENDER_REQUEST.replace("__REPOSITORY__", repr(str(RUNNER.parents[2])))
-            return run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            source = SENDER_REQUEST
+            fixture = run_fixture(root, "sender", source.replace("__MODE__", repr(mode)))
+            if mode != "setup_exit" and isinstance(fixture.recorded_times, UnwrittenFixtureTimes):
+                raise AssertionError("The sender fixture exited without a timing report")
+            self.assertEqual(fixture.standard_sender_folders, [], fixture.standard.stderr)
+            self.assertEqual(fixture.timed_sender_folders, [], fixture.timed.stderr)
+            return fixture
 
     def test_real_sender_request_fails_the_module_with_one_diagnostic(self) -> None:
         fixture = self.sender_fixture("uncaught")
@@ -278,14 +826,17 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(fixture.times["failures"], 1)
 
     def test_sender_from_its_folder_or_as_a_module_fails_with_one_diagnostic(self) -> None:
-        for mode in ("cd", "module"):
+        for mode in ("cd", "module", "setup_exit"):
             with self.subTest(mode=mode):
                 fixture = self.sender_fixture(mode)
                 self.assertNotEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+                self.assertEqual(fixture.timed.returncode, 1, fixture.timed.stderr)
                 diagnostic = "test_fixture.py: started the real scripts/message/send.py"
                 self.assertEqual(fixture.timed.stderr.splitlines().count(diagnostic), 1, fixture.timed.stderr)
                 self.assertIn("REFUSED: real scripts/message/send.py is forbidden in tests", fixture.timed.stderr)
                 self.assertNotIn("the sender probe attempted", fixture.timed.stderr)
+                if mode == "setup_exit":
+                    self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
 
     def test_caught_sender_refusal_still_fails_the_module(self) -> None:
         for mode in ("caught", "expected_failure"):
@@ -340,6 +891,74 @@ class ModuleRunnerTests(unittest.TestCase):
         self.assertEqual(times["tests_run"], 2)
         self.assertEqual(times["failures"], 1)
 
+    def test_none_fixtures_keep_the_standard_runner_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "none_fixtures", """import unittest
+setUpModule = None
+tearDownModule = None
+class Fixtures(unittest.TestCase):
+    setUpClass = None
+    tearDownClass = None
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_a_class_without_an_imported_module_keeps_the_standard_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = run_fixture(Path(directory), "absent_module", """import unittest
+class Fixtures(unittest.TestCase):
+    __module__ = "absent_module"
+    def test_runs(self):
+        pass
+""")
+        self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+        self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+        self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
+        self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_successful_class_fixture_has_its_own_cpu_measure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = """import time
+import unittest
+
+module_value = 0
+
+def setUpModule():
+    global module_value
+    module_value = 7
+
+class FixtureCPU(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        deadline = time.process_time() + 0.15
+        while time.process_time() < deadline:
+            pass
+        cls.value = module_value
+
+    def test_value(self):
+        self.assertEqual(self.value, 7)
+"""
+            fixture = run_fixture(root, "fixture_cpu", source)
+            self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
+            self.assertEqual(fixture.standard.returncode, 0, fixture.standard.stderr)
+            report = cast(dict[str, object], cast(object, fixture.times))
+            fixtures = cast(list[FixtureMeasure], report["fixtures"])
+            setup = next(row for row in fixtures if row["test"] == "setUpClass (test_fixture.FixtureCPU)")
+            test = cast(TestMeasure, fixture.times["tests"][0])
+            self.assertEqual(setup["kind"], "fixture")
+            self.assertEqual(test["kind"], "test")
+            self.assertGreater(setup["cpu_s"], 0.1)
+            self.assertGreater(setup["cpu_s"], test["cpu_s"])
+            self.assertGreater(setup["s"], 0)
+            self.assertEqual(fixture.times["tests_run"], 1)
+            self.assertEqual(fixture.times["tests_s"], test["s"])
+            self.assertTrue(any(row["test"] == "setUpModule (test_fixture)" for row in fixtures))
+
     def test_missing_arguments_print_one_usage_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -361,6 +980,33 @@ class ModuleRunnerTests(unittest.TestCase):
                 self.assertEqual(fixture.timed.stdout, fixture.standard.stdout)
                 self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "scripts/test_times/module_run.py"
+            copy_test_runner(root)
+            folder = root / "scripts" / "fixture"
+            folder.mkdir(parents=True)
+            _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
+            _ = (folder / "test_package_name.py").write_text(
+                "import sys, unittest\n"
+                + "from scripts.fixture import sibling\n"
+                + "class PackageImport(unittest.TestCase):\n"
+                + "    def test_package_name(self):\n"
+                + "        self.assertEqual(__name__, 'scripts.fixture.test_package_name')\n"
+                + "        self.assertNotIn('test_package_name', sys.modules)\n"
+                + "        self.assertEqual(sibling.VALUE, 42)\n", encoding="utf-8")
+            output = root / "times.json"
+            environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
+                           "TEST_TIMES_OUT": str(output)}
+            for working_directory in (root, folder, Path("/home")):
+                with self.subTest(case="package name", cwd=working_directory):
+                    result = subprocess.run(
+                        [str(root / "scripts/lib/py"), str(runner), str(folder), "test_package_name.py"],
+                        cwd=working_directory, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual([row["test"] for row in read_times(output)["tests"]],
+                                     ["PackageImport.test_package_name"])
 
     def test_each_parent_has_one_outcome_with_error_precedence(self) -> None:
         rows = self.outcomes.times["tests"]
@@ -410,11 +1056,11 @@ class ModuleRunnerTests(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
-            env = {**os.environ, "TEST_TIMES_OUT": str(output), "HOME": str(root / "home"),
-                   "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")}
-            _ = env.pop("PYTHONPATH", None)
+            env = direct_test_fixture_environment(root)
+            env.update(TEST_TIMES_OUT=str(output), HOME=str(root / "home"),
+                       BUILDLOG_DIR=str(root / "buildlog"), PYTHONPATH=str(root))
             result = subprocess.run(
-                [sys.executable, str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
+                [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_fixture.py"], cwd=root, env=env,
                 capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -422,3 +1068,222 @@ class ModuleRunnerTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1, result.stderr)
             self.assertTrue(output.is_dir())
             self.assertEqual(list(root.glob(".output.*")), [])
+
+
+class MacGateModuleTests(unittest.TestCase):
+    def test_macos_gate_keeps_the_module_temporary_folder(self) -> None:
+        from scripts.lib import build_folders
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        module = self.enterContext(build_folders.tool_folder("test-module", root))
+        case = root / "test_gate_parent.py"
+        _ = case.write_text(f"""import os
+from pathlib import Path
+import unittest
+
+class GateParent(unittest.TestCase):
+    def test_module_folder(self):
+        module = Path({str(module)!r})
+        self.assertEqual(Path(os.environ['TMPDIR']), module)
+        self.assertEqual(Path(os.environ['SCRATCH_ROOT']), module / 'test-run-roots' / 'scratch')
+        self.assertEqual(Path(os.environ['ASTRA_REVIEW_DIR']), module / 'test-run-roots' / 'astra')
+        self.assertEqual(Path(os.environ['CONF_READ_LOG']), module / 'config-reads' / 'reads')
+""", encoding="utf-8")
+        environment = direct_test_fixture_environment(root)
+        environment.update(GATE_PARENT_PID=str(os.getpid()), HOME=str(root / "home"), PYTHONPATH=str(root))
+        entry = "import runpy, sys; sys.platform = 'darwin'; runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        result = subprocess.run(
+            [str(gate.python_shim(RUNNER.parents[2])), "-c", entry, str(RUNNER), str(root), case.name],
+            cwd=RUNNER.parents[2], env=gate.test_module_environment(module, environment),
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+@unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
+class ModuleProcessCleanupTests(unittest.TestCase):
+    def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
+        from scripts.lib import build_folders
+
+        cases = ("standalone", "unleased TMPDIR", "gate")
+        parent_names = ("GATE_PARENT_PID", "MERGE_GATE_PARENT_PID")
+        for runner_case, parent_name in product(cases, parent_names):
+            with self.subTest(runner=runner_case, parent_name=parent_name), ExitStack() as cleanup:
+                root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
+                processes = OwnedTestProcesses()
+                environment = processes.environment(direct_test_fixture_environment(root))
+                environment.update({**interpreter_cache_environment(root / "cache"),
+                                    "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
+                                    "PYTHONPATH": str(root)})
+                _ = environment.pop("MERGE_GATE_MODULE_DIR", None)
+                module = root / "module"
+                if runner_case == "gate":
+                    module = cleanup.enter_context(build_folders.tool_folder("module", root))
+                    environment = gate.test_module_environment(module, environment)
+                elif runner_case == "unleased TMPDIR":
+                    module.mkdir()
+                    environment.update(TMPDIR=str(module), TEST_TIMES_OUT=str(module / "test-times.json"))
+                case = root / "test_parent.py"
+                _ = case.write_text("""import os, select, unittest
+from pathlib import Path
+from scripts.lib import conf_reads
+
+class ParentDeath(unittest.TestCase):
+    def test_wait(self):
+        for name in ('SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
+            folder = Path(os.environ[name])
+            folder.mkdir()
+            (folder / 'output').write_text(name)
+        conf_reads.record('ready')
+        print('ready', flush=True)
+        select.select([], [], [])
+""", encoding="utf-8")
+                repository = RUNNER.parents[2]
+                log = root / "runner.log"
+                shim = repository / "scripts/lib/py"
+                entry = ("import os, sys; "
+                         + "name = sys.argv.pop(1); os.environ[name] = os.environ.pop('GATE_PARENT_PID'); "
+                         + "os.execv(sys.argv[1], sys.argv[1:])")
+                arguments = [str(shim), "-c", entry, parent_name, str(shim), str(RUNNER), str(root), case.name]
+                source = f"""import os, sys
+from pathlib import Path
+from scripts.production import gate
+job = gate.start_gate_job("lib", Path({str(case)!r}), {arguments!r},
+                         Path({str(repository)!r}), dict(os.environ), Path({str(log)!r}))
+print(job.process.pid, flush=True)
+sys.exit(job.process.wait())
+"""
+                _ = cleanup.callback(processes.finish)
+                parent = subprocess.Popen([sys.executable, "-c", source], cwd=repository, env=environment,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
+                processes.track(parent)
+                output = parent.stdout
+                assert output is not None
+                self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+                runner_pid = int(cast(str, output.readline()))
+                runner = os.pidfd_open(runner_pid)
+                _ = cleanup.callback(os.close, runner)
+                wait_until(lambda: "ready\n" in log.read_text() or parent.poll() is not None,
+                           root, processes=(parent,), watch_writes=True)
+                self.assertIn("ready\n", log.read_text())
+                if runner_case == "gate":
+                    for folder, name in (("scratch", "SCRATCH_ROOT"), ("astra", "ASTRA_REVIEW_DIR")):
+                        self.assertEqual((module / "test-run-roots" / folder / "output").read_text(), name)
+                    self.assertEqual((module / "config-reads" / "reads").read_text(), "ready\n")
+                elif runner_case == "unleased TMPDIR":
+                    lease = cast(dict[str, object], json.loads((module / "test-run-roots.lease.json").read_text()))
+                    self.assertEqual(lease["pid"], runner_pid)
+                parent.terminate()
+                self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+                self.assertTrue(select.select([runner], [], [], TEST_HANG_GUARD_SECS)[0], log.read_text())
+                _, status = os.waitpid(runner_pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL, log.read_text())
+                self.assertNotIn("Traceback", log.read_text())
+                if runner_case != "standalone":
+                    self.assertEqual(list(module.glob("test-run-roots*")), [])
+                if runner_case == "gate":
+                    self.assertEqual(list(module.glob("config-reads*")), [])
+
+    def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")})
+        source = fr"""import os, signal, subprocess, sys
+reader, writer = os.pipe()
+prefix = 'import os; os.write(' + str(writer) + ', b"R"); os.close(' + str(writer) + '); os.read(0, 1)\n'
+child = subprocess.Popen([sys.executable, '-c', prefix + {gate.SUITE_BOOTSTRAP!r},
+    sys.executable, '-c', 'import signal; signal.pause()'],
+    env={{**os.environ, 'GATE_PARENT_PID': str(os.getpid())}},
+    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    pass_fds=(writer,), start_new_session=True)
+os.close(writer)
+os.read(reader, 1)
+os.close(reader)
+print(child.pid, flush=True)
+signal.pause()
+"""
+        parent = subprocess.Popen([sys.executable, "-c", source], env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(parent)
+        output = parent.stdout
+        assert output is not None
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+        child = int(cast(str, output.readline()))
+        descriptor = os.pidfd_open(child)
+        self.addCleanup(os.close, descriptor)
+        parent.send_signal(signal.SIGTERM)
+        stdout, stderr = parent.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(parent.returncode, -signal.SIGTERM, stdout + stderr)
+        self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                        "The module survived a gate that ended before bootstrap setup")
+
+    def test_ignored_sigchld_keeps_the_test_process_status_and_inheritance(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "test_signal.py").write_text(
+            """import signal, unittest
+class InheritedSignal(unittest.TestCase):
+    def test_sigchld(self):
+        self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+""",
+            encoding="utf-8")
+        environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+                       "BUILDLOG_DIR": str(root / "buildlog")}
+        for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
+            _ = environment.pop(name, None)
+        environment["PYTHONPATH"] = str(root)
+        launcher = ("import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
+                    "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])")
+        for arguments, status in (([], 2), ([str(root), "test_signal.py"], 0)):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, "-c", launcher, str(RUNNER), *arguments],
+                    cwd=root, env=environment, capture_output=True, text=True, check=False,
+                    timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def run_orphan(self, *, fail: bool = False, terminate: bool = False, reap: bool = False) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        source = (ORPHAN_PROCESS.replace("__REAP__", repr(reap)).replace("__FAIL__", repr(fail))
+                  .replace("__HANG_GUARD_MS__", str(TEST_HANG_GUARD_SECS * 1000)))
+        _ = (root / "test_orphan.py").write_text(source, encoding="utf-8")
+        environment = processes.environment(direct_test_fixture_environment(root))
+        environment.update(HOME=str(root / "home"), BUILDLOG_DIR=str(root / "buildlog"),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(root))
+        process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
+            cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        processes.track(process)
+        output = process.stdout
+        self.assertIsNotNone(output)
+        if output is None:
+            raise AssertionError("The runner has no output pipe")
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0], "The orphan did not start")
+        line = cast(str, output.readline())
+        self.assertTrue(line.strip().isdigit(), line)
+        descriptor = os.pidfd_open(int(line))
+        self.addCleanup(os.close, descriptor)
+        if terminate:
+            send_process_group(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+        expected = -signal.SIGTERM if terminate else 1 if fail else 0
+        self.assertEqual(process.returncode, expected, stdout + stderr)
+        # POLLHUP means the process was reaped, rather than left as a zombie.
+        observer = select.poll()
+        observer.register(descriptor, select.POLLHUP)
+        self.assertTrue(observer.poll(0), "The orphan remains alive or unreaped")
+
+    def test_normal_end_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan()
+
+    def test_failed_test_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(fail=True)
+
+    def test_sigterm_to_the_runner_group_kills_and_reaps_a_detached_orphan(self) -> None:
+        self.run_orphan(terminate=True)
+
+    def test_a_running_test_sees_its_killed_orphan_reaped(self) -> None:
+        self.run_orphan(reap=True)

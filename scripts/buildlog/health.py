@@ -6,6 +6,10 @@ report day's midnight without inspecting another machine's private sources.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import json
@@ -19,8 +23,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
-import record
-import store
+from scripts.buildlog import record
+from scripts.buildlog import store
 
 SNAPSHOT_NAME = "recorder-health.json"
 SNAPSHOT_MAX_AGE_SECONDS = 2 * 60 * 60
@@ -35,6 +39,7 @@ class Machine(StrEnum):
 
 @dataclass(frozen=True)
 class RecorderHealthSnapshot:
+    """The snapshot holds the machine, creation time, unfinished records, and error times."""
     machine: Machine
     generated_at: float
     unfinished_records: int
@@ -46,16 +51,19 @@ class RecorderHealthSnapshot:
 
 @dataclass(frozen=True)
 class FreshRecorderHealth:
+    """The recorder health snapshot is current."""
     snapshot: RecorderHealthSnapshot
 
 
 @dataclass(frozen=True)
 class StaleRecorderHealth:
+    """The recorder health snapshot is stale."""
     snapshot: RecorderHealthSnapshot
 
 
 @dataclass(frozen=True)
 class RecorderHealthUnavailable:
+    """This machine has no usable recorder health snapshot."""
     machine: Machine
 
 

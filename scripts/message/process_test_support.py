@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import ctypes
+from collections.abc import Iterator
 import os
 from pathlib import Path
 import select
@@ -12,26 +12,21 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import cast
 from uuid import uuid4
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.descendants import adopt_descendants
 from scripts.message import darwin_test_processes as darwin
 
 
 TestChild = subprocess.Popen[str] | subprocess.Popen[bytes]
 OWNERS = "MESSAGE_TEST_PROCESS_OWNERS"
 USE_PIDFD = sys.platform == "linux"
-PR_SET_CHILD_SUBREAPER = 36  # Linux prctl ABI, not a policy value.
 
 
 def adopt_test_descendants() -> None:
     """Let the test reap descendants after their immediate parents exit."""
-    if sys.platform != "linux":
-        return
-    libc = ctypes.CDLL(None, use_errno=True)
-    if cast(int, libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) != 0:
-        raise OSError(ctypes.get_errno(), "cannot adopt test descendants")
+    _ = adopt_descendants()
 
 
 def direct_children() -> set[int]:
@@ -44,6 +39,29 @@ def direct_children() -> set[int]:
         except (FileNotFoundError, ProcessLookupError):
             continue
     return result
+
+
+def _descendant_pids() -> Iterator[int]:
+    """Revisit parents after descendants so adopted orphans remain visible."""
+    visited: set[int] = {os.getpid()}
+    pending = [os.getpid()]
+    while pending:
+        pid = pending.pop()
+        children: set[int] = set()
+        try:
+            for task in Path(f"/proc/{pid}/task").iterdir():
+                try:
+                    children.update(int(value) for value in (task / "children").read_text().split())
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+        children.difference_update(visited)
+        if children:
+            pending.append(pid)
+            pending.extend(children)
+            visited.update(children)
+            yield from children
 
 
 @dataclass
@@ -108,18 +126,15 @@ class OwnedTestProcesses:
                         added = True
             return added
         added = False
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit() or int(entry.name) in self.handles:
-                continue
-            pid = int(entry.name)
-            if pid == os.getpid():
+        for pid in _descendant_pids():
+            if pid in self.handles:
                 continue
             try:
                 descriptor = os.pidfd_open(pid)
             except (ProcessLookupError, PermissionError):
                 continue
             try:
-                values = (entry / "environ").read_bytes().split(b"\0")
+                values = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
                 owned = any(value.startswith((OWNERS + "=").encode())
                             and self.token.encode() in value.split(b"=", 1)[1].split(b":")
                             for value in values)

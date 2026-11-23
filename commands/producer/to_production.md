@@ -16,7 +16,7 @@ Read both first.
 
 **Usage:** `/producer:to_production <plan> [<plan>…] [--name <production>] [--merge-branch <branch>]`
 
-This command writes plan docs only. It writes no code and makes no commits,
+This command writes plan docs and showrunner notes only. It writes no code and makes no commits,
 branches or worktrees; `/showrunner:produce` creates those at launch.
 
 ---
@@ -84,7 +84,7 @@ and merged units.
 3. **Links between units.** In every unit plan, including the kept source:
    - a fact in **Constraints from prior phases** that comes from a phase now in
      another unit names that unit and phase, for example "from
-     geometry-material-unit phase 2, on `<merge branch>` before this phase
+     geometry-material phase 2, on `<merge branch>` before this phase
      starts";
    - record a start-order wait as an owed action in the showrunner's notes;
    - use `cargo-berth sequence` for merge order;
@@ -101,14 +101,13 @@ Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
 - **Hub files** are copied from the greenlight result.
-- **Merge tests:** the command that runs the app package's tests, which catch
-  cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,
-  never a bare package name.
+- **Merge tests:** give the command for the app package's tests, if one exists. Exclude type checks. The nightly run checks types.
+  Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
+  These tests find failures across packages. Give a command, never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.
-- **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
   named for the top-level showrunner that will run it (a child production uses
-  its root's list); `change_review.py showrunner --production <doc>` prints the
+  its root's list); `change_review.py showrunner --production <showrunner name>` prints the
   name once the showrunner runs.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
@@ -124,7 +123,7 @@ production format, with status `planned`:
 Validate every `todo` phase in every unit plan:
 
 ```sh
-PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
+~/.claude/scripts/lib/py -m scripts.berth.work_order \
   --repository-root "${REPO}" validate --document "<unit plan>" --phase <N>
 ```
 
@@ -157,7 +156,7 @@ Then stop.
 
 ## Rules
 
-- Plan docs only; no code, commits, branches or worktrees.
+- Plan docs and showrunner notes only; no code, commits, branches or worktrees.
 - Never rewrite a `done` phase and never renumber one.
 - A Work Order moves whole. Change only cross-unit references. Keep its Spec verbatim.
 - Splitting is packaging under `<DecisionEconomy/>`: decide it and state it.

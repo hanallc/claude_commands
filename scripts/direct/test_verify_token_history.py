@@ -5,17 +5,21 @@ import subprocess
 import unittest
 from typing import cast
 from pathlib import Path
+from scripts.direct.recorder_fixture import record_wait_workers
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.build_queue.admission_test_support import caller_admission
 
 
 class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
         board = self.root / "board"
         self.record_phase(board)
+        runner = staff.caller_identity()
+        if runner:
+            record_wait_workers(self.root, board, self.environment, {"fixture-second": "thread-second"},
+                                runtime_ids={"fixture-second": runner})
         waiting = self.root / "waiting-for-token"
         resume = self.root / "resume-acquisition"
         first_clock = self.root / "first-clock"
@@ -29,10 +33,12 @@ fi
 exit 0
 ''')
         first_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": fixture_runtime_id("thread-first"), "TEST_BLOCK": "1",
+                             "UNIT_TEAM_ROLE": "first", "CODEX_THREAD_ID": runner or fixture_runtime_id("thread-first"),
+                             "TEST_BLOCK": "1",
                              "UNIT_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": fixture_runtime_id("thread-second"), "TEST_WAITING": str(waiting),
+                              "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": runner or fixture_runtime_id("thread-second"),
+                              "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
@@ -53,8 +59,6 @@ exit 0
                 _ = (self.root / "release").touch()
                 first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)
-                with admission.loop_turn():
-                    admission.allow_next_start()
                 resume.touch()
                 second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first_output)
@@ -81,15 +85,22 @@ exit 0
         self.assertEqual(first_wait, 0)
         self.assertEqual(second_wait, 20)
         self.assertGreater(second_wait, first_wait)
-        started, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
-        finished, = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
-        self.assertEqual((started["wait_kind"], started["wait_reason"], started["phase_id"]),
-                         ("WaitingForMemoryOrSlot", "cargo token", "6"))
-        self.assertEqual(started["wait_id"], finished["wait_id"])
+        starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
+        finished = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
+        # The second call waits for its start time after the first start, then for the token.
+        self.assertEqual([(row["wait_kind"], row["wait_reason"], row["phase_id"]) for row in starts],
+                         [("WaitingForMemoryOrSlot", "memory admission", "6"),
+                          ("WaitingForMemoryOrSlot", "cargo token", "6")], second_output)
+        self.assertEqual([row["wait_id"] for row in starts], [row["wait_id"] for row in finished])
 
     def test_unblocked_verification_records_no_resource_wait(self) -> None:
         session = Path(self.environment["UNIT_SESSION_DIR"])
         self.record_phase(session)
+        runner = staff.caller_identity()
+        if runner:
+            record_wait_workers(self.root, session, self.environment, {"fixture-impl": "thread-impl"},
+                                runtime_ids={"fixture-impl": runner})
+            self.environment["CODEX_THREAD_ID"] = runner
         result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.phase_waits(session), [])

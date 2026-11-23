@@ -2,25 +2,30 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import unittest
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import session_pane
-import herdr
+from scripts.production import session_pane
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.herdr import herdr
+from scripts.message import review_hold
 from scripts.message.relay_identity import relay_session_name
-from unit_lookup import Place
-from scripts.hooks import hook_dispatch
-from scripts.lib import test_hang_guard
+from scripts.production.unit_lookup import Place
+from scripts.hooks import hook_dispatch, review_hold_delivery
+from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
     ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
@@ -69,15 +74,72 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
         self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
 
 
-
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
+        other = self.create_instance("showrunner-other", session_id="another-owner")
+        for failure in ("invalid JSON", "directory"):
+            with self.subTest(failure=failure):
+                session_id = fixture_runtime_id(f"unreadable-{failure}")
+                instance = self.create_instance(f"unit-{session_id}", session_id=session_id)
+                path = self.root / "staff.json" if failure == "invalid JSON" else self.root
+                if failure == "invalid JSON":
+                    _ = path.write_text("invalid staff JSON\n")
+                self.environment["STAFF_FILE"] = str(path)
+                with patch.dict(os.environ, self.environment), self.assertRaises(staff.StaffUnreadable):
+                    _ = conversation_pause.director_turn(session_id)
+                result = self.run_prompt("hello", extra={"session_id": session_id})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                detail = "invalid staff JSON:" if failure == "invalid JSON" else "[Errno 21] Is a directory:"
+                self.assertIn(
+                    f"conversation-pause: timer lookup: cannot read staff record {path}: {detail}",
+                    result.stderr,
+                )
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                self.assertEqual(reply["systemMessage"],
+                                 f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}")
+                self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+                self.assertTrue((other / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_prompt_reuses_one_staff_read_for_activity_hold_and_timer_pause(self) -> None:
+        for state in ("active", "paused"):
+            with self.subTest(state=state):
+                owner = fixture_member("showrunner", name=f"one-read-{state}")
+                _ = staff.set_run(owner.id, staff.OpenRun(self.root / f"run-{state}"))
+                if state == "paused":
+                    _ = staff.set_hold(owner.id, staff.Paused("now", "reviewer", "review"))
+                timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+                with patch.object(staff, "_local_fields", wraps=staff._local_fields) as reads:  # pyright: ignore[reportPrivateUsage]
+                    result = self.run_prompt("hello", extra={"session_id": owner.current_session})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(reads.call_count, 1)
+                reply = cast(dict[str, object], json.loads(result.stdout))
+                if state == "paused":
+                    self.assertIn("This unit is paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=1\n"))
+                else:
+                    self.assertIn("Automatic updates paused", str(reply))
+                    self.assertTrue((timer / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_staff_timer_is_found_after_the_showrunner_session_changes(self) -> None:
+        owner = fixture_member("showrunner", name="timer-owner")
+        timer = self.create_instance(f"showrunner-{owner.id}", session_id=owner.id)
+        current = staff.native_id(fixture_runtime_id("timer-owner-cleared"))
+        _ = staff.update_current_session(owner.current_session, current)
+        unit = self.create_instance("unit-native", session_id=current)
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(conversation_pause.session_reports(current), [
+                conversation_pause.Report(timer.name, True),
+                conversation_pause.Report(unit.name, True),
+            ])
+
     def test_session_lookup_hang_escapes_product_timeout_recovery(self) -> None:
         blocked = self.root / "blocked_lookup.py"
         _ = blocked.write_text("import signal\nsignal.pause()\n")
         blocked.chmod(0o755)
         lookup = self.root / "lookup.py"
         _ = lookup.write_text(
-            "import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
+            "from scripts.hooks import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
         )
         with (
             patch.object(conversation_pause, "sessions_command", return_value=[str(blocked)]),
@@ -210,22 +272,24 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_typed_prompt_in_a_showrunner_or_unit_director_records_activity(self) -> None:
         self.environment["HERDR_PANE_ID"] = "w0:p6"
         self.record_activity()
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         self.assertEqual(self.run_prompt("hello").returncode, 0)
         expected = [["active", "--source", "UserTypedPrompt", "--session-id", SESSION,
                      "--pane-id", "w0:p6", "--prompt-hash", hashlib.sha256(b"hello").hexdigest()]]
         self.assertEqual(self.activity_calls(1), expected)
         self.activity_log.unlink()
-        _ = (self.notifier_root / "showrunner-demo" / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
-        _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
-        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        _ = (self.notifier_root / self.showrunner_timer("demo") / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
+        owner = fixture_member("showrunner", name="unit-director")
+        _ = staff.set_run(owner.id, staff.OpenRun(self.root / "run-1"))
+        self.assertEqual(self.run_prompt("hello", extra={"session_id": owner.current_session}).returncode, 0)
+        expected[0][4] = owner.current_session
         self.assertEqual(self.activity_calls(1), expected)
 
     def test_other_sessions_and_prompts_record_no_activity(self) -> None:
         self.record_activity()
         plain = self.run_prompt("hello")
         self.assertEqual((plain.returncode, plain.stderr), (0, ""))
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         for prompt in (cross_session("natedev", "continue"), "<task-notification>done</task-notification>",
                        "<system-reminder>hook output</system-reminder>"):
             self.assertEqual(self.run_prompt(prompt).returncode, 0)
@@ -241,7 +305,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_only_the_users_own_prompt_ends_auto_silence(self) -> None:
         """A mover's resume prompt, a pane typed by session_pane.py and Claude Code's notices are not the user."""
         self.record_activity()
-        _ = self.create_instance("showrunner-demo")
+        _ = self.create_instance(self.showrunner_timer("demo"))
         pane = "w1:p7"
         self.environment["HERDR_PANE_ID"] = pane
         resume = ("You are now messaging-unit in production demo (doc demo.md), under the showrunner. "
@@ -254,9 +318,10 @@ class ConversationPauseTests(ConversationPauseFixture):
                 patch.object(herdr.Herdr, "result", return_value={"process_info": {
                     "shell_pid": 998041, "foreground_process_group_id": 998042,
                     "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
-                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.RolloutThread(SESSION), "fixture-start", {})), \
+                patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(SESSION), "fixture-start", {})), \
                 patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
-            conversation_pause.record_scheduled_prompts(SESSION, (resume,))
+            conversation_pause.record_scheduled_prompts(
+                SESSION, (conversation_pause.ScheduledTaskPrompt("resume", resume, False),))
             with patch.object(herdr.Herdr, "prompt") as transmitted:
                 session_pane.type_place(Place("demo", pane), relay, target=SESSION)
             transmitted.assert_called_once_with(pane, script_prompt(relay), target=SESSION)
@@ -270,6 +335,77 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertCountEqual([call[2] for call in calls],
                               ["ScriptPrompt", "ScriptPrompt", "PeerPrompt", "HarnessNotice", "UserTypedPrompt"])
         self.assertTrue(all(call[4] == SESSION for call in calls))
+
+    def test_wrapped_resume_prompt_records_script_activity_without_a_typed_stamp(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        resume = script_prompt("You were stopped and resumed because unit watchdog recovery.\nContinue where you stopped.")
+        for closing in ('</pasted_content id="7d9f">', '</pasted_content>'):
+            with self.subTest(closing=closing):
+                prompt = f'\n\n<pasted_content id="7d9f">\n{resume}\n{closing}\n'
+                result = self.run_prompt(prompt)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+                self.assertFalse((self.escalate_root / "typed").exists())
+                self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(2)], ["ScriptPrompt", "ScriptPrompt"])
+
+    def test_wrapped_script_with_literal_paste_tags_records_script_activity(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        for token in ("<pasted_content>", "</pasted_content>"):
+            for closing in ('</pasted_content id="outer">', '</pasted_content>'):
+                with self.subTest(token=token, closing=closing):
+                    script = script_prompt(f"Continue reviewing the literal `{token}` token.\n")
+                    prompt = f'<pasted_content id="outer">\n{script}\n{closing}'
+                    result = self.run_prompt(prompt)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+                    self.assertFalse((self.escalate_root / "typed").exists())
+                    self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(4)], ["ScriptPrompt"] * 4)
+
+    def test_two_pasted_script_envelopes_record_typed_activity(self) -> None:
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        script = script_prompt("Continue where you stopped.")
+        prompt = (f'<pasted_content id="one">{script}</pasted_content>'
+                  + f'<pasted_content id="two">{script}</pasted_content>')
+        result = self.run_prompt(prompt)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertEqual([call[2] for call in self.activity_calls(1)], ["UserTypedPrompt"])
+
+    def test_user_pastes_and_text_around_a_script_paste_record_typed_activity(self) -> None:
+        self.record_activity()
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        wrapped = f'<pasted_content id="one">{script_prompt("Continue where you stopped.")}</pasted_content>'
+        prompts = (
+            '<pasted_content id="one">Please explain this code.</pasted_content>',
+            f"Explain this: {wrapped}",
+            f"{wrapped} Explain this.",
+            f'{wrapped}<pasted_content id="two">Explain this.</pasted_content>',
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                result = self.run_prompt(prompt)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertEqual([call[2] for call in self.activity_calls(len(prompts))],
+                         ["UserTypedPrompt"] * len(prompts))
+
+    def test_wrapped_recorded_script_consumes_its_inner_text_evidence_once(self) -> None:
+        self.record_activity()
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        with patch.dict(os.environ, self.environment, clear=True):
+            script_prompts.record(f"session:{SESSION}", "/resume")
+        prompt = '<pasted_content id="one">\n/resume\n</pasted_content id="one">'
+        first = self.run_prompt(prompt)
+        self.assertEqual((first.returncode, first.stdout, first.stderr), (0, "", ""))
+        self.assertFalse((self.escalate_root / "typed").exists())
+        second = self.run_prompt(prompt)
+        self.assertEqual((second.returncode, second.stderr), (0, ""))
+        self.assertTrue((self.escalate_root / "typed").exists())
+        self.assertEqual([call[2] for call in self.activity_calls(2)], ["ScriptPrompt", "UserTypedPrompt"])
 
     def test_typed_stamp_failure_does_not_skip_report_pause(self) -> None:
         _ = self.escalate_root.write_text("not a directory")
@@ -285,12 +421,339 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
-    def test_typed_showrunner_prompt_pauses_dailies_once(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+    def write_review_config(self, value: str) -> None:
+        config = self.root / "review-config"
+        config.mkdir(exist_ok=True)
+        _ = (config / "send.conf").write_text(
+            f"# one of: on, off\nreview_hold={value}\n"
+            + "# range: 0.001..\nreview_hold_idle_minutes=1\n", encoding="utf-8")
+        self.environment.update({"CONF_DIR": str(config), "USER_ZONE": "UTC"})
+
+    def open_review(self, at: int = 100) -> None:
+        self.write_review_config("on")
+        with patch.dict(os.environ, self.environment):
+            review_hold.set_count(SESSION, 2, at, self.fail,
+                record_keys=review_hold_delivery.record_keys)
+
+    def held_file(self) -> Path:
+        return self.root / ".local/state/adhoc_review/.holds" / f"{SESSION}.held.md"
+
+    def notice(self, count: int, header: str) -> str:
+        return review_hold.held_notice(count, self.held_file(), header)
+
+    def end_review(self, at: int) -> list[str]:
+        held: list[str] = []
+        with patch.dict(os.environ, self.environment):
+            review_hold.set_count(SESSION, 0, at, held.append,
+                record_keys=review_hold_delivery.record_keys)
+        return held
+
+    def test_native_peer_and_scheduled_prompts_are_saved_before_the_hook_blocks(self) -> None:
+        self.open_review()
+        for sender, body, at in (("Review peer", "The checks passed.\nURGENT: quoted text", 120),
+                                 ("stall-watch", "Report the current status.", 121)):
+            with self.subTest(sender=sender):
+                reply = self.parsed_reply(self.run_prompt(cross_session(sender, body), now=at))
+                self.assertEqual(reply, {
+                    "decision": "block",
+                    "reason": "Kept for the end of the review.",
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "suppressOriginalPrompt": True,
+                    },
+                })
+        self.assertEqual(self.end_review(122), [
+            f'2 held messages from the review in {self.held_file()}, under "Released at 00:02:02 UTC".'
+            + " Read them at your own pace."])
+        first_release = ("Released at 00:02:02 UTC\n\n"
+                         + "1. Review peer\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   The checks passed.\n   URGENT: quoted text\n\n"
+                         + "2. stall-watch\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   Report the current status.\n")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(stat.S_IMODE(self.held_file().stat().st_mode), 0o600)
+        self.open_review(180)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A later report."), now=181))
+        self.assertEqual(kept["decision"], "block")
+        self.assertEqual(self.end_review(182), [
+            f'1 held message from the review in {self.held_file()}, under "Released at 00:03:02 UTC".'
+            + " Read it at your own pace."])
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release
+                         + "\nReleased at 00:03:02 UTC\n\n"
+                         + "1. Review peer\n   Sent: 00:03 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   A later report.\n")
+
+    def test_a_failed_append_keeps_the_messages_held(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        self.held_file().mkdir()
+        with self.assertRaises(IsADirectoryError):
+            _ = self.end_review(102)
+        self.held_file().rmdir()
+        emitted: list[str] = []
+        with patch.dict(os.environ, self.environment):
+            review_hold.record_user_prompt(SESSION, 103, emitted.append, record_keys=review_hold_delivery.record_keys)
+        self.assertEqual(emitted, [self.notice(1, "Released at 00:01:43 UTC")])
+        self.assertEqual(self.held_file().read_text(encoding="utf-8").count("Held report."), 1)
+
+    def release_one_report(self, text: str, at: int) -> str:
+        """Hold one report, release it with a confirmed delivery and give the file text."""
+        self.open_review(at)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", text), now=at + 1))
+        self.assertEqual(kept["decision"], "block")
+        self.assertEqual(len(self.end_review(at + 2)), 1)
+        return self.held_file().read_text(encoding="utf-8")
+
+    def test_an_unconfirmed_release_after_a_confirmed_one_leaves_the_first_release(self) -> None:
+        first_release = self.release_one_report("First report.", 100)
+        self.open_review(110)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Second report."), now=111))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 200, "Unsent report.", "session:later")
+        with patch.dict(os.environ, self.environment), review_hold.route(
+                SESSION, pending, urgent=False, record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            notice = review_hold.file_release(SESSION, release, 200, batch_only=False)
+            self.assertEqual(notice, self.notice(1, "Released at 00:03:20 UTC"))
+            self.assertIn("Second report.", self.held_file().read_text(encoding="utf-8"))
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(len(self.end_review(201)), 1)
+        self.assertIn("Second report.", self.held_file().read_text(encoding="utf-8"))
+
+    def test_an_unconfirmed_release_keeps_the_file_when_it_changed_after_the_append(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 200, "Unsent report.", "session:later")
+        errors = io.StringIO()
+        with patch.dict(os.environ, self.environment), redirect_stderr(errors), review_hold.route(
+                SESSION, pending, urgent=False, record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            _ = review_hold.file_release(SESSION, release, 200, batch_only=False)
+            with self.held_file().open("a", encoding="utf-8") as held:
+                _ = held.write("Agent note.\n")
+            changed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), changed)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("changed after the append", errors.getvalue())
+        self.assertEqual(self.end_review(201), [self.notice(1, "Released at 00:03:21 UTC")])
+        newest = self.held_file().read_text(encoding="utf-8").removeprefix(changed)
+        self.assertTrue(newest.startswith("\nReleased at 00:03:21 UTC\n\n"), newest)
+        self.assertIn("Held report.", newest)
+
+    def test_a_partial_write_returns_the_file_to_its_size_before_the_append(self) -> None:
+        first_release = self.release_one_report("First report.", 100)
+        self.open_review(110)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Partial report."), now=111))
+        self.assertEqual(kept["decision"], "block")
+        real_write = os.write
+        writes: list[int] = []
+
+        def partial_write(descriptor: int, data: bytes | memoryview) -> int:
+            """Write part of the release, then fail on the next write to the same file."""
+            if len(writes) == 1 and descriptor == writes[0]:
+                writes.append(descriptor)
+                raise OSError(28, "No space left on device")
+            if not writes and b"Partial report." in bytes(data):
+                writes.append(descriptor)
+                return real_write(descriptor, bytes(data)[:20])
+            return real_write(descriptor, data)
+
+        with patch.object(os, "write", side_effect=partial_write), self.assertRaises(OSError):
+            _ = self.end_review(112)
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(len(self.end_review(113)), 1)
+        self.assertEqual(self.held_file().read_text(encoding="utf-8").count("Partial report."), 1)
+
+    def test_disabled_review_passes_native_prompts_with_an_open_count(self) -> None:
+        self.open_review()
+        for value in ("off", "invalid"):
+            with self.subTest(value=value):
+                self.write_review_config(value)
+                reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=101)
+                self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+        self.assertEqual(self.end_review(102), [])
+
+    def test_disabled_review_allows_the_send_route_with_an_open_count(self) -> None:
+        self.open_review()
+        self.write_review_config("off")
+        message = review_hold.ReviewMessage("Review peer", 101, "Send this update.")
+        with patch.dict(os.environ, self.environment), review_hold.route(
+            SESSION, message, urgent=False, record_keys=review_hold_delivery.record_keys,
+        ) as delivery:
+            assert isinstance(delivery, review_hold.ReleasedMessages)
+            self.assertEqual(delivery.messages, ())
+
+    def test_disabled_review_delivers_saved_messages_at_the_next_prompt(self) -> None:
+        for prompt in (cross_session("Review peer", "New update."),
+                       cross_session("stall-watch", "Report the current status."),
+                       IDLE_NOTICE, "Continue the review."):
+            with self.subTest(prompt=prompt):
+                self.open_review()
+                held = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Saved update."), now=101))
+                self.assertEqual(held["decision"], "block")
+                self.write_review_config("off")
+                reply = self.parsed_reply(self.run_prompt(prompt, now=102))
+                self.assertIn(self.notice(1, "Released at 00:01:42 UTC"), str(reply["hookSpecificOutput"]))
+                self.assertIn("Saved update.", self.held_file().read_text(encoding="utf-8"))
+                self.assertEqual(self.end_review(103), [])
+
+    def test_count_set_while_disabled_preserves_items_without_opening_a_hold(self) -> None:
+        self.write_review_config("off")
+        with patch.dict(os.environ, self.environment):
+            review_hold.set_count(SESSION, 2, 100, self.fail, record_keys=review_hold_delivery.record_keys)
+            self.assertEqual(review_hold.item_count(SESSION), 2)
+        self.write_review_config("on")
+        reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=101)
+        self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+
+    def test_native_urgent_prompt_passes_without_joining_the_hold(self) -> None:
+        self.open_review()
+        reply = self.run_prompt(cross_session("Review peer", "URGENT: Check the phase."), now=101)
+        self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+        self.assertEqual(self.end_review(102), [])
+
+    def test_native_prompt_passes_after_review_end(self) -> None:
+        self.open_review()
+        self.assertEqual(self.end_review(101), [])
+        reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=102)
+        self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+        self.assertEqual(self.end_review(103), [])
+
+    def test_idle_release_leaves_the_pause_reply_available_during_transport(self) -> None:
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        expired = self.run_prompt(cross_session("Review peer", "After the idle limit."), now=160)
+        self.assertEqual((expired.returncode, expired.stdout, expired.stderr), (0, "", ""))
+        message = review_hold.ReviewMessage("Later peer", 161, "New update.", "session:later")
+        with patch.dict(os.environ, self.environment), review_hold.route(SESSION, message, urgent=False,
+                                                           record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            self.assertEqual(release.new_message, message)
+            batch = review_hold.numbered_entries(release.messages)
+            self.assertIn("Held update.", batch)
+            self.assertIn("New update.", batch)
+            self.assertNotIn("After the idle limit.", batch)
+            typed = self.parsed_reply(self.run_prompt("Continue the review.", now=161))
+            self.assertEqual(typed, {
+                "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": PAUSE_CONTEXT,
+                },
+            })
+            reply = self.run_prompt(cross_session("Later peer", batch), now=161)
+            self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+            release.accepted_at = 161.0
+        self.assertEqual(self.end_review(162), [])
+
+    def test_failed_idle_release_restores_its_messages_before_newer_review_messages(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Older report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 161, "Unsent report.", "session:later")
+        with patch.dict(os.environ, self.environment), review_hold.route(SESSION, pending, urgent=False,
+                                                           record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            notice = review_hold.file_release(SESSION, release, 161, batch_only=False)
+            self.assertEqual(notice, self.notice(1, "Released at 00:02:41 UTC"))
+            self.assertIn("Older report.", self.held_file().read_text(encoding="utf-8"))
+            self.assertEqual(self.end_review(161), [])
+            review_hold.set_count(SESSION, 2, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
+            kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Newer report."), now=163))
+            self.assertEqual(kept["decision"], "block")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), "")
+        batches = self.end_review(164)
+        self.assertEqual(len(batches), 1)
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(filed.count("Released at"), 1)
+        self.assertLess(filed.index("Older report."), filed.index("Newer report."))
+        self.assertNotIn("Unsent report.", filed)
+
+    def test_session_start_keeps_messages_until_the_hold_expires(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        count = self.root / ".local/state/adhoc_review" / SESSION
+        state = count.parent / ".holds" / f"{SESSION}.json"
+        saved = state.read_bytes()
+        batches: list[str] = []
+
+        def receive(batch: str) -> None:
+            batches.append(batch)
+            reply = self.run_prompt(cross_session("Review peer", batch), now=160)
+            self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+
+        start_times = [datetime.fromtimestamp(at, timezone.utc) for at in (159, 160)]
+        clock = Mock(wraps=datetime, now=Mock(side_effect=start_times))
+        with patch.dict(os.environ, self.environment), patch.object(review_hold, "datetime", clock):
+            review_hold.deliver_at_session_start(SESSION, batches.append,
+                record_keys=review_hold_delivery.record_keys)
+            self.assertEqual(batches, [])
+            self.assertEqual(state.read_bytes(), saved)
+            self.assertEqual(review_hold.item_count(SESSION), 2)
+            kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Second update."), now=159))
+            self.assertEqual(kept["decision"], "block")
+            review_hold.deliver_at_session_start(SESSION, receive,
+                record_keys=review_hold_delivery.record_keys)
+        self.assertEqual(len(batches), 1)
+        self.assertIn("Held update.", self.held_file().read_text(encoding="utf-8"))
+        self.assertIn("Second update.", self.held_file().read_text(encoding="utf-8"))
+        self.assertEqual(self.end_review(161), [])
+
+    def test_native_review_prompt_fails_open_when_the_hold_is_unreadable(self) -> None:
+        self.open_review()
+        state = self.root / ".local/state/adhoc_review/.holds" / f"{SESSION}.json"
+        _ = state.write_text("{invalid JSON", encoding="utf-8")
+        reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=101)
+        self.assertEqual((reply.returncode, reply.stdout), (0, ""))
+        self.assertIn("review hold: Expecting property name", reply.stderr)
+        self.assertEqual(state.read_text(encoding="utf-8"), "{invalid JSON")
+
+    def test_native_review_prompt_fails_open_when_the_hold_write_fails(self) -> None:
+        self.open_review()
+        with patch.object(review_hold, "write_text_atomic", side_effect=PermissionError("fixture write refused")):
+            reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=101)
+        self.assertEqual((reply.returncode, reply.stdout), (0, ""))
+        self.assertIn("review hold: fixture write refused", reply.stderr)
+        self.assertEqual(self.end_review(102), [])
+
+    def test_idle_review_messages_use_the_same_hook_reply_as_the_pause(self) -> None:
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        self.open_review()
+        with patch.dict(os.environ, self.environment):
+            message = review_hold.ReviewMessage("Review peer", 101, "The checks passed.", "session:peer")
+            with review_hold.route(SESSION, message, urgent=False,
+                     record_keys=review_hold_delivery.record_keys) as result:
+                assert isinstance(result, review_hold.OpenReview)
+                result.keep(message)
+            reply = self.parsed_reply(self.run_prompt("Continue review.", now=161))
+            self.assertEqual(reply, {
+                "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": PAUSE_CONTEXT + "\n\n" + self.notice(1, "Released at 00:02:41 UTC"),
+                },
+            })
+            review_hold.set_count(SESSION, 1, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
+            self.assertEqual(review_hold.item_count(SESSION), 1)
+            follow_up = self.run_prompt("Next item.", now=162)
+            self.assertEqual((follow_up.returncode, follow_up.stdout, follow_up.stderr), (0, "", ""))
+            review_hold.set_count(SESSION, 0, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
+
+    def test_typed_showrunner_prompt_pauses_reports_once(self) -> None:
+        instance = self.create_instance(self.showrunner_timer("demo"))
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
             "systemMessage": (
-                f"Automatic updates paused while we talk: dailies. {RETURN_SCHEDULE}"
+                f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}"
             ),
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -301,7 +764,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.showrunner_root / "footers-off").exists())
         self.assertEqual(self.record(), {
             "session_id": SESSION,
-            "instances": ["showrunner-demo"],
+            "instances": [self.showrunner_timer("demo")],
             "phase": {"kind": "replying", "user_wrote_at": 100},
         })
         calls_after_first = self.calls(self.notifier_log)
@@ -357,7 +820,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_a_stopped_showrunner_timer_is_never_recorded_or_resumed(self) -> None:
         # A production on demand keeps its showrunner timer stopped. The pause has nothing to stop,
         # so it writes no record, and a resume leaves the timer stopped.
-        showrunner = self.create_instance("showrunner-show", enabled=False)
+        showrunner = self.create_instance(self.showrunner_timer("show"), enabled=False)
         result = self.run_prompt("hello")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
@@ -503,7 +966,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_peer_prompt_does_not_pause_a_showrunner_session(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+        instance = self.create_instance(self.showrunner_timer("demo"))
         result = self.run_prompt(cross_session("natedev", "continue"))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
@@ -551,7 +1014,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.escalate_root / "typed").exists())
 
     def test_subagent_hand_back_does_not_pause_reports(self) -> None:
-        instance = self.create_instance("showrunner-demo")
+        instance = self.create_instance(self.showrunner_timer("demo"))
         hand_back = (
             '<agent-message from="a715bbb613f1bc07c">\n'
             "[Subagent hand-back] fixed the recorder</agent-message>"
@@ -567,7 +1030,8 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.escalate_root / "typed").exists())
 
     def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
-        instance = self.create_instance("unit-abc")
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
         recorded = self.run_stop(
             extra={"session_crons": [scheduled_wakeup("  recurring status  ")]}
         )
@@ -575,11 +1039,61 @@ class ConversationPauseTests(ConversationPauseFixture):
             (recorded.returncode, recorded.stdout, recorded.stderr), (0, "", "")
         )
 
-        scheduled = self.run_prompt("recurring status")
+        for arrival in (1, 2):
+            with self.subTest(recurring_arrival=arrival):
+                scheduled = self.run_prompt("recurring status")
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                self.assertEqual(self.scheduled_prompts(), ["  recurring status  "])
 
-        self.assertEqual(
-            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        prompt = (
+            "P7 ETA 07:00 EST is due. If the Phase 7 landing notice is not sent, "
+            "send hana a new ETA with what slowed it."
         )
+        tasks = [scheduled_wakeup(prompt, task_id=task_id, recurring=False)
+                 for task_id in ("first-eta", "3aabfc24")]
+        recorded = self.run_stop(extra={"session_crons": tasks})
+        self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+        for arrival in (1, 2):
+            with self.subTest(one_shot_arrival=arrival):
+                scheduled = self.run_prompt(prompt)
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                if arrival == 1:
+                    self.assertEqual(json.loads(self.scheduled_prompts_path().read_text()), [
+                        {"id": "3aabfc24", "prompt": prompt, "recurring": False}])
+                    stopped = self.run_stop(extra={"session_crons": [
+                        scheduled_wakeup("a new task", task_id="new-task")]})
+                    self.assertEqual((stopped.returncode, stopped.stdout, stopped.stderr), (0, "", ""))
+                    self.assertEqual(self.scheduled_prompts(), ["a new task", prompt])
+                else:
+                    self.assertEqual(self.scheduled_prompts(), ["a new task"])
+        self.assertEqual([call[2] for call in self.activity_calls(4)], ["ScriptPrompt"] * 4)
+
+        rows = (
+            (False, ("check build B", "check build A"), ["check build… [+40 chars]"], 6),
+            (True, ("check build B", "check build A", "check build B"),
+             ["check build… [+40 chars]", "check build B"], 9),
+        )
+        for recurring_b, arrivals, remaining_after_b, activity_count in rows:
+            with self.subTest(recurring_b=recurring_b):
+                recorded = self.run_stop(extra={"session_crons": [
+                    scheduled_wakeup("check build… [+40 chars]", task_id="build-a", recurring=False),
+                    scheduled_wakeup("check build B", task_id="build-b", recurring=recurring_b),
+                ]})
+                self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+                for arrival, prompt in enumerate(arrivals):
+                    with self.subTest(overlapping_prompt=prompt, arrival=arrival):
+                        scheduled = self.run_prompt(prompt)
+                        self.assertEqual(
+                            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                        )
+                        if arrival == 0:
+                            self.assertEqual(self.scheduled_prompts(), remaining_after_b)
+                self.assertEqual([call[2] for call in self.activity_calls(activity_count)],
+                                 ["ScriptPrompt"] * activity_count)
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse((self.escalate_root / "typed").exists())
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
@@ -660,35 +1174,35 @@ class ConversationPauseTests(ConversationPauseFixture):
             self.assertIsInstance(context, conversation_pause.ContextOnly)
 
     def test_cli_resume_skips_missing_instance_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         record_path = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
-            instances=("showrunner-demo", "unit-gone"), scheduled=False,
+            instances=(self.showrunner_timer("demo"), "unit-gone"), scheduled=False,
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "automatic updates on: dailies\n")
-        self.assertEqual(self.calls(self.notifier_log), [["unpause", "showrunner-demo"]])
+        self.assertEqual(result.stdout, "automatic updates on: status reports\n")
+        self.assertEqual(self.calls(self.notifier_log), [["unpause", self.showrunner_timer("demo")]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(record_path.exists())
 
     def test_a_timer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance("showrunner-demo")
+        reports = self.create_instance(self.showrunner_timer("demo"))
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
-        # The showrunner stops its dailies on purpose while the user talks.
-        self.set_enabled(dailies, False)
+        # The showrunner stops its reports on purpose while the user talks.
+        self.set_enabled(reports, False)
 
         result = self.run_cli("resume")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_a_timer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance("showrunner-demo", enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
         self.assertEqual(self.record()["instances"], ["unit-abc"])
@@ -698,14 +1212,14 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
-        dailies = self.create_instance("showrunner-demo", enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
-            asked_read(100, 1), instances=("showrunner-demo", "unit-abc"),
+            asked_read(100, 1), instances=(self.showrunner_timer("demo"), "unit-abc"),
         )
 
         tick = self.run_cli("tick", now=400)
@@ -713,14 +1227,14 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(tick.returncode, 0, tick.stderr)
         self.assertEqual(self.record()["phase"], {"kind": "returned", "returned_at": 400})
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
-        dailies = self.create_instance("showrunner-demo")
+        reports = self.create_instance(self.showrunner_timer("demo"))
         _ = self.create_instance("unit-abc")
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.run_prompt("hello", now=100)
-        self.set_enabled(dailies, False)
+        self.set_enabled(reports, False)
 
         tick = self.run_cli("tick", now=150)
 
@@ -730,9 +1244,9 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_a_record_from_before_the_pause_marks_restarts_nothing(self) -> None:
         # Records written before `notifier.sh pause` existed name timers stopped with no mark;
         # nothing tells them from ones stopped on purpose.
-        instance = self.create_instance("showrunner-demo", enabled=False)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         record_path = self.write_record(
-            {"kind": "replying", "user_wrote_at": 1}, instances=("showrunner-demo",),
+            {"kind": "replying", "user_wrote_at": 1}, instances=(self.showrunner_timer("demo"),),
         )
 
         result = self.run_cli("resume")
@@ -774,11 +1288,11 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.run_cli("status").stdout, "not paused\n")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
-            instances=("unit-abc", "showrunner-demo"),
+            instances=("unit-abc", self.showrunner_timer("demo")),
         )
         self.assertEqual(
             self.run_cli("status").stdout,
-            "paused: dailies, status reports (replying)\n",
+            "paused: status reports (replying)\n",
         )
         kept = self.run_cli("keep")
         self.assertEqual(kept.returncode, 0, kept.stderr)
@@ -829,10 +1343,13 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.record(), before)
 
     def test_stop_hook_records_scheduled_prompts_without_pause_record(self) -> None:
+        path = self.scheduled_prompts_path()
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(["an old scheduled prompt"]))
         result = self.run_stop(extra={
             "session_crons": [
                 scheduled_wakeup("first scheduled prompt"),
-                scheduled_wakeup("second scheduled prompt"),
+                scheduled_wakeup("second scheduled prompt", task_id="scheduled-2"),
             ]
         })
 
@@ -935,7 +1452,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_tick_asks_nothing_when_no_paused_schedule_still_exists(self) -> None:
         path = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-            instances=("showrunner-example",), scheduled=False,
+            instances=(self.showrunner_timer("example"),), scheduled=False,
         )
         result = self.run_cli("tick", now=1_000)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1414,12 +1931,12 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_question_timeout_returns_updates_and_late_yes_removes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             asked_read(100, 1),
-            instances=("showrunner-demo", "unit-abc"),
+            instances=(self.showrunner_timer("demo"), "unit-abc"),
         )
         tick = self.run_cli("tick", now=400)
         self.assertEqual(tick.returncode, 0, tick.stderr)
@@ -1433,7 +1950,7 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertIn(["unpause", "showrunner-demo"], self.calls(self.notifier_log))
+        self.assertIn(["unpause", self.showrunner_timer("demo")], self.calls(self.notifier_log))
         self.assertIn(["unpause", "unit-abc"], self.calls(self.notifier_log))
         self.assertNotIn(["remove", "conversation-pause"], self.calls(self.notifier_log))
         self.assertTrue(watcher.exists())
@@ -1507,11 +2024,11 @@ print("SENT: delivered")
         )
 
     def test_kept_off_session_end_restores_items_and_removes_watcher(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         record_path = self.write_record(
             {"kind": "kept_off"},
-            instances=("showrunner-demo",),
+            instances=(self.showrunner_timer("demo"),),
         )
         running = self.run_cli("tick", now=100)
         self.assertEqual(running.returncode, 0, running.stderr)
@@ -1557,10 +2074,10 @@ print("SENT: delivered")
         self.assertEqual(calls.count(["unpause", restored.name]), 1)
 
     def test_missing_session_returns_updates_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        instance = self.create_instance(self.showrunner_timer("demo"), enabled=False, paused=True)
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 10},
-            instances=("showrunner-demo",),
+            instances=(self.showrunner_timer("demo"),),
         )
         result = self.run_cli(
             "tick", now=20, extra_env={"SESSION_RUNNING": "0"}
@@ -1684,84 +2201,6 @@ print("SENT: delivered")
             self.record("kept-session")["phase"], {"kind": "kept_off"}
         )
 
-    def test_open_reviews_leave_all_phases_byte_identical(self) -> None:
-        asked_instance = self.create_instance(
-            "showrunner-asked", session_id="asked-session", enabled=False, paused=True
-        )
-        quiet_instance = self.create_instance(
-            "showrunner-quiet", session_id="quiet-session", enabled=False, paused=True
-        )
-        returned_instance = self.create_instance(
-            "showrunner-returned", session_id="returned-session", enabled=False, paused=True
-        )
-        _ = self.create_instance("conversation-pause", run="tick")
-        paths = {
-            "asked": self.write_record(
-                asked_read(100, 1),
-                instances=(asked_instance.name,),
-                session_id="asked-session",
-            ),
-            "quiet": self.write_record(
-                {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-                instances=(quiet_instance.name,),
-                session_id="quiet-session",
-            ),
-            "returned": self.write_record(
-                {"kind": "returned", "returned_at": 100},
-                instances=(returned_instance.name,),
-                session_id="returned-session",
-            ),
-        }
-        review_root = self.showrunner_root / "review-paused"
-        review_root.mkdir(parents=True)
-        review_paths = [review_root / f"{slug}.json" for slug in paths]
-        for review_path in review_paths:
-            _ = review_path.write_text("{}\n")
-        before = {slug: path.read_bytes() for slug, path in paths.items()}
-
-        held = self.run_cli("tick", now=1_000)
-        self.assertEqual(held.returncode, 0, held.stderr)
-        self.assertEqual(
-            {slug: path.read_bytes() for slug, path in paths.items()}, before
-        )
-        self.assertEqual(self.calls(self.send_log), [])
-        self.assertEqual(
-            [call for call in self.calls(self.notifier_log) if call[0] == "unpause"],
-            [],
-        )
-
-        for review_path in review_paths:
-            review_path.unlink()
-        advanced = self.run_cli("tick", now=1_000)
-        self.assertEqual(advanced.returncode, 0, advanced.stderr)
-        self.assertEqual(
-            self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 1_000},
-        )
-        self.assertEqual(
-            self.record("quiet-session")["phase"],
-            asked_not_read(1_000),
-        )
-        self.assertFalse(paths["returned"].exists())
-        self.assertEqual(len(self.calls(self.send_log)), 1)
-
-    def test_review_file_is_ignored_without_a_showrunner_item(self) -> None:
-        instance = self.create_instance("unit-abc", enabled=False, paused=True)
-        _ = self.create_instance("conversation-pause", run="tick")
-        _ = self.write_record(
-            asked_read(100, 1),
-            instances=("unit-abc",),
-        )
-        review_path = self.showrunner_root / "review-paused/demo.json"
-        review_path.parent.mkdir(parents=True)
-        _ = review_path.write_text("{}\n")
-
-        result = self.run_cli("tick", now=400)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.record()["phase"], {"kind": "returned", "returned_at": 400}
-        )
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_unreadable_record_does_not_block_another_session(self) -> None:
         instance = self.create_instance("unit-abc", enabled=False, paused=True)
@@ -1811,7 +2250,7 @@ print("SENT: delivered")
 
     def test_release_leaves_out_what_was_stopped_by_hand_since_the_pause(self) -> None:
         paused = self.create_instance("unit-abc", enabled=False, paused=True)
-        stopped = self.create_instance("showrunner-demo", enabled=False)
+        stopped = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
             instances=(paused.name, stopped.name),

@@ -10,8 +10,8 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 class VerifyMacOptionValidationTests(VerifyMacOffloadFixture):
     def test_local_flag_requires_a_non_option_reason_before_any_work(self) -> None:
         expected = (
-            'verify.sh: --local needs a reason: --local "<why this test cannot pass on '
-            'macOS>". Leave it off to run on the Mac.\n'
+            'verify.sh: --local needs a reason: --local "<why this command must run on '
+            'natedev>". Leave it off to run on the Mac.\n'
         )
         cases = (
             ("test", "sample", "--local"),
@@ -51,10 +51,9 @@ class VerifyMacOptionValidationTests(VerifyMacOffloadFixture):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(
                     result.stderr,
-                    "verify.sh: --local is only for a test that cannot pass on macOS, not to keep "
-                    + f'tests off the Mac ("{reason}"). To reserve the Mac, its holder runs '
-                    + "/build:hold hold <why> target mac: tests then skip the Mac by themselves, "
-                    + "/build:status shows the hold, and it ends at its expiry. Leave --local off.\n",
+                    f'verify.sh: --local requires a test that cannot pass on macOS ("{reason}"). '
+                    + "To reserve the Mac, use /build:mac block <why>. Tests skip a held Mac. "
+                    + "/build:status shows the hold. The hold ends at its expiry. Omit --local.\n",
                 )
                 self.assertEqual(self.cargo_events(), [])
                 self.assertEqual(self.runner_events(), [])

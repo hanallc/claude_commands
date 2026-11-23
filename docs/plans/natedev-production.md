@@ -14,8 +14,9 @@
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
 - **Proposals:** `~/rust/hanadocs/issues`
 - **User zone:** read it with `python3 ~/.claude/scripts/lib/user_zone.py`. user_zone.conf is the one setting, and every time a report gives is in that zone. This doc stores no zone, because a stored copy goes stale when the user moves (it read AST after the move to EST).
-- **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
-- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout
+- **Updates:** Use `/showrunner:units` for unit status on request.
+  Dailies were retired on 2026-11-11.
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --checkout . --tests-only`. Run it in the showrunner checkout. The nightly run checks types. The gate includes every test module, including buildlog and accounts.
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** five units; `report.py` is shared, and whoever lands second resolves conflicts; its seats share natedev's build slots (steve)
@@ -65,7 +66,7 @@
 | `scripts/hooks/fn_length_lib.py` | stalls-unit | mul_add-unit (shared scanner, edit parser, lint reader and multiply-add target-root helper) |
 | `commands/showrunner/produce.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges); feature-log-unit (<ChangeReviewFeatureLog/> and <CloseChangeReview/>) |
 | `commands/showrunner/promote_unit.md` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
-| `scripts/production/showrunners.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
+| `scripts/production/showrunners.py` | devtools-unit (sdlc) | — |
 | `scripts/production/stall_watch.py` | stalls-unit | enh-showrunner-unit (after stalls-unit Phase 6 merges) |
 
 ## Close-out
@@ -78,4 +79,4 @@
 ## Production rules
 
 - **No CI on this repo** (natedev, 2026-10-04). `~/.claude` has no workflows, so the Merge tests replace `verify.sh test`, and <CIPoint/>, the smoke launch, the Mac run and `validate_and_push.sh` do not apply.
-- **Each merged phase goes to main at once** (natedev, 2026-10-04), since every phase is useful alone and `~/.claude` main is the live configuration. After a merge's tests pass: merge `main` into the **Merge branch** if main moved, push the **Merge branch**, fast-forward `~/.claude` main to it (`git -C ~/.claude merge --ff-only <sha>`; other sessions' uncommitted files there stay untouched), and push main only when `origin/main..main` held no other session's commits before the fast-forward. Then the Mac pulls: `ssh mac 'cd ~/.claude && git pull --ff-only natedev:/home/natepiano/.claude main'`.
+- **Each merged phase goes to main at once** (natedev, 2026-10-04), since every phase is useful alone and `~/.claude` main is the live configuration. After a merge's tests pass: merge `main` into the **Merge branch** if main moved, push the **Merge branch**, fast-forward `~/.claude` main to it (`git -C ~/.claude merge --ff-only <sha>`; other sessions' uncommitted files there stay untouched), and push main only when `origin/main..main` held no other session's commits before the fast-forward. The Mac pulls through [`main_publish.mac_pull_command`](../as-built/repair-rounds.md#mac-pulls-and-visible-change-ownership).

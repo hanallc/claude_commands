@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -16,8 +21,10 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import silence
-from user_zone import user_zone
+from scripts.notify import push_texts, silence
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.user_zone import user_zone
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -45,14 +52,14 @@ class SilenceTests(unittest.TestCase):
         self.assertIn("until off", self.main("on"))
         self.assertEqual(self.commands, [])
         self.assertIn("silence on from", self.main("status"))
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.Kept("until off"))
+        self.assertEqual(silence.keep_here(PUSH), silence.Kept("until off"))
         self.assertIn("1 push kept", self.main("status"))
 
     def test_off_clears_silence_and_posts_the_kept_pushes_oldest_first(self) -> None:
         _ = self.main("on")
         second: silence.KeptPush = {**PUSH, "title": "Tests done"}
         for push in (PUSH, second):
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         posted: list[str] = []
 
         def deliver(push: silence.KeptPush) -> int:
@@ -63,12 +70,71 @@ class SilenceTests(unittest.TestCase):
             self.assertEqual(silence.off(self.runner, deliver), 0)
         self.assertEqual(output.getvalue(), "silence off; 2 kept pushes delivered\n")
         self.assertEqual(posted, ["Build done", "Tests done"])
-        self.assertEqual(silence.keep(PUSH, "Linux"), silence.NotSilent())
+        self.assertEqual(silence.keep_here(PUSH), silence.NotSilent())
         self.assertEqual(self.main("status"), "silence off\n")
+
+    def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = Path(__file__).resolve().parents[2]
+        _ = shutil.copytree(checkout / "config", root / "config")
+        keys = root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
+        posted = root / "posted.jsonl"
+        channel = root / "channel.py"
+        _ = channel.write_text(python_tool_source('''import json
+import os
+from pathlib import Path
+import sys
+from urllib.parse import parse_qs
+from scripts.notify import pushover, push_texts, silence
+
+def post(url, data):
+    with Path(os.environ["FIXTURE_POSTED"]).open("a") as output:
+        output.write(json.dumps(parse_qs(data.decode())) + "\\n")
+    return 200, b'{"status":1}'
+
+keys = Path(os.environ["FIXTURE_KEYS"])
+push_texts.approval_date = lambda text_id: "2026-11-06"
+if sys.argv[1:] == ["release"]:
+    raise SystemExit(silence.off(lambda command: 0, lambda push: pushover.post_kept(push, keys, post)))
+raise SystemExit(pushover.send(sys.argv[1:], keys, post))
+'''))
+        environment = {
+            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": MISSING_HERDR_BIN,
+            "PYTHONPATH": str(checkout / "scripts/lib/python_startup"),
+            "CONF_DIR": str(root / "config"), "NOTIFY_STATE_DIR": str(root / "notify"),
+            "XDG_STATE_HOME": str(root / "state"), "USER_ZONE": "America/New_York",
+            "FIXTURE_KEYS": str(keys), "FIXTURE_POSTED": str(posted),
+        }
+        bootstrap = ("import sys; from pathlib import Path; from scripts.message import send; "
+                     "send.USER_CHANNEL = Path(sys.argv[1]); raise SystemExit(send.main(sys.argv[2:]))")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            _ = self.main("on")
+            results = tuple(push_texts.render("nightly.result", branch="main", time="03:53 EST",
+                outcome=outcome, types="passed", tests="passed" if outcome == "passed" else "failed in message/test_send.py")
+                for outcome in ("passed", "failed"))
+            for rendered in results:
+                command = push_texts.user_send_argv(rendered, key="nightly-result")
+                result = subprocess.run([command[0], "-c", bootstrap, str(channel), *command[2:]],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("KEPT:", result.stdout)
+                self.assertFalse(posted.exists())
+                kept, = silence.read_kept()
+                self.assertEqual((kept["title"], kept["message"], kept["key"]),
+                                 (rendered.title, rendered.message, "nightly-result"))
+            released = subprocess.run([sys.executable, str(channel), "release"], capture_output=True,
+                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+            delivery, = [cast(dict[str, list[str]], json.loads(line)) for line in posted.read_text().splitlines()]
+            self.assertEqual(delivery["title"], [results[-1].title])
+            self.assertTrue(delivery["message"][0].startswith(results[-1].message + "\n"))
+            self.assertEqual(silence.read_kept(), [])
+            self.assertIsNone(silence.read_state())
 
     def test_a_failed_post_is_counted(self) -> None:
         _ = self.main("on")
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("0 kept pushes delivered; 1 failed", output.getvalue())
@@ -78,7 +144,7 @@ class SilenceTests(unittest.TestCase):
                                          "timer": None, "auto": True}
         with silence.locked():
             silence.write_state(record)
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         posted: list[silence.KeptPush] = []
 
         def deliver(push: silence.KeptPush) -> int:
@@ -96,13 +162,13 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
 
     def test_manual_off_keeps_automatic_silence_when_the_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}
         with silence.locked():
             silence.write_state(record)
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         state, kept = silence.state_file().read_bytes(), silence.kept_file().read_bytes()
         with (mock.patch.object(auto_silence, "append_event", side_effect=OSError("disk full")),
               mock.patch.object(silence, "post_kept") as deliver,
@@ -113,7 +179,7 @@ class SilenceTests(unittest.TestCase):
         self.assertEqual(silence.kept_file().read_bytes(), kept)
 
     def test_manual_on_preserves_automatic_silence_when_its_end_log_fails(self) -> None:
-        import auto_silence
+        from scripts.notify import auto_silence
 
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,
                                          "timer": None, "auto": True}
@@ -130,7 +196,7 @@ class SilenceTests(unittest.TestCase):
                 _ = self.main("on")
                 second: silence.KeptPush = {**PUSH, "title": "Tests done"}
                 for push in (PUSH, second):
-                    _ = silence.keep(push, "Linux")
+                    _ = silence.keep_here(push)
                 posted: list[str] = []
 
                 def fail_second(push: silence.KeptPush) -> int:
@@ -164,7 +230,7 @@ class SilenceTests(unittest.TestCase):
                 record = silence.read_state()
                 assert record is not None and record["timer"] is not None
                 command = ["off", "--timer", record["timer"]]
-                _ = silence.keep(PUSH, "Linux")
+                _ = silence.keep_here(PUSH)
                 posted: list[silence.KeptPush] = []
 
                 def fail_delivery(push: silence.KeptPush) -> int:
@@ -199,7 +265,7 @@ class SilenceTests(unittest.TestCase):
     def test_a_kept_push_replaces_the_older_one_with_its_source_and_key(self) -> None:
         _ = self.main("on")
         for title in ("Old note", "Other", "New note"):
-            _ = silence.keep({**PUSH, "title": title, "key": "other" if title == "Other" else "subject"}, "Linux")
+            _ = silence.keep_here({**PUSH, "title": title, "key": "other" if title == "Other" else "subject"})
         self.assertEqual(self.kept_titles(), ["Other", "New note"])
 
     def test_an_empty_key_or_another_source_never_replaces(self) -> None:
@@ -208,7 +274,7 @@ class SilenceTests(unittest.TestCase):
                                           {**PUSH, "title": "Build", "key": "subject"},
                                           {**PUSH, "title": "Tests", "source": "tests", "key": "subject"}]
         for push in pushes:
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         self.assertEqual(self.kept_titles(), ["First", "Second", "Build", "Tests"])
 
     def test_drop_removes_the_kept_pushes_with_its_source_and_key_and_says_how_many(self) -> None:
@@ -218,7 +284,7 @@ class SilenceTests(unittest.TestCase):
                                           {**PUSH, "title": "No key"}, {**PUSH, "title": "Other key", "source": "stall-watch",
                                                                         "key": "prompt-2"}]
         for push in pushes:
-            _ = silence.keep(push, "Linux")
+            _ = silence.keep_here(push)
         self.assertEqual(silence.drop("stall-watch", "prompt", "Linux"), 1)
         self.assertEqual(self.kept_titles(), ["Other source", "No key", "Other key"])
         # An empty key drops nothing, as an empty key never replaces; a second drop finds nothing.
@@ -235,7 +301,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_a_kept_push_keeps_its_text_id(self) -> None:
         _ = self.main("on")
-        _ = silence.keep({**PUSH, "text_id": "nixos.ups_battery"}, "Linux")
+        _ = silence.keep_here({**PUSH, "text_id": "nixos.ups_battery"})
         self.assertEqual([push["text_id"] for push in silence.read_kept()], ["nixos.ups_battery"])
 
     def test_until_makes_a_timer_that_runs_off_and_a_new_end_stops_the_old_timer(self) -> None:
@@ -286,7 +352,7 @@ class SilenceTests(unittest.TestCase):
     def test_an_interrupted_extension_leaves_a_timer_that_cannot_end_the_replacement_silence(self) -> None:
         _ = self.main("on", "--for", "45min")
         old = silence.read_state()
-        _ = silence.keep(PUSH, "Linux")
+        _ = silence.keep_here(PUSH)
         with mock.patch.object(silence, "stop_timer", side_effect=RuntimeError("stopped at old timer stop")):
             with self.assertRaisesRegex(RuntimeError, "stopped at old timer stop"):
                 _ = self.main("on", "--for", "90min")
@@ -392,25 +458,6 @@ class MacTests(unittest.TestCase):
         self.assertEqual(seen[0][-2], "natedev")
         self.assertEqual(seen[0][-1], silence.REMOTE + " on --until '2026-10-21 07:00'")
 
-    def test_a_push_asks_natedev_and_sends_when_natedev_cannot_answer(self) -> None:
-        asked: list[tuple[list[str], str]] = []
-
-        def asker(answer: tuple[int, str]) -> silence.Ask:
-            def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
-                asked.append((list(argv), text))
-                return answer
-            return ask
-
-        self.assertEqual(silence.keep(PUSH, "Darwin", asker((0, "until 07:00 EDT\n"))), silence.Kept("until 07:00 EDT"))
-        self.assertEqual(asked[0][0][-1], silence.REMOTE + " keep")
-        self.assertIn('"title": "Build done"', asked[0][1])
-        _ = silence.keep({**PUSH, "key": "subject"}, "Darwin", asker((0, "until off\n")))
-        self.assertIn('"key": "subject"', asked[1][1])
-        self.assertEqual(silence.keep(PUSH, "Darwin", asker((1, ""))), silence.NotSilent())
-        with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(silence.keep(PUSH, "Darwin", asker((255, ""))), silence.NotSilent())
-        self.assertIn("natedev could not be asked", errors.getvalue())
-
     def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
         asked: list[tuple[list[str], str]] = []
 
@@ -426,22 +473,6 @@ class MacTests(unittest.TestCase):
             with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
             self.assertIn("natedev could not be asked to drop k", errors.getvalue())
-
-    def test_natedev_keep_reads_the_push_on_stdin(self) -> None:
-        with (tempfile.TemporaryDirectory() as folder, mock.patch.object(silence, "state_dir", return_value=Path(folder)),
-              mock.patch("sys.stdin", io.StringIO(json.dumps(PUSH)))):
-            self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 1)
-            _ = (Path(folder) / "silence.json").write_text('{"since": "2026-10-20T22:00:00-04:00", "until": null, "timer": null}')
-            with mock.patch("sys.stdin", io.StringIO('{"source": "b", "priority": "0", "title": "t", "message": "m", "detail": ""}')), \
-                    redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
-            self.assertEqual(output.getvalue(), "until off\n")
-            self.assertEqual(len(silence.read_kept()), 1)
-            for title in ("old", "new"):
-                with (mock.patch("sys.stdin", io.StringIO(json.dumps({**PUSH, "title": title, "key": "subject"}))),
-                      redirect_stdout(io.StringIO())):
-                    self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
-            self.assertEqual([push["title"] for push in silence.read_kept()], ["t", "new"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Prepare immutable style inputs and capture a read-only reviewer's result."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -13,7 +17,6 @@ from pathlib import Path
 from string import Template
 from typing import Literal, cast, final
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import worker_lifecycle
@@ -177,37 +180,39 @@ def start(root: Path, baseline: str, phase_dir: Path, prompt: Path, pass_name: s
         parent = phase_dir.resolve() / "style"
         parent.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", pass_name) or "pass"
-        directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["style-review"].format(owner=safe_name), build_folders.ExplicitBuildParent(parent)))
-        write_text_atomic(directory / "owner.json", json.dumps({
-            "pid": pid, "started": started, "dispatch": pass_name,
-        }))
-        write_text_atomic(directory / "baseline", baseline)
-        write_text_atomic(directory / "until", end.reference if isinstance(end, CommitEnd) else "working tree")
-        # A stop anywhere after allocation keeps this attempt owed.
-        publish(directory, "owed", "Style review: Error\nPreparation or dispatch did not finish.\n", in_flight=True)
-        result = prepare(root, baseline, directory, end)
-        assignment = ""
-        if isinstance(result, Ready):
-            inputs = result.inputs
-            write_text_atomic(directory / "baseline", inputs.baseline)
-            write_text_atomic(directory / "until", inputs.end.reference if isinstance(inputs.end, CommitEnd) else "working tree")
-            assignment = Template((ROOT / "config/review/style.md").read_text()).substitute(
-                range=f"{inputs.baseline}..{(directory / 'until').read_text()}",
-                scripts=str(SCRIPTS), diff=str(inputs.diff), additions=str(inputs.additions),
-                rust="yes" if inputs.rust_changed else "no", begin=BEGIN, end=END)
-            print(f"Rust change {'yes' if inputs.rust_changed else 'no'}: {', '.join(inputs.paths)}")
-            print(f"Diff: {inputs.diff}\nAdditions: {inputs.additions}")
-        elif isinstance(result, Finished):
-            publish(directory, "complete", f"Style review: {result.result}\nRange: {baseline}..{(directory / 'until').read_text()}\n")
-            print(result.result)
-        else:
-            publish(directory, "owed", f"Style review: Error\n{result.cause}\n")
-            print(f"Style review: Error: {result.cause}", file=sys.stderr)
-        write_text_atomic(directory / "assignment.md", assignment)
-        write_text_atomic(directory / "prompt.md", prompt.read_text() + ("\n" + assignment if assignment else ""))
-        print(f"Style report: {phase_dir.resolve() / 'phase_style_review.md'}")
-        return directory
+        # The review worker and finish command read these files after prepare exits.
+        request = build_folders.UniqueBuildFolder(
+            f"{safe_name}-", build_folders.ExplicitBuildParent(parent))
+        with build_folders.leased_build_folder(request) as directory:
+            write_text_atomic(directory / "owner.json", json.dumps({
+                "pid": pid, "started": started, "dispatch": pass_name,
+            }))
+            write_text_atomic(directory / "baseline", baseline)
+            write_text_atomic(directory / "until", end.reference if isinstance(end, CommitEnd) else "working tree")
+            # A stop anywhere after allocation keeps this attempt owed.
+            publish(directory, "owed", "Style review: Error\nPreparation or dispatch did not finish.\n", in_flight=True)
+            result = prepare(root, baseline, directory, end)
+            assignment = ""
+            if isinstance(result, Ready):
+                inputs = result.inputs
+                write_text_atomic(directory / "baseline", inputs.baseline)
+                write_text_atomic(directory / "until", inputs.end.reference if isinstance(inputs.end, CommitEnd) else "working tree")
+                assignment = Template((ROOT / "config/review/style.md").read_text()).substitute(
+                    range=f"{inputs.baseline}..{(directory / 'until').read_text()}",
+                    scripts=str(SCRIPTS), diff=str(inputs.diff), additions=str(inputs.additions),
+                    rust="yes" if inputs.rust_changed else "no", begin=BEGIN, end=END)
+                print(f"Rust change {'yes' if inputs.rust_changed else 'no'}: {', '.join(inputs.paths)}")
+                print(f"Diff: {inputs.diff}\nAdditions: {inputs.additions}")
+            elif isinstance(result, Finished):
+                publish(directory, "complete", f"Style review: {result.result}\nRange: {baseline}..{(directory / 'until').read_text()}\n")
+                print(result.result)
+            else:
+                publish(directory, "owed", f"Style review: Error\n{result.cause}\n")
+                print(f"Style review: Error: {result.cause}", file=sys.stderr)
+            write_text_atomic(directory / "assignment.md", assignment)
+            write_text_atomic(directory / "prompt.md", prompt.read_text() + ("\n" + assignment if assignment else ""))
+            print(f"Style report: {phase_dir.resolve() / 'phase_style_review.md'}")
+            return directory
 
 
 def finish(directory: Path, result_file: Path, dispatch_code: int) -> None:

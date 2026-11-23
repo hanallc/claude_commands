@@ -19,7 +19,7 @@ CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
-conf_value() { "$LIB/py" "$LIB/conf.py" get "$1" "$2"; }
+source "$LIB/conf.sh"
 PORT="${4:-$(conf_value production smoke_port)}"
 READY_SECONDS=$(conf_value production smoke_ready_seconds)
 EXIT_SECONDS=$(conf_value production smoke_exit_seconds)
@@ -70,18 +70,19 @@ BIN="$TARGET_DIR/debug/hana"
 
 [[ -n "${HANA_TEST_PURPOSE//[[:space:]]/}" ]] || { printf '%s\n' 'smoke_launch: set HANA_TEST_PURPOSE to the feature under test' >&2; exit 2; }
 
-SCRATCH="$(mktemp -d)"
-mkdir "$SCRATCH/xdg"
 HANA_PID=""
 cleanup() {
     if [[ -n "$HANA_PID" ]] && kill -0 "$HANA_PID" 2>/dev/null; then
         "$LIB/py" "$LIB/process_group.py" "$HANA_PID" TERM 2>/dev/null || true
         sleep "$SIGNAL_GRACE_SECONDS"
         "$LIB/py" "$LIB/process_group.py" "$HANA_PID" KILL 2>/dev/null || true
+        wait "$HANA_PID" 2>/dev/null || true
     fi
     rm -rf "$SCRATCH"
 }
+SCRATCH="$(mktemp -d)"
 trap cleanup EXIT
+mkdir "$SCRATCH/xdg"
 
 # setsid gives the app its own process group, so cleanup reaches every child.
 # The binary runs directly, so BEVY_ASSET_ROOT replaces cargo's

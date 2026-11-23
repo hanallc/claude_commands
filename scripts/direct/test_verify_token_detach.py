@@ -1,7 +1,12 @@
 """Real verify.sh token detach behavior."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import tempfile
+from typing import ClassVar, override
 import unittest
+from unittest import mock
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 
 
@@ -9,28 +14,28 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
     def test_a_codex_worker_call_detaches_and_returns_without_building(self) -> None:
         result = self.verify(self.detach_environment(0))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.mesh_runs_calls(), [[
+        self.assertEqual(self.detached_runs_calls(), [[
             "start", "--label", "verify.sh check sample", "--",
             "bash", str(VERIFY.resolve()), "check", "sample",
         ]])
         self.assertFalse((self.root / "cargo-calls").exists())
         self.assertEqual(self.records(), [])
 
-    def test_a_caller_mesh_runs_cannot_detach_runs_attached(self) -> None:
+    def test_a_caller_detached_runs_cannot_detach_runs_attached(self) -> None:
         for status, note in ((3, False), (1, True)):
             with self.subTest(status=status):
-                for path in (self.root / "mesh-runs-calls", self.root / "cargo-calls"):
+                for path in (self.root / "detached-runs-calls", self.root / "cargo-calls"):
                     path.unlink(missing_ok=True)
                 result = self.verify(self.detach_environment(status))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(len(self.mesh_runs_calls()), 1)
+                self.assertEqual(len(self.detached_runs_calls()), 1)
                 self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
                 self.assertEqual("could not detach" in result.stderr, note, result.stderr)
 
     def test_a_live_run_limit_refusal_starts_no_attached_command(self) -> None:
         result = self.verify(self.detach_environment(4))
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertEqual(len(self.mesh_runs_calls()), 1)
+        self.assertEqual(len(self.detached_runs_calls()), 1)
         self.assertFalse((self.root / "cargo-calls").exists())
         self.assertEqual(self.records(), [])
         self.assertNotIn("running attached", result.stderr)
@@ -39,9 +44,31 @@ class VerifyTokenDetachTests(VerifyTokenWaitFixture):
         environment = {**self.detach_environment(0), "UNIT_DETACHED_RUN": "1"}
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.mesh_runs_calls(), [])
+        self.assertEqual(self.detached_runs_calls(), [])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
+
+class VerifyTokenDetachInsideDetachedRunTests(VerifyTokenDetachTests):
+    """The same calls from a suite that a detached run started, as a merge gate does."""
+
+    outer_record: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        outer = tempfile.TemporaryDirectory(prefix="outer-run-")
+        cls.addClassCleanup(outer.cleanup)
+        cls.outer_record = Path(outer.name) / "outer-run.json"
+        with mock.patch.dict(os.environ, {"UNIT_DETACHED_RUN": "1", "UNIT_DETACHED_RECORD": str(cls.outer_record)}):
+            super().setUpClass()
+
+    @override
+    def tearDown(self) -> None:
+        try:
+            # verify.sh under test never saves its exit into the outer run's record.
+            self.assertNotIn("record-exit", [call[0] for call in self.detached_runs_calls()])
+        finally:
+            super().tearDown()
 
 
 if __name__ == "__main__":

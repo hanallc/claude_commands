@@ -5,25 +5,17 @@ import json
 import os
 import shutil
 import subprocess
-import sys
-import threading
-import time
 import unittest
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast, final
+from typing import cast, final
 from unittest import mock
 
-if TYPE_CHECKING:
-    import herdr
-    import unit_lookup
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-import herdr
-from fake_herdr import CommandResponse, herdr_listener
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PANE_RESULT = herdr.Herdr.result
@@ -32,8 +24,8 @@ PANE_RESULT = herdr.Herdr.result
 @contextmanager
 def private_process_registry() -> Generator[None]:
     """Read private process generations and retain normal reads for other processes."""
-    import sessions
-    from scripts.message import sessions as runtime_sessions
+    from scripts.message import sessions
+    from scripts.message import session_records as runtime_sessions
 
     original_start = runtime_sessions.process_start
     original_running = runtime_sessions.running_session
@@ -98,13 +90,12 @@ class HostedUnit:
     label: str = ""
 
 
-def labeled(session: str, pane: str, unit: str, slug: str = "show", *,
+def labeled(session: str, pane: str, unit: str, production_name: str = "show", *,
             screen: str = "", agent_status: str = "idle", label: str = "", **environment: str) -> HostedUnit:
     """Publish a fixture member with its current native session identity."""
-    from scripts.production import showrunners
     from scripts.production.staff_test_support import unit_membership
 
-    row = unit_membership(showrunners.canonical_slug(slug), unit)
+    row = unit_membership(production_name, unit)
     return HostedUnit(session, pane, {"CODEX_THREAD_ID": row.current_session, **environment}, screen, agent_status, label)
 
 
@@ -137,6 +128,13 @@ def _write_children(root: Path) -> None:
 
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
             session: int | None = None, cwd: Path | None = None) -> None:
+    _write_process(env, pid, parent, argv, marks, started=started, session=session, cwd=cwd)
+    _write_children(Path(env["HERDR_PROC"]))
+
+
+def _write_process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *,
+                   started: str = "1", session: int | None = None, cwd: Path | None = None) -> None:
+    """Write one process; the caller updates the child lists after its last write."""
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
     _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} 0 {session or pid} " + "0 " * 13 + started)
@@ -146,7 +144,6 @@ def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], 
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
     _ = (directory / "cgroup").write_text("")
-    _write_children(directory.parent)
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
@@ -163,7 +160,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
     sessions: list[dict[str, object]] = []
     for name, panes in by_session.items():
         server = shells[(name, panes[0].pane)] - 1
-        process(env, server, 0, ["herdr", "--session", name, "server"], {})
+        _write_process(env, server, 0, ["herdr", "--session", name, "server"], {})
         herdr_listener(Path(env["HERDR_PROC"]), server, name, env)
         sessions.append({"name": name, "running": True, "default": False,
                          "session_dir": "/fixture", "socket_path": "/fixture/socket"})
@@ -173,7 +170,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             {"pane_id": pane.pane, "label": pane.label or None} for pane in panes]}})}
         for unit in panes:
             shell = shells[(name, unit.pane)]
-            process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
+            _write_process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
                 "code": 0, "stdout": json.dumps({"result": {"process_info": {
                     "shell_pid": shell, "foreground_process_group_id": shell,
@@ -185,6 +182,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
                     for ansi in ("", " --format ansi"):
                         responses[f"--session {name} pane read {unit.pane} --source {source} --lines {lines}{ansi}"] = {
                             "code": 0, "stdout": unit.screen}
+    _write_children(Path(env["HERDR_PROC"]))
     responses["--session default session list --json"] = {"code": 0, "stdout": json.dumps({"sessions": sessions})}
     before_close = {command: dict(response) for command, response in responses.items()}
     for unit in units:
@@ -224,12 +222,12 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
         raise AssertionError(f"expected one hosted pane {session}:{pane}, found {len(matches)}")
     directory, marks = matches[0]
     parent = int((directory / "stat").read_text().split()[3]) if exec_shell else int(directory.name)
-    process(env, pid, parent, ["claude"], marks)
+    _write_process(env, pid, parent, ["claude"], marks)
     pane_foreground(env, marks["HERDR_SESSION"], pane, pid if exec_shell else int(directory.name), pid, "claude")
     if exec_shell:
         # Generic launch fixtures use exec; pane-shell scenarios keep both processes.
         shutil.rmtree(directory)
-        _write_children(directory.parent)
+    _write_children(directory.parent)
 
 
 def calls(env: Mapping[str, str]) -> list[list[str]]:
@@ -254,12 +252,10 @@ class PaneShellFixture:
     """One session-qualified pane host for lifecycle operations."""
 
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
-                 live: bool, slug: str = "demo", unit: str = "alpha-unit",
+                 live: bool, production_name: str = "demo", unit: str = "alpha",
                  env: dict[str, str] | None = None) -> None:
-        import herdr
-        import unit_lookup
-        import unit_move
-        self.slug: str = slug
+        from scripts.production import unit_move
+        self.production_name: str = production_name
         self.unit: str = unit
         self.worktree: Path = worktree
         self.environment: dict[str, str] = {**(env or {}), **environment(process_root.parent)}
@@ -271,7 +267,7 @@ class PaneShellFixture:
         self.shell: int = 991001
         self.director: int = 4242
         from scripts.production import staff
-        owner = staff.by_path(f"{slug}/{unit.removesuffix('-unit')}")
+        owner = staff.by_path(f"{production_name}/{unit}")
         assert owner is not None
         self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []
@@ -318,7 +314,6 @@ class PaneShellFixture:
                 session=self.shell, cwd=self.worktree)
 
     def stopped(self) -> None:
-        import unit_lookup
         self.lifecycle.append("director exited")
         shutil.rmtree(Path(self.environment["HERDR_PROC"]) / str(self.director), ignore_errors=True)
         _write_children(Path(self.environment["HERDR_PROC"]))
@@ -326,12 +321,12 @@ class PaneShellFixture:
         self._found = unit_lookup.LabeledSession(self.unit, unit_lookup.ClaudeNotRunning(), self.place,
             identity=unit_lookup.LiveSession(self.native_id))
 
-    def labeled_session(self, slug: str, unit: str) -> unit_lookup.LabeledSession | None:
-        return self.found if (slug, unit) == (self.slug, self.unit) else None
+    def labeled_session(self, production_name: str, unit: str) -> unit_lookup.LabeledSession | None:
+        return self.found if (production_name, unit) == (self.production_name, self.unit) else None
 
-    def labeled_sessions(self, slug: str) -> dict[str, unit_lookup.LabeledSession]:
+    def labeled_sessions(self, production_name: str) -> dict[str, unit_lookup.LabeledSession]:
         found = self.found
-        return {self.unit: found} if slug == self.slug and found else {}
+        return {self.unit: found} if production_name == self.production_name and found else {}
 
     def inside_pids(self, worktree: Path) -> list[int]:
         root = str(worktree)
@@ -361,42 +356,3 @@ class PaneShellFixture:
             parent, os_session = server, pid
         process(self.environment, pid, parent, ["visitor"], marks,
                 session=os_session, cwd=self.worktree)
-
-
-def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path, *,
-                    destination: tuple[str, str, str]) -> None:
-    """A shutdown boundary that records a clean stop and one native relaunch."""
-    import rename_unit
-    import unit_lookup
-    import herdr
-    stopped_event = threading.Event()
-    del path
-    pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)
-
-    def shutdown(*arguments: str) -> None:
-        pane.stop_calls.append(' '.join(arguments))
-        if arguments[0] == 'stop':
-            pane.stopped()
-            stopped_event.set()
-        elif arguments[0] == 'restart':
-            pane.slug, pane.unit, name = destination
-            pane.place = herdr.HerdrPlace('restored', 'w2:p1')
-            write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
-                  {"CLAUDE_CODE_SESSION_ID": pane.native_id})])
-            pane.shell = 991001
-            pane.found = unit_lookup.LabeledSession(pane.unit,
-                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place,
-                identity=unit_lookup.LiveSession(pane.native_id))
-        else:
-            raise AssertionError(f'unexpected shutdown: {arguments}')
-
-    from scripts.shutdown import stop_resume
-    def stop(identity: str) -> stop_resume.Stopped:
-        shutdown("stop", identity)
-        return stop_resume.Stopped(identity, pane.director)
-    _ = case.enterContext(mock.patch.object(stop_resume, 'stop', side_effect=stop))
-    _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
-    def wait_for_stop(_seconds: float) -> None:
-        case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
-    _ = case.enterContext(mock.patch.object(rename_unit, 'time',
-        SimpleNamespace(monotonic=time.monotonic, sleep=wait_for_stop)))

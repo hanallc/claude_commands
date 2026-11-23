@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Run synchronous verify helpers in one process."""
+from __future__ import annotations
+
+import ctypes
+from contextlib import ExitStack
+import contextvars
+from dataclasses import dataclass
+import hashlib
+import importlib.util
+import inspect
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import site
+import stat
+import sys
+import sysconfig
+import tempfile
+import time
+import traceback
+from types import ModuleType
+from typing import Callable, cast
+
+
+PARENT_CHECK_INTERVAL_SECONDS = 1
+# One request carries the caller's whole environment, so a large read takes it in a few calls.
+READ_SIZE = 65536
+PR_SET_PDEATHSIG = 1
+# A top-level main marks a program that the helper runs inside the helper process.
+TOP_LEVEL_MAIN = re.compile(rb"^def main\(", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class HelperCall:
+    program: str
+    directory: str
+    arguments: list[str]
+    environment: dict[str, str]
+    stdin: str
+    forwarded_environment: list[str]
+
+
+@dataclass(frozen=True)
+class LoadedProgram:
+    module: ModuleType
+    invoke: Callable[[], object]
+
+
+class SeparateProcess:
+    """The path needs its original interpreter process."""
+
+
+@dataclass(frozen=True)
+class SourceStamp:
+    """What identifies one version of a source file on disk."""
+
+    modified: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class MissingSource:
+    """The source file is gone."""
+
+
+@dataclass(frozen=True)
+class ChangedDuringCall:
+    """The file changed after its call began, so its module can be older than the file."""
+
+
+def source_stamp(path: str) -> SourceStamp | MissingSource:
+    try:
+        status = os.stat(path)
+    except OSError:
+        return MissingSource()
+    return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
+
+
+def module_source_path(module: object) -> str:
+    """Read the source path without executing a lazy module."""
+    if not isinstance(module, ModuleType):
+        return ""
+    attributes = cast(dict[str, object], object.__getattribute__(module, "__dict__"))
+    path = attributes.get("__file__")
+    return path if isinstance(path, str) else ""
+
+
+def installation_roots() -> tuple[str, ...]:
+    """Folders of the Python installation, whose files do not change while the helper runs."""
+    paths = sysconfig.get_paths()
+    roots = {sys.base_prefix, sys.prefix, sys.exec_prefix, *site.getsitepackages(),
+             *(paths[key] for key in ("stdlib", "platstdlib", "purelib", "platlib") if key in paths)}
+    return tuple(os.path.join(os.path.realpath(root), "") for root in roots)
+
+
+class LoadedSources:
+    """The source files of the modules the helper loaded, as they were when it loaded them.
+
+    A tree update between two calls leaves old modules in sys.modules while a lazy
+    import reads a new file, and the two versions need not fit. A changed source
+    drops every tracked module, so the next call imports one consistent tree.
+    """
+
+    def __init__(self) -> None:
+        self.installation: tuple[str, ...] = installation_roots()
+        self.stamps: dict[str, SourceStamp | MissingSource | ChangedDuringCall] = {}
+        self.untracked: set[str] = set()
+
+    def record(self, started: int) -> None:
+        """Stamp each source module loaded since the last record, by a call that began at started."""
+        for name, module in list(sys.modules.items()):
+            if name == "__main__" or name in self.untracked:
+                continue
+            path = module_source_path(module)
+            if not path.endswith(".py") or os.path.realpath(path).startswith(self.installation):
+                self.untracked.add(name)
+            elif path not in self.stamps:
+                stamp = source_stamp(path)
+                changed = isinstance(stamp, SourceStamp) and stamp.modified >= started
+                self.stamps[path] = ChangedDuringCall() if changed else stamp
+
+    def refresh(self, programs: dict[str, LoadedProgram | SeparateProcess]) -> None:
+        """Drop every tracked module and loaded program when any tracked source changed."""
+        if all(source_stamp(path) == stamp for path, stamp in self.stamps.items()):
+            return
+        for name, module in list(sys.modules.items()):
+            if name != "__main__" and module_source_path(module) in self.stamps:
+                del sys.modules[name]
+                # A namespace package has no source, so it stays loaded; drop its
+                # binding too, or `from package import name` returns the old module.
+                parent, _, child = name.rpartition(".")
+                if parent in sys.modules and getattr(sys.modules[parent], child, None) is module:
+                    delattr(sys.modules[parent], child)
+        programs.clear()
+        self.stamps.clear()
+        importlib.invalidate_caches()
+
+
+class FieldReader:
+    """Read NUL-terminated fields from a descriptor in large reads."""
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor: int = descriptor
+        self.pending: bytearray = bytearray()
+        self.start: int = 0
+
+    @property
+    def buffered(self) -> bool:
+        return self.start < len(self.pending)
+
+    def field(self) -> str:
+        while (end := self.pending.find(b"\0", self.start)) < 0:
+            chunk = os.read(self.descriptor, READ_SIZE)
+            if not chunk:
+                raise EOFError
+            del self.pending[:self.start]
+            self.start = 0
+            self.pending += chunk
+        value = os.fsdecode(bytes(self.pending[self.start:end]))
+        self.start = end + 1
+        return value
+
+    def fields(self) -> list[str]:
+        values: list[str] = []
+        while value := self.field():
+            values.append(value)
+        return values
+
+
+def read_call(source: FieldReader) -> HelperCall:
+    program, directory = source.field(), source.field()
+    count = int(source.field())
+    arguments: list[str] = []
+    while len(arguments) < count:
+        arguments.append(source.field())
+    environment = dict(value.split("=", 1) for value in source.fields())
+    return HelperCall(program, directory, arguments, environment, source.field(), source.fields())
+
+
+def load_program(path: str) -> LoadedProgram | SeparateProcess:
+    # Shell fixtures and scripts without main retain their original entry point.
+    # A text search costs far less than a parse of each program at each run.
+    if TOP_LEVEL_MAIN.search(Path(path).read_bytes()) is None:
+        return SeparateProcess()
+    name = "verify_helper_" + hashlib.sha256(os.fsencode(path)).hexdigest()
+    specification = importlib.util.spec_from_file_location(name, path)
+    if specification is None or specification.loader is None:
+        return SeparateProcess()
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[name] = module
+    specification.loader.exec_module(module)
+    main = cast(Callable[..., object], getattr(module, "main"))
+    if inspect.signature(main).parameters:
+        return LoadedProgram(module, lambda: main(sys.argv[1:]))
+    return LoadedProgram(module, main)
+
+
+def replace_environment(values: dict[str, str]) -> None:
+    """Make os.environ equal values; change only the names that differ."""
+    for name in [name for name in os.environ if name not in values]:
+        del os.environ[name]
+    for name, value in values.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+
+
+def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProcess]) -> tuple[str, str, str]:
+    environment = os.environ.copy()
+    arguments, directory, search = sys.argv, os.getcwd(), sys.path[:]
+    streams = sys.stdin, sys.stdout, sys.stderr
+    temporary_parent = tempfile.tempdir
+    status = "fallback"
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdin, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdout, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stderr, \
+            tempfile.TemporaryFile() as forwarded, ExitStack() as live_streams:
+        descriptors = [os.dup(number) for number in range(3)]
+        stderr_output = stderr
+        try:
+            if live_path := call.environment.get("VERIFY_HELPER_STDERR_PATH", ""):
+                live = live_streams.enter_context(os.fdopen(os.open(live_path, os.O_WRONLY | os.O_APPEND),
+                    "w", buffering=1, encoding="utf-8", errors="surrogateescape"))
+                mode = os.fstat(live.fileno()).st_mode
+                if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
+                    raise OSError("the helper cannot share this stderr stream")
+                stderr_output = live
+            replace_environment(call.environment)
+            os.chdir(call.directory)
+            tempfile.tempdir = None
+            sys.argv = [call.program, *call.arguments]
+            sys.path.insert(0, str(Path(call.program).parent))
+            _ = stdin.write(call.stdin)
+            _ = stdin.seek(0)
+            for number, stream in enumerate((stdin, stdout, stderr_output)):
+                _ = os.dup2(stream.fileno(), number)
+            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr_output
+            if "VERIFY_RESULT_ENVIRONMENT_FD" in os.environ:
+                _ = forwarded.write(b"".join(os.fsencode(value) + b"\0" for value in call.forwarded_environment))
+                _ = forwarded.seek(0)
+                os.environ["VERIFY_RESULT_ENVIRONMENT_FD"] = str(forwarded.fileno())
+            if call.program not in programs:
+                try:
+                    programs[call.program] = load_program(call.program)
+                except SystemExit:
+                    # A module that exits at import time runs in its own process from now on.
+                    programs[call.program] = SeparateProcess()
+                    raise
+            program = programs[call.program]
+            if isinstance(program, LoadedProgram):
+                try:
+                    # A ContextVar value lives for one command, as in its own process: each call
+                    # runs in a copy of the helper's context, and the copy ends with the call.
+                    value = contextvars.copy_context().run(program.invoke)
+                    status = str(value if isinstance(value, int) else 0)
+                except SystemExit as exit_request:
+                    value = exit_request.code
+                    status = str(value if isinstance(value, int) else 0 if value is None else 1)
+                    if value is not None and not isinstance(value, int):
+                        print(value, file=sys.stderr)
+                except Exception:
+                    traceback.print_exc()
+                    status = "1"
+        except (Exception, SystemExit):
+            # An import or protocol failure uses the original process path. A module that
+            # exits at import time ends only its call, so the caller runs it in its own process.
+            status = "fallback"
+        finally:
+            stdout.flush()
+            stderr_output.flush()
+            for number, descriptor in enumerate(descriptors):
+                _ = os.dup2(descriptor, number)
+                os.close(descriptor)
+            sys.stdin, sys.stdout, sys.stderr = streams
+            sys.argv, sys.path[:] = arguments, search
+            os.chdir(directory)
+            replace_environment(environment)
+            tempfile.tempdir = temporary_parent
+        _ = stdout.seek(0)
+        _ = stderr.seek(0)
+        output, errors = stdout.read(), stderr.read()
+    if status != "fallback" and (trace := call.environment.get("VERIFY_PY_TRACE")):
+        try:
+            with open(trace + ".calls", "a") as target:
+                _ = target.write("\t".join([Path(call.program).name, *call.arguments]) + "\n")
+        except OSError:
+            pass
+    return status, output, errors
+
+
+def stop_when_parent_exits(parent: int) -> None:
+    """Let Linux stop the helper when its parent exits."""
+    if sys.platform != "linux":
+        return
+    library = ctypes.CDLL(None, use_errno=True)
+    if cast(int, library.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)) != 0:
+        raise OSError(ctypes.get_errno(), "cannot set the helper parent-death signal")
+    if parent == 1 or os.getppid() != parent:
+        raise SystemExit(0)
+
+
+def main() -> int:
+    if trace := os.environ.get("VERIFY_PY_TRACE"):
+        with open(trace, "a") as target:
+            _ = target.write("verify_helper.py\t0\t0\n")
+    parent = os.getppid()
+    stop_when_parent_exits(parent)
+    programs: dict[str, LoadedProgram | SeparateProcess] = {}
+    sources = LoadedSources()
+    with os.fdopen(os.dup(0), "rb", buffering=0) as source, os.fdopen(os.dup(1), "wb") as reply:
+        reader = FieldReader(source.fileno())
+        while True:
+            # Bytes already read belong to the next request, so select would wait for nothing.
+            if not reader.buffered and not select.select([source], [], [], PARENT_CHECK_INTERVAL_SECONDS)[0]:
+                if os.getppid() != parent:
+                    break
+                continue
+            try:
+                call = read_call(reader)
+            except EOFError:
+                break
+            sources.refresh(programs)
+            started = time.time_ns()
+            result = run_call(call, programs)
+            sources.record(started)
+            _ = reply.write(b"".join(os.fsencode(value) + b"\0" for value in result))
+            reply.flush()
+    if len(sys.argv) == 2:
+        Path(sys.argv[1]).unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

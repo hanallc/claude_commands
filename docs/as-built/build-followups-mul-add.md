@@ -32,7 +32,8 @@ The release check sets `CARGO_INCREMENTAL=0` for clippy. It sets `CARGO_TARGET_X
 
 ### Lint-step fix
 
-The normal `verify.sh lint` path runs mend, fmt, Taplo, and Clippy judgment under the tree watch. The judgment uses `--workspace --all-targets --all-features --keep-going -- -D warnings`. A passing judgment ends the stage. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial statuses return directly.
+The normal `verify.sh lint` path runs mend, fmt, Taplo, and Clippy judgment.
+Only the judgment runs under the tree watch. The judgment uses `--workspace --all-targets --all-features --keep-going -- -D warnings`. A passing judgment ends the stage. Status 101 permits repairs for lint findings, compile errors, and unknown diagnostics. A kill, a compiler signal report, or a lint hold prevents repairs. Other initial statuses return directly.
 
 The repair loop reads `clippy_fix_pass_limit` from `${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}` when repairs start. The default is 3. Valid values are integers from 1 through 9999.
 
@@ -48,7 +49,10 @@ The fix pass never sets lint's status. lint ignores its exit code and uses the f
 
 The loop repeats because one fix can expose a new fix. For example, a `mul_add` rewrite can make a function eligible for `const`. A failed judgment is cached under the fixed tree. With one pass only, every later call would hit that cache and never apply the second fix. If the last allowed pass still changes the tree, lint sets `CLIPPY_FIX_LIMIT_REACHED`. Then `lint_failure_is_the_tree` does not cache a failed judgment, so the next call can fix more. A passing judgment at the limit is cached as usual. An empty `tree_key` never ends the loop early, because it cannot prove that the tree stopped changing.
 
-`lint --workspace --check`, `example`, `check`, `test`, `final` and the release check never run a fix pass. Clippy off prints the existing single `SKIPPED` line and runs neither the fix nor the judgment. The cache key includes `verify.sh`, `invoke.sh` and the lint configuration.
+`lint [<package>] --check` never runs a fix pass.
+Neither do `example`, `check`, `test`, `final`, or the release check.
+Clippy off prints one `SKIPPED` line and runs neither the fix nor the judgment.
+The cache key includes `verify.sh`, `invoke.sh`, and the lint configuration.
 
 A fix enters the calling worktree as an uncommitted edit. Buildlog records each fix pass as a clippy step with `--fix` in its argv.
 

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Gate a bumped checkpoint in a standing checkout of its pushed tip."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
+from dataclasses import replace
 import os
-import sys
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_queue.first_step import gate_targets
 from scripts.copies import copies
 
-from merge_checkpoint import (
+from scripts.production.checkpoint_gate import (
     Stop, complete_gate, read_record, record_lock,
-    run_checkpoint_test_steps, save_record,
+    run_checkpoint_test_steps, save_record, test_steps,
 )
-from scripts.production.production_doc import Production
-import sessions
+from scripts.production.production_doc import ProductionDocument
+from scripts.message import sessions
 
 
 def run_gate(path: Path) -> int:
@@ -37,14 +41,23 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
-        with copies.standing(record["slug"], Path(record["checkout"]), record["tip"]) as clone:
-            production = Production(Path(record["production_doc"]), record["slug"], record["merge_branch"],
-                                    clone, Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
-            os.environ["BUILDLOG_UNIT"] = record["unit"]
-            detail = run_checkpoint_test_steps(
-                production, tuple(record["paths"]), tuple(tuple(command) for command in record["merge_tests"]),
-                frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
-            )
+        production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
+            Path(record["checkout"]), Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
+        with copies.requested_source(production.checkout, copies.CommittedSource(record["tip"]), copies.NO_MERGE) as source:
+            steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
+                               tuple(tuple(command) for command in record["merge_tests"]))
+            command = steps[0].command if steps else []
+            # The checkpoint caller places each named gate under its own process.
+            if gate_targets(command):
+                command = []
+            with copies.command_tree(record["owner_id"], source, copies.CommittedSource("HEAD"),
+                                     command, step="integrate") as clone:
+                production = replace(production, checkout=clone)
+                os.environ["BUILDLOG_UNIT"] = record["unit"]
+                detail = run_checkpoint_test_steps(
+                    production, tuple(record["paths"]), tuple(tuple(command) for command in record["merge_tests"]),
+                    frozenset(record["flakes"]), frozenset(record["flaky_tests"]), Path(record["log"]),
+                )
         complete_gate(path, record, "green", detail)
         return 0
     except (Stop, copies.CopyError, OSError, ValueError, KeyError, TypeError) as error:

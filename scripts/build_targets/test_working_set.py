@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import working_set
+from scripts.build_targets import working_set
 from scripts.production import session_staff, staff
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 
 class WorkingSetTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class WorkingSetTests(unittest.TestCase):
                 *, cwd: str = "/home/test/.claude", owner: str = "") -> Path:
         if owner and not any(row.name == owner for row in self.rows):
             self.rows.append(staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
-                current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd))))
+                current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd)), unit_type=staff.UnitDetails("direct")))
         process = self.proc / str(pid)
         process.mkdir()
         _ = (process / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
@@ -128,12 +128,12 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_python_scripts_group_by_path_and_name_the_production_owner(self) -> None:
         script = "/home/test/.claude/scripts/lint/tmp_sweep.py"
-        _ = self.process(201, ["/usr/bin/python3", script, "--dry-run"], 1024, 128, owner="resources-unit")
+        _ = self.process(201, ["/usr/bin/python3", script, "--dry-run"], 1024, 128, owner="resources")
         _ = self.process(202, ["/usr/bin/python3", "-u", "scripts/lint/tmp_sweep.py"], 2048, 256)
         _ = self.process(203, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/record.py"], 512, 64,
-                         cwd="/work/report", owner="report-unit")
+                         cwd="/work/report", owner="report")
         _ = self.process(204, ["/usr/bin/python3", "/home/test/.claude/scripts/buildlog/mac_idle.py"], 256, 32,
-                         cwd="/work/verify", owner="verify-unit")
+                         cwd="/work/verify", owner="verify")
         _ = self.process(205, ["/usr/bin/python3", "/tmp/unowned.py"], 128, 16, cwd="/unassigned")
         _ = self.process(206, ["/usr/bin/python3", "/another/checkout/scripts/lint/tmp_sweep.py"], 64, 8)
 
@@ -142,11 +142,11 @@ class WorkingSetTests(unittest.TestCase):
         detail = {group.script: (group.owner, group.count, group.pss_kib, group.swap_kib)
                   for group in report.groups if group.script}
         self.assertEqual(detail, {
-            script: ("resources-unit", 2, 3072, 384),
-            "/home/test/.claude/scripts/buildlog/record.py": ("report-unit", 1, 512, 64),
-            "/home/test/.claude/scripts/buildlog/mac_idle.py": ("verify-unit", 1, 256, 32),
+            script: ("resources", 2, 3072, 384),
+            "/home/test/.claude/scripts/buildlog/record.py": ("report", 1, 512, 64),
+            "/home/test/.claude/scripts/buildlog/mac_idle.py": ("verify", 1, 256, 32),
             "/tmp/unowned.py": ("unassigned", 1, 128, 16),
-            "/another/checkout/scripts/lint/tmp_sweep.py": ("resources-unit", 1, 64, 8),
+            "/another/checkout/scripts/lint/tmp_sweep.py": ("resources", 1, 64, 8),
         })
         total = next(group for group in report.groups if group.category == "Python helpers" and not group.script)
         self.assertEqual((total.count, total.pss_kib, total.swap_kib), (6, 4032, 504))
@@ -172,22 +172,22 @@ class WorkingSetTests(unittest.TestCase):
             "scripts/direct/test_verify_doc.py",
         )
         for pid, script in enumerate(scripts, start=501):
-            _ = self.process(pid, ["python3", script], 1024, owner="verify-unit")
+            _ = self.process(pid, ["python3", script], 1024, owner="verify")
         report = self.report()
         owners = {group.script: group.owner for group in report.groups if group.script}
         for script in scripts:
             with self.subTest(script=script):
-                self.assertEqual(owners["/home/test/.claude/" + script], "verify-unit")
+                self.assertEqual(owners["/home/test/.claude/" + script], "verify")
 
     def test_phase_and_role_tests_have_their_production_owners(self) -> None:
         for script, owner in (
-            ("scripts/direct/test_phase_process.py", "phases-unit"),
-            ("scripts/production/test_roles_audit.py", "roles-unit"),
+            ("scripts/direct/test_phase_process.py", "phases"),
+            ("scripts/production/test_roles_audit.py", "roles"),
         ):
             with self.subTest(script=script):
                 folder = Path("/work") / owner
                 row = staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
-                    current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder))
+                    current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder), unit_type=staff.UnitDetails("direct"))
                 resolver = session_staff.RowResolver(staff.StaffSnapshot((row,)))
                 self.assertEqual(working_set.owner_for(str(folder / script), resolver), owner)
 
@@ -197,7 +197,7 @@ class WorkingSetTests(unittest.TestCase):
             _ = self.process(pid, ["python3", script], 1024, cwd=f"/work/{owner}", owner=owner)
         _ = self.process(803, ["python3", script], 512, cwd="/work/first-other")
         self.rows.append(staff.StaffRow(staff.StaffId("retired"), "unit", "retired", staff.STAFF_ROOT,
-            current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other"))))
+            current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other")), unit_type=staff.UnitDetails("direct")))
         groups = {(group.script, group.owner): group.pss_kib for group in self.report().groups if group.script}
         self.assertEqual(groups, {(script, "first"): 1024, (script, "second"): 1024, (script, "unassigned"): 512})
 
@@ -216,8 +216,8 @@ class WorkingSetTests(unittest.TestCase):
         self.rows.extend((
             staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", staff.STAFF_ROOT,
                 current_session=staff.StaffId("outer-session"),
-                worktree=staff.PresentWorktree("natedev", Path("/work/unit"))),
-            staff.StaffRow(staff.StaffId("nested-id"), "agent", "nested", staff.STAFF_ROOT,
+                worktree=staff.PresentWorktree("natedev", Path("/work/unit")), unit_type=staff.UnitDetails("direct")),
+            staff.StaffRow(staff.StaffId("nested-id"), "producer", "nested", staff.STAFF_ROOT,
                 current_session=staff.StaffId("nested-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit/nested"))),
         ))
@@ -227,7 +227,7 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_unfilled_worktree_reports_one_problem_and_keeps_the_report(self) -> None:
         self.rows.append(staff.StaffRow(staff.StaffId("pending"), "unit", "pending", staff.STAFF_ROOT,
-                                       current_session=staff.StaffId("pending-session")))
+                                       current_session=staff.StaffId("pending-session"), unit_type=staff.UnitDetails("direct")))
         _ = self.process(813, ["python3", "/shared/helper.py"], 1024)
         with redirect_stderr(io.StringIO()) as errors:
             report = self.report()
@@ -244,11 +244,11 @@ class WorkingSetTests(unittest.TestCase):
     def test_owner_snapshot_loads_ordered_rules_and_rejects_bad_files(self) -> None:
         path = self.root / "owners.json"
         payload = {"generated_on": "2026-10-29", "sources": ["docs/plans/builds-production.md"],
-                   "rules": [{"path": "scripts/a.py", "owner": "a-unit"},
-                             {"path": "scripts/", "owner": "default-unit"}]}
+                   "rules": [{"path": "scripts/a.py", "owner": "a"},
+                             {"path": "scripts/", "owner": "default"}]}
         _ = path.write_text(json.dumps(payload))
         self.assertEqual(working_set.load_owners(path),
-                         (("scripts/a.py", "a-unit"), ("scripts/", "default-unit")))
+                         (("scripts/a.py", "a"), ("scripts/", "default")))
         for content in ("{", "[]", "{}", '{"generated_on": "today", "sources": [], "rules": []}',
                         json.dumps({**payload, "rules": [{"path": "scripts/a.py", "owner": 3}]})):
             with self.subTest(content=content):
@@ -302,7 +302,7 @@ class WorkingSetTests(unittest.TestCase):
         _ = self.process(702, ["nodejs", "--redirect-warnings=/logs/warnings.log",
                                 "/opt/service.js"], 2048, 256, cwd="/unassigned")
         script = "scripts/build_targets/helper.js"
-        _ = self.process(703, ["node", script], 4096, 512, owner="resources-unit")
+        _ = self.process(703, ["node", script], 4096, 512, owner="resources")
         _ = self.process(704, ["python3", script], 512, 64)
 
         with mock.patch.object(working_set, "node_entry", wraps=working_set.node_entry) as entries:

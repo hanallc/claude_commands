@@ -6,11 +6,12 @@ import re
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from functools import cache
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Protocol
 
 from scripts.lib import conf
+from scripts.lib.conf import ConfigurationStamp, UnstampedConfiguration
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 _INITIAL_AGENTS_DIR = AGENTS_DIR
@@ -48,8 +49,14 @@ def note_name(label: str) -> str:
     return f"{parsed.tool}{parsed.number}.md"
 
 
-@cache
 def _configured_notes_dir() -> Path:
+    source = conf.path("accounts")
+    return _notes_dir_at(source, conf.file_stamp(source))
+
+
+# The path and its stamp are the cache key, so a long-lived process (verify_helper.py) sees an edit.
+@lru_cache(maxsize=1)
+def _notes_dir_at(_source: Path, _stamp: ConfigurationStamp | UnstampedConfiguration) -> Path:
     return Path(conf.read("accounts").text("notes_directory")).expanduser()
 
 
@@ -112,6 +119,20 @@ def reset_time(value: str | None) -> KnownReset | NoResetKnown | InvalidReset:
         return InvalidReset(value)
     return KnownReset(parsed if parsed.tzinfo is not None else parsed.astimezone())
 
+
+
+def ahead(resets: str | None, *, now: datetime) -> bool:
+    """Whether a note's reset is still to come."""
+    reset = reset_time(resets)
+    return isinstance(reset, KnownReset) and reset.value > now
+
+
+def remaining(note: FieldReader) -> float | None:
+    """The note's weekly remaining usage in percent, or None when it is absent or not a number."""
+    try:
+        return float(note.get("weekly_remaining_usage") or "")
+    except ValueError:
+        return None
 
 @dataclass
 class Note:

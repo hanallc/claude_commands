@@ -2,11 +2,12 @@
 """Tests for candidates.py: the nightly review's open candidates and the ledger lines a report adds."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 import contextlib
 import io
 import os
 import socket
-import shutil
 import tempfile
 import unittest
 from datetime import datetime
@@ -15,11 +16,15 @@ from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-import candidates
-from candidates import Candidate, TimeGain, TokenGain, Unmeasured
+from scripts.nightly_review import candidates
+from scripts.nightly_review.candidates import Candidate, TimeGain, TokenGain, Unmeasured
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
 # Importable once candidates has put scripts/lib on the path.
-import urgency
+from scripts.lib import file_lock, urgency
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.review_links import efficiency_reviews
 from scripts.lib import conf
 
 
@@ -70,9 +75,14 @@ class CandidatesTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="review")
+        _ = self.enterContext(mock.patch.object(staff, "caller_identity", return_value=""))
         configuration = self.root / "config"
         configuration.mkdir()
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/nightly_review.conf", configuration / "nightly_review.conf")
+        _ = write_config_fixture(configuration / "nightly_review.conf",
+                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
+                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.note = self.root / "nightly improvement list.md"
         with contextlib.ExitStack() as environment:
@@ -198,6 +208,72 @@ class CandidatesTests(unittest.TestCase):
         code, out, _ = self.run_main([])
         self.assertEqual((code, out.splitlines()[2].split(" | ")[0]), (0, "| recommended"))
 
+    def test_outcome_writes_each_state_on_its_own_line_and_a_rerun_changes_nothing(self) -> None:
+        ledger = self.root / "ledger.md"
+        head = "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] [by: unit-1]"
+        other = "- 2026-10-05 config: Other [gain/week: 2 min waiting] — proposed"
+        moment = datetime(2026, 10, 13, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+        cases: tuple[tuple[str, list[str], str], ...] = (("accepted", ["--applied", "claude abc123"], "accepted 2026-10-13, applied (claude abc123)"),
+                 ("declined", [], "declined"), ("deferred", ["--waiting-why", "The owner must finish the earlier check."], "deferred"),
+                 ("done", [], "done 2026-10-13"), ("relayed", [], "relayed 2026-10-13"))
+        with mock.patch.object(candidates, "now", return_value=moment):
+            for state, options, words in cases:
+                with self.subTest(state=state):
+                    _ = ledger.write_text(f"{other}\n{head} — proposed\n")
+                    code, out, err = self.run_main(["outcome", "sdlc/E2", state, *options])
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(ledger.read_text(), f"{other}\n{head} — {words}\n")
+                    self.assertEqual(out, f"E2: {head} — {words}\n")
+                    self.assertEqual(self.run_main(["outcome", "E2", state, *options]),
+                                     (0, f"E2 unchanged: {head} — {words}\n", ""))
+            self.assertIn("Other", self.note.read_text())
+            self.note.unlink()
+            elsewhere = self.root / "elsewhere.md"
+            _ = elsewhere.write_text(f"{head} — proposed\n")
+            self.assertEqual(self.run_main(["outcome", "E1", "declined", "--ledger", str(elsewhere)])[0], 0)
+            self.assertEqual((elsewhere.read_text(), self.note.exists()), (f"{head} — declined\n", False))
+            _ = ledger.write_text(f"{other}\n{head} — declined\n")
+            code, _, err = self.run_main(["outcome", "E2", "done"])
+            self.assertEqual((code, err.split(":")[0]), (1, "candidates"))
+            self.assertEqual(ledger.read_text(), f"{other}\n{head} — declined\n")
+            for arguments in (["outcome", "E2", "accepted"], ["outcome", "E2", "declined", "--applied", "x"],
+                              ["outcome", "P2", "declined"], ["outcome", "E0", "declined"], ["outcome", "E2", "kept"]):
+                with self.subTest(arguments=arguments):
+                    self.assertEqual(self.run_main(arguments)[0], 2)
+
+    def test_cli_ledger_writes_exclude_a_review_writer_from_the_read_through_the_write(self) -> None:
+        ledger = self.root / "ledger.md"
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        _ = report.write_text(REPORT)
+        _ = ledger.write_text(LEDGER)
+        lock = efficiency_reviews.path(ledger).with_suffix(".lock")
+        read = candidates.read_lines
+        collisions: list[str] = []
+
+        def contend(step: str) -> None:
+            with file_lock.exclusive(lock, wait=False) as result:
+                if result == file_lock.LockResult.BUSY:
+                    collisions.append(step)
+
+        def read_ledger(path: Path) -> list[str]:
+            if path == ledger:
+                contend("read")
+            return read(path)
+
+        def write_ledger(path: Path, content: str) -> None:
+            if path == ledger:
+                contend("write")
+            write_text_atomic(path, content)
+
+        for args in (["record", str(report)], ["outcome", "E2", "done"]):
+            with self.subTest(command=args[0]), mock.patch.multiple(
+                    candidates, read_lines=read_ledger, write_text_atomic=write_ledger):
+                collisions.clear()
+                code, _, error = self.run_main(args)
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(collisions[:2], ["read", "write"])
+
     def test_a_line_gives_its_night_area_gain_and_state(self) -> None:
         self.assertEqual(
             candidates.open_candidate("- 2026-10-11 config, also found: Duplicate CLAUDE.md [gain/week: 0.4% of tokens] — proposed"),
@@ -206,6 +282,16 @@ class CandidatesTests(unittest.TestCase):
         evening = candidates.open_candidate("- 2026-09-29-evening rust/hana: One feature set — deferred")
         self.assertEqual(evening, Candidate("2026-09-29-evening", "rust/hana", "", "One feature set", "", "deferred"))
         self.assertIsNone(candidates.open_candidate("One line per night."))
+        source = "4b2b7c73-5bed-4df0-a688-f72da64b598c"
+        for gain in ("", "38 min waiting"):
+            for by in ("", source):
+                with self.subTest(gain=gain, by=by):
+                    gain_tag = f" [gain/week: {gain}]" if gain else ""
+                    source_tag = f" [by: {by}]" if by else ""
+                    line = f"- 2026-10-12 rust/hana: Faster tests{gain_tag}{source_tag} — proposed"
+                    candidate = Candidate("2026-10-12", "rust/hana", "", "Faster tests", gain, "proposed", by=by)
+                    self.assertEqual(candidate.line, line)
+                    self.assertEqual(candidates.open_candidate(line), candidate)
 
     def test_the_table_marks_the_first_measured_row_recommended(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
@@ -350,6 +436,8 @@ class CandidatesTests(unittest.TestCase):
 
     def test_empty_or_unset_note_path_uses_the_default_under_a_temporary_home(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        _ = write_config_fixture(self.root / "config/nightly_review.conf",
+            "note_path=~/rust/hanadocs/nightly improvement list.md\n")
         default = self.root / "rust" / "hanadocs" / "nightly improvement list.md"
         default.parent.mkdir(parents=True)
         for value in ("", None):
@@ -503,21 +591,34 @@ class CandidatesTests(unittest.TestCase):
         night.mkdir()
         report = night / "rust.md"
         _ = report.write_text(REPORT, encoding="utf-8")
-        _ = (self.root / "ledger.md").write_text("- 2026-10-11 config: Earlier — proposed\n", encoding="utf-8")
-        expected = [
+        untagged = [
             "- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed",
             "- 2026-10-12 rust/hana, also found: The reload tests share one port [gain/week: 12 min red CI] — proposed",
             "- 2026-10-12 rust/hana, also found: Stale style rule — proposed",
             "- 2026-10-12 rust/hana, also found: A plain item — proposed",
             "- 2026-10-12 rust/hana, noted: Target choice was close — proposed",
         ]
-        code, out, err = self.run_main(["record", str(report)])
-        self.assertEqual((code, err, out.splitlines()), (0, "", expected))
-        ledger = (self.root / "ledger.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(ledger, ["- 2026-10-11 config: Earlier — proposed", *expected])
-        self.assertEqual([each.title for each in candidates.ranked(ledger)][:2],
-                         ["Run the GPU tests 8 at a time", "The reload tests share one port"])
-        self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
+        owner = fixture_member("showrunner", name="review")
+        unit = fixture_member("unit", name="tests", parent=owner.id)
+        unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("review-restarted")))
+        worker = fixture_member("worker", name="writer", parent=unit.id)
+        for caller, source, has_staff in (("", "", True), (owner.current_session, "", True),
+                                          (unit.current_session, unit.id, True), (worker.current_session, "", True),
+                                          ("", "", False)):
+            with (self.subTest(caller=caller, has_staff=has_staff),
+                  mock.patch.object(staff, "caller_identity", return_value=caller)):
+                if not has_staff:
+                    (self.root / "staff.json").unlink()
+                _ = (self.root / "ledger.md").write_text("- 2026-10-11 config: Earlier — proposed\n", encoding="utf-8")
+                expected = [line.replace(" — proposed", f" [by: {source}] — proposed")
+                            if source else line for line in untagged]
+                code, out, err = self.run_main(["record", str(report)])
+                self.assertEqual((code, err, out.splitlines()), (0, "", expected))
+                ledger = (self.root / "ledger.md").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(ledger, ["- 2026-10-11 config: Earlier — proposed", *expected])
+                self.assertEqual([each.title for each in candidates.ranked(ledger)][:2],
+                                 ["Run the GPU tests 8 at a time", "The reload tests share one port"])
+                self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
 
     def test_record_keeps_a_line_whose_outcome_was_already_written(self) -> None:
         night = self.root / "2026-10-12"
@@ -590,19 +691,22 @@ class NightlyReviewConfigTests(unittest.TestCase):
                 _ = settings.write_text("# whole: 1..\ntitle_characters=5\n")
                 self.assertEqual(candidates.escaped("A longer title", conf.read("nightly_review").whole("title_characters")), "A lo…")
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/nightly_review.conf")
-        for key, expected in {'state_directory': '~/.local/state', 'state_folder': 'nightly-review', 'sessions_directory': '~/.claude/sessions', 'review_modes': 'config rust messages', 'note_path': '~/rust/hanadocs/nightly improvement list.md', 'primary_showrunner_name': 'natedev', 'command_path': '~/.claude/commands/nightly_review.md'}.items():
+    def test_shipped_config_supplies_the_settings_used_by_nightly_review(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "nightly_review.conf"
+        _ = write_config_fixture(path)
+        settings = conf.read(path)
+        values = settings.values()
+        for key in ("state_directory", "state_folder", "sessions_directory", "review_modes", "note_path",
+                    "primary_showrunner_name", "command_path"):
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
-        for key, expected in {'message_sample_rows': 20, 'title_characters': 90}.items():
+                self.assertEqual(settings.text(key), values[key])
+        for key in ("message_sample_rows", "title_characters"):
             with self.subTest(key=key):
-                self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'sample_timeout_overhead_seconds': 15.0, 'message_history_hours': 24.0}.items():
+                self.assertEqual(settings.whole(key), int(values[key]))
+        for key in ("sample_timeout_overhead_seconds", "message_history_hours"):
             with self.subTest(key=key):
-                self.assertEqual(settings.number(key), expected)
+                self.assertEqual(settings.number(key), float(values[key]))
 
 if __name__ == "__main__":
     _ = unittest.main()

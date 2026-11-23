@@ -3,28 +3,26 @@ from __future__ import annotations
 
 from scripts.production.fake_unit_host import labeled as labeled_host
 
-from scripts.lib.test_models_registry import write_registry
+from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 
 import contextlib
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import fake_unit_host
-import unit_effort
-import unit_lookup
-import herdr
-from fake_herdr import CommandResponse
-from fake_unit_host import HostedUnit
-from unit_effort import Ready, Skipped
+from scripts.production import fake_unit_host
+from scripts.production import unit_effort
+from scripts.production import unit_lookup
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import HostedUnit
+from scripts.production.unit_effort import Ready, Skipped
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import models_registry  # noqa: E402
 from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, fixture_runtime_id, fixture_member
 
@@ -83,6 +81,7 @@ class UnitEffortTests(unittest.TestCase):
         synced = self.root / "catalog-sync-success"
         synced.touch()
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -93,17 +92,16 @@ class UnitEffortTests(unittest.TestCase):
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
-            labeled_host("review", "w1:p1", "review", slug="build-followups", screen=EMPTY),
-            labeled_host("widget", "w2:p1", "widget", slug="tool-based-ui", screen=screen("❯ my draft")),
-            labeled_host("trunk", "w3:p1", "trunk", slug="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
+            labeled_host("review", "w1:p1", "review", production_name="build-followups", screen=EMPTY),
+            labeled_host("widget", "w2:p1", "widget", production_name="tool-based-ui", screen=screen("❯ my draft")),
+            labeled_host("trunk", "w3:p1", "trunk", production_name="tool-based-ui", screen=screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
         identities = {unit.session: unit.marks["CODEX_THREAD_ID"] for unit in units
                       if "CODEX_THREAD_ID" in unit.marks}
-        notes = fixture_member("agent", name="notes", runtime_id=fixture_runtime_id("notes"))
+        notes = fixture_member("producer", name="notes", runtime_id=fixture_runtime_id("notes"))
         identities["notes"] = notes.current_session
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
@@ -152,14 +150,48 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.director_row(), "director=opus:xhigh")
 
+    def test_each_effort_command_reads_one_base_and_its_children_share_it(self) -> None:
+        probe = RegistryReadProbe(self.root, self.registry)
+        for current, expected in (("opus:xhigh", "opus:high (now opus:xhigh)"),
+                                  ("sonnet:medium", "sonnet:high (now sonnet:medium)")):
+            with self.subTest(current=current):
+                _ = write_registry(self.registry, {"production.claude": {"director": current}})
+                probe.clear()
+                with probe.active(os.environ):
+                    code, output, errors = self.run_main("high", "--check")
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("registry: production.director would be " + expected, output)
+                self.assertEqual(probe.total(), 1, probe.reads())
+        self.assertEqual(self.sent(), [])
+
     def test_every_productions_directors_get_effort_and_the_row_keeps_its_model(self) -> None:
-        code, out, _ = self.run_main("high")
-        self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[-1], "registry: production.director is now opus:high (was opus:xhigh)")
-        self.assertIn("widget: skipped — a draft is in its input line", out)
-        self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
-                                       ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
-        self.assertEqual(self.director_row(), "director=opus:high")
+        config = self.root / "claude-config"
+        catalog = config / "cache/model-catalog/fixture-cc.json"
+        catalog.parent.mkdir(parents=True)
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        binary = binaries / "claude"
+        _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
+        binary.chmod(0o755)
+        for model in ("opus", "claude-opus-fixture"):
+            with self.subTest(model=model), mock.patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": str(config), "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+            }):
+                _ = write_registry(self.registry, {"production.claude": {"director": "opus:xhigh"}}, update=True)
+                if model != "opus":
+                    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+                        "provider_alias_targets": {"opus": {"default": model}},
+                        "models": [{"id": model, "min_claude_code_version": "2.1.319"}],
+                    }}}))
+                (self.root / "herdr.log").unlink(missing_ok=True)
+                code, out, _ = self.run_main("high")
+                self.assertEqual(code, 0)
+                self.assertEqual(out.splitlines()[-1],
+                                 "registry: production.director is now opus:high (was opus:xhigh)")
+                self.assertIn("widget: skipped — a draft is in its input line", out)
+                self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
+                                               ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
+                self.assertEqual(self.director_row(), "director=opus:high")
 
     def test_a_level_the_model_does_not_take_is_refused_before_anything_happens(self) -> None:
         code, _, err = self.run_main("extreme")
@@ -208,6 +240,14 @@ class UnitEffortTests(unittest.TestCase):
 
 
 class NativeDirectorEffortTests(StaffTestCase):
+    def test_director_lines_report_an_unreadable_pane_list(self) -> None:
+        from scripts.production import session_staff
+
+        every = unit_lookup.LabeledProductions({}, {"show": ("unit",)}, unreadable_pane_lists=(
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        lines = unit_effort.director_lines(every, "high", True)
+        self.assertTrue(any("unknown" in line and "pane list denied" in line for line in lines), lines)
+
     def test_unknown_and_stopped_directors_require_no_pane_io(self) -> None:
         for state in (unit_lookup.ClaudeUnknown("unreadable session"), unit_lookup.ClaudeNotRunning()):
             with self.subTest(state=state):

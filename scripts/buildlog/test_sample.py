@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Tests for fixture parsing and one isolated machine memory sample."""
 
 from __future__ import annotations
@@ -8,33 +8,38 @@ import os
 import re
 import socket
 import subprocess
-import sys
 import tempfile
+import time
 import unittest
-from datetime import datetime
+from contextlib import closing
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import cli
-import index
-import sample
-import store
-from cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
-from test_index import use_test_log
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.cargo_output_test_support import fake_cargo_output_roots
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.buildlog import cli
+from scripts.buildlog import index
+from scripts.buildlog import report
+from scripts.buildlog import sample
+from scripts.buildlog import store
+from scripts.buildlog.cgroup_test_support import CPU, GIB, ZRAM_READING, write_cgroup, write_zram
+from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
+from scripts.buildlog.test_index import use_test_log
+from scripts.lib import test_hang_guard
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 
 use_test_log()
 
 CLI = Path(__file__).with_name("cli.py")
 Record = dict[str, object]
+SCCACHE_STATS = json.dumps({
+    "stats": {"compile_requests": 90, "cache_hits": {"counts": {"Rust": 30, "C/C++": 25}},
+              "cache_misses": {"counts": {"Rust": 10, "C/C++": 13}}},
+    "cache_size": 8192, "max_cache_size": 16384,
+})
+SCCACHE_PID = 701
+SCCACHE_ACTIVE = f"ActiveState=active\nExecMainStartTimestampMonotonic=123456\nMainPID={SCCACHE_PID}\n"
+SCCACHE_REQUEST = "[2026-10-02T12:00:00Z DEBUG sccache::commands] request_stats\n"
 
 
 class SampleTests(unittest.TestCase):
@@ -46,6 +51,11 @@ class SampleTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         proc = self.root / "proc"
         proc.mkdir(parents=True, exist_ok=True)
+        daemon = proc / str(SCCACHE_PID)
+        daemon.mkdir()
+        _ = (daemon / "environ").write_bytes(b"SCCACHE_START_SERVER=1\0")
+        (daemon / "cwd").mkdir()
+        _ = self.enterContext(patch.object(sample, "PROC", proc))
         for name, content in (
             ("cpu_pressure", "some total=12000000\nfull total=3000000\n"),
             ("io_pressure", "some total=4000000\nfull total=1000000\n"),
@@ -63,6 +73,146 @@ class SampleTests(unittest.TestCase):
         with patch.dict(os.environ, {"BUILDLOG_ZRAM": str(zram)}):
             row = self.power_profile_sample(self.root / "missing.ini")
         self.assertEqual(row["zram"], ZRAM_READING)
+
+    def test_hourly_sccache_sample_indexes_rust_counts_and_disk_sizes(self) -> None:
+        boot = self.root / "proc/boot_id"
+        _ = boot.write_text("fixture-boot\n")
+        at = 1_792_031_396.125
+        with (patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}),
+              patch.object(store, "host_name", return_value="fixture-host"),
+              patch.object(sample, "BOOT_ID", boot),
+              patch.object(time, "time", return_value=at),
+              patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, ""),
+                  subprocess.CompletedProcess(["sccache"], 0, SCCACHE_STATS, SCCACHE_REQUEST),
+                  subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, ""),
+              ]) as run):
+            self.assertEqual(sample.sccache_sample(), 0)
+            self.assertEqual([call.args[0][0] for call in run.call_args_list], ["systemctl", "sccache", "systemctl"])
+            self.assertEqual(run.call_args_list[1].args[0], ["sccache", "--show-stats", "--stats-format", "json"])
+            self.assertEqual(index.update(), 1)
+            with closing(index.read_only()) as connection:
+                rows = cast(list[tuple[object, ...]], connection.execute(
+                    "SELECT host, at, boot_id, server_started_us, rust_compile_requests, rust_hits, rust_misses,"
+                    + " rust_hit_rate, cache_size, max_cache_size FROM sccache_samples").fetchall())
+                self.assertEqual(rows, [("fixture-host", store.utc_iso(at), "fixture-boot", 123456,
+                                         40, 30, 10, 0.75, 8192, 16384)])
+                self.assertEqual(connection.execute("SELECT count(*) FROM samples").fetchone(), (0,))
+
+    def test_sccache_sample_uses_the_service_environment_and_working_directory(self) -> None:
+        boot = self.root / "proc/boot_id"
+        _ = boot.write_text("fixture-boot\n")
+        daemon = self.root / "proc" / str(SCCACHE_PID)
+        server_socket = daemon / "cwd" / "cache.sock"
+        caller_socket = self.root / "cache.sock"
+        server_socket.touch()
+        caller_socket.touch()
+        caller = {"BUILDLOG_DIR": str(self.root), "SCCACHE_SERVER_PORT": "9001",
+                  "SCCACHE_SERVER_UDS": "/run/caller.sock", "SCCACHE_DIR": "/tmp/caller",
+                  "SCCACHE_LOG": "off", "SCCACHE_OTHER": "caller", "RUST_LOG_STYLE": "always"}
+        service = {
+            b"SCCACHE_CACHE_SIZE=128G": {"SCCACHE_CACHE_SIZE": "128G"},
+            b"SCCACHE_SERVER_UDS=/run/service $cache.sock": {"SCCACHE_SERVER_UDS": "/run/service $cache.sock"},
+            b"SCCACHE_SERVER_UDS=cache.sock": {"SCCACHE_SERVER_UDS": "cache.sock"},
+        }
+        for assignments, settings in service.items():
+            with self.subTest(settings=settings):
+                environ = daemon / "environ"
+                _ = environ.write_bytes(assignments + b"\0SCCACHE_START_SERVER=1\0BUILDLOG_SCCACHE_FIXTURE_SERVICE_ONLY=1\0")
+                active = subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, "")
+                stats = subprocess.CompletedProcess(["sccache"], 0, SCCACHE_STATS, SCCACHE_REQUEST)
+                with (patch.dict(os.environ, caller), patch.object(sample, "BOOT_ID", boot),
+                      patch.object(subprocess, "run", side_effect=[active, stats, active]) as run):
+                    self.assertEqual(sample.sccache_sample(), 0)
+                for call in (run.call_args_list[0], run.call_args_list[2]):
+                    command = cast(list[str], call.args[0])
+                    self.assertIn("--property=MainPID", command)
+                    self.assertIn("--property=ActiveState", command)
+                    self.assertIn("--property=ExecMainStartTimestampMonotonic", command)
+                client = run.call_args_list[1]
+                environment = cast(dict[str, str], client.kwargs["env"])
+                self.assertEqual({key: value for key, value in environment.items() if key.startswith("SCCACHE_")},
+                                 {**settings, "SCCACHE_LOG": "sccache::commands=debug"})
+                self.assertEqual(environment["RUST_LOG_STYLE"], "never")
+                self.assertNotIn("BUILDLOG_SCCACHE_FIXTURE_SERVICE_ONLY", environment)
+                cwd = cast(Path, client.kwargs.get("cwd", caller_socket.parent))
+                if environment.get("SCCACHE_SERVER_UDS") == "cache.sock":
+                    self.assertTrue((cwd / "cache.sock").samefile(server_socket))
+                self.assertEqual(cwd, daemon / "cwd")
+
+    def test_sccache_sample_omits_failed_reads_and_restarts(self) -> None:
+        boot = self.root / "proc/boot_id"
+        _ = boot.write_text("fixture-boot\n")
+        active = subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, "")
+        stats = subprocess.CompletedProcess(["sccache"], 0, SCCACHE_STATS, SCCACHE_REQUEST)
+        outcomes: dict[str, list[subprocess.CompletedProcess[str] | BaseException]] = {
+            "inactive": [subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE.replace("=active", "=inactive"), "")],
+            "missing binary": [active, FileNotFoundError("sccache")],
+            "unusable cwd": [active, NotADirectoryError("cwd")],
+            "failure": [active, subprocess.CalledProcessError(1, "sccache")],
+            "timeout": [active, subprocess.TimeoutExpired("sccache", 2)],
+            "bad JSON": [active, subprocess.CompletedProcess(["sccache"], 0, "{", SCCACHE_REQUEST)],
+            "bad size": [active, subprocess.CompletedProcess(["sccache"], 0,
+                                                             SCCACHE_STATS.replace("8192", "-1"), SCCACHE_REQUEST)],
+            "restart": [active, stats,
+                        subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE.replace("123456", "234567"), "")],
+            "changed PID": [active, stats,
+                            subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE.replace(
+                                f"MainPID={SCCACHE_PID}", f"MainPID={SCCACHE_PID + 1}"), "")],
+        }
+        for case, replies in outcomes.items():
+            with (self.subTest(case=case), patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}),
+                  patch.object(sample, "BOOT_ID", boot), patch.object(subprocess, "run", side_effect=replies)):
+                self.assertEqual(sample.sccache_sample(), 0)
+            self.assertEqual(list(self.root.rglob("samples-*.jsonl")), [])
+
+    def test_sccache_sample_requires_a_readable_server_environment(self) -> None:
+        boot = self.root / "proc/boot_id"
+        _ = boot.write_text("fixture-boot\n")
+        active = subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, "")
+        proc = self.root / "proc"
+        environ = proc / str(SCCACHE_PID) / "environ"
+        environ.unlink()
+        environ.mkdir()
+        for case, root in (("missing", self.root / "missing-proc"), ("unreadable", proc)):
+            with (self.subTest(case=case), patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}),
+                  patch.object(sample, "BOOT_ID", boot), patch.object(sample, "PROC", root),
+                  patch.object(subprocess, "run", return_value=active) as run):
+                self.assertEqual(sample.sccache_sample(), 0)
+                run.assert_called_once()
+            self.assertEqual(list(self.root.rglob("samples-*.jsonl")), [])
+
+    def test_sccache_connection_fallback_does_not_inflate_the_next_delta(self) -> None:
+        boot = self.root / "proc/boot_id"
+        _ = boot.write_text("fixture-boot\n")
+        active = subprocess.CompletedProcess(["systemctl"], 0, SCCACHE_ACTIVE, "")
+        environment = {"BUILDLOG_DIR": str(self.root), **mac_natedev_environment(self.root)}
+        with (patch.dict(os.environ, environment), patch.object(store, "host_name", return_value="natedev"),
+              patch.object(sample, "BOOT_ID", boot)):
+            for day, hour, hits, misses, request in ((1, 12, 0, 0, SCCACHE_REQUEST), (2, 12, 100, 50, SCCACHE_REQUEST),
+                                                    (2, 13, 0, 0, ""), (2, 14, 110, 80, SCCACHE_REQUEST)):
+                at = datetime(2026, 10, day, hour, tzinfo=UTC).timestamp()
+                stats = json.dumps({"stats": {"compile_requests": hits + misses,
+                                              "cache_hits": {"counts": {"Rust": hits} if hits else {}},
+                                              "cache_misses": {"counts": {"Rust": misses} if misses else {}}},
+                                    "cache_size": None, "max_cache_size": 16384})
+                reply = subprocess.CompletedProcess(["sccache"], 0, stats, request)
+                with (patch.object(time, "time", return_value=at),
+                      patch.object(subprocess, "run", side_effect=[active, reply, active])):
+                    self.assertEqual(sample.sccache_sample(), 0)
+            _ = index.update()
+            with closing(index.read_only()) as connection:
+                day = date(2026, 10, 2)
+                self.assertEqual(report.sccache_hit_rate(connection, day, day),
+                                 "Rust sccache hit rate (2026-10-02 to 2026-10-02): 25.00% (10 hits, 30 misses)")
+                self.assertEqual(connection.execute(
+                    "SELECT rust_hits, rust_misses FROM sccache_samples ORDER BY at").fetchall(),
+                    [(0, 0), (100, 50), (110, 80)])
+
+    def test_sccache_counts_without_rust_keep_unavailable_size(self) -> None:
+        reading = sample.parse_sccache_stats(SCCACHE_STATS.replace('"Rust"', '"Other"').replace("8192", "null"))
+        self.assertEqual(reading, {"rust_compile_requests": 0, "rust_hits": 0, "rust_misses": 0,
+                                   "rust_hit_rate": None, "cache_size": None, "max_cache_size": 16384})
 
     def test_sample_keeps_memory_counters_when_zram_directory_is_unreadable(self) -> None:
         blocked = self.root / "blocked"
@@ -83,8 +233,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(row["mem_used_bytes"], 12 * 1024)
 
     def test_default_filesystem_uses_resolved_intermediate_root(self) -> None:
-        import filesystem
-        from cargo_output import CargoOutputRoots
+        from scripts.buildlog import filesystem
+        from scripts.lib.cargo_output import CargoOutputRoots
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
@@ -100,14 +250,14 @@ class SampleTests(unittest.TestCase):
 
     def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
         command = (
-            "import sys; sys.path.insert(0, sys.argv[1]); import sample; "
+            "import sys; from scripts.buildlog import sample; "
             "reading = sample.filesystem_reading(); "
             "assert reading['state'] == 'measured', reading; "
-            "assert 'disk' not in sys.modules, 'filesystem reading imported disk'; "
-            "assert 'sweep' not in sys.modules, 'filesystem reading imported sweep'"
+            "assert 'scripts.buildlog.disk' not in sys.modules, 'filesystem reading imported disk'; "
+            "assert 'scripts.lint.sweep' not in sys.modules, 'filesystem reading imported sweep'"
         )
         result = subprocess.run(
-            ["python3", "-c", command, str(CLI.parent)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command],
             cwd=CLI.parents[2],
             env={**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET_FILESYSTEM": str(self.root)},
             capture_output=True,
@@ -118,8 +268,8 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_failed_output_mapping_reports_unavailable(self) -> None:
-        import filesystem
-        from cargo_output import CargoOutputUnavailable
+        from scripts.buildlog import filesystem
+        from scripts.lib.cargo_output import CargoOutputUnavailable
 
         with patch.dict(os.environ, {}, clear=True), \
              patch.object(sample, "read_cargo_output_roots", return_value=CargoOutputUnavailable("no metadata")), \
@@ -152,7 +302,7 @@ class SampleTests(unittest.TestCase):
                 self.assertEqual(sample.free_pool_tokens("/dev/steve"), {"state": "unavailable"})
 
     def test_sample_shares_slice_capture_and_preserves_ci_when_builds_file_is_unreadable(self) -> None:
-        import cgroup_capture
+        from scripts.buildlog import cgroup_capture
 
         builds, ci = self.root / "builds.slice", self.root / "ci.slice"
         write_cgroup(builds, with_io=False)
@@ -171,7 +321,7 @@ class SampleTests(unittest.TestCase):
                                             "ci": {"state": "measured", "free_pool_tokens": 7}})
 
     def test_cli_sample_reads_each_slice_file_once(self) -> None:
-        import cgroup_capture
+        from scripts.buildlog import cgroup_capture
 
         builds, ci = self.root / "builds.slice", self.root / "ci.slice"
         write_cgroup(builds)
@@ -366,13 +516,14 @@ class SampleTests(unittest.TestCase):
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
-        _ = (proc / "boot_id").write_text("test-boot\n")
+        (proc / "sys/kernel/random").mkdir(parents=True, exist_ok=True)
+        _ = (proc / "sys/kernel/random/boot_id").write_text("test-boot\n")
         with patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root),
                                   "BUILDLOG_BUILDS_CGROUP": str(self.root / "absent-builds"),
                                   "BUILDLOG_CI_CGROUP": str(self.root / "absent-ci")}), \
              patch.object(sample, "MEMINFO", proc / "meminfo"), \
              patch.object(sample, "PRESSURE", proc / "pressure"), \
-             patch.object(sample, "BOOT_ID", proc / "boot_id"), \
+             patch.object(sample, "BOOT_ID", proc / "sys/kernel/random/boot_id"), \
              patch.object(sample, "POWER_PROFILE_STATE", state), \
              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["stevie"], 0, "7\n", "")):
             if via_cli:
@@ -413,11 +564,11 @@ class SampleTests(unittest.TestCase):
         missing = self.root / "no-proc" / "meminfo"
         command = (
             "import sys; from pathlib import Path; "
-            "sys.path.insert(0, sys.argv[1]); import sample, cli; "
-            "sample.MEMINFO = Path(sys.argv[2]); sys.exit(cli.main(['sample']))"
+            "from scripts.buildlog import sample, cli; "
+            "sample.MEMINFO = Path(sys.argv[1]); sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(CLI.parent), str(missing)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(missing)],
             env={**os.environ, "BUILDLOG_DIR": str(self.root)},
             capture_output=True,
             text=True,
@@ -433,7 +584,8 @@ class SampleTests(unittest.TestCase):
         proc.mkdir(parents=True, exist_ok=True)
         _ = (proc / "meminfo").write_text("MemTotal: 16384 kB\nMemAvailable: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 1024 kB\n")
         _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
-        _ = (proc / "boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
+        (proc / "sys/kernel/random").mkdir(parents=True, exist_ok=True)
+        _ = (proc / "sys/kernel/random/boot_id").write_text("d963a34a-50fa-48a8-8485-8b219c45fe02\n")
         builds = self.root / "builds.slice"
         ci = self.root / "ci.slice"
         builds.mkdir(parents=True)
@@ -456,10 +608,10 @@ class SampleTests(unittest.TestCase):
         environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILDS_CGROUP": str(builds),
                        "BUILDLOG_CI_CGROUP": str(ci), "BUILDLOG_ZRAM": str(zram)}
         command = (
-            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "import sample, cli; proc = Path(sys.argv[2]); "
+            "import sys; from pathlib import Path; "
+            "from scripts.buildlog import sample, cli; proc = Path(sys.argv[1]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
-            "sample.BOOT_ID = proc / 'boot_id'; "
+            "sample.BOOT_ID = proc / 'sys/kernel/random/boot_id'; "
             "from unittest.mock import patch; from contextlib import ExitStack; "
             "stack = ExitStack(); "
             "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots; "
@@ -468,10 +620,12 @@ class SampleTests(unittest.TestCase):
             "stack.enter_context(patch.object(sample, 'IO_PRESSURE', proc / 'io_pressure')); "
             "stack.enter_context(patch.object(sample, 'STAT', proc / 'stat')); "
             "stack.enter_context(patch.object(sample, 'POWER_PROFILE_STATE', proc / 'absent-profile')); "
+            "from scripts.buildlog import machine_facts; "
+            "stack.enter_context(patch.object(machine_facts, 'sample_once')); "
             "sys.exit(cli.main(['sample']))"
         )
         result = subprocess.run(
-            [sys.executable, "-c", command, str(CLI.parent), str(proc)],
+            [str(CLI.parents[1] / "lib/py"), "-c", command, str(proc)],
             env=environment,
             capture_output=True,
             text=True,

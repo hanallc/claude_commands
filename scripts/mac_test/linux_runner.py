@@ -1,52 +1,57 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Execute trusted source in a cached Linux development shell."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
+from array import array
 from collections.abc import Generator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from importlib import import_module
 import fcntl
-import hashlib
 import json
 import math
 import os
 import re
+import selectors
 from pathlib import Path
 import shlex
 import shutil
-import signal
 import subprocess
-import sys
-import tempfile
+import termios
 import time
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
-from types import FrameType
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_stat
+from scripts.lib.dev_shell import (
+    ShellEnvironment as ShellEnvironment,
+    exports_are_valid as exports_are_valid,
+    prepare_shell as prepare_shell,
+    shell_inputs as shell_inputs,
+    shell_key as shell_key,
+)
+from scripts.mac_test import floor_claims
+from scripts.mac_test.abandoned_sessions import removal_script
+
 if TYPE_CHECKING:
-    from ..lib import build_folders
-    from ..lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from ..aws_target import ledger
-    from ..build_targets.target_config import SshTarget, is_aws_target
-else:
-    from scripts.lib import build_folders
+    from scripts.copies import copies
+    from scripts.lib import build_folders, build_slots
+    from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from scripts.build_targets.target_config import SshTarget, is_aws_target
+else:
+    from scripts.copies import copies
+    from scripts.lib import build_folders
+    from scripts.lib.boot_identity import boot_identity as boot_identity
+    from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 
 
 PROC_ROOT = Path('/proc')
-
-
-def boot_identity(proc_root: Path = PROC_ROOT) -> str:
-    identity = (proc_root / 'sys/kernel/random/boot_id').read_text().strip()
-    if not identity:
-        raise ValueError('boot identity is missing')
-    return identity
 
 
 class SlotBoot(Enum):
@@ -68,92 +73,158 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
 
 
 @dataclass(frozen=True)
-class ShellEnvironment:
-    """Exports published after a successful shell evaluation."""
+class LeasedSlotExecution:
+    """Execute with the maker's held slot and its Cargo environment."""
 
-    key: str
-    exports: Path
-    inputs: Path
-
-
-def shell_inputs(root: Path) -> tuple[Path, ...]:
-    """List the shell inputs without source files or build output."""
-    paths = [root / 'flake.nix', root / 'flake.lock']
-    nix = root / 'nix'
-    if nix.is_symlink():
-        raise ValueError('unsafe shell input directory: nix')
-    if nix.exists():
-        children = tuple(nix.rglob('*'))
-        if any(path.is_symlink() for path in children):
-            raise ValueError('shell inputs must not contain symbolic links')
-        paths.extend(path for path in children if not path.is_dir())
-    for path in paths:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f'unsafe or missing shell input: {path}')
-        for parent in path.relative_to(root).parents:
-            if (root / parent).is_symlink():
-                raise ValueError(f'unsafe shell input directory: {parent}')
-    return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix()))
+    slot: build_slots.Slot | build_slots.LeasedCopy
+    descriptors: tuple[int, ...]
 
 
-def shell_key(root: Path, selector: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(selector.encode() + b'\0')
-    for path in shell_inputs(root):
-        name = path.relative_to(root).as_posix().encode()
-        content = path.read_bytes()
-        digest.update(len(name).to_bytes(8, 'big') + name)
-        digest.update(len(content).to_bytes(8, 'big') + content)
-    return digest.hexdigest()
+@dataclass(frozen=True)
+class LeasedCommandResult:
+    status: int
+    stdout: bytes
+    stderr: bytes
+    started_at: float
+    finished_at: float
+    execution_seconds: float
 
 
-def exports_are_valid(exports: Path) -> bool:
-    """Reevaluate exports when a referenced store path no longer exists."""
-    text = exports.read_text()
-    roots: list[str] = re.findall(r'/nix/store/[a-z0-9]{32}-[A-Za-z0-9+._?=-]+', text)
-    return bool(text.strip()) and all(Path(root).exists() for root in roots)
+class LeasedCommandLost(RuntimeError):
+    """A started command cannot return its complete output."""
 
 
-def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> ShellEnvironment:
-    """Publish immutable shell inputs and exports under a content key."""
-    key = shell_key(root, selector)
-    cache.mkdir(parents=True, exist_ok=True)
-    destination = cache / key
-    with (cache / f'{key}.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        exports = destination / 'exports.sh'
-        if exports.is_file() and exports_are_valid(exports):
-            return ShellEnvironment(key, exports, destination / 'inputs')
-        if not destination.exists():
-            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                    build_folders.FOLDER_PREFIXES["linux-cache-stage"].format(owner=key), build_folders.ExplicitBuildParent(cache))) as stage:
-                inputs = stage / 'inputs'
-                inputs.mkdir()
-                for path in shell_inputs(root):
-                    target = inputs / path.relative_to(root)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    _ = shutil.copyfile(path, target)
-                if shell_key(inputs, selector) != key:
-                    raise ValueError('shell inputs changed during the copy')
-                os.replace(stage, destination)
-        inputs = destination / 'inputs'
-        if shell_key(inputs, selector) != key:
-            raise ValueError('cached shell inputs do not match their key')
-        result = subprocess.run(
-            ['nix', 'print-dev-env', f'path:{inputs}#{selector}'],
-            capture_output=True, text=True, check=True, timeout=timeout_s,
-        )
-        if not result.stdout.strip():
-            raise ValueError('nix returned no shell exports')
-        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=destination, delete=False) as output:
-            temporary = Path(output.name)
-            try:
-                _ = output.write(result.stdout)
-                output.flush()
-                os.replace(temporary, exports)
-            finally:
-                temporary.unlink(missing_ok=True)
-    return ShellEnvironment(key, exports, destination / 'inputs')
+def execution_descriptors() -> tuple[int, ...]:
+    """Keep mirror locks and maker locks through every command child."""
+    return tuple(dict.fromkeys((*floor_claims.inherited_mirror_descriptors(),
+                               *build_folders.held_build_folder_descriptors())))
+
+
+def _pending_pipe_bytes(fd: int) -> int:
+    count = array('i', [0])
+    _ = cast(int, fcntl.ioctl(fd, termios.FIONREAD, count))
+    return count[0]
+
+
+def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
+                           environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float,
+                           extra_descriptors: tuple[int, ...] = ()) -> LeasedCommandResult:
+    """Capture output through command exit, including bytes still pending at exit."""
+    if output_max_bytes <= 0 or not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError('The command output bound and deadline must be positive')
+    started_at, started = time.time(), time.monotonic()
+    deadline = started + timeout_s
+    output = [bytearray(), bytearray()]
+    child = subprocess.Popen(command, cwd=execution.slot.path, env=dict(environment),
+            pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors, *extra_descriptors))),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    assert child.stdout is not None and child.stderr is not None
+    pipe_fds = (child.stdout.fileno(), child.stderr.fileno())
+    with ExitStack() as cleanup:
+        _ = cleanup.enter_context(child.stdout)
+        _ = cleanup.enter_context(child.stderr)
+        exit_fd = os.pidfd_open(child.pid)
+        _ = cleanup.callback(os.close, exit_fd)
+        streams = cleanup.enter_context(selectors.DefaultSelector())
+        _ = streams.register(exit_fd, selectors.EVENT_READ)
+        for index, fd in enumerate(pipe_fds):
+            os.set_blocking(fd, False)
+            _ = streams.register(fd, selectors.EVENT_READ, index)
+
+        while True:
+            remaining = deadline - time.monotonic()
+            events = streams.select(max(0, remaining))
+            if any(key.fd == exit_fd for key, _ in events):
+                break
+            if remaining <= 0:
+                # The systemd unit owns process cleanup.
+                raise LeasedCommandLost('The Hana command exceeded its execution deadline')
+            for key, _ in events:
+                try:
+                    content = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not content:
+                    _ = streams.unregister(key.fd)
+                    continue
+                if sum(map(len, output)) + len(content) > output_max_bytes:
+                    raise LeasedCommandLost('The command output exceeds its transport bound')
+                output[cast(int, key.data)].extend(content)
+
+        finished_at, finished = time.time(), time.monotonic()
+        # A descendant can write while the runner reads either pipe.
+        pending = tuple(_pending_pipe_bytes(fd) for fd in pipe_fds)
+        status = child.wait()
+        if sum(map(len, output)) + sum(pending) > output_max_bytes:
+            raise LeasedCommandLost('The command output exceeds its transport bound')
+        for fd, remaining, buffer in zip(pipe_fds, pending, output, strict=True):
+            while remaining > 0:
+                content = os.read(fd, min(remaining, 65536))
+                if not content:
+                    raise LeasedCommandLost('The command output ended before the pending bytes were read')
+                buffer.extend(content)
+                remaining -= len(content)
+    return LeasedCommandResult(status if status >= 0 else 128 - status, bytes(output[0]), bytes(output[1]),
+                               started_at, finished_at, finished - started)
+
+
+CARGO_START_ERROR = 'The guest could not start Cargo because the executable is missing from the prepared PATH'
+
+
+def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
+             shell: ShellEnvironment, compiler_version: str, free_floor_gib: float,
+             output_max_bytes: int, timeout_s: float, build_start_fd: int = -1) -> LeasedCommandResult:
+    """Check shell and compiler parity before running the exact judgment command."""
+    slot = execution.slot
+    descriptor = build_folders.build_folder_lock_fd(slot.path)
+    if descriptor not in execution.descriptors:
+        raise ValueError('The command lacks its maker slot descriptor')
+    if (argv[:2] not in (('cargo', 'check'), ('cargo', 'clippy'))
+            or any(word == '--fix' or word.startswith('--fix=') for word in argv)
+            or any('\0' in word for word in argv)):
+        raise ValueError('The guest accepts only Cargo judgment commands')
+    for index, word in enumerate(argv):
+        if word == '--target-dir':
+            if index + 1 >= len(argv):
+                raise ValueError('The Cargo target directory is missing')
+            target = (slot.path / argv[index + 1]).resolve()
+        elif word.startswith('--target-dir='):
+            target = (slot.path / word.partition('=')[2]).resolve()
+        else:
+            continue
+        if not target.is_relative_to(slot.path.resolve()) and target != slot.cargo_dir.resolve():
+            raise ValueError('The command output escapes its maker slot')
+    command_environment = {**os.environ, **environment, **slot.env,
+        'CARGO_TARGET_DIR': str(slot.path / 'target'), 'BUILD_FOLDER': str(slot.path),
+        'BUILD_FOLDER_LOCK_FD': str(descriptor)}
+    if min(shutil.disk_usage(slot.path).free, shutil.disk_usage(slot.cargo_dir).free) < free_floor_gib * 1024**3:
+        raise ValueError('The command lacks the required free disk space')
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            '.leased-step-', build_folders.ExplicitBuildParent(slot.cargo_dir))) as stage:
+        started = stage / 'started'
+        report_start = f"printf '\\n' >&{build_start_fd} || exit 75\n" if build_start_fd >= 0 else ''
+        close_report = f' {build_start_fd}>&-' if build_start_fd >= 0 else ''
+        assignments = ' '.join(f'{name}={shlex.quote(value)}' for name, value in
+                               {**environment, **slot.env, 'CARGO_TARGET_DIR': str(slot.path / 'target')}.items())
+        script = (shell_environment_script(shell)
+            + '\nunset RUSTUP_TOOLCHAIN\n'
+            + toolchain_install_script('rustc ' + compiler_version, 'hana') + '\n'
+            + 'actual=$(rustc -V) || exit 75\n'
+            + f'[[ "$actual" == {shlex.quote("rustc " + compiler_version)} '
+            + f'|| "$actual" == {shlex.quote("rustc " + compiler_version + " ")}* ]] || exit 75\n'
+            + f'export {assignments}\n'
+            + 'cargo=$(type -P -- cargo) && [[ -x "$cargo" && ! -d "$cargo" ]] || '
+            + f'{{ printf "%s\\n" {shlex.quote(CARGO_START_ERROR)} >&2; exit 127; }}\n'
+            + f': > {shlex.quote(str(started))} || exit 75\n'
+            + report_start + f'exec -a cargo -- "$cargo" {shlex.join(argv[1:])}{close_report}')
+        result = capture_leased_command(['bash', '-e', '-c', script], execution,
+                                        command_environment, output_max_bytes, timeout_s=timeout_s,
+                                        extra_descriptors=(build_start_fd,) if build_start_fd >= 0 else ())
+        if not started.exists():
+            reason = (CARGO_START_ERROR if result.stderr.endswith((CARGO_START_ERROR + '\n').encode())
+                      else 'The guest shell or compiler parity check failed')
+            raise ValueError(reason)
+        return result
 
 
 def positive_setting(values: dict[str, str], key: str) -> float:
@@ -161,6 +232,15 @@ def positive_setting(values: dict[str, str], key: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f'{key}: expected a positive number')
     return value
+
+
+def shell_environment_script(shell: ShellEnvironment) -> str:
+    """Keep the caller's tools after the development shell's tools."""
+    return ('linux_runner_path=$PATH\n'
+            + f'source {shlex.quote(str(shell.exports))} || exit 75\n'
+            + 'export PATH="$PATH:$linux_runner_path"\n'
+            + 'unset linux_runner_path\n'
+            + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n')
 
 
 def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
@@ -176,43 +256,28 @@ def tool_version_filter() -> str:
     """Use the same normalizer for versions read by Bash."""
     code = "\n".join((
         "import sys",
-        "from pathlib import Path",
-        "sys.path.insert(0, str(Path.home() / '.claude'))",
         "from scripts.mac_test.linux_runner import normalize_tool_version",
         "print(normalize_tool_version(sys.stdin.read()))",
     ))
-    return f'python3 -c {shlex.quote(code)}'
+    return f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)}'
 
 
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        f'mkdir -p -- "$HOME"/{shlex.quote(mirror)} || exit 1',
+        copies.mirror_probe_setup(mirror),
         f'checkout="$HOME"/{shlex.quote(mirror)}',
-        'if [[ -f "$checkout/Cargo.toml" ]]; then',
-        "  capacity_code=" + shlex.quote("\n".join((
-            "import sys",
-            "from pathlib import Path",
-            "sys.path.insert(0, str(Path.home() / '.claude'))",
-            "from scripts.mac_test.linux_runner import output_free_bytes",
-            "print(f'{output_free_bytes(Path(sys.argv[1])) / 1024 ** 3:.6f}')",
-        ))),
-        '  free_gib=$(python3 -c "$capacity_code" "$checkout") || { printf \'disk capacity unavailable\\n\' >&2; exit 1; }',
-        'else',
-        '  disk_usage=$(df -Pk "$checkout") || exit 1',
-        '  free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
-        'fi',
+        'disk_usage=$(df -Pk "$checkout") || exit 1',
+        'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
-        'rustc_version=$(rustc -V) || exit 1',
-        'nextest_version=$(cargo nextest --version) || exit 1',
-        'mend_version=$(cargo mend --version) || exit 1',
-        f'rustc_version=$(printf \'%s\' "$rustc_version" | {tool_version_filter()}) || exit 1',
+        'nextest_version=$(cargo-nextest nextest --version) || exit 1',
+        'mend_version=$(cargo-mend mend --version) || exit 1',
         f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
         f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
         'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
-        'printf \'rustc=%s\\nnextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
-        + '"$rustc_version" "$nextest_version" "$mend_version" "$scripts_commit"',
+        'printf \'nextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
+        + '"$nextest_version" "$mend_version" "$scripts_commit"',
     ))
 
 
@@ -253,11 +318,6 @@ def read_slot_run(marker: Path) -> SlotRun | UnmarkedSlot:
     return lease
 
 
-def process_fields(pid: int, proc_root: Path = PROC_ROOT) -> list[str]:
-    """Read stat fields after the process name, which can contain spaces."""
-    return (proc_root / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
-
-
 @dataclass(frozen=True)
 class SlotProcessSelection:
     """Confirmed slot processes and evidence that prevents release."""
@@ -290,7 +350,7 @@ class ProcessIdentity:
 
 
 def process_identity(pid: int, proc_root: Path) -> ProcessIdentity:
-    fields = process_fields(pid, proc_root)
+    fields = process_stat.process_fields(pid, proc_root)
     status = (proc_root / str(pid) / 'status').read_text()
     uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
     if uid is None:
@@ -320,7 +380,8 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            uncertain.add(pid)
+            if not isinstance(lease, UnmarkedSlot):
+                uncertain.add(pid)
     # The checking process and its ancestors cannot be leftovers of a lost run.
     checking_chain: set[int] = set()
     ancestor = own_pid
@@ -376,10 +437,10 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
                 selected.add(pid)
         except (PermissionError, FileNotFoundError, ProcessLookupError):
             denied = True
-        if denied and pid not in selected:
+        if denied and pid not in selected and not isinstance(lease, UnmarkedSlot):
             # Confirm that missing evidence does not belong to an exited process.
             try:
-                if process_fields(pid, proc_root)[0] in ('Z', 'X'):
+                if process_stat.process_fields(pid, proc_root)[0] in ('Z', 'X'):
                     continue
             except (FileNotFoundError, ProcessLookupError):
                 continue
@@ -432,7 +493,7 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
         raise SlotStartupRefused('an earlier run still has unresolved ownership') from error
     pid = os.getpid()
     token = uuid.uuid4().hex
-    lease: SlotRun = {'pid': pid, 'start_time': int(process_fields(pid)[19]),
+    lease: SlotRun = {'pid': pid, 'start_time': int(process_stat.process_fields(pid)[19]),
                       'process_group': os.getpgrp(), 'token': token, 'boot_id': boot_identity()}
     marker = mirror / '.linux-run.json'
     with marker.open('x') as output:
@@ -461,11 +522,10 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
 def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) -> str:
     """Select the runner and its children even outside the slot directory."""
     code = ("import sys; from pathlib import Path; "
-            + "sys.path.insert(0, str(Path.home()/'.claude/scripts/mac_test')); "
-            + "from linux_runner import print_slot_processes; "
+            + "from scripts.mac_test.linux_runner import print_slot_processes; "
             + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
     return ('select_leftovers() {\n'
-            + f'    python3 -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
+            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
             + '}\n')
 
 
@@ -494,148 +554,60 @@ def nextest_words_with_skip(
 
 
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str) -> str:
-    arguments = ['python3', '.claude/scripts/mac_test/linux_runner.py', 'run',
+                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
+                   test_environment: tuple[tuple[str, str], ...] = (),
+                   clear_environment: str = '') -> str:
+    arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
                  '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
                  '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
     if repo_identity:
         arguments.extend(['--repo-identity', repo_identity])
+    for name, value in test_environment:
+        arguments.extend(['--env', name + '=' + value])
+    if clear_environment:
+        arguments.extend(['--clear-environment', clear_environment])
     arguments.extend(['--', *words])
     return shlex.join(arguments)
 
 
 def probe_command_script(mirror: str, values: dict[str, str], repository: str) -> str:
-    return shlex.join(['python3', '.claude/scripts/mac_test/linux_runner.py', 'probe',
+    return shlex.join(['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'probe',
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
-
-
-class AwsExecutionEvidence(Protocol):
-    """Read generation-bound AWS evidence only for an AWS execution."""
-
-    def current_generation(self, directory: Path, boot_id: str) -> str: ...
-    def interruption_generation(self, directory: Path, *, target: str, generation: str) -> str: ...
-    def execution_permission(self, directory: Path, target: str, *, now: int,
-                             boot_id: str) -> ledger.AdmissionPermission: ...
-
-
-def aws_execution_evidence() -> AwsExecutionEvidence:
-    return cast(AwsExecutionEvidence, cast(object, import_module('scripts.aws_target.remote')))
-
-
-@dataclass(frozen=True)
-class AwsExecutionContext:
-    target: str
-    directory: Path
-
-
-@dataclass(frozen=True)
-class IndependentLinuxExecution:
-    """This Linux target does not use AWS spending permission."""
-
-
-def aws_execution_context(values: dict[str, str]) -> AwsExecutionContext | IndependentLinuxExecution:
-    target = SshTarget(values.get('selected_target', ''), 'linux', Path(values.get('selected_settings', '')))
-    if not is_aws_target(target):
-        return IndependentLinuxExecution()
-    return AwsExecutionContext(target.name, Path.home() / values['remote_state_directory'])
-
-
-def interruption_generation(values: dict[str, str]) -> str:
-    try:
-        context = aws_execution_context(values)
-        if isinstance(context, IndependentLinuxExecution):
-            return ''
-        remote = aws_execution_evidence()
-        generation = remote.current_generation(context.directory, boot_identity())
-        return remote.interruption_generation(context.directory, target=context.target, generation=generation)
-    except (OSError, ValueError, KeyError, TypeError):
-        return ''
-
-
-def permission_refused(values: dict[str, str]) -> bool:
-    try:
-        context = aws_execution_context(values)
-        if isinstance(context, IndependentLinuxExecution):
-            return False
-        if TYPE_CHECKING:
-            from ..aws_target import ledger
-        else:
-            from scripts.aws_target import ledger
-        remote = aws_execution_evidence()
-        permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
-                                                 boot_id=boot_identity())
-        if isinstance(permission, ledger.PermissionAllowed):
-            return False
-        reason = permission.reason
-    except (OSError, ValueError, KeyError) as error:
-        reason = str(error)
-    print(f'aws_permission=refused reason={reason}', flush=True)
-    return True
-
-
-@contextmanager
-def interruption_signals(values: dict[str, str]) -> Generator[None, None, None]:
-    if isinstance(aws_execution_context(values), IndependentLinuxExecution):
-        yield
-        return
-
-    def interrupted(signum: int, _frame: FrameType | None) -> None:
-        if not interruption_generation(values):
-            raise SystemExit(128 + signum)
-
-    previous = signal.signal(signal.SIGTERM, interrupted)
-    try:
-        yield
-    finally:
-        _ = signal.signal(signal.SIGTERM, previous)
-        if generation := interruption_generation(values):
-            print(f'aws_interrupted={generation}', flush=True)
-
-
-@contextmanager
-def interruptible_slot(mirror: Path, values: dict[str, str]) -> Generator[None, None, None]:
-    with interruption_signals(values), slot_run(
-        mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)
-    ):
-        yield
 
 
 def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
     """Read parity inside the same cached environment as the work."""
-    if permission_refused(values):
-        return 75
     try:
-        with interruptible_slot(mirror, values):
+        with slot_run(mirror):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
-                                  positive_setting(values, 'shell_timeout_s'))
-            if permission_refused(values):
-                return 75
-            command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-                       + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
+                                  positive_setting(values, 'shell_timeout_s'),
+                                  pass_fds=execution_descriptors())
+            command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
-            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False).returncode
+            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=execution_descriptors()).returncode
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
 
 
 def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
-    if permission_refused(values):
-        return 75
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
     try:
-        with interruptible_slot(mirror, values):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity)
+        with slot_run(mirror):
+            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
         return 75
 
 
-def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
+def output_filesystem_paths(checkout: Path, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Resolve the checkout and its Cargo output filesystems."""
-    outputs = read_cargo_output_roots(checkout)
+    outputs = read_cargo_output_roots(checkout, environment=environment)
     if isinstance(outputs, CargoOutputUnavailable):
         if not (checkout / "Cargo.toml").exists():
             return (checkout,)
@@ -643,9 +615,9 @@ def output_filesystem_paths(checkout: Path) -> tuple[Path, ...]:
     return (checkout, outputs.target_directory, outputs.build_directory)
 
 
-def output_free_bytes(checkout: Path) -> int:
+def output_free_bytes(checkout: Path, environment: Mapping[str, str] | None = None) -> int:
     readings: list[int] = []
-    for path in output_filesystem_paths(checkout):
+    for path in output_filesystem_paths(checkout, environment):
         while True:
             try:
                 readings.append(shutil.disk_usage(path)[2])
@@ -662,9 +634,8 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     code = '\n'.join((
         'import sys',
         'from pathlib import Path',
-        "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
-        'import sweep',
-        'import conf',
+        'from scripts.lint import sweep',
+        'from scripts.lib import conf',
         'config = conf.read(conf.path("lint"))',
         'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
         'import os',
@@ -674,8 +645,9 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
         'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
     ))
-    return subprocess.run([sys.executable, '-c', code, str(target)],
-                          env={**os.environ, **environment}, check=False).returncode
+    return subprocess.run([str(Path.home() / '.claude/scripts/lib/py'), '-c', code, str(target)],
+                          env={**os.environ, **environment}, check=False,
+                          pass_fds=execution_descriptors()).returncode
 
 
 def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[str, str], pin_file: str) -> str:
@@ -689,20 +661,64 @@ def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[s
     return f'{target} version mismatch: ' + '; '.join(differences) + hint
 
 
+def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
+    """Install the tree's toolchain under one lock for its channel."""
+    version = re.fullmatch(r'rustc (\d+\.\d+\.\d+)(?: .*)?', expected_rustc)
+    fallback = (f'export RUSTUP_TOOLCHAIN={shlex.quote(version[1])}' if version else ':')
+    # Bash decides the inherited, file and fallback cases; Python only parses a toolchain file.
+    parse_code = '\n'.join((
+        'import hashlib, sys, tomllib',
+        'from pathlib import Path',
+        'text = Path(sys.argv[1]).read_text()',
+        'try:',
+        '    print(tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest())',
+        'except tomllib.TOMLDecodeError:',
+        '    print(text.strip())',
+    ))
+    return '\n'.join((
+        'toolchain=${RUSTUP_TOOLCHAIN-}',
+        'if [[ -z $toolchain ]]; then',
+        '  toolchain_file=""',
+        '  if [[ -f rust-toolchain ]]; then toolchain_file=rust-toolchain',
+        '  elif [[ -f rust-toolchain.toml ]]; then toolchain_file=rust-toolchain.toml',
+        '  fi',
+        '  if [[ -n $toolchain_file ]]; then',
+        f'    toolchain=$(python3 -c {shlex.quote(parse_code)} "$toolchain_file") || exit 75',
+        '  else',
+        f'    {fallback}',
+        '    toolchain=${RUSTUP_TOOLCHAIN-}',
+        '  fi',
+        'fi',
+        'if [[ -n "$toolchain" ]]; then',
+        '  mkdir -p -- "${RUSTUP_HOME:-$HOME/.rustup}" || exit 75',
+        '  (',
+        '    flock -x 9 || exit 75',
+        '    if install_output=$(rustup toolchain install --no-self-update --no-update 2>&1); then',
+        '      if [[ -n "$install_output" ]]; then printf \'%s\\n\' "$install_output"; fi',
+        '    else',
+        '      install_output=${install_output//$\'\\n\'/ }',
+        f'      printf \'%s version mismatch: toolchain install failed: %s\\n\' {shlex.quote(target)} "$install_output" >&2',
+        '      exit 75',
+        '    fi',
+        '  ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/$toolchain.lock" || exit 75',
+        'fi',
+    ))
+
+
 def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '') -> int:
-    if verb not in ('nextest', 'check', 'doc'):
-        raise ValueError('Linux targets accept only test, check and doc')
+        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
+        test_environment: tuple[tuple[str, str], ...] = (),
+        clear_environment: str = '') -> int:
+    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
+        raise ValueError('unsupported remote verb')
     if verb == 'nextest':
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = 'test' if verb == 'nextest' else verb
+    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
         raise ValueError(f'{kind}: target does not permit this command')
     selector = policy_setting(values, 'devshell', repository)
     shell = prepare_shell(mirror, Path.home() / values['shell_cache'], selector,
-                          positive_setting(values, 'shell_timeout_s'))
-    if permission_refused(values):
-        return 75
+                          positive_setting(values, 'shell_timeout_s'), pass_fds=execution_descriptors())
     build_budget = positive_setting(values, 'build_budget_gib')
     budget = float(policy_setting(values, 'target_budget_gib', repository))
     if not math.isfinite(budget) or not 0 < budget <= build_budget:
@@ -728,6 +744,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),
     }
+    if verb == 'nextest':
+        environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
     if repo_identity:
@@ -758,22 +776,33 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
-    command = (f'source {shlex.quote(str(shell.exports))} || exit 75\n'
-               + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n'
-               + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-               + '\n'.join(parity) + '\n'
-               + f'export {assignments}\n')
+    abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
+                          if target == (mirror / 'target').resolve() else '')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
+            ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
-        command += (f': > {shlex.quote(str(started))} || exit 75\n'
+        toolchain_environment = step_directory / 'toolchain'
+        _ = toolchain_environment.write_text('')
+        command = (shell_environment_script(shell)
+                    + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
+                    + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
+                    + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
+                    + '\n'.join(parity) + '\n'
+                    + abandoned_sessions
+                    + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
+                    + f'export {assignments}\n'
+                    + f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
-        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)
+        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
+                                   pass_fds=execution_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
         step_started = started.exists()
+        toolchain = toolchain_environment.read_text()
+        if toolchain:
+            environment['RUSTUP_TOOLCHAIN'] = toolchain
     try:
-        free = output_free_bytes(mirror) / (1024 ** 3)
+        free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
             if target.exists():
                 shutil.rmtree(target)
@@ -800,6 +829,8 @@ class RunnerArguments(argparse.Namespace):
         self.call_id: str = ''
         self.tree_key: str = ''
         self.repo_identity: str = ''
+        self.environment: list[str] = []
+        self.clear_environment: str = ''
         self.words: list[str] = []
 
 
@@ -816,6 +847,8 @@ def main() -> int:
     _ = runner.add_argument('--call-id', required=True)
     _ = runner.add_argument('--tree-key', default='')
     _ = runner.add_argument('--repo-identity', default='')
+    _ = runner.add_argument('--clear-environment', default='')
+    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
     _ = runner.add_argument('words', nargs=argparse.REMAINDER)
     arguments = parser.parse_args(namespace=RunnerArguments())
     values = cast(object, json.loads(arguments.values))
@@ -827,7 +860,10 @@ def main() -> int:
     return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
                arguments.repository, arguments.verb,
                tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key, arguments.repo_identity)
+               arguments.call_id, arguments.tree_key, arguments.repo_identity,
+               tuple((name, value) for entry in arguments.environment
+                     for name, _, value in (entry.partition('='),)),
+               arguments.clear_environment)
 
 
 if __name__ == '__main__':

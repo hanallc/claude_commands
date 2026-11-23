@@ -2,51 +2,42 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from scripts.build_queue import execution_identity
+from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
+
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
 import select
 import shlex
-import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
 
-if TYPE_CHECKING:
-    from ..lib import process_start as process_identity
-else:
-    from scripts.lib import process_start as process_identity
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import process_start as process_identity
+from scripts.copies.copies_test_support import copies_environment
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, config_environment
-else:
-    from memory_test_support import write_config_fixture, config_environment
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture, config_environment
 
-import offload
-import conf
-import mac_test
-import treekey
-from offload_test_commands import COMMAND_STUB, write_shell
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-    from ..lib.process_group import send_process_group
-else:
-    from scripts.lib import test_hang_guard
-    from scripts.lib.process_group import send_process_group
-
-if TYPE_CHECKING:
-    from ..production.cli_fixture import invoke_cli
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    from cli_fixture import invoke_cli
+from scripts.mac_test import eligibility, offload, mac_test
+from scripts.buildlog import treekey
+from scripts.buildlog import sync as buildlog_sync
+from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
+from scripts.lib import test_hang_guard
+from scripts.lib.process_group import send_process_group
+from scripts.production.cli_fixture import invoke_cli
+from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
+from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_hold import owning_session as session_owner
+from scripts.mac_test import claim_state
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -55,6 +46,33 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
+
+
+def write_mac_target_registry(directory: Path, settings_name: str) -> None:
+    _ = (directory / "build_targets.conf").write_text(
+        "targets=mac\n"
+        + "kind.mac=ssh\n"
+        + "platform.mac=macos\n"
+        + f"settings.mac={settings_name}\n"
+        + UNREACHABLE_WAIT_FIXTURE,
+        encoding="utf-8",
+    )
+
+
+def assigned_adapter_main() -> int:
+    """Run the adapter after placement, with the current provider state."""
+    arguments = offload.parser().parse_args(namespace=offload.CliArguments())
+    request = offload.request_from_arguments(arguments)
+    config = eligibility.read_config(Path(arguments.settings)) if arguments.settings else eligibility.read_config()
+    controller = offload.ProcessController()
+    started = time.monotonic()
+    with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
+        result = offload.run_offload(controller, config, request, started)
+    status = offload.write_result(result, request.result, request.last_decline, request.verb,
+                                 request.target, controller.attempt_evidence, request.fetch)
+    offload.report_result_details(request, result)
+    offload.persist_attempt(request, result, controller.attempt_evidence, started)
+    return status
 
 
 class RemoteLine(TypedDict):
@@ -95,6 +113,35 @@ class CommandEvent(TypedDict):
     claim: NotRequired[RemoteClaimRecord]
 
 
+def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str]:
+    remote = argv[-1]
+    if "\ndispatch_status=$?\nexec 8<&-\n" in remote:
+        case.assertIn("\n(\n", remote)
+        remote = remote.split("\n(\n", 1)[1].rsplit("\n)\ndispatch_status=$?\n", 1)[0]
+    elif "\n)\nprobe_status=$?\n" in remote:
+        case.assertTrue(remote.startswith("(\n"))
+        remote = remote.removeprefix("(\n").split("\n)\nprobe_status=$?\n", 1)[0]
+    words = shlex.split(remote)
+    if "mirror-use" not in words:
+        return [*argv[:-1], remote]
+    boundary = words.index("--")
+    case.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
+    case.assertEqual(len(words[boundary + 3:]), 1)
+    case.assertIn("--owner", words[:boundary])
+    case.assertIn("--repository", words[:boundary])
+    case.assertIn("--session", words[:boundary])
+    return [*argv[:-1], words[boundary + 3]]
+
+
+def split_mac_run_command(remote: str) -> tuple[list[str], str]:
+    """Get the invocation words and the cleanup commands."""
+    for status in (f" || echo {offload.MAC_NEXTTEST_SETUP_FAILURE}", "; echo mac_exit=$?"):
+        invocation, separator, cleanup = remote.rpartition(status)
+        if separator:
+            return shlex.split(invocation), cleanup
+    raise AssertionError(f"Missing Mac status command in {remote!r}")
+
+
 class SelectorEvent(TypedDict):
     command: str
     args: list[str]
@@ -108,6 +155,10 @@ class WireResult(TypedDict):
 
 
 class RemoteClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     copy: NotRequired[bool]
     pid: int
     proc_start: str
@@ -115,10 +166,13 @@ class RemoteClaimRecord(TypedDict):
     worktree: str
     since: str
     remote_host: str
+    repo_name: NotRequired[str]
+    repo_key: NotRequired[str]
+    mac_repository: NotRequired[claim_state.MacRepositoryRecord]
 
-HANA = offload.KnownRepository("hana")
+HANA = eligibility.KnownRepository("hana")
 
-FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
+FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
 HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
 
@@ -133,44 +187,78 @@ from pathlib import Path
 import sys
 import time
 
+from scripts.mac_test import claim_state
+
 def main() -> int:
     root = Path(os.environ["MAC_TEST_STUB_DIR"])
-    state = Path(os.environ["MAC_TEST_STATE_DIR"])
+    paths = claim_state.StatePaths(Path(os.environ["MAC_TEST_STATE_DIR"]), "mac")
     action = sys.argv[1]
     with (root / "state-events").open("a", encoding="utf-8") as output:
         output.write(action + "\n")
+    arguments = sys.argv[2:]
+    fields = ("claim_id", "episode", "attempt")
+    identity_words = {field: arguments[arguments.index("--" + field.replace("_", "-")) + 1]
+                      for field in fields}
+    identity = claim_state.ClaimIdentity(**identity_words)
+    if action == "release":
+        for saved in claim_state.read_claims(paths):
+            if claim_state.claim_identity(saved.record) == identity:
+                saved.path.unlink()
+        return 0
     if action == "claim":
-        state.mkdir(parents=True, exist_ok=True)
-        arguments = sys.argv[2:]
         owner_pid = int(arguments[arguments.index("--pid") + 1])
         proc_start = Path(f"/proc/{owner_pid}/stat").read_text().rpartition(")")[2].split()[19]
-        record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
+        record = {**identity_words, "pid": owner_pid, "proc_start": proc_start,
+                  "what": arguments[arguments.index("--what") + 1],
                   "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
-                  "remote_host": arguments[arguments.index("--remote") + 1]}
+                  "remote_host": arguments[arguments.index("--remote") + 1],
+                  "submitting_session": arguments[arguments.index("--session") + 1]}
+        path = paths.run
+        if "--from-pid" in arguments:
+            saved, = (claim for claim in claim_state.read_claims(paths)
+                      if claim_state.claim_identity(claim.record) == identity)
+            path = saved.path
+            record = {"remote_host": record["remote_host"], **saved.record, "pid": owner_pid, "proc_start": proc_start}
+        elif "--mac-repository" in arguments:
+            repository = claim_state.mac_repository_record(json.loads(arguments[arguments.index("--mac-repository") + 1]))
+            if "--leased-slot" in arguments:
+                slot = int(arguments[arguments.index("--leased-slot") + 1])
+                repository = repository.for_slot(slot)
+                record["slot"] = slot
+            path = paths.claims / repository.claim_file
+            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
+        if "--copy" in arguments:
+            record["copy"] = True
+        reply = ["claim_identity=" + json.dumps(identity_words),
+                 "claim_fence=" + claim_state.claim_fence_scope_key(path, record)]
+        if "mac_repository" in record:
+            reply.append("mac_repository=" + json.dumps(record["mac_repository"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
         actions = (root / "state-events").read_text().splitlines()
-        if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
+        cleanup_pending = record.get("cleanup_pending", False)
+        if not cleanup_pending and (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-            (state / "claims").mkdir(exist_ok=True)
-            (state / "claims" / "hana.json").write_text(json.dumps(record))
+            path.write_text(json.dumps(record), encoding="utf-8")
+            print(*reply, sep="\n", flush=True)
             print("leftovers: previous-mac", flush=True)
             return 13
-        takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
+        takeover = not cleanup_pending and os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
         if takeover:
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-        (state / "claims").mkdir(exist_ok=True)
-        (state / "claims" / "hana.json").write_text(json.dumps(record), encoding="utf-8")
+        path.write_text(json.dumps(record), encoding="utf-8")
         (root / "claim-started").write_text("started\n", encoding="utf-8")
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
+        print(*reply, sep="\n", flush=True)
+        if cleanup_pending:
+            print("leftovers: " + record["remote_host"], flush=True)
+            return 13
         if takeover:
             print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
             return 13
-        return 0
-    if action == "release":
-        (state / "claims" / "hana.json").unlink(missing_ok=True)
         return 0
     return 12
 
@@ -182,6 +270,18 @@ exec(compile(Path(__file__).read_text(), __file__, "exec"), globals())
 
 
 class OffloadCommandFixture(unittest.TestCase):
+    tools_root: ClassVar[Path | None] = None
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.tools_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="offload-tools-")))
+        cls.addClassCleanup(setattr, cls, "tools_root", None)
+
+    def private_tools(self) -> Path:
+        return self.tools_root if self.tools_root is not None else self.root / "tools"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -205,7 +305,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
-            "run_cleanup_line": "mac_cleanup=0",
+            "run_cleanup_line": "mac_cleanup=0 32715571 59",
             "run_ssh_status": 0,
             "hold_run": False,
             "hold_after_first_line": False,
@@ -224,7 +324,6 @@ class OffloadCommandFixture(unittest.TestCase):
         self.repository = self.root / "hana"
         self.unknown_directory = self.root / "not-a-repository"
         self.state_directory = self.root / "state"
-        self.claim_file = self.state_directory / "claims" / "hana.json"
         self.stub_directory = self.root / "stub-state"
         self.bin_directory = self.root / "bin"
         self.config_path = self.root / "mac_test.conf"
@@ -242,11 +341,21 @@ class OffloadCommandFixture(unittest.TestCase):
         self.assertEqual(
             initialized.returncode, 0, initialized.stdout + initialized.stderr
         )
+        _ = subprocess.run(["git", "-C", str(self.repository),
+                            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "-c", "core.hooksPath=/dev/null", "commit", "-qm", "Fixture",
+                            "--no-gpg-sign", "--allow-empty"], check=True)
+        paths = claim_state.StatePaths(self.state_directory, "mac")
+        repository = self.mac_repository()
+        self.claim_file = paths.claims / repository.claim_file
+        legacy_claim_file = mac_test.claim_path(paths, claim_state.RepositoryScope(repository.mirror_name))
         stub = self.bin_directory / "command-stub"
         write_shell(stub, COMMAND_STUB)
         for name in ("ssh", "rsync", "gh", "systemd-run"):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
+            "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
+            "mirror_busy_backoff_s": "120",
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -254,6 +363,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "leftover_timeout_s": "300",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
+            "abandoned_session_minutes": "9",
             "mac_budget_gib": "24",
             "mac_budget_gib.hana": "64",
             "linux_only.hana": "",
@@ -273,7 +383,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
-            "run_cleanup_line": "mac_cleanup=0",
+            "run_cleanup_line": "mac_cleanup=0 32715571 59",
             "run_ssh_status": 0,
             "hold_run": False,
             "hold_after_first_line": False,
@@ -293,12 +403,17 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
+        write_mac_target_registry(self.root, self.config_path.name)
+        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
-            **os.environ,
+            **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
+            **copies_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
+            "MAC_TEST_FIXTURE_CLAIM_FILE": str(self.claim_file),
+            "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE": str(legacy_claim_file),
             "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
@@ -306,21 +421,81 @@ class OffloadCommandFixture(unittest.TestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "PYTHONPYCACHEPREFIX": str(self.private_tools() / "bytecode"),
         }
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        self.start_admission()
+
+    def start_admission(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.25)
+
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            directory = (self.state_directory if key.destination.provider == "mac" else
+                         Path(self.environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
+            paths = claim_state.StatePaths(directory, key.destination.target,
+                platform="macos" if key.destination.provider == "mac" else "linux")
+            return private_provider_evidence(admission, key, paths)
+
+        admission.server.host_probe = provider
+
+    def assignment_options(self, repository: Path, verb: eligibility.MacVerb,
+                           settings: Path | eligibility.DefaultMacSettings,
+                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None,
+                           source: offload.MacSource = WORKING_TREE_SOURCE) -> list[str]:
+        """Give command fixtures one real queue assignment before the adapter starts."""
+        if "--assignment-file" in runner_options:
+            return []
+        admission = caller_admission(self, self.root, self.environment)
+        owner_start = process_identity.process_start(os.getpid())
+        if not isinstance(owner_start, process_identity.Started):
+            self.fail("The command fixture has no checked coordinator identity")
+        owner = wire.Owner(os.getpid(), owner_start.start)
+        admission.proc.register(owner)
+        target = runner_options[runner_options.index("--target") + 1] if "--target" in runner_options else "mac"
+        settings_path = settings if isinstance(settings, Path) else self.config_path
+        values = dict(line.split("=", 1) for line in settings_path.read_text().splitlines()
+                      if "=" in line and not line.lstrip().startswith("#")) if settings_path.is_file() else self.config
+        host = values.get("host", self.config["host"])
+        provider: Literal["mac", "ssh"] = "mac" if target == "mac" else "ssh"
+        scope = (claim_state.target_claim_scope(claim_state.StatePaths(self.state_directory), str(repository))
+                 if provider == "mac" else claim_state.RepositoryScope(repository.name, "", 1))
+        destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
+        local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
+        source_path = source.root if isinstance(source, offload.StagedDocSnapshot) else repository
+        source_key = treekey.tree_key(str(source_path))
+        source_identity = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                           else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
+        constraints = placement.PlacementConstraints(source_identity, ("cargo", verb), str(repository), "hana",
+            session_owner.owning_session(self.environment if environment is None else environment),
+            (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
+        request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
+            local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
+        deadline = time.monotonic() + 10
+        while True:
+            with admission.loop_turn():
+                reply, = admission.server.handle_request(request)
+            if not isinstance(reply, wire.PlacementWait) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if not isinstance(reply, wire.Assignment):
+            self.fail(f"The command fixture could not obtain its assigned destination: {reply!r}")
+        assignment_file = self.root / f"assignment-{local.episode}.json"
+        _ = assignment_file.write_text(wire.encode_reply(reply))
+        return ["--assignment-file", str(assignment_file)]
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(
-            f"#!{sys.executable}\n" + source, encoding="utf-8"
-        )
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def sync_config(self) -> None:
-        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
-        lines = self.config_path.read_text().splitlines()
-        _ = self.config_path.write_text("\n".join(line for line in lines
+        ready = self.config_path.with_suffix(".ready")
+        _ = write_config_fixture(ready, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
+        lines = ready.read_text().splitlines()
+        _ = ready.write_text("\n".join(line for line in lines
             if not line.startswith("linux_only.") or line.partition("=")[0] in self.config) + "\n")
+        _ = ready.replace(self.config_path)
 
     def sync_fixture(self) -> None:
         assignments = [f"TEST_HANG_GUARD_SECS={test_hang_guard.TEST_HANG_GUARD_SECS}"]
@@ -344,19 +519,21 @@ class OffloadCommandFixture(unittest.TestCase):
         filter_run: bool = False,
         timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
         subprocess_cli: bool = False,
-        settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
+        settings: Path | eligibility.DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
         copy: bool = False,
-        verb: offload.MacVerb = "nextest",
+        verb: eligibility.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
         runner_options: tuple[str, ...] = (),
         call_id: str = "call-17",
+        direct_placement: bool = False,
+        assigned_adapter: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(SCRIPT),
             "run",
             "--repo-root",
@@ -377,29 +554,44 @@ class OffloadCommandFixture(unittest.TestCase):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
-        arguments.extend(["--result", str(self.result_path), *runner_options, "--"])
+        assignment_options = (() if direct_placement or assigned_adapter else self.assignment_options(
+            self.repository if repository is None else repository, verb, settings, runner_options, source=source))
+        arguments.extend(["--result", str(self.result_path), *runner_options, *assignment_options, "--"])
         arguments.extend(nextest_arguments)
+        if assigned_adapter:
+            if not subprocess_cli:
+                return invoke_cli(offload, assigned_adapter_main, arguments[2:], self.environment, self.root,
+                                  combined_output=not separate_stderr,
+                                  environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+            entry = self.root / "assigned-adapter.py"
+            _ = entry.write_text(
+                f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
+                + "from scripts.mac_test.offload_test_support import assigned_adapter_main\n"
+                + "raise SystemExit(assigned_adapter_main())\n")
+            arguments[1] = str(entry)
         if subprocess_cli:
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                                   text=True, check=False, timeout=timeout)
         return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
-                          combined_output=not separate_stderr)
+                          combined_output=not separate_stderr,
+                          environment_lock=caller_admission(self, self.root, self.environment).loop_access)
 
     def process_command(self, *arguments: str, separate_stderr: bool = False,
-                        last_decline: str = "") -> subprocess.CompletedProcess[str]:
+                        last_decline: str = "", assigned_adapter: bool = False,
+                        runner_options: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
         # These cases inspect a claim owned by an exited launcher. Its lifetime
         # is part of the assertion, so use a real child rather than this process.
         return self.command(*arguments, separate_stderr=separate_stderr,
-                            last_decline=last_decline, subprocess_cli=True)
+                            last_decline=last_decline, subprocess_cli=True, assigned_adapter=assigned_adapter,
+                            runner_options=runner_options)
 
     def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
         # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
         program = r'''
 import subprocess
 import sys
-sys.path.insert(0, sys.argv.pop(1))
-import offload
+from scripts.mac_test import eligibility, offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -415,8 +607,8 @@ def capture(self, arguments, *args, **kwargs):
         clock[0] = 102.0
     return answer
 
-def stream(self, arguments):
-    answer = real_stream(self, arguments)
+def stream(self, arguments, *args, **kwargs):
+    answer = real_stream(self, arguments, *args, **kwargs)
     clock[0] = 103.0
     return answer
 
@@ -438,10 +630,10 @@ subprocess.run = run
 raise SystemExit(offload.main())
 '''
         return subprocess.run(
-            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), "-c", program, "run",
              "--repo-root", str(self.repository), "--package", "hana",
              "--call-id", "call-17", "--result", str(self.result_path), "--"],
-            cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+            cwd=Path(__file__).resolve().parents[2], env=self.environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
             text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
@@ -458,7 +650,7 @@ raise SystemExit(offload.main())
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
-            sys.executable,
+            str(SCRIPT.resolve().parents[1] / "lib/py"),
             str(script),
             "run",
             "--repo-root",
@@ -470,6 +662,8 @@ raise SystemExit(offload.main())
             "--result",
             str(self.result_path),
             *runner_options,
+            *self.assignment_options(self.repository, "nextest", eligibility.DEFAULT_MAC_SETTINGS, runner_options,
+                                     environment={**self.environment, **(extra or {})}),
             "--",
             *nextest_arguments,
         ]
@@ -492,25 +686,20 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        scripts_directory = self.root / "claim-runner" / "scripts"
-        runner_directory = scripts_directory / "mac_test"
-        runner_directory.mkdir(parents=True)
-        runner = runner_directory / "offload.py"
-        _ = shutil.copyfile(SCRIPT, runner)
-        _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
-        self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
-        (scripts_directory / "lint").symlink_to(
-            SCRIPT.parent.parent / "lint", target_is_directory=True
-        )
-        (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
-        (scripts_directory / "buildlog").symlink_to(
-            SCRIPT.parent.parent / "buildlog", target_is_directory=True
-        )
-        return runner
+        tools = self.private_tools()
+        checkout = tools / "claim-runner"
+        if not checkout.exists():
+            tools.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="claim-runner-", dir=tools) as directory:
+                staging = Path(directory) / "checkout"
+                copy_runtime(staging)
+                self.write_executable(staging / "scripts/mac_test/mac_test.py", CLAIM_STUB)
+                _ = staging.rename(checkout)
+        return checkout / "scripts/mac_test/offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(STATE_SCRIPT), *arguments],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(STATE_SCRIPT), *arguments],
             cwd=self.root,
             env=self.environment,
             capture_output=True,
@@ -526,6 +715,8 @@ raise SystemExit(offload.main())
         events = [cast(CommandEvent, json.loads(line))
                   for line in path.read_text(encoding="utf-8").splitlines()]
         for event in events:
+            if event["command"] == "ssh" and "copies.py mirror-use " in event["args"][-1]:
+                event["args"] = mirror_use_payload(self, event["args"])
             if "claim" in event:
                 event["copy_claim"] = event["claim"].get("copy", False)
                 event["what"] = event["claim"]["what"]
@@ -584,11 +775,28 @@ raise SystemExit(offload.main())
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
 
-    def write_kept_claim(self, host: str = "previous-mac") -> RemoteClaimRecord:
+    def mac_repository(self) -> claim_state.MacRepositoryIdentity:
+        repository = claim_state.mac_repository_identity(str(self.repository))
+        if isinstance(repository, claim_state.WholeMacScope):
+            self.fail(f"The fixture repository has no Mac identity: {self.repository}")
+        saved = repository.claim_repository()
+        if not isinstance(saved, claim_state.MacRepositoryIdentity):
+            self.fail(f"The fixture repository has no history key: {self.repository}")
+        return saved
+
+    def write_kept_claim(self, host: str = "previous-mac", *, legacy: bool = False) -> RemoteClaimRecord:
+        self.claim_file = Path(self.environment[
+            "MAC_TEST_FIXTURE_LEGACY_CLAIM_FILE" if legacy else "MAC_TEST_FIXTURE_CLAIM_FILE"
+        ])
         self.claim_file.parent.mkdir(parents=True, exist_ok=True)
-        record: RemoteClaimRecord = {"pid": 1073741824, "proc_start": "gone", "what": "older tests",
+        record: RemoteClaimRecord = {"claim_id": "kept-claim", "episode": "kept-episode", "attempt": "kept-attempt",
+                                     "submitting_session": "fixture-session",
+                                     "pid": 1073741824, "proc_start": "gone", "what": "older tests",
                                      "worktree": str(self.repository), "since": datetime.now(timezone.utc).isoformat(),
                                      "remote_host": host}
+        if not legacy:
+            repository = self.mac_repository()
+            record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
         _ = self.claim_file.write_text(json.dumps(record))
         return record
 
@@ -606,6 +814,7 @@ raise SystemExit(offload.main())
     def reset_leftover_case(self) -> None:
         self.clear_events()
         self.claim_file.unlink(missing_ok=True)
+        self.claim_file = Path(self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"])
         (self.state_directory / "unreachable_until").unlink(missing_ok=True)
         for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
             (self.stub_directory / name).unlink(missing_ok=True)
@@ -675,14 +884,23 @@ raise SystemExit(offload.main())
     def interrupt_held_claim(
         self, *, takeover: bool = False, after_takeover: bool = False,
         signal_group: bool = False, signal_number: int = signal.SIGTERM,
-        reply_host: str = "reply-mac",
+        reply_host: str = "reply-mac", runner_options: tuple[str, ...] = (),
     ) -> str:
+        runner = self.claim_stub_runner()
+        if after_takeover:
+            first = self.start_command(script=runner, extra={"MAC_TEST_TAKEOVER_FIRST": "1"})
+            try:
+                _ = first.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                    _ = first.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         process = self.start_command(
-            script=self.claim_stub_runner(),
+            script=runner,
             extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
-                   "MAC_TEST_TAKEOVER_FIRST": "1" if after_takeover else "0",
+                   "MAC_TEST_TAKEOVER_FIRST": "0",
                    "MAC_TEST_TAKEOVER_REPLY": reply_host},
-            start_new_session=signal_group,
+            start_new_session=signal_group, runner_options=runner_options,
         )
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
@@ -730,22 +948,75 @@ raise SystemExit(offload.main())
         self.assertEqual(self.events_for("ssh"), [])
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
-    def assert_takeover_signal_checks_reply_host(self, outcome: str) -> None:
+    def assert_takeover_signal_keeps_claim_for_leased_cleanup(self, reply_host: str) -> None:
+        # The run holds mirror leases here. A later run checks leftovers under the cleanup lease.
+        self.set_leftover_answer("clean")
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host)
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        self.assertEqual(self.events_for("ssh"), [], output)
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+        self.assertEqual(output, "", output)
+
+    def use_linux_target(self) -> tuple[str, ...]:
+        """Register the trusted Linux target box and return its runner options."""
+        settings = self.root / "box.conf"
+        _ = write_config_fixture(settings, "".join(f"{name}={value}\n" for name, value in {
+            **self.config, "slots": "1", "slots.hana": "1", "kinds": "test,check,lint,doc,build",
+            "parity.rustc": "fixture", "parity.nextest": "fixture", "parity.mend": "fixture",
+            "parity.scripts_commit": "fixture"}.items()), template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac\n", "targets=mac,box\n")
+                                + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+        # The Linux runner refuses an untrusted source before it claims.
+        _ = write_config_fixture(self.root / "nix_env.conf", f"trusted_home_folders={self.repository.name}\n")
+        self.environment["HOME"] = str(self.root)
+        # The Linux leftover selector has no lsof; answer it like the Mac selector.
+        stub = self.bin_directory / "command-stub"
+        _ = stub.write_text(stub.read_text().replace(
+            "[[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]", "[[ $remote == *'select_leftovers()'* ]]"))
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").run
+        return ("--target", "box", "--settings", str(settings))
+
+    def assert_linux_takeover_signal_checks_reply_host(self, outcome: str, reply_host: str = "reply-box") -> None:
+        options = self.use_linux_target()
         self.set_leftover_answer(outcome)
-        output = self.interrupt_held_claim(takeover=True)
+        output = self.interrupt_held_claim(takeover=True, reply_host=reply_host, runner_options=options)
+        state_events = (self.stub_directory / "state-events").read_text().splitlines()
+        if not reply_host:
+            self.assertEqual(state_events, ["claim"], output)
+            self.assert_claim_is_kept("previous-mac")
+            self.assertEqual(output, "mac_test: could not confirm that a lost run's leftovers ended: "
+                             + "the kept claim's host could not be read; the box stays busy\n")
+            self.assertEqual(self.events_for("ssh"), [], output)
+            self.assertFalse((self.stub_directory / "cleanup-called").exists())
+            return
         ssh = self.events_for("ssh")
         self.assertEqual(len(ssh), 1, output)
-        self.assertEqual(ssh[0]["args"][-2], "reply-mac", output)
+        self.assertEqual(ssh[0]["args"][-2], reply_host, output)
+        self.assertIn("select_leftovers()", ssh[0]["args"][-1])
         self.assertTrue((self.stub_directory / "cleanup-called").exists())
-        state_events = (self.stub_directory / "state-events").read_text().splitlines()
         if outcome == "clean":
-            self.assertEqual(state_events, ["claim", "release"])
-            self.assertFalse(self.claim_file.exists())
-            self.assertEqual(output, "")
+            self.assertEqual(state_events, ["claim", "release"], output)
+            self.assertFalse(self.claim_file.exists(), output)
+            self.assertEqual(output, "", output)
+            return
+        self.assertEqual(state_events, ["claim"], output)
+        self.assert_claim_is_kept("previous-mac")
+        if outcome == "remaining":
+            self.assertEqual(output, "mac_test: 3 leftover processes of a lost run are still on the box; "
+                             + "it stays busy until they end\n")
         else:
-            self.assertEqual(state_events, ["claim"])
-            self.assert_claim_is_kept("previous-mac")
-            self.assert_leftover_diagnostic(output, outcome)
+            self.assertRegex(output, r"^mac_test: could not confirm that a lost run's leftovers ended: "
+                             + r"[^\n]*connection refused by host[^\n]*; the box stays busy\n$")
+
+    def remove_tree_key(self) -> None:
+        # The origin keeps the history key that a Mac claim needs; no HEAD means no tree key.
+        git = ["git", "-C", str(self.repository)]
+        _ = subprocess.run([*git, "remote", "add", "origin", "https://example.invalid/fixture/hana.git"], check=True)
+        _ = subprocess.run([*git, "update-ref", "-d", "HEAD"], check=True)
+        self.claim_file = claim_state.StatePaths(self.state_directory, "mac").claims / self.mac_repository().claim_file
+        self.environment["MAC_TEST_FIXTURE_CLAIM_FILE"] = str(self.claim_file)
 
     def commit_sent_tree(self) -> str:
         environment = {
@@ -765,7 +1036,7 @@ raise SystemExit(offload.main())
         assert isinstance(key, str)
         return key
 
-    def run_with_copy_change(self, change: Callable[[], None]) -> None:
+    def run_with_copy_change(self, change: Callable[[], None], *, source_changed: bool = False) -> None:
         self.fixture["hold_copy"] = True
         self.sync_fixture()
         process = self.start_command()
@@ -774,8 +1045,10 @@ raise SystemExit(offload.main())
             change()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
             output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(process.returncode, 0, output)
-            self.assert_wire("passed", "")
+            self.assertEqual(process.returncode, 75 if source_changed else 0, output)
+            self.assert_wire("declined" if source_changed else "passed", "source_changed" if source_changed else "")
+            if source_changed:
+                self.assertFalse(any("mirror-use" in event["args"][-1] for event in self.events_for("ssh")))
         finally:
             if process.poll() is None:
                 process.kill()
@@ -785,7 +1058,8 @@ raise SystemExit(offload.main())
         self.assertEqual(len(self.events_for("rsync")), 1)
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("lint nextest", remote)
-        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        words, _ = split_mac_run_command(remote)
+        return words
 
     def assert_stable_copy_sends_key(self) -> None:
         # A later stable copy must send its key after the earlier copy omitted it.

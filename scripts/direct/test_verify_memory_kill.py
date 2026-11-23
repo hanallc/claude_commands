@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib.shell_test_support import shell_function
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.memory_kill_test_support import (
     EARLYOOM_MESSAGE, KILL_AT, failed_compile_log, install_journal, journal_event,
@@ -21,11 +22,9 @@ from scripts.direct.memory_kill_test_support import (
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# A Codex worker running this suite must not make verify.sh detach its call.
-WORKER_FREE_ENVIRONMENT = {name: value for name, value in os.environ.items()
-                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}}
-
-WORKER_FREE_ENVIRONMENT.update({"VERIFY_START_DIR": str(VERIFY.parent), "PY": sys.executable})
+WORKER_FREE_ENVIRONMENT = {
+    **verify_test_environment(), "VERIFY_START_DIR": str(VERIFY.parent), "PY": sys.executable,
+}
 
 
 def classifier_functions() -> str:
@@ -39,8 +38,8 @@ def classifier_functions() -> str:
     for path, name in (
         (VERIFY.parent.parent / "lint" / "invoke.sh", "buildlog_step_compiles"),
         *((VERIFY, name) for name in (
-            "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
-            "step_writes_tree", "finish_step_token", "run", "run_step", "note_event")),
+            "verify_helper", "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
+            "release_wait_claim", "step_writes_tree", "finish_step_token", "run", "run_step", "note_event")),
     ):
         functions.append(shell_function(path.read_text(), name))
     return "\n".join(functions)

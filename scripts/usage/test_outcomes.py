@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.agents import remote
+
 import importlib
 import json
 import os
@@ -226,11 +228,13 @@ class ProductionPathsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         _ = document.write_text("# Production\n\n- **Repository:** `/repo/main`\n", encoding="utf-8")
         with isolated_staff_file(Path(directory.name) / "staff.json", {}):
-            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
+            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc(remote.local_machine(), document))
             _ = fixture_member("unit", name="a", parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", branch_worktree))
+                               worktree=staff.PresentWorktree(remote.local_machine(), branch_worktree))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent, staff.snapshot())), (owner,))
+            self.assertEqual(tuple(outcomes.production_owners(document.parent / "other", staff.snapshot())), ())
             self.assertEqual(
-                outcomes.production_paths(document),
+                outcomes.production_paths(owner),
                 (Path("/repo/main"), branch_worktree),
             )
 
@@ -253,9 +257,9 @@ class ProductionPathsTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(Path(directory.name) / "staff.json", {}))
         owner = recorded_showrunner("fixture-owner", document)
         _ = fixture_member("unit", name="a", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", worktree))
+                           worktree=staff.PresentWorktree(remote.local_machine(), worktree))
         self.assertEqual(
-            outcomes.production_paths(document),
+            outcomes.production_paths(owner),
             (repository, worktree),
         )
 
@@ -369,7 +373,7 @@ class OutcomeTests(OutcomeFixture):
     def test_outcome_schema_keeps_identity_and_source_event_without_finding_details(self) -> None:
         _ = self.collect()
         expected = {
-            "runs": (("machine", "run_id", "started_at", "plan_doc", "worktree", "branch", "state", "finished_at",
+            "runs": (("machine", "run_id", "started_at", "plan_doc", "worktree", "finished_at",
                       "source_event"), ("machine", "run_id")),
             "phases": (("machine", "run_id", "phase_instance_id", "phase_id", "title", "started_at", "state",
                         "finished_at", "source_event"), ("machine", "phase_instance_id")),
@@ -402,9 +406,9 @@ class OutcomeTests(OutcomeFixture):
         output = self.collect()
         self.assert_outcomes_added(output, "history", 9)
         self.assertEqual(self.values(self.rows("SELECT * FROM runs"), "run_id", "started_at", "plan_doc", "worktree",
-                                     "branch", "state", "finished_at", "source_event"), [
+                                     "finished_at", "source_event"), [
             ("fixture-run", "2026-10-10T21:00:00+00:00", "docs/plans/fixture-plan.md", "/invented/worktree",
-             "fixture-branch", "open", None, "run-create"),
+             None, "run-create"),
         ])
         self.assertEqual(self.values(self.rows("SELECT * FROM phases"), "phase_instance_id", "phase_id", "title",
                                      "state", "finished_at", "source_event"),
@@ -436,14 +440,14 @@ class OutcomeTests(OutcomeFixture):
         self.append_bytes(path, tail[:-1])
         output = self.collect()
         self.assert_outcomes_added(output, "history", 0)
-        self.assertEqual(self.values(self.rows("SELECT state, source_event FROM runs"), "state", "source_event"),
-                         [("open", "run-create")])
+        self.assertEqual(self.values(self.rows("SELECT finished_at, source_event FROM runs"), "finished_at", "source_event"),
+                         [(None, "run-create")])
         self.assertEqual(self.cursor_for(path), previous + len(tail) - len(tail.splitlines(keepends=True)[-1]))
         self.append_bytes(path, b"\n")
         output = self.collect()
         self.assert_outcomes_added(output, "history", 0)
-        self.assertEqual(self.values(self.rows("SELECT * FROM runs"), "state", "finished_at", "source_event"),
-                         [("complete", "2026-10-10T22:03:00+00:00", "run-create")])
+        self.assertEqual(self.values(self.rows("SELECT * FROM runs"), "finished_at", "source_event"),
+                         [("2026-10-10T22:03:00+00:00", "run-create")])
         self.assertEqual(self.values(self.rows("SELECT * FROM phases"), "state", "finished_at", "source_event"),
                          [("complete", "2026-10-10T22:02:00+00:00", "phase-create")])
         self.assertEqual(self.values(self.rows("SELECT * FROM passes WHERE pass_instance_id = 'unfinished-pass'"),
@@ -575,9 +579,9 @@ class OutcomeTests(OutcomeFixture):
             encoding="utf-8")
         owner = recorded_showrunner("second-owner", self.production_docs / "fixture-production.md")
         _ = fixture_member("unit", name="second", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", second_repo))
+                           worktree=staff.PresentWorktree(remote.local_machine(), second_repo))
         _ = fixture_member("unit", name="first", parent=owner.id,
-                           worktree=staff.PresentWorktree("natedev", self.repository))
+                           worktree=staff.PresentWorktree(remote.local_machine(), self.repository))
         _ = self.collect()
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {first, side, second})
         _ = self.collect()
@@ -620,9 +624,9 @@ class OutcomeTests(OutcomeFixture):
         _ = (self.production_docs / "fixture-production.md").write_text(
             "# Production\n", encoding="utf-8")
         owner = fixture_member("showrunner", name="fixture",
-                               doc=staff.LiveDoc("natedev", self.production_docs / "fixture-production.md"))
+                               doc=staff.LiveDoc(remote.local_machine(), self.production_docs / "fixture-production.md"))
         _ = fixture_member("unit", name="retired", parent=owner.id,
-                           worktree=staff.RemovedWorktree("natedev", self.root / "removed-worktree"))
+                           worktree=staff.RemovedWorktree(remote.local_machine(), self.root / "removed-worktree"))
         output = self.collect()
         self.assert_family_state(output, "natedev", "checkpoints", "ready")
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {commit_id})
@@ -788,7 +792,8 @@ class MacOutcomeTests(OutcomeFixture):
         binary_directory = self.root / "bin"
         binary_directory.mkdir()
         ssh = binary_directory / "ssh"
-        _ = shutil.copyfile(COLLECT_FIXTURES / "mac/fake_ssh.py", ssh)
+        _ = ssh.write_text((COLLECT_FIXTURES / "mac/fake_ssh.py").read_text().replace(
+            "${HOME}/.claude/scripts/lib/py", str(Path(__file__).resolve().parents[1] / "lib/py")))
         ssh.chmod(0o700)
 
     def mac_collect(self, behavior: SshBehavior = "complete") -> MacRun:
@@ -907,8 +912,8 @@ class MacOutcomeTests(OutcomeFixture):
         self.assertEqual(run.stream["measurement_records"], 0)
         self.assertEqual(run.stream["history_cursor_records"], 1)
         self.assert_outcomes_added(run.output, "history", 0, "mac")
-        self.assertEqual(self.values(self.rows("SELECT * FROM runs WHERE machine = 'mac'"), "state", "finished_at", "source_event"),
-                         [("complete", "2026-10-10T22:03:00+00:00", "run-create")])
+        self.assertEqual(self.values(self.rows("SELECT * FROM runs WHERE machine = 'mac'"), "finished_at", "source_event"),
+                         [("2026-10-10T22:03:00+00:00", "run-create")])
         before = self.snapshot()
         repeated = self.mac_collect()
         self.assertEqual(repeated.stream["outcome_records"], 0)
@@ -962,17 +967,18 @@ class MacOutcomeTests(OutcomeFixture):
         _ = self.mac_collect()
         path = self.remote_history()
         previous = path.stat().st_size
-        tail = b'{"event_id":"mac-finish","event_type":"run_finished","timestamp":"2026-10-10T22:00:00Z","status":"complete"}'
+        tail = b'{"event_id":"mac-finish","event_type":"run_finished","timestamp":"2026-10-10T22:00:00Z"}'
         self.append_bytes(path, tail)
         incomplete = self.mac_collect()
         self.assertEqual(incomplete.stream["outcome_records"], 0)
         self.assertEqual(self.cursor_for(path, "mac"), previous)
-        self.assertEqual(self.values(self.rows("SELECT state FROM runs WHERE machine = 'mac'"), "state"), [("open",)])
+        self.assertEqual(self.values(self.rows("SELECT finished_at FROM runs WHERE machine = 'mac'"), "finished_at"), [(None,)])
         self.append_bytes(path, b"\n")
         complete = self.mac_collect()
         self.assertEqual(complete.stream["outcome_records"], 1)
         self.assertEqual(self.cursor_for(path, "mac"), path.stat().st_size)
-        self.assertEqual(self.values(self.rows("SELECT state FROM runs WHERE machine = 'mac'"), "state"), [("complete",)])
+        self.assertEqual(self.values(self.rows("SELECT finished_at FROM runs WHERE machine = 'mac'"), "finished_at"),
+                         [("2026-10-10T22:00:00+00:00",)])
 
     def test_cut_inside_history_rolls_back_its_rows_and_cursor_then_resume_adds_once(self) -> None:
         cut = self.mac_collect("cut_inside_history")
@@ -1082,7 +1088,8 @@ from scripts.production.staff_test_support import StaffTestCase
 class BranchRepositoryLocationTests(StaffTestCase):
     def test_repository_discovery_uses_the_staff_worktree(self) -> None:
         fixture = self.separated_unit_folders()
-        self.assertEqual(outcomes.production_paths(fixture.doc), (fixture.doc.parents[1], fixture.worktree))
+        with patch.object(staff.StaffSnapshot, "by_doc", side_effect=AssertionError("repeated owner lookup")):
+            self.assertEqual(outcomes.production_paths(fixture.runner), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

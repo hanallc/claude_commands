@@ -7,10 +7,6 @@
   ],
   "rules": [
     {
-      "path": "scripts/agents/codex_mesh.py",
-      "owner": "models-unit"
-    },
-    {
       "path": "scripts/buildlog/mac_idle.py",
       "owner": "verify-unit"
     },
@@ -257,10 +253,6 @@
     {
       "path": "scripts/message/",
       "owner": "shutdown-unit"
-    },
-    {
-      "path": "scripts/model_study/",
-      "owner": "models-unit"
     },
     {
       "path": "scripts/shot_report/",

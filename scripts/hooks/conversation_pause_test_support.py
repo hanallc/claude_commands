@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.agents import remote
+
 from collections.abc import Callable
 import io
 import json
@@ -16,15 +18,14 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import conversation_pause as conversation_pause
+from scripts.hooks import conversation_pause as conversation_pause
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
@@ -45,7 +46,7 @@ RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first a
 ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
 PAUSE_CONTEXT = (
     "Automatic updates for this session are paused while the user talks to you: "
-    "dailies. Leave them off; the session asks the user before they return. "
+    "status reports. Leave them off; the session asks the user before they return. "
     f"If the user asks for them back sooner, run: {RESUME}"
 )
 OTHER_ANSWER_CONTEXT = (
@@ -93,11 +94,11 @@ def asked_read(asked_at: int, replies_ended: int) -> dict[str, object]:
     }
 
 
-def scheduled_wakeup(prompt: str) -> dict[str, object]:
+def scheduled_wakeup(prompt: str, *, task_id: str = "scheduled-1", recurring: bool = True) -> dict[str, object]:
     return {
-        "id": "scheduled-1",
+        "id": task_id,
         "schedule": "0 * * * *",
-        "recurring": True,
+        "recurring": recurring,
         "prompt": prompt,
     }
 
@@ -132,7 +133,6 @@ class ConversationPauseFixture(unittest.TestCase):
     send_stub: Path = Path()
     activity_log: Path = Path()
     activity_stub: Path = Path()
-    unit_active_root: Path = Path()
     socket_path: Path = Path()
     environment: dict[str, str] = {}
 
@@ -156,7 +156,7 @@ class ConversationPauseFixture(unittest.TestCase):
         self.root = self.fixture_root
         self.bind_environment()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        self.record_showrunner("showrunner-demo")
+        _ = self.showrunner_timer("demo")
 
     def build_fixture(self) -> None:
         self.root.mkdir()
@@ -278,8 +278,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
 """
         )
         self.activity_stub.chmod(0o755)
-        self.unit_active_root = self.root / "unit-active"
-        self.unit_active_root.mkdir()
     def bind_environment(self) -> None:
         self.notifier_root = self.root / "notifier"
         self.pause_root = self.root / "conversation-pause"
@@ -294,11 +292,10 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         self.send_stub = self.root / "send.py"
         self.activity_log = self.root / "auto-silence.args"
         self.activity_stub = self.root / "auto_silence.py"
-        self.unit_active_root = self.root / "unit-active"
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(self.notifier_root),
             "SHOWRUNNER_STATE_DIR": str(self.showrunner_root),
@@ -319,18 +316,15 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             # writes one (`record_activity`).
             "AUTO_SILENCE_COMMAND": shutil.which("true") or "/bin/true",
             "AUTO_SILENCE_LOG": str(self.activity_log),
-            "UNIT_ACTIVE_DIR": str(self.unit_active_root),
         }
 
-    def record_showrunner(self, name: str) -> None:
-        """Record the production owner that review checks require."""
-        if not name.startswith("showrunner-"):
-            return
-        slug = name.removeprefix("showrunner-")
-        doc = self.root / f"{slug}-production.md"
+    def showrunner_timer(self, name: str) -> str:
+        """Return the timer name for a production fixture."""
+        doc = self.root / f"{name}-production.md"
         if not doc.exists():
-            _ = doc.write_text(f"# {slug}\n")
-        _ = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", doc))
+            _ = doc.write_text(f"# {name}\n")
+        owner = fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
+        return f"showrunner-{owner.id}"
 
     def create_instance(
         self,
@@ -342,7 +336,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         sender: str = "",
         run: str = "",
     ) -> Path:
-        self.record_showrunner(name)
         instance = self.notifier_root / name
         instance.mkdir()
         if run:
@@ -373,8 +366,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         # A paused item is one whose schedule still exists; `scheduled=False` writes a record
         # naming schedules removed since, as switching a production to on demand does. An item
         # the test has not set up yet is set up as the pause leaves it: stopped and marked.
-        for name in instances:
-            self.record_showrunner(name)
         for name in instances if scheduled else ():
             (self.notifier_root / name).mkdir(exist_ok=True)
         for name in instances if scheduled else ():
@@ -399,9 +390,8 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         return self.pause_root / "scheduled-prompts" / f"{session_id}.json"
 
     def scheduled_prompts(self, session_id: str = SESSION) -> list[str]:
-        return cast(
-            list[str], json.loads(self.scheduled_prompts_path(session_id).read_text())
-        )
+        entries = cast(list[dict[str, object]], json.loads(self.scheduled_prompts_path(session_id).read_text()))
+        return [cast(str, entry["prompt"]) for entry in entries]
 
     def calls(self, path: Path) -> list[list[str]]:
         if not path.exists():
@@ -549,13 +539,13 @@ print("SENT: delivered")
     def invoke(self, command: list[str], *, input: str = "", capture_output: bool = True,
                text: bool = True, check: bool = False,
                env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        # Alarm expiry, blocked flock, re-entrant delivery and executable diagnostics
-        # keep their actual process boundary. Other cases exercise the same scripts
-        # and stand-ins in fresh namespaces, including every write and error path.
+        # Process tests use the executable and its deadline.
         if self.run_in_subprocess:
             return subprocess.run(command, input=input, capture_output=capture_output,
                                   text=text, check=check, env=env, timeout=TEST_HANG_GUARD_SECS)
 
+        # Run the work in this process so it uses the fixture's streams and patches.
+        env = {**env, "CONVERSATION_PAUSE_HOOK_BUDGET": "0"}
         real_run = subprocess.run
 
         def run_child(command: list[str], *, capture_output: bool = False,
@@ -592,16 +582,11 @@ print("SENT: delivered")
             exec(code, vars(module))
             return 0
 
-        # The hook's imported alert module has one import-time path. Rebind it
-        # under the temporary home, and restore the caller's alarm and stdin.
-        with patch.dict(os.environ, environment, clear=True), patch.object(sys, "path", sys.path.copy()):
-            sys.path.insert(0, str(LIBRARY.parents[1] / "message"))
-            import escalate
-            import direct_run
+        # Set the alert module's state path to the temporary home.
+        with patch.dict(os.environ, environment, clear=True):
+            from scripts.message import escalate
 
         with patch.object(sys, "stdin", io.StringIO(stdin)), patch.object(
             escalate, "STATE", Path(environment["ESCALATE_STATE_DIR"]),
-        ), patch.object(
-            direct_run, "ACTIVE_OVERRIDE", environment["UNIT_ACTIVE_DIR"],
         ), patch.dict(sys.modules, {"__main__": module}):
             return invoke_cli(module, main, arguments, environment, self.root)

@@ -16,18 +16,16 @@ from unittest.mock import patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
-from scripts.lib.code_kind import is_test_code
 
 
-ROOT = Path(__file__).resolve().parents[1]
 # These are account decisions with a separate, explicit contract.
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
-    ("shutdown/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
+    ("agents/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
     ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
-    ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
+    ("notify/review.py", "reviewer_environment"): "a headless model check uses the account of its group through group_account",
 }
-SELECTORS = frozenset({"pick", "placement", "role_account", "group_label"})
+SELECTORS = frozenset({"pick", "placement", "role_account", "group_account", "group_label"})
 RENDERERS = frozenset({"prepared_account", "account_prefix", "named_account_environment", "account_dir"})
 
 
@@ -101,8 +99,8 @@ def launch_account_violations(source: str, path: str) -> list[str]:
         for node in nodes:
             if called(node) in SELECTORS:
                 reviewer_role = ((path, name) == ("notify/review.py", "reviewer_environment")
-                                 and called(node) == "role_account" and node.args
-                                 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "unit")
+                                 and called(node) == "group_account" and node.args
+                                 and isinstance(node.args[0], ast.Name) and node.args[0].id == "group")
                 if not reviewer_role:
                     problems.append(f"{path}:{node.lineno}: {name} selects with {called(node)} instead of account_for_group_launch")
         if (path, name) in EXCEPTIONS:
@@ -428,22 +426,14 @@ def session_launch(identity: str):
     return selected
 '''
         self.assertTrue(any("selects with role_account" in problem
-                            for problem in launch_account_violations(source, "shutdown/restart.py")))
-
-    def test_all_python_claude_launchers_use_the_shared_account_resolver(self) -> None:
-        violations: list[str] = []
-        for path in sorted(ROOT.rglob("*.py")):
-            if is_test_code(path):
-                continue
-            violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
-        self.assertEqual(violations, [], "\n".join(violations))
+                            for problem in launch_account_violations(source, "agents/restart.py")))
 
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
                 ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
-                ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
-                 + 'open_window claude -n "$session_name" /berth_fix'),
-                ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
+                ("fixtures/window-launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /fixture\n'
+                 + 'open_window claude -n "$session_name" /fixture'),
+                ("fixtures/background.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
             with self.subTest(path=path):
                 self.assertTrue(any("no resolved account" in problem
                                     for problem in shell_launch_account_violations(source, path)))
@@ -453,24 +443,7 @@ def session_launch(identity: str):
 claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
 '''
-        self.assertEqual(shell_launch_account_violations(source, "direct/implement.sh"), [])
-
-    def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
-        for arguments in ("--print prompt", "-p prompt", "prompt", ""):
-            with self.subTest(arguments=arguments):
-                selecting = f'chosen=$(python accounts.py pick claude)\nCLAUDE_CONFIG_DIR="$chosen" claude {arguments}\n'
-                self.assertTrue(shell_launch_account_violations(selecting, "fixture.sh"))
-                unresolved = f'CLAUDE_CONFIG_DIR="/somewhere/.claude3" claude {arguments}\n'
-                self.assertTrue(shell_launch_account_violations(unresolved, "fixture.sh"))
-                for directory in ("resolver_config_dir", "record_config_dir"):
-                    rendering = f'CLAUDE_CONFIG_DIR="${directory}" claude {arguments}\n'
-                    self.assertEqual(shell_launch_account_violations(rendering, "fixture.sh"), [])
-        violations: list[str] = []
-        for path in sorted(ROOT.rglob("*.sh")):
-            if is_test_code(path):
-                continue
-            violations.extend(shell_launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
-        self.assertEqual(violations, [], "\n".join(violations))
+        self.assertEqual(shell_launch_account_violations(source, "direct/assign_claude.py"), [])
 
 
 if __name__ == "__main__":

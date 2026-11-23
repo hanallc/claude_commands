@@ -1,15 +1,80 @@
 """Validation and merged-branch recovery use only a local bare remote."""
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import shutil
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    def test_dispatch_and_poll_report_the_run_or_error(self) -> None:
+        self.seed()
+        _ = self.git("switch", "-c", "ci-delay")
+        _ = self.git("push", "origin", "ci-delay")
+        published = self.git("rev-parse", "HEAD").stdout.strip()
+        repo = "github.com/example/example"
+        self.environment.update(CI_PUSH_ORIGIN=str(self.remote), CI_PUSH_REPO=repo, CANCEL_PRIOR="false")
+        calls = self.root / "gh-calls"
+        lookup_error = self.root / "lookup-error"
+        listings = self.root / "poll-runs.json"
+        _ = self.stub("gh", f'''import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path({str(calls)!r}).open("a") as log:
+    log.write(json.dumps(args[:2]) + "\\n")
+if args[:2] == ["workflow", "run"]:
+    print("Dispatch was refused", file=sys.stderr)
+    raise SystemExit(9)
+if args[:2] != ["run", "list"]:
+    raise SystemExit("Unexpected gh command")
+if Path({str(lookup_error)!r}).exists():
+    print("Could not list runs", file=sys.stderr)
+    raise SystemExit(8)
+print(Path({str(listings)!r}).read_text())
+''')
+        _ = self.stub("sleep", 'raise SystemExit("No eligible run in the first poll")\n')
+        created_at = "2026-10-30T00:01:00Z"
+        at_bound = (123, "queued", "")
+        queued = (124, "queued", "")
+        failed = (125, "completed", "failure")
+        dispatch_args = ("--dispatch-published", published, "ci.yml")
+        follow_args = ("--follow-published", published, "pushed", "ci.yml", "workflow_dispatch")
+        poll_args = (*follow_args, f"dispatched 123 {created_at}")
+        list_call = '["run", "list"]'
+
+        for outcome, args, runs, exit_code, message, gh_calls in (
+            ("lookup error", dispatch_args, (), 8, "Could not list runs", [list_call]),
+            ("poll error", (*follow_args, "dispatched 0"), (), 8, "Could not list runs", [list_call]),
+            ("refused", dispatch_args, (), 9, "Dispatch was refused", [list_call, '["workflow", "run"]']),
+            ("queued and failed", poll_args, (at_bound, queued, failed), 0, "run_id:  124", [list_call]),
+            ("failed before first poll", poll_args, (at_bound, failed), 1,
+             f"CI run 125 completed with failure (https://{repo}/actions/runs/125)", [list_call]),
+            ("moved", dispatch_args, (), 1, f"origin/ci-delay moved before dispatch of {published}", [list_call]),
+        ):
+            with self.subTest(outcome=outcome):
+                if outcome in ("lookup error", "poll error"):
+                    lookup_error.touch()
+                else:
+                    lookup_error.unlink(missing_ok=True)
+                if outcome == "moved":
+                    _ = self.git("commit", "--allow-empty", "-m", "Advance the published branch")
+                    _ = self.git("push", "origin", "ci-delay")
+                _ = calls.write_text("")
+                _ = self.write(listings, json.dumps([
+                    {"databaseId": run_id, "status": status, "conclusion": conclusion,
+                     "createdAt": created_at, "headSha": published}
+                    for run_id, status, conclusion in runs
+                ]))
+
+                result = self.script("validate_and_push/push_direct.sh", *args)
+
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr if exit_code else result.stdout)
+                self.assertEqual(calls.read_text().splitlines(), gh_calls)
+
     def install_gh(self) -> None:
         _ = self.stub("gh", '''import subprocess, sys
 args = sys.argv[1:]
@@ -59,7 +124,10 @@ touch hook-finished
         _ = self.git("commit", "-am", "next")
         self.install_gh()
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
-        self.assertNotEqual(stopped.returncode, 0)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("post-push hook: failed (exit 9); rerun:", stopped.stderr)
+        self.assertIn("LANDED_SHA=", stopped.stderr)
+        self.assertIn("LANDED_BRANCH=main", stopped.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout, self.git("rev-parse", "origin/main").stdout)
         landed = self.git("rev-parse", "HEAD").stdout
         finished = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
@@ -76,10 +144,24 @@ touch hook-finished
         self.seed()
         self.install_gh()
         first = self.git("rev-parse", "HEAD").stdout.strip()
-        # Stop after publishing the completion, before the script exits.
-        self.stop_command("mv", target=".git/post-push-completed", after=True)
+        stop = self.write(self.root / "stop-completion", "stop\n")
+        startup = self.root / "startup"
+        _ = self.write(startup / "sitecustomize.py", f'''from pathlib import Path
+from scripts.lib import atomic_file
+write = atomic_file.write_text_atomic
+def stop_after_completion(path, text, **options):
+    write(path, text, **options)
+    flag = Path({str(stop)!r})
+    if path.name == "post-push-completed" and flag.exists():
+        flag.unlink()
+        raise SystemExit(86)
+atomic_file.write_text_atomic = stop_after_completion
+''')
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(Path(__file__).resolve().parents[2])))
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertNotEqual(stopped.returncode, 0)
+        self.assertFalse(stop.exists(), stopped.stdout + stopped.stderr)
+        self.assertEqual((self.repo / ".git/post-push-completed").read_text().strip(), first)
         repeated = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual((self.repo / ".git/hook-runs").read_text().splitlines(), [first])
@@ -192,6 +274,31 @@ printf '%s\\n' "${GIT_INDEX_FILE:-real}" >> "$TEST_INDEX_HOOK_LOG"
         self.assertTrue(calls, "The real commit still runs repository hooks")
         self.assertFalse(any("validate-index." in call for call in calls), calls)
         self.assertEqual((self.repo / "seed.txt").read_text(), "formatted\n")
+
+    def test_autofix_proof_refuses_a_same_size_edit_at_the_index_mtime(self) -> None:
+        self.seed()
+        self.install_autofix()
+        _ = self.git("config", "core.trustctime", "false")
+        source = self.write(self.repo / "racy.txt", "before\n")
+        timestamp = 1_600_000_000_000_000_000
+        os.utime(source, ns=(timestamp, timestamp))
+        _ = self.git("add", "racy.txt")
+        _ = self.git("commit", "-qm", "Add the racy file")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        _ = self.write(self.repo / ".git/validate-autofix", f"{head} {tree}\n")
+        index = self.repo / ".git/index"
+        os.utime(index, ns=(timestamp, timestamp))
+        _ = source.write_text("edited\n")
+        os.utime(source, ns=(timestamp, timestamp))
+
+        result = self.script("validate_and_push/validate_ci.sh")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uncommitted changes outside the saved autofix output", result.stderr)
+        self.assertIn("racy.txt", result.stderr)
+        self.assertEqual(source.read_text(), "edited\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head)
 
     def assert_user_edit_refused(self, before: str) -> None:
         index = (self.repo / ".git/index").read_bytes()

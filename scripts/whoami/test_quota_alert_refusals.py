@@ -5,19 +5,107 @@ from __future__ import annotations
 from scripts.lib.test_models_registry import write_registry
 
 import os
+import fcntl
+import json
+import io
+import shutil
+import socket
+import subprocess
 import unittest
+from contextlib import redirect_stdout
 from datetime import timedelta
+from typing import cast
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
-import quota_alert
+from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
-from scripts.accounts import refusals
+from scripts.accounts import refusals, role_map
 from scripts.whoami.quota_alert_test_support import Notes, REFUSAL_ACTION, REGISTRY as REGISTRY
 
 setUpModule = support.setUpModule
 
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
+    def test_no_capacity_announces_once_after_a_zero_episode_without_holding_the_state_lock(self) -> None:
+        for hostname, enabled in ((role_map.ROLE_MAP_HOST + ".local", True), ("other-host.local", False)):
+            with self.subTest(hostname=hostname):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.seed, self.root)
+                self.credits.add("codex1")
+                notes: Notes = [self.note("codex1.md", "active", "0")]
+                _ = self.alert(notes, self.now)
+                self.assertEqual(self.broadcasts, [])
+                self.credits.discard("codex1")
+                calls: list[list[str]] = []
+                stops: list[list[str]] = []
+                copies: list[list[str]] = []
+
+                def record_broadcast(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    with quota_alert.STATE.with_name(f".{quota_alert.STATE.name}.lock").open() as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    saved = cast(quota_alert.StoredState, json.loads(quota_alert.STATE.read_text()))
+                    self.assertTrue(saved.get("no_worker_mode", False))
+                    self.assertIn("--no-block", arguments)
+                    if os.path.basename(arguments[arguments.index("--") + 2]) == "send.py":
+                        copies.append(arguments[arguments.index("--to"):])
+                    elif "--from" in arguments:
+                        calls.append(arguments[arguments.index("--from"):])
+                    else:
+                        stops.append(arguments[arguments.index("--") + 2:])
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+
+                with mock.patch.object(socket, "gethostname", return_value=hostname), \
+                     mock.patch("scripts.whoami.quota_alert.subprocess.run", side_effect=record_broadcast):
+                    _ = self.block(notes, self.now)
+                    _ = self.block(notes, self.now + timedelta(minutes=1))
+                if enabled:
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][2::2], ["--showrunners", "--units"])
+                    self.assertIn("Send no assign.", calls[0][3])
+                    self.assertEqual(calls[0][3], calls[0][5])
+                    self.assertEqual(copies, [["--to", producer, "--from", "quota-alert", "--text", f"FYI, no action: {calls[0][3]}"]
+                                              for producer in ("morty", "dwight")])
+                    with quota_alert.state_file() as state:
+                        self.assertTrue(state.get("no_worker_mode", False))
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual([[os.path.basename(stop[0]), *stop[1:]] for stop in stops], [["worker_capacity.py", "stop"]])
+                else:
+                    self.assertEqual(calls, [])
+                    self.assertEqual(stops, [])
+                    self.assertEqual(copies, [])
+                    with quota_alert.state_file() as state:
+                        self.assertFalse(state.get("no_worker_mode", False))
+
+    def test_failed_notice_start_logs_once_and_keeps_the_refusal_pass_running(self) -> None:
+        self.credits.discard("codex1")
+        for failure, detail in ((7, "exit 7"), (OSError("manager unavailable"), "manager unavailable")):
+            with self.subTest(failure=detail):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.seed, self.root)
+                notes: Notes = [self.note("codex1.md", "active", "0")]
+                output = io.StringIO()
+
+                def fail_start(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    if isinstance(failure, OSError):
+                        raise failure
+                    return subprocess.CompletedProcess(arguments, failure, "", "")
+
+                with redirect_stdout(output), mock.patch("scripts.whoami.quota_alert.subprocess.run", side_effect=fail_start) as start:
+                    log = self.block(notes, self.now)
+                    _ = self.block(notes, self.now + timedelta(minutes=1))
+                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}",
+                                                                  f"quota-alert: no-worker mode FYI to morty failed: {detail}",
+                                                                  f"quota-alert: no-worker mode FYI to dwight failed: {detail}",
+                                                                  f"quota-alert: Codex worker stop failed: {detail}"])
+                self.assertEqual(start.call_count, 4)
+                self.assertIn("quota status codex1: Codex refused work on codex1. No credit balance is reported for codex1. "
+                              + "New work moved to Claude, the other coding assistant.", log)
+                self.assertEqual(self.assignments()["direct"], "claude")
+                with quota_alert.state_file() as state:
+                    self.assertTrue(state.get("no_worker_mode", False))
+
     def test_explicit_refusal_time_is_recorded_without_replacing_it_with_pass_time(self) -> None:
         notes = [self.note("codex1.md", "active", "0")]
         readings = self.alert_readings(notes, self.now)
@@ -42,7 +130,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         log = self.alert([self.note("codex1.md", "active", "1")], self.now)
         self.assertEqual([line for line in log if "switch" in line], [])
         self.assertEqual(self.assignments(),
-                         {"direct": "codex", "cli": "claude", "design_roles": "codex", "ask_a_friend": "caller"})
+                         {"direct": "codex", "cli": "claude", "design_roles": "codex"})
         self.assertEqual(self.sent, [])
         self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
@@ -66,6 +154,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = write_registry(registry, {"direct.claude": {"impl": "opus:ultra"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
+        self.credits.discard("codex1")
         self.pushed.clear()
         log = self.block(notes, self.now)
         self.assertTrue(any(line.startswith("switch to claude for codex1 failed: ERROR: [direct.impl] effort 'ultra'") for line in log))
@@ -86,6 +175,39 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["direct"], "codex")
+        _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(minutes=61))
+        self.assertEqual(len(self.broadcasts), 2)
+        self.assertIn("Use workers again.", self.broadcasts[1][3])
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
+
+
+class RefusalOwnershipTests(support.CodexZeroEpisodeFixture):
+    def test_login_faults_and_other_homes_never_route_workers_or_announce_no_capacity(self) -> None:
+        identities = (
+            agent_accounts.UnknownCodexAccount(self.root / ".codex", "Codex (~/.codex): Not logged in"),
+            agent_accounts.UnknownCodexAccount(self.root / ".codex1", "Not logged in"),
+            agent_accounts.KnownCodexAccount(self.root / ".codex", "account2@example.invalid", "codex2"),
+            agent_accounts.KnownCodexAccount(self.root / ".codex", "account1@example.invalid", "codex1"),
+        )
+        before = quota_alert.registry_assignments()
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            for left, balance in ((96, "2544"), (0, "2544"), (0, "0")):
+                for identity in identities:
+                    with self.subTest(left=left, balance=balance, identity=identity):
+                        readings = self.readings(self.now, left=left, balance=balance)
+                        with mock.patch.object(quota_alert, "switch_to_claude") as switch:
+                            _ = quota_alert.blocked([self.note(1)], identity, self.now, codex_readings=readings,
+                                                    window=refusals.KnownWindow("weekly"))
+                        switch.assert_not_called()
+                        self.assertEqual(quota_alert.registry_assignments(), before)
+                        self.assertEqual((self.broadcasts, self.broadcasts.stops, self.broadcasts.fyi), ([], [], []))
+                        self.swap.assert_not_called()
+                        self.phone.assert_not_called()
+                        self.relay.assert_not_called()
+                        with quota_alert.state_file() as state:
+                            self.assertFalse(state.get("no_worker_mode", False))
+                            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+from dataclasses import replace
 import os
 import runpy
 import shutil
@@ -17,17 +18,18 @@ from collections.abc import Callable
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
-import phase_reservation  # noqa: E402
+from scripts.direct import phase_reservation  # noqa: E402
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.production.staff_test_support import (  # noqa: E402
     fixture_runtime_id, fixture_worker, fixture_unit_location, isolated_staff_file, showrunner_relationship, unit_membership,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
-DIRECTOR = "sid-director"
+DIRECTOR = fixture_runtime_id("sid-director")
 RESERVATION = "01a13f9c-0000-7000-8000-000000000001"
 RUN = "01a13f9c-0000-7000-8000-0000000000aa"
 HEAD = "0123456789abcdef0123456789abcdef01234567"
@@ -60,6 +62,7 @@ def patch_text(*headers: str) -> str:
 
 class BerthHookTests(unittest.TestCase):
     root: Path = Path()
+    main: Path = Path()
     repo: Path = Path()
     session_dir: Path = Path()
     bin_dir: Path = Path()
@@ -70,18 +73,17 @@ class BerthHookTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.repo = self.root / "repo"
-        (self.repo / "src").mkdir(parents=True)
+        isolate_fixture_git(self, self.root)
+        self.main = self.root / "rust" / "fixture"
+        (self.main / "src").mkdir(parents=True)
         for command in (["init", "-q", "-b", "main"], ["config", "user.name", "t"], ["config", "user.email", "t@example.invalid"],
                         ["config", "gc.auto", "0"], ["config", "maintenance.auto", "false"]):
-            _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
-        _ = (self.repo / "src" / "lib.rs").write_text("fn a() {}\n")
-        _ = subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True, capture_output=True)
-        _ = subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "base"], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(self.main), *command], check=True, capture_output=True)
+        _ = (self.main / "src" / "lib.rs").write_text("fn a() {}\n")
+        _ = subprocess.run(["git", "-C", str(self.main), "add", "-A"], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(self.main), "commit", "-q", "-m", "base"], check=True, capture_output=True)
         self.session_dir = self.root / "unit" / "run-1"
         self.session_dir.mkdir(parents=True)
-        (self.root / "unit" / "active").mkdir()
-        _ = (self.root / "unit" / "active" / DIRECTOR).write_text(f"{self.session_dir}\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         fake = self.bin_dir / "cargo-berth"
@@ -91,17 +93,21 @@ class BerthHookTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_CODE_SESSION_ID": DIRECTOR,
-            "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
+            "STAFF_FILE": str(self.root / "unit" / "staff.json"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
             "DESIGN_ROLES_HOST": "fixture-host",
-            "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            **model_worktree_environment(self.root, self.root / "config"),
+            "HERDR_BIN": MISSING_HERDR_BIN,
         }
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.repo = make_fixture_worktree(self.main, "design-unit", "home")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
+        owner = staff.update_current_session(owner.id, staff.native_id(DIRECTOR))
+        _ = staff.set_run(owner.id, staff.OpenRun(self.session_dir))
         self.owner_id = owner.id
         self.recorder_phases("15")
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
@@ -129,6 +135,10 @@ class BerthHookTests(unittest.TestCase):
             "src/lib.rs\n")
         _ = (phase_reservation.phase_directory(self.session_dir, "16") / phase_reservation.FILES_FILE).write_text(
             "./src/panels/\ndocs/panels.md\n")
+
+    def make_phase_worktree(self, phase: str) -> Path:
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            return make_fixture_worktree(self.main, "design-unit", f"p{phase}")
 
     def claim_phase_worktree(self, phase: str, root: Path) -> None:
         directory = phase_reservation.phase_directory(self.session_dir, phase)
@@ -158,21 +168,23 @@ class BerthHookTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000036"
         binding = design_roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
         parent = unit_membership("demo", "design-unit")
+        parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.repo), expected=parent.worktree)
+        binding = replace(binding, checkout=design_roles.UnitCheckout(parent.id))
         thread = fixture_runtime_id("berth-designer")
-        _ = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
+        worker = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
                                   "2026-10-21T12:00:00+00:00", binding,
-                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(staff.native_id(thread))),
-                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(worker.id)),
+                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())),
+                                  checkout=design_roles.UnitCheckout(parent.id))
         self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": directory.name, "owner_staff_id": parent.id, "history_file": str(self.root / (directory.name + ".jsonl")),
-            "open_phases": [],
-            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "active"},
+            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "active"}],
         }))
 
     def held_hook(self, patch: str) -> str:
@@ -239,7 +251,7 @@ class BerthHookTests(unittest.TestCase):
 
     def map_director_session(self, reservation: str = RESERVATION) -> None:
         """cargo-berth's session map names `reservation` for the director's bare session id."""
-        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
         ledger.mkdir()
         _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
             DIRECTOR: {"coordination_run_id": RUN, "reservation_id": reservation}}}))
@@ -261,7 +273,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.state()["kind"], "active")
 
-    def test_a_left_unmapped_reservation_stays_unrecorded_unless_the_map_names_it_for_one_open_phase(self) -> None:
+    def test_a_left_unmapped_reservation_needs_the_directors_mapping_not_a_single_open_phase(self) -> None:
         self.answer_left_unmapped()
         _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
         for case in ("another reservation mapped", "a sibling phase open"):
@@ -269,13 +281,104 @@ class BerthHookTests(unittest.TestCase):
                 if case == "another reservation mapped":
                     self.map_director_session(reservation="01a13f9c-0000-7000-8000-000000000002")
                 else:
-                    shutil.rmtree(self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY)
+                    shutil.rmtree(self.main / ".git" / phase_reservation.LEDGER_DIRECTORY)
                     self.map_director_session()
                     self.open_second_phase()
                 code, written = self.backstop()
                 self.assertEqual(code, 0)
-                self.assertIn("a sibling phase's reservation holds every changed path", written)
-                self.assertEqual(self.state(), AWAITING)
+                if case == "another reservation mapped":
+                    self.assertIn("a sibling phase's reservation holds every changed path", written)
+                    self.assertEqual(self.state(), AWAITING)
+                else:
+                    self.assertIn(f"Active, reservation {RESERVATION}", written)
+                    self.assertEqual(self.state()["active_phase_reservation"], {
+                        "reservation_id": RESERVATION, "coordination_run_id": RUN,
+                        "phase": "15", "phase_start_head": HEAD})
+                    self.assertEqual(self.state(phase="16"), {
+                        "kind": "enrolled_awaiting_first_touch", "phase": "16"})
+
+    def test_a_siblings_active_reservation_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded(phase_reservation.ACTIVE)
+
+    def test_a_siblings_pending_release_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded(phase_reservation.PENDING)
+
+    def test_a_siblings_mapped_reservation_is_not_recorded_from_the_directors_mapping(self) -> None:
+        self.assert_sibling_reservation_stays_unrecorded("mapped")
+
+    def test_the_directors_mapping_must_name_the_acquired_run(self) -> None:
+        self.answer_left_unmapped()
+        self.open_second_phase()
+        self.map_director_session()
+        path = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+        _ = path.write_text(json.dumps({"identities": {
+            DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": "another-run"}}}))
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn("still awaiting first touch", written)
+        self.assertEqual(self.state(), AWAITING)
+
+    def test_a_siblings_different_reservation_does_not_block_the_directors_reservation(self) -> None:
+        self.answer_left_unmapped()
+        self.open_second_phase()
+        self.map_director_session()
+        sibling = self.state({"kind": phase_reservation.ACTIVE, "active_phase_reservation": {
+            "reservation_id": EARLIER, "coordination_run_id": RUN,
+            "phase": "16", "phase_start_head": HEAD}}, phase="16")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", written)
+        self.assertEqual(self.state()["kind"], phase_reservation.ACTIVE)
+        self.assertEqual(self.state(phase="16"), sibling)
+
+    def assert_sibling_reservation_stays_unrecorded(self, holding: str) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        if holding == "mapped":
+            path = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+            _ = path.write_text(json.dumps({"identities": {
+                DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": RUN},
+                phase_reservation.phase_session_id(DIRECTOR, "16"): {
+                    "reservation_id": RESERVATION, "coordination_run_id": RUN}}}))
+        else:
+            field = "active_phase_reservation" if holding == phase_reservation.ACTIVE else phase_reservation.PENDING_FIELD
+            _ = self.state({"kind": holding, field: {
+                "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "16",
+                "phase_start_head": HEAD, "checkpoint_commit": "b" * 40}}, phase="16")
+        sibling_before = self.state(phase="16")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn("a sibling phase's reservation holds every changed path", written)
+        self.assertEqual(self.state(), AWAITING)
+        self.assertEqual(self.state(phase="16"), sibling_before)
+
+    def test_the_hook_records_the_directors_reservation_when_the_sibling_holds_nothing(self) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state()["active_phase_reservation"], {
+            "reservation_id": RESERVATION, "coordination_run_id": RUN,
+            "phase": "15", "phase_start_head": HEAD})
+        self.assertEqual(self.state(phase="16"), {"kind": "enrolled_awaiting_first_touch", "phase": "16"})
+
+    def test_claim_records_the_directors_reservation_when_the_sibling_holds_nothing(self) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        self.open_second_phase()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), contextlib.redirect_stdout(output):
+            code = phase_reservation.main(["claim", "--session-dir", str(self.session_dir), "--phase", "15",
+                                           "--repo", str(self.repo)])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", output.getvalue())
+        self.assertEqual(self.state()["kind"], phase_reservation.ACTIVE)
+        self.assertEqual(self.state(phase="16"), {"kind": "enrolled_awaiting_first_touch", "phase": "16"})
 
     def test_a_seat_first_touch_checks_its_paths_and_records_active(self) -> None:
         result = self.hook(patch_text("*** Add File: new.rs", "*** Update File: lib.rs"), cwd=self.repo / "src")
@@ -294,7 +397,7 @@ class BerthHookTests(unittest.TestCase):
         _ = (directory / phase_reservation.STATE_FILE).write_text(json.dumps(
             {"kind": "enrolled_awaiting_first_touch", "phase": "7"}))
         _ = (run / "progress_history_state.json").write_text(json.dumps({
-            "owner_staff_id": self.owner_id, "phase": {"id": "7", "status": "active"}}))
+            "owner_staff_id": self.owner_id, "open_phases": [{"id": "7", "status": "active"}]}))
         return run
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
@@ -396,12 +499,11 @@ class BerthHookTests(unittest.TestCase):
         records = [{"id": phase, "status": "active"} for phase in phases]
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
             "owner_staff_id": self.owner_id,
-            "phase": records[-1] if records else {"id": "15", "status": "completed"},
-            "open_phases": records[:-1]}))
+            "open_phases": records}))
 
     def map_phase_session(self, phase: str) -> None:
         """Berth's session map names the phase's own session, as a check acquired under it leaves it."""
-        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
         ledger.mkdir(exist_ok=True)
         _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
             phase_reservation.phase_session_id(DIRECTOR, phase): {"reservation_id": RESERVATION,
@@ -600,9 +702,7 @@ class BerthHookTests(unittest.TestCase):
 
     def test_same_path_in_two_worktrees_checks_only_that_worktrees_phase(self) -> None:
         self.open_second_phase()
-        other = self.root / "other-worktree"
-        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        other = self.make_phase_worktree("16")
         self.claim_phase_worktree("15", self.repo)
         self.claim_phase_worktree("16", other)
         directory = phase_reservation.phase_directory(self.session_dir, "16")
@@ -631,9 +731,7 @@ class BerthHookTests(unittest.TestCase):
         ])
 
     def test_edit_outside_all_claimed_phase_worktrees_checks_the_bare_session(self) -> None:
-        other = self.root / "other-worktree"
-        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        other = self.make_phase_worktree("15")
         self.claim_phase_worktree("15", other)
         directory = phase_reservation.phase_directory(self.session_dir, "15")
         before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
@@ -647,9 +745,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}, before)
 
     def test_record_active_outside_the_phases_worktree_keeps_its_state(self) -> None:
-        other = self.root / "other-worktree"
-        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        other = self.make_phase_worktree("15")
         self.claim_phase_worktree("15", other)
         _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
 
@@ -679,7 +775,7 @@ class BerthHookTests(unittest.TestCase):
         phase = phase_reservation.phase_directory(self.session_dir, "15")
         self.assertEqual(sorted(path.name for path in phase.iterdir()),
                          [phase_reservation.STATE_FILE, phase_reservation.BASELINE_FILE,
-                          phase_reservation.BASELINE_STATUS_FILE])
+                          phase_reservation.BASELINE_FILE + ".lock", phase_reservation.BASELINE_STATUS_FILE])
         self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR, "progress_history_state.json"])
 
     def backstop(self, phase: str = "15") -> tuple[int, str]:

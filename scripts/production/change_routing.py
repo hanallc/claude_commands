@@ -10,23 +10,40 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import cast
 
 from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.proposals_folder import slug_of
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
 
 
-def configured_lists_directory() -> Path:
-    return Path(conf.read("change_review").text("lists_directory")).expanduser()
+def routing_setting(file: str, key: str, *, sources: list[Path] | None = None) -> str:
+    """Read a routing setting. A collector rejects recovery from an unreadable or invalid source."""
+    settings = conf.read(file)
+    if sources is None:
+        return settings.text(key)
+    sources.append(settings.source)
+    result = settings.origin(key, str)
+    if isinstance(result, conf.UsableLiveValue):
+        return result.value
+    if isinstance(result, conf.RecoveredValue) and not settings.source.exists():
+        return result.value
+    raise ValueError(result.reason)
 
 
-def lists_directory() -> Path:
+def configured_lists_directory(*, sources: list[Path] | None = None) -> Path:
+    return Path(routing_setting("change_review", "lists_directory", sources=sources)).expanduser()
+
+
+def lists_directory(*, sources: list[Path] | None = None) -> Path:
     override = os.environ.get("CHANGE_REVIEW_DIR")
-    return Path(override) if override else configured_lists_directory()
+    if override:
+        return Path(override)
+    return configured_lists_directory() if sources is None else configured_lists_directory(sources=sources)
 
 
 def _is_real_list(review_list: Path, configured_folder: Path) -> bool:
@@ -72,6 +89,38 @@ class UnroutedChange:
 ChangeOwner = StaffRoutedChange | ShowrunnerOwnChange | UnroutedChange
 
 
+def producer_row(record: staff.StaffSnapshot, identity: staff.StaffId) -> staff.StaffRow | UnroutedChange:
+    """Find the unit or showrunner that a Producer cell names.
+
+    The staff record keeps retired producers, so a retired unit still gives its row.
+    """
+    producer = record.by_id(identity)
+    if producer is None:
+        return UnroutedChange(f"No staff record for {identity}")
+    if producer.kind not in ("showrunner", "unit"):
+        return UnroutedChange(f"Producer {identity} is not a staff unit or showrunner")
+    return producer
+
+
+def _route_producer(record: staff.StaffSnapshot, identity: staff.StaffId) -> ChangeOwner:
+    producer = producer_row(record, identity)
+    if isinstance(producer, UnroutedChange):
+        return producer
+    if producer.kind == "showrunner":
+        return ShowrunnerOwnChange(producer.id, producer.name)
+    parent = producer
+    seen: set[staff.StaffId] = set()
+    while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
+        seen.add(parent.id)
+        ancestor = record.by_id(parent.parent.id)
+        if ancestor is None:
+            break
+        parent = ancestor
+    if parent.kind != "showrunner":
+        return UnroutedChange(f"No staff showrunner for {producer.name}")
+    return StaffRoutedChange(producer.id, parent.id, parent.name)
+
+
 @dataclass(frozen=True)
 class UnavailableProduction:
     review_list: Path
@@ -86,7 +135,7 @@ class ChangeAssignment:
     production: Path | UnavailableProduction
 
 
-def list_documents(text: str) -> list[Path]:
+def _list_document_paths(text: str) -> list[Path]:
     front = text.split("---", 2)
     if len(front) != 3:
         return []
@@ -97,54 +146,77 @@ def list_documents(text: str) -> list[Path]:
             productions = line.strip() == "productions" + ":"
         if productions and (match := re.match(r"\s+-\s+(.+)$", line)):
             path = Path(match[1].strip('"\'')).expanduser()
-            if path.is_absolute() and path.is_file():
+            if path.is_absolute():
                 documents.append(path)
     return documents
+
+
+def list_documents(text: str) -> list[Path]:
+    return [path for path in _list_document_paths(text) if path.is_file()]
 
 
 def production_documents(initial: dict[str, Path], lists: Iterable[tuple[str, str]]) -> dict[str, Path]:
     """Add each list's production references without replacing initial documents."""
     documents = dict(initial)
     for owner, text in lists:
-        docs = list_documents(text)
-        for doc in docs:
-            _ = documents.setdefault(slug_of(doc), doc)
-        if docs:
-            _ = documents.setdefault(owner, docs[0])
+        if owner not in documents:
+            document = next((path for path in _list_document_paths(text) if path.is_file()), None)
+            if document is not None:
+                documents[owner] = document
     return documents
+
+
+class ProductionPathUnreadable(OSError):
+    def __init__(self, path: Path, error: OSError) -> None:
+        super().__init__(str(error))
+        self.path: Path = path
 
 
 class StaffRouting:
     """Read fixed producer identities and staff parent edges."""
 
-    def __init__(self, record: staff.StaffSnapshot, documents: dict[str, Path]) -> None:
+    def __init__(self, record: staff.StaffSnapshot, documents: dict[str, Path], *,
+                 sources: list[Path] | None = None, lists: Iterable[tuple[str, str]] = ()) -> None:
+        self.sources: list[Path] | None = sources
         self.record: staff.StaffSnapshot = record
         self.runners: dict[staff.StaffId, staff.StaffRow] = {
             row.id: row for row in record.rows if row.kind == "showrunner"}
-        self.documents: dict[str, Path] = dict(documents)
         self.runners_by_name: dict[str, staff.StaffRow] = {row.name: row for row in self.runners.values()}
-        self.production_by_runner: dict[staff.StaffId, Path] = {}
-        exists: dict[Path, bool] = {}
-        for runner in self.runners.values():
-            candidates: list[Path] = []
-            if isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-                candidates.append(runner.doc.path)
-            if runner.name in self.documents:
-                candidates.append(self.documents[runner.name])
-            for path in candidates:
-                if path not in exists:
-                    exists[path] = path.is_file()
-                if exists[path]:
-                    self.production_by_runner[runner.id] = path
-                    self.documents[runner.name] = path
-                    self.documents[slug_of(path)] = path
-                    break
-        self.production_by_name: dict[str, Path] = {}
-        for name, path in self.documents.items():
-            if path not in exists:
-                exists[path] = path.is_file()
-            if exists[path]:
-                self.production_by_name[name] = path
+        self.supplied_documents: dict[str, Path] = dict(documents)
+        self.list_documents: dict[str, list[Path]] = {
+            name: _list_document_paths(text) for name, text in lists if name not in documents}
+        self.checked_paths: dict[Path, bool | ProductionPathUnreadable] = {}
+
+    def production(self, name: str) -> Path | None:
+        """Check only documents that can supply this production."""
+        runner = self.runners_by_name.get(name)
+        candidates: list[Path] = []
+        if runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            candidates.append(runner.doc.path)
+        if name in self.supplied_documents:
+            candidates.append(self.supplied_documents[name])
+        candidates.extend(self.list_documents.get(name, ()))
+        for path in dict.fromkeys(candidates):
+            if path not in self.checked_paths:
+                if self.sources is not None:
+                    self.sources.append(path)
+                try:
+                    self.checked_paths[path] = path.is_file()
+                except OSError as error:
+                    self.checked_paths[path] = ProductionPathUnreadable(path, error)
+            available = self.checked_paths[path]
+            if isinstance(available, ProductionPathUnreadable):
+                raise available
+            if available:
+                return path
+        return None
+
+    @cached_property
+    def documents(self) -> dict[str, Path]:
+        """Read candidates for a legacy list that has no owner in its name."""
+        return {name: path for name in dict.fromkeys(
+            (*self.supplied_documents, *self.runners_by_name, *self.list_documents))
+                if (path := self.production(name)) is not None}
 
     @cached_property
     def _configured_folder(self) -> Path:
@@ -156,20 +228,41 @@ class StaffRouting:
 
     @cached_property
     def _root(self) -> staff.StaffRow | None:
-        name = conf.read("review_links").text("unrouted_alert_recipient")
+        name = routing_setting("review_links", "unrouted_alert_recipient", sources=self.sources)
         return self.runners_by_name.get(name)
+
+    @cached_property
+    def document_lines(self) -> dict[Path, list[str]]:
+        """Share one document read across list and question routing."""
+        documents: dict[Path, list[str]] = {}
+        for doc in dict.fromkeys(self.documents.values()):
+            if self.sources is not None:
+                self.sources.append(doc)
+            try:
+                documents[doc] = doc.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                if self.sources is not None:
+                    raise
+                continue
+        return documents
 
     @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
+            if self.sources is not None:
+                self.sources.append(doc)
             try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
+                lines = self.document_lines.get(doc, [])
                 listing = Path(production_field(lines, "Change review")).expanduser()
                 for name, known in self.documents.items():
                     if known == doc:
                         paths[name] = listing
-            except (OSError, Refusal):
+            except (OSError, UnicodeError):
+                if self.sources is not None:
+                    raise
+                continue
+            except Refusal:
                 continue
         return paths
 
@@ -195,39 +288,24 @@ class StaffRouting:
             if runner is not None and runner.kind == "showrunner":
                 return ShowrunnerOwnChange(runner.id, runner.name)
             return ShowrunnerOwnChange(MissingShowrunner(list_owner), list_owner)
-        producer = self.record.by_id(staff.StaffId(identity))
-        if producer is None:
-            return self.unrouted(review_list, row, f"No staff record for {identity}", identity)
-        if producer.kind == "showrunner":
-            return ShowrunnerOwnChange(producer.id, producer.name)
-        if producer.kind != "unit":
-            return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
-        parent = producer
-        seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
-            seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent.id)
-            if ancestor is None:
-                break
-            parent = ancestor
-        if parent.kind != "showrunner":
-            return self.unrouted(review_list, row, f"No staff showrunner for {producer.name}", identity)
-        return StaffRoutedChange(producer.id, parent.id, parent.name)
+        owner = _route_producer(self.record, staff.StaffId(identity))
+        if isinstance(owner, UnroutedChange):
+            return self.unrouted(review_list, row, owner.note, identity)
+        return owner
 
     def owner_and_production(self, review_list: Path, row: dict[str, str]) -> ChangeAssignment:
         """Read the producer and its showrunner's current production document."""
         name = self.list_owner(review_list)
         owner = self._staff_owner(row, review_list)
         if isinstance(owner, UnroutedChange) or isinstance(owner.showrunner_id, MissingShowrunner):
-            runner = self.runners_by_name.get(name)
-            document = self.production_by_runner.get(runner.id) if runner is not None else self.production_by_name.get(name)
+            document = self.production(name)
         else:
-            document = self.production_by_runner.get(owner.showrunner_id)
+            document = self.production(owner.tab)
         missing_owner = isinstance(owner, ShowrunnerOwnChange) and isinstance(owner.showrunner_id, MissingShowrunner)
         if missing_owner or document is None:
             root = self._root
             if root is not None:
-                root_document = document if document is not None else self.production_by_runner.get(root.id)
+                root_document = document if document is not None else self.production(root.name)
                 if root_document is not None:
                     return ChangeAssignment(owner if isinstance(owner, UnroutedChange)
                                             else ShowrunnerOwnChange(root.id, root.name), root_document)
@@ -236,13 +314,22 @@ class StaffRouting:
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
+        if self.sources is None and not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")
-            member = self.record.by_id(staff.StaffId(producer))
+            identity = staff.StaffId(producer)
+
+            def still_unrouted() -> bool:
+                try:
+                    fresh = staff.authority_snapshot()
+                except staff.StaffUnreadable:
+                    return True
+                return isinstance(_route_producer(fresh, identity), UnroutedChange)
+
+            member = self.record.by_id(identity)
             names = (member.name if member is not None else producer,)
-            unrouted_alert.notify(root, list_owner, row, note, names)
+            unrouted_alert.notify(root, list_owner, row, note, names, still_unrouted=still_unrouted)
         return UnroutedChange(note + "; no message goes out")
 
 
@@ -256,25 +343,46 @@ def delivery_path(root: Path, review_list: Path, row: str) -> Path:
     return root / delivery_name(review_list.resolve(), row)
 
 
-def review_root() -> Path:
-    return Path(os.environ.get("REVIEW_LINKS_ROOT") or conf.read("change_review").text("review_links_directory")).expanduser()
+def review_root(*, sources: list[Path] | None = None) -> Path:
+    return Path(os.environ.get("REVIEW_LINKS_ROOT") or routing_setting(
+        "change_review", "review_links_directory", sources=sources)).expanduser()
 
 
-def waits_for_user(review_list: Path, row: dict[str, str], root: Path) -> bool:
-    """Use the shared typed waiting rule."""
+def delivery_slots(path: Path, *, sources: list[Path] | None = None,
+                   strict: bool = False) -> delivery_state.DeliverySlots:
+    """Reject read and parse errors in strict mode and during collection.
+
+    Strict reads also require an attempt ID for a pending verdict.
+    """
+    require_read = strict or sources is not None
+    if sources is not None:
+        sources.append(path)
     try:
-        slots = delivery_state.decode(delivery_path(root, review_list, row["#"]).read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     except OSError:
-        slots = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+        if require_read:
+            raise
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    if require_read:
+        return delivery_state.decode_value(cast(object, json.loads(text)), require_verdict_attempt=strict)
+    return delivery_state.decode(text)
+
+
+def waits_for_user(review_list: Path, row: dict[str, str], root: Path, *,
+                   sources: list[Path] | None = None) -> bool:
+    """Use the shared typed waiting rule."""
+    slots = delivery_slots(delivery_path(root, review_list, row["#"]), sources=sources)
     return slots.waits_for_user(bool(row.get("Verdict")))
 
 
 def waiting_rows(review_list: Path, rows: list[dict[str, str]],
-                 names: set[str] | None = None) -> list[dict[str, str]]:
+                 names: set[str] | None = None, *, sources: list[Path] | None = None) -> list[dict[str, str]]:
     """Scan delivery names once and open only records that exist."""
-    root = review_root()
+    root = review_root(sources=sources)
     if names is None:
-        names = {path.name for path in root.glob(".review-link-delivery-*")}
+        names = {path.name for path in source_paths(root, ".review-link-delivery-*", sources=sources)}
     resolved = review_list.resolve()
     empty = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     found: list[dict[str, str]] = []
@@ -284,10 +392,7 @@ def waiting_rows(review_list: Path, rows: list[dict[str, str]],
         name = delivery_name(resolved, row["#"])
         slots = empty
         if name in names:
-            try:
-                slots = delivery_state.decode((root / name).read_text(encoding="utf-8"))
-            except OSError:
-                pass
+            slots = delivery_slots(root / name, sources=sources)
         if slots.waits_for_user(False):
             found.append(row)
     return found

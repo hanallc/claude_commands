@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""Review phone drafts; keep one owner for delivery of a held push."""
+"""Review phone drafts and manage delivery of held pushes.
+
+Use `texts --ask --id ID` to show every example and request approval in the current herdr pane.
+"""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
+
+from scripts.lib.transcripts import open_transcript, uncompressed_path
 
 import argparse
 import fcntl
@@ -24,19 +33,16 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
-import reply_asks
-import push_texts
-import push_reference
+from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-import nix_env
+from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
+from scripts.lib import conf_reads, models_registry, nix_env
 
-from user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
+from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
-    from ..accounts import accounts
+    from scripts.accounts import accounts
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
@@ -54,7 +60,7 @@ EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
 def review_timeout_seconds() -> float:
     """Read the reviewer limit once; configuration faults use the 60 s default."""
     try:
-        contents = NOTIFY_CONFIG.read_text(encoding="utf-8")
+        contents = conf_reads.read_text(NOTIFY_CONFIG)
         for line in contents.splitlines():
             key, separator, value = line.partition("#")[0].partition("=")
             if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
@@ -236,12 +242,12 @@ Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 @dataclass(frozen=True)
 class QuestionKey:
-    slug: str
+    name: str
     text: str
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256((self.slug + self.text).encode()).hexdigest()[:16]
+        return hashlib.sha256((self.name + self.text).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -452,6 +458,97 @@ def run_process(argv: list[str], *, timeout: float,
                           timeout=timeout, env=env)
 
 
+@dataclass(frozen=True)
+class StructuredAnswer:
+    """The model answered; the value is not yet checked against the schema."""
+    value: object
+
+
+@dataclass(frozen=True)
+class ModelTimeout:
+    """The model call passed its deadline."""
+
+
+@dataclass(frozen=True)
+class ModelExit:
+    """The model program exited with a status other than 0."""
+    code: int
+
+
+@dataclass(frozen=True)
+class ModelError:
+    """The model program reported an error in its reply."""
+
+
+@dataclass(frozen=True)
+class BadJson:
+    """The reply or its result is not a JSON object."""
+
+
+@dataclass(frozen=True)
+class ShellRefused:
+    """The nix shell of the current folder did not load."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class ModelUnavailable:
+    """The model name or the model program failed with an OSError or a ValueError."""
+    reason: str
+
+
+StructuredOutcome = StructuredAnswer | ModelTimeout | ModelExit | ModelError | BadJson | ShellRefused | ModelUnavailable
+
+
+@dataclass(frozen=True)
+class StructuredCall:
+    """The model that the account resolved, and the outcome of the call."""
+    model: str
+    outcome: StructuredOutcome
+
+
+def structured_call(runner: ProcessRunner, binary: Path, environment: dict[str, str], *, model: str, effort: str,
+                    system_prompt: str, schema: Mapping[str, object], prompt: str, deadline: float) -> StructuredCall:
+    """Ask the model once for a JSON answer in the schema, with no tools, no session and no settings.
+
+    The deadline is a time.monotonic() value. This is the one form of a headless model check.
+    """
+    loaded = nix_env.ensure(Path.cwd(), environment)
+    if isinstance(loaded, nix_env.Refused):
+        return StructuredCall(model, ShellRefused(loaded.reason))
+    environment = models_registry.agent_environment(loaded.env)
+    try:
+        model = models_registry.claude_model(model, environment)
+    except (OSError, ValueError) as error:
+        return StructuredCall(model, ModelUnavailable(str(error)))
+    command = [str(binary), "-p", "--model", model, "--effort", effort, "--system-prompt", system_prompt,
+               "--json-schema", json.dumps(schema), "--output-format", "json",
+               "--tools", "", "--no-session-persistence", "--setting-sources", "", prompt]
+    try:
+        result = runner(command, timeout=max(0.001, deadline - time.monotonic()), env=environment)
+    except subprocess.TimeoutExpired:
+        return StructuredCall(model, ModelTimeout())
+    except (OSError, ValueError) as error:
+        return StructuredCall(model, ModelUnavailable(str(error)))
+    if result.returncode != 0:
+        return StructuredCall(model, ModelExit(result.returncode))
+    try:
+        envelope = cast(object, json.loads(result.stdout))
+        if not isinstance(envelope, dict):
+            return StructuredCall(model, BadJson())
+        fields = cast(dict[str, object], envelope)
+        if fields.get("is_error") is True:
+            return StructuredCall(model, ModelError())
+        value: object = fields
+        if "structured_output" in fields:
+            value = fields["structured_output"]
+        elif isinstance(text := fields.get("result"), str):
+            value = cast(object, json.loads(text))
+    except json.JSONDecodeError:
+        return StructuredCall(model, BadJson())
+    return StructuredCall(model, StructuredAnswer(value))
+
+
 def state_path() -> Path:
     return Path(os.environ.get("NOTIFY_STATE_DIR", str(STATE_DIR)))
 
@@ -655,16 +752,15 @@ def validate(value: object, draft: Draft, revision: bool,
         return Unreviewed(str(error), metadata, tuple(failures))
 
 
-def reviewer_environment() -> tuple[dict[str, str], str]:
+def reviewer_environment(group: accounts.ClaudeGroup = "units") -> tuple[dict[str, str], str]:
+    """The environment and account label of a headless model call on the account of the group."""
     # Import the shared account modules from this checkout, not the writer's login.
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
     environment = dict(os.environ)
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
-    selected = accounts.role_account("unit")
+    selected = accounts.group_account(group)
     prepared = accounts.prepare_claude_launch(selected.label, resume=False)
     for name in prepared.remove:
         _ = environment.pop(name, None)
@@ -675,8 +771,8 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
 def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
                         timeout: float) -> tuple[str, str]:
     try:
-        result = runner(["bash", "-c", "source ~/.claude/scripts/agents/models_config.sh; " +
-                         "agents_resolve_print message_review.reviewer"],
+        result = runner(["bash", "-c", 'source "$1" && agents_resolve_print message_review.reviewer', "review-model",
+                         str(Path(__file__).resolve().parents[1] / "agents/models_config.sh")],
                         timeout=timeout, env=environment)
         fields = dict(item.split("=", 1) for item in result.stdout.split() if "=" in item)
         if result.returncode == 0 and fields.get("agent") and fields.get("effort"):
@@ -753,29 +849,28 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
         draft_prompt = zone_line() + "\n" + draft_prompt
-        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
-                   "--system-prompt", guide.stdout + "\n" + prompt,
-                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
-                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
-        loaded = nix_env.ensure(Path.cwd(), environment)
-        if isinstance(loaded, nix_env.Refused):
-            return Unreviewed(loaded.reason, details())
-        environment = loaded.env
-        result = runner(command, timeout=remaining(), env=environment)
-        if result.returncode != 0:
-            return Unreviewed(f"reviewer exit {result.returncode}", details())
-        value = cast(object, json.loads(result.stdout))
-        envelope = _object(value)
-        if envelope.get("is_error") is True:
-            return Unreviewed("reviewer error", details())
-        if "structured_output" in envelope:
-            value = envelope["structured_output"]
-        elif "result" in envelope and isinstance(envelope["result"], str):
-            value = cast(object, json.loads(envelope["result"]))
-        return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
-                        question=isinstance(context, QuestionReview))
+        call = structured_call(runner, binary.path, environment, model=model, effort=effort,
+                               system_prompt=guide.stdout + "\n" + prompt, schema=SCHEMA, prompt=draft_prompt,
+                               deadline=started + timeout)
+        model = call.model
+        match call.outcome:
+            case StructuredAnswer(value=value):
+                return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
+                                question=isinstance(context, QuestionReview))
+            case ModelTimeout():
+                return Unreviewed("timeout", details())
+            case ModelExit(code=code):
+                return Unreviewed(f"reviewer exit {code}", details())
+            case ModelError():
+                return Unreviewed("reviewer error", details())
+            case BadJson():
+                return Unreviewed("bad JSON", details())
+            case ShellRefused(reason=reason):
+                return Unreviewed(reason, details())
+            case ModelUnavailable(reason=reason):
+                return Unreviewed(f"review unavailable: {reason}", details())
     except subprocess.TimeoutExpired:
         return Unreviewed("timeout", details())
     except json.JSONDecodeError:
@@ -840,7 +935,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
         raise ValueError("question needs nonempty text")
     path = state_path() / "questions" / f"{key.digest}.json"
     context = QuestionReview(key)
-    draft = Draft(key.slug, "0", "", NoActionRequired(), question, False)
+    draft = Draft(key.name, "0", "", NoActionRequired(), question, False)
     timeout = review_timeout_seconds()
     outcome = _review(draft, revision or path.exists(), runner, context, timeout_seconds=timeout)
     log_review(draft, outcome, sample=context)
@@ -864,7 +959,7 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
     else:
         result = QuestionReviewFailed(question, tuple(outcome.failed_rules), outcome.failures)
     if isinstance(result, (QuestionAwaitingFacts, QuestionReviewFailed)):
-        record = QuestionHoldRecord(slug=key.slug, text=key.text, question=question,
+        record = QuestionHoldRecord(slug=key.name, text=key.text, question=question,
                                     details=list(result.questions if isinstance(result, QuestionAwaitingFacts) else result.details))
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_suffix(".tmp")
@@ -1178,7 +1273,7 @@ class PushChannel(Protocol):
 
 
 def push_channel() -> PushChannel:
-    return cast(PushChannel, cast(object, importlib.import_module("pushover")))
+    return cast(PushChannel, cast(object, importlib.import_module('scripts.notify.pushover')))
 
 
 def expiry_post(url: str, data: bytes) -> tuple[int, bytes]:
@@ -1301,7 +1396,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
     replies: list[TranscriptReply] = []
     previous = ""
     seen: set[str] = set()
-    with path.open(encoding="utf-8") as transcript:
+    with open_transcript(path) as transcript:
         for line in transcript:
             try:
                 record = _object(cast(object, json.loads(line)))
@@ -1328,7 +1423,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
             except ValueError:
                 continue
             if stamp >= since:
-                replies.append(TranscriptReply(text, ReplyContext(path, stamp, previous)))
+                replies.append(TranscriptReply(text, ReplyContext(uncompressed_path(path), stamp, previous)))
             previous = text
     return replies
 
@@ -1348,7 +1443,6 @@ class QuestionRegistrationsIncomplete:
 def registered_questions(since: datetime) -> list[str] | QuestionRegistrationsIncomplete:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    sys.path.insert(0, str(ROOT))
     question_store = importlib.import_module("scripts.production.update_registration")
     read_fields = cast(Callable[[], Sequence[Mapping[str, str]]], question_store.read_all_open_fields)
     try:
@@ -1468,7 +1562,7 @@ def text_approvals(value: object) -> dict[str, dict[str, TextApproval]]:
 
 def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process,
           authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED) -> int:
-    import push_texts
+    from scripts.notify import push_texts
     if isinstance(authority, UserSpecifiedText) and (not approve or not authority.source.strip()):
         raise ValueError("a user spec requires --approve and a nonempty source")
     entries = push_texts.catalog()
@@ -1479,7 +1573,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
     if approve and push_texts.REVIEWED_FILE.exists():
         approvals = text_approvals(cast(object, json.loads(push_texts.REVIEWED_FILE.read_text(encoding="utf-8"))))
     failed = False
-    timeout_seconds = review_timeout_seconds()
+    timeout_seconds: float | None = None
     for entry in entries:
         if ids and entry.id not in ids:
             continue
@@ -1488,10 +1582,21 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
             approvals[entry.id] = {name: approval for name, approval in approvals[entry.id].items()
                                    if name in current_examples}
         digest = push_texts.fingerprint(entry)
+        if approve and isinstance(authority, ReviewerApprovalRequired):
+            response = text_asks.approval_for(entry.id, digest)
+            if isinstance(response, text_asks.Approved):
+                approval = TextApproval(
+                    sha256=digest, time=response.time, objections=[],
+                    reviewer=f"user-prompt: {response.words} ({response.session}, {response.time})")
+                approvals[entry.id] = {example.name: approval for example in entry.examples}
+                print(f"{entry.id} approved with the words {response.words!r}.")
+                continue
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
-                          rendered.title, rendered.action, rendered.body, False, rendered.session)
+                          rendered.posted_title, rendered.action, rendered.posted_body, False, rendered.session)
+            if timeout_seconds is None:
+                timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
             print_review(draft, outcome, f"{entry.id}/{example.name}")
             log_review(draft, outcome, dry=True, text_id=entry.id)
@@ -1513,14 +1618,35 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
     return int(failed)
 
 
+def ask_text(text_id: str) -> int:
+    pane = os.environ.get("HERDR_PANE_ID")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not pane or not session:
+        print("review: --ask requires a herdr pane and a Claude session ID.", file=sys.stderr)
+        return 2
+    entry = next((entry for entry in push_texts.catalog() if entry.id == text_id), None)
+    if entry is None:
+        print(f"review: unknown push text ID {text_id}.", file=sys.stderr)
+        return 2
+    examples = [(example.name, push_texts.render_entry(entry, example.values)) for example in entry.examples]
+    try:
+        text_asks.open_ask(entry.id, push_texts.fingerprint(entry), session, pane, datetime.now().astimezone())
+    except OSError as error:
+        print(f"review: cannot save the ask. {error}", file=sys.stderr)
+        return 2
+    for name, rendered in examples:
+        print(f"{entry.id}/{name}\n{push_texts.shown_title(rendered)}\n{rendered.message}")
+    return 0
+
+
 def list_texts() -> int:
-    import push_texts
+    from scripts.notify import push_texts
     print(push_texts.listing(push_texts.catalog()))
     return 0
 
 
 def show_text(text_id: str) -> int:
-    import push_texts
+    from scripts.notify import push_texts
     entries = push_texts.catalog()
     for entry in entries:
         if entry.id == text_id:
@@ -1547,7 +1673,10 @@ def main(argv: list[str]) -> int:
     _ = commands.add_parser("due")
     text_parser = commands.add_parser("texts")
     _ = text_parser.add_argument("--id", action="append", default=[])
-    _ = text_parser.add_argument("--approve", action="store_true")
+    text_mode = text_parser.add_mutually_exclusive_group()
+    _ = text_mode.add_argument("--approve", action="store_true")
+    _ = text_mode.add_argument("--ask", action="store_true",
+                               help="print the examples and request approval in the current herdr pane")
     _ = text_parser.add_argument("--user-spec", metavar="SOURCE")
     _ = commands.add_parser("list", help="one line per phone text: its id and purpose")
     show_parser = commands.add_parser("show", help="one phone text's template and its first example")
@@ -1574,12 +1703,17 @@ def main(argv: list[str]) -> int:
     command = cast(str, arguments.command)
     if command == "texts":
         source = cast(str | None, arguments.user_spec)
+        ids = cast(list[str], arguments.id)
+        if cast(bool, arguments.ask):
+            if len(ids) != 1 or source is not None:
+                parser.error("--ask requires one --id and cannot use --user-spec")
+            return ask_text(ids[0])
         authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED
         if source is not None:
             if not cast(bool, arguments.approve) or not source.strip():
                 parser.error("--user-spec requires --approve and a nonempty source")
             authority = UserSpecifiedText(source)
-        return texts(cast(list[str], arguments.id), cast(bool, arguments.approve), authority=authority)
+        return texts(ids, cast(bool, arguments.approve), authority=authority)
     if command == "list":
         return list_texts()
     if command == "show":

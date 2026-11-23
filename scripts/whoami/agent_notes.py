@@ -10,13 +10,18 @@ hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 (/quota_refresh) is the run after the user reports a usage reset.
 `usage-only` reads and saves usage, then starts `renew-logins` when renewal is due.
+Off natedev, it then completes the local group members that are off the current group selection.
 `renew-logins` renews expired local Claude logins under its own schedule lock.
-It sends no quota alerts and runs neither account moves nor the Codex pacer.
-`blocked` is codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+Neither sends quota alerts or runs refusal moves or the Codex pacer.
+`blocked` records a launch that Codex refused for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import asyncio
@@ -32,12 +37,12 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import codex_pacer
-import five_hour
+from scripts.whoami import codex_pacer
+from scripts.whoami import five_hour
+from scripts.whoami import mac_fallback_token
 from scripts.whoami import note_file
 from scripts.whoami import session_table
 from scripts.whoami.session_table import SessionsSection, KeepSections, KEEP_SECTIONS
@@ -49,20 +54,23 @@ from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource,
                             ScheduledUsageReads, UnscheduledUsageReads, UNSCHEDULED_USAGE_READS,
                             claude_on_disk, codex_email_on_disk, codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
-from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
+from scripts.whoami.quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown,
-                         StoppedWorkerCommand, StoppedCommandUnknown)
+                         StoppedWorker, StoppedWorkerUnknown)
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
-from scripts.maintenance.settings import positive, usage_only_interval
-from user_zone import user_zone
+from scripts.maintenance.settings import InvalidPartSchedule, Part, part_cadence, positive, usage_only_intervals
+from scripts.lib.user_zone import user_zone
 
 
 # Expand at refresh time so callers can use a scratch home.
 SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
 # Read low accounts every two minutes so exhaustion moves keep their cadence.
 LIVE_USAGE_REMAINING_THRESHOLD = 10
+# natedev's refusal part waits one interval after its last run ends, then the next job tick, so two plans can be
+# almost two intervals apart. A third interval covers a slow pass.
+COMPLETION_PLAN_INTERVALS = 3
 
 
 def read_sessions_seen() -> dict[str, str]:
@@ -346,7 +354,6 @@ def apply(
 
 @role_map_command
 def update(*, include_warnings: bool = True) -> list[str]:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     workers_home = resolve_workers_home()
@@ -394,6 +401,14 @@ def refresh_usage(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkers
     return RefreshedUsage(reports, observed_at, tuple(messages))
 
 
+def _publish_mac_token() -> list[str]:
+    try:
+        mac_fallback_token.publish_metadata()
+    except (OSError, ValueError):
+        return ["Mac fallback token: could not publish metadata"]
+    return []
+
+
 def timer_usage_signature(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> str:
     """Invalidate reuse when a login, directory, or account selection changes."""
     identities = sorted((str(home), codex_email_on_disk(home)) for home in codex_homes(workers_home))
@@ -427,7 +442,7 @@ def urgent_usage_read(notes: list[Note], selection: ClaudeAccountsInUse, workers
             except ValueError:
                 pass
     # A fallback can restore workers as soon as its reset passes.
-    import quota_alert
+    from scripts.whoami import quota_alert
     try:
         saved = cast(object, json.loads(quota_alert.STATE.read_text(encoding="utf-8")))
         return isinstance(saved, dict) and bool(cast(dict[str, object], saved).get("switch"))
@@ -450,6 +465,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
 
     accounts.sweep_claude_temp_files(datetime.now(timezone.utc))
     messages = rename_legacy_notes(note_file.notes_dir())
+    messages.extend(_publish_mac_token())
     if isinstance(workers_home, NoWorkersHome):
         messages.append(workers_home.reason)
     notes = note_file.read_notes()
@@ -504,7 +520,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
     except accounts.AccountsError as error:
         messages.append(f"roles: {error}")
         groups = None
-    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"))
+    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"), ("producers", "producer"))
     sessions = session_table.live_sessions(os.environ)
     machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):
@@ -576,10 +592,15 @@ def positive_poll_seconds(value: str) -> float:
 
 
 def usage_only(*, poll_seconds: float = 0) -> None:
-    """Read each due account, then start renewal without waiting for a probe."""
+    """Read each due account, start renewal without waiting for a probe, then complete local group members."""
     from scripts.accounts import accounts, refusal_watch
 
-    interval = usage_only_interval() - poll_seconds / 2
+    for line in _publish_mac_token():
+        print(line)
+
+    intervals = usage_only_intervals()
+    claude_interval = intervals.claude_seconds - poll_seconds / 2
+    codex_interval = intervals.codex_seconds - poll_seconds / 2
     with locked_history(schedule_directory("usage-only")) as history:
         if isinstance(history, ScheduleBusy):
             print(f"already claimed by {history.owner_id}")
@@ -588,9 +609,9 @@ def usage_only(*, poll_seconds: float = 0) -> None:
             selection = accounts.claude_account_selection(usage_only=True)
             workers_home = resolve_workers_home()
             logins = claude_note_logins(note_file.read_notes())
-            with usage_store.read_cadence(interval):
+            with usage_store.read_cadence(claude_interval):
                 refreshed = refresh_usage(selection, workers_home, logins,
-                    schedule=ScheduledUsageReads(history, interval))
+                    schedule=ScheduledUsageReads(history, claude_interval, codex_interval))
     for line in refreshed.messages:
         print(line)
     try:
@@ -600,6 +621,40 @@ def usage_only(*, poll_seconds: float = 0) -> None:
     except Exception as error:
         reason = str(error).splitlines()[0] if str(error) else type(error).__name__
         print(f"login renewal: {reason}", file=sys.stderr)
+    if not role_map.is_role_map_host():
+        complete_local_groups(poll_seconds=poll_seconds, report_seconds=intervals.claude_seconds)
+
+
+def complete_local_groups(*, poll_seconds: float = 0, report_seconds: float) -> None:
+    """Complete this machine's off-target group members at the cadence of natedev's refusal pass."""
+    try:
+        with locked_history(schedule_directory("group-completion")) as history:
+            if isinstance(history, ScheduleBusy):
+                return
+            now = datetime.now(timezone.utc)
+            cadence = part_cadence(Part.REFUSALS)
+            # Start jitter must not add a poll, as for usage reads.
+            interval = (report_seconds if isinstance(cadence, InvalidPartSchedule) else cadence.interval_seconds) - poll_seconds / 2
+            if not history.is_due("group completion", interval, now.timestamp()):
+                return
+            try:
+                if isinstance(cadence, InvalidPartSchedule):
+                    print(f"group completion: {cadence.reason}", file=sys.stderr)
+                    return
+                from scripts.accounts import refusal_watch
+                from scripts.agents import stop_resume
+
+                max_age = timedelta(seconds=COMPLETION_PLAN_INTERVALS * cadence.interval_seconds)
+                # Moves continue in their own process, as they do from the notes timer.
+                with stop_resume.detached_moves():
+                    for line in refusal_watch.complete_local_groups(now, max_age=max_age):
+                        print(line)
+            finally:
+                # A failed move or a bad setting waits for the next interval.
+                history.record("group completion", now.timestamp())
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"group completion: {reason}", file=sys.stderr)
 
 
 def renew_logins() -> None:
@@ -630,7 +685,7 @@ def main() -> None:
         _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
         _ = parser.add_argument("--window", choices=("weekly", "five_hour", "unknown"), default="unknown")
         _ = parser.add_argument("--refused-at", default="", metavar="AWARE_ISO_TIME")
-        _ = parser.add_argument("--stopped", nargs=3, metavar=("SESSION_ID", "WORKER", "COMMAND"))
+        _ = parser.add_argument("--stopped", nargs=2, metavar=("SESSION_ID", "WORKER"))
         parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
         arguments = parsed.identity
         if len(arguments) == 3:
@@ -653,8 +708,8 @@ def main() -> None:
             refused_at = RefusedAt(parsed_time)
         window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
                   refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
-        stopped = (StoppedWorkerCommand(*parsed.stopped) if parsed.stopped is not None
-                   else StoppedCommandUnknown())
+        stopped = (StoppedWorker(*parsed.stopped) if parsed.stopped is not None
+                   else StoppedWorkerUnknown())
         for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at, stopped=stopped):
             print(line)
         return
@@ -669,14 +724,9 @@ def main() -> None:
         return
     if sys.argv[1:] not in ([], ["refresh"]):
         sys.exit("usage: agent_notes.py [refresh|usage-only|renew-logins|blocked]")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
-    if TYPE_CHECKING:
-        from scripts.herdr import herdr
-    else:
-        import herdr
+    from scripts.herdr import herdr
 
     from scripts.accounts import refusal_watch
 

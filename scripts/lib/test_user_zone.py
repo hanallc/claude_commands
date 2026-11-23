@@ -15,7 +15,7 @@ from scripts.lib.code_kind import is_test_code
 from scripts.lib import user_zone
 
 SCRIPT = Path(__file__).with_name("user_zone.py")
-PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from datetime import datetime, timezone; "
+PROBE = ("from scripts.lib import user_zone; from datetime import datetime, timezone; "
          "print(user_zone.user_zone().key, user_zone.zone_label(datetime(2026, 7, 1, 12, tzinfo=timezone.utc)), "
          "user_zone.zone_label(datetime(2026, 1, 1, 12, tzinfo=timezone.utc)))")
 
@@ -23,8 +23,6 @@ PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from da
 HARDCODED = re.compile(r"""ZoneInfo\(\s*["'](?!UTC)|TZ=["']?[A-Z][a-z]+/|%[HMS] ?[PE][DS]T\b""")
 # The scripts that may name a zone, each because the zone there is a fact and never the user's setting.
 NAMES_A_ZONE = {
-    "build_queue/queue_fixture.py": "one fixed zone, so a golden render is the same in every user zone",
-    "model_study/turns.py": "the zone the roster's stored times were recorded in",
     "prioritize/renumber.py": "one fixed zone, so a date is the same on both machines",
     "whoami/agent_accounts.py": "the offset a stored reset time is written with",
 }
@@ -32,11 +30,8 @@ NAMES_A_ZONE = {
 MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 # The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
 USES_THE_MACHINE_ZONE = {
-    "agents/codex_mesh.py": "log stamps written with their offset",
-    "hooks/banned_words_lib.py": "a log stamp written with its offset",
     "notify/pushover.py": "a log stamp written with its offset",
     "notify/review.py": "a log stamp written with its offset",
-    "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
@@ -106,7 +101,7 @@ class UserZoneTests(unittest.TestCase):
 
     def test_the_label_comes_from_the_zone_and_the_date(self) -> None:
         env = {**os.environ, "USER_ZONE_CONF": str(self.conf), "USER_ZONE": "America/New_York"}
-        result = subprocess.run([sys.executable, "-c", PROBE, str(SCRIPT.parent)], env=env, capture_output=True,
+        result = subprocess.run([str(SCRIPT.with_name("py")), "-c", PROBE], env=env, capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.stdout, "America/New_York EDT EST\n", result.stderr)
 

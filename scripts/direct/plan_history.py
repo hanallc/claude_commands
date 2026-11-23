@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
+import fcntl
 import json
 import re
-import subprocess
-import sys
-import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import unit_runs
 from scripts.production import session_staff  # noqa: E402
-from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 
@@ -32,8 +36,9 @@ RATE_FACTOR_LIMIT = 2.0
 # commit annotation instead. Counting on the status marker alone silently
 # ignores every already-archived phase, which is how a 67%-complete plan once
 # reported 36%. Match the `Phase <id>` heading itself and classify after.
+PHASE_ID = r"\d+[a-z]?"
 PHASE_HEADING_PATTERN = re.compile(
-    r"^(?P<hashes>#{2,4})[ \t]+Phase[ \t]+(?P<id>\d+[a-z]?)\b(?P<rest>[^\n]*)$",
+    r"^(?P<hashes>#{2,4})[ \t]+Phase[ \t]+(?P<id>" + PHASE_ID + r")\b(?P<rest>[^\n]*)$",
     re.MULTILINE,
 )
 PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b")
@@ -41,17 +46,6 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # section inside one. A real phase heading always names a title after an
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
-DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
-PHASE_REFERENCE_PATTERN = re.compile(
-    r"\b(?i:Phase)[ \t]+(?P<single>\d+[a-z]?(?!\w|[-:./]\w))"
-    + r"|\b(?i:Phases)[ \t]+(?P<list>\d+[a-z]?(?!\w|[-:./]\w)"
-    + r"(?:[ \t]*(?:,[ \t]*(?:(?i:and)[ \t]+)?|(?i:and)[ \t]+|&[ \t]*)"
-    + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
-)
-UNIT_PHASE_PREFIX = re.compile(
-    r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
-    + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
-)
 
 
 class PlanPhase(TypedDict):
@@ -60,8 +54,8 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
-    # The phases its `**Depends on:**` line names; None when the line is absent.
-    depends_on: list[str] | None
+    waits_for: NotRequired[str]
+    depends_on: NotRequired[tuple[str, ...]]
 
 
 class EtaBand(NamedTuple):
@@ -76,15 +70,109 @@ class EtaProjectionUnavailable(NamedTuple):
     """The reported progress cannot support an ETA projection."""
 
 
+class CompleteRunHistory(NamedTuple):
+    """Every row of a run history was read."""
+
+    events: list[dict[str, object]]
+
+
+class IncompleteRunHistory(NamedTuple):
+    """The readable events cannot prove that an event is absent."""
+
+    events: list[dict[str, object]]
+
+
+@dataclass
+class HistorySnapshot:
+    """Share staff and run history reads within one report."""
+
+    record: staff.StaffSnapshot
+    histories: dict[Path, CompleteRunHistory | IncompleteRunHistory] = field(default_factory=dict)
+    plans: dict[Path, tuple[list[PlanPhase], list[str]]] = field(default_factory=dict)
+
+    @cached_property
+    def starts(self) -> list[tuple[Path, dict[str, object]]]:
+        return _run_starts()
+
+
+class NoHistorySnapshot(NamedTuple):
+    """Read history directly outside a report."""
+
+
+_history_snapshot: ContextVar[HistorySnapshot | NoHistorySnapshot] = ContextVar(
+    "history_snapshot", default=NoHistorySnapshot())
+
+
+@contextmanager
+def history_snapshot(record: staff.StaffSnapshot) -> Generator[None]:
+    """Retain history reads until the report ends."""
+    token = _history_snapshot.set(HistorySnapshot(record))
+    try:
+        yield
+    finally:
+        _history_snapshot.reset(token)
+
+
+def staff_record() -> staff.StaffSnapshot:
+    """Use the report's staff snapshot, or read staff for another caller."""
+    snapshot = _history_snapshot.get()
+    return snapshot.record if isinstance(snapshot, HistorySnapshot) else staff.snapshot()
+
+
+def _read_run_history(path: Path) -> CompleteRunHistory | IncompleteRunHistory:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            lines = handle.read().splitlines()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, UnicodeError):
+        return IncompleteRunHistory([])
+    events: list[dict[str, object]] = []
+    complete = True
+    for line in lines:
+        try:
+            event = cast(object, json.loads(line))
+        except json.JSONDecodeError:
+            event = None
+        if not isinstance(event, dict):
+            complete = False
+            continue
+        fields = cast(dict[str, object], event)
+        kind = fields.get("event_type")
+        if not isinstance(kind, str) or not kind or (
+            kind == "phase_started"
+            and not all(pass_recorder.string(fields.get(key)) for key in ("phase_id", "phase_instance_id"))
+        ):
+            complete = False
+        events.append(fields)
+    events = pass_recorder.without_voided_checkpoints(events)
+    if complete and events and events[0].get("event_type") == "run_started":
+        return CompleteRunHistory(events)
+    return IncompleteRunHistory(events)
+
+
+def read_run_history(path: Path) -> CompleteRunHistory | IncompleteRunHistory:
+    """Read each run's history once within a report."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, NoHistorySnapshot):
+        return _read_run_history(path)
+    if path not in snapshot.histories:
+        snapshot.histories[path] = _read_run_history(path)
+    return snapshot.histories[path]
+
+
+def read_run_events(path: Path) -> list[dict[str, object]]:
+    """Return the readable events for reports that can use partial history."""
+    return read_run_history(path).events
+
+
 def history_root() -> Path:
     return unit_runs.history_root()
 
 
-def now_epoch() -> float:
-    configured = unit_runs.environ("NOW_EPOCH")
-    if configured:
-        return float(configured)
-    return time.time()
+def run_events_path(session_dir: Path) -> Path:
+    """The events file of the run that uses this session folder."""
+    return history_root() / "runs" / f"{session_dir.name}.jsonl"
 
 
 def resolve_plan_path(working_dir: Path, value: str) -> Path:
@@ -98,18 +186,18 @@ def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None =
     return resolver.member_by_folder(remote.local_machine(), plan_path.expanduser().resolve().parent)
 
 
-def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[list[PlanPhase], list[str]]:
+def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    """Read phase headings and their recorded waits from one plan read."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, HistorySnapshot) and plan_path in snapshot.plans:
+        return snapshot.plans[plan_path]
     text = plan_path.read_text(encoding="utf-8")
-    try:
-        member = plan_member(plan_path, resolver=resolver)
-    except (OSError, ValueError) as error:
-        print(f"plan_history: {plan_path}: {error}", file=sys.stderr)
-        member = session_staff.NoSuchMember(session_staff.FolderMember(remote.local_machine(), plan_path.parent))
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
-    headings = list(PHASE_HEADING_PATTERN.finditer(text))
-    for position, match in enumerate(headings):
+    headings = [match for match in PHASE_HEADING_PATTERN.finditer(text)
+                if PHASE_STATUS_PATTERN.search(match.group("rest")) or PHASE_TITLE_PATTERN.match(match.group("rest"))]
+    for index, match in enumerate(headings):
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -130,38 +218,23 @@ def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver |
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
-        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
-        body = text[match.end() : end]
-        depends_match = DEPENDS_ON_PATTERN.search(body)
-        depends_on: list[str] | None = None
-        if depends_match is not None:
-            depends_on = []
-            dependency_text = depends_match.group("list")
-            for reference in PHASE_REFERENCE_PATTERN.finditer(dependency_text):
-                # A unit name qualifies only the phase span that follows it.
-                qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
-                if qualifier is not None and (
-                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit").removesuffix("-unit") != member.row.name
-                ):
-                    continue
-                phase_ids = reference.group("single") or reference.group("list")
-                for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
-                    if dependency.lower() != "and" and dependency not in depends_on:
-                        depends_on.append(dependency)
-        phases.append(
-            PlanPhase(
-                id=identifier,
-                title=title,
-                done=done,
-                depends_on=depends_on,
-            )
-        )
+        phase = PlanPhase(id=identifier, title=title, done=done)
+        section = text[match.end():headings[index + 1].start() if index + 1 < len(headings) else len(text)]
+        waits = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Waits for:\*\*[ \t]*(.+)$", section)
+        depends = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Depends on:\*\*[ \t]*(.+)$", section)
+        if waits:
+            phase["waits_for"] = waits.group(1).strip()
+        if depends:
+            phase["depends_on"] = tuple(re.findall(r"\b(\d+[a-z]?)\b", depends.group(1), re.IGNORECASE))
+        phases.append(phase)
+    if isinstance(snapshot, HistorySnapshot):
+        snapshot.plans[plan_path] = (phases, duplicates)
     return phases, duplicates
 
 
-def plan_phases(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> list[PlanPhase]:
+def plan_phases(plan_path: Path) -> list[PlanPhase]:
     """Return the plan's unique phase headings in document order."""
-    phases, _ = plan_phase_details(plan_path, resolver=resolver)
+    phases, _ = plan_phase_details(plan_path)
     return phases
 
 
@@ -169,7 +242,7 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     try:
         with path.open(encoding="utf-8") as handle:
             first_line = handle.readline()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     try:
         parsed = cast(object, json.loads(first_line))
@@ -183,55 +256,36 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
-def _text(value: object) -> str:
-    return value if isinstance(value, str) else ""
+def _run_starts() -> list[tuple[Path, dict[str, object]]]:
+    try:
+        paths = list((history_root() / "runs").glob("*.jsonl"))
+    except OSError:
+        return []
+    return [(path, event) for path in paths if (event := run_started_event(path)) is not None]
 
 
-def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
-    """Resolve the director's current folder without changing its stored record."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
-        return fields
-    row = unit_runs.run_owner(fields, record)
-    if isinstance(row, unit_runs.RunOwnerUnrecorded):
-        return fields
-    previous = _text(fields.get("working_dir"))
-    for key in ("plan_doc", "project_plan_doc"):
-        value = _text(fields.get(key))
-        if previous and value.startswith(previous + "/"):
-            fields[key] = str(Path(value).relative_to(previous))
-    for key in ("working_dir", "worktree"):
-        if key in fields:
-            del fields[key]
-    if not isinstance(row.worktree, staff.WorktreeUnfilled):
-        fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
-        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
-            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
-                                    capture_output=True, text=True, check=False)
-            fields["branch"] = branch.stdout.strip()
-            if branch.returncode == 0 and not fields["branch"]:
-                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
-                                        capture_output=True, text=True, check=False)
-                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
-    return fields
+def run_starts() -> list[tuple[Path, dict[str, object]]]:
+    """Read run headers once within a report."""
+    snapshot = _history_snapshot.get()
+    return snapshot.starts if isinstance(snapshot, HistorySnapshot) else _run_starts()
 
 
 def plan_runs(plan_path: Path, *,
               record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
     target = plan_path.expanduser().resolve()
-    try:
-        paths = list((history_root() / "runs").glob("*.jsonl"))
-    except OSError:
-        return []
-    starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
+    starts = run_starts()
     if record is None:
-        record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+        record = (staff_record() if any(event.get(unit_runs.OWNER_FIELD) or event.get("main_agent") or event.get("owner_session") for _, event in starts)
                   else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
     for path, event in starts:
-        event = staff_directory(event, record)
-        working_dir = event.get("working_dir")
-        plan_doc = event.get("plan_doc")
+        owner = unit_runs.run_owner(event, record)
+        fields = dict(event)
+        if isinstance(owner, staff.StaffRow):
+            pass_recorder.staff_paths(fields, owner)
+        working_dir = fields.get("working_dir")
+        plan_doc = fields.get("plan_doc")
         if not isinstance(working_dir, str) or not isinstance(plan_doc, str):
             continue
         if not working_dir or not plan_doc:

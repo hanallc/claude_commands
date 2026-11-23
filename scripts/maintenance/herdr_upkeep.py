@@ -1,6 +1,10 @@
-#!/usr/bin/env python3
-"""Save the shared layout and refresh detection rules on a runtime schedule."""
+#!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
+"""Restore producers, save the shared layout, and refresh detection rules."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import fcntl
@@ -10,30 +14,89 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-from scripts.lib import process_group
-from scripts.maintenance.settings import schedule, table
+from scripts.lib import conf, operation_deadline, process_group
+from scripts.maintenance.settings import Schedule, schedule, table
+
+
+def _cadence() -> Schedule:
+    config = Path(os.environ.get("HERDR_UPKEEP_CONFIG", str(ROOT / "config/herdr_upkeep.toml")))
+    return schedule(table(tomllib.loads(config.read_text()))["job"])
 
 
 def upkeep() -> None:
+    from scripts.accounts import accounts
+    from scripts.agents import shutdown_record, stop_resume
     from scripts.herdr import detection_rules, herdr
-    running = {session["name"] for session in herdr.live_sessions()}
-    herdr.save_shared_layout(running)
-    _ = detection_rules.refresh(running, herdr.reload_agent_rules)
+    from scripts.production import gate
+    from scripts.production.gate_modules import GateRefused
+
+    try:
+        _ = gate.check_nightly_assignments()
+    except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
+
+    if shutdown_record.active():
+        return
+    cadence = _cadence()
+    deadline = min(time.monotonic() + cadence.timeout_seconds,
+                   float(os.environ.get("HERDR_UPKEEP_DEADLINE", "inf")))
+    with operation_deadline.within(deadline), accounts.settings_report_scope():
+        _ = herdr.restore_server(herdr.shared_session(),
+            int(operation_deadline.remaining(herdr.PROGRAM_TIMEOUT_SECONDS) * 1000),
+            session_kind=herdr.security_session())
+        running = {session["name"] for session in herdr.live_sessions()}
+        herdr.save_shared_layout(running)
+        _ = detection_rules.refresh(running, herdr.reload_agent_rules)
+        producers = accounts.producer_upkeep_members()
+        if producers:
+            offset = int(time.time() // cadence.interval_seconds) % len(producers)
+            producers = producers[offset:] + producers[:offset]
+        start_seconds = conf.read("shutdown").number("START_SECONDS")
+        for row in producers:
+            if shutdown_record.active():
+                break
+            if time.monotonic() >= deadline:
+                print("herdr-upkeep: producer budget ended; retry remaining producers next run", file=sys.stderr)
+                break
+            try:
+                with operation_deadline.within(min(deadline, time.monotonic() + start_seconds)):
+                    result = stop_resume.resume_for_upkeep(row.id)
+                if result is None:
+                    break
+                if isinstance(result, stop_resume.StoppedOnPurpose):
+                    print(f"herdr-upkeep: {result.name}: stopped on purpose; agents resume brings it back",
+                          file=sys.stderr)
+                elif isinstance(result, stop_resume.ResumeFailed):
+                    print(f"herdr-upkeep: {row.name}: {result.reason}", file=sys.stderr)
+                elif isinstance(result, stop_resume.SessionNotFound):
+                    print(f"herdr-upkeep: {row.name}: session not found", file=sys.stderr)
+            except Exception as error:
+                print(f"herdr-upkeep: {row.name}: {error}", file=sys.stderr)
 
 
-def run_job() -> int:
-    config = Path(os.environ.get("HERDR_UPKEEP_CONFIG", str(ROOT / "config/herdr_upkeep.toml")))
-    cadence = schedule(table(tomllib.loads(config.read_text()))["job"])
+@contextmanager
+def upkeep_lock(*, blocking: bool) -> Generator[Path | None]:
+    """Use the timer's job lock to hold upkeep work."""
     directory = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "herdr-upkeep"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "lock").open("a") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            yield None
+        else:
+            yield directory
+
+
+def run_job() -> int:
+    cadence = _cadence()
+    with upkeep_lock(blocking=False) as directory:
+        if directory is None:
             print("herdr-upkeep: already running; exit 0")
             return 0
         completed = directory / "completed"
@@ -45,8 +108,9 @@ def run_job() -> int:
             print("herdr-upkeep: not due; exit 0")
             return 0
         started = time.monotonic()
-        with subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--work"],
-                              cwd=ROOT, start_new_session=True) as child:
+        with subprocess.Popen([str(ROOT / "scripts/lib/py"), str(Path(__file__).resolve()), "--work"],
+                              cwd=ROOT, start_new_session=True,
+                              env={**os.environ, "HERDR_UPKEEP_DEADLINE": str(started + cadence.timeout_seconds)}) as child:
             try:
                 code = child.wait(timeout=cadence.timeout_seconds)
             except subprocess.TimeoutExpired:

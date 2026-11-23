@@ -9,32 +9,22 @@ import signal
 import socket
 import stat
 import subprocess
-import sys
 import tomllib
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
+from typing import BinaryIO, Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import store
+from scripts.buildlog import store
 from scripts.message import send_budget
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import process_group
+from scripts.lib import process_group
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
-import override_guard
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
-if TYPE_CHECKING:
-    from ..copies import copies
-    from ..lib import cargo_output, scratch
-    from ..notify import review
-    from ..notify.push_texts import RenderedPush
-else:
-    from scripts.copies import copies
-    from scripts.lib import cargo_output, scratch
-    import review
+from scripts.build_hold import override_guard
+from scripts.copies import copies
+from scripts.lib import cargo_output, conf_reads, scratch
+from scripts.notify import review
+from scripts.notify.push_texts import RenderedPush
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -130,7 +120,7 @@ def pinned_version() -> str | None:
 
 def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
     with subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, stdin=subprocess.DEVNULL, start_new_session=True) as process:
+                          text=True, stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -182,10 +172,7 @@ def cargo_building() -> bool:
 
 
 def send_release_text(push: RenderedPush) -> bool:
-    if TYPE_CHECKING:
-        from ..notify.push_texts import user_send_argv
-    else:
-        from push_texts import user_send_argv
+    from scripts.notify.push_texts import user_send_argv
 
     command = user_send_argv(push)
     result = subprocess.run(command, capture_output=True, text=True,
@@ -218,7 +205,7 @@ def mapping(value: object) -> dict[str, object]:
 def free_floor_gib() -> float:
     values: dict[str, str] = {}
     try:
-        for raw in LINT_CONFIG.read_text().splitlines():
+        for raw in conf_reads.read_text(LINT_CONFIG).splitlines():
             line = raw.split("#", 1)[0].strip()
             if line and not (line.startswith("[") and line.endswith("]")) and "=" in line:
                 key, _, value = line.partition("=")
@@ -310,8 +297,11 @@ def diagnostic_counts(output: str) -> tuple[int, int, int, int]:
     return totals["warning"], len(crates["warning"]), totals["error"], len(crates["error"])
 
 
-def directory_gib(path: Path) -> float:
-    return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file()) / GIB if path.exists() else 0.0
+def directory_gib(path: Path, excluded: tuple[Path, ...] = ()) -> float:
+    if not path.exists():
+        return 0.0
+    return sum(entry.stat().st_size for entry in path.rglob("*")
+               if entry.is_file() and not any(entry.resolve().is_relative_to(root) for root in excluded)) / GIB
 
 
 def trial_output_gib(clone: Path) -> tuple[float, float]:
@@ -320,10 +310,10 @@ def trial_output_gib(clone: Path) -> tuple[float, float]:
     roots = {clone / "target"}
     for output in saved:
         roots.update((output.roots.target_directory, output.roots.build_directory))
-    mend = clone / "mend-target"
+    mend = clone / "target/mend-target"
     roots = {root.resolve() for root in roots if not root.resolve().is_relative_to(mend.resolve())}
     outer = [root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)]
-    return sum(directory_gib(root) for root in outer), directory_gib(mend)
+    return sum(directory_gib(root, (mend.resolve(),)) for root in outer), directory_gib(mend)
 
 
 def trial_step_was_killed(result: subprocess.CompletedProcess[str]) -> bool:
@@ -354,7 +344,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         finally:
             if cwd is not None:
                 target_gib, mend_target_gib = trial_output_gib(cwd)
-                mend_target = cwd / "mend-target"
+                mend_target = cwd / "target/mend-target"
                 if mend_target.is_dir() and not mend_target.is_symlink():
                     scratch.mark_cargo_cache(mend_target)
         if held():
@@ -378,7 +368,8 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         step = "checkout"
         if held():
             raise TrialDeferred("build hold active")
-        with copies.standing("toolchain-trial", HANA, revision.stdout.strip()) as checkout:
+        # The raw Cargo commands are OtherCommand and have no first queue step.
+        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip()), step="toolchain-trial") as checkout:
             _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {
                 "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),
@@ -390,8 +381,8 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
             warnings, warning_crates, errors, error_crates = diagnostic_counts(clippy.stdout)
             if clippy.returncode and errors == 0:
                 return failed(first_error(clippy))
-            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "mend-target"),
-                              "CARGO_BUILD_BUILD_DIR": str(checkout / "mend-target/intermediates")}
+            mend_env = env | {"RUSTC_BOOTSTRAP": "1", "CARGO_TARGET_DIR": str(checkout / "target/mend-target"),
+                              "CARGO_BUILD_BUILD_DIR": str(checkout / "target/mend-target/intermediates")}
             mend = run("cargo-mend", ["cargo", f"+{version}", "install", "--path",
                                       str(Path.home() / "rust/cargo-liner/crates/cargo-mend"),
                                       "--root", str(checkout / "target" / "mend-root")], checkout, mend_env, 3600)
@@ -421,10 +412,7 @@ def trial_text(trial: TrialOutcome) -> str:
 
 
 def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
-    if TYPE_CHECKING:
-        from ..notify.push_texts import render
-    else:
-        from push_texts import render
+    from scripts.notify.push_texts import render
 
     if trial["status"] != "finished":
         raise ValueError("incomplete compiler trials are log notes, not user pushes")

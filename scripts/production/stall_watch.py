@@ -7,6 +7,10 @@ Retire the alert when the prompt ends. Staff ids identify files and alert keys.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import fcntl
 import hashlib
@@ -22,34 +26,37 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock
+from enum import Enum
 from pathlib import Path
 from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
+from scripts.agents import detached_runs
+from scripts.build_targets.target_config import pinned_target_names
+from scripts.build_targets.targets import (
+    ConfigError, Held, LocalTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
+)
+from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
+from scripts.message import session_send
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
-from scripts.production import showrunners, staff, unit_names, session_staff
-import unit_lookup
-from session_pane import HerdrFailure, agent_status, read_place
+from scripts.production import showrunners, staff, session_staff
+from scripts.production import unit_lookup
+from scripts.production.session_pane import HerdrFailure, agent_status, read_place
+from scripts.whoami import account, usage_store
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-import context_usage  # noqa: E402
-import push_texts  # noqa: E402
-import rca  # noqa: E402
-import sessions  # noqa: E402
+from scripts.hooks import context_usage  # noqa: E402
+from scripts.notify import push_texts  # noqa: E402
+from scripts.message import rca  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 
-import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
+from scripts.herdr import herdr, worker_panes  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Iterator
@@ -57,23 +64,32 @@ if TYPE_CHECKING:
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
-SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
+WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
+COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
+BUILD_HOLD_WAIT = re.compile(
+    r"\bwait(?:s|ing)?\s+(?:for|on)\s+(?:\w+(?:[.-]\w+)*\s+){0,3}"
+    + r"hold\s+(?:releases?|ends|to\s+(?:end|lift))\b",
+    re.IGNORECASE,
+)
 TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*)$",
                       re.MULTILINE)
 # A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
 # not in the production's zone.
 HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
-WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
+WORK = {"zsh", "bash", "sh", "review.sh", "verify.sh"}
 BLOCKED = herdr.AgentStatus.BLOCKED
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 # The prompt alert's sender, which its retire names too.
 SENDER = "stall-watch"
 # The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
 PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
+# The first answer under the question, with the cursor mark when it is selected: "❯ 1. Yes".
+PROMPT_OPTION = re.compile(r"^❯?\s*1\.\s*Yes\b")
 # "make this edit to panes.py" reads as "edit panes.py".
 EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
 BASH_PROMPT_TITLE = "Bash command"
@@ -119,16 +135,29 @@ class Stretch(TypedDict):
     bump_sent: bool
     tell_sent: bool
     reported_status: str
+    login_since: NotRequired[float]
+    login_pid: NotRequired[int]
 
 
 class PaneInspection(NamedTuple):
-    slug: str
+    production_name: str
     configured: showrunners.Showrunner
     zone: ZoneInfo
-    members: tuple[str, ...]
+    peers: tuple[str, ...]
     name: str
     unit: unit_lookup.LabeledSession
+    claude: unit_lookup.LiveClaude | unit_lookup.ClaudeNotRunning
     row: staff.StaffRow
+
+
+class PaneWorkersUnread(NamedTuple):
+    """The cycle has not needed worker activity yet."""
+
+
+class BusyPaneWorkerParents(NamedTuple):
+    """The directors with busy pane workers in this cycle."""
+
+    ids: frozenset[staff.StaffId]
 
 
 class PromptWait(TypedDict):
@@ -212,6 +241,12 @@ class TranscriptEntry(TypedDict, total=False):
     type: str
     timestamp: str
     message: TranscriptMessage
+    isApiErrorMessage: bool
+
+
+class SessionLoginLifetime(TypedDict):
+    sessionId: str
+    startedAt: int
 
 
 class PendingTool(NamedTuple):
@@ -306,7 +341,8 @@ def process_session(pid: int) -> str:
             environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return ""
-        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment
+                      if item.startswith((b"CODEX_THREAD_ID=", b"CLAUDE_CODE_SESSION_ID=")))
     return values.get("CODEX_THREAD_ID", "") or values.get("CLAUDE_CODE_SESSION_ID", "")
 
 
@@ -336,6 +372,40 @@ def work_running(pid: int, rows: list[Process], session_id: str = "") -> bool:
     return False
 
 
+def read_busy_pane_worker_parents(parents: tuple[staff.StaffRow, ...], record: staff.StaffSnapshot) -> BusyPaneWorkerParents:
+    """Read worker activity for all directors once per cycle."""
+    if not any(record.find(kind="worker", parent=parent.id) for parent in parents):
+        return BusyPaneWorkerParents(frozenset())
+    try:
+        observations = worker_panes.observe_parents(parents, record)
+    except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"stall-watch: pane workers: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return BusyPaneWorkerParents(frozenset())
+    return BusyPaneWorkerParents(frozenset(
+        parent for parent, workers in observations.items()
+        if any(worker_panes.worker_state(observed) == "busy" for observed in workers)))
+
+
+def has_live_detached_worker_run(parent: staff.StaffRow, run: unit_lookup.HeldRun,
+                                record: staff.StaffSnapshot) -> bool:
+    """Check detached work for the director's staff workers in its unfinished run."""
+    workers = record.find(kind="worker", parent=parent.id)
+    if not workers:
+        return False
+    directory = run.folder / "detached_runs"
+    try:
+        try:
+            # Path.glob suppresses folder errors in live_runs.
+            with os.scandir(directory):
+                pass
+        except FileNotFoundError:
+            return False
+        return any(detached_runs.live_runs(directory, worker.name) for worker in workers)
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: detached runs: {parent.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+    return False
+
+
 def latest_transcript_activity(session_id: str) -> float:
     latest = 0.0
     for transcript in PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
@@ -345,6 +415,63 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+class LoginVerdict(Enum):
+    """The current login evidence can establish a limit, clear it, or remain unknown."""
+
+    LIMITED = "limited"
+    CLEAR = "clear"
+    UNKNOWN = "unknown"
+
+
+def login_limited(pid: int, session_id: str, pattern: re.Pattern[str]) -> LoginVerdict:
+    """Use the current process's latest assistant error, independent of pane scrollback."""
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
+            return LoginVerdict.CLEAR
+        for line in lines_from_end(transcript):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            text = "\n".join(block.get("text", "") for block in blocks_of(entry) if block.get("type") == "text")
+            if not entry.get("isApiErrorMessage") or not pattern.search(text):
+                return LoginVerdict.CLEAR
+            try:
+                failed_at = datetime.fromisoformat(entry.get("timestamp", "")).timestamp()
+            except (ValueError, KeyError, OverflowError):
+                return LoginVerdict.LIMITED
+            break
+        else:
+            return LoginVerdict.CLEAR
+    except OSError:
+        return LoginVerdict.UNKNOWN
+    try:
+        record = cast(SessionLoginLifetime, json.loads((sessions.sessions_dir() / f"{pid}.json").read_text()))
+        if record["sessionId"] == session_id and record["startedAt"] / 1000 > failed_at:
+            return LoginVerdict.CLEAR
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        folder = account.process_config_dir(pid)
+        if not isinstance(folder, account.ConfiguredClaudeFolder):
+            return LoginVerdict.LIMITED
+        stored = usage_store.load()
+        login = stored.directory_logins[usage_store.directory_key("Claude", str(folder.path))]
+        usage = stored[login]
+        if "weekly" not in usage:
+            return LoginVerdict.LIMITED
+        read_at = datetime.fromisoformat(usage["weekly"]["at"])
+        return (LoginVerdict.CLEAR if read_at.tzinfo is not None and read_at.timestamp() > failed_at
+                else LoginVerdict.LIMITED)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return LoginVerdict.LIMITED
 
 
 def context_near_compaction(session_id: str) -> bool:
@@ -378,28 +505,40 @@ def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
 
 
 def transcript_turn_end(session_id: str) -> re.Match[str] | None:
-    """The turn-end line closing the session's last assistant text, read from its transcript.
+    """Read the turn-end line from the session's latest assistant text.
 
-    Read before the pane, whose text can be stale after resume or compaction. The pane supplies
-    the fallback when the transcript has no usable turn end. A tool call after the text means
-    the turn went on, so there is no turn-end line.
+    Read the transcript before the pane, which can show stale text after resume or compaction.
+    Use the pane when the transcript has no usable turn-end line.
+    If the stripped text is only "—", skip that turn and its tool calls to read the previous assistant text.
+    A user prompt ends this skip; a tool result does not.
+    Otherwise, a tool call after the text means the turn continued, so return no turn-end line.
     """
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return None
+        skipping_peer_turn = False
         for line in lines_from_end(transcript):
-            if b'"assistant"' not in line:
+            if b'"assistant"' not in line and (not skipping_peer_turn or b'"user"' not in line):
                 continue
             try:
                 entry = cast(TranscriptEntry, json.loads(line))
             except ValueError:
                 continue
-            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            content = entry.get("message", {}).get("content")
             blocks = content if isinstance(content, list) else []
-            if any(block.get("type") == "tool_use" for block in blocks):
+            if entry.get("type") == "user":
+                if not any(block.get("type") == "tool_result" for block in blocks):
+                    skipping_peer_turn = False
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            if not skipping_peer_turn and any(block.get("type") == "tool_use" for block in blocks):
                 return None
             text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text.strip() == "—":
+                skipping_peer_turn = True
+                continue
             if text:
                 turns = list(TURN_END.finditer(text))
                 return turns[-1] if turns else None
@@ -500,37 +639,16 @@ def stated_hold_end(line: str, now: float, zone: ZoneInfo) -> float | None:
 
 
 class WatchedUnit(NamedTuple):
-    slug: str
+    production_name: str
     name: str
     stretch_path: Path
     prompt_path: Path
     prompt_key: str
 
 
-def _watched_staff_unit(slug: str, unit: str, row: staff.StaffRow) -> WatchedUnit:
+def watched_staff_unit(production_name: str, unit: str, row: staff.StaffRow) -> WatchedUnit:
     path = STATE_DIR / f"{row.id}.json"
-    return WatchedUnit(slug, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{row.id}")
-
-
-def watched_unit(slug: str, unit: str, record: staff.StaffSnapshot) -> WatchedUnit:
-    found = record.by_path(f"{slug}/{unit}")
-    if found is None:
-        found = record.by_path(f"{slug}/{unit_names.name(unit)}")
-    if found is None:
-        raise ValueError(f"{slug}/{unit}: no unique staff row")
-    return _watched_staff_unit(slug, unit, found)
-
-
-def stretch_path(slug: str, unit: str) -> Path:
-    return watched_unit(slug, unit, staff.snapshot()).stretch_path
-
-
-def prompt_path(slug: str, unit: str) -> Path:
-    return watched_unit(slug, unit, staff.snapshot()).prompt_path
-
-
-def prompt_key(slug: str, unit: str) -> str:
-    return watched_unit(slug, unit, staff.snapshot()).prompt_key
+    return WatchedUnit(production_name, unit, path, path.with_suffix(".prompt.json"), f"stall-watch:prompt:{row.id}")
 
 
 def prompt_alert_seconds() -> float:
@@ -539,13 +657,13 @@ def prompt_alert_seconds() -> float:
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
-    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    defaults = WATCH_DEFAULTS
     path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
     fields: dict[str, str] = {}
     for source in paths:
         try:
-            content = source.read_text(encoding="utf-8")
+            content = conf_reads.read_text(source)
         except FileNotFoundError:
             if status_defaults and source != defaults:
                 continue
@@ -587,6 +705,46 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
         raise ValueError("external_wait_pattern must capture a nonempty owner")
     owner = owner.strip()
     return names_outside(owner, fields["external_owner_pattern"].strip(), peers, own_names, at_start=True)
+
+
+class BuildHolds(NamedTuple):
+    configured_targets: frozenset[str]
+    held_targets: frozenset[str]
+    local_hold_live: bool = False
+
+    def status_waits_on_hold(self, status: str) -> bool:
+        any_hold = self.local_hold_live or bool(self.held_targets)
+        if not any_hold or BUILD_HOLD_WAIT.search(status) is None:
+            return False
+        named = {target for target in self.configured_targets if name_spans(status, target)}
+        return not named or bool(named & self.held_targets)
+
+
+def read_build_holds() -> BuildHolds:
+    local_hold_live = False
+    for state in local_hold_states():
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: local build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            local_hold_live = True
+    try:
+        configuration = tunables.read("build_targets")
+        targets = read_targets(configuration=configuration)
+        pinned = pinned_target_names(configuration)
+    except ConfigError as error:
+        print(f"stall-watch: build targets unreadable: {error}", file=sys.stderr)
+        return BuildHolds(frozenset(), frozenset(), local_hold_live)
+    held_targets = {target.name for target in targets if isinstance(target, LocalTarget) and local_hold_live}
+    for target in targets:
+        if isinstance(target, LocalTarget) or target.platform != "macos":
+            continue
+        state = ssh_target_state(target)
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: {target.name}: build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            held_targets.add(target.name)
+    known_targets = frozenset(target.name for target in targets).union(pinned)
+    return BuildHolds(known_targets, frozenset(held_targets), local_hold_live)
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
@@ -653,22 +811,22 @@ def sender_configuration() -> SenderConfiguration:
 
 def inspection_order(work: list[PaneInspection]) -> list[PaneInspection]:
     """Start after the last pass's first attempt, even when that read exhausted its budget."""
-    work = sorted(work, key=lambda item: (item.slug, item.name))
+    work = sorted(work, key=lambda item: (item.production_name, item.name))
     cursor = ("", "")
     try:
         value = cast(object, json.loads((STATE_DIR / "inspection.cursor").read_text(encoding="utf-8")))
         if not isinstance(value, dict):
             raise ValueError("expected a production and unit")
         fields = cast(dict[str, object], value)
-        slug, unit = fields.get("slug"), fields.get("unit")
-        if not isinstance(slug, str) or not slug or not isinstance(unit, str) or not unit:
+        production_name, unit = fields.get("name"), fields.get("unit")
+        if not isinstance(production_name, str) or not production_name or not isinstance(unit, str) or not unit:
             raise ValueError("expected a production and unit")
-        cursor = (slug, unit)
+        cursor = (production_name, unit)
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as error:
         print(f"stall-watch: inspection cursor: {error}; starting at the first unit", file=sys.stderr)
-    first = next((index for index, item in enumerate(work) if (item.slug, item.name) > cursor), 0)
+    first = next((index for index, item in enumerate(work) if (item.production_name, item.name) > cursor), 0)
     return work[first:] + work[:first]
 
 
@@ -736,8 +894,7 @@ def finish_cancellations(requests: list[PromptCancellation]) -> None:
 
 
 def retire_key(path: Path, key: str) -> Delivery:
-    command = push_texts.user_retire_argv(SENDER, key)
-    return Delivery(path, "retire", [sys.executable, str(SEND), *command[2:]])
+    return Delivery(path, "retire", session_send.send_argv(*push_texts.user_retire_argv(SENDER, key)[2:], send_script=SEND))
 
 
 def end_prompt(watch: WatchedUnit) -> Delivery | None:
@@ -903,6 +1060,13 @@ def save_prompt(path: Path, prompt: PromptWait) -> None:
     write_text_atomic(path, json.dumps(record) + "\n")
 
 
+def prompt_on_screen(pane: str) -> bool:
+    """Whether a permission prompt's question and its first answer show at the pane's bottom."""
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
+    asked = next((index for index, line in enumerate(lines) if PROMPT_QUESTION.search(line)), None)
+    return asked is not None and any(PROMPT_OPTION.match(line) for line in lines[asked + 1:])
+
+
 def auto_denied(pane: str) -> bool:
     """Whether the permission prompt at the pane's bottom shows the auto-deny banner."""
     return any(AUTO_DENY_BANNER.match(line.strip(FRAME)) for line in pane.splitlines()[-PROMPT_LINES:])
@@ -1046,19 +1210,20 @@ def prompt_report(watch: WatchedUnit, session_id: str, pending: PendingTool | No
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
     except OSError:
         transcript = None
-    return rca.Report(watch.name, machine_name(), "prompt", commands, str(transcript or ""), watch.slug,
+    return rca.Report(watch.name, machine_name(), "prompt", commands, str(transcript or ""), watch.production_name,
                       stopped=datetime.fromtimestamp(since, ZoneInfo("UTC")).isoformat(), source=SENDER,
                       key=watch.prompt_key)
 
 
 def prompt_alert(watch: WatchedUnit, pane: str, since: float, zone: ZoneInfo,
                  pending: PendingTool | None = None, report: rca.Report | None = None) -> Delivery:
-    rendered = push_texts.render(PROMPT_TEXT_ID, unit=watch.name.removesuffix("-unit"), machine=machine_name(),
+    rendered = push_texts.render(PROMPT_TEXT_ID, unit=watch.name, machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
     # end_prompt() retires the alert when its prompt is gone.
-    command = push_texts.user_send_argv(rendered, sender=SENDER, key=watch.prompt_key, self_clearing=True)
-    return Delivery(watch.prompt_path, "alert", [sys.executable, str(SEND), *command[2:]], report)
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=watch.prompt_key, self_clearing=True,
+                                       send_script=SEND)
+    return Delivery(watch.prompt_path, "alert", command, report)
 
 
 def prompt_owner(watch: WatchedUnit, socket: str, pane: str, prompt: PromptWait,
@@ -1079,7 +1244,7 @@ def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
     try:
         old = saved_stretch(path)
         if (old["pane_hash"] == pane_hash or old["bump_sent"] or old["tell_sent"]
-                or old.get("reported_status")):
+                or old.get("reported_status") or "login_since" in old):
             return old
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -1094,8 +1259,8 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
-    return Delivery(path, kind, [sys.executable, str(SEND), "--to", f"uds:{socket}", "--from", "stall-watch",
-                                 "--key", key, "--text", text])
+    return Delivery(path, kind, session_send.send_argv("--to", f"uds:{socket}", "--from", "stall-watch",
+                                 "--key", key, "--text", text, send_script=SEND))
 
 
 def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,
@@ -1190,13 +1355,13 @@ class InspectionReport:
 
 
 @contextmanager
-def inspection_report(slug: str, name: str) -> Generator[InspectionReport, None, None]:
+def inspection_report(production_name: str, name: str) -> Generator[InspectionReport, None, None]:
     """Write one log line without entering a delivery path."""
     report = InspectionReport()
     try:
         yield report
     finally:
-        print(f"inspected {slug}/{name}: {report.decision}")
+        print(f"inspected {production_name}/{name}: {report.decision}")
 
 
 def tick(now: float, *, deadline: float = math.inf) -> int:
@@ -1225,48 +1390,69 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         print(f"stall-watch: process snapshot: {rows.reason}", file=sys.stderr)
     runners = showrunners.ShowrunnerDiscovery()
     record = staff.StaffSnapshot(())
+    work: list[PaneInspection] = []
     try:
         record = staff.snapshot()
+        sessions = unit_lookup.every_labeled_session(record=record)
     except (OSError, UnicodeError) as error:
         print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
     else:
+        showrunner_names = tuple(member.name for member in record.find(kind="showrunner")
+                                 if not isinstance(member.worktree, staff.RemovedWorktree))
+        sibling_names_by_parent: dict[staff.ReportsTo | staff.StaffRoot, dict[staff.StaffId, str]] = {}
         runners = showrunners.registered_showrunners(deadline=inspection_deadline, membership=record)
-    work: list[PaneInspection] = []
-    members_by_parent: dict[staff.ReportsTo | staff.StaffRoot, tuple[str, ...]] = {}
-    for configured in runners:
-        # A showrunner that is not running has no one to tell: its units are not watched.
-        showrunner_socket = configured["socket"]
-        if not showrunner_socket:
-            continue
-        try:
-            zone = ZoneInfo(configured["zone"])
-        except (KeyError, ValueError):
-            print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
-            continue
-        try:
-            slug = configured["slug"]
-            marked = unit_lookup.labeled_sessions(slug, record=record)
-            for name, unit in marked.items():
-                if isinstance(unit.identity, session_staff.NoSession):
-                    raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
-                row = unit_lookup.unit_row(name, record, reference=unit.identity)
-                if row.parent not in members_by_parent:
-                    members_by_parent[row.parent] = tuple(alias
-                        for member in (record.find(kind="unit", parent=row.parent.id) if isinstance(row.parent, staff.ReportsTo) else ())
-                        if not isinstance(member.worktree, staff.RemovedWorktree)
-                        for alias in (member.name, unit_names.unit_id(member.name)))
-                work.append(PaneInspection(slug, configured, zone, members_by_parent[row.parent], name, unit, row))
-        except (OSError, UnicodeError, ValueError) as error:
-            print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
-            continue
+        for configured in runners:
+            # A showrunner that is not running has no one to tell: its units are not watched.
+            showrunner_socket = configured["socket"]
+            if not showrunner_socket:
+                continue
+            try:
+                zone = ZoneInfo(configured["zone"])
+            except (KeyError, ValueError):
+                print(f"stall-watch: invalid zone for {configured['name']}: {configured['zone']}", file=sys.stderr)
+                continue
+            try:
+                production_name = configured["name"]
+                for name in sessions.status_units(production_name):
+                    match sessions.checked_unit(production_name, name):
+                        case unit_lookup.UnknownUnit(reason=reason):
+                            print(f"stall-watch: {name}: {reason}", file=sys.stderr)
+                            continue
+                        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                                claude=unit_lookup.LiveClaude() as claude) as unit):
+                            pass
+                        case unit_lookup.ProvedAbsentUnit(pane=unit_lookup.LabeledSession(
+                                claude=unit_lookup.ClaudeNotRunning() as claude,
+                                empty=herdr.ObservedEmpty()) as unit):
+                            pass
+                        case _:
+                            continue
+                    if isinstance(unit.identity, session_staff.NoSession):
+                        raise staff.StaffUnreadable(f"{name}: native runtime identity is unavailable")
+                    row = unit_lookup.unit_row(name, record, reference=unit.identity)
+                    if row.parent not in sibling_names_by_parent:
+                        sibling_names_by_parent[row.parent] = {
+                            member.id: member.name for member in record.rows
+                            if member.kind == "unit" and member.parent == row.parent
+                            and not isinstance(member.worktree, staff.RemovedWorktree)}
+                    peers = (*showrunner_names,
+                             *(sibling_name for sibling_id, sibling_name in sibling_names_by_parent[row.parent].items()
+                               if sibling_id != row.id), configured["session"], production_name)
+                    work.append(PaneInspection(production_name, configured, zone, peers, name, unit, claude, row))
+            except (OSError, UnicodeError, ValueError) as error:
+                print(f"stall-watch: {configured['name']}: its units are not watched: {error}", file=sys.stderr)
+                continue
     runs = unit_lookup.HeldRunLookup(record=record)
+    pane_worker_parents = tuple(item.row for item in work)
+    busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    for slug, configured, zone, members, name, unit, row in inspection_order(work):
+    build_holds = read_build_holds() if work else BuildHolds(frozenset(), frozenset())
+    for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
         showrunner_socket = configured["socket"]
-        watch = _watched_staff_unit(slug, name, row)
+        watch = watched_staff_unit(production_name, name, row)
         if any(item.state_path == watch.prompt_path for item in pending):
             continue
         if not pane_budget_left(name, inspection_deadline):
@@ -1274,7 +1460,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
         # The shared lookup follows recorded director changes, not stale worktree paths.
         run = runs.unfinished_held_run(row.current_session)
         if isinstance(run, unit_lookup.HeldRunUnknown):
-            print(f"inspected {slug}/{name}: run unknown: {run.path}: {run.reason}")
+            print(f"inspected {production_name}/{name}: run unknown: {run.path}: {run.reason}")
             continue
         if not pane_budget_left(name, inspection_deadline):
             continue
@@ -1282,12 +1468,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if (retire := forget(watch)) is not None:
                 pending.append(retire)
             continue
-        claude = unit.claude
         if not isinstance(claude, unit_lookup.LiveClaude):
-            if isinstance(claude, unit_lookup.ClaudeUnknown):
-                print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
-            # A prompt is not on screen without its Claude.
-            elif (retire := end_prompt(watch)) is not None:
+            if (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
             continue
         observed_at = time.time()
@@ -1298,9 +1480,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             continue
         if not inspection_started:
             # Progress belongs to the attempted read, independent of its alert state or outcome.
-            write_text_atomic(STATE_DIR / "inspection.cursor", json.dumps({"slug": slug, "unit": name}) + "\n")
+            write_text_atomic(STATE_DIR / "inspection.cursor", json.dumps({"name": production_name, "unit": name}) + "\n")
             inspection_started = True
-        with inspection_report(slug, name) as report:
+        with inspection_report(production_name, name) as report:
             if unit.place.session not in labels_by_session:
                 # Discovery already read these panes. A missing label must not prevent prompt checks.
                 panes = read_panes(unit.place.session)
@@ -1327,6 +1509,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 if time.monotonic() >= inspection_deadline:
                     continue
                 blocked = None
+            # herdr's state can miss a prompt for hours while the pane shows it: the screen decides too.
+            if prompt_on_screen(pane):
+                blocked = True
             if not pane_budget_left(name, inspection_deadline):
                 continue
             if blocked:
@@ -1353,18 +1538,44 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 continue
             if blocked is not None and (retire := end_prompt(watch)) is not None:
                 pending.append(retire)
-            stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
+            pane_hash = hashlib.sha256(pane.encode()).hexdigest()
+            stretch = read_stretch(path, pane_hash, now)
             turns = list(TURN_END.finditer(pane))
+            try:
+                login_limit = login_limited(pid, session_id, re.compile(
+                    watch_config(status_defaults=True)["login_limit_pattern"].strip(), re.IGNORECASE))
+            except (OSError, UnicodeError, KeyError, ValueError, re.error) as error:
+                print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+                continue
+            if login_limit is LoginVerdict.UNKNOWN:
+                continue
+            if login_limit is LoginVerdict.LIMITED:
+                report.decision = "login limit"
+                if "login_since" not in stretch or stretch.get("login_pid", pid) != pid:
+                    stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                      reported_status="", login_since=now)
+                stretch["login_pid"] = pid
+                stretch["since"] = now
+                save_stretch(path, stretch)
+                if not stretch["tell_sent"]:
+                    text = f"{name}: the Claude login reached its time limit and needs /login."
+                    login_since = stretch.get("login_since", now)
+                    key = f"stall-watch:{row.id}:login:{int(login_since)}:tell"
+                    pending.append(delivery(path, "tell", showrunner_socket, key, text))
+                continue
+            if "login_since" in stretch:
+                stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
+                                  reported_status="")
             # A resumed or compacted pane can retain an older turn. The session's last
             # assistant text is authoritative when it supplies a turn-end status.
             turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
             last = turn.group("status").strip() if turn else "none on screen"
-            peers = (*(member for member in members if member not in (row.name, unit_names.unit_id(row.name))),
-                     configured["session"], slug)
             own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
             try:
                 deferred = bool(turn) and status_defers_bump(last, peers, own_names)
-                holding = turn is not None and turn.group("kind") == HOLDING_KIND and holding_names_outside(last, peers, own_names)
+                holding = (turn is not None and turn.group("kind") == HOLDING_KIND
+                           and (holding_names_outside(last, peers, own_names)
+                                or build_holds.status_waits_on_hold(last)))
             except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
                 print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
                 continue
@@ -1372,13 +1583,19 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
             if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
-                            and not context_near_compaction(session_id)):
+                            and not (turn.group("kind") == COMPACTION_WAKE_KIND and context_near_compaction(session_id))):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
                 report.decision = "waiting"
                 continue
             running_work = work_running(pid, rows, session_id)
+            if not running_work:
+                if isinstance(busy_pane_workers, PaneWorkersUnread):
+                    busy_pane_workers = read_busy_pane_worker_parents(pane_worker_parents, record)
+                running_work = row.id in busy_pane_workers.ids
+            if not running_work:
+                running_work = has_live_detached_worker_run(row, run, record)
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
@@ -1395,12 +1612,13 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 stretch["reported_status"] = last
                 save_stretch(path, stretch)
             report.decision = "holding" if holding else "idle already bumped"
-            if not holding and not stretch["bump_sent"]:
+            if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
-                        "Continue your run; if you are waiting on someone, say on whom in one line.")
+                        + "Continue your run. If you wait for someone, name that person in your status line. "
+                        + "Do not reply to stall-watch.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not holding and not stretch["tell_sent"] and showrunner_socket:
+            if not holding and socket and not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)
@@ -1417,9 +1635,8 @@ def migrate_staff_ids() -> int:
         if parent is None:
             continue
         targets[str(row.id)] = (row, parent.name)
-        for name in (row.name, unit_names.unit_id(row.name)):
-            digest = hashlib.sha256(f"{parent.name}\0{name}".encode()).hexdigest()
-            targets[digest] = (row, parent.name)
+        digest = hashlib.sha256(f"{parent.name}\0{row.name}".encode()).hexdigest()
+        targets[digest] = (row, parent.name)
     result = 0
     for source in sorted(STATE_DIR.glob("*.json")):
         if source.name.endswith(".case.json"):
@@ -1429,7 +1646,7 @@ def migrate_staff_ids() -> int:
             print(f"stall-watch: unmatched file: {source}", file=sys.stderr)
             result = 1
             continue
-        row, slug = targets[stem]
+        row, production_name = targets[stem]
         suffix = ".prompt.json" if source.name.endswith(".prompt.json") else ".json"
         target = STATE_DIR / f"{row.id}{suffix}"
         if source != target:
@@ -1448,7 +1665,7 @@ def migrate_staff_ids() -> int:
             retire = retire_key(target, prompt["key"])
             _ = subprocess.run(retire.command, check=True, timeout=30)
             if not prompt["retiring"]:
-                alert = prompt_alert(_watched_staff_unit(slug, unit_names.unit_id(row.name), row), "", prompt["since"], ZoneInfo("UTC"))
+                alert = prompt_alert(watched_staff_unit(production_name, row.name, row), "", prompt["since"], ZoneInfo("UTC"))
                 _ = subprocess.run(alert.command, check=True, timeout=30)
         prompt["key"] = key
         if "case_pending" in prompt:

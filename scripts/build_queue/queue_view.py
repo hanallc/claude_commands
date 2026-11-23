@@ -1,19 +1,690 @@
-"""The compact queue view and the checks shared with one-step cards."""
+"""Read build activity and prepare rows for the Builds page."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from functools import cache, cached_property
-from typing import assert_never
-from zoneinfo import ZoneInfo
+from dataclasses import dataclass, field as dataclass_field
+from functools import cached_property
+from enum import Enum
+import os
+import inspect
+import logging
+import re
+import shlex
+import json
+from pathlib import Path
+import subprocess
+import time
+from typing import cast
 
-from scripts.build_queue import head_facts, queue_evidence
+from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
+from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_wire import cloud_queue_order
+from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
+    eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
-from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
-from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
-from scripts.lint import memory_admit as gate
+from scripts.build_queue.queue_lines import Line, Span
+from scripts.buildlog.parse import cargo_subcommand
+from scripts.lib import cargo_target_config, conf
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import StepNames, command_script, read_step_names
+from scripts.build_queue import admission_records
 from scripts.message.unit_labels import UnitLabels
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.message import unit_labels
+
+
+@dataclass(frozen=True)
+class MacBuilding:
+    """No test executable runs in this build's process tree."""
+
+
+@dataclass(frozen=True)
+class MacTesting:
+    test_pid: int
+
+
+@dataclass(frozen=True)
+class MacTestingCounter:
+    counter: progress_profile.ProgressCounter
+
+
+@dataclass(frozen=True)
+class MacStageUnavailable:
+    """No process reading supplies the build stage."""
+
+
+MacBuildStage = MacBuilding | MacTesting | MacTestingCounter | MacStageUnavailable
+
+
+@dataclass(frozen=True)
+class MacMemoryUnavailable:
+    """No resident memory reading exists for this process tree."""
+
+
+@dataclass(frozen=True)
+class MacJobsUnavailable:
+    """The command does not specify a positive jobs value."""
+
+
+class MacBuildOrigin(Enum):
+    CI = "ci"
+    NON_CI = "non-ci"
+    UNKNOWN = "unknown"
+
+
+class MacGateLabel(Enum):
+    USER = "user"
+    PLACEMENT = "placement"
+    CI = "hana-ci"
+    UNPLACED = "unplaced"
+    UNAVAILABLE = "unavailable"
+
+
+def parse_gate_label(wire: str) -> MacGateLabel:
+    if wire.startswith("placement "):
+        return MacGateLabel.PLACEMENT
+    return next((label for label in MacGateLabel if label.value == wire), MacGateLabel.UNAVAILABLE)
+
+
+@dataclass(frozen=True)
+class MacBuild:
+    pid: int
+    folder: str
+    started_at: float
+    command: str = ""
+    repository: str = ""
+    stage: MacBuildStage = MacStageUnavailable()
+    resident_bytes: int | MacMemoryUnavailable = MacMemoryUnavailable()
+    jobs: int | MacJobsUnavailable = MacJobsUnavailable()
+    counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
+    recorded_unit: str = ""
+    session: str = ""
+    origin: MacBuildOrigin = MacBuildOrigin.UNKNOWN
+    ci_runner: str = ""
+    ci_job: str = ""
+    gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
+    gate_placement: str = ""
+
+
+@dataclass(frozen=True)
+class UnplacedMacRun:
+    pid: int
+    started_at: float
+    command: str
+
+
+def unplaced_run_record(run: UnplacedMacRun) -> dict[str, object]:
+    return {"pid": run.pid, "started_at": run.started_at, "command": run.command}
+
+
+def unplaced_run_from_record(row: dict[str, object]) -> UnplacedMacRun:
+    return UnplacedMacRun(int(cast(int, row["pid"])), float(cast(float, row["started_at"])), str(row["command"]))
+
+
+@dataclass(frozen=True)
+class MacBuildReading:
+    read_at: float
+    builds: tuple[MacBuild, ...]
+    error: str = ""
+    unplaced_runs: tuple[UnplacedMacRun, ...] = ()
+    home: str = ""
+
+
+def mac_reading_path() -> Path:
+    """Use the feed folder for the shared periodic Mac reading."""
+    folder = Path(os.path.expandvars(conf.read("memory_feed").text("output_folder"))).expanduser()
+    return folder / "mac-builds.json"
+
+
+def mac_activity_refresh_seconds() -> int:
+    return conf.read("memory_feed").whole("mac_activity_refresh_seconds")
+
+
+def mac_command_jobs(command: str) -> int | MacJobsUnavailable:
+    match = re.search(r"(?:^|\s)(?:-j\s*|--(?:jobs|test-threads)(?:=|\s+))([0-9]+)(?:\s|$)", command)
+    return int(match[1]) if match and int(match[1]) > 0 else MacJobsUnavailable()
+
+
+def mac_command_step(build: MacBuild) -> tuple[str, str]:
+    try:
+        words = shlex.split(build.command)
+    except ValueError:
+        words = []
+    step = ""
+    for index, word in enumerate(words):
+        name = Path(word).name
+        if name == "cargo":
+            step = cargo_subcommand(words[index + 1:]) or "cargo"
+            break
+        if name == "cargo-nextest":
+            step = "nextest"
+            break
+        if name == "rustc":
+            step = "rustc"
+            break
+    step = step or command_script(words)
+    if step in ("", "cargo") and isinstance(build.stage, (MacTesting, MacTestingCounter)):
+        step = "test"
+    package = ""
+    for index, word in enumerate(words):
+        if word in ("-p", "--package") and index + 1 < len(words):
+            package = words[index + 1]
+            break
+        if word.startswith("--package="):
+            package = word.removeprefix("--package=")
+            break
+        if word.startswith("-p") and len(word) > 2:
+            package = word[2:]
+            break
+    return step, package
+
+
+def gate_label_text(build: MacBuild) -> str:
+    """Serialize the gate identity for records. Keep placement ids out of visible names."""
+    if build.gate_label == MacGateLabel.PLACEMENT and build.gate_placement:
+        return "placement " + build.gate_placement
+    return "" if build.gate_label == MacGateLabel.UNAVAILABLE else build.gate_label.value
+
+
+def mac_build_record(build: MacBuild) -> dict[str, object]:
+    return {"pid": build.pid, "folder": build.folder, "started_at": build.started_at,
+            "command": build.command, "repository": build.repository,
+            "test_pid": build.stage.test_pid if isinstance(build.stage, MacTesting) else
+                0 if isinstance(build.stage, MacBuilding) else -1,
+            "resident_bytes": build.resident_bytes if isinstance(build.resident_bytes, int) else -1,
+            "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
+                if isinstance(build.counter, progress_profile.ProgressCounter) else {},
+            "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build)}
+
+
+def mac_build_from_record(row: dict[str, object]) -> MacBuild:
+    test_pid = int(cast(int, row["test_pid"]))
+    resident = int(cast(int, row["resident_bytes"]))
+    command = str(row["command"])
+    counter_data = cast(dict[str, object], row["counter"])
+    counter = progress_profile.ProgressCounter(str(counter_data["phase"]), int(cast(int, counter_data["done"])),
+        int(cast(int, counter_data["total"]))) if counter_data else progress_profile.NoCounter()
+    stage = MacTesting(test_pid) if test_pid > 0 else MacBuilding() if test_pid == 0 else MacStageUnavailable()
+    if isinstance(counter, progress_profile.ProgressCounter) and counter.phase.startswith("test:"):
+        stage = MacTestingCounter(counter)
+    return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
+                    command, str(row["repository"]), stage,
+                    resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
+                    str(row["recorded_unit"]), str(row["session"]),
+                    MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
+                    str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
+                    parse_gate_label(str(row.get("gate_label", ""))),
+                    str(row.get("gate_label", "")).removeprefix("placement ")
+                    if str(row.get("gate_label", "")).startswith("placement ") else "")
+
+
+def read_mac_builds() -> MacBuildReading:
+    """Read the cached Mac activity without a network call."""
+    try:
+        data = cast(dict[str, object], json.loads(mac_reading_path().read_text()))
+        rows = cast(list[dict[str, object]], data["builds"])
+        return MacBuildReading(float(cast(float, data["read_at"])), tuple(mac_build_from_record(row) for row in rows),
+                               str(data.get("error", "")), tuple(unplaced_run_from_record(row)
+                                   for row in cast(list[dict[str, object]], data.get("unplaced_runs", []))),
+                               str(data.get("home", "")))
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
+        return MacBuildReading(0, (), "Mac reading unavailable")
+
+
+def mac_reading_status(reading: MacBuildReading, now: float) -> str:
+    """Replace old native rows with one short status and the reading age."""
+    elapsed = max(0, now - reading.read_at)
+    if not reading.error and elapsed <= 2 * mac_activity_refresh_seconds():
+        return ""
+    age_text = cloud_update_age(elapsed) if reading.read_at else "unavailable"
+    return f"Mac reading is old · age {age_text}"
+
+
+def mac_build_script() -> str:
+    """Read cargo tile registrations and process trees in one SSH call."""
+    return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
+import ctypes
+import json
+import re
+import struct
+import sys
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import time
+import tomllib
+
+CAPTURE_ROOT = Path("/tmp/cargo-tile")
+
+
+def output(arguments):
+    return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL,
+                                   env=dict(os.environ, LC_ALL="C"), timeout=4)
+
+
+def read_processes():
+    rows = {}
+    for line in output(["ps", "-axww", "-o", "pid=,ppid=,uid=,rss=,etime=,lstart=,comm="]).splitlines():
+        fields = line.split(None, 10)
+        if len(fields) != 11:
+            continue
+        pid, parent, uid, rss = map(int, fields[:4])
+        try:
+            born = int(time.mktime(time.strptime(" ".join(fields[5:10]), "%a %b %d %H:%M:%S %Y")))
+        except ValueError:
+            continue
+        rows[pid] = dict(pid=pid, parent=parent, uid=uid, resident_bytes=rss * 1024,
+                         started_at=born, executable=fields[10], command="")
+    for line in output(["ps", "-axww", "-o", "pid=,args="]).splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and int(fields[0]) in rows:
+            rows[int(fields[0])]["command"] = fields[1]
+    return rows
+
+
+def read_captures(processes):
+    try:
+        boot = output(["sysctl", "-n", "kern.bootsessionuuid"]).strip()
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    captures = {}
+    for account in CAPTURE_ROOT.glob("[0-9]*"):
+        if not account.name.isdecimal() or account.is_symlink():
+            continue
+        for record in (account / "state/pids").glob("*"):
+            try:
+                pid_text, generation = record.name.split(".", 1)
+                pid = int(pid_text)
+                process = processes.get(pid)
+                if not process or process["uid"] != int(account.name):
+                    continue
+                if record.is_symlink() or record.stat().st_size > 65536:
+                    continue
+                raw = record.read_bytes()
+                if not raw.endswith(b"\0"):
+                    continue
+                fields = raw[:-1].split(b"\0")
+                if len(fields) < 8 or fields[0] != b"cargo-tile-v3":
+                    continue
+                if fields[1].decode() != generation or fields[2].decode() != boot:
+                    continue
+                if int(fields[3]) != process["started_at"]:
+                    continue
+                log_name = fields[4].decode()
+                if Path(log_name).name != log_name:
+                    continue
+                folder = fields[5].decode()
+                if not Path(folder).is_absolute():
+                    continue
+                count_at = 7 if not fields[6] or fields[6].startswith(b"/") else 6
+                arguments = [word.decode() for word in fields[count_at + 1:]]
+                if int(fields[count_at]) != len(arguments):
+                    continue
+                log = account / log_name
+                tail = ""
+                if not log.is_symlink():
+                    try:
+                        with log.open("rb") as stream:
+                            stream.seek(max(0, log.stat().st_size - 65536))
+                            tail = stream.read(65536).decode(errors="replace")
+                    except OSError:
+                        pass
+                captures[pid] = dict(folder=folder, command=shlex.join(["cargo", *arguments]), progress_tail=tail)
+            except (OSError, ValueError, UnicodeError, IndexError):
+                continue
+    return captures
+
+
+def project_record(folder):
+    try:
+        tree = Path(folder).resolve()
+        for parent in (tree, *tree.parents):
+            for name in (".copy-record.json", ".scratch.json", ".gate.json", ".gate-copy.json"):
+                record = parent / name
+                try:
+                    if record.is_symlink() or record.stat().st_size > 65536:
+                        continue
+                    values = json.loads(record.read_text())
+                    owner = values.get("owner_unit", values.get("owner", ""))
+                    session = values.get("session", values.get("holder_session", ""))
+                    repo = values.get("repo", "")
+                    if name == ".gate-copy.json" and not tree.is_relative_to(parent):
+                        continue
+                    return dict(recorded_unit=owner if isinstance(owner, str) else "",
+                                session=session if isinstance(session, str) else "",
+                                repository=repo if isinstance(repo, str) else "")
+                except (FileNotFoundError, ValueError, TypeError):
+                    continue
+            if (parent / ".git").exists():
+                break
+    except OSError:
+        pass
+    return dict(recorded_unit="", session="", repository="")
+
+
+def repository_name(folder):
+    try:
+        remote = output(["git", "-C", folder, "config", "--get", "remote.origin.url"]).strip()
+        for _ in range(8):
+            if not remote.startswith("/"):
+                break
+            remote = output(["git", "-C", remote, "config", "--get", "remote.origin.url"]).strip()
+        if "://" in remote or remote.startswith("git@"):
+            return remote.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        manifest = tomllib.loads((Path(folder) / "Cargo.toml").read_text())
+        package = manifest.get("workspace", {}).get("package", {}) or manifest.get("package", {})
+        repository = package.get("repository", "")
+        if isinstance(repository, str) and ("://" in repository or repository.startswith("git@")):
+            return repository.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
+def process_environment(pid):
+    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
+    if sys.platform != "darwin":
+        return {}
+    try:
+        kernel = ctypes.CDLL(None, use_errno=True)
+        kernel.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                  ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        kernel.sysctl.restype = ctypes.c_int
+        # sysinfo uses CTL_KERN and KERN_PROCARGS2 for the same process observation.
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        size = ctypes.c_size_t()
+        if kernel.sysctl(mib, 3, None, ctypes.byref(size), None, 0) or not 4 <= size.value <= 2097152:
+            return {}
+        data = ctypes.create_string_buffer(size.value)
+        if kernel.sysctl(mib, 3, data, ctypes.byref(size), None, 0):
+            return {}
+        return cargo_environment(data.raw[:size.value])
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def cargo_environment(data):
+    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
+    if len(data) < 4:
+        return {}
+    argc = struct.unpack_from("i", data)[0]
+    if argc < 1:
+        return {}
+    start = data.find(b"\0", 4)
+    if start < 0:
+        return {}
+    start += 1
+    while start < len(data) and data[start] == 0:
+        start += 1
+    fields = data[start:].split(b"\0")
+    selected = {}
+    for field in fields[argc:]:
+        if not field:
+            break
+        key, separator, value = field.partition(b"=")
+        if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
+            selected[os.fsdecode(key)] = os.fsdecode(value)
+    return selected
+
+
+def test_output_directories(pid, folder, command, members, processes):
+    """Resolve target settings and observed compiler output directories."""
+    try:
+        arguments = shlex.split(command)
+        environment = process_environment(pid)
+        settings = cargo_folder_settings(arguments, folder, environment)
+        if "target-dir" in settings:
+            setting = settings["target-dir"]
+            target = setting.base / setting.value
+        else:
+            try:
+                target = cargo_workspace_manifest(arguments, folder).parent / "target"
+            except (OSError, ValueError, TypeError):
+                target = Path(folder) / "target"
+        targets = {target.resolve()}
+    except (OSError, ValueError, TypeError):
+        targets = set()
+    outputs = set()
+    for member in members:
+        try:
+            words = shlex.split(processes[member]["command"])
+            directory = cargo_path_argument(words, "--out-dir") if "--crate-name" in words else ""
+            if directory:
+                outputs.add((Path(folder) / directory).resolve())
+        except (OSError, ValueError):
+            continue
+    return targets, outputs
+
+
+def running_test_pid(pid, folder, command, members, processes):
+    targets, outputs = test_output_directories(pid, folder, command, members, processes)
+    for member in members:
+        try:
+            executable = Path(processes[member]["executable"]).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if (executable.parent.name == "deps" and
+                not executable.name.startswith(("build-script", "build_script_")) and
+                (executable.parent in outputs or any(executable.is_relative_to(target) for target in targets))):
+            return member
+    return 0
+
+
+def build_origin(pid, processes):
+    """Identify a build with a GitHub Actions runner ancestor."""
+    cursor = pid
+    seen = set()
+    while cursor in processes and cursor not in seen:
+        seen.add(cursor)
+        try:
+            words = shlex.split(processes[cursor]["command"])
+        except ValueError:
+            return "unknown"
+        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
+            return "ci"
+        cursor = processes[cursor]["parent"]
+    return "non-ci"
+
+
+def read_gate_records():
+    records = {}
+    for path in (Path.home() / ".local/state/mac-gate/records").glob("[0-9]*"):
+        try:
+            pid, stamp, label = path.read_text().rstrip("\n").split("\t")
+            born = int(time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")))
+            records[int(pid)] = (born, label)
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+PLACEMENT_FORM = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def gate_label(pid, processes, records, ci_uid):
+    """Use the nearest gate record whose start time matches, or the nearest MAC_PLACEMENT."""
+    if processes[pid].get("uid") == ci_uid:
+        return "hana-ci"
+    seen = set()
+    while pid in processes and pid not in seen:
+        seen.add(pid)
+        process = processes[pid]
+        record = records.get(pid)
+        if record and record[0] == process["started_at"]:
+            return record[1]
+        # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
+        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        if PLACEMENT_FORM.fullmatch(placement):
+            return "placement " + placement
+        pid = process["parent"]
+    return "unplaced"
+
+
+def ci_user_id():
+    import pwd
+    try:
+        return pwd.getpwnam("hana-ci").pw_uid
+    except KeyError:
+        return -1
+
+
+def unplaced_runs(processes, records, captures):
+    """Name each cargo or rustc root with no placement; a compiler under sccache or a build is not a root."""
+    candidates = {pid for pid, process in processes.items()
+                  if Path(process["executable"]).name in ("cargo", "rustc", "cargo-nextest")}
+    roots = candidates | set(captures)
+    runs = []
+    ci_uid = ci_user_id()
+    for pid in candidates:
+        cursor, seen = processes[pid]["parent"], {pid}
+        while (cursor in processes and cursor not in seen and cursor not in roots
+               and Path(processes[cursor]["executable"]).name != "sccache"):
+            seen.add(cursor)
+            cursor = processes[cursor]["parent"]
+        if cursor in processes and cursor not in seen:
+            continue
+        if gate_label(pid, processes, records, ci_uid) == "unplaced":
+            runs.append(dict(pid=pid, started_at=processes[pid]["started_at"], command=processes[pid]["command"]))
+    return sorted(runs, key=lambda run: (run["started_at"], run["pid"]))
+
+
+def read_builds(processes=None, records=None, captures=None):
+    processes = read_processes() if processes is None else processes
+    captures = read_captures(processes) if captures is None else captures
+    records = read_gate_records() if records is None else records
+    ci_uid = ci_user_id()
+    candidates = set(captures)
+    for pid, process in processes.items():
+        if Path(process["executable"]).name in ("cargo", "cargo-nextest"):
+            candidates.add(pid)
+    roots = []
+    for pid in candidates:
+        cursor = processes[pid]["parent"]
+        seen = {pid}
+        while cursor in processes and cursor not in seen and cursor not in candidates:
+            seen.add(cursor)
+            cursor = processes[cursor]["parent"]
+        if cursor not in candidates:
+            roots.append(pid)
+    cwd = {}
+    if roots:
+        try:
+            current = 0
+            for line in output(["lsof", "-a", "-p", ",".join(map(str, roots)), "-d", "cwd", "-Fpn"]).splitlines():
+                if line.startswith("p"):
+                    current = int(line[1:])
+                elif line.startswith("n"):
+                    cwd[current] = line[1:]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    builds = []
+    for pid in roots:
+        members = []
+        for child in processes:
+            cursor = child
+            seen = set()
+            while cursor in processes and cursor not in seen and cursor != pid:
+                seen.add(cursor)
+                cursor = processes[cursor]["parent"]
+            if cursor == pid:
+                members.append(child)
+        capture_ids = [member for member in members if member in captures and captures[member]["progress_tail"]]
+        capture = captures.get(pid, {})
+        folder = capture.get("folder", cwd.get(pid, ""))
+        if not folder:
+            continue
+        try:
+            record = project_record(folder)
+        except Exception:
+            record = dict(recorded_unit="", session="", repository="")
+        command = capture.get("command", processes[pid]["command"])
+        try:
+            test_pid = running_test_pid(pid, folder, command, members, processes)
+        except Exception:
+            test_pid = -1
+        try:
+            repository = record["repository"] or repository_name(folder)
+        except Exception:
+            repository = ""
+        try:
+            origin = build_origin(pid, processes)
+        except Exception:
+            origin = "unknown"
+        ci_environment = process_environment(pid) if origin == "ci" else {}
+        try:
+            folder = str(Path(folder).resolve())
+        except OSError:
+            pass
+        tail = capture.get("progress_tail", "")
+        if not tail and capture_ids:
+            tail = captures[min(capture_ids, key=lambda value: processes[value]["started_at"])]["progress_tail"]
+        builds.append(dict(pid=pid, folder=folder, started_at=processes[pid]["started_at"],
+                           command=command, test_pid=test_pid,
+                           resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
+                           progress_tail=tail, repository=repository,
+                           recorded_unit=record["recorded_unit"], session=record["session"],
+                           origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
+                           ci_job=ci_environment.get("GITHUB_JOB", ""),
+                           gate_label=gate_label(pid, processes, records, ci_uid)))
+    return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
+
+
+def read_reading():
+    processes = read_processes()
+    records = read_gate_records()
+    captures = read_captures(processes)
+    return dict(home=str(Path.home()), builds=read_builds(processes, records, captures),
+                unplaced_runs=unplaced_runs(processes, records, captures))
+
+
+print(json.dumps(read_reading()))
+print("rc=0")
+''' + "MAC_READING\n"
+
+
+def refresh_mac_builds() -> None:
+    """Refresh the shared reading from the feed loop at its configured interval."""
+    now = time.time()
+    previous = read_mac_builds()
+    try:
+        settings = conf.read("mac_test")
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
+            f"ConnectTimeout={settings.number('connect_timeout_s'):g}", settings.text("host"), mac_build_script()],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=10)
+        if result.returncode or result.stderr or not result.stdout.endswith("rc=0\n"):
+            raise ValueError(" ".join(result.stderr.split()) or "Mac activity check failed")
+        data = cast(dict[str, object], json.loads(result.stdout.removesuffix("rc=0\n")))
+        records = cast(list[dict[str, object]], data["builds"])
+        unplaced = tuple(unplaced_run_from_record(row) for row in
+            cast(list[dict[str, object]], data.get("unplaced_runs", [])))
+        builds: list[MacBuild] = []
+        for row in records:
+            counter = progress_profile.parse_progress(str(row.pop("progress_tail")))
+            row["counter"] = ({"phase": counter.phase, "done": counter.done, "total": counter.total}
+                              if isinstance(counter, progress_profile.ProgressCounter) else {})
+            builds.append(mac_build_from_record(row))
+        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)),
+                                  unplaced_runs=unplaced, home=str(data.get("home", "")))
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
+        logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
+        reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable",
+                                  previous.unplaced_runs, previous.home)
+    write_text_atomic(mac_reading_path(), json.dumps({"read_at": reading.read_at, "error": reading.error,
+        "builds": [mac_build_record(build) for build in reading.builds],
+        "unplaced_runs": [unplaced_run_record(run) for run in reading.unplaced_runs],
+        "home": reading.home}), new_file_mode=0o644)
+
+def step_counter(step: admission_records.RunningStep) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+    """Read the counter from the local memory reading."""
+    if isinstance(step.measured, admission_records.ProgressAdjustedMemory):
+        return step.measured.counter
+    return progress_profile.NoCounter("the step has no readable counter")
 
 
 @dataclass(frozen=True)
@@ -22,316 +693,136 @@ class UnknownCpuCount:
 
 
 @dataclass(frozen=True)
-class HostLoad:
-    load: float
-    cpus: int | UnknownCpuCount
+class QueueModel:
+    reading: admission_records.QueueRead
+    labels: Mapping[str, UnitLabels]
+    names: StepNames = dataclass_field(default_factory=read_step_names)
+
+    @cached_property
+    def cloud_labels(self) -> Mapping[str, UnitLabels]:
+        missing = {row.identity.session_id for row in cloud_rows(self)
+                   if row.identity.session_id and row.identity.session_id not in self.labels}
+        return {**unit_labels.unit_labels_for(missing, os.environ), **self.labels} if missing else self.labels
 
 
 @dataclass(frozen=True)
-class HostLoadUnavailable:
+class CloudPushInterval:
+    seconds: float
+
+
+@dataclass(frozen=True)
+class CloudPushIntervalUnavailable:
+    reason: str
+
+
+def cloud_push_interval() -> CloudPushInterval | CloudPushIntervalUnavailable:
+    try:
+        return CloudPushInterval(conf.read("cloud_gate").number("log_push_s"))
+    except conf.Unusable as error:
+        return CloudPushIntervalUnavailable(str(error))
+
+
+def cloud_rows(model: QueueModel) -> tuple[wire.CloudRow, ...]:
+    return model.reading.cloud if isinstance(model.reading, wire.CloudQueueRead) else ()
+
+
+@dataclass(frozen=True)
+class CloudUpdateCurrent:
     pass
 
 
 @dataclass(frozen=True)
-class QueueModel:
-    reading: gate.QueueRead
-    labels: Mapping[str, UnitLabels]
-    facts: head_facts.HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter
-    pace: head_facts.RecordedPace | head_facts.PaceUnavailable
-    zone: ZoneInfo
-    load: HostLoad | HostLoadUnavailable
-    release: gate.HeadAfterEnd
-    ci_memory_slice: str = ""
-
-    @cached_property
-    def moves(self) -> head_facts.QueueMoves:
-        return head_facts.queue_moves(self.reading, self.facts)
-
-
-def same_waiter(left: gate.WaitingStep, right: gate.WaitingStep) -> bool:
-    """Match a saved decision to its row even when display fields change."""
-    return left.pid == right.pid and left.since == right.since
-
-
-def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable:
-    explanation = model.reading.explanation
-    if isinstance(explanation.host, gate.ReadingUnavailable):
-        return explanation.host
-    step = model.reading.view.waiting[position - 1]
-    if isinstance(step.reason, gate.ReadingUnavailable):
-        return step.reason
-    if isinstance(explanation.head, gate.HeadExplanation) and same_waiter(explanation.head.waiter, step):
-        return explanation.head
-    return next((item for item in explanation.line.steps if same_waiter(item.waiter, step)),
-                gate.ReadingUnavailable("step admission checks unavailable"))
-
-
-def shown_waiters(selector: str, reading: gate.QueueRead, labels: Mapping[str, UnitLabels]) -> list[int]:
-    return [position for position, step in enumerate(reading.view.waiting, 1)
-            if step_labels(step, labels).session == selector]
-
-
-def running_matches_selector(step: gate.RunningStep, selector: str, labels: Mapping[str, UnitLabels]) -> bool:
-    return (selector == step_labels(step, labels).session
-            or gate.step_matches(selector, step)
-            or isinstance(step.measured, gate.UnownedSliceMemory) and selector == step.measured.owner)
-
-
-def name_spans(step: gate.WaitingStep | gate.RunningStep, labels: Mapping[str, UnitLabels],
-               *, production: bool = True) -> Line:
-    identity = step_labels(step, labels)
-    seen: set[str] = set()
-    parts: list[Span] = []
-    names = ((identity.showrunner, False),) if production else ()
-    for text, session in (*names, (identity.unit, False), (identity.session, True)):
-        text = field(text)
-        if text == "—" or not text or text in seen:
-            continue
-        seen.add(text)
-        if parts:
-            parts.append(Span(" · "))
-        parts.append(Span(text, "inactive" if session else "default"))
-    return tuple(parts)
-
-
-def name_text(step: gate.WaitingStep | gate.RunningStep, model: QueueModel) -> str:
-    return plain([name_spans(step, model.labels)])
-
-
-def clock(model: QueueModel, at: float, *, seconds: bool = False) -> str:
-    return head_facts.clock(at, model.zone, seconds=seconds)
-
-
-def estimate_minutes(model: QueueModel, position: int) -> int:
-    return max(1, round(position * 60 / model.pace.steps)) if isinstance(model.pace, head_facts.RecordedPace) and model.pace.steps else 0
-
-
-def start_text(model: QueueModel, position: int, *, clock_time: bool = False) -> str:
-    minutes = estimate_minutes(model, position)
-    if not minutes:
-        return "—"
-    return "~" + (clock(model, model.reading.explanation.now + minutes * 60) if clock_time else f"{minutes} min")
-
-
-def waiting_moves(model: QueueModel, position: int) -> tuple[head_facts.BumpRecord, ...]:
-    return model.moves.waiting[position - 1]
-
-
-def is_moved(model: QueueModel, position: int) -> bool:
-    return has_move_priority(model, position)
-
-
-def has_move_priority(model: QueueModel, position: int) -> bool:
-    return isinstance(gate.waiter_priority(model.reading.ordered[position - 1][1]), gate.PriorityUnit)
-
-
-def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
-    if isinstance(pressure, gate.NoPressureHold):
-        return True, "memory pressure: no hold"
-    return False, queue_evidence.pressure_text(pressure, model.reading.explanation.policy)
-
-
-def check_line(passes: bool, text: str) -> Line:
-    return (Span("✓ " if passes else "✗ ", "success" if passes else "error"), Span(text))
-
-
-def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable,
-                model: QueueModel) -> list[Line]:
-    if isinstance(checks, gate.ReadingUnavailable):
-        return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
-    return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
-
-
-def eligible_head_position(waiting: Sequence[gate.WaitingStep]) -> int:
-    """Position of the first row eligible for the head rule; requires an eligible row."""
-    return next(place for place, step in enumerate(waiting, 1)
-                if not isinstance(step.reason, gate.TokenWaitingWaiter))
-
-
-def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
-    match reason:
-        case gate.TokenWaitingWaiter():
-            return "waiting for the cargo token"
-        case gate.EstimateExpired():
-            return "estimate expired"
-        case gate.ReadingUnavailable():
-            return reason.reason
-        case gate.MemoryPressure():
-            return "memory pressure"
-        case gate.PressureUnavailable():
-            return reason.reason
-        case gate.StartSpacingWait():
-            return "start spacing"
-        case gate.NeedsMemory():
-            return "free memory"
-        case gate.BehindHead():
-            place = next((place for place, step in enumerate(waiting, 1)
-                          if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
-            return f"behind #{place}" if place else "behind the first step"
-        case gate.ReadyForAdmission():
-            return "starts at the next check"
-        case gate.HeadAdmissionStatus():
-            return (f"#{eligible_head_position(waiting)}'s turn" if isinstance(reason.cause, gate.ReadyForAdmission)
-                    else reason_phrase(reason.cause, waiting))
-        case _:
-            assert_never(reason)
-
-
-def bar_eighths(gib: float, cap: float) -> int:
-    """Round to the nearest eighth on the shared one-cell-per-GiB scale."""
-    return int(max(0.0, min(gib, cap)) * 8 + 0.5)
-
-
-def size_bar(gib: float, cap: float) -> str:
-    eighths = bar_eighths(gib, cap)
-    whole, fraction = divmod(eighths, 8)
-    return "█" * whole + ("▏▎▍▌▋▊▉"[fraction - 1] if fraction else "")
-
-
-def countdown(until: float, now: float) -> str:
-    minutes, seconds = divmod(max(0, int(until - now)), 60)
-    return f"{minutes}:{seconds:02d}"
-
-
-def head_status(model: QueueModel) -> Line:
-    head = model.reading.explanation.head
-    if not isinstance(head, gate.HeadExplanation):
-        return ()
-    result: Line = (Span(" ↑", "warning" if head.has_priority else "success"),)
-    cause = head.cause
-    if isinstance(cause, gate.MemoryPressure):
-        return (*result, Span(" pressure", "error"))
-    if isinstance(cause, gate.PressureUnavailable):
-        return (*result, Span(" pressure unreadable", "error"))
-    if isinstance(cause, gate.StartSpacingWait):
-        return (*result, Span(" spacing", "inactive"))
-    if isinstance(cause, gate.EstimateExpired):
-        return (*result, Span(" estimate expired", "error"))
-    if isinstance(cause, gate.ReadingUnavailable):
-        return (*result, Span(" " + cause.reason, "error"))
-    if isinstance(cause, gate.NeedsMemory):
-        return (*result, Span(" low room", "error"))
-    if isinstance(cause, gate.BehindHead):
-        return (*result, Span(" queue order", "inactive"))
-    return result
-
-
-def cap_bar(room: gate.MemoryRoom | gate.ReadingUnavailable, width: int, *, colour: bool) -> Line:
-    """Draw captured use, keep-aside, room, safety, and other programs."""
-    if not isinstance(room, gate.MemoryRoom) or not isinstance(room.cap, int):
-        return (Span("cap unavailable", "inactive"),)
-    total = room.total if isinstance(room.total, int) else max(1, room.cap + room.safety)
-    cells = max(1, min(width, (total + gate.GIB - 1) // gate.GIB))
-    scale = total / cells
-    cap_at = min(cells - 1, max(0, int(room.cap / scale)))
-    kept_end = min(room.cap, room.used + room.kept)
-    result: list[Span] = []
-    for cell in range(cells):
-        point = (cell + 0.5) * scale
-        if cell == cap_at:
-            result.append(Span("│", "error"))
-        elif point < min(room.used, room.cap):
-            result.append(Span("█", "suggestion"))
-        elif point < kept_end:
-            result.append(Span("░", "warning"))
-        elif point < room.cap:
-            result.append(Span("█" if colour else "·", "success"))
-        elif point < room.cap + room.safety:
-            result.append(Span("█" if colour else "▒", "warning"))
-        else:
-            result.append(Span("█", "inactive"))
-    return tuple(result)
+class CloudUpdateLate:
+    seconds: float
 
 
 @dataclass(frozen=True)
-class RunningBuild:
-    step: gate.RunningStep
-    used: int
-    kept: int
-    started_at: float
-    measured: bool
-    swap_bytes: int = 0
+class CloudWork:
+    state: str
+    modules: str
+    vcpus: int | UnknownCpuCount
+    failed_modules: int
+    update: CloudUpdateCurrent | CloudUpdateLate
 
 
-def running_builds(model: QueueModel) -> list[RunningBuild]:
-    """Combine captured keep-asides and scope evidence for each run."""
-    explanation = model.reading.explanation
-    captured = explanation.room
-    holds = {hold.owner: hold for hold in captured.runs} if isinstance(captured, gate.MemoryRoom) else {}
-    active = (entry.step for entry in explanation.running if gate.running_has_reservation(entry.step))
-    owners_by_step = {id(step): gate.reservation_run_owner(reservation, step)
-                      for reservation, step in zip(explanation.reservations, active, strict=True)}
-    rows: dict[tuple[int, str] | int, RunningBuild] = {}
-    for index, running in enumerate(model.reading.explanation.running):
-        step = running.step
-        memory = step.measured
-        if isinstance(memory, (gate.GoneMemory, gate.CompilerServiceMemory)):
-            continue
-        if isinstance(memory, gate.UnownedSliceMemory) and (not isinstance(memory.job_state, NotServiceSlice) or not (
-                isinstance(memory.activity, ScopeProcesses) and isinstance(memory.activity.run, LiveBuildRun))):
-            continue
-        key = (step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else index
-        started = step.run.started_at if isinstance(step.run, LiveBuildRun) else step.started_at
-        if not started and isinstance(running.admitted_at, float):
-            started = running.admitted_at
-        previous = rows.get(key)
-        used = (memory.anonymous.bytes if isinstance(memory, gate.MeasuredMemory)
-                and isinstance(memory.anonymous, gate.AnonymousRunUse) else
-                memory.bytes if isinstance(memory, gate.UnownedSliceMemory) else 0)
-        measured = (isinstance(memory, gate.MeasuredMemory) and isinstance(memory.anonymous, gate.AnonymousRunUse)
-                    or isinstance(memory, gate.UnownedSliceMemory))
-        hold = holds.get(owners_by_step.get(id(step), ""))
-        if hold is not None and not isinstance(step.run, LiveBuildRun):
-            used = hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0
-            measured = isinstance(hold.use, gate.AnonymousRunUse)
-        kept = hold.bytes if hold is not None and not isinstance(step.run, LiveBuildRun) else 0
-        if previous is None:
-            rows[key] = RunningBuild(step, used, kept, started, measured,
-                                      memory.swap_bytes if isinstance(memory, gate.MeasuredMemory) else 0)
-        else:
-            chosen = step if step.promise and not previous.step.promise else previous.step
-            rows[key] = RunningBuild(chosen, previous.used + used, previous.kept + kept,
-                                     previous.started_at or started, previous.measured and measured,
-                                     previous.swap_bytes + (memory.swap_bytes if isinstance(memory, gate.MeasuredMemory) else 0))
-    if isinstance(captured, gate.MemoryRoom):
-        for key, row in rows.items():
-            if not isinstance(row.step.run, LiveBuildRun):
-                continue
-            hold = holds.get(f"{row.step.run.pid}-{row.step.run.start_time}")
-            if hold is not None:
-                rows[key] = RunningBuild(row.step,
-                    hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0,
-                    hold.bytes, row.started_at, isinstance(hold.use, gate.AnonymousRunUse), row.swap_bytes)
-        owners = {f"{row.step.run.pid}-{row.step.run.start_time}" for row in rows.values()
-                  if isinstance(row.step.run, LiveBuildRun)}
-        owners.update(owners_by_step.values())
-        for hold in captured.runs:
-            pid, separator, start = hold.owner.partition("-")
-            if hold.owner in owners or not separator or not pid.isdecimal():
-                continue
-            run = LiveBuildRun(int(pid), start, 0.0)
-            used = hold.use.bytes if isinstance(hold.use, gate.AnonymousRunUse) else 0
-            step = gate.RunningStep("", "", "between steps", "", 0, gate.MeasuredMemory(used), pid=run.pid, run=run)
-            rows[(run.pid, run.start_time)] = RunningBuild(step, used, hold.bytes, 0.0,
-                                                         isinstance(hold.use, gate.AnonymousRunUse))
-    return list(rows.values())
+def cloud_work(row: wire.CloudRow, now: float, stale_pushes: int,
+               interval: CloudPushInterval | CloudPushIntervalUnavailable) -> CloudWork:
+    progress = row.progress
+    state = (row.wait.text if isinstance(row.wait, wire.CloudSlotWait) else progress.state
+             if isinstance(progress, cloud_progress.CloudProgress) else "progress " + progress.reason)
+    modules = (f"{row.counter.done} of {row.counter.total} modules"
+               if isinstance(row.counter, progress_profile.ProgressCounter) else "modules unknown")
+    update: CloudUpdateCurrent | CloudUpdateLate = CloudUpdateCurrent()
+    if (isinstance(progress, cloud_progress.CloudProgress) and isinstance(interval, CloudPushInterval)
+            and now - progress.updated_at >= stale_pushes * interval.seconds):
+        update = CloudUpdateLate(now - progress.updated_at)
+    return CloudWork(state, modules,
+                     progress.size_vcpus if isinstance(progress, cloud_progress.CloudProgress) else UnknownCpuCount(),
+                     progress.failed_modules if isinstance(progress, cloud_progress.CloudProgress) else 0, update)
 
 
-def running_bar(used: float, grant: float, cap: float) -> Line:
-    solid = size_bar(used, cap)
-    rest = max(0, (bar_eighths(max(used, grant), cap) + 7) // 8 - len(solid))
-    return (Span(solid, "suggestion"), Span("░" * rest, "inactive"))
+def cloud_update_age(seconds: float) -> str:
+    for divisor, unit in ((86400, "d"), (3600, "h"), (60, "min")):
+        if seconds >= divisor:
+            return f"{int(seconds // divisor)} {unit}"
+    return f"{int(seconds)} s"
 
 
-def started_ago(started: float, now: float) -> str:
-    if not started:
-        return "start time unknown"
-    seconds = max(0, int(now - started))
-    for unit, scale in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
-        if seconds >= scale or scale == 1:
-            count = seconds // scale
-            return f"started {count} {unit}{'' if count == 1 else 's'} ago"
-    raise AssertionError("the seconds scale always matches")
+def cloud_detail(row: wire.CloudRow) -> str:
+    progress = row.progress
+    if not isinstance(progress, cloud_progress.CloudProgress):
+        return ""
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+    return " · ".join(filter(None, (progress.stage, location)))
+
+
+def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
+    if isinstance(row.wait, wire.CloudSlotWait):
+        return (Span(" · ".join(filter(None, (work.state, cloud_detail(row))))),)
+    text = " · ".join(filter(None, (work.state, cloud_detail(row), work.modules, cloud_failed_modules(work))))
+    return (Span(text),)
+
+
+def cloud_failed_modules(work: CloudWork) -> str:
+    if work.failed_modules <= 0:
+        return ""
+    noun = "module" if work.failed_modules == 1 else "modules"
+    return f"{work.failed_modules} failed {noun}"
+
+
+def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
+    if isinstance(row.wait, wire.CloudSlotWait):
+        return cloud_status(row, work)
+    parts = (work.state if work.state != "running" else "",
+             cloud_detail(row),
+             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
+             cloud_failed_modules(work))
+    return (Span(" · ".join(filter(None, parts))),)
+
+
+@dataclass(frozen=True)
+class WaitingBuild:
+    position: int
+    step: admission_records.WaitingStep
+
+
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
+    """Insert cloud waits in admission order. Keep the local queue order."""
+    rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
+        for index, step in enumerate(model.reading.view.waiting, 1)]
+    slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
+
+    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
+        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+
+    for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
+                        key=order):
+        order_time = order(cloud)[0]
+        position = next((index for index, row in enumerate(rows)
+                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
+        rows.insert(position, cloud)
+    return rows
 
 
 def leftover_age(minutes: int) -> str:
@@ -342,171 +833,15 @@ def leftover_age(minutes: int) -> str:
     return f"{minutes // (24 * 60)} d"
 
 
-def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "",
-                selector: str = "") -> list[Line]:
-    explanation = model.reading.explanation
-    head = explanation.head
-    room = explanation.room
-    cap_bytes = room.cap if isinstance(room, gate.MemoryRoom) and isinstance(room.cap, int) else 0
-    cap = cap_bytes / gate.GIB
-    waiting = model.reading.view.waiting
-    running = running_builds(model)
-    bumped_unit = "" if isinstance(explanation.priority, gate.NoQueuePriority) else explanation.priority["unit"]
-
-    def names(step: gate.WaitingStep | gate.RunningStep) -> tuple[str, str, bool]:
-        identity = step_labels(step, model.labels)
-        show = field(identity.showrunner) or "—"
-        unit = field(identity.unit).removeprefix(show + "-")
-        unit = unit or "—"
-        return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
-
-    waiting_names = [names(step) for step in waiting]
-    running_names = [names(row.step) for row in running]
-    all_names = [*waiting_names, *running_names]
-    bars = [size_bar(step.need / gate.GIB, cap) for step in waiting]
-    status = head_status(model)
-    waiting_status = [
-        (Span(" " + reason_phrase(step.reason, waiting), "error"),)
-        if isinstance(step.reason, gate.ReadingUnavailable) else
-        status if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else ()
-        for step in waiting]
-    place_width = max(3, len(str(len(waiting))))
-    minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
-                        max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0))
-    step_width = max(7, min(13, max(
-        max((terminal_width(row.step.step) for row in running), default=7),
-        max((terminal_width(step.step) for step in waiting), default=7))))
-    pids = [queue_evidence.pid_text(queue_evidence.step_pid(step)) for step in waiting]
-    running_pids = [queue_evidence.pid_text(queue_evidence.step_pid(row.step)) for row in running]
-    pid_width = max((len(text) for text in [*pids, *running_pids]), default=5)
-    # Reserve the text widths before the pid takes cells from the bars.
-    fixed = place_width + step_width + minutes_width + 5
-    show_width, unit_width = 12, 10
-    # Keep the previous name widths with a fixed memory area of 24 cells.
-    # The cap and the pid change the bars, not the name widths.
-    name_room = columns - fixed - 24
-    if columns > 60:
-        longest_show = max((terminal_width(show) for show, _, _ in all_names), default=12)
-        longest_unit = max((terminal_width(unit) for _, unit, _ in all_names), default=10)
-        while show_width + unit_width < name_room and (show_width < longest_show or unit_width < longest_unit):
-            if show_width < longest_show:
-                show_width += 1
-            if show_width + unit_width < name_room and unit_width < longest_unit:
-                unit_width += 1
-    while show_width + unit_width > name_room and (show_width > 3 or unit_width > 3):
-        if show_width > 3:
-            show_width -= 1
-        if show_width + unit_width > name_room and unit_width > 3:
-            unit_width -= 1
-    bar_column = fixed + show_width + unit_width + pid_width + 1
-    running_text = [
-        (f" {row.kept / gate.GIB:.1f} / {row.used / gate.GIB:.1f}" if row.measured
-         else f" {row.kept / gate.GIB:.1f} / —")
-        + (f"; {row.swap_bytes / gate.GIB:.1f} GiB swapped" if row.swap_bytes else "")
-        for row in running]
-    number_width = max(
-        max((terminal_width(text) for text in running_text), default=0),
-        max((len(f" {step.need / gate.GIB:.1f}") + terminal_width(plain([suffix]))
-             for step, suffix in zip(waiting, waiting_status)), default=0))
-    bar_width = max(0, columns - bar_column - number_width)
-    cap_label = f"cap {cap:.1f}" if isinstance(room, gate.MemoryRoom) and isinstance(room.cap, int) else "cap unavailable"
-    memory_bar = cap_bar(room, max(1, columns - bar_column), colour=colour)
-    cap_cell = next((index for index, span in enumerate(memory_bar) if span.text == "│"), 0)
-    lines: list[Line] = [
-        (Span(f"Build queue · {clock(model, explanation.now)}", "inactive"),), (),
-        (Span(" " * max(0, min(columns - len(cap_label), bar_column + cap_cell))),
-         Span(cap_label, "error")),
-        (Span(" " * bar_column), *memory_bar), (),
-    ]
-    priority = head_facts.priority_text(explanation.priority)
-    if priority:
-        lines.insert(2, (Span(priority),))
-
-    def heading() -> Line:
-        place, memory = "#", "GiB: kept/use; need"
-        return (Span(pad_left(place, place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
-                     + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", step_width) + " "
-                     + pad_left("min", minutes_width) + " " + pad_right("pid", pid_width) + " " + memory, "inactive"),)
-
-    @cache
-    def column(text: str, width: int) -> str:
-        if text.isascii():
-            return (text if len(text) <= width else text[:max(0, width - 1)] + "…").ljust(width) + " "
-        return pad_right(cut_tail(text, width), width) + " "
-
-    def identity_columns(place: str, step: str, pair: tuple[str, str, bool], minutes: str, marker: str = " ") -> Line:
-        show, unit, bumped = pair
-        unit_spans = ((Span("●", "warning"), Span(column(unit, unit_width - 1), "suggestion"))
-                      if bumped else (Span(column(unit, unit_width), "suggestion"),))
-        return (Span(pad_left(place, place_width), "warning" if place == "1" else "inactive"),
-                Span(marker, "suggestion"),
-                Span(column(show, show_width)),
-                *unit_spans,
-                Span(column(field(step), step_width)),
-                Span(pad_left(minutes, minutes_width) + " ", "inactive"))
-
-    def append_row(row: Line) -> None:
-        if terminal_width(plain([row])) <= columns:
-            lines.append(row)
-            return
-        first, *continued = wrap(row, max(1, columns - 2), indent=0)
-        lines.append(first)
-        lines.extend((Span("· ", "inactive"), *line) for line in continued)
-
-    lines.extend(wrap((Span(queue_evidence.room_text(explanation.room), "inactive"),), columns))
-    lines.append(heading())
-    for row, pair, text in zip(running, running_names, running_text):
-        used = row.used / gate.GIB
-        held_end = used + row.kept / gate.GIB
-        bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
-        minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
-        append_row((*identity_columns("run", row.step.step, pair, minutes,
-                                        "▸" if (you and row.step.session_id == you
-                                                or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
-                      Span(column(queue_evidence.pid_text(queue_evidence.step_pid(row.step)), pid_width), "inactive"),
-                      *bar, Span(text)))
-    for index, (step, pair, bar, suffix) in enumerate(zip(waiting, waiting_names, bars, waiting_status)):
-        row = (*identity_columns(str(index + 1), step.step, pair, str(age(step.since, explanation.now)),
-                                "▸" if you and step.session_id == you else " "),
-               Span(column(pids[index], pid_width), "inactive"), Span(bar[:bar_width], "warning"), Span(f" {step.need / gate.GIB:.1f}", "warning" if isinstance(head, gate.HeadExplanation) and same_waiter(head.waiter, step) else "inactive"))
-        append_row((*row, *suffix))
-    if isinstance(head, gate.TokenWaitersOnly):
-        lines.extend([(), (Span("All waiting steps are waiting for the cargo token."),)])
-    if isinstance(head, gate.HeadExplanation) and head.decision.state == "hold":
-        lines.append((Span(f"Head: free {head.free.available / gate.GIB:.1f} GiB; "
-            + f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need {head.free.need / gate.GIB:.1f} GiB"),))
-    if isinstance(head, gate.HeadExplanation) and isinstance(head.cause, (gate.PressureUnavailable, gate.ReadingUnavailable)):
-        append_row((Span("Head: " + head.cause.reason, "error"),))
-    services = [step.measured for step in model.reading.view.running
-                if isinstance(step.measured, gate.CompilerServiceMemory)
-                or isinstance(step.measured, gate.UnownedSliceMemory)
-                and not isinstance(step.measured.job_state, NotServiceSlice)]
-    if services:
-        lines.extend([(), (Span("Services", bold=True),)])
-        for memory in services:
-            append_row((Span("   " + queue_evidence.service_text(memory, explanation.now)),))
-    ended: list[tuple[gate.RunningStep, gate.UnownedSliceMemory, ScopeProcesses]] = []
-    for step in model.reading.view.running:
-        if not isinstance(step.measured, gate.UnownedSliceMemory):
+def leftover_processes(steps: Sequence[admission_records.RunningStep]) -> list[tuple[admission_records.RunningStep, admission_records.UnownedSliceMemory, ScopeProcesses]]:
+    """Return the process scopes whose builds have ended."""
+    ended: list[tuple[admission_records.RunningStep, admission_records.UnownedSliceMemory, ScopeProcesses]] = []
+    for step in steps:
+        if not isinstance(step.measured, admission_records.UnownedSliceMemory):
             continue
         activity = step.measured.activity
         if not isinstance(step.measured.job_state, NotServiceSlice):
             continue
         if isinstance(activity, ScopeProcesses) and not isinstance(activity.run, LiveBuildRun):
             ended.append((step, step.measured, activity))
-    if ended:
-        count = sum(activity.count for _, _, activity in ended)
-        total = sum(memory.bytes for _, memory, _ in ended)
-        noun = "process" if count == 1 else "processes"
-        lines.extend([(), (Span(f"Still running after their build ended ({count} {noun}, {total / gate.GIB:.1f} GiB)",
-                               bold=True),),
-                      (Span("These processes outlive their builds; ask the named owner to stop them if no longer needed."),)])
-        for step, memory, activity in ended:
-            identity = model.labels.get(activity.session_id)
-            owner = field(identity.session if identity else "") or field(activity.session_name) or "unlabelled session"
-            elapsed = leftover_age(age(activity.started_at, explanation.now)) if activity.started_at else "—"
-            lines.append((Span(f"   {queue_evidence.pid_text(queue_evidence.step_pid(step))} · {owner} · {field(activity.program)} · {elapsed} · {memory.bytes / gate.GIB:.1f} GiB"
-                              + (f"; {memory.swap_bytes / gate.GIB:.1f} GiB swapped" if memory.swap_bytes else "")),))
-            for member in activity.members[1:]:
-                lines.append((Span(f"   pid {member.pid} · {field(member.program)} · {owner}"),))
-    return [clip(line, columns) for line in lines]
+    return ended

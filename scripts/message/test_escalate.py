@@ -10,21 +10,19 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest.mock import patch
 
-import escalate
-import push_texts
-import push_reference
-import send
-import sessions
+from scripts.message import escalate
+from scripts.notify import push_texts
+from scripts.notify import push_reference
+from scripts.message import send
+from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file
-if TYPE_CHECKING:
-    from ..whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-else:
-    from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from user_action import ActionRequired, NoActionRequired
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
+from scripts.notify.user_action import ActionRequired, NoActionRequired
 
 SCRIPT = Path(__file__).with_name("escalate.py")
 NOTIFIER_STUB = 'print -r -- "notifier $*" >> "$LOG"\n'
@@ -75,15 +73,24 @@ class EscalateTests(unittest.TestCase):
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         _ = (self.root / "log").write_text("", encoding="utf-8")
         self.environment = {
-            **os.environ, "ESCALATE_STATE_DIR": str(self.root / "state"), "LOG": str(self.root / "log"),
+            **os.environ, "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "ESCALATE_STATE_DIR": str(self.root / "state"), "LOG": str(self.root / "log"),
             "ESCALATE_SEND": str(self.root / "send.py"), "ESCALATE_NOTIFIER": str(self.root / "notifier.sh"),
         }
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
 
     def run_script(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *registered_arguments(arguments)], env={**self.environment, **environment},
-                              capture_output=True, text=True, check=False)
+        call_environment = {**self.environment, **environment}
+        command_arguments = list(registered_arguments(arguments))
+        if process_boundary_for_case(self):
+            return subprocess.run([sys.executable, str(SCRIPT), *command_arguments], env=call_environment,
+                                  capture_output=True, text=True, check=False)
+        with (patch.object(escalate, "STATE", Path(call_environment["ESCALATE_STATE_DIR"])),
+              patch.object(escalate, "SEND", Path(call_environment["ESCALATE_SEND"])),
+              patch.object(escalate, "NOTIFIER", Path(call_environment["ESCALATE_NOTIFIER"]))):
+            return invoke_cli(escalate, lambda: escalate.main(command_arguments), command_arguments,
+                              call_environment, Path.cwd())
 
     def hold(self, minutes: str = "0") -> subprocess.CompletedProcess[str]:
         return self.run_script("hold", "disk", "--summary", "Disk", "--text", "Disk is full.",
@@ -92,6 +99,7 @@ class EscalateTests(unittest.TestCase):
     def log(self) -> str:
         return (self.root / "log").read_text(encoding="utf-8")
 
+    @process_boundary
     def test_a_hold_starts_the_minute_tick_and_a_second_hold_changes_nothing(self) -> None:
         self.assertEqual(self.hold("15").stdout,
                          "disk: held; sent to the user in 15 min unless they type in a terminal\n")
@@ -166,6 +174,7 @@ class EscalateTests(unittest.TestCase):
             with self.subTest(route=route):
                 _ = path.write_text(json.dumps(record))
                 with (patch.object(escalate, "STATE", path.parents[1]), patch.object(escalate, "schedule"),
+                      patch.object(escalate, "workers_home", return_value=self.root / "workers"),
                       patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
                       patch.object(subprocess, "run", side_effect=AssertionError("obsolete hold delivered"))):
                     if route == "due":
@@ -205,7 +214,8 @@ class EscalateTests(unittest.TestCase):
     def test_review_held_push_is_terminal_and_returns_to_the_relayed_session(self) -> None:
         with (patch.object(escalate, "STATE", self.root / "held review"),
               patch.object(escalate, "schedule"), patch.object(escalate, "typed_at", return_value=0),
-              patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
+              patch.object(escalate, "workers_home", return_value=self.root / "workers"),
+                      patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
               patch.object(subprocess, "run", side_effect=[
                   subprocess.CompletedProcess([], 4, "HELD: not sent, failed review: reader-starts-cold\n", ""),
                   subprocess.CompletedProcess([], 0, "SENT: to session\n", "")]) as run):
@@ -228,7 +238,8 @@ class EscalateTests(unittest.TestCase):
         with (patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_PID": "123"}),
               patch.object(escalate, "STATE", self.root / "origin holds"), patch.object(escalate, "schedule"),
               patch.object(escalate, "typed_at", return_value=0),
-              patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
+              patch.object(escalate, "workers_home", return_value=self.root / "workers"),
+                      patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
               patch.object(subprocess, "run", side_effect=[
                   subprocess.CompletedProcess([], 4, "HELD: failed review\n", ""),
                   subprocess.CompletedProcess([], 0, "SENT\n", "")]) as run):
@@ -244,7 +255,8 @@ class EscalateTests(unittest.TestCase):
         reason = "HELD: not sent, failed review: reader-starts-cold"
         with (patch.object(escalate, "STATE", self.root / "held review"),
               patch.object(escalate, "schedule"), patch.object(escalate, "typed_at", return_value=0) as typed,
-              patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
+              patch.object(escalate, "workers_home", return_value=self.root / "workers"),
+                      patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
               patch.object(subprocess, "run", side_effect=[
                   subprocess.CompletedProcess([], 4, reason + "\n", ""),
                   subprocess.CompletedProcess([], 3, "FAILED: relay unavailable\n", ""),
@@ -392,6 +404,7 @@ class EscalateTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 path = self.question_file()
                 with (patch.object(escalate, "STATE", self.root / "state"), patch.object(escalate, "schedule"),
+                      patch.object(escalate, "workers_home", return_value=self.root / "workers"),
                       patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline"))):
                     self.assertTrue(escalate.hold("choice", self.decision_push(), 0, question=str(path)))
                     _ = self.question_file(status, since)
@@ -531,6 +544,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(send, "STATE", self.root / "messages"),
               patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
+            _ = fixture_member("producer", name="offline")
             a = self.select_codex(1)
             for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
                 send.enqueue(send.Message("offline", "quota_alert", "", "low window", key, stamp=send.UnavailableSender()), "offline", datetime.now(timezone.utc))
@@ -543,11 +557,10 @@ class EscalateTests(unittest.TestCase):
                 _ = send.retire(command[command.index("--to") + 1], "quota_alert", command[command.index("--key") + 1])
                 return subprocess.CompletedProcess(command, 0, "", "")
             with (patch.object(subprocess, "run", side_effect=retire),
-                  patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
-                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(()))):
+                  patch.object(escalate, "load_settings", return_value={"always": ["offline"]})):
                 _ = escalate.due(10**12)
             deliver.assert_not_called()
-            self.assertEqual([item["key"] for item in send.read_queue(send.queue_path("offline"))], ["5-hour Claude"])
+            self.assertEqual([item["key"] for item in send.read_queue(send.queue_for("offline"))], ["5-hour Claude"])
             self.assertEqual(list((escalate.STATE / "held").glob("*.json")), [])
 
     def test_any_other_arguments_print_the_usage(self) -> None:

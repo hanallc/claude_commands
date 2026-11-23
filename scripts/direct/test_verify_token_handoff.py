@@ -3,69 +3,13 @@ from __future__ import annotations
 
 import subprocess
 import unittest
-from pathlib import Path
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
-    def test_a_memory_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
-        # The memory waiter keeps the token until its step ends.
-        board = self.root / "board"
-        lock = board / "locks" / "cargo.d"
-        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
-        _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        environment = {**self.environment, "UNIT_RUN_DIR": str(board),
-                       "UNIT_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
-                       "USER_ZONE": "UTC"}
-        _ = environment.pop("USER_ZONE_SCRIPT", None)
-        phase_16_errors = self.root / "phase-16.err"
-        phase_16 = self.start_memory_waiter({**environment, "TEST_BLOCK": "1"}, phase_16_errors)
-        resume_waiter = self.defer_memory_waiter_for_peer()
-        phase_15: subprocess.Popen[bytes] | None = None
-        try:
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-            peer_errors = self.root / "phase-15.err"
-            with peer_errors.open("wb") as stream:
-                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
-                                            cwd=self.root,
-                                            env={**environment, "TEST_BLOCK": "1"},
-                                            stdout=stream, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-            self.started_groups.add(phase_15.pid)
-            self.wait_for_output(peer_errors, "waiting for the cargo token since", phase_15)
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
-                                               "cargo"], capture_output=True, text=True,
-                                              check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
-            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
-
-            self.assertRegex(peer_errors.read_text(),
-                             r"waiting for the cargo token since [0-2][0-9]:[0-5][0-9] UTC:")
-            resume_waiter()
-            self.wait_for_running(self.root / "running", phase_16)
-            self.assertIsNone(phase_16.poll(), phase_16_errors.read_text())
-            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
-
-            _ = (self.root / "release").touch()
-            self.assertEqual(phase_15.wait(timeout=TEST_HANG_GUARD_SECS), 0)
-            self.assertEqual(phase_16.wait(timeout=TEST_HANG_GUARD_SECS), 0, phase_16_errors.read_text())
-            self.assertNotIn("Traceback", phase_16_errors.read_text())
-            self.assertNotIn("unbound variable", phase_16_errors.read_text())
-            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
-            self.assertFalse(lock.exists())
-        finally:
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
-            _ = (self.root / "release").touch()
-            for process in (phase_16, phase_15):
-                if process is not None:
-                    if process.poll() is None:
-                        self.end_group(process.pid)
-                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
-
-    def test_a_hold_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
+    def test_a_hold_waiter_holds_no_token_and_takes_it_after_the_hold(self) -> None:
         board = self.root / "board"
         lock = board / "locks" / "cargo.d"
         environment = self.hold_environment(board, 0)
@@ -78,7 +22,9 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             peer_holds.mkdir()
             peer = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                     cwd=self.root,
-                                    env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1"},
+                                    env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1",
+                                         "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-hold-owner"),
+                                         "CODEX_THREAD_ID": fixture_runtime_id("fixture-hold-owner")},
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True)
             self.started_groups.add(peer.pid)
@@ -101,7 +47,7 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
                         self.end_group(process.pid)
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
-    def test_a_hold_wait_that_leaves_for_the_mac_does_not_take_the_token_again(self) -> None:
+    def test_a_hold_wait_that_leaves_for_the_mac_never_takes_the_token(self) -> None:
         board = self.root / "board"
         environment = self.hold_environment(board, 75)
         output = self.root / "held.out"
@@ -113,8 +59,8 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             if held.poll() is None:
                 self.end_group(held.pid)
                 _ = held.wait(timeout=TEST_HANG_GUARD_SECS)
-        log = (board / "board.log").read_text()
-        self.assertEqual(log.count("token cargo acquired"), 1, log)
+        log = (board / "board.log").read_text() if (board / "board.log").exists() else ""
+        self.assertNotIn("token cargo acquired", log, "a Mac step took the natedev token")
         self.assertFalse((board / "locks" / "cargo.d").exists())
         self.assertFalse((self.root / "cargo-calls").exists(), "the step ran on natedev")
 

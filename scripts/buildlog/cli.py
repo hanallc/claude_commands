@@ -4,8 +4,6 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
-  buildlog costs [--days N]          phase time and ranked build costs, read-only
-  buildlog charts [--days 7|30] [--no-open]  publish build history charts and print the tailnet link, read-only
   buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
@@ -13,21 +11,26 @@
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog sync pause <why>         pause Mac contact while hourly keeps running
   buildlog sync resume              resume Mac contact
-  buildlog vault                    fast-forward the Mac's hanadocs vault
+  buildlog vault                    sync the Mac's hanadocs vault
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
-  buildlog sample                   record memory counters and check for idle Mac test waits
+  buildlog sample                   record memory counters, check for idle Mac test waits, save machine facts
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
-  buildlog hourly                   sync, vault pull, ci, screenshot scan, then Rust release check
+  buildlog hourly                   sample sccache, sync, and run the hourly collectors
+  buildlog sccache [START END]       Rust cache hit rate for inclusive local dates, default today
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
 """
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import json
 import os
@@ -38,6 +41,7 @@ import time
 from datetime import date
 from pathlib import Path
 from typing import cast
+
 
 # Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
 SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
@@ -87,34 +91,14 @@ STEP_NAMES = "clippy, mend, doc, fmt, nextest, check (cargo subcommands), sweep 
 
 def cell(value: object) -> str:
     if value is None:
-        return ""
+        return "—"
     if isinstance(value, float):
         return f"{value:g}" if abs(value) < 1e15 else str(value)
     return str(value)
 
 
-def print_table(names: list[str], rows: list[tuple[object, ...]]) -> None:
-    texts = [[cell(value) for value in row] for row in rows]
-    numeric = [
-        all(isinstance(row[column], int | float) or row[column] is None for row in rows) for column in range(len(names))
-    ]
-    widths = [max([len(name), *(len(text[column]) for text in texts)]) for column, name in enumerate(names)]
-
-    def line(values: list[str]) -> str:
-        parts = [
-            value.rjust(width) if is_number else value.ljust(width)
-            for value, width, is_number in zip(values, widths, numeric, strict=True)
-        ]
-        return "  ".join(parts).rstrip()
-
-    print(line(names))
-    print("  ".join("-" * width for width in widths))
-    for text in texts:
-        print(line(text))
-
-
 def query(args: list[str]) -> int:
-    import index
+    from scripts.buildlog import index
 
     as_json = "--json" in args
     words = [word for word in args if word != "--json"]
@@ -139,7 +123,10 @@ def query(args: list[str]) -> int:
     if as_json:
         print(json.dumps([dict(zip(names, row, strict=True)) for row in rows]))
     else:
-        print_table(names, rows)
+        from scripts.lib import terminal_cells
+
+        texts = [[cell(value) for value in row] for row in rows]
+        terminal_cells.print_table(names, texts, empty_message="no rows")
     print(
         f"{len(rows)} rows in {(finished - began) * 1000:.0f} ms"
         + f" (index update {(updated - began) * 1000:.0f} ms)",
@@ -149,8 +136,8 @@ def query(args: list[str]) -> int:
 
 
 def schema() -> int:
-    import index
-    import store
+    from scripts.buildlog import index
+    from scripts.buildlog import store
 
     print(f"buildlog: records in {store.root()}, index {index.index_path()}")
     print("Times are UTC ISO strings; use date(x, 'localtime') or datetime(x, 'localtime') for local.")
@@ -174,9 +161,9 @@ def schema() -> int:
 
 
 def day_report(args: list[str]) -> int:
-    import index
-    import launches
-    import report
+    from scripts.buildlog import index
+    from scripts.buildlog import launches
+    from scripts.buildlog import report
 
     day = args[0] if args else date.today().isoformat()
     try:
@@ -189,15 +176,38 @@ def day_report(args: list[str]) -> int:
     _ = index.update()
     connection = index.read_only()
     try:
-        print(report.report(connection, day, usage_day=day if args else ""))
+        day_selection = report.ReportDaySelection.EXPLICIT_DATE if args else report.ReportDaySelection.CURRENT_DAY
+        print(report.report(connection, day, day_selection=day_selection))
+    finally:
+        connection.close()
+    return 0
+
+
+def sccache_report(args: list[str]) -> int:
+    from scripts.buildlog import index
+    from scripts.buildlog import report
+
+    usage = "usage: buildlog sccache [YYYY-MM-DD YYYY-MM-DD]"
+    today = date.today().isoformat()
+    try:
+        first, last = map(date.fromisoformat, args or [today, today])
+        if not date(2000, 1, 1) <= first <= last < date.max:
+            raise ValueError("Invalid date range.")
+    except ValueError:
+        print(usage, file=sys.stderr)
+        return 2
+    _ = index.update()
+    connection = index.read_only()
+    try:
+        print(report.sccache_hit_rate(connection, first, last))
     finally:
         connection.close()
     return 0
 
 
 def moments_report(args: list[str]) -> int:
-    import index
-    import report
+    from scripts.buildlog import index
+    from scripts.buildlog import report
 
     day = args[0] if args else date.today().isoformat()
     try:
@@ -218,23 +228,39 @@ def moments_report(args: list[str]) -> int:
 def screenshot_hourly() -> int:
     command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
     return subprocess.run(
-        [sys.executable, str(command), "hourly"],
+        [str(Path(__file__).resolve().parents[1] / "lib/py"), str(command), "hourly"],
         check=False,
         timeout=SCREENSHOT_HOURLY_TIMEOUT_SECONDS,
     ).returncode
 
 
+def aws_snapshot() -> int:
+    from scripts.aws_target.aws_target import hourly
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.lib import conf
+
+    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'), allow_aws_unavailable=True)
+
+
+def aws_page() -> int:
+    from scripts.aws_target import aws_page
+
+    return aws_page.publish_configured()
+
+
 def hourly() -> int:
-    import ci
-    import index
-    import rust_release
-    import store
-    import sync
-    import vault_pull
+    from scripts.buildlog import ci
+    from scripts.buildlog import index
+    from scripts.buildlog import rust_release
+    from scripts.buildlog import sample
+    from scripts.buildlog import store
+    from scripts.buildlog import sync
+    from scripts.buildlog import vault_pull
 
     status = 0
-    for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
-                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
+    for name, job in (("sccache", sample.sccache_sample), ("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
+                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
+                      ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run
@@ -249,17 +275,57 @@ def hourly() -> int:
     return status
 
 
-def run_in_user_zone() -> None:
-    """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-    from user_zone import user_zone_name
+def process_zone_file(zone_key: str) -> Path:
+    import atexit
+    from contextlib import ExitStack
+    from importlib.resources import as_file, files
+    from zoneinfo import TZPATH
 
-    os.environ["TZ"] = user_zone_name()
+    for directory in TZPATH:
+        zone_file = Path(directory) / zone_key
+        if zone_file.is_file():
+            return zone_file
+
+    try:
+        packaged = files("tzdata.zoneinfo").joinpath(*zone_key.split("/"))
+        if packaged.is_file():
+            with ExitStack() as cleanup:
+                zone_file = cleanup.enter_context(as_file(packaged))
+                # Keep an extracted zone file while libc can still read it.
+                _ = atexit.register(cleanup.pop_all().close)
+            return zone_file
+    except ModuleNotFoundError:
+        pass
+    raise ValueError(f"{zone_key!r}: no zone file for the process in zoneinfo.TZPATH or tzdata")
+
+
+def run_in_user_zone() -> None:
+    """Set the process zone for report times and SQLite local dates."""
+    from datetime import UTC, datetime, timedelta
+
+    from scripts.lib.user_zone import user_zone
+
+    zone = user_zone()
+    os.environ["TZ"] = f":{process_zone_file(zone.key)}"
     time.tzset()
+    year = datetime.now(UTC).year
+    for month in (1, 7):
+        at = datetime(year, month, 15, 12, tzinfo=UTC)
+        process_offset = timedelta(seconds=time.localtime(at.timestamp()).tm_gmtoff)
+        expected_offset = at.astimezone(zone).utcoffset()
+        if process_offset != expected_offset:
+            raise ValueError(
+                f"{zone.key!r}: process offset {process_offset} differs from zoneinfo offset "
+                + f"{expected_offset} at {at.isoformat()}"
+            )
 
 
 def main(argv: list[str]) -> int:
-    run_in_user_zone()
+    try:
+        run_in_user_zone()
+    except (OSError, ValueError) as error:
+        print(f"buildlog: {error}", file=sys.stderr)
+        return 2
     command, rest = (argv[0], argv[1:]) if argv else ("", [])
     if command == "query":
         return query(rest)
@@ -267,19 +333,13 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
-    if command == "costs":
-        import costs
-
-        return costs.main(rest)
-    if command == "charts":
-        import charts
-
-        return charts.main(rest)
+    if command == "sccache":
+        return sccache_report(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":
-        import index
-        import report
+        from scripts.buildlog import index
+        from scripts.buildlog import report
 
         if len(rest) > 1:
             print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
@@ -298,11 +358,11 @@ def main(argv: list[str]) -> int:
             connection.close()
         return 0
     if command == "mac-report":
-        import mac_report
+        from scripts.buildlog import mac_report
 
         return mac_report.main(rest)
     if command == "launches":
-        import launches
+        from scripts.buildlog import launches
 
         if rest:
             print("usage: buildlog launches", file=sys.stderr)
@@ -310,7 +370,7 @@ def main(argv: list[str]) -> int:
         print(f"buildlog launches: {launches.collect().summary()}")
         return 0
     if command == "tree-key":
-        import treekey
+        from scripts.buildlog import treekey
 
         key = treekey.tree_key(rest[0] if rest else os.getcwd())
         if key is None:
@@ -318,13 +378,13 @@ def main(argv: list[str]) -> int:
         print(key)
         return 0
     if command == "reindex":
-        import index
+        from scripts.buildlog import index
 
         lines = index.reindex()
         print(f"buildlog reindex: {lines} records indexed in {index.index_path()}")
         return 0
     if command == "sync":
-        import sync
+        from scripts.buildlog import sync
 
         if not rest:
             return sync.sync()
@@ -335,18 +395,18 @@ def main(argv: list[str]) -> int:
         print("usage: buildlog sync [pause <why> | resume]", file=sys.stderr)
         return 2
     if command == "ci":
-        import ci
+        from scripts.buildlog import ci
 
         return ci.ci()
     if command == "vault":
-        import vault_pull
+        from scripts.buildlog import vault_pull
 
         if rest:
             print("usage: buildlog vault", file=sys.stderr)
             return 2
         return vault_pull.vault()
     if command == "disk":
-        import disk
+        from scripts.buildlog import disk
 
         try:
             disk.write_snapshot(disk.snapshot())
@@ -355,8 +415,8 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     if command == "sample":
-        import sample
-        import mac_idle
+        from scripts.buildlog import sample
+        from scripts.buildlog import mac_idle
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
@@ -364,12 +424,24 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())
+                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
+            from scripts.build_queue import head_stall
+
+            try:
+                _ = head_stall.watch_once(head_stall.default_paths(), taken.at)
+            except (OSError, ValueError) as error:
+                print(f"buildlog sample: head-stall check failed: {error}", file=sys.stderr)
+            from scripts.buildlog import machine_facts
+
+            try:
+                _ = machine_facts.sample_once(machine_facts.state_path(), taken.at)
+            except OSError as error:
+                print(f"buildlog sample: machine facts not saved: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
-        import memory
+        from scripts.buildlog import memory
 
         if rest:
             print("usage: buildlog snapshot", file=sys.stderr)
@@ -377,17 +449,20 @@ def main(argv: list[str]) -> int:
         print(json.dumps(memory.snapshot(), separators=(",", ":")))
         return 0
     if command == "memory":
-        import memory
+        from scripts.buildlog import memory
 
         return memory.memory_command(rest)
     if command == "hourly":
         return hourly()
     if command == "backfill-verify":
-        import record
+        from scripts.buildlog import record
 
         return record.main(["backfill-verify", *rest])
+    if command and command not in ("-h", "--help", "help"):
+        print(f"buildlog: unknown command '{command}'; type buildlog to see the commands", file=sys.stderr)
+        return 2
     print(__doc__, file=sys.stderr)
-    return 0 if command in ("-h", "--help", "help") else 2
+    return 0 if command else 2
 
 
 if __name__ == "__main__":

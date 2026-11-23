@@ -1,22 +1,25 @@
 ---
 description: Review one pending item with the user.
-argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below]"
+argument-hint: "[change | proposal | efficiency | question | investigation] [oldest | newest] [all-below] | <change ID>"
 ---
 
 # Next
 
 **Usage:** `/next` · `/next <kind>` · `/next [<kind>] oldest` · `/next [<kind>] newest` ·
-`/next [<kind>] [oldest|newest] all-below` · `/next to the end`
+`/next [<kind>] [oldest|newest] all-below` · `/next to the end` · `/next <change ID>`
 
-Kinds: `change`, `proposal`, `efficiency`, `question`. The words "next", "next change", "next
+Kinds: `change`, `proposal`, `efficiency`, `question`, `investigation`. The words "next", "next change", "next
 proposal", "next efficiency proposal", "next question", "next oldest" and "next newest" mean this
 command too.
 
-- No kind: the most urgent item of all four kinds.
+- No kind: the most urgent item of all five kinds.
 - A kind: the most urgent item of that kind.
 - `oldest` or `newest`, alone or with a kind: the oldest or newest item instead (user,
   2026-10-22).
 - `all-below`, with any of the above: also the items of every production below this one.
+- A change ID, such as `C1535` or `sdlc/C1535`: that one change row. Run
+  `next_item.py show --id <ID>` (with `--production` outside the showrunner session).
+  It pins nothing. A row with a verdict, or an ID on no list, prints one line: show that line and stop.
 
 Any other argument: print the usage line and stop.
 
@@ -32,11 +35,11 @@ above it, and by default not those of the showrunners below it, which show
 their own. So each showrunner's review is complete for its level (user,
 2026-10-27). `all-below` adds every production below it, at any depth. The
 user runs `/next` in the showrunner whose work they want. Run it in the
-showrunner session, or pass that production's doc.
+showrunner session, or pass the showrunner name.
 
 ## Order
 
-One order for all four kinds, from `~/.claude/scripts/lib/urgency.py`:
+One order for all five kinds, from `~/.claude/scripts/lib/urgency.py`:
 
 1. What the user called important, the newest mark first.
 2. What blocks work.
@@ -55,12 +58,13 @@ current until it has its answer, also when a more urgent item arrives.
 
 ## Show
 
-Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show
-[--kind <kind>] [--order oldest|newest] [--all-below]`. Outside the showrunner session add
-`--production <doc>`, for every kind. It prints the item's kind on the first line, then the
-item, or a line that nothing waits. Judge the item against current events
-first. Print its verdict line, then present the item by its kind's section
-below.
+1. Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show [--kind <kind>] [--order oldest|newest] [--all-below]`.
+2. Add `--production <showrunner name>` outside the showrunner session, for every kind.
+3. Judge the item against current events.
+4. Print its verdict line only for `obsolete` or `in conflict`.
+5. Present the item under its kind's section below.
+
+The command prints the item's kind, then the item or a message that no item waits.
 
 ## Current events
 
@@ -74,17 +78,18 @@ Check, and stop when the answer is clear:
 2. Merges since the item's date: `git log --since=<date> -- <files it names>`.
 3. The user's recent rulings: your memory and this session.
 
-Print one verdict line with its evidence (commit, plan, ruling or phase):
+Classify the item:
 
-- `current`: nothing since its date changes it.
+- `current`: nothing since its date changes it. Print no verdict line.
 - `obsolete`: the work is done, removed or replaced.
 - `in conflict`: it clashes with work in progress or a ruling, such as a tuning
   proposal for code the user is redoing. Name that work.
 
-Then recommend the kind's own answer from the verdict: for `current`, the answer
-the item deserves; for `obsolete`, close it; for `in conflict`, defer it, decline
-it or reshape it. Show an obsolete item too: the user answers it. The one
-exception is an efficiency item already fixed, which its section records as done.
+For `obsolete` or `in conflict`, print one verdict line with its reason and evidence (commit, plan, ruling or phase).
+Recommend the kind's own answer: for `current`, the answer the item deserves; for `obsolete`, close it.
+For `in conflict`, defer it, decline it or reshape it.
+Show an obsolete item too: the user answers it.
+The one exception is an efficiency item already fixed, which its section records as done.
 
 ## To the end
 
@@ -100,11 +105,16 @@ kind's script (below).
 ## change
 
 The next change for the user to check, from its current and earlier lists.
-A row belongs to the production its Production cell names; without one, to
-its list's production. Mark: `change_review.py mark-important --row <id>`.
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`. Say
-what changed, how to try it and what the user sees, in plain words. Record the
-user's verdict through `/change_review` → verdict.
+A row follows the staff id in its Producer cell. With no Producer and no verdict,
+it follows a staff id in its Production cell. A unit id gives that unit's current
+production, and a showrunner id gives that showrunner's production. A Producer id
+with no staff row is unrouted. Any other row belongs to its list's production.
+Mark: `change_review.py mark-important --row <id>`.
+Pass the displayed ID, such as `sdlc/C9`.
+Its prefix names the responsible showrunner from the shared staff resolver.
+The list-based ID remains valid; use `--list <path>` when the displayed ID matches several lists.
+Say what changed, how to try it, and what the user sees.
+Record the verdict through `/change_review` → verdict.
 
 ## proposal
 
@@ -124,33 +134,71 @@ in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside the
 ledger. Where a cheap check exists (its measurement script, the line it cites),
 confirm the candidate still holds; record one already fixed as done.
 
-Present only this one; never list the backlog. After the verdict, give the line
-as it reads today next to the line as proposed (file:line), then the measured
-gain, then the cost. End with one choice line, its recommendation from the
-verdict: `approve (recommended — reason) / decline / defer / elaborate`. A fix
-that belongs to another session offers `relay` in place of `approve`.
+Present only this item; never list the backlog.
+After the current-events check, give the current and proposed lines (file:line), then the measured gain and the cost.
+End with one choice line, based on that check:
+`approve (recommended — reason) / decline / defer / elaborate`.
+For a fix that belongs to another session, offer `relay` in place of `approve`.
 
-Record the outcome on the candidate's own ledger line as soon as it is decided:
-its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,
-`— declined`, `— deferred`, `— done <date>` or `— relayed <date>`. Apply an
-approved change; commit and push only when the user says so.
+Record the outcome as soon as it is decided. Never edit the ledger by hand. Run:
+`~/.claude/scripts/lib/py ~/.claude/scripts/nightly_review/candidates.py outcome E<n> <state> [--ledger <path>]`.
+`E<n>` is the item's id. `<state>` is `accepted --applied '<repo> <sha>'`,
+`declined`, `deferred`, `done` or `relayed`. Pass `--ledger` with the ledger
+that the `Efficiency ledger` line names, when it is not the nightly review's own.
+Apply an approved change; commit and push only when the user says so.
 
 ## question
 
-The current open question. Mark: `update_registration.py mark-important
---production PRODUCTION_DOC --item "<its text>"`. Ask it in full: what is asked,
-why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
-Throughout says, and remove the item through its Open-questions list.
+If `/next` shows a sent Question, keep its full key and fixed owner.
+Show the Question and the recipient's reply.
+To mark it important, run `update_registration.py mark-important --key "<key>" --production <fixed owner>`.
+When the user accepts the reply, run the displayed `answer --key` command to mark the Question read.
+
+For a Question filed outside Review, use `--item` when the title identifies one Question.
+If the command lists matching keys, select the intended Question and use its full `--key`.
+
+In a producer session, `/next question` reads the producer's question folder.
+The Review page sends an answer to the producer's current session.
+To answer in chat, run `update_registration.py answer --production <producer name> --item "<its text>"`.
+Use its relay line to send the answer to the producer.
+
+A Question with a pending follow-up stays out of `/next`.
+Mark a Question important with `update_registration.py mark-important --production <showrunner name> --item "<its text>"`.
+Ask the full Question and show its reason and choices.
+Follow the instructions in the Throughout section of `/showrunner:produce`.
+Remove the Question through the Open-questions list.
 
 An item shown with `asked by <unit>` was filed with `/unit:question` or
 `/showrunner:question`. When the user answers it, run `update_registration.py
-answer --production PRODUCTION_DOC --item "<its text>"`. It removes the item and
+answer --production <showrunner name> --item "<its text>"`. It removes the item and
 prints whom the answer goes to:
 
 - `relay: to <unit>`: send the unit the answer, beginning
   `From the user (via the showrunner): `, with the question's one-line text.
-- `relay: to the showrunner of <slug>, for <unit>`: the item is a production
+- `relay: to the showrunner of <showrunner name>, for <unit>`: the item is a production
   below this one (`all-below`). Send the answer to that production's
   showrunner, beginning `From the user (via <your name>): `, naming the unit
   and the item. That showrunner relays it to its unit.
 - `relay: none`: act on the answer here.
+
+## investigation
+
+`/next investigation` reads answer-ready records through `review_items.py`.
+Show the question and answer, then record the user's read result with `investigation.py read --owner <owner> --id <id>`.
+Open investigations wait for the owner and do not appear in `/next`.
+
+## Review actions
+
+All five kinds share Send feedback, Ask question and Later on the Review page.
+Proposals and efficiencies also have Approve and Decline.
+Approve and Decline make the item Done at once.
+Approve sends the user's words and the record command to the owner showrunner.
+Run that command when the message arrives.
+Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
+Send feedback closes questions, investigations, proposals and efficiencies.
+Ask question moves those items to Waiting.
+On a change, Send feedback and Ask question send the words to the showrunner and move the change to Validating.
+Answer it with `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
+Use the question ID from the request message for all five Review types.
+The item returns to Open with the answer in its log.
+Later takes a date and time and hides the item from Review, the count and `/next` until then.

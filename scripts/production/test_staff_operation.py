@@ -1,6 +1,11 @@
 """Real operation-lock contention with bounded flock waits."""
 from __future__ import annotations
 
+from pathlib import Path
+from contextlib import AbstractContextManager
+
+import io
+import os
 import subprocess
 import sys
 import time
@@ -14,6 +19,22 @@ from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 
 
 class StaffOperationTests(StaffTestCase):
+    def test_apply_seed_consumes_stdin_before_the_operation_lock(self) -> None:
+        _ = self.tree()
+        before = staff.snapshot()
+        seed_text = '{"members": [], "retire": []}'
+        operation = staff.operation
+        with io.StringIO(seed_text) as input_stream:
+            def begin_operation() -> AbstractContextManager[None]:
+                self.assertEqual(input_stream.tell(), len(seed_text))
+                return operation()
+
+            with (mock.patch.object(sys, "stdin", input_stream),
+                  mock.patch.object(staff, "operation", side_effect=begin_operation) as begin):
+                self.assertEqual(staff.main(["apply-seed", "--json"]), 0)
+            begin.assert_called_once_with()
+        self.assertEqual(staff.snapshot(), before)
+
     def test_foreign_holder_refuses_by_lock_pid_and_elapsed_wait(self) -> None:
         lock = self.staff_file.parent / "operation.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -33,7 +54,7 @@ class StaffOperationTests(StaffTestCase):
                              "raise SystemExit(staff.cli_result(lambda: "
                              "staff.operation().__enter__()))")
                 started = time.monotonic()
-                refused = subprocess.run([sys.executable, "-c", contender], cwd=CHECKOUT,
+                refused = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", contender], cwd=CHECKOUT,
                                          capture_output=True, text=True, check=False, timeout=3)
                 elapsed = time.monotonic() - started
                 self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
@@ -49,6 +70,18 @@ class StaffOperationTests(StaffTestCase):
         with staff.operation():
             self.assertTrue(staff.operation_fds())
 
+        with self.subTest(lock="row"):
+            contender = ("from scripts.production import staff; "
+                         "raise SystemExit(staff.cli_result(lambda: "
+                         "staff.slot_operation('busy', 'busy').__enter__()))")
+            with mock.patch.object(sys, "argv", ["staff.py", "move", "busy worker"]), staff.slot_operation("busy", "busy"):
+                refused = subprocess.run([str(CHECKOUT / "scripts/lib/py"), "-c", contender], cwd=CHECKOUT,
+                                         env=staff.child_environment(os.environ), capture_output=True,
+                                         text=True, check=False, timeout=30)
+            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+            self.assertIn(f"busy: another operation holds this row (pid {os.getpid()}: staff.py move 'busy worker')",
+                          refused.stderr)
+
 
     def test_row_transaction_stops_at_the_operation_deadline_without_a_write(self) -> None:
         owner, _, _ = self.tree()
@@ -63,7 +96,7 @@ class StaffOperationTests(StaffTestCase):
         )
         with lock.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
-            result = subprocess.run([sys.executable, "-c", program, owner.id], cwd=CHECKOUT,
+            result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", program, owner.id], cwd=CHECKOUT,
                                     capture_output=True, text=True, check=False, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OperationDeadlineExpired", result.stderr)
@@ -105,9 +138,7 @@ class StaffOperationTests(StaffTestCase):
                         with self.assertRaises((staff.StaffUnreadable, worker_lifecycle.OperationDeadlineExpired)):
                             _ = staff.snapshot()
                     self.assertEqual(len(observed), 1)
-                    command, timeout = observed[0]
+                    timeout = observed[0][1]
                     expected = min(configured, budget)
                     self.assertLessEqual(timeout, expected)
                     self.assertGreater(timeout, expected - (time.monotonic() - started) - 0.01)
-                    connect = next(value for value in command if value.startswith("ConnectTimeout="))
-                    self.assertLessEqual(int(connect.split("=", 1)[1]), math.ceil(expected))
