@@ -5,14 +5,18 @@ No source is imported or evaluated. Callers own certification and execution.
 from __future__ import annotations
 
 import ast
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
+import copy
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+import itertools
 import json
+import math
 import os
 import posixpath
 import re
@@ -20,7 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from typing import cast
+from typing import cast, override
 
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
@@ -68,8 +72,8 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 
 # Bump the extractor version whenever source-fact semantics change.
-CACHE_FORMAT_VERSION = 2
-EXTRACTOR_VERSION = 11
+CACHE_FORMAT_VERSION = 3
+EXTRACTOR_VERSION = 12
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 
@@ -119,11 +123,22 @@ class ScanPath:
     parts: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, order=True)
+class NameFilter:
+    """The file names that the code which takes the paths of a scan rejects before it reads a file."""
+    excludes: tuple[str, ...] = ()
+    keeps: tuple[str, ...] = ()
+
+    def rejects(self, name: str) -> bool:
+        return name not in self.keeps and any(fnmatchcase(name, pattern) for pattern in self.excludes)
+
+
 @dataclass(frozen=True)
 class ScanPattern:
     directory: ScanPath | UnrootedPath
     pattern: str
     recursive: bool
+    names: NameFilter = NameFilter()
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,7 @@ class RepositoryScan:
     directory: str
     pattern: str
     recursive: bool
+    names: NameFilter = NameFilter()
 
 
 @dataclass(frozen=True)
@@ -231,12 +247,357 @@ def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
     return UnrootedPath()
 
 
+type Definition = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+type LoopValues = dict[str, tuple[str, ...]]
+
+# A call in a literal loop gets one copy for each combination of the loop values, up to this count.
+# Above the count, the loop names stay unknown and the scan reads the whole repository.
+LOOP_VARIANT_LIMIT = 32
+
+
+def bound_names(node: ast.AST) -> Iterator[str]:
+    """Give each name that one node binds, deletes or declares global or nonlocal."""
+    match node:
+        case ast.Name(id=name, ctx=ast.Store() | ast.Del()) | ast.arg(arg=name):
+            yield name
+        case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
+            yield name
+        case (ast.ExceptHandler(name=str() as name) | ast.MatchAs(name=str() as name)
+              | ast.MatchStar(name=str() as name) | ast.MatchMapping(rest=str() as name)):
+            yield name
+        case ast.Import(names=aliases) | ast.ImportFrom(names=aliases):
+            yield from ((alias.asname or alias.name).split(".")[0] for alias in aliases)
+        case ast.Global(names=names) | ast.Nonlocal(names=names):
+            yield from names
+        case _:
+            pass
+
+
+def literal_strings(node: ast.expr) -> tuple[str, ...] | None:
+    """Give the strings of a literal tuple, list or set that holds only string constants."""
+    if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return None
+    strings = tuple(element.value for element in node.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str))
+    return strings if len(strings) == len(node.elts) else None
+
+
+def scope_parts(node: ast.AST) -> Iterator[ast.AST]:
+    """Visit one scope, and the parts of a nested scope that run in it, such as decorators and defaults."""
+    yield node
+    body: list[ast.AST] = []
+    if isinstance(node, ast.Lambda):
+        body = [node.body]
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        body = list(node.body)
+    skipped = {id(statement) for statement in body}
+    for child in ast.iter_child_nodes(node):
+        if id(child) not in skipped:
+            yield from scope_parts(child)
+
+
+def scope_constants(definition: Definition, declared: frozenset[str]) -> dict[str, tuple[str, ...]]:
+    """Find the names that a scope binds only once, to a literal tuple of strings.
+
+    A tuple cannot change. A nested scope can bind the name only through a name in `declared`,
+    which holds every global or nonlocal declaration in the module.
+    """
+    counts: Counter[str] = Counter()
+    constants: dict[str, tuple[str, ...]] = {}
+    for statement in definition.body:
+        for node in scope_parts(statement):
+            counts.update(bound_names(node))
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Tuple) and (strings := literal_strings(node.value)) is not None):
+                constants[node.targets[0].id] = strings
+    # A star import can bind any name.
+    return {name: strings for name, strings in constants.items()
+            if counts[name] == 1 and name not in declared and not counts["*"]}
+
+
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+STAT_TESTS = frozenset({"is_file", "is_dir", "is_symlink", "exists"})
+OPPOSITES: dict[type[ast.cmpop], type[ast.cmpop]] = {
+    ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In, ast.Is: ast.IsNot, ast.IsNot: ast.Is}
+
+
+def name_clause(clause: ast.expr, variable: str, constants: dict[str, tuple[str, ...]]) -> NameFilter | None:
+    """Give the names that one clause rejects, or None when the clause is not a known name test.
+
+    A clause is one test, or tests joined with `or`, so it keeps a name when one test keeps it.
+    """
+    prefix: str | None = None
+    suffix: str | None = None
+    keeps: list[str] = []
+    for test in clause.values if isinstance(clause, ast.BoolOp) and isinstance(clause.op, ast.Or) else [clause]:
+        if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Call)
+                and ast.unparse(test.operand.func) == f"{variable}.name.startswith" and len(test.operand.args) == 1
+                and not test.operand.keywords and isinstance(argument := test.operand.args[0], ast.Constant)
+                and isinstance(argument.value, str) and re.fullmatch(r"[^*?\[]*", argument.value) and prefix is None):
+            prefix = argument.value
+        elif (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.NotEq)
+                and ast.unparse(test.left) == f"{variable}.suffix" and isinstance(value := test.comparators[0], ast.Constant)
+                and isinstance(value.value, str) and re.fullmatch(r"\.[^.*?\[/]+", value.value) and suffix is None):
+            suffix = value.value
+        elif (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.In)
+                and ast.unparse(test.left) == f"{variable}.name"):
+            # A named set can change, so only a literal or a tuple constant gives the kept names.
+            comparator = test.comparators[0]
+            names = constants.get(comparator.id) if isinstance(comparator, ast.Name) else literal_strings(comparator)
+            if names is None:
+                return None
+            keeps.extend(names)
+        else:
+            return None
+    # Path.suffix is empty for a name that only starts with a dot, so a suffix needs one character before it.
+    return NameFilter(((prefix or "?") + "*" + (suffix or ""),), tuple(keeps))
+
+
+def pure_test(test: ast.expr, variable: str, constants: dict[str, tuple[str, ...]]) -> bool:
+    """Tell whether a test reads only the name or the file type of the path, and no file."""
+    match test:
+        case ast.BoolOp(values=values):
+            return all(pure_test(value, variable, constants) for value in values)
+        case ast.UnaryOp(op=ast.Not(), operand=operand):
+            return pure_test(operand, variable, constants)
+        case ast.Call(func=ast.Attribute(value=ast.Name(id=name), attr=attribute), args=[], keywords=[]):
+            return name == variable and attribute in STAT_TESTS
+        case ast.Compare(left=ast.Constant(value=str()), ops=[ast.NotIn()],
+                         comparators=[ast.Attribute(value=ast.Name(id=name), attr="parts")]):
+            return name == variable
+        case _:
+            return name_clause(test, variable, constants) is not None
+
+
+def name_filter(tests: list[ast.expr], variable: str, constants: dict[str, tuple[str, ...]]) -> NameFilter:
+    """Keep the name tests that run before the first test that can read a file.
+
+    The tests run in order: each `if` of a comprehension, then each value of an `and`.
+    """
+    if any(isinstance(node, ast.NamedExpr) for test in tests for node in ast.walk(test)):
+        return NameFilter()
+    pending = list(reversed(tests))
+    excludes: set[str] = set()
+    keeps: set[str] = set()
+    while pending:
+        test = pending.pop()
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            pending.extend(reversed(test.values))
+        elif (clause := name_clause(test, variable, constants)) is not None:
+            excludes.update(clause.excludes)
+            keeps.update(clause.keeps)
+        elif not pure_test(test, variable, constants):
+            break
+    return NameFilter(tuple(sorted(excludes)), tuple(sorted(keeps)))
+
+
+def negated(test: ast.expr) -> ast.expr:
+    """Give the opposite test, and keep the order of its parts."""
+    match test:
+        case ast.UnaryOp(op=ast.Not(), operand=operand):
+            return operand
+        case ast.BoolOp(op=ast.And(), values=values):
+            return ast.BoolOp(ast.Or(), [negated(value) for value in values])
+        case ast.BoolOp(op=ast.Or(), values=values):
+            return ast.BoolOp(ast.And(), [negated(value) for value in values])
+        case ast.Compare(left=left, ops=[operator], comparators=comparators) if type(operator) in OPPOSITES:
+            return ast.Compare(left, [OPPOSITES[type(operator)]()], comparators)
+        case _:
+            return ast.UnaryOp(ast.Not(), test)
+
+
+def loop_conditions(body: list[ast.stmt]) -> list[ast.expr]:
+    """Give the test that a loop body applies to each path before any other statement."""
+    first = body[0]
+    if not isinstance(first, ast.If) or first.orelse:
+        return []
+    if len(first.body) == 1 and isinstance(first.body[0], ast.Continue):
+        return [negated(first.test)]
+    return [first.test] if len(body) == 1 else []
+
+
+def consumed_scan(node: ast.expr) -> ast.Call | None:
+    """Give the glob call whose paths a loop takes one by one."""
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"sorted", "list", "tuple"}
+            and len(node.args) == 1 and not node.keywords):
+        node = node.args[0]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+        return node
+    return None
+
+
+def closure_reads(node: ast.AST, name: str) -> bool:
+    """Tell whether a lambda or a nested definition in a node reads a name. It can run after the loop."""
+    return any(isinstance(scope, NESTED_SCOPES) and any(
+        isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, ast.Load) for child in ast.walk(scope))
+        for scope in ast.walk(node))
+
+
+class ScopeLoops:
+    """Find the literal loop values around each call, and the name filter of each consumed glob call, in one scope."""
+
+    def __init__(self, definition: Definition, declared: frozenset[str]) -> None:
+        self.definition: Definition = definition
+        self.declared: frozenset[str] = declared
+        self.known_constants: dict[str, tuple[str, ...]] | None = None
+        self.known_loads: Counter[str] | None = None
+        self.values: dict[int, LoopValues] = {}
+        self.filters: dict[int, NameFilter] = {}
+        self.visited: set[int] = set()
+
+    def constants(self) -> dict[str, tuple[str, ...]]:
+        if self.known_constants is None:
+            self.known_constants = scope_constants(self.definition, self.declared)
+        return self.known_constants
+
+    def loads(self) -> Counter[str]:
+        if self.known_loads is None:
+            self.known_loads = Counter(node.id for statement in self.definition.body for node in ast.walk(statement)
+                                       if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+        return self.known_loads
+
+    def filter(self, node: ast.For | ast.AsyncFor | ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        """Record the name filter that a loop or a comprehension applies to the paths of its glob call."""
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            target = node.target
+            if not isinstance(target, ast.Name) or (scan := consumed_scan(node.iter)) is None or node.orelse:
+                return
+            # After the loop, the loop name holds the last path, which the filter can reject.
+            inside = sum(isinstance(child, ast.Name) and child.id == target.id and isinstance(child.ctx, ast.Load)
+                         for child in ast.walk(node))
+            if self.loads()[target.id] == inside and not closure_reads(node, target.id):
+                self.filters[id(scan)] = name_filter(loop_conditions(node.body), target.id, self.constants())
+            return
+        for generator in node.generators:
+            if (isinstance(generator.target, ast.Name) and (scan := consumed_scan(generator.iter)) is not None
+                    and not closure_reads(node, generator.target.id)):
+                self.filters[id(scan)] = name_filter(generator.ifs, generator.target.id, self.constants())
+
+    def literal(self, iterable: ast.expr, literal_names: set[str]) -> bool:
+        """Tell whether a loop iterable can be literal strings, from the assignments seen so far."""
+        return literal_strings(iterable) is not None or isinstance(iterable, ast.Name) and iterable.id in literal_names
+
+    def enter(self, node: ast.For | ast.AsyncFor | ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
+              literal_names: set[str]) -> None:
+        """Record the name filter of a loop, and visit a loop over literal strings once."""
+        iterables = [node.iter] if isinstance(node, (ast.For, ast.AsyncFor)) else [item.iter for item in node.generators]
+        if id(node) not in self.visited and any(self.literal(iterable, literal_names) for iterable in iterables):
+            self.visit(node, {})
+        self.filter(node)
+
+    def inner(self, target: ast.expr, iterable: ast.expr, bound: LoopValues, body: list[ast.stmt]) -> LoopValues:
+        """Bind the loop name, unless the loop body binds it again or a global or nonlocal statement names it."""
+        targets = {name for node in ast.walk(target) for name in bound_names(node)}
+        result = {name: values for name, values in bound.items() if name not in targets}
+        values = literal_strings(iterable)
+        if values is None and isinstance(iterable, ast.Name):
+            values = self.constants().get(iterable.id)
+        if (values is not None and isinstance(target, ast.Name) and target.id not in self.declared
+                and not any(name == target.id for step in body for node in ast.walk(step) for name in bound_names(node))):
+            result[target.id] = values
+        return result
+
+    def visit(self, node: ast.AST, bound: LoopValues) -> None:
+        if isinstance(node, NESTED_SCOPES):
+            return
+        if isinstance(node, ast.Call) and bound:
+            self.values[id(node)] = bound
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self.visited.add(id(node))
+            body = self.inner(node.target, node.iter, bound, node.body)
+            for child in node.body:
+                self.visit(child, body)
+            for child in (node.target, node.iter, *node.orelse):
+                self.visit(child, bound)
+        elif isinstance(node, COMPREHENSIONS):
+            self.visited.add(id(node))
+            current = bound
+            for generator in node.generators:
+                self.visit(generator.iter, current)
+                current = self.inner(generator.target, generator.iter, current, [])
+                for condition in generator.ifs:
+                    self.visit(condition, current)
+            for part in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
+                self.visit(part, current)
+        else:
+            for child in ast.iter_child_nodes(node):
+                self.visit(child, bound)
+
+
+class LoopValue(ast.NodeTransformer):
+    """Replace each loop name with one of its literal values."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values: dict[str, str] = values
+
+    @override
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        return ast.Constant(self.values[node.id]) if node.id in self.values and isinstance(node.ctx, ast.Load) else node
+
+
+def loop_variants(node: ast.Call, bound: LoopValues) -> list[ast.Call]:
+    """Give one copy of a call for each combination of the literal loop values that it reads."""
+    names = sorted({child.id for child in ast.walk(node) if isinstance(child, ast.Name) and child.id in bound})
+    choices = [bound[name] for name in names]
+    if not names or math.prod(len(values) for values in choices) > LOOP_VARIANT_LIMIT:
+        return [node]
+    variants: list[ast.Call] = []
+    for values in itertools.product(*choices):
+        variant = copy.deepcopy(node)
+        _ = LoopValue(dict(zip(names, values))).generic_visit(variant)
+        variants.append(variant)
+    return variants
+
+
+def call_facts(node: ast.Call, name: str, parent: str, definitions: dict[str, Definition],
+               bindings: dict[str, ScanPath | UnrootedPath], aliases: dict[str, str], names: NameFilter
+               ) -> tuple[ScanCall | None, ScanPattern | None]:
+    """Give the scope call and the folder scan that one call makes."""
+    target = ast.unparse(node.func)
+    head = target.split(".", 1)[0]
+    if target.startswith(("self.", "cls.")):
+        target = parent + "." + target.split(".", 1)[1]
+    for alias, imported_name in aliases.items():
+        if target == alias or target.startswith(alias + "."):
+            target = imported_name + target.removeprefix(alias)
+            break
+    for prefix in (name, parent):
+        if f"{prefix}.{target}".lstrip(".") in definitions:
+            target = f"{prefix}.{target}".lstrip(".")
+            break
+    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
+    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
+                     for keyword in node.keywords if keyword.arg is not None)
+    call = None
+    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
+        call = ScanCall(target, arguments, keywords)
+    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
+        directory = scan_path(node.func.value, bindings, aliases)
+        pattern = node.args[0] if node.args else ast.Constant("*")
+        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
+            return call, ScanPattern(directory, pattern.value, node.func.attr == "rglob", names)
+        return call, ScanPattern(directory, "*", True, names)
+    # A walk through the imported ast module visits a syntax tree, not a folder.
+    syntax_walk = target == "ast.walk" and head in aliases and head not in bindings
+    if target.endswith(".walk") and arguments and not syntax_walk:
+        return call, ScanPattern(arguments[0], "*", True)
+    if any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
+        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
+        if directories:
+            return call, ScanPattern(directories[0], "*", True)
+    return call, None
+
+
 def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
     """Keep parameters, paths, and scan calls in their lexical scopes."""
-    definitions: dict[str, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {"": tree}
+    definitions: dict[str, Definition] = {"": tree}
+    declared: set[str] = set()
 
     def definitions_in(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                declared.update(child.names)
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 name = f"{prefix}.{child.name}".lstrip(".")
                 definitions[name] = child
@@ -245,6 +606,7 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                 definitions_in(child, prefix)
 
     definitions_in(tree, "")
+    shared = frozenset(declared)
     scopes: list[ScanScope] = []
     environments: dict[str, tuple[dict[str, ScanPath | UnrootedPath], dict[str, str]]] = {}
     for name, definition in definitions.items():
@@ -261,6 +623,8 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
             bindings.update((parameter, ScanPath(ParameterRoot(parameter))) for parameter in parameters)
         scans: list[ScanPattern] = []
         calls: list[ScanCall] = []
+        loops = ScopeLoops(definition, shared)
+        literal_names: set[str] = set()
         for statement in definition.body:
             for node in scope_nodes(statement):
                 if isinstance(node, ast.Import):
@@ -274,36 +638,19 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     bindings.update((ast.unparse(target), value) for target in targets
                                     if isinstance(target, (ast.Name, ast.Attribute)))
+                    if isinstance(node.value, ast.Tuple) and literal_strings(node.value) is not None:
+                        literal_names.update(target.id for target in targets if isinstance(target, ast.Name))
+                elif isinstance(node, (ast.For, ast.AsyncFor, *COMPREHENSIONS)):
+                    loops.enter(node, literal_names)
                 elif isinstance(node, ast.Call):
-                    target = ast.unparse(node.func)
-                    if target.startswith(("self.", "cls.")):
-                        target = parent + "." + target.split(".", 1)[1]
-                    for alias, imported_name in aliases.items():
-                        if target == alias or target.startswith(alias + "."):
-                            target = imported_name + target.removeprefix(alias)
-                            break
-                    for prefix in (name, parent):
-                        if f"{prefix}.{target}".lstrip(".") in definitions:
-                            target = f"{prefix}.{target}".lstrip(".")
-                            break
-                    arguments = tuple(scan_path(argument, bindings, aliases) for argument in node.args)
-                    keywords = tuple((keyword.arg, scan_path(keyword.value, bindings, aliases))
-                                     for keyword in node.keywords if keyword.arg is not None)
-                    if target in definitions or any(isinstance(value, ScanPath) for value in (*arguments, *(item[1] for item in keywords))):
-                        calls.append(ScanCall(target, arguments, keywords))
-                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"}:
-                        directory = scan_path(node.func.value, bindings, aliases)
-                        pattern = node.args[0] if node.args else ast.Constant("*")
-                        if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str):
-                            scans.append(ScanPattern(directory, pattern.value, node.func.attr == "rglob"))
-                        else:
-                            scans.append(ScanPattern(directory, "*", True))
-                    elif target.endswith(".walk") and arguments:
-                        scans.append(ScanPattern(arguments[0], "*", True))
-                    elif any(isinstance(part, ast.Constant) and part.value == "ls-files" for part in ast.walk(node)):
-                        directories = [value for key, value in keywords if key == "cwd"] or list(arguments)
-                        if directories:
-                            scans.append(ScanPattern(directories[0], "*", True))
+                    bound = loops.values.get(id(node))
+                    for variant in loop_variants(node, bound) if bound else [node]:
+                        call, scan = call_facts(variant, name, parent, definitions, bindings, aliases,
+                                                loops.filters.get(id(node), NameFilter()))
+                        if call is not None:
+                            calls.append(call)
+                        if scan is not None:
+                            scans.append(scan)
         environments[name] = bindings, aliases
         scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls)))
     return tuple(scopes)
@@ -439,11 +786,11 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
                 raise ValueError("invalid scan binding")
             paths.append((key, directory))
         patterns: list[ScanPattern] = []
-        for path, pattern, recursive in scan_rows(scans, 3):
+        for path, pattern, recursive, excludes, keeps in scan_rows(scans, 5):
             directory = decoded_scan_path(path)
             if not isinstance(pattern, str) or not isinstance(recursive, bool):
                 raise ValueError("invalid scan pattern")
-            patterns.append(ScanPattern(directory, pattern, recursive))
+            patterns.append(ScanPattern(directory, pattern, recursive, NameFilter(scan_strings(excludes), scan_strings(keeps))))
         invocations: list[ScanCall] = []
         for target, arguments, keywords in scan_rows(calls, 3):
             if not isinstance(target, str) or not isinstance(arguments, list):
@@ -461,7 +808,8 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
 def encoded_scan_scopes(scopes: tuple[ScanScope, ...]) -> list[object]:
     return [[scope.name, scope.parameters,
              [[name, encoded_scan_path(path)] for name, path in scope.bindings],
-             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive] for scan in scope.scans],
+             [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive, scan.names.excludes, scan.names.keeps]
+              for scan in scope.scans],
              [[call.target, [encoded_scan_path(path) for path in call.arguments],
                [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls]] for scope in scopes]
 
@@ -650,9 +998,9 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         for scan in scope.scans:
             root = directory(source, scan.directory, parameters, frozenset())
             if isinstance(root, UnrootedPath):
-                result.add(RepositoryScan(".", scan.pattern, True))
+                result.add(RepositoryScan(".", scan.pattern, True, scan.names))
             elif isinstance(root, RepositoryDirectory):
-                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive))
+                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive, scan.names))
         for call in scope.calls:
             arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
             keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
@@ -904,7 +1252,7 @@ def scans_repository_changes(graph: SourceGraph, sources: set[str], changed: set
                 except ValueError:
                     continue
                 pattern = "**/" + scan.pattern if scan.recursive else scan.pattern
-                if relative.full_match(pattern):
+                if relative.full_match(pattern) and not scan.names.rejects(relative.name):
                     return True
     return False
 

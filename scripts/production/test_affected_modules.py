@@ -933,5 +933,144 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(self.selection().modules, ())
 
 
+class RepositoryScanInferenceTests(unittest.TestCase):
+    """Infer repository scans from source text, without a Git fixture."""
+
+    PATH: str = "scripts/checks/test_scan.py"
+    HEADER: str = ("import ast, os, shutil, tempfile, unittest\nfrom dataclasses import dataclass\nfrom pathlib import Path\n"
+                   + "ROOT = Path(__file__).resolve().parents[2]\n")
+
+    def scans(self, body: str) -> frozenset[affected.RepositoryScan]:
+        facts = affected.extract_facts(self.HEADER + body, self.PATH)
+        cached = cast(object, json.loads(json.dumps(affected.encoded_scan_scopes(facts.scan_scopes))))
+        self.assertEqual(affected.decoded_scan_scopes(cached), facts.scan_scopes)
+        return affected.repository_scan_graph(Path("/fixture"), {self.PATH: facts}, {})[self.PATH]
+
+    def selects(self, body: str, changed: str) -> bool:
+        graph = affected.SourceGraph({}, {}, {}, {self.PATH: self.scans(body)})
+        return affected.scans_repository_changes(graph, {self.PATH}, {changed}, self.PATH, {})
+
+    def test_a_literal_loop_gives_one_scan_root_for_each_value(self) -> None:
+        scans = self.scans("def files():\n"
+                           + "    return [path for folder in ('scripts', 'config') for path in (ROOT / folder).rglob('*')]\n"
+                           + "def pages():\n    for folder in ['docs']:\n        yield from (ROOT / folder).glob('*.md')\n"
+                           + "def notes():\n    folders = ('notes', 'plans')\n"
+                           + "    for folder in folders:\n        yield from (ROOT / folder).glob('*.md')\n")
+        self.assertEqual(scans, {affected.RepositoryScan("scripts", "*", True), affected.RepositoryScan("config", "*", True),
+                                 affected.RepositoryScan("docs", "*.md", False),
+                                 affected.RepositoryScan("notes", "*.md", False),
+                                 affected.RepositoryScan("plans", "*.md", False)})
+
+    def test_a_syntax_tree_walk_is_not_a_folder_scan(self) -> None:
+        self.assertEqual(self.scans("NODES = list(ast.walk(ast.parse('VALUE = 1')))\n"), frozenset())
+        whole = {affected.RepositoryScan(".", "*", True)}
+        self.assertEqual(self.scans("FOLDERS = list(os.walk(Path(os.environ['ROOT'])))\n"), whole)
+        self.assertEqual(self.scans("def scan(ast):\n    return list(ast.walk(Path(os.environ['ROOT'])))\n"
+                                    + "FOUND = scan(Path())\n"), whole)
+
+    def test_an_unproven_loop_value_keeps_the_whole_tree_scan(self) -> None:
+        bodies = (
+            "def scan():\n    for folder in ('scripts',):\n        folder = folder + 'x'\n"
+            + "        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ['scripts']\n    folders.append('lib')\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    try:\n        pass\n    except OSError as folders:\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    def change():\n        nonlocal folders\n        folders = ('lib',)\n"
+            + "    change()\n    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folder = 'scripts'\n    def change():\n        nonlocal folder\n        folder = 'lib'\n"
+            + "    for folder in ('scripts',):\n        change()\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "FOLDERS = ('scripts',)\ndef change():\n    global FOLDERS\n    FOLDERS = ('lib',)\n"
+            + "for folder in FOLDERS:\n    FOUND = list((ROOT / folder).rglob('*.py'))\n",
+            "def scan():\n    folders = ('scripts',)\n    def folders():\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    folders = ('scripts',)\n    @register(folders := ('lib',))\n    def change():\n        pass\n"
+            + "    for folder in folders:\n        yield from (ROOT / folder).rglob('*.py')\n",
+            "def scan():\n    names = ('a', 'b', 'c', 'd', 'e', 'f')\n    for first in names:\n        for second in names:\n"
+            + "            yield from (ROOT / first / second).rglob('*.py')\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertEqual(self.scans(body), {affected.RepositoryScan(".", "*.py", True)})
+
+    def test_the_loop_value_limit_allows_a_product_up_to_the_limit(self) -> None:
+        scans = self.scans("def scan():\n    for first in ('a', 'b', 'c', 'd'):\n"
+                           + "        for second in ('e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'):\n"
+                           + "            yield from (ROOT / first / second).glob('*.py')\n")
+        self.assertEqual(len(scans), affected.LOOP_VARIANT_LIMIT)
+        self.assertIn(affected.RepositoryScan("d/l", "*.py", False), scans)
+
+    def test_a_name_filter_rejects_names_only_before_a_file_read(self) -> None:
+        runtime = ("def runtime_files():\n    helpers = ('test_support.py',)\n"
+                   + "    return tuple(path.relative_to(ROOT) for folder in ('scripts', 'config')\n"
+                   + "                 for path in sorted((ROOT / folder).rglob('*'))\n"
+                   + "                 if (path.is_file() or path.is_symlink() and path.is_dir()) and '__pycache__' not in path.parts\n"
+                   + "                 and (path.suffix != '.py' or not path.name.startswith('test_') or path.name in helpers))\n")
+        pages = ("def pages():\n    for path in (ROOT / 'docs').glob('*'):\n"
+                 + "        if not path.is_file() or path.name.startswith('draft_'):\n            continue\n        yield path.read_text()\n")
+        cases = (
+            (runtime, "scripts/x/test_x.py", False), (runtime, "scripts/a.py", True),
+            (runtime, "scripts/x/test_support.py", True), (runtime, "scripts/x/test_notes.txt", True),
+            (runtime, "config/gate.conf", True),
+            (pages, "docs/draft_a.md", False), (pages, "docs/a.md", True),
+            (runtime.replace("('test_support.py',)", "{'test_support.py'}"), "scripts/x/test_x.py", True),
+            (pages.replace("        yield path.read_text()\n", "        yield path.read_text()\n    else:\n        pass\n"),
+             "docs/draft_a.md", True),
+            (pages.replace("        yield path.read_text()\n", "        yield path.read_text()\n    print(path)\n"),
+             "docs/draft_a.md", True),
+            (pages.replace("yield path.read_text()", "yield lambda: path.read_text()"), "docs/draft_a.md", True),
+            ("def f():\n    for p in (ROOT / 'docs').glob('*'):\n        if (q := p).is_file() and not p.name.startswith('draft_'):\n"
+             + "            print(q)\n", "docs/draft_a.md", True),
+        )
+        for body, changed, selected in cases:
+            with self.subTest(body=body, changed=changed):
+                self.assertEqual(self.selects(body, changed), selected)
+
+    def test_each_review_snippet_reads_its_changed_path(self) -> None:
+        # A name filter counts the same as a glob pattern, so the two sibling snippets of finding 1 are not here.
+        cases = (
+            ("def f():\n    return [p for p in (ROOT / 'docs').glob('*') if p.read_text() if not p.name.startswith('draft_')]\n",
+             "docs/draft_a.md"),
+            ("def f():\n    for p in (ROOT / 'docs').glob('*'):\n        if 'x' in p.read_text() and not p.name.startswith('draft_'):\n"
+             + "            print(p)\n", "docs/draft_a.md"),
+            ("def f():\n    folders = ['docs']\n    folders.append('notes')\n    for folder in folders:\n"
+             + "        yield from (ROOT / folder).glob('*.md')\n", "notes/a.md"),
+            ("def f():\n    keep = {'a.md'}\n    keep.add('b.md')\n    return [p for p in (ROOT / 'docs').glob('*') if p.name in keep]\n",
+             "docs/b.md"),
+            ("class Other(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "class Case(unittest.TestCase):\n    @property\n    def root(self):\n        return ROOT / 'docs'\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "docs/a.md"),
+            ("class Other(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "@dataclass\nclass Fixture:\n    root: Path\n    def files(self):\n        return list(self.root.glob('*.md'))\n"
+             + "def use():\n    return Fixture(ROOT / 'docs').files()\n", "docs/a.md"),
+            ("from scripts.lib import support\nclass Case(unittest.TestCase):\n    def setUp(self):\n"
+             + "        self.root = Path(tempfile.mkdtemp())\n        support.point_at_repository(self)\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "a.md"),
+            ("def f():\n    tmp = Path(tempfile.mkdtemp())\n    (tmp / 'link').symlink_to(ROOT / 'docs')\n"
+             + "    return list((tmp / 'link').glob('*.md'))\n", "docs/a.md"),
+            ("def f():\n    tmp = Path(tempfile.mkdtemp())\n    shutil.copytree(ROOT / 'docs', tmp / 'docs')\n"
+             + "    return [p.read_text() for p in (tmp / 'docs').glob('*.md')]\n", "docs/a.md"),
+            ("def f():\n    fns = []\n    for p in (ROOT / 'docs').glob('*'):\n        if p.name.startswith('draft_'):\n"
+             + "            continue\n        fns.append(lambda: p.read_text())\n    return fns\n", "docs/draft_a.md"),
+            ("def f():\n    folders = ('docs',)\n    try:\n        pass\n    except Exception as folders:\n        pass\n"
+             + "    for folder in folders:\n        yield from (ROOT / folder).glob('*.md')\n", "docs/a.md"),
+            ("def f():\n    found = [p for p in (ROOT / 'docs').glob('*') if (last := p) and not p.name.startswith('draft_')]\n"
+             + "    return last.read_text()\n", "docs/draft_a.md"),
+            ("def f():\n    with tempfile.TemporaryDirectory() as tmp:\n        for _ in range(2):\n"
+             + "            list(Path(tmp).glob('*.md'))\n            tmp = ROOT / 'docs'\n", "docs/a.md"),
+            ("from unittest import mock\nclass Case(unittest.TestCase):\n    def setUp(self):\n"
+             + "        self.root = Path(tempfile.mkdtemp())\n"
+             + "    @mock.patch('scripts.checks.test_scan.Case.root', ROOT / 'docs', create=True)\n"
+             + "    def test_scan(self):\n        return list(self.root.glob('*.md'))\n", "docs/a.md"),
+            ("class Case(unittest.TestCase):\n    def setUp(self):\n        self.root = Path(tempfile.mkdtemp())\n"
+             + "        vars(self)['root'] = ROOT / 'docs'\n    def test_scan(self):\n        return list(self.root.glob('*.md'))\n",
+             "docs/a.md"),
+            ("def f():\n    return list(Path(tempfile.mkdtemp(dir=ROOT)).parent.glob('*.md'))\n", "a.md"),
+        )
+        for body, changed in cases:
+            with self.subTest(body=body):
+                self.assertTrue(self.selects(body, changed))
+
+
 if __name__ == "__main__":
     _ = unittest.main()

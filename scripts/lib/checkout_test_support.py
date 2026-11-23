@@ -23,7 +23,7 @@ sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: Fal
 @cache
 def runtime_files() -> tuple[Path, ...]:
     """List runtime files without compiled files or unrelated test modules."""
-    helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
+    helpers = ("test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py")
     return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
                  for path in sorted((SOURCE / folder).rglob("*"))
                  if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
