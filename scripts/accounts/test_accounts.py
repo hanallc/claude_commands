@@ -9617,6 +9617,36 @@ class PickerTests(unittest.TestCase):
         result = accounts.placement("units", self.now, exclude=frozenset())
         self.assertEqual(result.label, "claude1")
 
+    def test_pick_and_placement_skip_a_family_refusal_only_for_its_family_or_an_unknown_family(self) -> None:
+        self.assert_picked("claude3")
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now,
+            refusals.ModelFamily("fable")))
+        for family, label in ((refusals.ModelFamily("fable"), "claude1"), (refusals.ModelFamily("opus"), "claude3"),
+                              (refusals.UNKNOWN_FAMILY, "claude1")):
+            with self.subTest(family=family):
+                chosen = accounts.pick("claude", self.now, family=family)
+                assert isinstance(chosen, accounts.PickedAccount)
+                self.assertEqual(chosen.label, label)
+                self.assertEqual(accounts.placement("units", self.now, exclude=frozenset(), family=family).label, label)
+                explained = [accounts._pick_explanation(reason) for reason in chosen.reasons]  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(any("refused at" in line for line in explained), label == "claude1")
+
+    def test_group_family_reads_the_staff_model_setting(self) -> None:
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        for producers, expected in (("morty=claude:fable:high\nbob=claude:fable:high\n", refusals.ModelFamily("fable")),
+                                    ("morty=claude:fable:high\nbob=claude:opus:high\n", refusals.UNKNOWN_FAMILY)):
+            with self.subTest(producers=producers):
+                families = "[claude.families]\nfable=fable\nopus=opus\nsonnet=sonnet\n"
+                staff = "[production.claude]\ndirector=opus:xhigh\nshowrunner=sonnet:high\n"
+                _ = registry.write_text(f"{families}\n[producers]\n{producers}\n{staff}")
+                self.assertEqual(accounts.group_family("producers"), expected)
+                self.assertEqual(accounts.group_family("units"), refusals.ModelFamily("opus"))
+                self.assertEqual(accounts.group_family("showrunners"), refusals.ModelFamily("sonnet"))
+        registry.unlink()
+        self.assertEqual(accounts.group_family("units"), refusals.UNKNOWN_FAMILY)
+
     def test_placement_units_choose_soonest_reset_and_break_ties_by_most_left(self) -> None:
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")
         self.reading("Claude", "first@example.invalid", 4, 2)

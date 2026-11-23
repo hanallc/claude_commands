@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -97,11 +98,15 @@ class LiveSessionMessenger(Protocol):
 
 @dataclass(frozen=True)
 class TranscriptRefusal:
+    """A transcript refusal. `family` is the refusal's scope; `session_family` is the family of the session's work."""
+
     entry_id: str
     refused_at: RefusedAt
     window: refusals.KnownWindow | refusals.UnknownWindow
     text: str
     reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
+    family: refusals.ModelFamily | refusals.AllModels = refusals.ALL_MODELS
+    session_family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,8 @@ class ProofRefusal:
     refused_at: RefusedAt
     window: refusals.KnownWindow | refusals.UnknownWindow
     reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
+    family: refusals.ModelFamily | refusals.AllModels = refusals.ALL_MODELS
+    session_family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY
 
 
 _assumed_refusals: ContextVar[Mapping[str, ProofRefusal]] = ContextVar("assumed_refusals", default={})
@@ -120,6 +127,7 @@ class FirstRefusalObservation(TypedDict):
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
     at: str
+    family: NotRequired[str]
 
 
 WatchTransition = Literal["requested", "cancelled", "continued", "waited", "no room", "retry", "group selected"]
@@ -434,8 +442,8 @@ class NoExchange:
     """The transcript has no readable exchange or turn start."""
 
 
-def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchange:
-    """Read the newest exchange or turn start and ignore later bookkeeping."""
+def _entries_newest_first(path: Path, chunk_bytes: int) -> Generator[dict[str, object]]:
+    """Read decoded transcript entries from the end; an unreadable file ends the read."""
     try:
         with open_transcript(path) as source:
             position = source.seek(0, os.SEEK_END)
@@ -452,21 +460,54 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                     except (ValueError, TypeError, UnicodeError):
                         continue
                     if isinstance(value, dict):
-                        entry = cast(dict[str, object], value)
-                        if entry.get("type") in ("user", "assistant"):
-                            return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
-                        payload = entry.get("payload")
-                        if isinstance(payload, dict):
-                            message = cast(dict[str, object], payload)
-                            if (entry.get("type") == "event_msg" and (message.get("type") in (
-                                    "user_message", "agent_message", "error", "task_started")
-                                    or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
-                                    entry.get("type") == "response_item" and message.get("type") == "message"
-                                    and message.get("role") in ("user", "assistant")):
-                                return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+                        yield cast(dict[str, object], value)
     except OSError:
-        pass
+        return
+
+
+def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchange:
+    """Read the newest exchange or turn start and ignore later bookkeeping."""
+    for entry in _entries_newest_first(path, chunk_bytes):
+        if entry.get("type") in ("user", "assistant"):
+            return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+        payload = entry.get("payload")
+        if isinstance(payload, dict):
+            message = cast(dict[str, object], payload)
+            if (entry.get("type") == "event_msg" and (message.get("type") in (
+                    "user_message", "agent_message", "error", "task_started")
+                    or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
+                    entry.get("type") == "response_item" and message.get("type") == "message"
+                    and message.get("role") in ("user", "assistant")):
+                return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
     return NoExchange()
+
+
+SYNTHETIC_MODEL = "<synthetic>"
+
+
+def entry_model_family(entry: Mapping[str, object], families: frozenset[str]) -> refusals.ModelFamily | refusals.UnknownFamily | None:
+    """Name the model family of one real assistant entry; give None for any other entry.
+
+    A real entry whose model is not in `families` has an unknown family.
+    """
+    if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is True:
+        return None
+    message = entry.get("message")
+    model = cast(dict[str, object], message).get("model") if isinstance(message, dict) else None
+    candidates = [candidate for candidate in (model, entry.get("requestedModel")) if isinstance(candidate, str)]
+    if model == SYNTHETIC_MODEL or not candidates:
+        return None
+    return next((family for candidate in candidates
+                 if isinstance(family := refusals.model_family(candidate, families), refusals.ModelFamily)),
+                refusals.UNKNOWN_FAMILY)
+
+
+def _session_family(path: Path, chunk_bytes: int, families: frozenset[str]) -> refusals.ModelFamily | refusals.UnknownFamily:
+    """Name the family of the newest real assistant entry before the refusal, even when it is unknown."""
+    for entry in _entries_newest_first(path, chunk_bytes):
+        if (family := entry_model_family(entry, families)) is not None:
+            return family
+    return refusals.UNKNOWN_FAMILY
 
 
 def transcript_refusal(session_id: str, *, config_dir: Path | None = None, screen_text: str = "", account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | NoSessionRefusal:
@@ -484,82 +525,154 @@ def transcript_refusal(session_id: str, *, config_dir: Path | None = None, scree
     return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"), screen_text=screen_text)
 
 
+def _refusal_time(entry_id: object, timestamp: object) -> datetime | None:
+    if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):
+        return None
+    try:
+        at = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None
+
+
+def _text_window(text: str, codex_error: bool) -> refusals.KnownWindow | refusals.UnknownWindow:
+    folded = text.casefold()
+    return (refusals.KnownWindow("weekly") if "weekly limit" in folded or codex_error and "weekly" in folded else
+            refusals.KnownWindow("five_hour") if CLAUDE_LIMIT_PHRASES[0] in folded or codex_error and (
+                "5-hour" in folded or "five-hour" in folded) else refusals.UnknownWindow())
+
+
+# The provider names a model family limit in text such as "You've reached your Fable limit."
+FAMILY_LIMIT_TEXT = re.compile(r"reached your ([A-Za-z]+) limit")
+OVERAGE_LIMIT = "seven_day_overage_included"
+FAMILY_LIMIT_PREFIX = "seven_day_"
+
+
+def _text_family(text: str, families: frozenset[str]) -> refusals.ModelFamily | refusals.UnknownFamily:
+    found = FAMILY_LIMIT_TEXT.search(text)
+    name = found[1].casefold() if found else ""
+    return refusals.ModelFamily(name) if name in families else refusals.UNKNOWN_FAMILY
+
+
+def _rate_limit_fields(entry: Mapping[str, object]) -> tuple[object, object]:
+    """Read the limit type and reset from apiErrorParams.rate_limit_info, then from quotaLimits."""
+    sources: list[dict[str, object]] = []
+    params = entry.get("apiErrorParams")
+    if isinstance(params, dict):
+        info = cast(dict[str, object], params).get("rate_limit_info")
+        if isinstance(info, dict):
+            sources.append(cast(dict[str, object], info))
+    quota = entry.get("quotaLimits")
+    if isinstance(quota, dict):
+        sources.append(cast(dict[str, object], quota))
+    return (next((source["rateLimitType"] for source in sources if "rateLimitType" in source), None),
+            next((source["resetsAt"] for source in sources if "resetsAt" in source), None))
+
+
+def _limit_reset(raw_reset: object) -> refusals.KnownReset | refusals.NoResetKnown:
+    try:
+        if isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
+            return refusals.KnownReset(datetime.fromtimestamp(raw_reset, timezone.utc))
+        if isinstance(raw_reset, str):
+            parsed = datetime.fromisoformat(raw_reset)
+            if parsed.tzinfo is not None:
+                return refusals.KnownReset(parsed)
+    except (ValueError, OverflowError, OSError):
+        pass
+    return refusals.NoResetKnown()
+
+
+def claude_refusal_shape(entry: Mapping[str, object]) -> bool:
+    """Tell whether one Claude transcript entry is a rate limit API error."""
+    return entry.get("type") == "assistant" and entry.get("isApiErrorMessage") is True and entry.get("error") == "rate_limit"
+
+
+def claude_entry_refusal(entry: Mapping[str, object],
+                         session_family: Callable[[], refusals.ModelFamily | refusals.UnknownFamily],
+                         families: frozenset[str]) -> TranscriptRefusal | NoSessionRefusal:
+    """Read one Claude transcript entry as a refusal with its window, reset and model family scope.
+
+    The family that the refusal text names wins; `session_family` gives the prior model's family as the fallback.
+    Only a name in `families` is a family.
+    """
+    if not claude_refusal_shape(entry):
+        return NoSessionRefusal()
+    entry_id = entry.get("uuid")
+    at = _refusal_time(entry_id, entry.get("timestamp"))
+    if at is None or not isinstance(entry_id, str):
+        return NoSessionRefusal()
+    message = entry.get("message")
+    content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
+                         for block in cast(list[object], content) if isinstance(block, dict))
+    else:
+        text = ""
+    window = _text_window(text, False)
+    rate_type, raw_reset = _rate_limit_fields(entry)
+    # The text describes the refused request; the prior model describes an earlier one.
+    family = _text_family(text, families)
+    if isinstance(family, refusals.UnknownFamily):
+        family = session_family()
+    scope: refusals.ModelFamily | refusals.AllModels = refusals.ALL_MODELS
+    if rate_type in ("seven_day", "weekly"):
+        window = refusals.KnownWindow("weekly")
+    elif rate_type == "five_hour":
+        window = refusals.KnownWindow("five_hour")
+    elif rate_type == OVERAGE_LIMIT:
+        window = refusals.KnownWindow("weekly")
+        scope = family if isinstance(family, refusals.ModelFamily) else refusals.ALL_MODELS
+    elif isinstance(rate_type, str) and rate_type.startswith(FAMILY_LIMIT_PREFIX):
+        window = refusals.KnownWindow("weekly")
+        suffix = rate_type.removeprefix(FAMILY_LIMIT_PREFIX).casefold()
+        scope = refusals.ModelFamily(suffix) if suffix in families else refusals.ALL_MODELS
+    return TranscriptRefusal(entry_id, RefusedAt(at), window, text, _limit_reset(raw_reset), scope, family)
+
+
 def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str = "") -> TranscriptRefusal | NoSessionRefusal:
     try:
-        latest = _newest_exchange(max(paths, key=lambda path: path.stat().st_mtime), chunk_bytes) if paths else NoExchange()
+        newest = max(paths, key=lambda path: path.stat().st_mtime) if paths else None
+        latest = _newest_exchange(newest, chunk_bytes) if newest is not None else NoExchange()
     except OSError:
-        latest = NoExchange()
-    quota: object = None
-    codex_error = isinstance(latest, NoExchange) or latest.entry.get("type") == "event_msg"
+        newest, latest = None, NoExchange()
+    if isinstance(latest, NewestExchange) and latest.entry.get("type") != "event_msg":
+        source = newest
+        entry = cast(Mapping[str, object], latest.entry)
+        if not claude_refusal_shape(entry):
+            return NoSessionRefusal()
+        # Read the registry only for a refusal; most passes see none.
+        families = refusals.claude_families()
+        return claude_entry_refusal(entry,
+            lambda: _session_family(source, chunk_bytes, families) if source is not None else refusals.UNKNOWN_FAMILY,
+            families)
     if isinstance(latest, NoExchange):
         text = screen_text
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp: object = datetime.now(timezone.utc).isoformat()
         entry_id = hashlib.sha256(text.encode()).hexdigest()
     else:
         entry = latest.entry
         timestamp = entry.get("timestamp")
-        if codex_error:
-            payload_value = entry.get("payload")
-            if not isinstance(payload_value, dict):
-                return NoSessionRefusal()
-            payload = cast(dict[str, object], payload_value)
-            error = payload.get("error")
-            if payload.get("type") == "task_complete" and isinstance(error, dict):
-                text = str(cast(dict[str, object], error).get("message", ""))
-            elif payload.get("type") == "error":
-                text = str(payload.get("message", ""))
-            else:
-                return NoSessionRefusal()
-            entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
+        payload_value = entry.get("payload")
+        if not isinstance(payload_value, dict):
+            return NoSessionRefusal()
+        payload = cast(dict[str, object], payload_value)
+        error = payload.get("error")
+        if payload.get("type") == "task_complete" and isinstance(error, dict):
+            text = str(cast(dict[str, object], error).get("message", ""))
+        elif payload.get("type") == "error":
+            text = str(payload.get("message", ""))
         else:
-            if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
-                return NoSessionRefusal()
-            entry_id = entry.get("uuid")
-            message = entry.get("message")
-            content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else ""
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = "\n".join(str(cast(dict[str, object], block).get("text", ""))
-                                 for block in cast(list[object], content) if isinstance(block, dict))
-            else:
-                text = ""
-            quota = entry.get("quotaLimits")
-    if codex_error and QUOTA_REFUSAL not in text.casefold():
+            return NoSessionRefusal()
+        entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
+    if QUOTA_REFUSAL not in text.casefold():
         if not isinstance(latest, NoExchange) or not any(phrase in text.casefold() for phrase in CLAUDE_LIMIT_PHRASES):
             return NoSessionRefusal()
-    if not isinstance(entry_id, str) or not entry_id or not isinstance(timestamp, str):
+    at = _refusal_time(entry_id, timestamp)
+    if at is None:
         return NoSessionRefusal()
-    try:
-        at = datetime.fromisoformat(timestamp)
-    except ValueError:
-        return NoSessionRefusal()
-    if at.tzinfo is None:
-        return NoSessionRefusal()
-    folded = text.casefold()
-    window: refusals.KnownWindow | refusals.UnknownWindow = (
-        refusals.KnownWindow("weekly") if "weekly limit" in folded or codex_error and "weekly" in folded else
-        refusals.KnownWindow("five_hour") if CLAUDE_LIMIT_PHRASES[0] in folded or codex_error and (
-            "5-hour" in folded or "five-hour" in folded) else refusals.UnknownWindow())
-    reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    if isinstance(quota, dict):
-        limits = cast(dict[str, object], quota)
-        rate_type = limits.get("rateLimitType")
-        if rate_type in ("seven_day", "weekly", "seven_day_opus", "seven_day_sonnet"):
-            window = refusals.KnownWindow("weekly")
-        elif rate_type == "five_hour":
-            window = refusals.KnownWindow("five_hour")
-        raw_reset = limits.get("resetsAt")
-        try:
-            if isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
-                reset = refusals.KnownReset(datetime.fromtimestamp(raw_reset, timezone.utc))
-            elif isinstance(raw_reset, str):
-                parsed = datetime.fromisoformat(raw_reset)
-                if parsed.tzinfo is not None:
-                    reset = refusals.KnownReset(parsed)
-        except (ValueError, OverflowError, OSError):
-            pass
-    return TranscriptRefusal(entry_id, RefusedAt(at), window, text, reset)
+    return TranscriptRefusal(entry_id, RefusedAt(at), _text_window(text, True), text)
 
 
 def assumed_refusal(session_id: str) -> ProofRefusal | NoSessionRefusal:
@@ -727,7 +840,8 @@ def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedH
 def _first_refusal(held: FirstRefusalObservation) -> refusals.AccountRefusal:
     window = refusals.UnknownWindow() if held["window"] == "unknown" else refusals.KnownWindow(held["window"])
     reset = refusals.KnownReset(datetime.fromisoformat(held["reset"])) if "reset" in held else refusals.NoResetKnown()
-    return refusals.AccountRefusal("claude", held["login"], window, reset, datetime.fromisoformat(held["at"]))
+    family = refusals.ModelFamily(held["family"]) if "family" in held else refusals.ALL_MODELS
+    return refusals.AccountRefusal("claude", held["login"], window, reset, datetime.fromisoformat(held["at"]), family)
 
 
 def _set_transition(state: WatchState, session_id: str, entry_id: str, transition: WatchTransition, move_id: str) -> None:
@@ -930,19 +1044,23 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             reading = refusals.stored_reading_with_age("claude", login, now, stale_after)
             window = _refusal_window(refusal.window, reading, refusal.refused_at.at)
             reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-            if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
+            # A reading holds no family window, so a family refusal keeps only its own reset.
+            if (isinstance(window, refusals.KnownWindow) and isinstance(refusal.family, refusals.AllModels)
+                    and isinstance(reading, (refusals.FreshReading, refusals.StaleReading))):
                 value = reading.weekly if window.name == "weekly" else reading.five_hour
                 if isinstance(value, refusals.ReadingWindow):
                     reset = value.reset
             if isinstance(refusal.reset, refusals.KnownReset):
                 reset = refusal.reset
-            account_refusal = refusals.AccountRefusal("claude", login, window, reset, refusal.refused_at.at)
+            account_refusal = refusals.AccountRefusal("claude", login, window, reset, refusal.refused_at.at, refusal.family)
             if not dry_run:
                 observation = FirstRefusalObservation(login=login,
                     window=account_refusal.window.name if isinstance(account_refusal.window, refusals.KnownWindow) else "unknown",
                     at=account_refusal.at.isoformat())
                 if isinstance(account_refusal.reset, refusals.KnownReset):
                     observation["reset"] = account_refusal.reset.at.isoformat()
+                if isinstance(account_refusal.family, refusals.ModelFamily):
+                    observation["family"] = account_refusal.family.name
                 if not previous or previous["entry_id"] != refusal.entry_id:
                     if isinstance(refusal, TranscriptRefusal):
                         refusals.write_refusal(account_refusal)
@@ -1007,10 +1125,18 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(identity, agent_accounts.NumberedAccount) and identity.login.casefold() in refusing_logins:
                 excluded.add(canonical_label(named.label))
         if group_name == "ungrouped":
+            families = {refusal.session_family for _, refusal, _ in group}
             chosen = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep(),
-                                   reading_age_minutes=stale_minutes)
+                                   reading_age_minutes=stale_minutes,
+                                   family=families.pop() if len(families) == 1 else refusals.UNKNOWN_FAMILY)
         else:
-            placed = accounts.placement(group_name, now, exclude=frozenset(excluded), reading_age_minutes=stale_minutes)
+            family = accounts.group_family(group_name)
+            # A member whose own session runs another family makes the group's family unknown.
+            if any(isinstance(refusal.session_family, refusals.ModelFamily) and refusal.session_family != family
+                   for _, refusal, _ in group):
+                family = refusals.UNKNOWN_FAMILY
+            placed = accounts.placement(group_name, now, exclude=frozenset(excluded), reading_age_minutes=stale_minutes,
+                                        family=family)
             if isinstance(placed.reason, accounts.GroupNoRoom):
                 chosen = placed.reason.outcome
             else:
@@ -1157,8 +1283,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         continue
                     directory = accounts.claude_account_dir(target)
                     login = accounts.claude_login(directory)
-                    held = refusals.load().get(refusals.key("claude", login))
-                    if held is not None and not refusals.resolved(held, refusals.stored_reading_with_age("claude", login, now, stale_after), now):
+                    held = refusals.blocking(refusals.load(), "claude", login, accounts.group_family(group_name),
+                                             refusals.stored_reading_with_age("claude", login, now, stale_after), now)
+                    if held is not None:
                         lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
                         continue
                     if dry_run:
@@ -1195,6 +1322,7 @@ class BlockedAutoMoveTargets:
 def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: datetime,
                              account_config: conf.ConfigRead) -> AutoMoveRule | BlockedAutoMoveTargets:
     held_refusals = refusals.load()
+    family = accounts.group_family(rule.group)
     stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
     blocked: list[tuple[AutoMoveRule, BlockedHeadReason]] = []
     for label in (rule.to, *rule.fallback_targets):
@@ -1227,8 +1355,7 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
         elif target.weekly.left <= rule.when.percent:
             reason = TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent)
         else:
-            held = held_refusals.get(refusals.key("claude", target_login))
-            if held is None or refusals.resolved(held, target, now):
+            if refusals.blocking(held_refusals, "claude", target_login, family, target, now) is None:
                 return candidate
             reason = TargetUnresolvedRefusal()
         blocked.append((candidate, reason))

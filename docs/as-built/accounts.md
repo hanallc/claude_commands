@@ -235,6 +235,14 @@ Units prefer the earliest weekly reset, then the most weekly allowance left.
 Showrunners prefer the most weekly allowance left.
 Labels provide a stable final ordering.
 Recorded provider refusals block a destination until the refusal resolves.
+`pick` and `placement` take the model family of the work to place.
+A refusal for one model family blocks only work of that family.
+When the family is not known, any unresolved family refusal blocks the destination.
+`group_family()` reads a group's family from the staff model setting in `config/models.conf`.
+The producers use their `[producers]` rows.
+Unit directors and showrunners use `director` and `showrunner` in `[production.claude]`.
+Producers on two families, or an unreadable setting, give an unknown family.
+Automatic group moves and their next-move target checks use the group's family.
 Codex selection also checks allowance and whether `codex_credit_accounts` lets the account spend credits.
 
 `_exec_codex_account()` serves both `codex` and numbered Codex aliases.
@@ -376,6 +384,28 @@ Known short five-hour resets can wait instead of moving.
 The default wait boundary is strictly less than 20 minutes.
 An unknown reset or the exact boundary does not qualify for that wait.
 Failed continuation delivery retains the retry state.
+
+A Claude refusal entry gives its limit type and reset in `apiErrorParams.rate_limit_info` or in `quotaLimits`.
+`refusal_watch.claude_entry_refusal(entry, session_family, families)` reads one entry.
+The caller supplies the family of the session's prior model and `families`, the key set of `[claude.families]`.
+The prior model is the newest real assistant entry, even when its model is not a known family.
+`seven_day` and `weekly` give an all-model weekly refusal; `five_hour` gives an all-model five-hour refusal.
+A family name is a key of `[claude.families]` in `config/models.conf`; any other name is not a family.
+`seven_day_<family>` gives a weekly refusal for that model family.
+Another `seven_day_` type gives an all-model weekly refusal.
+`seven_day_overage_included` gives a weekly refusal for the family of the refused work.
+The text "reached your <Name> limit" names that family.
+Without a family in the text, the newest real assistant entry before the refusal names it: `message.model`, then `requestedModel`.
+Without either, the refusal applies to all models.
+The refused session's own family is used when the watcher places that session without a group.
+When a refused group member's own family differs from the group's family, the watcher places the group with an unknown family.
+
+`refusals.json` keeps one all-model record and one record for each model family for each account.
+A family record has the key `tool:login:family` and a `family` field.
+A newer refusal replaces only the record with the same key.
+A family refusal resolves at its reset.
+A fresh reading never resolves it, because saved readings do not hold the family window.
+Without a known reset, it resolves 7 days after the refusal.
 
 Queued moves use group-local positions and stable internal identities.
 Only the head of each group can run.

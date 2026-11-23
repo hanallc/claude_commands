@@ -2090,8 +2090,12 @@ def _codex_reading_can_work(reading: FreshReading, now: datetime, credits: agent
 
 
 def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False,
-         reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> PickedAccount | NoAccountWithRoom:
-    """Keep a working account, otherwise spend the weekly allowance resetting soonest."""
+         reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+         family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY) -> PickedAccount | NoAccountWithRoom:
+    """Keep a working account, otherwise spend the weekly allowance resetting soonest.
+
+    A refusal for another model family leaves the account a candidate; an unknown family honors every refusal.
+    """
     exclude = frozenset(numbered_account_label(label, tool).label for label in exclude)
     keep = KeepAccount(numbered_account_label(keep.label, tool).label) if isinstance(keep, KeepAccount) else keep
     candidates: list[tuple[str, Path, str]] = []
@@ -2150,12 +2154,12 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         for window in (weekly, five):
             if isinstance(window, ReadingWindow) and isinstance(window.reset, KnownReset) and window.reset.at > now:
                 resets.append(window.reset.at)
-        refusal = held_refusals.get(refusals.key(tool, login))
-        if refusal is not None and isinstance(refusal.reset, KnownReset) and refusal.reset.at > now:
-            resets.append(refusal.reset.at)
+        resets.extend(held.reset.at for held in refusals.applicable(held_refusals, tool, login, family)
+                      if isinstance(held.reset, KnownReset) and held.reset.at > now)
+        refusal = refusals.blocking(held_refusals, tool, login, family, reading, now)
         if refusal_problem:
             reason = refusal_problem
-        elif refusal is not None and not refusals.resolved(refusal, reading, now):
+        elif refusal is not None:
             reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
             isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
@@ -2500,12 +2504,14 @@ def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
 
 
 def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS,
-              reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> GroupPlacement:
-    """Rank Claude accounts with room for a group using the picker's reading rules."""
+              reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+              family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY) -> GroupPlacement:
+    """Rank Claude accounts with room for a group's model family using the picker's reading rules."""
     stale_minutes = (read_account_settings(account_config).whole("usage_stale_minutes")
                      if isinstance(reading_age_minutes, ConfiguredReadingAge) else reading_age_minutes)
     stale_after = timedelta(minutes=stale_minutes)
-    chosen = pick("claude", now, exclude=exclude, keep=NoKeep(), reading_age_minutes=stale_minutes, account_config=account_config)
+    chosen = pick("claude", now, exclude=exclude, keep=NoKeep(), reading_age_minutes=stale_minutes, account_config=account_config,
+                  family=family)
     if isinstance(chosen, NoAccountWithRoom):
         label = group_label(group_accounts(), group)
         directory = claude_account_dir(label) if isinstance(label, str) and _label_is(label, "claude") else GROUP_NOT_CONFIGURED
@@ -2530,6 +2536,33 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
     selected = min(eligible, key=order) if group == "units" else min(eligible, key=lambda item: (-item.weekly_left, *order(item)))
     reason = UnitsResetSoonest() if group == "units" else MostWeeklyQuotaLeft()
     return GroupPlacement(group, selected.label, selected.dir, reason, chosen.reasons)
+
+
+def group_family(group: ClaudeGroup) -> refusals.ModelFamily | refusals.UnknownFamily:
+    """Read the group's model family from the staff model setting in the model registry.
+
+    Producers use their [producers] rows; showrunners and unit directors use [production.claude].
+    Producers on two families, or an unreadable setting, give an unknown family.
+    """
+    try:
+        # Resolve the registry from this call's HOME, as a launch does.
+        sections = registry_rows.parse_registry(models_registry.registry_text(models_registry.registry_path(os.environ)))
+    except (OSError, ValueError):
+        return refusals.UNKNOWN_FAMILY
+    if group == "producers":
+        models: list[str] = []
+        for value in sections.get("producers", {}).values():
+            try:
+                profile = models_registry.parse_producer_profile(value)
+            except ValueError:
+                return refusals.UNKNOWN_FAMILY
+            if profile.family == "claude":
+                models.append(profile.model)
+    else:
+        models = [sections.get("production.claude", {}).get("director" if group == "units" else "showrunner", "").partition(":")[0]]
+    known = refusals.registry_families(sections)
+    families = {refusals.model_family(model, known) for model in models}
+    return families.pop() if len(families) == 1 else refusals.UNKNOWN_FAMILY
 
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
@@ -2656,7 +2689,7 @@ def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, 
         identity = account_identity(directory)
         if isinstance(identity, agent_accounts.NumberedAccount):
             excluded |= account_labels_for_logins(frozenset({identity.login.casefold()}))
-        chosen = placement(group, at, exclude=excluded, account_config=account_config)
+        chosen = placement(group, at, exclude=excluded, account_config=account_config, family=group_family(group))
         reason_text = (no_room_line("claude", chosen.reason.outcome) if isinstance(chosen.reason, GroupNoRoom) else
                        "soonest weekly reset" if isinstance(chosen.reason, UnitsResetSoonest) else "most weekly left")
         lines.append(f"{group} on refusal: {chosen.label}; {reason_text}")

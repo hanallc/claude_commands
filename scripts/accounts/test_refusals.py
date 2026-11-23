@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -178,3 +179,64 @@ class AccountRefusalTests(unittest.TestCase):
                         reading = accounts.FreshReading(window if name == "weekly" else other,
                             window if name == "five_hour" else other, "0")
                         self.assertEqual(refusals.resolved(refused, reading, at), left > 0)
+
+    def test_family_and_all_model_refusals_on_one_account_both_survive_and_old_records_load(self) -> None:
+        reset = refusals.KnownReset(self.now + timedelta(days=1))
+        everything = self.refusal(reset=reset)
+        fable = refusals.AccountRefusal("claude", "owner@example.invalid", WEEKLY_REFUSAL_WINDOW, reset,
+                                        self.now - timedelta(hours=1), refusals.ModelFamily("fable"))
+        refusals.write_refusal(fable)
+        refusals.write_refusal(everything)
+        refusals.write_refusal(replace(fable, at=self.now - timedelta(hours=2)))
+        self.assertEqual(refusals.load(), {refusals.key("claude", "owner@example.invalid"): everything,
+                                           refusals.refusal_key(fable): fable})
+        stored = cast(dict[str, dict[str, str]], json.loads(refusals.store_file().read_text()))
+        # The old reader needs these five text fields; it reads the family record as a weekly refusal.
+        self.assertEqual(stored[refusals.refusal_key(fable)], {"tool": "claude", "login": "owner@example.invalid",
+            "window": "weekly", "reset": reset.at.isoformat(), "at": fable.at.isoformat(), "family": "fable"})
+        old = {"tool": "claude", "login": "owner@example.invalid", "window": "unknown", "reset": "", "at": self.now.isoformat()}
+        _ = refusals.store_file().write_text(json.dumps({"claude:owner@example.invalid": old}))
+        self.assertEqual(refusals.load(), {refusals.key("claude", "owner@example.invalid"): refusals.AccountRefusal(
+            "claude", "owner@example.invalid", refusals.UnknownWindow(), refusals.NoResetKnown(), self.now, refusals.ALL_MODELS)})
+
+    def test_fresh_reading_with_room_never_resolves_a_family_refusal_before_its_reset(self) -> None:
+        reset = self.now + timedelta(days=1)
+        fable = refusals.AccountRefusal("claude", "owner@example.invalid", WEEKLY_REFUSAL_WINDOW,
+                                        refusals.KnownReset(reset), self.now, refusals.ModelFamily("fable"))
+        reading = self.reading(at=self.now + timedelta(seconds=1), weekly=39, reset=self.now + timedelta(days=4))
+        self.assertFalse(refusals.resolved(fable, reading, reset - timedelta(microseconds=1)))
+        self.assertTrue(refusals.resolved(fable, reading, reset))
+        unknown_reset = replace(fable, reset=refusals.NoResetKnown())
+        self.assertFalse(refusals.resolved(unknown_reset, reading, self.now + timedelta(days=7) - timedelta(microseconds=1)))
+        self.assertTrue(refusals.resolved(unknown_reset, reading, self.now + timedelta(days=7)))
+
+    def test_blocking_honors_a_family_refusal_only_for_its_family_or_an_unknown_family(self) -> None:
+        fable = refusals.AccountRefusal("claude", "owner@example.invalid", WEEKLY_REFUSAL_WINDOW,
+            refusals.KnownReset(self.now + timedelta(days=1)), self.now, refusals.ModelFamily("fable"))
+        held = {refusals.refusal_key(fable): fable}
+        for family, expected in ((refusals.ModelFamily("fable"), fable), (refusals.ModelFamily("opus"), None),
+                                 (refusals.UNKNOWN_FAMILY, fable)):
+            with self.subTest(family=family):
+                self.assertEqual(refusals.blocking(held, "claude", "OWNER@example.invalid", family,
+                                                   accounts.NoReading(), self.now), expected)
+
+    def test_model_family_names_claude_model_ids_and_aliases(self) -> None:
+        families = frozenset({"fable", "opus", "sonnet", "haiku"})
+        for model, expected in (("claude-fable-5-2", refusals.ModelFamily("fable")),
+                                ("claude-opus-5-5", refusals.ModelFamily("opus")),
+                                ("claude-opus-5-5[1m]", refusals.ModelFamily("opus")),
+                                ("claude-3-5-sonnet-20241022", refusals.ModelFamily("sonnet")),
+                                ("haiku", refusals.ModelFamily("haiku")),
+                                ("opusplan", refusals.UNKNOWN_FAMILY), ("default", refusals.UNKNOWN_FAMILY),
+                                ("claude-cowork-1-0", refusals.UNKNOWN_FAMILY),
+                                ("<synthetic>", refusals.UNKNOWN_FAMILY), ("", refusals.UNKNOWN_FAMILY)):
+            with self.subTest(model=model):
+                self.assertEqual(refusals.model_family(model, families), expected)
+
+    def test_claude_families_are_the_registry_family_keys(self) -> None:
+        self.assertEqual(refusals.claude_families(), frozenset())
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True)
+        _ = registry.write_text("[claude.families]\nfable=fable\nOpus=opus\n\n[producers]\nbrain=claude:fable:high\n")
+        self.assertEqual(refusals.claude_families(), frozenset({"fable", "opus"}))
+        self.assertEqual(refusals.model_family("claude-sonnet-5-5", refusals.claude_families()), refusals.UNKNOWN_FAMILY)

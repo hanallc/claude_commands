@@ -126,7 +126,7 @@ The request includes the retained terminal.
 Failures, waits, wait completion, no room, and renewed room have separate entries.
 Readers skip malformed lines, including during duplicate confirmation checks.
 Requests omit an unknown `reset`; waits carry a known reset.
-Refusal state stays in `refusals.json`.
+Refusal state stays in `refusals.json`, with one all-model record and one record for each model family for each account.
 A usage store failure writes a log line without preventing alerts.
 Advice reads the saved store.
 
