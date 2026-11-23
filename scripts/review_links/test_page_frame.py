@@ -56,7 +56,8 @@ def status_configuration() -> Generator[None]:
             + pages)
         _ = (root / "review_links.conf").write_text(
             "# range: 5..300\npage_refresh_seconds=15\n"
-            + "# range: 0.5..60\nframe_retry_seconds=2\n")
+            + "# range: 0.5..60\nframe_retry_seconds=2\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=15\n")
         with patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "America/New_York"}):
             yield
 
