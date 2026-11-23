@@ -1,6 +1,7 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.agents import remote
@@ -607,9 +608,8 @@ class RestartFixtureTests(RestartTestCase):
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "result", return_value={"panes": [{
             "pane_id": "w9:p9", "workspace_id": "w9", "session_id": "host-session", "label": "host"}]}))
-        fixture = SessionLaunchTests("test_restart_reads_a_claude_transcript_without_a_pane_launch_record")
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
+        _ = set_up_fixture(self.addCleanup, SessionLaunchTests(
+            "test_restart_reads_a_claude_transcript_without_a_pane_launch_record"))
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), herdr.Herdr("agents")).rows, [])
         self.assertEqual(errors.getvalue(), "")
@@ -1125,8 +1125,7 @@ class WorkerRestartTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.case.setUp()
-        self.addCleanup(self.case.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.case)
         world = self.case.fixture.world
         world.locations["w1:p0"]["agent_session"] = {"value": self.case.fixture.parent.current_session}
 
@@ -1560,7 +1559,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(errors.getvalue().splitlines(), [
             "restart anomaly: efficiency-unit: worker macdata-bytes not restored: pane identity is unavailable; "
             + "run worker.py restore in efficiency-unit"])
-        self.assertEqual(shutdown_record.read(), [str(owner.id), str(bad.id)])
+        self.assertEqual(shutdown_record.read(), [str(bad.id)])
 
     def test_bulk_command_output_with_twenty_units_and_506_finished_dispatches(self) -> None:
         history_sizes = (1, 2, 3, 3, 4, 5, 5, 5, 6, 8, 12, 18, 20, 29, 46, 54, 63, 65, 68, 89)
@@ -2992,9 +2991,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             with self.subTest(unselected_evidence_incomplete=incomplete), ExitStack() as scope:
                 unselected: list[staff.StaffRow] = []
                 if incomplete:
-                    fixture = WorkerPaneTests("runTest")
-                    fixture.setUp()
-                    _ = scope.callback(fixture.doCleanups)
+                    fixture = set_up_fixture(scope.callback, WorkerPaneTests("runTest"))
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
                     _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
@@ -3686,9 +3683,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         from scripts.herdr.test_worker_panes import WorkerPaneTests
         from dataclasses import replace
 
-        case = WorkerPaneTests("runTest")
-        case.setUp()
-        self.addCleanup(case.doCleanups)
+        case = set_up_fixture(self.addCleanup, WorkerPaneTests("runTest"))
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
@@ -5581,7 +5576,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore_attempt) as restore):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(shutdown_record.read(), [str(holder.id), str(child.id)])
+            self.assertEqual(shutdown_record.read(), [str(child.id)])
             self.assertEqual(restart.restart(), 0)
         self.assertEqual([item.args[0] for item in restore.call_args_list], [holder.id, holder.id])
         self.assertEqual(len(self.launches), 1)
@@ -5613,7 +5608,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         with (patch.object(staff, "initial_snapshot", return_value=record),
               patch.object(worker, "restore", side_effect=restore)):
             self.assertEqual(restart.restart(), 0)
-            self.assertEqual(len(shutdown_record.read()), 3)
+            self.assertEqual(shutdown_record.read(), [str(child.id) for child in children])
             self.assertEqual(restart.restart(), 0)
             self.assertEqual(restart.restart(only=(str(holder.id),)), 0)
         self.assertEqual(resumed, {child.id for child in children})
@@ -5636,9 +5631,7 @@ class RetainedSplitRestartTests(RestartTestCase):
         from scripts.production import worker
         from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 
-        fixture = StaffTestCase()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
+        fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         root = fixture.root
         config = root / "conf"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):

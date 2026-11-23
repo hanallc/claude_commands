@@ -28,6 +28,7 @@ import unittest
 from unittest.mock import ANY, Mock, call, patch
 from uuid import UUID, uuid4
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
 from scripts.astra import astra_roles
@@ -35,7 +36,7 @@ from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
 from scripts.buildlog import treekey
 from scripts.herdr import test_worker_panes as pane_fixtures
-from scripts.herdr import turn_end, worker_panes
+from scripts.herdr import pass_notices, turn_end, worker_panes
 from scripts.direct import assign, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
@@ -141,6 +142,26 @@ def run_compaction_helper_fixture() -> int:
     with Path(done).open("w") as stream:
         _ = stream.write(f"{int(code)}\n")
     return code
+
+
+DETACHED_FIXTURE_DEAD_PID = 2 ** 22 + 12345
+DETACHED_FIXTURE_MAX_PID = 2_147_483_647
+
+
+@contextmanager
+def detached_fixture_processes() -> Generator[None]:
+    """Report the synthetic supervisor as absent without asking the host."""
+    read = detached_run_process.process_args
+
+    def process_args(pid: int) -> (
+        list[str] | detached_run_process.ProcessCommandText
+        | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent
+    ):
+        absent = pid in (DETACHED_FIXTURE_DEAD_PID, DETACHED_FIXTURE_MAX_PID)
+        return detached_run_process.ProcessAbsent() if absent else read(pid)
+
+    with patch.object(detached_run_process, "process_args", side_effect=process_args):
+        yield
 
 
 @final
@@ -432,20 +453,12 @@ class WorkerCommandTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = pane_fixtures.WorkerPaneTests("runTest")
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, pane_fixtures.WorkerPaneTests("runTest"))
         _ = write_config_fixture(self.fixture.root / "conf/shutdown.conf")
+        _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf")
+        _ = self.enterContext(detached_fixture_processes())
         _ = (self.fixture.root / "conf/build_targets.conf").write_text("targets=natedev,mac\nkind.natedev=local\nkind.mac=ssh\n")
         self.fixture.world.binary = "/nonexistent/herdr"
-        self.addCleanup(self.fixture.doCleanups)
-        process_args = detached_run_process.process_args
-
-        def fixture_arguments(pid: int) -> list[str] | detached_run_process.ProcessCommandText | detached_run_process.ProcessArgumentsUnavailable | detached_run_process.ProcessAbsent:
-            if pid in (2 ** 22 + 12345, 2_147_483_647):
-                return detached_run_process.ProcessAbsent()
-            return process_args(pid)
-
-        _ = self.enterContext(patch.object(detached_run_process, "process_args", side_effect=fixture_arguments))
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
@@ -462,6 +475,7 @@ class WorkerCommandTests(unittest.TestCase):
             + "# whole: 1..\nrepo_depth=3\n"
             + "repo_skip=target node_modules .git\n")
         root = self.fixture.root
+        _ = self.enterContext(patch.object(send, "STATE", root / "message-state"))
         (root / "worker-tmp").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "TMPDIR": str(root / "worker-tmp"),
@@ -554,7 +568,7 @@ class WorkerCommandTests(unittest.TestCase):
         before = cast(dict[str, dict[str, dict[str, object]]], json.loads(previous))["pass"]["impl"]
         after = cast(dict[str, dict[str, dict[str, object]]],
                      json.loads((self.run_dir / "progress_history_state.json").read_text()))["pass"]["impl"]
-        changed = {"status", "finished_at", "hook_notice", "hook_completion"}
+        changed = {"status", "finished_at", "hook_completion"}
         self.assertEqual({key: value for key, value in after.items() if key not in changed},
                          {key: value for key, value in before.items() if key not in changed})
         self.assertEqual(after["status"], "completed")
@@ -576,10 +590,6 @@ class WorkerCommandTests(unittest.TestCase):
 
     def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
         config = self.fixture.root / "conf"
-        atomic_file.write_text_atomic(config / "detached_runs.conf",
-            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
-            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
-            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
@@ -597,7 +607,7 @@ class WorkerCommandTests(unittest.TestCase):
             "run_id": "orphan", "status": "running", "session_dir": str(self.run_dir),
             "worker": opened.row.name, "staff_id": opened.row.id, "label": "fixture gate",
             "command": ["true"], "log": str(folder / "orphan.log"), "started_at": time.time(),
-            "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
+            "pid": DETACHED_FIXTURE_DEAD_PID, "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
         return opened, path, run
@@ -1744,7 +1754,10 @@ class WorkerCommandTests(unittest.TestCase):
             atomic_file.write_text_atomic(self.run_dir / f"impl_worker_{row.name}.json", json.dumps({
                 "staff_id": row.id, "slot": row.name, "launcher_pid": 0}))
         atomic_file.write_text_atomic(self.run_dir / "impl_status_native-child", "implementing")
-        with patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.fixture.root / "usage")}):
+        darwin_launcher = SimpleNamespace(
+            pid=os.getpid(), parent=1, arguments=herdr.ReadProcessArguments(tuple(command)))
+        with (patch.dict(os.environ, {"USAGE_STATE_DIR": str(self.fixture.root / "usage")}),
+              patch.object(herdr, "_darwin_processes", return_value=[darwin_launcher])):
             dispatch = progress_history.begin_dispatch(self.run_dir, slot="native-child", phase="8", role="impl",
                 worker_name=native.name, worker_id=native.id, launcher_command=["assign.sh"], prompt=self.prompt,
                 kind="impl", lens="")
@@ -2039,7 +2052,7 @@ class WorkerCommandTests(unittest.TestCase):
         reap_path, orphan = self.detached_record(reap.row, "unreaped-check")
         process = process_start.process_start(os.getpid())
         assert isinstance(process, process_start.Started)
-        orphan.update(status="running", pid=2_147_483_647, pane_dispatch_id=dispatches["reap"],
+        orphan.update(status="running", pid=DETACHED_FIXTURE_MAX_PID, pane_dispatch_id=dispatches["reap"],
                       command_pid=os.getpid(), command_started=process.start)
         atomic_file.write_text_atomic(reap_path, json.dumps(orphan))
         self.agent.append(reap.pane, "assistant", f"DONE {dispatches['reap']}")
@@ -2629,9 +2642,14 @@ class WorkerCommandTests(unittest.TestCase):
                             saved = worker_panes.worker_pass(current.row, self.run_dir)
                             self.assertEqual(saved["status"], "active")
                             self.assertNotIn("confirmed_delivery_ids", saved)
-                            self.assertEqual({key: value for key, value in saved.items() if key != "hook_notice"},
-                                             {key: value for key, value in passed.items() if key != "hook_notice"})
+                            self.assertEqual(saved, passed)
                             self.assertEqual(status.read_text(), "running\n")
+
+                        def busy_events() -> list[str]:
+                            notices = pass_notices.read(self.run_dir, pass_id)
+                            assert notices is not None
+                            return [entry.source_event_id for entry in notices.notices.values()
+                                    if entry.source_event_id.startswith("busy:")]
 
                         send_notice = send.send
                         agent_command = worker._agent_command  # pyright: ignore[reportPrivateUsage]
@@ -2654,8 +2672,7 @@ class WorkerCommandTests(unittest.TestCase):
                                     self.run_dir / f"compact-{completion_id}.lock", wait=False) as lock:
                                 self.assertIs(lock, file_lock.LockResult.ACQUIRED)
                             check_pending()
-                            claimed = worker_panes.worker_pass(current.row, self.run_dir)
-                            self.assertTrue(str(claimed["hook_notice"]).startswith("busy:"))
+                            self.assertEqual(len(busy_events()), 1)
                             self.assertEqual(len(self.agent.submitted), before)
                             self.assertEqual(len(self.agent.compactions), compacted)
                             if outcome == "replaced after handoff":
@@ -2725,18 +2742,21 @@ class WorkerCommandTests(unittest.TestCase):
                                 self.assertEqual(order, ["returned", "compacted"])
                                 continue
                             if outcome == "busy twice":
-                                first_notice = worker_panes.worker_pass(current.row, self.run_dir)["hook_notice"]
+                                first_notice, = busy_events()
                                 live_runs.close()
                                 retry()
                                 with (pane_fixtures.live_detached_run(self.run_dir, current.row),
                                       patch.object(send, "send", wraps=send_notice) as send_again):
                                     self.assertEqual(worker.main(commands[1][2:]), worker.ExitCode.BUSY)
                                 check_pending()
-                                identity = str(worker_panes.worker_pass(current.row, self.run_dir)["hook_notice"])
-                                self.assertNotEqual(identity, first_notice)
+                                first, identity = busy_events()
+                                self.assertEqual(first, first_notice)
                                 send_again.assert_called_once()
                                 options = cast(send.Options, send_again.call_args.args[0])
-                                self.assertEqual(options.key, f"worker-busy:{pass_id}:{identity.removeprefix('busy:')}")
+                                notices = pass_notices.read(self.run_dir, str(pass_id))
+                                assert notices is not None
+                                event, = (key for key, entry in notices.notices.items() if entry.source_event_id == identity)
+                                self.assertEqual(options.key, f"worker-completion:{pass_id}:{event}")
                                 self.assertEqual(len(self.agent.notices), notices_before + 2)
                                 self.assertEqual(self.agent.notices[-1], self.agent.notices[-2])
                                 self.assertEqual(len(self.agent.compactions), compacted)
@@ -2846,6 +2866,10 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertEqual(len(self.agent.notices), notices_before)
                         self.assertEqual(failure_steps[:4], ["pass end", "hook completion", "error reply", "notice"])
                         self.assertEqual(errors.getvalue().count("dispatch notice failed: director message failed"), 1)
+                        # The notice record keeps the failed notice, and a retry sends it once.
+                        pass_notices.retry(self.run_dir)
+                        self.assertEqual(len(self.agent.notices), notices_before + 1)
+                        self.assertIn("error", self.agent.notices[-1])
                     else:
                         self.assertEqual(len(self.agent.notices), notices_before + 1)
                         self.assertIn("error", self.agent.notices[-1])
@@ -3476,23 +3500,17 @@ class WorkerCommandTests(unittest.TestCase):
         progress_history.complete_dispatch(self.run_dir, "impl", instance, status="error")
         if fail_notice:
             self.agent.notice_failures = 1
-            with redirect_stderr(io.StringIO()) as errors:
-                self.assertIs(self.dispatch(), worker.ExitCode.UNCERTAIN)
-            self.assertIn("director message failed", errors.getvalue())
-            self.assertEqual(len(self.agent.submitted), 1)
-            self.assertEqual(self.agent.notices, [])
-            pending = worker_panes.worker_pass(row, self.run_dir)
-            self.assertEqual((pending["instance_id"], pending["status"]), (instance, "error"))
-            self.assertNotIn("hook_notice", pending)
-
-        def check_notice() -> None:
-            notice, = self.agent.notices
-            self.assertIn(f"; pass {instance}", notice)
-            self.assertIn("The earlier pass ended with state error.", notice)
-            self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
-
-        self.agent.during_prompt = check_notice
-        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+            with self.assertRaisesRegex(ValueError, "director message failed"):
+                _ = self.finish()
+        with patch.object(send, "send") as send_during_assignment:
+            self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        send_during_assignment.assert_not_called()
+        self.assertEqual(self.agent.notices, [])
+        self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
+        _ = detached_runs.reap_orphans(str(self.run_dir))
+        notice, = self.agent.notices
+        self.assertIn(f"; pass {instance}", notice)
+        self.assertIn("The earlier pass ended with state error.", notice)
         self.assertEqual(len(self.agent.submitted), 2)
         next_pane, line = self.agent.submitted[-1]
         self.assertEqual(self.agent.row(next_pane).id, row.id)
@@ -3504,13 +3522,13 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 2)
         self.assertEqual(len(self.agent.notices), 1)
 
-    def test_reassignment_after_launcher_error_starts_a_new_turn_after_the_old_notice(self) -> None:
+    def test_reassignment_after_launcher_error_starts_a_new_turn_before_delivery(self) -> None:
         self.assert_reassignment_after_launcher_error(fail_notice=False)
 
     def test_reassignment_after_a_failed_notice_starts_one_new_turn(self) -> None:
         self.assert_reassignment_after_launcher_error(fail_notice=True)
 
-    def test_completed_dispatch_rerun_repeats_its_notice_without_typing(self) -> None:
+    def test_completed_dispatch_rerun_leaves_the_settled_notice_and_pane_alone(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.agent.submitted[-1][0]
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
@@ -3541,14 +3559,7 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(status.read_text(), "running\n")
                     continue
                 if repeated == 3:
-                    send_notice = send.send
-
-                    def send_unlocked(options: send.Options) -> send.Result:
-                        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as acquired:
-                            self.assertIsInstance(acquired, worker_panes.WorkerLockHold)
-                        return send_notice(options)
-
-                    _ = sends.enter_context(patch.object(send, "send", side_effect=send_unlocked))
+                    transport = sends.enter_context(patch.object(send, "send"))
                     with ExitStack() as notices, worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
                         self.assertIsInstance(hold, worker_panes.WorkerLockHold)
                         assert isinstance(hold, worker_panes.WorkerLockHold)
@@ -3557,16 +3568,17 @@ class WorkerCommandTests(unittest.TestCase):
                             launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)], reply=self.reply,
                             lock=hold, notices=notices)
                     self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    transport.assert_not_called()
                 else:
                     self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
-                self.assertEqual(self.agent.notices, [notice] * (repeated + 1))
+                self.assertEqual(self.agent.notices, [notice])
                 self.assertEqual(len(self.agent.submitted), 1)
                 self.assertEqual(len(self.fixture.world.launches), 1)
                 self.assertNotIn(pane, self.fixture.world.locations)
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.fixture.staff_state()), before)
                 self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns), reply)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.IGNORED)
-        self.assertEqual(len(self.agent.notices), 5)
+        self.assertEqual(len(self.agent.notices), 1)
 
     def test_dispatch_rerun_before_prompt_records_one_submission(self) -> None:
         target = herdr.check_target
@@ -3936,9 +3948,8 @@ class WorkerCommandTests(unittest.TestCase):
 
         for exited in (False, True):
             with self.subTest(exited=exited):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     config = case.fixture.root / "conf/direct.conf"
                     atomic_file.write_text_atomic(config, config.read_text().replace("WORKER_SETTLE_SECONDS=30", "WORKER_SETTLE_SECONDS=1"))
                     opened = case.opened()
@@ -3968,12 +3979,9 @@ class WorkerCommandTests(unittest.TestCase):
                         worker.DispatchSubmission.SUBMITTED)
                     case.assertEqual(len(case.agent.submitted), 1)
                     case.assertEqual(case.agent.row(case.agent.submitted[-1][0]).current_session, opened.row.current_session)
-                finally:
-                    case.doCleanups()
 
-        with self.subTest(delivery="delayed transcript"):
-            case = WorkerCommandTests("runTest")
-            case.setUp()
+        with self.subTest(delivery="delayed transcript"), ExitStack() as cleanup:
+            case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
             opened = case.opened()
             case.agent.defer_prompt_transcript = True
             config = case.fixture.root / "conf/direct.conf"
@@ -3992,7 +4000,6 @@ class WorkerCommandTests(unittest.TestCase):
                 case.assertIsInstance(case.receipt(), worker.DispatchSubmitted)
             finally:
                 delivery.join()
-                case.doCleanups()
 
     def test_blocked_dispatch_returns_blocked(self) -> None:
         opened = self.opened()
@@ -4558,7 +4565,7 @@ class WorkerCommandTests(unittest.TestCase):
                         pane: worker.KeepCompletedPane) -> worker.CompletionRecovery:
             self.assertIs(pane, worker.KeepCompletedPane.KEEP)
             passed = worker_panes.worker_pass(member, run, record=record)
-            turn_end.repeat_completion_notice(member.name, director, run, passed)()
+            turn_end.retry_completed_notice(member.name, director, run, passed)()
             return worker.CompletionRecovery.NO_PENDING_NOTICE
 
         atomic_file.write_text_atomic(self.reply, f"DONE {dispatch}\n")
@@ -4713,9 +4720,8 @@ class WorkerCommandTests(unittest.TestCase):
         for failure in failures:
             for existing in (False, True, "closed"):
                 with self.subTest(failure=failure, existing=existing):
-                    case = WorkerCommandTests("runTest")
-                    case.setUp()
-                    try:
+                    with ExitStack() as cleanup:
+                        case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                         if existing:
                             opened = case.opened()
                             if existing == "closed":
@@ -4778,15 +4784,12 @@ class WorkerCommandTests(unittest.TestCase):
                             case.assertEqual(staff.find(kind="worker", parent=case.fixture.parent.id), [])
                             case.assertEqual(len(case.fixture.world.closed), 1)
                         case.assertNotIn("cleanup failed", errors.getvalue())
-                    finally:
-                        case.doCleanups()
 
     def test_failed_dispatch_closes_its_new_pane_with_a_named_target(self) -> None:
         for family in ("claude", "codex"):
             with self.subTest(family=family):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
                     rows: list[staff.StaffRow] = []
                     targets: list[str] = []
@@ -4816,8 +4819,6 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(len(case.fixture.world.closed), 1)
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_dispatch_keeps_a_replacement_terminal_after_preparation_fails(self) -> None:
         def replace_terminal(*_arguments: object, **_options: object) -> str:
@@ -4838,9 +4839,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_dispatch_uses_saved_start_ownership_without_a_pane_read(self) -> None:
         for incomplete in (False, True):
             with self.subTest(incomplete=incomplete):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     start = cast(Callable[..., worker_panes.WorkerStart], worker_panes.start_or_resume)
                     arm = worker.arm_launch_cleanup
                     def launch(*arguments: object, **options: object) -> worker_panes.WorkerStart:
@@ -4861,15 +4861,12 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(len(case.fixture.world.closed), int(incomplete))
                     if incomplete:
                         case.assertIn("TEST startup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_failed_first_assignment_ends_only_its_new_team_panes(self) -> None:
         for failure in ("selection", "dispatch"):
             with self.subTest(failure=failure):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     with ExitStack() as patches, redirect_stderr(io.StringIO()) as errors:
                         if failure == "selection":
                             _ = patches.enter_context(patch.object(worker, "select_worker", return_value=worker_panes.StartRefused(
@@ -4885,16 +4882,13 @@ class WorkerCommandTests(unittest.TestCase):
                                                   if isinstance(destination, herdr.SplitPane)])
                     case.assertEqual(case.agent.submitted, [])
                     case.assertNotIn("cleanup failed", errors.getvalue())
-                finally:
-                    case.doCleanups()
 
     def test_failed_restore_before_submission_ends_only_its_new_pane(self) -> None:
         for existing, incomplete, refused in ((False, False, False), (True, False, False),
                                                (False, True, False), (False, False, True)):
             with self.subTest(existing=existing, incomplete=incomplete, refused=refused):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     opened = case.opened()
                     _ = progress_history.begin_dispatch(case.run_dir, slot="impl", phase="8", role="impl",
                         worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -4929,8 +4923,6 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(start_worker.call_count, int(opens_pane))
                     case.assertEqual(staff.by_id(opened.row.id), opened.row)
                     case.assertEqual(len(case.fixture.world.closed), closed + int(opens_pane))
-                finally:
-                    case.doCleanups()
 
     def test_publication_failure_reports_that_its_new_pane_was_closed(self) -> None:
         with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
@@ -5233,6 +5225,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual([pane for pane, _ in self.agent.submitted], [opened.pane, opened.pane])
         self.assertEqual(status.read_text(), "running\n")
         self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
+        # A new assignment leaves the old result to the notice retry.
+        self.assertEqual(self.agent.notices, [])
+        _ = detached_runs.reap_orphans(str(self.run_dir))
         self.assertEqual(len(self.agent.notices), 1)
         self.assertIn(str(passed["instance_id"]), self.agent.notices[0])
         finished = [event["status"] for event in assign.recorded_passes(self.run_dir)
@@ -5343,9 +5338,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_first_standard_assignment_creates_the_default_team(self) -> None:
         for role, ready_hooks in (("impl", False), ("test", True)):
             with self.subTest(role=role, ready_hooks=ready_hooks):
-                case = WorkerCommandTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, WorkerCommandTests("runTest"))
                     case.agent.finish_after = 1
                     assignment_thread = current_thread()
                     hook_acquired = Event()
@@ -5401,8 +5395,6 @@ class WorkerCommandTests(unittest.TestCase):
                     case.assertEqual(case.agent.row(case.agent.submitted[0][0]).name, role)
                     if ready_hooks:
                         case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
-                finally:
-                    case.doCleanups()
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
         row = self.fixture.worker("impl", family="codex")
@@ -6594,7 +6586,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertIs(worker.restore(parent), worker.ExitCode.OK)
         self.assertNotIn(pane, self.fixture.world.locations)
         self.assertIsNotNone(staff.by_id(row.id))
-        self.assertTrue(progress_history.stopped_notice_delivered(self.run_dir, instance))
+        self.assertTrue(pass_notices.is_settled(self.run_dir, instance, "stopped"))
         completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
         assert isinstance(completion, progress_history.HookCompletion)
         self.assertFalse(completion.finished)

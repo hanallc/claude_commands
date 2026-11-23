@@ -30,6 +30,7 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.mac_test import eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
@@ -38,8 +39,6 @@ from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-UNREACHABLE_WAIT_KEY = 'unreachable_wait_seconds'
-MAX_UNREACHABLE_WAIT_SECONDS = 86400
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
@@ -95,20 +94,13 @@ class GuestSettings:
         return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
 
 
-def _unreachable_wait_seconds(value: str) -> int:
-    seconds = conf.positive_whole(value)
-    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
-        raise ValueError(f'expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds')
-    return seconds
-
-
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     settings = conf.read(eligibility.mac_linux_target(registry).settings)
     hops = settings.value('ssh.hops', str.split, recover_invalid=False)
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
-    proof_wait = registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait_seconds, recover_invalid=False)
+    proof_wait = target_config.unreachable_wait_seconds(registry)
     if len(hops) != 2 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', host) for host in hops):
         raise GuestUnavailable('ssh.hops must name two SSH aliases')
     if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
@@ -703,7 +695,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
     if not proof_obtained:
         guest = settings.ssh_hops[-1]
         error = GuestUnavailable(f'guest unreachable: {guest} did not confirm the run ended '
-                                 + f'within {settings.unreachable_wait_seconds} seconds ({UNREACHABLE_WAIT_KEY})')
+                                 + f'within {settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})')
         if detail:
             error.add_note(detail)
         raise error

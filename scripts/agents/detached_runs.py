@@ -659,9 +659,13 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
             fcntl.flock(admission, fcntl.LOCK_EX)
             result = _reap_orphans_locked(runs, worker)
         result.complete()
-    if next(runs.parent.glob(".*.pending-done.json"), None) is not None:
-        retry = cast(Callable[[Path, str], None], import_module("scripts.herdr.turn_end").retry_pending_done)
-        retry(runs.parent, worker)
+    run = runs.parent
+    if next(run.glob(".*.pending-done.json"), None) is not None:
+        retry_done = cast(Callable[[Path, str], None], import_module("scripts.herdr.turn_end").retry_pending_done)
+        retry_done(run, worker)
+    if next(run.glob(".*.pass-notices.jsonseq"), None) is not None:
+        retry_notices = cast(Callable[[Path, str], None], import_module("scripts.herdr.pass_notices").retry)
+        retry_notices(run, worker)
     return result.run_ids
 
 

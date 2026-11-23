@@ -1230,15 +1230,13 @@ class CompletionRecovery(Enum):
 
 
 class CompletionNotices(Protocol):
-    def completion_notice_delivered(self, passed: dict[str, object]) -> bool: ...
-
     def recover_completion(self, row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                            hold: worker_panes.WorkerLockHold, *, record: staff.StaffSnapshot,
                            pane: CloseCompletedPane | ReuseCompletedPane | KeepCompletedPane = CloseCompletedPane.CLOSE,
                            ) -> CompletionRecovery: ...
 
-    def repeat_completion_notice(self, worker_name: str, parent: staff.StaffRow, run: Path,
-                                 passed: dict[str, object]) -> Callable[[], None]: ...
+    def retry_completed_notice(self, worker_name: str, parent: staff.StaffRow, run: Path,
+                               passed: dict[str, object]) -> Callable[[], None]: ...
 
 
 def _completion_notices() -> CompletionNotices:
@@ -1333,12 +1331,9 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 previous = worker_panes.worker_pass(row, recorded.directory, record=record)
                 same_pass = (isinstance(matched, pass_recorder.MatchedDispatch)
                              and matched.instance_id == previous.get("instance_id"))
-                if same_pass:
-                    pane = (KeepCompletedPane.KEEP if completion_notices.completion_notice_delivered(previous)
-                            else CloseCompletedPane.CLOSE)
-                else:
-                    pane = ReuseCompletedPane(completion_actions.held_role)
-                awaiting_hook = (same_pass and previous.get("status") in ("active", "refused")
+                previous_open = previous.get("status") in ("active", "refused")
+                pane = KeepCompletedPane.KEEP if same_pass else ReuseCompletedPane(completion_actions.held_role)
+                awaiting_hook = (same_pass and previous_open
                                  and isinstance(progress_history.hook_completion(previous), progress_history.NoHookCompletion))
                 try:
                     if not awaiting_hook:
@@ -1346,7 +1341,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                                                                          record=record, pane=pane)
                 except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                         staff.StaffRefused, staff.StaffUnreadable) as error:
-                    print(f"anomaly: {row.name}: pending completion notice for pass {previous.get('instance_id')}: {error}",
+                    print(f"anomaly: {row.name}: completion recovery for pass {previous.get('instance_id')}: {error}",
                           file=sys.stderr)
                     return ExitCode.UNCERTAIN
                 if recovered in (CompletionRecovery.WAITING_ON_RUNS, CompletionRecovery.WAITING_ON_REPLY,
@@ -1354,6 +1349,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                     print(f"{row.name}: {recovered.value}", file=sys.stderr)
                     return ExitCode.BUSY
                 if recovered is CompletionRecovery.PENDING_CLOSE:
+                    print(f"{row.name}: {recovered.value}", file=sys.stderr)
                     return ExitCode.UNCERTAIN
 
         def refuse_new_assignment(target: staff.StaffRow, check: CheckAssignmentAvailability,
@@ -1375,25 +1371,20 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 and row is not None):
             passed = worker_panes.worker_pass(row, session_dir)
             delivery = pass_recorder.dispatch_delivery(passed)
-            same_pass = passed.get("instance_id") == matched.instance_id
-            if not same_pass:
+            if passed.get("instance_id") != matched.instance_id:
                 print(f"{row.name}: the selected pass belongs to another worker", file=sys.stderr)
                 return ExitCode.BUSY
-            retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
             if _compaction_retry_pending(session_dir, selection):
                 return _pending_compaction_result(session_dir, selection)
-            completed = same_pass and passed.get("status") == "completed"
-            if retired or completed:
+            if passed.get("status") == "completed":
                 try:
                     progress_history.validate_dispatch_selection(session_dir, selection)
                 except pass_recorder.DispatchSelectionChanged as error:
                     return _selection_changed(error)
-                if recovered is CompletionRecovery.RECOVERED:
-                    return DispatchSubmission.SUBMITTED
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
                 if isinstance(receipt, DispatchComplete):
                     save_reply(Path(delivery.reply_file), receipt.reply)
-                _ = notice_delivery.callback(completion_notices.repeat_completion_notice(
+                _ = notice_delivery.callback(completion_notices.retry_completed_notice(
                     row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
                     worker_panes.worker_pass(row, session_dir)))
                 return DispatchSubmission.SUBMITTED
@@ -1637,6 +1628,13 @@ def _dispatch_notice(parent: StaffId, identity: StaffId, run: Path, instance: st
                             PreparedDirectorNotice], module._prepare_notice)
     turn_outcome = cast(Callable[[str], object], module.TurnOutcome)(outcome)
     prepare(name, owner, run, passed, instance, turn_outcome, run, "", detail).send_notice()
+
+
+def _stopped_notice_settled(run: Path, instance: str) -> bool:
+    # The notice record imports send, so load it only on this path.
+    from scripts.herdr import pass_notices
+
+    return pass_notices.is_settled(run, instance, "stopped")
 
 
 def _dispatch_failure_step(identity: StaffId, step: str, action: Callable[[], None]) -> bool:
@@ -2288,7 +2286,7 @@ def end(parent: StaffId, name: WorkerName, *,
                                       and isinstance(completion, progress_history.HookCompletion)
                                       and completion.outcome == "stopped" and passed.get("status") == "canceled"
                                       and isinstance(instance, str)
-                                      and progress_history.stopped_notice_delivered(run, instance))
+                                      and _stopped_notice_settled(run, instance))
                     no_late_reply = canceled_without_hook and recovery is CompletionRecovery.WAITING_ON_REPLY
                     if (recovery not in (CompletionRecovery.NO_PENDING_NOTICE, CompletionRecovery.RECOVERED)
                             and not delivered_stop and not no_late_reply):

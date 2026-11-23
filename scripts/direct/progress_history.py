@@ -1449,36 +1449,34 @@ def _pending_dispatch_notice_pass(state: dict[str, object], worker_id: staff.Sta
     return passed
 
 
-def dispatch_uncertainty_pending(run: Path, worker_id: staff.StaffId, instance_id: str, completion_id: str) -> bool:
+def dispatch_delivery_pending(run: Path, instance_id: str, completion_id: str) -> bool:
     """Check the exact pending delivery under the recorder lock before sending a notice."""
     with pass_recorder.recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not pass_recorder.state_path(run).is_file():
             return False
         state = pass_recorder.read_state(run, resolve_staff=False)
-        return bool(_pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id))
+        worker_id = next((pass_recorder.string(passed.get("worker_id")) for passed in pass_recorder.open_passes(state).values()
+                          if passed.get("instance_id") == instance_id), "")
+        return bool(worker_id and _pending_dispatch_notice_pass(state, staff.StaffId(worker_id), instance_id, completion_id))
 
 
-def handoff_busy_dispatch_notice(run: Path, worker_id: staff.StaffId, instance_id: str,
-                                 completion_id: str, attempt_id: uuid.UUID, *, owner_id: staff.StaffId) -> bool:
-    """Accept a notice for the recorded owner and exact unconfirmed delivery."""
+def busy_dispatch_notice_pending(run: Path, worker_id: staff.StaffId, instance_id: str,
+                                 completion_id: str, *, owner_id: staff.StaffId) -> bool:
+    """Check the recorded owner and exact unconfirmed delivery before a busy notice."""
     record = staff.snapshot()
     with pass_recorder.recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not pass_recorder.state_path(run).is_file():
             return False
         state = pass_recorder.read_state(run, resolve_staff=False)
-        passed = _pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id)
-        stamp = f"busy:{attempt_id}"
-        if not passed or passed.get("hook_notice") == stamp:
+        if not _pending_dispatch_notice_pass(state, worker_id, instance_id, completion_id):
             return False
         owner = unit_runs.run_owner(state, record)
         if isinstance(owner, unit_runs.RunOwnerUnrecorded):
             raise ValueError(f"{run}: {owner.reason}")
         if owner.id != owner_id:
             raise ValueError(f"{run}: recorded owner {owner.id} differs from notice recipient {owner_id}")
-        passed["hook_notice"] = stamp
-        pass_recorder.write_state(run, state)
         return True
 
 
@@ -1516,17 +1514,11 @@ def submitted_worker_thread(state: dict[str, object], thread: str) -> bool:
 NO_COMPLETION_ACTIONS = pass_recorder.CompletionActions()
 
 
-def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object, *,
-                     stopped_notice: bool = False) -> None:
+def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object) -> None:
     with pass_recorder.recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = pass_recorder.read_state(session_dir)
         changed = False
-        if stopped_notice:
-            notice = pass_recorder.object_dict((pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}).get(instance_id))
-            if notice is not None and notice.get("delivered") is not True:
-                notice["delivered"] = True
-                changed = True
         for passed in pass_recorder.pass_slots(state).values():
             if passed.get("instance_id") == instance_id:
                 if isinstance(value, pass_recorder.DispatchDelivery):
@@ -1620,7 +1612,6 @@ class StoppedPassNotice:
     director_id: staff.StaffId
     phase_id: str
     reason: str
-    delivered: bool = False
 
 
 class NoStoppedPassNotice(Enum):
@@ -1665,16 +1656,9 @@ def stopped_run_notice(run: Path, run_id: str) -> StoppedPassNotice | NoStoppedP
             return StoppedPassNotice(
                 pass_recorder.string(fields.get("instance_id")), run_id, staff.StaffId(pass_recorder.string(fields.get("worker_id"))),
                 pass_recorder.string(fields.get("worker_name")), staff.StaffId(pass_recorder.string(fields.get("director_id"))),
-                pass_recorder.string(fields.get("phase_id")), pass_recorder.string(fields.get("reason")), fields.get("delivered") is True,
+                pass_recorder.string(fields.get("phase_id")), pass_recorder.string(fields.get("reason")),
             )
     return NoStoppedPassNotice.UNRECORDED
-
-
-def stopped_notice_delivered(run: Path, instance_id: str) -> bool:
-    state = pass_recorder.read_state(run, resolve_staff=False)
-    notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
-    fields = pass_recorder.object_dict(notices.get(instance_id)) or {}
-    return fields.get("delivered") is True
 
 
 class StopDispatchRefused(Enum):
@@ -1683,7 +1667,7 @@ class StopDispatchRefused(Enum):
 
 def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
                   director: staff.StaffId, *, run_id: str, reason: str) -> StoppedPassNotice | StopDispatchRefused:
-    """Commit the stopped outcome, pass status, and notice in one state write."""
+    """Save the stopped outcome and archive the owning pass receipt."""
     with pass_recorder.recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = pass_recorder.read_state(run)
@@ -1710,11 +1694,6 @@ def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow
 def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
     passed = pass_recorder.pass_slots(pass_recorder.read_state(run)).get(slot, {})
     return passed.get("instance_id") == instance_id and passed.get("status") == "completed"
-
-
-def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str, *, stopped_pass: bool = False) -> None:
-    """Record a notice only after its message succeeds."""
-    _update_dispatch(session_dir, instance_id, "hook_notice", notice, stopped_notice=stopped_pass)
 
 
 def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:

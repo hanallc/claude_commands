@@ -17,6 +17,7 @@ from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 from uuid import UUID
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, progress_history, recorder_state, remove_run_scratch
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
@@ -117,6 +118,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         calls = self.failing_worker()
         result = self.launch()
         self.assert_run_active(result)
+        self.assertIn("The worker command failed at launch.", result.stderr.splitlines())
         self.assertEqual([event for event in self.events() if event.get("event_type") in (
             "pass_started", "pass_finished", "phase_finished")], [])
         command = cast(list[str], json.loads(calls.read_text()))
@@ -371,8 +373,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.fixture.fixture.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.fixture.fixture.root)})))
         _ = self.enterContext(assignment_helpers(bytecode_setting))
@@ -433,12 +434,11 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().rows, before)
         self.assertEqual(self.fixture.agent.submitted, [])
 
-    def test_completed_astra_review_rerun_repeats_its_notice_without_typing(self) -> None:
+    def test_completed_astra_review_rerun_keeps_its_notice_and_reply(self) -> None:
         for changed_session in (False, True):
             with self.subTest(changed_session=changed_session):
-                case = PaneReviewLauncherTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, PaneReviewLauncherTests("runTest"))
                     write_text_atomic(case.fixture.prompt, "Phase astra-review — Astra review\nReview the assigned change.\n")
                     case.fixture.run_dir = case.fixture.fixture.root / f"astra-run-{changed_session}"
                     reply = case.fixture.run_dir / "astra-review.md"
@@ -472,13 +472,11 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         launches = case.fixture.fixture.world.launches.copy()
                         repeated = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
                     self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-                    self.assertEqual(case.fixture.agent.notices, [notice, notice])
-                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))] * 2)
+                    self.assertEqual(case.fixture.agent.notices, [notice])
+                    self.assertEqual(case.fixture.agent.notice_senders, [send.CodexSender(str(row.current_session))])
                     self.assertEqual(case.fixture.agent.submitted, submitted)
                     self.assertEqual(case.fixture.fixture.world.launches, launches)
                     self.assertEqual((reply.read_bytes(), reply.stat().st_mtime_ns), saved)
-                finally:
-                    case.doCleanups()
 
     def test_review_stage_two_uses_its_own_done_line_and_reuses_both_receipts(self) -> None:
         summary = self.phase / "review_summary_1.txt"
@@ -517,8 +515,9 @@ class PaneReviewLauncherTests(unittest.TestCase):
         saved = summary.read_bytes(), (self.phase / "review_status_1").read_bytes()
         notices = self.fixture.agent.notices.copy()
         self.fixture.agent.notice_failures = 1
-        failed = self.launch_review()
-        self.assertNotEqual(failed.returncode, 0)
+        settled = self.launch_review()
+        self.assertEqual(settled.returncode, 0, settled.stdout + settled.stderr)
+        self.assertEqual(self.fixture.agent.notice_failures, 1)
         self.assertEqual((self.phase / "review_status_1").read_bytes(), saved[1])
         self.assertEqual(summary.read_bytes(), saved[0])
         self.assertEqual(self.fixture.agent.submitted, [first, second])
@@ -526,7 +525,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         repeated = self.launch_review()
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.fixture.agent.submitted, [first, second])
-        self.assertEqual(self.fixture.agent.notices, [*notices, notices[-1]])
+        self.assertEqual(self.fixture.agent.notices, notices)
         self.assertEqual((summary.read_bytes(), (self.phase / "review_status_1").read_bytes()), saved)
         self.assertEqual(self.fixture.prompt.read_bytes(), prompt)
 
@@ -593,9 +592,8 @@ class PaneReviewLauncherTests(unittest.TestCase):
     def test_review_role_refusal_keeps_the_active_worker_and_types_neither_stage(self) -> None:
         for sole_worker in (False, True):
             with self.subTest(sole_worker=sole_worker):
-                case = PaneReviewLauncherTests("runTest")
-                case.setUp()
-                try:
+                with ExitStack() as cleanup:
+                    case = set_up_fixture(cleanup.callback, PaneReviewLauncherTests("runTest"))
                     name = "impl" if sole_worker else "review"
                     opened = case.fixture.opened(name, "impl")
                     _ = progress_history.begin_dispatch(case.fixture.run_dir, slot=name, phase="8", role="impl",
@@ -645,8 +643,6 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         self.assertEqual(case.fixture.finish(name), turn_end.TurnOutcome.DONE)
                         self.assertEqual(worker_panes.worker_pass(opened.row, case.fixture.run_dir)["status"], "completed")
                         self.assertNotIn(opened.pane, case.fixture.fixture.world.locations)
-                finally:
-                    case.doCleanups()
 
 
 @final

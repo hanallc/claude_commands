@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -8343,9 +8344,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def setUp(self) -> None:
         from scripts.production.staff_test_support import StaffTestCase
 
-        self.fixture = StaffTestCase()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.agents import restart

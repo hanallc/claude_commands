@@ -28,8 +28,8 @@ The relay can forward one SendMessage call. It runs sonnet in auto mode (haiku c
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
-SendMessage tool result in the relay's stream, never from what the model says;
-the last stream per recipient stays in STATE/relay/<to>.jsonl.
+SendMessage tool result in the relay's stream, never from what the model says.
+Relays without the fallback token save the last stream in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
 An absent staff recipient keeps its queue without selecting a session family.
@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
+from scripts.whoami import mac_fallback_token, token_expiry
 from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
 from scripts.notify import review  # noqa: E402
@@ -775,6 +776,13 @@ class Result(NamedTuple):
     detail: str
     failure: FailureText = NO_FAILED_PUSH
     receiver: str = ""
+
+
+class RepeatGuardHeld(Result):
+    """The repeat guard took responsibility for the owner notice."""
+
+
+REPEAT_GUARD_REPORT = "SEND_HOLD: repeat-guard"
 
 
 class PaneTextDelivered(Result):
@@ -4201,6 +4209,23 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
         return _unaccepted_relay(write.state, f"cannot relay through the checked socket: {error}")
 
 
+def _relay_token_login(observed: RelayTransportResponse) -> mac_fallback_token.RelayLogin:
+    from scripts.whoami.mac_fallback_token import RelayLogin
+
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    for event in events:
+        if event.get("type") == "assistant" and event.get("error") == "authentication_failed":
+            return RelayLogin.FAILED
+        if event.get("type") == "result" and event.get("is_error") is True:
+            message = as_str(event.get("result")).casefold()
+            if message.startswith(("login expired", "login reached its time limit", "api error: 401")):
+                return RelayLogin.FAILED
+    if any(event.get("type") == "assistant" and not event.get("error")
+           and as_list(as_dict(event.get("message")).get("content")) for event in events):
+        return RelayLogin.GOOD
+    return RelayLogin.UNCONFIRMED
+
+
 def relay(message: Message, timeout: float) -> Result:
     attempt = message.claude_attempt
     if not isinstance(attempt, ClaudeDeliveryAttempt):
@@ -4230,15 +4255,11 @@ def relay(message: Message, timeout: float) -> Result:
                "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
-    token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
     try:
-        if token_file.exists():
-            token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
-                                   capture_output=True, text=True, timeout=10, check=False)
-            if token.returncode != 0:
-                return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
+        token_made = mac_fallback_token.prepare_child(env)
         relay_env = models_registry.agent_environment(env)
+    except mac_fallback_token.TokenDecryptFailed:
+        return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return Result("failed", f"cannot prepare the relay: {error}")
     command = [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
@@ -4250,20 +4271,32 @@ def relay(message: Message, timeout: float) -> Result:
     if isinstance(observed, Result):
         return observed
     code, out, err = observed.code, observed.stdout, observed.stderr
-    try:
-        raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
-        raw.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(raw, out + err)
-    except OSError as error:
-        print(f"message relay log: {error}", file=sys.stderr)
+    if isinstance(token_made, datetime):
+        login = _relay_token_login(observed)
+        try:
+            mac_fallback_token.record_relay(token_made, login, datetime.now(timezone.utc))
+        except (OSError, ValueError):
+            print("message relay: could not save the Mac token result", file=sys.stderr)
+    else:
+        try:
+            raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(raw, out + err)
+        except OSError as error:
+            print(f"message relay log: {error}", file=sys.stderr)
     result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
                         review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
+        if isinstance(token_made, datetime):
+            return Result("sent", "the relay confirmed delivery")
         return Result("sent", result.detail)
     if code is None:
         if isinstance(observed.forward, RelayRequestForwarded) and not isinstance(result, UncertainRelayDelivery):
-            return result
+            return (result._replace(detail="the relay did not confirm delivery")
+                    if isinstance(token_made, datetime) else result)
         return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
+    if isinstance(token_made, datetime):
+        return result._replace(detail="the relay did not confirm delivery")
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -4405,6 +4438,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
          reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False,
          silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE, user_asked: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
+    if text_id in token_expiry.ALERT_IDS and not push_texts.approval_date(text_id):
+        return Result("refused", "the token alert template needs current approval")
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
     command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
@@ -4588,6 +4623,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
     command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
+    error_lines = err.splitlines()
+    repeat_guard_held = REPEAT_GUARD_REPORT in error_lines
+    if repeat_guard_held:
+        err = "\n".join(line for line in error_lines if line != REPEAT_GUARD_REPORT)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
@@ -4604,6 +4643,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
+    if parsed.outcome == "held" and repeat_guard_held:
+        return RepeatGuardHeld("held", f"on {host}: {detail}", failure, receiver)
     return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
@@ -5675,7 +5716,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     elif isinstance(claim_result, RepeatPending):
         new_message_result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
-        new_message_result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
+        new_message_result = RepeatGuardHeld("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif review_error:
         new_message_result = Result("failed", review_error)
     elif isinstance(review_route, review_hold.AlreadyKeptForReview):
@@ -6035,6 +6076,8 @@ def main(argv: list[str]) -> int:
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
             print(f"{outcome.upper()}: {result.detail}")
+            if options.report_recipient and isinstance(result, RepeatGuardHeld):
+                print(REPEAT_GUARD_REPORT, file=sys.stderr)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):
