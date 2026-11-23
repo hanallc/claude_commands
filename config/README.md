@@ -226,7 +226,6 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 | Key | Meaning |
 | --- | --- |
-| `visible_root` | Root for visible scratch folders. |
 | `holds_file` | File that records scratch holds. |
 | `default_life_seconds` | Lifetime of a scratch folder without an explicit task. |
 | `repo_depth` | Maximum folder depth for the repository scan. |

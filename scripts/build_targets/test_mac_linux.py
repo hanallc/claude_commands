@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import timedelta
 import errno
 import fcntl
+import io
 import os
 from pathlib import Path
 import pwd
@@ -14,6 +15,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,10 +27,11 @@ import unittest
 from unittest.mock import call, patch
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import mac_run
+from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
-from scripts.lib import conf, process_group
+from scripts.buildlog import store
+from scripts.lib import conf, process_group, process_start
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -41,6 +44,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 
@@ -148,8 +152,17 @@ sys.exit(status)
 
 BWRAP_FIXTURE = '''import os
 from pathlib import Path
+import subprocess
 import sys
 
+if sys.argv[1] == '--json-status-fd':
+    # The read limit of a hand made run: run the argv after the limit words, and write its exit status.
+    words = sys.argv[1:]
+    end = words.index('--')
+    assert {'--unshare-net', '--remount-ro', '--chdir'} <= set(words[:end]), words
+    status = subprocess.call(words[end + 1:])
+    os.write(int(words[1]), f'{{"exit-code": {status}}}\\n'.encode())
+    sys.exit(status)
 flags = ['--die-with-parent', '--unshare-pid', '--dev-bind', '/', '/',
          '--proc', '/proc', '--bind', os.environ['TMPDIR'], '/tmp', '--tmpfs', '/dev/shm', '--']
 assert sys.argv[1:1 + len(flags)] == flags, sys.argv[1:]
@@ -164,6 +177,7 @@ SANDBOX_SUITE = '''import fcntl
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 
 tmp_device, tmp_inode, shm_device, pid_namespace, lock = map(int, sys.argv[1:])
@@ -189,6 +203,7 @@ GATE_FIXTURE = '''import fcntl
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 from time import sleep
 
@@ -290,6 +305,7 @@ from pathlib import Path
 import runpy
 import signal
 import socket
+import socket
 import sys
 
 from scripts.aws_target import gate_box, ledger
@@ -355,6 +371,122 @@ class MacLinuxSandboxTests(unittest.TestCase):
         unlocked = subprocess.run(['flock', '--exclusive', '--timeout', '1', str(run_lock), 'true'],
                                   timeout=2, check=False)
         self.assertEqual(unlocked.returncode, 0, 'The guest run lock is still held after the deadline.')
+
+
+# A hand made program under the guest read limit: it prints the source text of its copy, then yes or no for each
+# try. It also tries to write each outside path; the fixture is under /tmp, so such a write can land in the private
+# /tmp of the limit, and the test reads the real paths.
+LIMIT_PROGRAM = '''from pathlib import Path
+import socket
+import sys
+
+copy, sibling, key, port, *outside = sys.argv[1:]
+
+
+def connect():
+    with socket.create_connection(('127.0.0.1', int(port)), timeout=2):
+        pass
+
+
+tries = (lambda: Path(sibling, 'source.txt').read_text(), lambda: Path(key).read_text(),
+         lambda: Path(copy, 'written').write_text('copy'), lambda: Path(copy, 'target/built').write_text('output'),
+         lambda: Path('/tmp/written').write_text('tmp'), lambda: Path('/hand-made-written').write_text('root'),
+         connect)
+results = []
+for attempt in tries:
+    try:
+        attempt()
+    except OSError:
+        results.append('no')
+    else:
+        results.append('yes')
+for path in outside:
+    try:
+        Path(path).write_text('outside')
+    except OSError:
+        pass
+print(Path(copy, 'source.txt').read_text().strip(), *results, flush=True)
+'''
+
+
+@contextmanager
+def standard_output(path: Path) -> Generator[None]:
+    """Send file descriptor 1, which the guest run writes, to the file while the block runs."""
+    _ = sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        with path.open('wb') as output:
+            _ = os.dup2(output.fileno(), 1)
+        yield
+    finally:
+        _ = sys.stdout.flush()
+        _ = os.dup2(saved, 1)
+        os.close(saved)
+
+
+class GuestLimitTests(unittest.TestCase):
+    """A hand made argv runs under the read limit with the real bwrap, in a fixture home with two numbered copies."""
+    root: Path = Path()
+    home: Path = Path()
+    copy: Path = Path()
+    sibling: Path = Path()
+    tmp: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        if shutil.which('bwrap') is None:
+            self.fail('This Mac Linux sandbox test requires Bubblewrap (bwrap) on PATH.')
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.home = self.root / 'home'
+        self.copy, self.sibling = self.home / 'build/claude/unit/1', self.home / 'build/claude/unit/2'
+        # The runner makes the run tool folder in the copy target folder.
+        self.tmp = self.copy / 'target/runtime/tmp'
+        for folder in (self.home / '.ssh', self.sibling, self.tmp):
+            folder.mkdir(parents=True)
+        _ = (self.home / '.ssh/id_fixture').write_text('key\n')
+        for folder in (self.copy, self.sibling):
+            _ = (folder / 'source.txt').write_text(f'copy {folder.name}\n')
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {'HOME': str(self.home)})))
+
+    def run_limited(self, argv: list[str], tmp: Path | None = None) -> tuple[int, str, str]:
+        """Run the argv as the runner does: the status, the stream standard output and the runner stderr."""
+        runtime = self.copy / 'target/runtime'
+        environment = {**os.environ, 'HOME': str(runtime / 'home'), 'TMPDIR': str(self.tmp),
+                       'CARGO_HOME': str(runtime / 'home/.cargo'), 'RUSTUP_HOME': str(runtime / 'home/.rustup'),
+                       'CARGO_TARGET_DIR': str(self.copy / 'target')}
+        output, errors = self.root / 'output', io.StringIO()
+        with standard_output(output), redirect_stderr(errors):
+            status = mac_linux.run_limited(tmp or self.tmp, argv, self.copy, environment, 'fixture')
+        return status, output.read_text(), errors.getvalue()
+
+    def test_a_hand_made_argv_reads_and_writes_only_its_copy_and_has_no_network(self) -> None:
+        outside = (self.root / 'outside', self.home / '.ssh/written', self.sibling / 'written')
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen()
+            port = cast(tuple[str, int], server.getsockname())[1]
+            status, output, errors = self.run_limited([
+                os.path.realpath(sys.executable), '-I', '-c', LIMIT_PROGRAM, str(self.copy), str(self.sibling),
+                str(self.home / '.ssh/id_fixture'), str(port), *map(str, outside)])
+        self.assertEqual(status, 0, output + errors)
+        # The sibling copy and the key do not exist for the program. It writes its copy, its output folder and its
+        # own /tmp, and not the root of the limit; and it reaches no port outside.
+        self.assertEqual(output, f'{mac_linux.run_start_line("fixture")}\ncopy 1 no no yes yes yes no no\n')
+        self.assertEqual([(self.copy / 'written').exists(), (self.copy / 'target/built').exists(),
+                          (self.tmp / 'written').exists()], [True, True, True])
+        self.assertEqual([path for path in outside if path.exists()], [])
+
+    def test_a_limit_that_bwrap_cannot_set_up_starts_nothing_and_refuses_the_run(self) -> None:
+        mark = self.copy / 'ran'
+        status, output, errors = self.run_limited(['touch', str(mark)], tmp=self.root / 'missing-tmp')
+        self.assertEqual((status, output), (1, f'{mac_linux.run_refused_line("fixture")}\n'))
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
+        self.assertFalse(mark.exists())
+        with patch.dict(os.environ, {'PATH': str(self.root)}):
+            status, output, errors = self.run_limited(['touch', str(mark)])
+        self.assertEqual((status, output, errors),
+                         (1, f'{mac_linux.run_refused_line("fixture")}\n', mac_linux.BWRAP_MISSING + '\n'))
+        self.assertFalse(mark.exists())
 
 
 class GuestCommandParityTests(unittest.TestCase):
@@ -495,12 +627,23 @@ class GuestCommandParityTests(unittest.TestCase):
         self.assertIn(f'the guest PATH finds {self.copy / "target/built"}', refusal)
 
 
+# A Mac claim identity for a fixture reservation that holds no claim.
+FIXTURE_CLAIM = claim_state.ClaimIdentity(mac_test.MAC_LINUX_CLAIM_ID_PREFIX + 'fixture', 'episode', 'attempt')
+
+
 class MacLinuxRouteTests(unittest.TestCase):
     root: Path = Path()
     guest_home: Path = Path()
     trace: Path = Path()
     repo: Path = Path()
     registry: Path = Path()
+    placed: placement.PlacementAssignment = placement.PlacementAssignment(
+        'gate-episode', 'gate-attempt', placement.PlacementDestination(
+            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude', slot=1), 1),
+        execution_identity.SourceKeyUnavailable('fixture'), placement.SubmittingOwner('natedev', 1, 'start'),
+        OwningSession('submitting-session'), 0.0)
+    # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
+    consumed: tuple[tuple[wire.ConsumePermission, str, bool], ...] = ()
 
     @override
     def setUp(self) -> None:
@@ -549,7 +692,18 @@ class MacLinuxRouteTests(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.test',
             'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.test',
+            'ADMISSION_SOCKET': str(self.root / 'no-queue.sock'),
         })))
+        self.consumed = ()
+
+        def consume(request: wire.ConsumePermission) -> wire.FirstAuthorization:
+            holder = request.holder
+            assert isinstance(holder, placement.ClaimHolderIdentity)
+            held = mac_run.claim_held(mac_linux.GUEST_CLAIM_TARGET, request.claim.claim_id, holder.pid, holder.start_time)
+            self.consumed = (*self.consumed, (request, self.trace.read_text(encoding='utf-8'), held))
+            return wire.FirstAuthorization(request.assignment, request.claim)
+
+        _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
@@ -606,7 +760,8 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
+                                     module_time_limit_s=3, gate_job=gate_job, assignment=self.placed,
+                                     type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
@@ -635,6 +790,12 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
+    def test_a_targeted_run_without_the_natedev_module_list_fails_before_ssh(self) -> None:
+        result = mac_linux.route(self.repo, mode=SuiteMode.TARGETED, full=False, selected=ALL_MODULES,
+                                 module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
+        self.assertEqual(result, 'mac-linux: the targeted run has no module list from the natedev selection')
+        self.assert_guest_clean()
+
     def test_mac_claim_refuses_another_sessions_block(self) -> None:
         paths = claim_state.state_paths('mac')
         paths.directory.mkdir()
@@ -657,6 +818,54 @@ fi
                     self.assertEqual(claim_state.read_claims(paths), ())
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
+
+    def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
+        result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, trace, held), = self.consumed
+        start = process_start.process_start(os.getpid())
+        assert isinstance(start, process_start.Started)
+        self.assertEqual(request.assignment, self.placed)
+        self.assertEqual(request.holder, placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start))
+        destination = self.placed.destination
+        self.assertEqual(request.claim, placement.ProviderClaimReference(destination.provider, destination.target,
+            destination.scope, request.claim.claim_id, self.placed.episode, self.placed.attempt))
+        self.assertTrue(request.claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+        self.assertTrue(held)
+        self.assertEqual(trace, '')
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
+        refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),
+                                      'the attempt is closed: cancelled')
+        def refuse(_request: wire.ConsumePermission) -> wire.DispatchStatus:
+            return refusal
+
+        cases: tuple[tuple[Callable[[wire.ConsumePermission], wire.DispatchStatus] | wire.AdmissionUnavailable, str], ...] = (
+            (refuse, 'the queue refused the launch permission: the attempt is closed: cancelled'),
+            (wire.AdmissionUnavailable('the queue is down'), 'the launch permission is unavailable: the queue is down'))
+        for answer, reason in cases:
+            with self.subTest(reason=reason):
+                with patch.object(admission_client, 'consume_permission', side_effect=answer) as consume:
+                    self.assertEqual(self.not_started(self.route()), reason)
+                consume.assert_called_once()
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
+                self.assert_guest_clean()
+
+    def test_the_route_consumes_the_assignment_it_got_and_reads_no_placement_file(self) -> None:
+        # The gate checked its assignment at its start. The route reads no placement file again.
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
+        self.placed = replace(self.placed, attempt='checked-attempt')
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(placement_file)}),
+              patch.object(admission_client, 'read_assignment',
+                           side_effect=AssertionError('the route read the placement file'))):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, _, _), = self.consumed
+        self.assertEqual(request.assignment, self.placed)
 
     def test_busy_mac_claim_refuses_the_route_before_ssh(self) -> None:
         paths = claim_state.state_paths('mac')
@@ -821,13 +1030,18 @@ fi
             'from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED',
             'from scripts.build_targets import mac_linux',
             'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
+            'from scripts.build_queue import admission_wire',
+            'mac_linux.consume_launch_permission = lambda claim, assignment: None',
             'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
-            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)'))
+            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED,',
+            '                assignment=admission_wire.read_assignment(Path(sys.argv[2])).assignment)'))
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
         environment = {**os.environ, 'FIXTURE_GUEST_RESULT': 'hang',
                        'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}
         group_record = self.root / 'run.group'
         with (self.root / 'natedev.log').open('wb') as log, subprocess.Popen(
-                [sys.executable, '-c', program, str(self.repo)], cwd=Path(__file__).resolve().parents[2],
+                [sys.executable, '-c', program, str(self.repo), str(placement_file)], cwd=Path(__file__).resolve().parents[2],
                 env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log) as natedev:
             try:
                 started = time.monotonic() + 30
@@ -1012,10 +1226,10 @@ fi
 
         @contextmanager
         def record_failure(repo: Path, work: SuiteMode | StepJob,
-                           gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
-            with reservation(repo, work, gate_job):
+                           gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
+            with reservation(repo, work, gate_job) as claim:
                 try:
-                    yield
+                    yield claim
                 except mac_linux.GuestUnavailable as error:
                     unproven.append(error)
                     raise
@@ -1044,7 +1258,7 @@ fi
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0),
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
                 result = mac_linux.route(self.repo, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
-                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)
+                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
                 first, = attempts
                 failure, = unproven
                 assert isinstance(failure, mac_linux.GuestEndUnproven), failure
@@ -1165,9 +1379,9 @@ fi
         prove_guest_end = mac_linux.prove_guest_end
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual([type(proof) for proof in proofs],
                                  [mac_linux.GuestEndPending, mac_linux.GuestEndPending, mac_linux.GuestEndProven])
@@ -1280,6 +1494,20 @@ fi
         with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
 
+    def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
+        # A busy Mac can be silent for more than 30 s, so each hop waits the unreachable wait of 600 s.
+        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600)
+        command = settings.command('true')
+        alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
+        mac_hop = list(command[:-2])
+        guest_hop = shlex.split(command[-1])
+        guest_hop = guest_hop[:guest_hop.index('-l')]
+        self.assertEqual(command[-2], 'fixture-mac')
+        for hop in (mac_hop, guest_hop):
+            # ssh uses the first value of an option, so each hop names each keepalive option once.
+            self.assertEqual(hop[-4:], alive)
+            self.assertEqual([word for word in hop if word.startswith('ServerAlive')], alive[1::2])
+
     def test_kept_guest_end_proof_refuses_unreadable_settings(self) -> None:
         settings_user = mac_linux.read_settings(conf.read(self.registry)).guest_user
         settings = self.registry.with_name('mac_linux.conf')
@@ -1326,9 +1554,9 @@ fi
             raise KeyboardInterrupt
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
@@ -1345,10 +1573,10 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 events.append('released')
 
@@ -1387,10 +1615,10 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('released')

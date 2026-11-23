@@ -43,7 +43,8 @@ from scripts.build_hold.owning_session import owning_session
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
 from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
 from scripts.build_targets import build_targets
-from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, entry_kind, main_folder
+from scripts.build_targets.mac_linux import (BWRAP_FAILED, BWRAP_MISSING, COMPILED_START, TOOL_FOLDERS, bindable,
+                                             entry_kind, home_folder, main_folder, setup_failed)
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
@@ -282,9 +283,9 @@ def written_paths(repo: Path) -> list[Path]:
     """The paths that the run writes on natedev. The limit binds only a bindable path, so only such a path is
     one."""
     environment = program_environment()
-    home = hand_made_limit.home_folder(environment)
+    home = home_folder(environment)
     return [Path(os.path.normpath(bind)) for bind in hand_made_limit.write_binds(repo, environment)
-            if hand_made_limit.bindable(bind, home, read=False)]
+            if bindable(bind, home, read=False)]
 
 
 def write_refusal(path: Path, written: Sequence[Path]) -> str | None:
@@ -704,7 +705,7 @@ class NatedevRun:
         """
         bwrap = shutil.which("bwrap")
         if bwrap is None:
-            raise Refused(hand_made_limit.BWRAP_MISSING)
+            raise Refused(BWRAP_MISSING)
         environment = program_environment()
         with ExitStack() as held:
             lock = hand_made_limit.held_output(self.program.argv, self.program.repo, environment, held,
@@ -726,9 +727,9 @@ class NatedevRun:
             tail = hand_made_limit.OutputTail(output)
             with process:
                 status = stream(process, tail)
-            if hand_made_limit.setup_failed(status, status_read):
+            if setup_failed(status, status_read):
                 self.started_at = None
-                raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
+                raise Refused(BWRAP_FAILED.format(status=status))
             if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
                 raise Refused(hand_made_limit.NO_NETWORK)
             return status

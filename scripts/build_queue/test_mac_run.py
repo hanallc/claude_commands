@@ -138,6 +138,17 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(mac_test.command_release(native, self.paths), 0)
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
+    def test_claim_held_names_only_the_exact_guest_claim_holder(self) -> None:
+        start = process_identity.process_start(os.getpid())
+        assert isinstance(start, process_identity.Started)
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED) as claim:
+            self.assertTrue(claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+            self.assertTrue(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
+            self.assertFalse(mac_run.claim_held("mac", claim.claim_id + "-other", os.getpid(), start.start))
+            self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getppid(), start.start))
+            self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
+        self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
+
     def test_quoted_origin_uses_the_shared_repository_scope(self) -> None:
         config = self.checkout / ".git/config"
         origin = ORIGIN

@@ -87,14 +87,25 @@ class UnroutedChange:
 ChangeOwner = StaffRoutedChange | ShowrunnerOwnChange | UnroutedChange
 
 
-def _route_producer(record: staff.StaffSnapshot, identity: staff.StaffId) -> ChangeOwner:
+def producer_row(record: staff.StaffSnapshot, identity: staff.StaffId) -> staff.StaffRow | UnroutedChange:
+    """Find the unit or showrunner that a Producer cell names.
+
+    The staff record keeps retired producers, so a retired unit still gives its row.
+    """
     producer = record.by_id(identity)
     if producer is None:
         return UnroutedChange(f"No staff record for {identity}")
+    if producer.kind not in ("showrunner", "unit"):
+        return UnroutedChange(f"Producer {identity} is not a staff unit or showrunner")
+    return producer
+
+
+def _route_producer(record: staff.StaffSnapshot, identity: staff.StaffId) -> ChangeOwner:
+    producer = producer_row(record, identity)
+    if isinstance(producer, UnroutedChange):
+        return producer
     if producer.kind == "showrunner":
         return ShowrunnerOwnChange(producer.id, producer.name)
-    if producer.kind != "unit":
-        return UnroutedChange(f"Producer {identity} is not a staff unit or showrunner")
     parent = producer
     seen: set[staff.StaffId] = set()
     while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:

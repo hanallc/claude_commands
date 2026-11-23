@@ -74,13 +74,17 @@ for arg in "${@:subcommand_index+1}"; do
 done
 
 # A builds.slice scope came from the build queue: a queued step or an editor.
-# Its Cargo calls start at once. Detached scopes have no queue place.
+# Its Cargo calls start at once. A detached run lives under builds-detached.slice
+# and has no queue place, so its Cargo calls go to the queue.
+# A queued step of a detached run is different: invoke.sh exports its scope folder
+# as BUILDLOG_STEP_SCOPE. When that folder is this cgroup, Cargo starts at once.
 # The override selects a saved cgroup record instead of the host's process state.
 cgroup_file=${CARGO_WRAPPER_CGROUP_FILE:-/proc/self/cgroup}
 in_build_scope=0
 if [[ -r "$cgroup_file" ]]; then
     while IFS= read -r cgroup || [[ -n "$cgroup" ]]; do
-        if [[ "$cgroup" == */builds.slice/* && "$cgroup" != */builds.slice/builds-detached.slice/* ]]; then
+        if [[ "$cgroup" == */builds.slice/* && "$cgroup" != */builds.slice/builds-detached.slice/* ]] ||
+           [[ "$cgroup" == 0::* && "/sys/fs/cgroup${cgroup#0::}" == "${BUILDLOG_STEP_SCOPE-}" ]]; then
             in_build_scope=1
             break
         fi
