@@ -149,11 +149,11 @@ class GpuTestSlots:
     repositories: frozenset[str]
 
     def holds(self, repository: str, step: str) -> bool:
-        return repository in self.repositories and step in GPU_TEST_STEPS
+        return repository in self.repositories and step in TEST_BINARY_STEPS
 
 
-# These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
+# These steps run test binaries. A GPU repository's tests open render apps, and rule 20 holds no place after them.
+TEST_BINARY_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected"})
 RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
@@ -1442,13 +1442,16 @@ def place_kind(job: str) -> str:
     return "test" if job in TEST_JOB_FAMILY else job
 
 
-# "failed": the first step released with a status other than 0. "no_result": its owner ended with no release.
+# "failed": a step released with a status other than 0. "no_result": the owner of its only step ended with no release.
 HeldPlaceEnd = Literal["failed", "no_result"]
 
 
 @dataclass(frozen=True)
 class HeldPlace:
-    """The arrival time of a run that ended in its first step, kept for the next run of its unit and job kind."""
+    """The arrival time of a failed run, kept for the next run of its unit and job kind.
+
+    Rule 20 holds the place when the only step of the run failed, or when a step failed before the tests started.
+    """
     unit: str
     repository: str
     job: str
@@ -1575,7 +1578,7 @@ REPLACE_AFTER_FAIL_MAX_KEY = "replace_after_fail.max_times"
 
 @dataclass(frozen=True)
 class ReplaceAfterFail:
-    """Rule 20: how many times a failed first step keeps its place, and how long a held place waits."""
+    """Rule 20: how many times a failed run keeps its place, and how long a held place waits."""
     max_times: int
     time_limit_seconds: float
 

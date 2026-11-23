@@ -160,16 +160,16 @@ class PlaceTakePageTests(unittest.TestCase):
         self.assertFalse({"machine", "need", "used", "reserved"} & row.keys())
         self.assertEqual(len(page["waiters"]), 4)
 
-    def test_a_held_place_whose_first_step_failed_says_so(self) -> None:
+    def test_a_held_place_whose_run_failed_says_so(self) -> None:
         row = self.held_page(HELD)["held_places"][0]
-        self.assertEqual(row["text"], "First step failed at 16:40. The place waits for the next run of queue until 17:10.")
+        self.assertEqual(row["text"], "Failed at 16:40. The place waits for the next run of queue until 17:10.")
         self.assertEqual(row["text_parts"], [
-            {"kind": "text", "text": "First step failed at 16:40. The place waits for the next run of "},
+            {"kind": "text", "text": "Failed at 16:40. The place waits for the next run of "},
             {"kind": "staff", "text": "queue"}, {"kind": "text", "text": " until 17:10."}])
 
     def test_a_held_place_whose_owner_ended_with_no_result_says_so(self) -> None:
         row = self.held_page(replace(HELD, ended="no_result"))["held_places"][0]
-        self.assertEqual(row["text"], ("First step ended without a result at 16:40. "
+        self.assertEqual(row["text"], ("Ended without a result at 16:40. "
                                        + "The place waits for the next run of queue until 17:10."))
 
     def test_a_run_that_took_a_place_shows_its_order_note(self) -> None:

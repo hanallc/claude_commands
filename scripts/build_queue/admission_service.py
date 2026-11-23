@@ -1561,22 +1561,30 @@ def _place_key(owner: wire.Owner | placement.SubmittingOwner, since: float) -> s
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
-def _run_step_key(owner: wire.Owner | placement.SubmittingOwner, since: float, step: str, scope: str) -> str:
+@dataclass(frozen=True)
+class RunStep:
+    """One step of a run, as rule 20 counts it."""
+    key: str
+    # The step runs test binaries (records.TEST_BINARY_STEPS).
+    tests: bool
+
+
+def _run_step(owner: wire.Owner | placement.SubmittingOwner, since: float, step: str, scope: str) -> RunStep:
     """Name one step of a run: verify.sh sends every step with one owner and one arrival time.
 
     The local grant and the Mac start of one step give the same name, so a step that moves counts once.
     """
-    return "\t".join((_place_key(owner, since), step, scope))
+    return RunStep("\t".join((_place_key(owner, since), step, scope)), step in records.TEST_BINARY_STEPS)
 
 
-def _step_key(record: ReservationRecord) -> str:
-    return _run_step_key(record.owner, record.queue_waiter["since"], record.step, record.test_scope)
+def _local_step(record: ReservationRecord) -> RunStep:
+    return _run_step(record.owner, record.queue_waiter["since"], record.step, record.test_scope)
 
 
-def _placed_step_key(request: wire.PlacementRequest) -> str:
+def _placed_step(request: wire.PlacementRequest) -> RunStep:
     profile = request.profile
     scope = profile.scope if isinstance(profile, records.StepProfile) else "full"
-    return _run_step_key(request.owner, request.since, profile.step, scope)
+    return _run_step(request.owner, request.since, profile.step, scope)
 
 
 def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
@@ -2498,7 +2506,7 @@ class AdmissionServer:
         for item in parked:
             self._send(item.connection, refused)
 
-    def _granted(self, run: wire.RunIdentity | wire.NoRun, step: str) -> None:
+    def _granted(self, run: wire.RunIdentity | wire.NoRun, step: RunStep) -> None:
         """Count a grant of the run. A new grant of its first step does not count again.
 
         The caller can give a grant back before its command runs and then wait again for the same step.
@@ -2511,35 +2519,49 @@ class AdmissionServer:
         if place is None or not isinstance(line := place.unit_place, status_wire.UnitPlace):
             return
         if line.reservations == 0:
-            line = replace(line, reservations=1, first_step=step)
-        elif step == line.first_step:
+            line = replace(line, reservations=1, first_step=step.key)
+        elif step.key == line.first_step:
             line = replace(line, first_status=status_wire.NO_FIRST_STATUS)
         else:
             line = replace(line, reservations=line.reservations + 1)
+        if step.key == line.failed_step:
+            line = replace(line, failed_step="")
+        if step.tests:
+            line = replace(line, tests_started=True)
         self.run_places[key] = replace(place, unit_place=line)
 
-    def _released(self, run: wire.RunIdentity | wire.NoRun, step: str, status: int) -> None:
-        """Keep the status of the first step while it is the only step of the run."""
+    def _released(self, run: wire.RunIdentity | wire.NoRun, step: RunStep, status: int) -> None:
+        """Keep the status of the first step while it is the only step of the run.
+
+        Also keep the latest step that failed before the tests started. A failed test step keeps no place.
+        """
         if not isinstance(run, wire.RunIdentity):
             return
         key = records.run_owner(run.pid, run.start_time)
         place = self.run_places.get(key)
-        if (place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace)
-                and line.reservations == 1 and line.first_step == step
+        if place is None or not isinstance(line := place.unit_place, status_wire.UnitPlace):
+            return
+        if (line.reservations == 1 and line.first_step == step.key
                 and isinstance(line.first_status, status_wire.NoFirstStatus)):
-            self.run_places[key] = replace(place, unit_place=replace(line, first_status=status))
+            line = replace(line, first_status=status)
+        if status != 0 and not step.tests and not line.tests_started:
+            line = replace(line, failed_step=step.key)
+        self.run_places[key] = replace(place, unit_place=line)
 
-    def _handed_off(self, run: wire.RunIdentity | wire.NoRun, step: str) -> None:
-        """A grant that only held the place until the command sent its own first step is not a step."""
+    def _handed_off(self, run: wire.RunIdentity | wire.NoRun, step: RunStep) -> None:
+        """A grant that only held the place until the command sent its own first step is not a step.
+
+        The caller does not call _released for a handoff, so its status is not the result of a step.
+        """
         if not isinstance(run, wire.RunIdentity):
             return
         key = records.run_owner(run.pid, run.start_time)
         place = self.run_places.get(key)
         # Only a handoff before any other step is known: copies.py starts a new run for each command.
         if (place is not None and isinstance(line := place.unit_place, status_wire.UnitPlace)
-                and line.reservations == 1 and line.first_step == step):
-            self.run_places[key] = replace(place, unit_place=replace(
-                line, reservations=0, first_step="", first_status=status_wire.NO_FIRST_STATUS))
+                and line.reservations == 1 and line.first_step == step.key):
+            self.run_places[key] = replace(place, unit_place=replace(line, reservations=0, first_step="",
+                first_status=status_wire.NO_FIRST_STATUS, tests_started=False))
 
     def _copy_passed(self, run: wire.RunIdentity | wire.NoRun) -> None:
         """A passed copy is the result of its step.
@@ -2547,6 +2569,7 @@ class AdmissionServer:
         The copy watch then stops the local step, so the status of that local release is not the result.
         A copy has its own owner and arrival time, so it cannot name its step. A copy runs only while
         its local step holds a grant, so in a run of one step it is a copy of that step.
+        The copy watch copies only a test step (cargo nextest), so its local release never sets failed_step.
         """
         if not isinstance(run, wire.RunIdentity):
             return
@@ -2557,13 +2580,13 @@ class AdmissionServer:
             self.run_places[key] = replace(place, unit_place=replace(line, first_status=0))
 
     def _keep_place(self, ended: wire.RunPlace, now: float) -> None:
-        """Rule 20: keep the place of a run that failed or ended with no result in its only step."""
+        """Rule 20: keep the place of a run that failed before its tests, or failed or ended with no result in its only step."""
         line = ended.unit_place
         rules = self.last_usable_configuration
         if (not isinstance(line, status_wire.UnitPlace) or not isinstance(rules, records.MemoryConfig)
                 or not isinstance(limits := rules.replace_after_fail, records.ReplaceAfterFail)
-                or isinstance(line.replaced_by, wire.RunIdentity) or line.reservations != 1
-                or line.first_status == 0 or line.replaces >= limits.max_times):
+                or isinstance(line.replaced_by, wire.RunIdentity) or line.replaces >= limits.max_times
+                or not (line.failed_step or (line.reservations == 1 and line.first_status != 0))):
             return
         replaces = line.replaces + 1
         waiting = self._waiting_runs(ended.unit, line.repository, line.job)
@@ -2576,7 +2599,8 @@ class AdmissionServer:
         key = (ended.unit, line.repository, records.place_kind(line.job))
         same = [kept for kept in self.held_places
                 if (kept.unit, kept.repository, records.place_kind(kept.job)) == key]
-        end: records.HeldPlaceEnd = "no_result" if isinstance(line.first_status, status_wire.NoFirstStatus) else "failed"
+        end: records.HeldPlaceEnd = ("no_result" if not line.failed_step
+            and isinstance(line.first_status, status_wire.NoFirstStatus) else "failed")
         held = records.HeldPlace(ended.unit, line.repository, line.job,
             min((ended.since, *(kept.since for kept in same))), now, now + limits.time_limit_seconds,
             records.run_owner(ended.run.pid, ended.run.start_time),
@@ -3731,7 +3755,7 @@ class AdmissionServer:
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
                 if isinstance(request, wire.AdmitRequest) and isinstance(admission.place, wire.LocalPlace):
-                    self._granted(request.run, _step_key(admission))
+                    self._granted(request.run, _local_step(admission))
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
                 if slot is not None:
                     current = self.verify_run_slots.get(slot.key)
@@ -3776,8 +3800,6 @@ class AdmissionServer:
                 pass
         if started:
             self._finish_verify_grant(record.reservation_id, started=True)
-        if isinstance(ending, ReleaseStatus):
-            self._released(record.run, _step_key(record), ending.status)
         record = replace(record, ending=ending)
         self.reservations[episode] = record
         self.persist()
@@ -5132,7 +5154,7 @@ done
         self.assignments[key] = saved
         # A speculative copy repeats a step of the run, so it is not a step of its own.
         if destination.provider != "local" and not isinstance(submitted.purpose, placement.SpeculativeCopy):
-            self._granted(submitted.run, _placed_step_key(submitted))
+            self._granted(submitted.run, _placed_step(submitted))
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
@@ -5263,7 +5285,7 @@ done
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is not None and assignment.destination.provider != "local":
                 if not isinstance(submitted.purpose, placement.SpeculativeCopy):
-                    self._released(submitted.run, _placed_step_key(submitted), outcome.status)
+                    self._released(submitted.run, _placed_step(submitted), outcome.status)
                 elif outcome.status == 0:
                     self._copy_passed(submitted.run)
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
@@ -5673,9 +5695,11 @@ done
             episode = next((episode for episode, record in self.reservations.items() if record.reservation_id == request.reservation), None)
             if episode is not None:
                 record = self.reservations[episode]
+                # Before _end, so that its save keeps the change. The status of a handoff is not a step result.
                 if request.ending == "handed_off":
-                    # Before _end, so that its save keeps the change and its status is not the step result.
-                    self._handed_off(record.run, _step_key(record))
+                    self._handed_off(record.run, _local_step(record))
+                else:
+                    self._released(record.run, _local_step(record), request.status)
                 self._end(episode, ReleaseStatus(key, request.status))
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         elif isinstance(request, wire.WidthRequest):

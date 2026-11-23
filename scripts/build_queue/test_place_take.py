@@ -1,4 +1,4 @@
-"""Rules 13 and 20: a new run of a unit takes the place of its waiting run or of its failed first step."""
+"""Rules 13 and 20: a new run of a unit takes the place of its waiting run or of its failed run."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -78,6 +78,18 @@ def failed_run(fixture: AdmissionFixture, *, status: int = 1,
     _ = first_step(fixture, request, status)
     fixture.end_run(run)
     return run, request
+
+
+def run_steps(fixture: AdmissionFixture, run: wire.RunIdentity, *steps: tuple[str, int]) -> float:
+    """Grant and release each step of one run in order, and give the arrival time of the run.
+
+    verify.sh sends each step of a run with one owner and one arrival time.
+    """
+    owner, since = fixture.proc.spawn(), fixture.clock.now()
+    for step, status in steps:
+        _ = first_step(fixture, unit_request(fixture, run, owner=owner, since=since, step=step, episode=step), status)
+        fixture.clock.advance(1)
+    return since
 
 
 def held(fixture: AdmissionFixture) -> tuple[records.HeldPlace, ...]:
@@ -197,7 +209,7 @@ def finish_on_mac(fixture: PlacementFixture, request: wire.PlacementRequest, ass
 
 
 class FailedFirstStepTests(unittest.TestCase):
-    """Rule 20: a run that fails at its first step keeps its place for one new run of the unit."""
+    """Rule 20: a run that fails at its only step, or at a step before its tests, keeps its place for one new run."""
 
     def test_a_new_run_takes_the_arrival_of_a_failed_first_step(self) -> None:
         with AdmissionFixture() as fixture:
@@ -231,18 +243,49 @@ class FailedFirstStepTests(unittest.TestCase):
             wait_in_line(fixture, request)
             self.assertEqual(run_since(fixture, third), request.since)
 
-    def test_a_fail_at_the_second_step_keeps_no_place(self) -> None:
+    def test_a_fail_at_a_lint_step_after_a_passed_step_keeps_the_place(self) -> None:
         with AdmissionFixture() as fixture:
             place_rules(fixture)
             run = fixture.run_owner()
-            # verify.sh sends each step of a run with one owner and one arrival time.
-            owner, since = fixture.proc.spawn(), fixture.clock.now()
-            _ = first_step(fixture, unit_request(fixture, run, owner=owner, since=since, step="check",
-                                                 episode="check"), 0)
-            fixture.clock.advance(1)
-            _ = first_step(fixture, unit_request(fixture, run, owner=owner, since=since, step="clippy",
-                                                 episode="clippy"), 1)
+            since = run_steps(fixture, run, ("mend", 0), ("clippy", 1))
             self.assertEqual(unit_place(fixture, run).reservations, 2)
+            fixture.end_run(run)
+            kept, = held(fixture)
+            self.assertEqual((kept.since, kept.replaces, kept.ended), (since, 1, "failed"))
+            fixture.clock.advance(60)
+            new_run = fixture.run_owner()
+            wait_in_line(fixture, unit_request(fixture, new_run))
+            self.assertEqual(run_since(fixture, new_run), since)
+            self.assertEqual(unit_place(fixture, new_run).took_place, "failed")
+            self.assertFalse(held(fixture))
+
+    def test_a_fail_at_a_lint_step_after_a_test_step_started_keeps_no_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            _ = run_steps(fixture, run, ("mend", 0), ("nextest", 0), ("clippy", 1))
+            fixture.end_run(run)
+            self.assertFalse(held(fixture))
+
+    def test_a_failed_test_step_after_passed_lint_steps_keeps_no_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            _ = run_steps(fixture, run, ("mend", 0), ("clippy", 0), ("nextest", 101))
+            fixture.end_run(run)
+            self.assertFalse(held(fixture))
+
+    def test_a_lint_grant_given_back_with_a_failed_status_and_then_passed_keeps_no_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            owner, since = fixture.proc.spawn(), fixture.clock.now()
+            _ = first_step(fixture, unit_request(fixture, run, owner=owner, since=since, step="mend", episode="mend"), 0)
+            # The caller gives the clippy grant back before its command runs, then waits again for clippy.
+            for episode, status in (("given-back", 1), ("ran", 0)):
+                fixture.clock.advance(1)
+                _ = first_step(fixture, unit_request(fixture, run, owner=owner, since=since, step="clippy",
+                                                     episode=episode), status)
             fixture.end_run(run)
             self.assertFalse(held(fixture))
 
@@ -280,6 +323,21 @@ class FailedFirstStepTests(unittest.TestCase):
             fixture.end_run(run)
             kept, = held(fixture)
             self.assertEqual((kept.since, kept.ended), (prepared.since, "failed"))
+
+    def test_a_lint_grant_handed_off_with_a_failed_status_keeps_no_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            fixture.free(60 * GIB)
+            fixture.allow_next_start()
+            grant = only_admitted(fixture.server.handle_request(unit_request(fixture, run, step="clippy",
+                                                                             episode="prepared")))
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                "handed-off", grant.reservation, 1, "handed_off")), [wire.Ok()])
+            fixture.clock.advance(1)
+            _ = run_steps(fixture, run, ("clippy", 0), ("nextest", 0))
+            fixture.end_run(run)
+            self.assertFalse(held(fixture))
 
     def test_a_mac_step_counts_as_a_step_and_its_speculative_copy_does_not(self) -> None:
         for copy in (False, True):
@@ -335,6 +393,21 @@ class FailedFirstStepTests(unittest.TestCase):
                 self.assertEqual(unit_place(fixture, run).reservations, 1)
                 fixture.end_run(run)
                 self.assertFalse(held(fixture))
+
+    def test_a_red_mac_lint_step_after_a_passed_step_keeps_the_place(self) -> None:
+        with PlacementFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            _ = first_step(fixture, unit_request(fixture, run, step="mend", episode="mend"), 0)
+            request = mac_step(fixture, run)
+            request = replace(request, profile=replace(request.profile, step="clippy"),
+                              identity=replace(request.identity, step="clippy"))
+            assignment, claim = start_on_mac(fixture, request)
+            self.assertEqual(unit_place(fixture, run).reservations, 2)
+            finish_on_mac(fixture, request, assignment, claim, 101)
+            fixture.end_run(run)
+            kept, = held(fixture)
+            self.assertEqual(kept.ended, "failed")
 
     def test_a_run_that_ends_while_it_waits_keeps_no_place(self) -> None:
         with AdmissionFixture() as fixture:
@@ -393,6 +466,22 @@ class FailedFirstStepTests(unittest.TestCase):
             self.assertFalse(state.held_places)
             self.assertTrue(all(isinstance(place.unit_place, status_wire.OutsideUnitRules)
                                 for place in state.run_places.values()))
+
+    def test_a_saved_unit_place_with_no_test_or_failed_step_fields_reads(self) -> None:
+        with AdmissionFixture() as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            wait_in_line(fixture, unit_request(fixture, run))
+            fixture.server.persist()
+            path = fixture.state_dir / "state.json"
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            for place in cast(dict[str, dict[str, dict[str, object]]], saved["run_places"]).values():
+                del place["unit_place"]["tests_started"], place["unit_place"]["failed_step"]
+            _ = path.write_text(json.dumps(saved))
+            self.assertEqual(service.state_check(fixture.state_dir), 0)
+            line = service.read_state(fixture.state_dir).run_places[records.run_owner(run.pid, run.start_time)].unit_place
+            assert isinstance(line, status_wire.UnitPlace)
+            self.assertEqual((line.tests_started, line.failed_step), (False, ""))
 
     def test_another_units_new_run_does_not_take_the_place(self) -> None:
         with AdmissionFixture() as fixture:
@@ -517,7 +606,9 @@ class BothSourcesTests(unittest.TestCase):
             unit: str = ""
 
         place = wire.RunPlace(wire.RunIdentity(1, "2"), 3.0, wire.Owner(1, "2"), UNIT,
-                              unit_place=status_wire.UnitPlace("fixture", JOB, ("natedev",), 1, "step", 1, 1))
+                              unit_place=status_wire.UnitPlace("fixture", JOB, ("natedev",), reservations=2,
+                                  first_step="step", first_status=0, tests_started=True, failed_step="lint",
+                                  replaces=1))
         older = wire.parse_record(wire.encode_record(place), RunPlace)
         self.assertEqual((older.run, older.since, older.unit), (place.run, place.since, UNIT))
         self.assertEqual(wire.parse_record(wire.encode_record(place), wire.RunPlace), place)

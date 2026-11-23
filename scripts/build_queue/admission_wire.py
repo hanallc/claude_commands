@@ -142,7 +142,7 @@ class NotReplaced:
 
 NOT_REPLACED = NotReplaced()
 
-# The kind of run whose place a new run took: a run that ended in its first step, or a run that waited.
+# The kind of run whose place a new run took: a run that failed (rule 20), or a run that waited (rule 13).
 TookPlace = Literal["", "failed", "waiting"]
 
 
@@ -157,7 +157,11 @@ class UnitPlace:
     reservations: int = 0
     first_step: str = ""
     first_status: int | NoFirstStatus = NO_FIRST_STATUS
-    # How many times a place of a failed first step moved to a newer run of the unit.
+    # A step that runs test binaries got a grant. After that, a failed step holds no place.
+    tests_started: bool = False
+    # The step key of the latest step that failed before the tests started; "" when no step failed.
+    failed_step: str = ""
+    # How many times a place of a failed run moved to a newer run of the unit.
     replaces: int = 0
     replaced_by: RunIdentity | NotReplaced = NOT_REPLACED
     took_place: TookPlace = ""

@@ -1025,7 +1025,7 @@ class MemoryWaitRow(WaitRow):
 
 
 class HeldPlaceRow(TypedDict):
-    """The place of a run that ended in its first step or while it waited. It waits for the next run of its unit."""
+    """The place of a failed run (rule 20). It waits for the next run of its unit."""
 
     kind: Literal["held"]
     key: str
@@ -1042,7 +1042,7 @@ def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlac
         return datetime.fromtimestamp(moment, zone).strftime("%H:%M")
 
     unit = public_queue_text(place.unit)
-    ended = "First step failed" if place.ended == "failed" else "First step ended without a result"
+    ended = "Failed" if place.ended == "failed" else "Ended without a result"
     parts = staff_names.text_parts(f"{ended} at {clock(place.failed_at)}. The place waits for the next run of ",
                                    staff_names.StaffReference(unit), f" until {clock(place.ends_at)}.")
     return {"kind": "held", "key": place.failed_run, "unit": StaffUnitName(unit) if unit else "", "since": place.since,
