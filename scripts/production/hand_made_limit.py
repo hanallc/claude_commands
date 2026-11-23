@@ -15,6 +15,7 @@ import re
 import shutil
 
 from scripts.build_hold import cargo_folder
+from scripts.lib import conf
 from scripts.production.hand_made_route import Output, Program, in_checkout
 from scripts.worktree import worktrees
 
@@ -37,11 +38,15 @@ EXIT_STATUS = re.compile(rb'"exit-code"\s*:')
 TARGET_REFUSAL = "the run builds in {place}; leave out --target-dir, or give that folder"
 OUTPUT_REFUSAL = ("the run cannot build in {place}, because {reason}; make the checkout target link name the build "
                   + "folder of this checkout, or set CARGO_TARGET_DIR to a real folder that does not hold the home folder")
-# The start of a cargo error line, and the text of each cargo error that offline mode causes.
-CARGO_ERROR = b"error: "
-OFFLINE = b"--offline"
-# The most lines of a cargo error that the output holds before it knows the cause.
-HELD_LINES = 20
+TOOLS_REFUSAL = "the checkout holds the tools that check the run; use a worktree"
+# The texts of the cargo errors that offline mode causes, from cargo 1.99.1 runs with CARGO_NET_OFFLINE=true:
+# a git source, a registry resolve, and a crate download.
+OFFLINE_TEXTS = (b"you are in the offline mode (--offline)", b"offline mode (via `--offline`)",
+                 b"--offline was specified")
+# The bytes at the end of the program output that the offline check reads.
+TAIL_BYTES = 64 * 1024
+# An ANSI colour or style code, which cargo puts in its output when the terminal takes colour.
+ANSI_CODE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
 NO_NETWORK = ("a hand made run has no network, so cargo cannot fetch a dependency; a normal run of this line "
               + "must fetch the dependency first")
 BWRAP_MISSING = "bwrap is not on PATH, so the run cannot start under the read limit; the program did not start"
@@ -93,6 +98,21 @@ def bindable(path: Path, home: Path, *, read: bool) -> bool:
     real = Path(os.path.realpath(path))
     return (os.path.lexists(path) and not home.is_relative_to(path)
             and (real == Path(os.path.normpath(path)) or (read and real.is_relative_to(STORE))))
+
+
+def tools_refusal(checkout: Path, environment: Mapping[str, str]) -> str:
+    """The refusal of a checkout that holds, or is in, a folder of the tools that check the run: the repository
+    of this code, the build-hold cargo wrapper folder, or the config folder. The run can write its checkout, so it
+    could change the check of the next run. Empty for none."""
+    real = Path(os.path.realpath(checkout))
+    tools = (Path(__file__).resolve().parents[2], *wrapper_folders(environment.get("PATH", "")),
+             Path(os.path.realpath(conf.directory())))
+    return TOOLS_REFUSAL if any(tool.is_relative_to(real) or real.is_relative_to(tool) for tool in tools) else ""
+
+
+def limit_refusal(argv: Sequence[str], checkout: Path, environment: Mapping[str, str]) -> str:
+    """The refusal of a run that the limit cannot take; the tools check comes before the build folder model."""
+    return tools_refusal(checkout, environment) or output_refusal(argv, checkout, environment)
 
 
 def output_refusal(argv: Sequence[str], checkout: Path, environment: Mapping[str, str]) -> str:
@@ -231,59 +251,20 @@ def setup_failed(status: int, status_fd: int) -> bool:
 
 
 @dataclass
-class OfflineNote:
-    """The output of the program, with the no network line just before a cargo error that offline mode causes.
-
-    A cargo error line and the lines after it wait until they show the offline cause, HELD_LINES lines come,
-    or the program ends. A last line that can be the start of a cargo error line waits for the next chunk.
-    Other output passes at once.
-    """
+class OutputTail:
+    """The program output, which passes at once and unchanged; the last TAIL_BYTES bytes stay for the offline
+    check."""
     output: Output
-    held: bytes = b""
     tail: bytes = b""
-    line_start: bool = True
-    offline: bool = False
 
     def write(self, chunk: bytes) -> None:
-        if not self.held:
-            data, self.tail = self.tail + chunk, b""
-            start = self.error_start(data)
-            given = start if start >= 0 else self.tail_start(data)
-            if given:
-                self.output.write(data[:given])
-            if start < 0:
-                self.tail = data[given:]
-                self.line_start = bool(self.tail) or (data.endswith(b"\n") if data else self.line_start)
-                return
-            chunk = data[start:]
-        self.held += chunk
-        if not self.offline and OFFLINE in self.held:
-            self.offline = True
-            self.output.write(f"hand made: {NO_NETWORK}\n".encode())
-            self.end()
-        elif self.held.count(b"\n") > HELD_LINES:
-            self.end()
+        self.output.write(chunk)
+        self.tail = (self.tail + chunk)[-TAIL_BYTES:]
 
-    def error_start(self, chunk: bytes) -> int:
-        """The index of the first cargo error line in the chunk, or -1."""
-        if self.offline:
-            return -1
-        if self.line_start and chunk.startswith(CARGO_ERROR):
-            return 0
-        found = chunk.find(b"\n" + CARGO_ERROR)
-        return found + 1 if found >= 0 else -1
 
-    def tail_start(self, data: bytes) -> int:
-        """The index of a last line that is a part of the start of a cargo error line, else the data length."""
-        begin = data.rfind(b"\n") + 1
-        rest = data[begin:]
-        if self.offline or not rest or (not begin and not self.line_start) or not CARGO_ERROR.startswith(rest):
-            return len(data)
-        return begin
-
-    def end(self) -> None:
-        """Give the held output; the program ended or the cause is known."""
-        held, self.held, self.tail = self.tail + self.held, b"", b""
-        if held:
-            self.line_start = held.endswith(b"\n")
-            self.output.write(held)
+def offline_failure(argv: Sequence[str], status: int, tail: bytes) -> bool:
+    """cargo failed because offline mode stopped a dependency fetch: the program is cargo, the status is not 0,
+    and the end of the output has a cargo offline text."""
+    text = ANSI_CODE.sub(b"", tail)
+    return (bool(argv) and Path(argv[0]).name == "cargo" and status != 0
+            and any(offline in text for offline in OFFLINE_TEXTS))

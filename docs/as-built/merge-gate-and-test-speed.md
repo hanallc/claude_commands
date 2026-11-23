@@ -100,11 +100,12 @@ When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to
 If AWS refuses that unassigned run, natedev runs the selection.
 
 On natedev, a hand made run starts its program under `bwrap` with a read limit (`scripts/production/hand_made_limit.py`).
-The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
+The program reads only the system folders, the toolchains, the cargo config and its `PATH` folders, and it writes only the checkout, the cargo registry and git folders, the cargo lock files `CARGO_HOME/.package-cache`, `CARGO_HOME/.package-cache-mutate` and `CARGO_HOME/.global-cache`, `SCCACHE_DIR`, the one cargo build output folder and the attempt temp folder, which it sees as `/tmp`.
 A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it counts in the program scope memory and ends with the run. `~/.ssh`, the ssh agent and `~/.config/git` are hidden.
 The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
 The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
-The program has no network and no display. `CARGO_NET_OFFLINE` is `true`, and a dependency fetch ends the attempt as a refusal with a no network line before the cargo error.
+The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
+natedev refuses a checkout that holds, or is in, a folder of the tools that check the run: the repository of the checker code, the build-hold cargo wrapper folder, or the config folder.
 When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
 
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).

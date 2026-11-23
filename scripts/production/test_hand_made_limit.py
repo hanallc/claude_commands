@@ -338,7 +338,7 @@ class NatedevRunTests(unittest.TestCase):
             place=self.program.repo / "target", reason=NOT_ASSIGNED))
         self.assertEqual(place.started, [])
 
-    def test_a_dependency_fetch_ends_the_attempt_as_a_refusal_with_the_no_network_line_first(self) -> None:
+    def test_a_dependency_fetch_ends_the_attempt_as_the_no_network_refusal(self) -> None:
         checkout = self.program.repo
         (checkout / "src").mkdir()
         _ = (checkout / "Cargo.toml").write_text(GIT_CRATE)
@@ -348,43 +348,51 @@ class NatedevRunTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": program_path()}), self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(output, None))
         self.assertEqual(str(caught.exception), hand_made_limit.NO_NETWORK)
-        text = output.getvalue().decode()
-        note = text.index(f"hand made: {hand_made_limit.NO_NETWORK}\n")
-        self.assertLess(note, text.index("error: failed to get `missing`"), text)
-        self.assertIn("offline mode", text)
+        self.assertIn(b"you are in the offline mode (--offline)", output.getvalue())
 
-
-class OfflineNoteTests(unittest.TestCase):
-    """The no network line comes just before a cargo error from offline mode, and only then."""
-
-    def written(self, *chunks: bytes) -> tuple[bytes, bool]:
+    def run_script(self, argv: tuple[str, ...], script: str) -> tuple[bytes, Refused | int]:
+        """Run the script as the start file of argv under the limit: the output, and the refusal or the status."""
+        start = self.program.repo / "start"
+        _ = start.write_text(f"#!/bin/sh\n{script}\n")
+        start.chmod(0o755)
         output = io.BytesIO()
-        noted = hand_made_limit.OfflineNote(hand_made.OutputCopy(output, None))
-        for chunk in chunks:
-            noted.write(chunk)
-        noted.end()
-        return output.getvalue(), noted.offline
+        run = hand_made.NatedevRun(FakePlace(), Program(argv, self.program.repo, start, ()), self.root / "tmp")
+        result: Refused | int
+        try:
+            result = run.run(hand_made.OutputCopy(output, None))
+        except Refused as refused:
+            result = refused
+        return output.getvalue(), result
 
-    def test_an_offline_error_gets_the_line_before_it(self) -> None:
-        note = f"hand made: {hand_made_limit.NO_NETWORK}\n".encode()
-        self.assertEqual(self.written(b"Compiling a\nerror: failed to get `x`\n", b"\nCaused by:\n",
-                                      b"  you are in the offline mode (--offline)\n", b"after\n"),
-                         (b"Compiling a\n" + note + b"error: failed to get `x`\n\nCaused by:\n"
-                          + b"  you are in the offline mode (--offline)\nafter\n", True))
+    def test_a_cargo_failure_with_an_offline_text_in_colour_is_the_no_network_refusal(self) -> None:
+        output, result = self.run_script(("cargo", "build"), "printf '\\033[1m\\033[91merror\\033[0m: failed to "
+                                         + "download\\n  but \\033[1m--offline\\033[0m was specified\\n'; exit 101")
+        self.assertIsInstance(result, Refused)
+        self.assertEqual(str(result), hand_made_limit.NO_NETWORK)
+        self.assertIn(b"\x1b[91merror\x1b[0m: failed to download\n", output)
 
-    def test_an_offline_error_that_two_chunks_split_gets_the_line_before_it(self) -> None:
-        note = f"hand made: {hand_made_limit.NO_NETWORK}\n".encode()
-        for first, second in ((b"Compiling a\nerr", b"or: failed"), (b"Compiling a\n", b"error: failed"),
-                              (b"Compiling a\nerror:", b" failed")):
-            with self.subTest(first=first):
-                self.assertEqual(self.written(first, second, b" to get `x`\n  offline mode (--offline)\n"),
-                                 (b"Compiling a\n" + note + b"error: failed to get `x`\n  offline mode (--offline)\n",
-                                  True))
+    def test_another_program_with_an_error_and_the_offline_word_is_no_refusal(self) -> None:
+        output, result = self.run_script(("sh", "-c", "x"), "echo 'error: x'; echo 'see --offline'; exit 1")
+        self.assertEqual((output, result), (b"error: x\nsee --offline\n", 1))
 
-    def test_other_output_and_another_error_pass_unchanged(self) -> None:
-        chunks = (b"ran\n", b"error: could not compile `x`\n", *(b"line\n" for _ in range(30)),
-                  b"the error: is in the line\n", b"err", b"and more\n", b"e")
-        self.assertEqual(self.written(*chunks), (b"".join(chunks), False))
+
+class OfflineFailureTests(unittest.TestCase):
+    """Only a cargo failure with a cargo offline text is the no network refusal; output passes at once."""
+
+    def test_output_passes_at_once_and_unchanged(self) -> None:
+        output = io.BytesIO()
+        tail = hand_made_limit.OutputTail(hand_made.OutputCopy(output, None))
+        tail.write(b"error: x\n")
+        self.assertEqual(output.getvalue(), b"error: x\n")
+        tail.write(b"y" * hand_made_limit.TAIL_BYTES)
+        self.assertEqual(len(tail.tail), hand_made_limit.TAIL_BYTES)
+
+    def test_a_cargo_status_0_or_another_program_is_no_refusal(self) -> None:
+        text = b"attempting to make an HTTP request, but --offline was specified\n"
+        self.assertTrue(hand_made_limit.offline_failure(("/bin/cargo", "build"), 101, text))
+        self.assertFalse(hand_made_limit.offline_failure(("cargo", "build"), 0, text))
+        self.assertFalse(hand_made_limit.offline_failure(("sh", "-c", "cargo build"), 101, text))
+        self.assertFalse(hand_made_limit.offline_failure(("cargo", "build"), 101, b"error: x\nsee --offline\n"))
 
 
 class OutputFolderTests(unittest.TestCase):
@@ -441,6 +449,23 @@ class OutputFolderTests(unittest.TestCase):
                 (checkout / "target").symlink_to(named)
                 self.assertEqual(hand_made_limit.output_refusal(("cargo", "build"), checkout, dict(os.environ)), refused)
                 self.assertEqual(hand_made_limit.bound_output(checkout, dict(os.environ)), checkout / "target")
+
+    def test_a_checkout_that_holds_or_is_in_a_tool_folder_is_refused_and_a_worktree_is_not(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        hold = root / "scripts" / hand_made_limit.BUILD_HOLD
+        hold.mkdir(parents=True)
+        (hold / "cargo").touch(mode=0o755)
+        checker = Path(hand_made_limit.__file__).resolve().parents[2]
+        refused = hand_made_limit.TOOLS_REFUSAL
+        cases: tuple[tuple[Path, dict[str, str]], ...] = (
+            (checker, {}), (checker / "scripts", {}), (root, {"PATH": str(hold)}),
+            (root, {"CONF_DIR": str(root / "config")}))
+        for checkout, values in cases:
+            with self.subTest(checkout=checkout, values=values), mock.patch.dict(os.environ, values):
+                program = Program(("true",), checkout, None, ())
+                self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(program), refused)
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config")}):
+            self.assertEqual(hand_made_limit.tools_refusal(root / "worktree", {"PATH": str(root / "bin")}), "")
 
     def test_natedev_takes_no_run_that_names_another_output_folder(self) -> None:
         program = Program(("cargo", "build", "--target-dir", "other"), Path("/fixture/checkout"), None, ())

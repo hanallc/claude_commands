@@ -603,8 +603,9 @@ def program_environment() -> dict[str, str]:
 
 
 def natedev_refusal(program: Program) -> str:
-    """Why natedev cannot take the program: a word that names another cargo build output folder."""
-    return hand_made_limit.output_refusal(program.argv, program.repo, program_environment())
+    """Why natedev cannot take the program: a checkout that holds the tools that check the run, or an output
+    folder that the limit cannot bind."""
+    return hand_made_limit.limit_refusal(program.argv, program.repo, program_environment())
 
 
 @dataclass
@@ -625,14 +626,15 @@ class NatedevRun:
     def run(self, output: Output) -> int:
         """Run the program under bwrap.
 
-        A limit that bwrap does not set up, an output folder that the limit cannot bind (the program can change
-        the target link after the check), or a cargo error from offline mode ends the attempt as a refusal.
+        A checkout that holds the tools that check the run, a limit that bwrap does not set up, an output folder
+        that the limit cannot bind (the program can change the target link after the check), or a cargo failure
+        from offline mode ends the attempt as a refusal.
         """
         bwrap = shutil.which("bwrap")
         if bwrap is None:
             raise Refused(hand_made_limit.BWRAP_MISSING)
         environment = program_environment()
-        refusal = hand_made_limit.output_refusal(self.program.argv, self.program.repo, environment)
+        refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
         if refusal:
             raise Refused(refusal)
         self.temp.mkdir(exist_ok=True)
@@ -645,14 +647,13 @@ class NatedevRun:
             finally:
                 os.close(status_write)
             self.started_at = time.time()
-            noted = hand_made_limit.OfflineNote(output)
+            tail = hand_made_limit.OutputTail(output)
             with process:
-                status = stream(process, noted)
-            noted.end()
+                status = stream(process, tail)
             if hand_made_limit.setup_failed(status, status_read):
                 self.started_at = None
                 raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
-            if noted.offline:
+            if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
                 raise Refused(hand_made_limit.NO_NETWORK)
             return status
         finally:
