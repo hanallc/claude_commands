@@ -27,10 +27,9 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.build_targets import target_config
-from scripts.copies import copy_owner
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
-from scripts.lib import conf, scratch
+from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
 from scripts.lib.showrunner_state import state_root
@@ -1945,6 +1944,11 @@ def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
 
 def folder_owner(worktree: Path) -> str:
     """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
+    # These imports stay here, so a process start of this module does not load scratch.
+    # copy_owner imports no build_queue module, so this import makes no cycle.
+    from scripts.copies import copy_owner
+    from scripts.lib import scratch
+
     try:
         # The queue request reads the owner only; it never clears a stale removal intent.
         return copy_owner.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)

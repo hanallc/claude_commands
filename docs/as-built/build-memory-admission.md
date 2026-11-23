@@ -1024,7 +1024,8 @@ The client checks the staff name, the exported name, and the session folder name
 `admission_records.request_owner(worktree)` finds who started a request. It uses the first rule that matches:
 1. A session (`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`), `BUILDLOG_OWNER_STAFF_ID`, or `CLAUDE_SESSION_NAME`.
 2. The process family, through `family_owner(pid, proc_root)`: a state-root script, a terminal, or a desktop or login scope.
-3. The recorded owner of an absolute worktree, through `copy_owner.recorded_owner` (scripts/copies/copy_owner.py, which imports no build_queue module): an active gate, the copy record, or the staff worktree.
+3. The recorded owner of an absolute worktree, through `copy_owner.recorded_owner`: an active gate, the copy record, or the staff worktree.
+   `scripts/copies/copy_owner.py` imports no build_queue module, so this read makes no import cycle.
    `admission_records.folder_owner` reads with `RemovalIntentAccess.READ_ONLY`, so a queue request never clears a removal intent.
    `copies.source_owner` keeps the default `RECOVER` read, so its other callers still clear a stale removal intent.
 4. Otherwise the result is `OwnerNotGiven(program)`, which says only which program asked.
