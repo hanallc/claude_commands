@@ -58,4 +58,6 @@ The exit status is the status of the command, or 2 for an attempt that ended wit
 
 After a no, change the command or the script, then start a new attempt. A check with no answer (timeout, model exit, bad JSON, schema failure, a program file that cannot be read, or program files over the size limit together) also ends the attempt with no run.
 
+Known gap, open until its fix is on main: the check reads no file for a command word that names a folder, but a tool can run a file from that folder, for example `make -C target` runs `target/Makefile` and `node target` runs `target/index.js`.
+
 The check settings are in the `[cli.hand_made]` section of `~/.claude/config/models.conf`.
