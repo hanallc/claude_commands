@@ -130,7 +130,7 @@ class ProducerCommandsTests(unittest.TestCase):
             code = shutdown.retirement_clear_worktree(unit, settings=conf.read("production"),
                 record=staff.StaffSnapshot((member,)), pane_workers=[], pane=herdr.NoPane("alpha"), require_cleanup=True)
         self.assertEqual(code, 0, output.getvalue())
-        self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
+        self.assertIn(["build_hold.py", "release", "natedev", "--holder", member.id], case.calls)
         self.assertFalse(fixed_hold.exists())
         remove.assert_called_once()
         trees.assert_called_once_with(str(member.id))

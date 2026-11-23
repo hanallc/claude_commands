@@ -28,7 +28,7 @@ from typing import Literal, cast
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.build_hold import build_hold
+from scripts.build_hold import build_hold, machine_hold
 from scripts.build_queue import admission_protocol, admission_service, placement
 from scripts.aws_target import hana_placement
 from scripts.build_targets import target_config
@@ -642,6 +642,92 @@ def clear_queued_runs(proc_root: Path) -> None:
     stop_queued_runs(processes, holders, os.getuid(), os.getpid(), claims.identities, proc_root)
 
 
+def machine_state_paths(machine: machine_hold.Machine) -> claim_state.StatePaths:
+    """Find the block and claim records of mac or mac-linux without a read of the target config."""
+    return claim_state.StatePaths(target_config.ssh_target_state_directory(machine), machine)
+
+
+def active_holds(machines: tuple[machine_hold.Machine, ...] = machine_hold.MACHINES) -> machine_hold.ActiveHolds:
+    """Read the active holds of these machines only. The queue hold store (item 226, part 2) replaces this function.
+
+    natedev holds come from the holder files. mac and mac-linux holds come from their own Mac blocks.
+    A mac hold also covers mac-linux, so read mac too to act on mac-linux.
+    A Mac block records no verb, so it reads as a drain. No hana-aws hold has a source yet.
+    Raise OSError or ValueError when a record cannot be read.
+    """
+    from scripts.mac_test import mac_test
+
+    holds: list[machine_hold.MachineHold] = []
+    if "natedev" in machines:
+        holds.extend(machine_hold.MachineHold("natedev", holder.verb, machine_hold.NamedOwner(holder.key, holder.name),
+                                              holder.purpose)
+                     for holder in build_hold.natedev_holds(build_hold.holder_directory()).in_force)
+    for machine in machine_hold.covered_machines("mac"):
+        if machine not in machines:
+            continue
+        block = mac_test.read_block(machine_state_paths(machine).block)
+        if not isinstance(block, mac_test.NoMacBlock):
+            owner = machine_hold.NamedOwner(block.holder, mac_test.holder_name(block.holder))
+            holds.append(machine_hold.MachineHold(machine, "drain", owner, block.reason))
+    return machine_hold.ActiveHolds(tuple(holds))
+
+
+def enforce_machine(
+    holds: machine_hold.ActiveHolds, machine: machine_hold.Machine, proc_root: Path, *,
+    signal_process: Callable[[int, int], None] = os.kill,
+) -> tuple[str, ...]:
+    """Act once on one machine by the strongest active hold that covers it. A drain ends nothing.
+
+    A clear on natedev ends runs outside the allow rules. A clear on mac or mac-linux ends each run with a live claim
+    there. A clear on hana-aws ends nothing while the AWS hold is in force. The enforcer makes no AWS call.
+    """
+    match machine_hold.machine_action(holds, machine):
+        case machine_hold.EndRuns() if machine == "natedev":
+            clear_queued_runs(proc_root)
+            return ()
+        case machine_hold.EndRuns(hold=hold):
+            return end_claim_runs(machine, hold, proc_root, signal_process=signal_process)
+        case machine_hold.ClearWaitsForAwsHold():
+            return (f"{machine}: {machine_hold.CLEAR_WAITS_FOR_AWS_HOLD}",)
+        case _:
+            return ()
+
+
+def end_claim_runs(
+    machine: machine_hold.Machine, hold: machine_hold.MachineHold, proc_root: Path, *,
+    signal_process: Callable[[int, int], None] = os.kill,
+) -> tuple[str, ...]:
+    """End each run whose live claim is on the machine. The run ends as refused; it does not go back to its lines.
+
+    The run's stderr gets the reason before the stop. The caller and its ancestors never get a signal.
+    """
+    reason = machine_hold.refused_reason(hold)
+    try:
+        claims = claim_state.read_claims(machine_state_paths(machine))
+    except (OSError, ValueError) as error:
+        return (f"{machine}: claims unreadable; the clear ended no run there: {error}",)
+    caller = build_hold.caller_processes(proc_root, os.getpid())
+    lines: list[str] = []
+    for claim in claims:
+        pid, start, what = claim.record["pid"], claim.record["proc_start"], claim.record["what"]
+        # A pid of 0 or less signals a process group or every process. A claim without a start time names no run.
+        if pid <= 0 or not start.isdecimal():
+            continue
+        identity = build_hold.ProcessIdentity(pid, start)
+        if identity in caller or build_hold.process_start_time(pid, proc_root) != start:
+            continue
+        write_run_line(proc_root, pid, reason + "\n")
+        try:
+            signal_process(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as error:
+            lines.append(f"{machine}: pid {pid} ({what}) could not be ended: {error}")
+            continue
+        lines.append(f"{machine}: pid {pid} ({what}) {reason}")
+    return tuple(lines)
+
+
 def stop_queued_runs(
     processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
     uid: int, enforcer_pid: int, claimed: frozenset[build_hold.ProcessIdentity], proc_root: Path, *,
@@ -769,7 +855,7 @@ def send_overdue_notices(
         try:
             text = (f"Your natedev hold for {holder.purpose} is overdue. "
                     f"Its release time is {build_hold.release_eta_text(release)}. The hold stays in force. "
-                    "Use /build:hold release, or a new clear or drain with a later --release-eta.")
+                    "Use /build:hold release natedev, or a new clear natedev or drain natedev with a later --release-eta.")
             result = send(holder.key, text)
         except Exception as error:
             result = build_hold.HolderMessageFailed(str(error))
@@ -1123,11 +1209,15 @@ def refusal_line(build: WouldStopBuild) -> str:
 
 
 def write_refusal(proc_root: Path, build: WouldStopBuild) -> None:
-    """Best effort only; never wait on a full stderr pipe."""
+    write_run_line(proc_root, build.process.identity.pid, refusal_line(build))
+
+
+def write_run_line(proc_root: Path, pid: int, line: str) -> None:
+    """Write one line to the run's stderr. Best effort only; never wait on a full stderr pipe."""
     try:
-        descriptor = os.open(proc_root / str(build.process.identity.pid) / "fd/2", os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND)
+        descriptor = os.open(proc_root / str(pid) / "fd/2", os.O_WRONLY | os.O_NONBLOCK | os.O_APPEND)
         try:
-            _ = os.write(descriptor, refusal_line(build).encode())
+            _ = os.write(descriptor, line.encode())
         finally:
             os.close(descriptor)
     except (OSError, ValueError):

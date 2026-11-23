@@ -310,7 +310,7 @@ parse_routing_arguments() {
                 # A reservation used as a --local reason never ends.
                 # Use a Mac hold to keep tests off the Mac (user, 2026-10-18).
                 if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
-                    printf 'verify.sh: --local requires a test that cannot pass on macOS ("%s"). To reserve the Mac, use /build:mac block <why>. Tests skip a held Mac. /build:status shows the hold. The hold ends at its expiry. Omit --local.\n' "$2" >&2
+                    printf 'verify.sh: --local requires a test that cannot pass on macOS ("%s"). To reserve the Mac, use /build:hold drain mac <why>. Tests skip a held Mac. /build:status shows the hold. The hold ends at its expiry. Omit --local.\n' "$2" >&2
                     exit 2
                 fi
                 LOCAL_ONLY=1

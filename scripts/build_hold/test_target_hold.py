@@ -9,7 +9,8 @@ from typing import override
 from unittest import mock
 import unittest
 
-from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold
+from scripts.build_hold import machine_hold
+from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, build_hold
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 ORIGINAL_RUN = subprocess.run
@@ -44,46 +45,49 @@ class TargetHoldTests(IsolatedTargetState):
                 status = error.code if isinstance(error.code, int) else 1
         return subprocess.CompletedProcess(arguments, status, output.getvalue(), errors.getvalue())
 
-    def test_unsupported_targets_do_not_change_any_target(self) -> None:
+    def test_a_name_that_is_not_a_machine_is_a_refusal_without_changes(self) -> None:
         before = self.snapshot()
+        cases = [(name, machine_hold.NAME_THE_MACHINE) for name in ("", "linux", "linux-two", "aws", "all")]
         for action in ("clear", "drain", "release"):
-            for name in (*TARGET_NAMES, "aws", "all"):
+            for name, refusal in (*cases, ("hana-aws", f"{action} hana-aws is not supported yet")):
                 with self.subTest(action=action, target=name):
-                    arguments = [action, name]
+                    arguments = [action, *([name] if name else [])]
                     if action != "release":
                         arguments.extend(["--for", "private test"])
                     result = self.invoke_hold(arguments)
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertEqual(result.stdout, f"{action} {name} is not supported yet\n")
+                    self.assertEqual(result.stdout, f"{refusal}\n")
                     self.assertEqual(result.stderr, "")
                     self.assertEqual(self.snapshot(), before)
 
-    def test_default_and_explicit_natedev_clear_drain_and_release_use_local_records(self) -> None:
-        _ = self.config.write_text(self.config.read_text() + "default_target=natedev\n")
+    def test_natedev_clear_drain_and_release_use_local_records(self) -> None:
         (self.root / "proc").mkdir(exist_ok=True)
         for action in ("clear", "drain"):
-            for selection in ([], ["natedev"]):
-                with self.subTest(action=action, selection=selection), \
-                     mock.patch.object(build_hold.hold_enforcer(), "start"), \
-                     mock.patch.object(build_hold.hold_enforcer(), "wait_for_kept_runs", return_value=0), \
-                     mock.patch.object(build_hold, "print_hold_audit"), \
-                     mock.patch.object(build_hold, "record_hold_event"):
-                    result = self.invoke_hold([action, *selection, "--holder", "alice", "--for", "inspect local",
-                                               "--release-eta", "23:59", "--zone", "Etc/GMT+12",
-                                               "--proc-root", str(self.root / "proc")])
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    path = self.root / "holders" / build_hold.holder_of("alice").key
-                    self.assertTrue(path.is_file())
-                    result = self.invoke_hold(["release", *selection, "--holder", "alice"])
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertFalse(path.exists())
+            with self.subTest(action=action), \
+                 mock.patch.object(build_hold.hold_enforcer(), "start"), \
+                 mock.patch.object(build_hold.hold_enforcer(), "wait_for_kept_runs", return_value=0), \
+                 mock.patch.object(build_hold, "print_hold_audit"), \
+                 mock.patch.object(build_hold, "record_hold_event"):
+                result = self.invoke_hold([action, "natedev", "--holder", "alice", "--for", "inspect local",
+                                           "--release-eta", "23:59", "--zone", "Etc/GMT+12",
+                                           "--proc-root", str(self.root / "proc")])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                path = self.root / "holders" / build_hold.holder_of("alice").key
+                self.assertTrue(path.is_file())
+                self.assertFalse((self.directory("mac") / "block.json").exists())
+                result = self.invoke_hold(["release", "natedev", "--holder", "alice"])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(path.exists())
 
-    def test_remote_helpers_remain_available(self) -> None:
-        result = build_hold.run_mac_hold(["block", "--holder", "alice", "--for", "private test"])
-        self.assertEqual(result.status, 0, result.stdout + result.stderr)
-        result = build_hold.release_mac_hold(build_hold.HolderIdentity("alice", "alice"))
-        self.assertEqual(result.status, 0, result.stdout + result.stderr)
-
+    def test_drain_mac_and_release_mac_use_the_mac_block(self) -> None:
+        block = self.directory("mac") / "block.json"
+        result = self.invoke_hold(["drain", "mac", "--holder", "alice", "--for", "Mac system update"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(block.is_file())
+        self.assertFalse((self.root / "holders" / build_hold.holder_of("alice").key).exists())
+        result = self.invoke_hold(["release", "mac", "--holder", "alice"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(block.exists())
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -177,7 +177,7 @@ def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = Blo
         if block is BlockText.OMITTED:
             return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
         return (f"MAC BLOCKED by {holder} since {clock_text(saved['since'], zone)} ({detail}): {waiting_steps_text(waiting)} "
-                f"for the Mac, idle {int(elapsed // 60)} min; /build:mac unblock clears it{suffix}.")
+                f"for the Mac, idle {int(elapsed // 60)} min; /build:hold release mac clears it{suffix}.")
     if saved["cause"] == "claim_idle":
         cause = f"Claim of {holder} ({detail}) runs no build or test on the Mac"
     elif saved["cause"] == "disk":

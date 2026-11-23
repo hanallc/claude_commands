@@ -2649,7 +2649,7 @@ process.stdout.write(JSON.stringify({
         now = reading.explanation.now
         cases = (
             ("idle", 0, "MAC BLOCKED by research since 07:23 (P15 F11 L0 run): 7 steps wait for the Mac, "
-                + "idle 10 min; /build:mac unblock clears it."),
+                + "idle 10 min; /build:hold release mac clears it."),
             ("busy", 0, ""),
             ("unreachable", 0, "MAC UNREACHABLE until 07:38: 7 steps wait for the Mac."),
             ("unreadable", 0, "MAC IDLE WATCH: Mac state unreadable: P15 F11 L0 run."),

@@ -330,6 +330,7 @@ class CliArguments(argparse.Namespace):
         self.reason: str = ""
         self.hours: str = ""
         self.showrunner: str = ""
+        self.hold_verb: Literal["drain", "clear"] = "drain"
         self.settings: str = ""
         self.repo_root: str = ""
         self.copy: bool = False
@@ -411,6 +412,11 @@ def lock_if_available(path: Path) -> Generator[bool, None, None]:
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def hold_command(verb: Literal["drain", "clear", "release"], target: str) -> str:
+    """Name the /build:hold form that sets or ends the block of the target."""
+    return f"/build:hold {verb} {target}"
 
 
 def holder_name(key: str) -> str:
@@ -1066,7 +1072,7 @@ def send_target_free(block: ActiveMacBlock, owed: FreeMessageOwed, target: str) 
     text = (
         f"Message from mac-test: {label} is free. {owed.what} ended at "
         + f"{message_time(owed.ended)}; your block ({block.reason}) is active, and "
-        + "nothing is built or tested there until you run unblock."
+        + f"nothing is built or tested there until you run {hold_command('release', target)}."
     )
     return send_message(
         delivery_target(block.delivery),
@@ -1283,7 +1289,7 @@ def expire_block(
             text = (
                 f"Message from mac-test: {label} block by {holder_name(block.holder)} is past "
                 + f"its time limit but still in place: CI's {label} switch could not be "
-                + f"turned back on ({restored.line}). Run github-warmup, then unblock."
+                + f"turned back on ({restored.line}). Run github-warmup, then {hold_command('release', paths.target)}."
             )
             send_to_block_recipients(
                 block,
@@ -1325,7 +1331,7 @@ def warning_text(block: PendingMacBlock | ActiveMacBlock, target: str) -> str:
     label = "Mac" if target == "mac" else target
     return (
         f"Message from mac-test: your {label} block ({block.reason}) lifts by itself at "
-        + f"{block_time(block.expires)}. Run block again to keep it."
+        + f"{block_time(block.expires)}. Run {hold_command('drain', target)} again to keep it."
     )
 
 
@@ -2449,11 +2455,11 @@ def command_block(
                 )
             )
             print(
-                f"CI can still use the Mac: {line}. Run github-warmup, then block again."
+                f"CI can still use the Mac: {line}. Run github-warmup, then {hold_command(args.hold_verb, paths.target)} again."
             )
         print(
             f"It lifts by itself at {block_time(outcome.block.expires)} "
-            + "unless you run block again."
+            + f"unless you run {hold_command('drain', paths.target)} again."
         )
         return 2 if ci_may_still_be_on(outcome.block.ci) else 0
 
@@ -2479,7 +2485,7 @@ def command_unblock(
             if isinstance(restored, GhFailure):
                 print(
                     "Mac still blocked: CI's Mac switch could not be turned back "
-                    + f"on ({restored.line}). Run github-warmup, then unblock again."
+                    + f"on ({restored.line}). Run github-warmup, then {hold_command('release', paths.target)} again."
                 )
                 return 2
         remove_block(paths, block)
@@ -2591,7 +2597,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             print(
                 "The block is past its time limit but could not lift: CI's Mac "
                 + "switch could not be turned back on "
-                + f"({lift_failure.gh_error_line}). Run github-warmup, then unblock."
+                + f"({lift_failure.gh_error_line}). Run github-warmup, then {hold_command('release', paths.target)}."
             )
     return 0
 
@@ -2690,6 +2696,8 @@ def parser() -> argparse.ArgumentParser:
     _ = block.add_argument("--for", dest="reason", required=True)
     _ = block.add_argument("--hours", default="")
     _ = block.add_argument("--showrunner", default="")
+    # The /build:hold verb that set the block; the advice names it.
+    _ = block.add_argument("--hold-verb", choices=("drain", "clear"), default="drain")
 
     unblock = commands.add_parser("unblock")
     _ = unblock.add_argument("--holder", required=True)

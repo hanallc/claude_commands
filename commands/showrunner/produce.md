@@ -207,7 +207,8 @@ The question form for every question to the user is defined by this import:
       productions promoting;
     - disk room and quota: the root, always.
   - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+    `/build:hold drain mac <why> [--release-eta HH:MM --zone <IANA zone>]`, or direct the
+    unit to run it.
     Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records

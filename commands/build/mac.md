@@ -1,32 +1,22 @@
 ---
-description: Hold the Mac, audit packages, or run a queued Mac command.
+description: Show Mac state, audit packages, or run a queued Mac command.
 ---
 
-`$ARGUMENTS` is `block <why> [hours N]`, `unblock`, `status`, or `audit <repo dir>`.
+`$ARGUMENTS` is `status` or `audit <repo dir>`.
+`block` and `unblock` are removed. On either one, do nothing and reply: `Use /build:hold drain mac <why> to hold the Mac, and /build:hold release mac to end the hold.`
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py block --holder '<your session name>' --for '<why>' [--hours N]`.
-   A unit director also passes `--showrunner '<showrunner name>'`.
-   Resolve the name with `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py name <showrunner name>`.
-   The block admits the holder's claims and refuses other sessions' new Mac work.
-   It disables CI's Mac switch while pending or active.
-   Existing local work and CI Mac jobs finish first.
-   The free message arrives when that work ends.
-   New CI runs skip macOS and remain green.
-   Repeat the listed CI commits after release.
-   Repeat `block` to renew it.
-2. `unblock` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py unblock --holder '<your session name>'`. It restores CI's Mac switch only if this block turned it off, then lists skipped runs by branch and their re-run commands. A block remains in force after expiry until its record is removed. If expiry cannot restore CI, run `github-warmup`, then `/build:mac unblock`; the failed restore keeps the block.
-3. `status` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py status`. It settles block state and may lift an expired block, restore CI, or send pending messages. For a read-only view, use `/build:status`.
-4. `audit <repo dir>` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/audit.py <repo dir>`. Its table shows compile-time gating: a gated test is not built on the Mac. `Not built on the Mac` names omitted lines.
+1. `status` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py status`. It settles block state and may lift an expired block, restore CI, or send pending messages. For a read-only view, use `/build:status`.
+2. `audit <repo dir>` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/audit.py <repo dir>`. Its table shows compile-time gating: a gated test is not built on the Mac. `Not built on the Mac` names omitted lines.
 
-Run `block`, `unblock`, and `status` with the sandbox off; they write state, call `gh`, and start the block watcher.
+Run `status` with the sandbox off; it writes state, calls `gh`, and starts the block watcher.
 
 ## State and recovery
 
 - `free` with no block: start work through its normal claim. `running`: let the job finish; do not remove a live job's claim.
 - A kept claim means the claiming process died, but its remote work can remain. `status` shows the host, time, and PID. Confirm that the remote work ended. Read `claim_id`, `episode`, and `attempt` from the claim record. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`. The offload runner ends remote work before it releases a claim that it takes over.
-- `blocked` or `block pending`: wait for the holder's release or free message; `unblock` removes your own block. If CI can still use the Mac, run `github-warmup`, then repeat `block`. An expiry with a failed CI restore needs `github-warmup`, then `unblock`.
+- `blocked` or `block pending`: wait for the holder's release or free message; `/build:hold release mac` removes your own block. If CI can still use the Mac, run `github-warmup`, then repeat `/build:hold drain mac <why>`. An expiry with a failed CI restore needs `github-warmup`, then `/build:hold release mac`.
 - `unreachable`: use `/build:status --probe`; restore the connection before remote work.
-- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json`, `run.json`, or `claims/<repo>.json`. Check the holder and any running job before you repair or remove a damaged file. Repeat `block` or `unblock` for a block. Release a readable kept claim with `release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`. Use `/build:hold` for a natedev holder or release record.
+- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json`, `run.json`, or `claims/<repo>.json`. Check the holder and any running job before you repair or remove a damaged file. Repeat `/build:hold drain mac <why>` or `/build:hold release mac` for a block. Release a readable kept claim with `release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`. Use `/build:hold` for a natedev holder or release record.
 
 ## Run a command from natedev
 

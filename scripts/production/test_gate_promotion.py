@@ -195,7 +195,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
         source = ("import pathlib, signal, sys; signal.signal(signal.SIGTERM, signal.SIG_DFL); "
                   "pathlib.Path(sys.argv[1]).touch(); sys.stdin.readline()")
         process = subprocess.Popen(
-            [sys.executable, "-c", source, str(ready), "build_hold.py", "release"],
+            [sys.executable, "-c", source, str(ready), "build_hold.py", "release", "natedev"],
             env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, text=True)
         try:

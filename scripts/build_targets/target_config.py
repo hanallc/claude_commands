@@ -334,14 +334,3 @@ def read_execution_transport(target: SshTarget, *,
         return SshCommandTransport(target.settings)
     return HanaControlTransport(target.settings, settings.value("host", reporting_host))
 
-
-def command_target_name(given: str | None) -> str:
-    """Resolve a positional target for clear, drain, or release."""
-    configuration = conf.read_or_repository("build_targets")
-    selected = given if given is not None else configuration.text("default_target")
-    configured = read_targets(selected="" if selected == "all" else selected, configuration=configuration)
-    names = {target.name for target in configured}
-    names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
-    if selected != "all" and selected not in names:
-        raise ConfigError(f"unknown target {selected}")
-    return selected

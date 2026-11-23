@@ -705,7 +705,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         expires = cast(str, block["expires"])
         return (
             f"It lifts by itself at {self.local_time(expires, include_day=True)} "
-            + "unless you run block again.\n"
+            + "unless you run /build:hold drain mac again.\n"
         )
 
     def assert_utc_time(self, value: str) -> None:
@@ -2006,7 +2006,7 @@ for arguments in (
             result,
             2,
             "Mac still blocked: CI's Mac switch could not be turned back on "
-            + "(permission denied). Run github-warmup, then unblock again.\n",
+            + "(permission denied). Run github-warmup, then /build:hold release mac again.\n",
         )
         self.assertEqual(self.block_state(), block)
         self.assertEqual([(row["event"], row["hold_key"]) for row in self.hold_events()], [("began", block["since"])])
@@ -2087,7 +2087,7 @@ for arguments in (
             + "CI's Mac switch: off (this block)\n"
             + "The block is past its time limit but could not lift: CI's Mac switch "
             + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
-            + "then unblock.\n",
+            + "then /build:hold release mac.\n",
         )
 
     def test_pending_expired_block_with_failed_switch_back_status_names_stuck_lift(
@@ -2116,7 +2116,7 @@ for arguments in (
             + "CI's Mac switch: off (this block)\n"
             + "The block is past its time limit but could not lift: CI's Mac switch "
             + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
-            + "then unblock.\n",
+            + "then /build:hold release mac.\n",
         )
 
     def test_unexpired_block_status_has_no_stuck_lift_line(self) -> None:
@@ -2185,7 +2185,7 @@ for arguments in (
         self.assertEqual(renewed.returncode, 2, renewed.stdout + renewed.stderr)
         self.assertIn(
             "CI can still use the Mac: cold signing agent. "
-            + "Run github-warmup, then block again.\n",
+            + "Run github-warmup, then /build:hold drain mac again.\n",
             renewed.stdout,
         )
         self.assertNotIn("unknown error", renewed.stdout)
@@ -2523,7 +2523,7 @@ for arguments in (
         block = self.block_state()
         self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
         self.assertIn(
-            "CI can still use the Mac: authentication required. Run github-warmup, then block again.\n",
+            "CI can still use the Mac: authentication required. Run github-warmup, then /build:hold drain mac again.\n",
             blocked.stdout,
         )
         self.assertEqual(block["ci"], "still_on")
@@ -2534,6 +2534,29 @@ for arguments in (
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertEqual(self.block_state()["ci"], "off_by_this_block")
         self.assertEqual(self.read_fixture_variable(), "false")
+
+    def test_block_advice_names_the_hold_verb_that_set_the_block(self) -> None:
+        self.gh["failures"] = [
+            {"match": "variable get", "line": "authentication required", "status": 1},
+            {"match": "run list", "line": "authentication required", "status": 1},
+        ]
+        self.sync_gh()
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering", "--hold-verb", "clear")
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        self.assertIn(
+            "CI can still use the Mac: authentication required. Run github-warmup, then /build:hold clear mac again.\n",
+            blocked.stdout,
+        )
+        self.assertIn("unless you run /build:hold drain mac again.\n", blocked.stdout)
+        self.assertNotIn("unless you run /build:hold clear", blocked.stdout)
+
+    def test_clear_renewal_line_names_drain(self) -> None:
+        # A repeat clear ends the holder's own runs, so the renewal line
+        # always names drain.
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering", "--hold-verb", "clear")
+        self.assertEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        self.assertIn(self.expiry_line(self.block_state()), blocked.stdout)
+        self.assertNotIn("/build:hold clear", blocked.stdout)
 
     def test_timed_out_set_is_reconciled_and_restored(self) -> None:
         # The set reaches gh and is applied, then the call times out. Expire

@@ -46,7 +46,7 @@ from scripts.build_hold.shared_state_defaults import (
     stop_confirmation_path as stop_confirmation_path,
     write_stop_confirmation,
 )
-from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
+from scripts.build_hold import machine_hold
 
 from scripts.message import session_send
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
@@ -174,7 +174,7 @@ class ReleaseNoticeReadError(ReleaseRecordReadError):
 
 
 def release_record_error_line(error: ReleaseRecordReadError) -> str:
-    return f"release record could not be read: {error}; /build:hold release sets it aside and ends the hold"
+    return f"release record could not be read: {error}; /build:hold release natedev sets it aside and ends the hold"
 
 
 @dataclass(frozen=True)
@@ -271,51 +271,6 @@ class HolderIdentity:
 
 
 @dataclass(frozen=True)
-class NatedevHoldTarget:
-    pass
-
-
-@dataclass(frozen=True)
-class MacHoldTarget:
-    pass
-
-
-@dataclass(frozen=True)
-class ConfiguredSshHoldTarget:
-    name: str
-
-
-@dataclass(frozen=True)
-class UnknownHoldTarget:
-    name: str
-    configured: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class UncheckedHoldTarget:
-    name: str
-    reason: str
-
-
-HoldTarget = NatedevHoldTarget | MacHoldTarget | ConfiguredSshHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
-
-
-def parse_hold_target(name: str) -> HoldTarget:
-    if name == "natedev":
-        return NatedevHoldTarget()
-    if name == "mac":
-        return MacHoldTarget()
-    try:
-        configured = read_targets()
-    except (ConfigError, OSError, UnicodeError) as error:
-        return UncheckedHoldTarget(name, str(error))
-    for target in configured:
-        if target.name == name and isinstance(target, SshTarget):
-            return ConfiguredSshHoldTarget(name)
-    return UnknownHoldTarget(name, tuple(target.name for target in configured))
-
-
-@dataclass(frozen=True)
 class MacHoldResult:
     status: int
     stdout: str
@@ -338,6 +293,52 @@ def print_mac_hold_result(result: MacHoldResult) -> int:
     return result.status
 
 
+def mac_hold_command(action: str, machine: machine_hold.Machine, options: argparse.Namespace) -> int:
+    """Hold mac or mac-linux through its Mac block until the queue hold store (item 226, part 2) exists.
+
+    A drain blocks the machine: running runs finish. A clear blocks it, then ends each run with a live claim there.
+    A release ends the block. A mac block covers mac-linux, and a mac-linux block stays after a mac release.
+    """
+    if action == "release":
+        if cast(bool, options.resume):
+            print(f"--resume is not supported for {machine}")
+            return 2
+        return print_mac_hold_result(release_mac_hold(holder_of(cast(str | None, options.holder)), machine))
+    if cast(list[int], options.keep):
+        print(f"--keep is not supported for {machine}")
+        return 2
+    identity = holder_of(cast(str | None, options.holder))
+    purpose = cast(str, options.purpose)
+    request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
+    now = datetime.now(timezone.utc)
+    hours = ([] if isinstance(request, NoReleaseEta)
+             else ["--hours", f"{(release_instant(request, now) - now).total_seconds() / 3600:.4f}"])
+    showrunner = cast(str, options.showrunner)
+    notices = ["--showrunner", showrunner] if showrunner else []
+    result = run_mac_hold(
+        ["block", "--holder", identity.key, "--for", purpose, "--hold-verb", action, *hours, *notices], machine)
+    status = print_mac_hold_result(result)
+    if action != "clear":
+        return status
+    # The block can be in place while the CI switch step fails. The clear then still ends the runs.
+    # Read only this machine's own block: a damaged record of another machine does not stop this clear.
+    try:
+        holds = hold_enforcer().active_holds((machine,))
+    except (OSError, ValueError) as error:
+        print(f"{machine}: block unreadable; the clear ended no run: {error}")
+        return status or 1
+    blocked = next((hold for hold in holds.holds if hold.comment == purpose
+                    and isinstance(hold.owner, machine_hold.NamedOwner) and hold.owner.staff_id == identity.key),
+                   None)
+    if blocked is not None:
+        # A Mac block records no verb, so the read holds name it a drain; this command's clear is the clear.
+        holds = holds.including(machine_hold.MachineHold(machine, "clear", blocked.owner, purpose))
+        for covered in machine_hold.covered_machines(machine):
+            for line in hold_enforcer().enforce_machine(holds, covered, cast(Path, options.proc_root)):
+                print(line)
+    return status
+
+
 @dataclass(frozen=True)
 class Holder:
     # The current staff name, or the text given for a holder outside staff.
@@ -349,6 +350,7 @@ class Holder:
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
     start_recorded: bool = True
+    verb: machine_hold.HoldVerb = "clear"
 
 
 @dataclass(frozen=True)
@@ -662,7 +664,9 @@ class HoldEnforcer(Protocol):
     def holds_claim(self, process: AuditProcess, processes: Mapping[int, AuditProcess],
                     claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
-    def clear_queued_runs(self, proc_root: Path) -> None: ...
+    def active_holds(self, machines: tuple[machine_hold.Machine, ...] = ...) -> machine_hold.ActiveHolds: ...
+    def enforce_machine(self, holds: machine_hold.ActiveHolds, machine: machine_hold.Machine,
+                        proc_root: Path) -> tuple[str, ...]: ...
     def record_clear_cutoff(self, identity: HolderIdentity, since: datetime) -> None: ...
     def drain_identities(self, proc_root: Path, identity: HolderIdentity) -> tuple[ProcessIdentity, ...]: ...
     def wait_for_kept_runs(self, holder: Holder, proc_root: Path) -> int: ...
@@ -880,7 +884,8 @@ def read_holder(path: Path) -> Holder:
                             pid, start = entry.get("pid"), entry.get("start_time")
                             if isinstance(pid, int) and pid > 0 and isinstance(start, str) and start.isdecimal():
                                 keep.append(ProcessIdentity(pid, start))
-                return Holder(now, aware_instant(since), purpose, eta, path.name, tuple(keep))
+                verb: machine_hold.HoldVerb = "drain" if fields.get("verb") == "drain" else "clear"
+                return Holder(now, aware_instant(since), purpose, eta, path.name, tuple(keep), verb=verb)
     except (ValueError, TypeError):
         pass
     match = INSTANT.search(content)
@@ -1042,33 +1047,37 @@ class KeptRunRecord(TypedDict):
     start_time: str
 
 
+def release_instant(request: ClockReleaseEta | DatedReleaseEta, now: datetime) -> datetime:
+    """Resolve the requested release to an instant after now."""
+    release = (request.when if isinstance(request, DatedReleaseEta)
+               else datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone))
+    if release.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
+        raise ValueError("release ETA has already passed")
+    return release
+
+
 HoldFileRecord = TypedDict("HoldFileRecord", {
     "holder": str, "since": str, "for": str, "release_eta": str, "keep": list[KeptRunRecord],
+    "verb": machine_hold.HoldVerb,
 })
 
 
 def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
                keep: Sequence[ProcessIdentity] = (), *,
-               before_publish: Callable[[], None] | None = None) -> str:
+               before_publish: Callable[[], None] | None = None, verb: machine_hold.HoldVerb = "clear") -> str:
     """Keep a hold under its resolved key and display name."""
     path = holder_path(directory, identity.key)
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     require_hold_write(directory, temporary)
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
-    if isinstance(request, NoReleaseEta):
-        release_eta = "unknown"
-    else:
-        release = (request.when if isinstance(request, DatedReleaseEta)
-                   else datetime.combine(now.astimezone(request.zone).date(), request.clock, request.zone))
-        if release.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
-            raise ValueError("release ETA has already passed")
-        release_eta = release.isoformat()
+    release_eta = "unknown" if isinstance(request, NoReleaseEta) else release_instant(request, now).isoformat()
     directory.mkdir(parents=True, exist_ok=True)
     previous = read_holder(path).keep if path.is_file() else ()
     record: HoldFileRecord = {
         "holder": identity.name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta,
         "keep": [{"pid": item.pid, "start_time": item.start_time} for item in dict.fromkeys((*previous, *keep))],
+        "verb": verb,
     }
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     if before_publish is not None:
@@ -1487,10 +1496,10 @@ def pending_release_status_lines() -> list[str]:
         except (OSError, ValueError) as error:
             if isinstance(error, ReleaseNoticeReadError):
                 path = error.path
-            lines.append(f"release pending: {path} could not be read: {error}; /build:hold release sets it aside")
+            lines.append(f"release pending: {path} could not be read: {error}; /build:hold release natedev sets it aside")
             continue
         released = aware_instant(intent["released_at"]).astimezone(user_zone())
-        lines.append(f"release pending: {intent['holder_name']}, released {released:%H:%M %Z} - unsent: {unsent}; run /build:hold release to finish it")
+        lines.append(f"release pending: {intent['holder_name']}, released {released:%H:%M %Z} - unsent: {unsent}; run /build:hold release natedev to finish it")
     return lines
 
 
@@ -1653,7 +1662,7 @@ def open_cycle(now: datetime) -> HoldCycle:
 
 def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
                keep: Sequence[ProcessIdentity] = (), *,
-               before_publish: Callable[[], None] | None = None) -> str:
+               before_publish: Callable[[], None] | None = None, verb: machine_hold.HoldVerb = "clear") -> str:
     with release_lock(directory) as held:
         at = datetime.now(timezone.utc)
         new_hold = not holder_path(directory, identity.key).is_file()
@@ -1662,7 +1671,7 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
         else:
             cycle = read_cycle_for_change(held)
         notice = write_hold(directory, identity, purpose, request, now, keep,
-                            before_publish=before_publish)
+                            before_publish=before_publish, verb=verb)
         if new_hold:
             record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -2133,22 +2142,19 @@ def main(arguments: list[str]) -> int:
     override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    clear = commands.add_parser("clear")
-    _ = clear.add_argument("--holder")
-    _ = clear.add_argument("--for", dest="purpose", required=True)
-    _ = clear.add_argument("--release-eta")
-    _ = clear.add_argument("--zone")
-    _ = clear.add_argument("target", nargs="?")
-    _ = clear.add_argument("--proc-root", type=Path, default=PROC_ROOT)
-    _ = clear.add_argument("--keep", type=int, action="append", default=[])
-    drain = commands.add_parser("drain")
-    _ = drain.add_argument("--holder")
-    _ = drain.add_argument("--for", dest="purpose", required=True)
-    _ = drain.add_argument("--release-eta")
-    _ = drain.add_argument("--zone")
-    _ = drain.add_argument("target", nargs="?")
-    _ = drain.add_argument("--proc-root", type=Path, default=PROC_ROOT)
-    _ = drain.add_argument("--keep", type=int, action="append", default=[])
+    hold_parsers: dict[str, argparse.ArgumentParser] = {}
+    for verb in ("clear", "drain"):
+        hold = hold_parsers[verb] = commands.add_parser(verb)
+        _ = hold.add_argument("--holder")
+        # Required after the machine check, so a bare verb first names the machine.
+        _ = hold.add_argument("--for", dest="purpose")
+        _ = hold.add_argument("--release-eta")
+        _ = hold.add_argument("--zone")
+        _ = hold.add_argument("target", nargs="?")
+        _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+        _ = hold.add_argument("--keep", type=int, action="append", default=[])
+        # A unit director names its showrunner, who gets the Mac block notices.
+        _ = hold.add_argument("--showrunner", default="")
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
@@ -2166,46 +2172,21 @@ def main(arguments: list[str]) -> int:
     try:
         action = cast(str, options.action)
         if action in {"clear", "drain", "release"}:
-            try:
-                target_name = command_target_name(cast(str | None, options.target))
-            except (ConfigError, OSError, UnicodeError) as error:
-                print(f"target configuration cannot be read: {error}")
+            machine = machine_hold.parse_machine(cast(str | None, options.target))
+            if isinstance(machine, machine_hold.UnknownMachine):
+                print(machine_hold.NAME_THE_MACHINE)
                 return 2
-            if target_name != "natedev":
-                print(f"{action} {target_name} is not supported yet")
+            if machine == "hana-aws":
+                # The queue hold store (item 226, part 2) saves the first hana-aws hold.
+                print(f"{action} {machine} is not supported yet")
                 return 2
-            target = parse_hold_target(target_name)
-            if isinstance(target, UnknownHoldTarget):
-                print(f"unknown target {target.name}; configured targets: {', '.join(target.configured)}")
+            if action in hold_parsers and cast(str | None, options.purpose) is None:
+                hold_parsers[action].error("the following arguments are required: --for")
+            if machine != "natedev":
+                return mac_hold_command(action, machine, options)
+            if action != "release" and cast(str, options.showrunner):
+                print("--showrunner is only for mac and mac-linux")
                 return 2
-            if isinstance(target, UncheckedHoldTarget):
-                print(f"unknown target {target.name}; the target config cannot be read: {target.reason}")
-                return 2
-            if isinstance(target, (MacHoldTarget, ConfiguredSshHoldTarget)):
-                target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
-                if action == "drain":
-                    print(f"drain is not supported with --target {target_name}")
-                    return 2
-                refused: list[str] = []
-                if action == "clear":
-                    if cast(list[int], options.keep):
-                        refused.append("--keep")
-                    if cast(object, options.release_eta) is not None:
-                        refused.append("--release-eta")
-                    if cast(object, options.zone) is not None:
-                        refused.append("--zone")
-                elif cast(bool, options.resume):
-                    refused.append("--resume")
-                if refused:
-                    print(f"{refused[0]} is not supported with --target {target_name}")
-                    return 2
-                identity = holder_of(cast(str | None, options.holder))
-                if action == "clear":
-                    command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
-                    result = run_mac_hold(command, target_name)
-                else:
-                    result = release_mac_hold(identity, target_name)
-                return print_mac_hold_result(result)
         if action in {"clear", "drain"} and cast(str | None, options.release_eta) is None:
             print("build_hold: give --release-eta HH:MM --zone <IANA zone> for a natedev hold")
             return 2
@@ -2229,14 +2210,14 @@ def main(arguments: list[str]) -> int:
                 publication_bound = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
 
             _ = start_hold(holder_directory(), identity, purpose, request, now, kept,
-                           before_publish=record_publication_bound)
+                           before_publish=record_publication_bound, verb="drain")
             kept = [run for run in hold_enforcer().drain_identities(proc_root, identity)
                     if int(run.start_time) < publication_bound]
             with release_lock():
                 if not holder_path(holder_directory(), identity.key).is_file():
                     print("the hold was released; drain ends", flush=True)
                     return 0
-                _ = write_hold(holder_directory(), identity, purpose, request, now, kept)
+                _ = write_hold(holder_directory(), identity, purpose, request, now, kept, verb="drain")
             print(f"natedev is draining for {purpose}. Existing runs finish; new natedev work waits until release.",
                   flush=True)
             hold_enforcer().start()
@@ -2261,7 +2242,9 @@ def main(arguments: list[str]) -> int:
                              now, keep, before_publish=record_clear_cutoff))
             hold_enforcer().start()
             print_hold_audit(holder_directory(), proc_root, beginning=True)
-            hold_enforcer().clear_queued_runs(proc_root)
+            holds = hold_enforcer().active_holds(("natedev",))
+            for line in hold_enforcer().enforce_machine(holds, "natedev", proc_root):
+                print(line)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):

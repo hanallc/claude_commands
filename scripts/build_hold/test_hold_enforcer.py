@@ -22,7 +22,7 @@ from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.build_hold import build_hold, hold_enforcer, override_guard
+from scripts.build_hold import build_hold, hold_enforcer, machine_hold, override_guard
 from scripts.build_queue import admission_protocol, admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
@@ -70,7 +70,7 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = boot.write_text("test-boot\n")
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
+        _ = write_config_fixture(configuration / "build_targets.conf", "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
@@ -450,7 +450,8 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(set(holder.keep), {build_hold.ProcessIdentity(pid, "11000") for pid in (20, 30, 40, 60, 80)})
             self.assertIsInstance(holder.release, build_hold.KnownReleaseEta)
             record = cast(dict[str, object], json.loads((self.holders / member.id).read_text()))
-            self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep"})
+            self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep", "verb"})
+            self.assertEqual(record["verb"], "drain")
             for pid, expected in ((10, build_hold.Holder), (11, build_hold.Holder),
                                   *((pid, build_targets.NoBlockingHold) for pid in (20, 21, 30, 60, 61, 80, 81))):
                 lineage = build_targets.read_caller_lineage(self.proc, pid, "11000")
@@ -466,7 +467,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(os, "kill") as kill, \
              mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(build_hold, "print_hold_audit"), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "natedev", "--holder", "holder", "--for", "private drain",
                 "--keep", "40", "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
         stop.assert_not_called()
@@ -503,12 +504,14 @@ class HoldEnforcerTests(unittest.TestCase):
         def publish(directory: Path, identity: build_hold.HolderIdentity, purpose: str,
                     request: build_hold.ReleaseRequest, now: datetime,
                     keep: tuple[build_hold.ProcessIdentity, ...] | list[build_hold.ProcessIdentity], *,
-                    before_publish: Callable[[], None] | None = None) -> str:
+                    before_publish: Callable[[], None] | None = None, verb: machine_hold.HoldVerb = "clear") -> str:
             self.assertEqual(discoveries, [()])
+            self.assertEqual(verb, "drain")
             self.assertFalse(build_hold.has_holder_file(directory))
             _ = self.process(55, "bash", argv=("bash", "verify.sh", "check"))
             _ = self.process(57, "cargo", parent=55, argv=("cargo", "build"))
-            return original_start(directory, identity, purpose, request, now, keep, before_publish=before_publish)
+            return original_start(directory, identity, purpose, request, now, keep, before_publish=before_publish,
+                                  verb=verb)
 
         def start_enforcer() -> None:
             self.assertEqual(discoveries, [(), (build_hold.ProcessIdentity(55, "11000"),)])
@@ -529,7 +532,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "natedev", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
 
@@ -670,12 +673,13 @@ class HoldEnforcerTests(unittest.TestCase):
             with self.subTest(name):
                 self.assert_kept(self.drain_keep(state), 60, 70)
 
-    def test_drain_command_refuses_remote_targets(self) -> None:
-        for target in ("mac", "aws", "all"):
+    def test_drain_command_refuses_unknown_machines_and_hana_aws(self) -> None:
+        for target, refusal in (("aws", machine_hold.NAME_THE_MACHINE), ("all", machine_hold.NAME_THE_MACHINE),
+                                ("hana-aws", "drain hana-aws is not supported yet")):
             with self.subTest(target=target), \
                  mock.patch.object(build_hold, "start_hold") as start, redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(build_hold.main(["drain", target, "--for", "private drain"]), 2)
-                self.assertEqual(output.getvalue(), f"drain {target} is not supported yet\n")
+                self.assertEqual(output.getvalue(), f"{refusal}\n")
                 start.assert_not_called()
 
     def test_kept_drain_interrupt_retains_the_hold(self) -> None:
@@ -709,7 +713,7 @@ class HoldEnforcerTests(unittest.TestCase):
         with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
              mock.patch.object(hold_enforcer, "start") as start, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+            self.assertEqual(build_hold.main(["clear", "natedev", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "30", "--proc-root", str(self.proc)]), 0)
         start.assert_called_once_with()
@@ -728,7 +732,7 @@ class HoldEnforcerTests(unittest.TestCase):
         with mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+            self.assertEqual(build_hold.main(["clear", "natedev", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "11", "--proc-root", str(self.proc)]), 0)
         stop.assert_not_called()
@@ -867,7 +871,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "natedev", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "45", "--proc-root", str(self.proc)]), 0)
         clock.assert_called_once_with(time.CLOCK_BOOTTIME)
@@ -891,7 +895,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start") as start, \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "natedev", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
         self.assertFalse((self.holders / member.id).exists())
@@ -900,7 +904,7 @@ class HoldEnforcerTests(unittest.TestCase):
         wait.assert_not_called()
 
     def test_parser_rejects_removed_hold_command_and_drain_option(self) -> None:
-        for arguments in (["hold", "--for", "test"], ["clear", "--for", "test", "--drain"]):
+        for arguments in (["hold", "--for", "test"], ["clear", "natedev", "--for", "test", "--drain"]):
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors:
                 with self.assertRaises(SystemExit) as exit_code:
                     _ = build_hold.main(arguments)
@@ -2070,7 +2074,7 @@ class HoldEnforcerTests(unittest.TestCase):
             passes((release, release + timedelta(seconds=1)))
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0][:2], (release, "holder"))
-            for words in ("timed test", "12:01 UTC", "stays in force", "/build:hold release",
+            for words in ("timed test", "12:01 UTC", "stays in force", "/build:hold release natedev",
                           "clear", "drain", "--release-eta"):
                 self.assertIn(words, attempts[0][2])
             passes((release + timedelta(seconds=20), release + timedelta(seconds=30)))
@@ -2404,6 +2408,315 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(subprocess, "Popen") as launch:
             hold_enforcer.start()
             self.assertTrue(launch.call_args.kwargs["start_new_session"])
+
+
+    # Machine holds (item 226, part 3): the enforcer acts on the named machine only.
+
+    def machine_hold(self, machine: machine_hold.Machine, verb: machine_hold.HoldVerb,
+                     comment: str = "Mac system update") -> machine_hold.MachineHold:
+        return machine_hold.MachineHold(machine, verb, machine_hold.NamedOwner("bob-id", "bob"), comment)
+
+    def write_claim(self, machine: machine_hold.Machine, pid: int, *, start: str = "11000") -> None:
+        path = hold_enforcer.machine_state_paths(machine).claims / f"repo-{pid}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({
+            "claim_id": f"claim-{pid}", "episode": f"episode-{pid}", "attempt": "1", "submitting_session": "",
+            "pid": pid, "proc_start": start, "what": f"tests {pid}", "worktree": "repo",
+            "since": "2026-11-22T12:00:00+00:00"}))
+
+    def write_block(self, machine: machine_hold.Machine, holder: str, reason: str) -> Path:
+        from scripts.mac_test import mac_test
+
+        path = hold_enforcer.machine_state_paths(machine).block
+        path.parent.mkdir(parents=True, exist_ok=True)
+        since = datetime(2026, 11, 22, 12, tzinfo=timezone.utc)
+        mac_test.write_block(path, mac_test.ActiveMacBlock(
+            holder, reason, since, since + timedelta(hours=4), mac_test.HolderQueue(holder), mac_test.NO_SHOWRUNNER,
+            "not_configured", mac_test.FREE_MESSAGE_NOT_NEEDED))
+        return path
+
+    def enforce(self, holds: tuple[machine_hold.MachineHold, ...], machine: machine_hold.Machine,
+                signals: list[tuple[int, int]]) -> tuple[str, ...]:
+        return hold_enforcer.enforce_machine(machine_hold.ActiveHolds(holds), machine, self.proc,
+                                             signal_process=lambda pid, number: signals.append((pid, number)))
+
+    def test_machine_action_takes_the_strongest_hold_on_the_named_machine_only(self) -> None:
+        drain, clear = self.machine_hold("natedev", "drain"), self.machine_hold("natedev", "clear")
+        cases: tuple[tuple[tuple[machine_hold.MachineHold, ...], machine_hold.Machine, machine_hold.MachineAction], ...] = (
+            ((), "natedev", machine_hold.Free()),
+            ((drain,), "natedev", machine_hold.KeepRuns(drain)),
+            ((drain, clear), "natedev", machine_hold.EndRuns(clear)),
+            ((drain,), "mac", machine_hold.Free()),
+            ((self.machine_hold("mac", "drain"),), "mac-linux", machine_hold.KeepRuns(self.machine_hold("mac", "drain"))),
+            ((self.machine_hold("mac", "clear"),), "mac-linux", machine_hold.EndRuns(self.machine_hold("mac", "clear"))),
+            ((self.machine_hold("mac-linux", "clear"),), "mac", machine_hold.Free()),
+            ((self.machine_hold("hana-aws", "clear"),), "hana-aws",
+             machine_hold.ClearWaitsForAwsHold(self.machine_hold("hana-aws", "clear"))),
+        )
+        for holds, machine, expected in cases:
+            with self.subTest(holds=holds, machine=machine):
+                self.assertEqual(machine_hold.machine_action(machine_hold.ActiveHolds(holds), machine), expected)
+
+    def test_machine_names_refuse_any_other_name(self) -> None:
+        for name in machine_hold.MACHINES:
+            self.assertEqual(machine_hold.parse_machine(name), name)
+        for name in (None, "", "aws", "all", "linux", "Mac"):
+            with self.subTest(name=name):
+                self.assertEqual(machine_hold.parse_machine(name), machine_hold.UnknownMachine(name or ""))
+
+    def test_natedev_drain_ends_nothing_and_natedev_clear_stops_runs_outside_the_allow_rules(self) -> None:
+        signals: list[tuple[int, int]] = []
+        with mock.patch.object(hold_enforcer, "clear_queued_runs") as clear:
+            self.assertEqual(self.enforce((self.machine_hold("natedev", "drain"),), "natedev", signals), ())
+            clear.assert_not_called()
+            self.assertEqual(self.enforce((self.machine_hold("natedev", "clear"),), "natedev", signals), ())
+            clear.assert_called_once_with(self.proc)
+        self.assertEqual(signals, [])
+
+    def test_natedev_holder_files_read_as_machine_holds_with_their_verb(self) -> None:
+        identity = build_hold.HolderIdentity("drainer", "drainer")
+        _ = build_hold.write_hold(self.holders, identity, "folder switch", build_hold.NoReleaseEta(),
+                                  datetime.now(timezone.utc), verb="drain")
+        holds = hold_enforcer.active_holds(("natedev",)).on("natedev")
+        self.assertCountEqual([(hold.verb, hold.comment) for hold in holds],
+                              [("clear", "timed test"), ("drain", "folder switch")])
+
+    def test_mac_clear_ends_each_claim_run_as_refused_with_the_reason(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        _ = self.process(41, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        self.write_claim("mac", 41, start="10000")
+        signals: list[tuple[int, int]] = []
+        hold = self.machine_hold("mac", "clear")
+        lines = self.enforce((hold,), "mac", signals)
+        reason = 'ended: mac cleared by bob — "Mac system update". A Mac run cannot go back to its lines yet.'
+        self.assertEqual(machine_hold.refused_reason(hold), reason)
+        self.assertEqual(signals, [(40, signal.SIGTERM)])
+        self.assertEqual((self.proc / "40/fd/2").read_text(), reason + "\n")
+        self.assertEqual((self.proc / "41/fd/2").read_text(), "")
+        self.assertEqual(lines, (f"mac: pid 40 (tests 40) {reason}",))
+
+    def test_mac_drain_ends_nothing_on_mac_or_mac_linux(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        self.write_claim("mac-linux", 40)
+        signals: list[tuple[int, int]] = []
+        for machine in machine_hold.covered_machines("mac"):
+            self.assertEqual(self.enforce((self.machine_hold("mac", "drain"),), machine, signals), ())
+        self.assertEqual(signals, [])
+
+    def test_mac_clear_covers_mac_linux_and_a_mac_linux_clear_does_not_cover_mac(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        _ = self.process(50, "python3", argv=("python3", "mac_linux.py"))
+        self.write_claim("mac", 40)
+        self.write_claim("mac-linux", 50)
+        signals: list[tuple[int, int]] = []
+        own = (self.machine_hold("mac-linux", "clear"),)
+        self.assertEqual(self.enforce(own, "mac", signals), ())
+        self.assertEqual(len(self.enforce(own, "mac-linux", signals)), 1)
+        self.assertEqual(signals, [(50, signal.SIGTERM)])
+        signals.clear()
+        mac = (self.machine_hold("mac", "clear"),)
+        for machine in machine_hold.covered_machines("mac"):
+            _ = self.enforce(mac, machine, signals)
+        self.assertEqual(signals, [(40, signal.SIGTERM), (50, signal.SIGTERM)])
+        self.assertIn("ended: mac cleared by bob", (self.proc / "50/fd/2").read_text())
+
+    def test_mac_block_covers_mac_linux_and_the_mac_linux_block_stays_after_the_mac_release(self) -> None:
+        mac = self.write_block("mac", "bob-id", "flight home")
+        _ = self.write_block("mac-linux", "alice-id", "guest image")
+        holds = hold_enforcer.active_holds(machine_hold.covered_machines("mac"))
+        self.assertEqual([(hold.machine, hold.verb, hold.comment) for hold in holds.on("mac-linux")],
+                         [("mac", "drain", "flight home"), ("mac-linux", "drain", "guest image")])
+        self.assertEqual([hold.machine for hold in holds.on("mac")], ["mac"])
+        mac.unlink()
+        after = hold_enforcer.active_holds(machine_hold.covered_machines("mac"))
+        self.assertEqual(machine_hold.machine_action(after, "mac"), machine_hold.Free())
+        action = machine_hold.machine_action(after, "mac-linux")
+        self.assertIsInstance(action, machine_hold.KeepRuns)
+        self.assertEqual(cast(machine_hold.KeepRuns, action).hold.comment, "guest image")
+
+    def test_hana_aws_clear_acts_as_a_drain_and_makes_no_aws_call(self) -> None:
+        signals: list[tuple[int, int]] = []
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("no subprocess")), \
+             mock.patch.object(subprocess, "Popen", side_effect=AssertionError("no subprocess")):
+            lines = self.enforce((self.machine_hold("hana-aws", "clear"),), "hana-aws", signals)
+            drain = self.enforce((self.machine_hold("hana-aws", "drain"),), "hana-aws", signals)
+        self.assertEqual(lines, ("hana-aws: clear waits for the AWS hold",))
+        self.assertEqual(drain, ())
+        self.assertEqual(signals, [])
+
+    def test_a_run_that_named_natedev_and_mac_stays_in_its_natedev_line_after_drain_mac(self) -> None:
+        (self.holders / "holder").unlink()
+        _ = self.process(50, "bash", argv=("bash", "verify.sh", "test"), session="two-machines")
+        _ = self.process(51, "cargo", parent=50, argv=("cargo", "test"))
+        _ = self.process(60, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 60)
+        state = self.run_state(reservations=(self.local_reservation(50, admission_protocol.NoRun()),))
+        signals: list[tuple[int, int]] = []
+        for machine in machine_hold.covered_machines("mac"):
+            self.assertEqual(self.enforce((self.machine_hold("mac", "drain"),), machine, signals), ())
+        self.assertEqual(signals, [])
+        self.assertEqual(hold_enforcer.taken_runs(state, self.proc), frozenset({build_hold.ProcessIdentity(50, "11000")}))
+        decisions = {item.process.identity.pid: item for item in self.decisions()}
+        self.assertIsInstance(decisions[51], hold_enforcer.AllowedBuild)
+        # A clear of the Mac ends only the run with the Mac claim.
+        for machine in machine_hold.covered_machines("mac"):
+            _ = self.enforce((self.machine_hold("mac", "clear"),), machine, signals)
+        self.assertEqual(signals, [(60, signal.SIGTERM)])
+        self.assertEqual((self.proc / "50/fd/2").read_text(), "")
+
+    def test_clear_mac_command_blocks_the_mac_then_ends_its_claim_runs(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        signals: list[tuple[int, int]] = []
+        original = hold_enforcer.end_claim_runs
+
+        def end_claim_runs(machine: machine_hold.Machine, hold: machine_hold.MachineHold, proc_root: Path,
+                           **_: object) -> tuple[str, ...]:
+            return original(machine, hold, proc_root, signal_process=lambda pid, number: signals.append((pid, number)))
+
+        _ = self.write_block("mac", "holder", "Mac system update")
+        result = build_hold.MacHoldResult(0, "Mac blocked for holder.\n", "")
+        for action, notices in (("drain", ["--showrunner", "producer"]), ("clear", [])):
+            with self.subTest(action=action), \
+                 mock.patch.object(build_hold, "run_mac_hold", return_value=result) as block, \
+                 mock.patch.object(hold_enforcer, "end_claim_runs", side_effect=end_claim_runs), \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(build_hold.main([action, "mac", "--holder", "holder", "--for", "Mac system update",
+                                                  "--proc-root", str(self.proc), *notices]), 0)
+                block.assert_called_once_with(["block", "--holder", "holder", "--for", "Mac system update",
+                                               "--hold-verb", action, *notices], "mac")
+                if action == "drain":
+                    self.assertEqual(signals, [])
+                    self.assertEqual(output.getvalue(), "Mac blocked for holder.\n")
+                else:
+                    self.assertEqual(signals, [(40, signal.SIGTERM)])
+                    self.assertIn('ended: mac cleared by holder — "Mac system update"', output.getvalue())
+
+    def test_clear_mac_ends_the_runs_when_the_block_is_set_but_the_ci_switch_step_fails(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        _ = self.write_block("mac", "holder", "Mac system update")
+        for action in ("drain", "clear"):
+            advice = f"CI can still use the Mac: cold agent. Run github-warmup, then /build:hold {action} mac again.\n"
+            signals: list[tuple[int, int]] = []
+            original = hold_enforcer.end_claim_runs
+
+            def end_claim_runs(machine: machine_hold.Machine, hold: machine_hold.MachineHold, proc_root: Path,
+                               **_: object) -> tuple[str, ...]:
+                return original(machine, hold, proc_root,
+                                signal_process=lambda pid, number: signals.append((pid, number)))
+
+            with self.subTest(action=action), \
+                 mock.patch.object(build_hold, "run_mac_hold",
+                                   return_value=build_hold.MacHoldResult(2, advice, "")) as block, \
+                 mock.patch.object(hold_enforcer, "end_claim_runs", side_effect=end_claim_runs), \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(build_hold.main([action, "mac", "--holder", "holder", "--for", "Mac system update",
+                                                  "--proc-root", str(self.proc)]), 2)
+                self.assertEqual(cast(list[str], block.call_args.args[0])[-2:], ["--hold-verb", action])
+                printed = output.getvalue()
+                self.assertTrue(printed.startswith(advice))
+                if action == "drain":
+                    self.assertEqual((signals, printed), ([], advice))
+                else:
+                    self.assertEqual(signals, [(40, signal.SIGTERM)])
+                    self.assertTrue(printed[len(advice):].startswith(
+                        'mac: pid 40 (tests 40) ended: mac cleared by holder'))
+
+    def test_a_damaged_mac_linux_block_does_not_stop_clear_mac(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        _ = self.process(50, "python3", argv=("python3", "mac_linux.py"))
+        self.write_claim("mac", 40)
+        self.write_claim("mac-linux", 50)
+        _ = self.write_block("mac", "holder", "Mac system update")
+        _ = hold_enforcer.machine_state_paths("mac-linux").block.write_text("{damaged")
+        signals: list[tuple[int, int]] = []
+        original = hold_enforcer.end_claim_runs
+
+        def end_claim_runs(machine: machine_hold.Machine, hold: machine_hold.MachineHold, proc_root: Path,
+                           **_: object) -> tuple[str, ...]:
+            return original(machine, hold, proc_root, signal_process=lambda pid, number: signals.append((pid, number)))
+
+        with mock.patch.object(build_hold, "run_mac_hold", return_value=build_hold.MacHoldResult(0, "", "")), \
+             mock.patch.object(hold_enforcer, "end_claim_runs", side_effect=end_claim_runs), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["clear", "mac", "--holder", "holder", "--for", "Mac system update",
+                                              "--proc-root", str(self.proc)]), 0)
+        # clear mac still ends the mac-linux claim runs through the mac hold.
+        self.assertEqual(signals, [(40, signal.SIGTERM), (50, signal.SIGTERM)])
+
+    def test_a_damaged_mac_block_prints_the_mac_test_output_then_the_error(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        path = hold_enforcer.machine_state_paths("mac").block
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("{damaged")
+        state = "Mac blocked for holder.\nIt lifts by itself at Sun 16:00 PST unless you run /build:hold drain mac again.\n"
+        with mock.patch.object(build_hold, "run_mac_hold", return_value=build_hold.MacHoldResult(0, state, "")), \
+             mock.patch.object(hold_enforcer, "end_claim_runs", side_effect=AssertionError("no run ends")), \
+             redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_hold.main(["clear", "mac", "--holder", "holder", "--for", "Mac system update",
+                                              "--proc-root", str(self.proc)]), 1)
+        printed = output.getvalue()
+        self.assertTrue(printed.startswith(state))
+        self.assertTrue(printed[len(state):].startswith("mac: block unreadable; the clear ended no run: "))
+
+    def test_clear_mac_ends_no_run_when_the_block_is_not_set(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        self.write_claim("mac", 40)
+        refused = build_hold.MacHoldResult(1, "already blocked by alice\n", "")
+        with mock.patch.object(build_hold, "run_mac_hold", return_value=refused), \
+             mock.patch.object(hold_enforcer, "end_claim_runs", side_effect=AssertionError("no run ends")), \
+             redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_hold.main(["clear", "mac", "--holder", "holder", "--for", "Mac system update",
+                                              "--proc-root", str(self.proc)]), 1)
+        self.assertEqual(output.getvalue(), "already blocked by alice\n")
+
+    def test_mac_clear_signals_no_claim_without_a_positive_pid_and_a_decimal_start(self) -> None:
+        self.write_claim("mac", -1, start="")
+        self.write_claim("mac", 0, start="")
+        self.write_claim("mac", 42, start="not-a-start")
+        signals: list[tuple[int, int]] = []
+        self.assertEqual(self.enforce((self.machine_hold("mac", "clear"),), "mac", signals), ())
+        self.assertEqual(signals, [])
+
+    def test_mac_clear_names_a_run_it_may_not_signal_and_ends_the_next_run(self) -> None:
+        for pid in (40, 41):
+            _ = self.process(pid, "python3", argv=("python3", "mac_queue_run.py"))
+            self.write_claim("mac", pid)
+
+        def signal_process(pid: int, number: int) -> None:
+            if pid == 40:
+                raise PermissionError(1, "Operation not permitted")
+            signals.append((pid, number))
+
+        signals: list[tuple[int, int]] = []
+        lines = hold_enforcer.enforce_machine(machine_hold.ActiveHolds((self.machine_hold("mac", "clear"),)), "mac",
+                                              self.proc, signal_process=signal_process)
+        self.assertEqual(signals, [(41, signal.SIGTERM)])
+        self.assertEqual(sorted(line.split(" (")[0] for line in lines), ["mac: pid 40", "mac: pid 41"])
+        self.assertIn("mac: pid 40 (tests 40) could not be ended: [Errno 1] Operation not permitted", lines)
+
+    def test_mac_clear_never_signals_the_caller_or_its_ancestors(self) -> None:
+        _ = self.process(40, "python3", argv=("python3", "mac_queue_run.py"))
+        _ = self.process(41, "python3", parent=40, argv=("python3", "build_hold.py", "clear", "mac"))
+        _ = self.process(50, "python3", argv=("python3", "mac_queue_run.py"))
+        for pid in (40, 41, 50):
+            self.write_claim("mac", pid)
+        signals: list[tuple[int, int]] = []
+        with mock.patch.object(os, "getpid", return_value=41):
+            _ = self.enforce((self.machine_hold("mac", "clear"),), "mac", signals)
+        self.assertEqual(signals, [(50, signal.SIGTERM)])
+
+    def test_release_mac_command_ends_the_mac_block_only(self) -> None:
+        result = build_hold.MacHoldResult(0, "", "")
+        with mock.patch.object(build_hold, "release_mac_hold", return_value=result) as release, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["release", "mac", "--holder", "holder"]), 0)
+        release.assert_called_once_with(build_hold.HolderIdentity("holder", "holder"), "mac")
+        self.assertTrue((self.holders / "holder").is_file())
 
 
 if __name__ == "__main__":

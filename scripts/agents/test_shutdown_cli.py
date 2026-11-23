@@ -1825,7 +1825,7 @@ fi
                 case.assertEqual(case.stops(), [
                     ["stop_resume.stop", DIRECTOR],
                     ["stop_resume.stop", SEAT],
-                    ["build_hold.py", "release", "--holder", DIRECTOR],
+                    ["build_hold.py", "release", "natedev", "--holder", DIRECTOR],
                 ])
                 case.assertIn("alpha retired", output)
                 case.assertEqual(case.unit_worktree(), staff.RemovedWorktree(machine, case.worktree, staff.ParkedBranch("alpha-branch")))

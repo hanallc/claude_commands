@@ -268,7 +268,7 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 ## mac_test.conf
 
-Controls Mac test offload and the `/build:mac` block command. It names the CI
+Controls Mac test offload and the Mac block that `/build:hold drain mac` sets. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
 window. Offload settings name the SSH host and connection and probe time

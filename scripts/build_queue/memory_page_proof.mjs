@@ -2331,7 +2331,7 @@ try {
           const blocked=structuredClone(readings.spacing);
           Object.assign(blocked,{room:1.0,pressure:'some stall above its limit',psi:{some:31.0,full:6.2},
             mac_idle_alert:'MAC IDLE 8 min: 1 steps wait for the Mac. Blocked by research since 15:32 ('+blockReason
-              +'); /build:mac unblock clears it.',
+              +'); /build:hold release mac clears it.',
             targets:[
               {target:'mac',state:'Blocked',reason:blockReason,holder:'research',unit:'research',showrunner:'hana',
                since:'since 15:32 EST',until:'awaiting unblock; requested expiry was 16:30 EST'},

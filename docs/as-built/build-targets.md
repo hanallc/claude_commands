@@ -79,14 +79,19 @@ Without a matching row, `target_platform` returns no answer and status 1.
 
 ### Holds: `scripts/build_hold/build_hold.py`
 
-`build_hold.py clear|drain|release [target]` reads its default from `default_target` in `config/build_targets.conf`.
-The shared target reader resolves configured target names.
-Only natedev supports these commands in this delivery.
-Mac, AWS, and `all` return exit 2 with `<command> <target> is not supported yet`.
-No unsupported selection changes any target.
-The commands have no `--target` option or trailing `target <name>` form.
-Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
-The retained remote helpers remain unreachable from these three commands.
+`build_hold.py clear|drain|release <machine>` needs a machine: `natedev`, `mac`, `mac-linux` or `hana-aws`.
+With no machine or another name, it prints `Name the machine: natedev, mac, mac-linux or hana-aws.` and returns exit 2.
+`hana-aws` returns exit 2 with `<command> hana-aws is not supported yet` until the queue hold store exists.
+No refused selection changes any target.
+`machine_hold.py` holds the machine names, the hold record (machine, verb, owner, comment) and the action for each machine.
+`hold_enforcer.active_holds` reads the natedev holder files and the Mac blocks into that record. It is the one function that the queue hold store replaces.
+A hold acts only on the named machine:
+- natedev: `drain` keeps runs that work; `clear` stops runs outside the allow rules.
+- `mac` and `mac-linux`: `drain` and `release` set and end the Mac block of that target through `mac_test.py block|unblock`. A drain ends no run.
+- `clear mac` sets the block, then ends each run with a live claim on the machine. It writes `ended: <machine> cleared by <owner> — "<comment>". A Mac run cannot go back to its lines yet.` to the run's stderr and sends `SIGTERM` to the claim PID.
+- A `mac` hold makes no second hold for `mac-linux`. `clear mac` also ends `mac-linux` runs. Placement of new `mac-linux` runs reads only the `mac-linux` block, so a `mac` hold does not refuse them until the queue hold store exists. A `mac-linux` block stays after a `mac` release.
+- `hana-aws`: the command refuses it with exit 2 for now. With the queue hold store, a clear acts as a drain while the AWS hold is in force, and its state line is `clear waits for the AWS hold`.
+`--showrunner <name>` sends the Mac block notices to that showrunner. `--keep` is natedev only.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
 `drain` keeps existing runs that work until they finish, also between their steps; a run that only waits waits for the release.
@@ -190,7 +195,7 @@ It saves no pass because a saved pass describes this machine.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
 - `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
-- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:mac unblock` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:hold release mac` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
 - Repairs still run only when no block or live claim exists. Buildlog schema 21 includes `mac_idle`, one row per cause per call; `message_showrunner` names its message action and failed sends stay pending without more rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
 - Exports for the build log: `BUILDLOG_TARGET` is `mac` from the start of a Mac attempt and for a call that ends there, empty after a decline or a lost run, `natedev` once tests start locally (a Mac pass confirmed on natedev is `natedev` with `BUILDLOG_MAC=passed`). `BUILDLOG_HOLD_WAIT_S` sums every wait a hold caused: routing sleeps, each declined Mac retry's seconds, and `wait-local`'s; memory waits are not counted. `BUILDLOG_MAC_HOLDER` carries a `busy` decline's `holder=` value and is passed on the `record.py call` line, never exported.
 
@@ -248,8 +253,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 
 | Command | Script | Role |
 | --- | --- | --- |
-| `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
-| `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
+| `/build:hold` | `build_hold.py` | Clear, drain, or release one named machine; check quiet and show holds. |
+| `/build:mac` | `mac_test.py` | Settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Changes unit priority. A bare command prints usage and the Builds page link. Use `/build:page` for the queue view. |
 | `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
@@ -476,7 +481,7 @@ the log does not record that connection. Journal retention also limits the evide
 - Hold checks store no build call records. A Mac attempt needs no local registration.
 - A hold nobody releases still escalates after 2 h: the waiter prints the holder and asks the agent to ask them.
 - Defaults are "go": no load threshold and no check for others' processes on any target. The claim watcher's activity check counts processes only to release an idle claim, never to turn a test away.
-- The scripts keep their arguments and exit codes: `build_hold.py clear|drain|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
+- The scripts keep their arguments and exit codes: `build_hold.py wait|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `build_hold.py clear|drain|release` need a machine name. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
 - Guard lines precede every read of `HOME` or a listed variable in `verify.sh` and `memory_gate.sh`.
   The guard runs at an entry point, never inside a directory reader.
 - The installed callers require `override_guard.sh`. Both machines need compatible installed helpers.
@@ -527,8 +532,7 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - `BUILDLOG_TARGET` becomes `mac` when a Mac attempt starts, before the claim is decided; it names where the call was when it ended, not proof that tests ran there.
 - A launch without a session waits while any holder file exists. A staff caller maps its current session to its fixed hold key. An explicit holder outside staff keeps its given key.
 - `holders_in_force`, `natedev_holds` and local hold checks use present holder files, never cycle release fields. A damaged cycle cannot admit a waiter; removing the last holder file permits it even when that cycle remains damaged.
-- `parse_hold_target` runs as argparse's `type=`, so an exception other than `ConfigError` or `UnicodeError` from `read_targets` prints a traceback. A non-UTF-8 config reaches the caller as `conf.Unusable`, which names the file.
-- `mac_test.py unblock` matches the stored holder key. Human-readable lines resolve that key to the current staff name when possible.
+- `mac_test.py unblock`, which `build_hold.py release mac` runs, matches the stored holder key. Human-readable lines resolve that key to the current staff name when possible.
 - Installed hold and claim writers must use compatible code. A running waiter retains the code that it started.
 - The build log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so report code selects the Mac as `host <> 'natedev'`, never by one name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; check worktree report code with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 - The claim watcher's ssh activity check has a fixed 10 s total limit beside the configurable connect timeout. A live check of worktree claim code runs `mac_test.py` through `~/.claude/scripts/lib/py` with scratch `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG`; the installed copy refuses those overrides.

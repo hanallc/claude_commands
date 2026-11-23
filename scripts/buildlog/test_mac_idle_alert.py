@@ -83,7 +83,7 @@ class SavedAlertTests(unittest.TestCase):
                                  "MAC IDLE WATCH: admission query failed: socket closed.")
                 self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone),
                                  "MAC BLOCKED by research since 00:16 (P15 F11 L0 run): 7 steps wait for the Mac, idle 10 min; "
-                                 + "/build:mac unblock clears it; admission query failed: socket closed.")
+                                 + "/build:hold release mac clears it; admission query failed: socket closed.")
 
 class MacIdleConfigTests(unittest.TestCase):
     def test_conf_dir_values_apply_without_a_second_read(self) -> None:

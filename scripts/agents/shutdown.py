@@ -1594,7 +1594,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.id for member in owned}):
         hold_script = override_guard.helper_root(Path(__file__)) / "build_hold/build_hold.py"
-        result = retirement_run([sys.executable, str(hold_script), "release", "--holder", key], settings=settings)
+        result = retirement_run([sys.executable, str(hold_script), "release", "natedev", "--holder", key], settings=settings)
         if result.returncode:
             print(f"anomaly: {retirement_failure(result)}")
     retirement_release_reservations(unit, settings=settings)
