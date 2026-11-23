@@ -98,6 +98,32 @@ If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
 When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
 If AWS refuses that unassigned run, natedev runs the selection.
+
+The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).
+It holds one argv, the work name and the owner unit, in place of the test selection.
+A hand made run comes to the guest through the `mac-linux` queue line: `fixed_mac_linux_candidate` allows the hand made command kind `HAND_MADE_KIND` as it allows a gate step.
+A hand made guest run that proves no start gives the assignment back with the reason `mac_linux_no_answer`.
+After natedev sends the command, only `GuestNotLocked` and `GuestRefusedCommand` prove no start; each other start failure is a start unknown, which ends the attempt and gives nothing back.
+`GuestCommand` uses the same commit snapshot, Git bundle, arm, run lock, sandbox and end proof as the gate.
+Before the arm, natedev compares each checked file with its blob in the snapshot tree, and refuses a missing or different blob.
+The request also holds the checkout path of each file that natedev read for an argv word.
+After the checkout and clean of the numbered copy, `command_refusal` checks each argv word; a failed word ends the run before the start.
+The guest then prints a refused line with the attempt, and `wait_for_start` raises `GuestRefusedCommand`.
+A later word that names a `main_folder` fails: python runs a `__main__` file of that folder, such as `__main__.py` or `__main__.pyc`. Natedev uses the same `main_folder`.
+A word with a checked file passes. For another word with a slash, the path from the copy must have no `..` and no symbolic link in a part, and its last part must not exist.
+Another later word with no slash must name no entry of the copy other than a plain folder, for example the `.lint-sweep-used` stamp.
+The check uses `lstat` on each part and follows no link outside the sandbox. An `lstat` error other than a missing part fails the word.
+For a word with no slash, each guest PATH match must be in `TOOL_FOLDERS` or be a compiled file outside the copy.
+For a later word, each readable PATH match counts, because bash finds a script name on PATH with no execute bit.
+The check reads PATH outside the sandbox; the sandbox `/tmp` and `/dev/shm` start empty, so the sandbox finds no file there that the check does not see.
+The guest prints a lock line with the attempt to stderr when it has taken the run lock.
+A failed lock step exits with `GUEST_NOT_LOCKED_STATUS`.
+The guest prints a start line with the attempt before it starts the argv.
+`GuestCommand.start` returns at that line, and a stream that ends before it is a start failure with the guest output.
+A stream that ends before the lock line with `GUEST_NOT_LOCKED_STATUS` raises `GuestNotLocked`, and `finish` proves no end.
+The gate route still proves the end after a failed lock step.
+The guest runs the argv in its numbered copy and streams the output to the caller.
+The stream sends no byte count and no full bundle after a refused delta bundle.
 A current assignment to an unsupported target fails and reports the target.
 
 ## Cloud gate route
@@ -695,6 +721,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   `GateJobResult.cpu_seconds` retains the reaped CPU time for that job.
 - **Rerun alone.** After all parallel jobs end, each failed test module runs once more, alone.
   Jobs killed at the module time limit and `types` do not run again.
+  The gate also excludes jobs that trigger a tripwire, including the live config guard.
   If more than `RERUN_LIMIT` (8) ordinary failures qualify, those failures do not run again; one line reports the count.
   Memory stops use their separate retry count even when ordinary failures exceed this limit.
   Each rerun uses the same launch, cleanup, arguments, environment, scope prefix, memory sampling, and time limit.
@@ -1353,6 +1380,19 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 The merge gate owns each module folder through a `tool_folder` context.
 The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
 The runner puts its config-read log, scratch root, and review root inside that folder.
+Before test discovery, the runner guards the real home’s `.claude/config` against Python writes.
+Python child processes inherit the guard through a temporary startup hook.
+The runner removes the hook at the end of the run. A child checks that the hook still exists before it records a violation.
+The guard records a violation in the module folder even when a test catches the error.
+The gate reads that record as a tripwire and fails the module without a rerun.
+For directory entry changes, the guard resolves symlinks in the parent path.
+For file content writes, it also resolves the final symlink.
+
+The guard covers Python file operations that emit audit events. Non-Python programs run outside the guard.
+Python children can bypass the hook by replacing `PYTHONPATH` or disabling Python startup hooks.
+Writes through an already open file descriptor also fall outside the guard.
+The Python open audit event omits the directory descriptor. The guard skips relative paths in this event.
+
 The runner supervisor removes these folders after it reaps the test processes, including after gate death on Linux.
 The gate repairs permissions if necessary when it removes the module folder.
 After gate death, recovery reports the retained gate folder for removal.

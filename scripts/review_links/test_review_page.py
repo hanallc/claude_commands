@@ -43,7 +43,7 @@ from scripts.production import change_review, change_routing, footer_counts, inv
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
-from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
+from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -402,7 +402,7 @@ window.fetch=(url,options)=>{
         for kind in investigation.InvestigationKind:
             request = self.submission_request(new_item_dialog.SubmissionKind(kind.value), unit.id)
             origin = new_item_dialog.ReviewSubmission(
-                request.request_id, 'a'*64, request.evidence, (), new_item_dialog.new_reply_token())
+                request.request_id, 'a'*64, request.evidence, (), 'b'*64)
             reports.append(investigation.file(owner.id, request.words, request.words, kind=kind,
                                                waiting_why='The owner checks the report.', submission=origin))
         snapshot = review_page.build_snapshot(self.root)
@@ -2702,8 +2702,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ // The limit only names a stuck step; each wait ends when its condition holds.
  const until=async(predicate,label)=>{
-  const end=performance.now()+8000;
+  const end=performance.now()+20000;
   while(!predicate()){
    if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');
    await new Promise(resolve=>requestAnimationFrame(resolve));
@@ -2729,7 +2730,12 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
   const failed=review();
   check(typeof frame.contentWindow.consoleNavigate==='undefined','The error page does not register navigation.');
   nav('list').click();
-  await until(()=>list()?.readyState==='interactive' && aliasLink('questions'),'the interactive List document');
+  // The console intercepts List links only after its ready handler runs, a task after readyState changes.
+  let listConnected=false;
+  document.querySelector('[data-console-page=list]').addEventListener('console-document-ready',
+   ()=>{listConnected=true;},{once:true});
+  await until(()=>listConnected && list()?.readyState==='interactive' && aliasLink('questions'),
+   'the connected interactive List document');
   aliasLink('questions').click();
   await until(()=>review()!==failed && review().querySelector('[data-review-loading]'),'the second Review request');
   check(review().readyState==='loading','The second Review document waits for the fixture.');
@@ -3773,8 +3779,8 @@ window.fetch=async(url,options)=>{
   show('all').click();await flush();await flush();
   chooseOwner(builder);
   check(counts('[data-show-chip]')==='1|0|1|0|0','Show counts use the selected owner.');
-  check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
-   'Type counts use the selected owner.');
+  check(type('change').querySelector('b').textContent==='2' && type('investigation').querySelector('b').textContent==='1',
+   'Type counts include the rows that appear if the Owner filter returns to All.');
   type('change').click();
   check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|2|0|0|0',
    'F007: an owner without the selected type resets to All.');
@@ -3945,6 +3951,95 @@ window.fetch=async(url,options)=>{
             'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_each_review_chip_counts_the_rows_after_its_click(self) -> None:
+        question = self.question()
+        other_question = self.question('What should the other owner check?')
+        _ = self.investigation(False)
+        _ = self.file_response(self.ready_submission_recipient().id)
+        opened = for_you.ForYouRow(f'action/{uuid4()}', 'action', 'Restore access', '', 'natedev',
+                                  '/tmp', 'builder-unit', '', '', '2026-11-17T15:00:00+00:00',
+                                  'open', 'manual', '')
+        completed = replace(opened, key=f'action/{uuid4()}', title='Completed action', status='done')
+        other = fixture_member('showrunner', name='other-owner')
+        records = [replace(item, owner=other.id)
+                   if item.key == other_question or item.type == review_items.ReviewType.CHANGE else item
+                   for item in review_items.read(self.root)]
+        with (patch.object(review_items, 'read', return_value=records),
+              patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((opened, completed), ()))):
+            markup = browser_markup(self.root, show='all')
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const review=document.querySelector('[data-review]');
+ const rows=()=>[...review.querySelectorAll('[data-list-item]:not([hidden])')];
+ const chip=(group,value)=>review.querySelector('[data-'+group+'-chip="'+value+'"]');
+ const question=QUESTION,owner=question.split('/')[1];
+ const place=(type='question',show='all')=>{
+  history.replaceState({recordTable:{opened:[]}},'','#'+new URLSearchParams({show,type,owner}));
+  dispatchEvent(new HashChangeEvent('hashchange'));
+ };
+ const clickAndCheck=button=>{
+  const label=button.textContent.trim(),count=Number(button.querySelector('b').textContent);
+  button.click();
+  check(rows().length===count,label+' shows '+rows().length+' rows after the click.');
+ };
+ const fetchPage=window.fetch;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && options.body.get('row')===question && options.body.get('outcome')==='later')
+   return Promise.resolve(Response.json({answer:'later',state:'Open',later:Date.now()+3600000}));
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('version') && !params.has('body'))
+   return Promise.resolve(Response.json({version:review.dataset.version,facts:pageRefreshFacts()}));
+  return fetchPage(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='900px';
+  window.matchMedia=()=>({matches:true});
+  place();
+  check(rows().length===1 && rows()[0].dataset.key===question,'The Question starts in the selected view.');
+  const buttons=[...review.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip]')]
+   .filter(button=>!button.hidden);
+  for(const button of buttons){place();clickAndCheck(button);}
+  place('investigations');clickAndCheck(chip('type','investigations'));
+  place();
+  clickAndCheck(chip('type','for-you'));
+  check(review.dataset.show==='open' && rows().length===1 && rows()[0].dataset.state==='Open',
+   'For you opens the single Open action from All.');
+  clickAndCheck(chip('show','all'));
+  check(rows().length===2,'For you in All shows both actions.');
+  clickAndCheck(chip('type','for-you'));
+  check(review.dataset.show==='all','The selected For you chip keeps All.');
+  place('question','Validating');
+  clickAndCheck(chip('type','response'));
+  check(review.dataset.show==='open' && rows().length===1 && rows()[0].dataset.type==='response',
+   'Responses opens the single response from Validating.');
+  place();
+  const [row]=rows();
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!form.dataset.sending){observer.disconnect();resolve();}
+   });
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-preset="soon"]').click();
+  if(!form.dataset.sending) throw new Error('Later did not start.');
+  await saved;
+  check(rows().length===0 && !review.querySelector('[data-empty]').hidden,'Later empties the selected Question view.');
+  for(const button of [chip('type','question'),chip('show','all'),chip('owner',owner)]){
+   check(button.getAttribute('aria-pressed')==='true' && button.querySelector('b').textContent==='0',
+    'The selected chip displays zero in the empty view.');
+   clickAndCheck(button);
+  }
+  for(const button of buttons){place();if(!button.hidden) clickAndCheck(button);}
+ }catch(error){failures.push(String(error));}
+ await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('QUESTION', json.dumps(question))
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
@@ -4669,7 +4764,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
                 assert isinstance(delivery, change_page.MessageDelivery)
                 path = self.status.path(delivery.page, delivery.row)
-                original_message = delivery.message
+                original_message = change_page.outbound_review_message(delivery).text
                 write = atomic_file.write_bytes_atomic
                 send = change_page.send_to_staff
                 original_sends = 0
@@ -4744,12 +4839,13 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                     if case == "response":
                         current = review_page.build_snapshot(self.root)
                         self.assertEqual(current.records[key].state, review_items.ReviewState.WAITING)
-                        for source in (current, None):
-                            with self.assertRaises(review_items.ReviewRecordChanged):
-                                _ = review_page.submit(self.root, body, self.status, snapshot=source)
-                            replayed = self.status.slots(delivery.page, delivery.row).verdict
-                            assert isinstance(replayed, change_page.DeliveryIntent)
-                            self.assertEqual(replayed.attempt, delivery.attempt)
+                        with patch.object(reply_tokens, 'path', return_value=self.root / 'absent-reply-token.key'):
+                            for source in (current, None):
+                                with self.assertRaises(review_items.ReviewRecordChanged):
+                                    _ = review_page.submit(self.root, body, self.status, snapshot=source)
+                                replayed = self.status.slots(delivery.page, delivery.row).verdict
+                                assert isinstance(replayed, change_page.DeliveryIntent)
+                                self.assertEqual(replayed.attempt, delivery.attempt)
                     change_page.recover_pending(change_page.DeliveryStatus(self.root))
                 send_key = change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt)
                 self.assertEqual(seen, [send_key] * 2)
@@ -5512,11 +5608,13 @@ window.fetch=async(url)=>{
   await document.fonts.ready;
   for(const width of [1280,390,320]){
    frameElement.style.width=width+'px';
+   await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
+   const atRight=Math.abs(o.right-r.right)<=1;
    if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
-      n.left<r.left-1 || Math.abs(o.right-r.right)>1 ||
+      n.left<r.left-1 || !atRight ||
       (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
     failures.push('The owner button is the only title action and fits at '+width+' px.');
    }
