@@ -264,6 +264,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
 | `scripts/production/waiting_why.py` | read | snapshot supplies the filer name for missing Waiting reasons |
 | `scripts/production/live_units.py` | read | snapshot |
+| `scripts/production/producer_map.py` | read | snapshot, active, by_id, by_path and qualified_name resolve members, find the producer that each showrunner or unit reports to, and name the member to map |
+| `scripts/production/producer_map_rows.py` | read | snapshot, active and by_id check and name each producer_map row that /tune saves |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/checkpoint_gate.py` | read | snapshot |
 | `scripts/production/merge_checkpoint.py` | read | snapshot |
@@ -333,6 +335,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
 | `scripts/review_links/review_submissions.py` | read | snapshot and by_id find the active recipient and locate the saved record for retries and replies. |
+| `scripts/review_links/new_item.py` | read | snapshot, active, by_current_session and caller_identity resolve the /new_item assignee and this session, name the active producers, and guess a name that is not known |
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
