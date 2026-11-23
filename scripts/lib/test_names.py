@@ -66,7 +66,7 @@ class NamesTests(unittest.TestCase):
         clear_runtime_names()
         self.addCleanup(clear_runtime_names)
 
-    def test_runtime_configuration_is_loaded_once_even_when_a_later_read_would_change(self) -> None:
+    def test_runtime_configuration_loads_once_while_the_file_stays_the_same(self) -> None:
         original = fixture_names(worker="builder")
         with patch.object(names, "load_names", side_effect=(original, fixture_names(worker="maker"))) as load:
             self.assertEqual(names.runtime_names(), original)

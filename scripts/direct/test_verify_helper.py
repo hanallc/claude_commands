@@ -71,7 +71,9 @@ if __name__ == "__main__":
                program: Path | None = None, temporary: Path | None = None) -> bytes:
         environment = {**verify_test_environment(), "VALUE": value}
         if temporary is not None:
+            # A build_folders call reads its settings from an empty folder, not from the live home.
             environment["TMPDIR"] = str(temporary)
+            environment["CONF_DIR"] = str(temporary)
         fields = [str(program or self.program), str(directory or self.root), str(len(arguments)), *arguments,
                   *(f"{name}={value}" for name, value in environment.items()), "", text, ""]
         return b"\0".join(os.fsencode(value) for value in fields) + b"\0"
@@ -222,13 +224,19 @@ def main():
 
     def test_an_exit_at_import_returns_the_fallback_and_keeps_the_helper_ready(self) -> None:
         exiting = self.root / "exit_at_import.py"
-        _ = exiting.write_text("raise SystemExit(3)\ndef main():\n    return 0\n")
+        imports = self.root / "imports"
+        _ = exiting.write_text(f"with open({str(imports)!r}, 'a') as imports:\n    imports.write('import\\n')\n"
+                               + "raise SystemExit(3)\ndef main():\n    return 0\n")
         process = self.start_helper()
         assert process.stdin is not None and process.stdout is not None
-        _ = process.stdin.write(self.encode("exit", "", program=exiting))
-        process.stdin.flush()
-        self.assertEqual(self.read_field(cast(BinaryIO, process.stdout)), "fallback")
-        _ = [self.read_field(cast(BinaryIO, process.stdout)) for _ in range(2)]
+        for attempt in ("first", "second"):
+            with self.subTest(attempt=attempt):
+                _ = process.stdin.write(self.encode("exit", "", program=exiting))
+                process.stdin.flush()
+                self.assertEqual(self.read_field(cast(BinaryIO, process.stdout)), "fallback")
+                _ = [self.read_field(cast(BinaryIO, process.stdout)) for _ in range(2)]
+        # The second call uses the recorded fallback and does not import the module again.
+        self.assertEqual(imports.read_text(), "import\n")
         status, output, _ = self.request(process, "after", "")
         self.assertEqual((status, output["value"]), (0, "after"))
 

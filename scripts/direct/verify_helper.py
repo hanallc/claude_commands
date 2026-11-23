@@ -249,7 +249,12 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 _ = forwarded.seek(0)
                 os.environ["VERIFY_RESULT_ENVIRONMENT_FD"] = str(forwarded.fileno())
             if call.program not in programs:
-                programs[call.program] = load_program(call.program)
+                try:
+                    programs[call.program] = load_program(call.program)
+                except SystemExit:
+                    # A module that exits at import time runs in its own process from now on.
+                    programs[call.program] = SeparateProcess()
+                    raise
             program = programs[call.program]
             if isinstance(program, LoadedProgram):
                 try:
