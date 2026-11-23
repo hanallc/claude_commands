@@ -2428,7 +2428,7 @@ The table starts half the cap line and one gap past the cap, and the fit measure
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
-A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
+A small line under a title (the showrunner or repository line, or a waiting note) never wraps either. It ends in an ellipsis in the same way.
 The 12rem cap (9rem in a narrow pane) on the label column stays.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
@@ -2448,7 +2448,7 @@ It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue
 3. A running and a waiting hana CI row.
 4. A Mac build, and an AWS row.
 5. A fixed Mac-only waiting row.
-6. A waiting hana CI row with a long waiting note and a job start.
+6. A waiting hana CI row with a long waiting note, and a job start in its hover.
 The queue-move stub gives the page a token, so the reorder handles draw.
 At 1440 px and at 900 px, dark, it fails when one of these is false:
 1. The table has no Unit and no Slot column.
