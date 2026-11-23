@@ -1493,7 +1493,17 @@ class TurnEndTests(unittest.TestCase):
                     self.assertIn(opened.pane, self.case.fixture.world.locations)
                     self.assertEqual(len(self.case.agent.submitted), submitted)
                     self.assertEqual(len(self.case.agent.notices), notices)
-                    self.assertEqual(worker.restore(parent, only=frozenset({opened.row.id})), worker.ExitCode.OK)
+                    original_send = send.send
+
+                    def send_before_close(options: send.Options) -> send.Result:
+                        self.assertIn(opened.pane, self.case.fixture.world.locations)
+                        self.assertEqual(len(self.case.agent.submitted), submitted)
+                        self.assertEqual(worker_panes.worker_pass(opened.row, run)["instance_id"], instance)
+                        return original_send(options)
+
+                    with patch.object(send, "send", side_effect=send_before_close) as delivered:
+                        self.assertEqual(worker.restore(parent, only=frozenset({opened.row.id})), worker.ExitCode.OK)
+                    delivered.assert_called()
                     self.assertNotIn(opened.pane, self.case.fixture.world.locations)
                 self.assertEqual(len(self.case.agent.notices), notices + 1)
                 self.assertIn(f"stopped; reply {saved}\nPass {instance}.", self.case.agent.notices[-1])

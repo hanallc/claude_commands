@@ -243,11 +243,12 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         if not hook.is_file():
             return Landed(sha, branch, pushed, HookAbsent())
         record = Path(checked("rev-parse", "--path-format=absolute", "--git-common-dir")) / "post-push-completed"
-        return Landed(sha, branch, pushed, run_hook(root, hook, record, sha, branch, retry_source or root))
+        return Landed(sha, branch, pushed, run_hook(root, hook, record, sha, branch, retry_source or root,
+                                                    git_config=git_config))
 
 
 def run_hook(root: Path, hook: Path, record: Path, sha: str, branch: str,
-             source: Path) -> HookAbsent | HookDone | HookSkipped | HookFailed:
+             source: Path, *, git_config: Sequence[str] = ()) -> HookAbsent | HookDone | HookSkipped | HookFailed:
     if not hook.is_file():
         return HookAbsent()
     try:
@@ -259,6 +260,7 @@ def run_hook(root: Path, hook: Path, record: Path, sha: str, branch: str,
     rerun = (f"LANDED_SHA={shlex.quote(sha)} LANDED_BRANCH={shlex.quote(branch)} "
              f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
              f"--checkout {shlex.quote(str(source))} --retry-hook")
+    rerun += "".join(f" --git-config {shlex.quote(setting)}" for setting in git_config)
     try:
         digest = hashlib.sha256(hook.read_bytes()).hexdigest()
         rerun += f" --hook-digest {digest}"
@@ -278,18 +280,19 @@ class CommitOrder(Enum):
     REQUESTED_ANCESTOR = auto()
 
 
-def commit_order(source: Path, current: str, requested: str) -> CommitOrder:
+def commit_order(source: Path, current: str, requested: str, *,
+                 environment: dict[str, str] | None = None) -> CommitOrder:
     """Compare exact commits in one repository. Refuse unrelated histories."""
     for sha in dict.fromkeys((current, requested)):
-        resolved = checked_git(source, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
+        resolved = checked_git(source, "rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}",
+                               environment=environment)
         if resolved != sha:
             raise LandError(f"{source}: expected a full commit SHA, got {sha}")
     if current == requested:
         return CommitOrder.SAME_COMMIT
     for ancestor, descendant, order in ((current, requested, CommitOrder.REQUESTED_DESCENDANT),
                                         (requested, current, CommitOrder.REQUESTED_ANCESTOR)):
-        result = subprocess.run(["git", "-C", str(source), "merge-base", "--is-ancestor", ancestor, descendant],
-                                capture_output=True, text=True, check=False)
+        result = run_git(source, "merge-base", "--is-ancestor", ancestor, descendant, environment=environment)
         if result.returncode == 0:
             return order
         if result.returncode != 1:
@@ -299,17 +302,20 @@ def commit_order(source: Path, current: str, requested: str) -> CommitOrder:
 
 
 @contextmanager
-def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "") -> Generator[Path]:
+def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "",
+                        environment: dict[str, str] | None = None) -> Generator[Path]:
     """Supply the tracked hook and files from the recorded commit."""
     with tempfile.TemporaryDirectory(prefix="promotion-hook-") as folder:
         exact = Path(folder) / "checkout"
-        _ = checked_git(source, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(exact), sha)
+        _ = checked_git(source, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(exact), sha,
+                        environment=environment)
         try:
             local_hook = source / HOOK_PATH
             exact_hook = exact / HOOK_PATH
             if not exact_hook.resolve().is_relative_to(exact.resolve()):
                 raise LandError(f"{HOOK_PATH} resolves outside the approved checkout")
-            if local_hook.is_file() and not exact_hook.exists() and not checked_git(source, "ls-files", "--", HOOK_PATH):
+            if (local_hook.is_file() and not exact_hook.exists()
+                    and not checked_git(source, "ls-files", "--", HOOK_PATH, environment=environment)):
                 contents = local_hook.read_bytes()
                 if hook_digest and hashlib.sha256(contents).hexdigest() != hook_digest:
                     raise LandError(f"{HOOK_PATH} changed since the failed hook")
@@ -317,18 +323,21 @@ def exact_hook_checkout(source: Path, sha: str, *, hook_digest: str = "") -> Gen
                 _ = exact_hook.write_bytes(contents)
             yield exact
         finally:
-            _ = checked_git(source, "worktree", "remove", "--force", str(exact))
+            _ = checked_git(source, "worktree", "remove", "--force", str(exact), environment=environment)
 
 
-def retry_hook(source: Path, sha: str, branch: str, hook_digest: str) -> HookAbsent | HookDone | HookSkipped | HookFailed:
+def retry_hook(source: Path, sha: str, branch: str, hook_digest: str, *,
+               git_config: Sequence[str] = ()) -> HookAbsent | HookDone | HookSkipped | HookFailed:
+    environment = _git_config_environment(git_config)
     with main_push_lock.main_push_lock(source):
-        published = remote_branch_commit(source, "origin", branch)
-        order = commit_order(source, published, sha)
+        published = remote_branch_commit(source, "origin", branch, environment=environment)
+        order = commit_order(source, published, sha, environment=environment)
         if order == CommitOrder.REQUESTED_ANCESTOR:
             raise LandError(f"origin/{branch} has a newer publication {published}; hook retry for {sha} refused")
         if order == CommitOrder.REQUESTED_DESCENDANT:
             raise LandError(f"origin/{branch} has not published {sha}; hook retry refused")
-        record = Path(checked_git(source, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "post-push-completed"
+        record = Path(checked_git(source, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                                  environment=environment)) / "post-push-completed"
         try:
             completed = record.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
@@ -336,16 +345,16 @@ def retry_hook(source: Path, sha: str, branch: str, hook_digest: str) -> HookAbs
         except UnicodeError as error:
             raise LandError(f"{record}: {error}") from error
         else:
-            order = commit_order(source, completed, sha)
+            order = commit_order(source, completed, sha, environment=environment)
             if order == CommitOrder.SAME_COMMIT:
                 return HookSkipped()
             if order == CommitOrder.REQUESTED_ANCESTOR:
                 raise LandError(f"the hook completion record has a newer commit {completed}; hook retry for {sha} refused")
-        with exact_hook_checkout(source, sha, hook_digest=hook_digest) as exact:
+        with exact_hook_checkout(source, sha, hook_digest=hook_digest, environment=environment) as exact:
             hook = exact / HOOK_PATH
             if not hook.is_file():
                 raise LandError(f"{HOOK_PATH} is missing from the approved checkout")
-            return run_hook(exact, hook, record, sha, branch, source)
+            return run_hook(exact, hook, record, sha, branch, source, git_config=git_config)
 
 
 def hook_report(hook: HookAbsent | HookDone | HookSkipped | HookFailed) -> str:
@@ -362,6 +371,7 @@ class LandCommand(argparse.Namespace):
     branch: str = "main"
     retry_hook: bool = False
     hook_digest: str = ""
+    git_config: list[str] = []
 
 
 def main() -> int:
@@ -371,16 +381,17 @@ def main() -> int:
     _ = parser.add_argument("--retry-hook", action="store_true")
     _ = parser.add_argument("--hook-digest", default="")
     _ = parser.add_argument("--branch", default="main")
+    _ = parser.add_argument("--git-config", action="append", default=[])
     args = parser.parse_args(namespace=LandCommand())
     try:
         if args.retry_hook:
             hook = retry_hook(args.checkout.resolve(), os.environ.get("LANDED_SHA", ""),
-                              os.environ.get("LANDED_BRANCH", "main"), args.hook_digest)
+                              os.environ.get("LANDED_BRANCH", "main"), args.hook_digest, git_config=args.git_config)
             print(hook_report(hook), file=sys.stderr if isinstance(hook, HookFailed) else sys.stdout)
             return hook.exit_code if isinstance(hook, HookFailed) else 0
         if not args.commit:
             parser.error("--commit is required to land a commit")
-        result = land(args.checkout, args.commit, args.branch)
+        result = land(args.checkout, args.commit, args.branch, git_config=args.git_config)
     except (LandError, OSError) as error:
         print(f"land_main: {error}", file=sys.stderr)
         return 1

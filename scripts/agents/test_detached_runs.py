@@ -3545,6 +3545,62 @@ class PaneRunDeliveryTests(unittest.TestCase):
             self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
         self.assertEqual(case.agent.notices[1:], [message])
 
+    def test_a_failed_stop_notice_retries_with_the_late_reply_path(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        agent.pane_commands(self)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        reply.unlink(missing_ok=True)
+        delivery = pass_recorder.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        agent.append(pane, "user", delivery.line)
+        path = self.create_stopped_run(row, dispatch)
+        agent.notice_failures = 1
+        with (patch.object(detached_runs, "_group_is_live", return_value=False),
+              contextlib.redirect_stderr(io.StringIO())):
+            _ = detached_runs.main(["deliver", str(path)])
+        self.assertEqual(agent.notices, [])
+        self.assertFalse(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
+
+        result = f"The work is complete.\nDONE {dispatch}"
+        agent.append(pane, "assistant", result)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=result)),
+                             turn_end.TurnOutcome.STOPPED)
+        late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
+        self.assertEqual(late_reply.read_text().rstrip(), result)
+        notice, = agent.notices
+        self.assertIn(f"stopped; reply {late_reply}\nPass {dispatch}.", notice)
+        self.assertTrue(pass_notices.is_settled(self.run_dir, dispatch, "stopped"))
+
+    def test_legacy_diagnostics_without_a_saved_sender_keep_the_record_readable(self) -> None:
+        case = self.stopped_diagnostic_fixture()
+        state_path = pass_recorder.state_path(self.run_dir)
+        state = worker_lifecycle.read_json_object(state_path)
+        notices = cast(dict[str, dict[str, dict[str, object]]], state["stopped_pass_notices"])
+        del notices[case.dispatch]["receipt"]["sender_native_id"]
+        write_text_atomic(state_path, json.dumps(state))
+        # A new worker session leaves no current sender for the stopped pass.
+        updated = staff.native_id(fixture_runtime_id("replacement-worker-session"))
+        _ = staff.update_current_session(case.row.current_session, updated)
+        message = "Pending diagnostic."
+        write_text_atomic(case.diagnostics, json.dumps({message: False}))
+        deliver = send.send
+
+        def check_sender(options: send.Options) -> send.Result:
+            self.assertEqual(options.sender_origin, send.ForwardedSender(send.UnavailableSender()))
+            return deliver(options)
+
+        with patch.object(send, "send", side_effect=check_sender):
+            self.assertIs(turn_end.retry_stopped_diagnostics(self.run_dir), worker_panes.StoppedDiagnosticRecovery.SETTLED)
+        self.assertFalse(case.diagnostics.exists())
+        record = pass_notices.read(self.run_dir, case.dispatch)
+        assert record is not None
+        self.assertEqual([(notice.text, notice.sender_native_id, notice.settled) for notice in record.notices.values()
+                          if notice.kind == pass_notices.NoticeKind.DIAGNOSTIC], [(message, "unavailable", True)])
+        self.assertEqual(case.agent.notices[1:], [message])
+
     def test_late_done_after_reassignment_uses_the_stopped_pass_receipt(self) -> None:
         for status, shared_role in (("idle", False), ("done", False), ("working", True)):
             with self.subTest(status=status, shared_role=shared_role):

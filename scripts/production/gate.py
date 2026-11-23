@@ -820,7 +820,7 @@ def recover_gate_runs(repo: Path) -> None:
 
 def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
-    refusals: list[str] = []
+    refusals: list[GateRefused] = []
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -829,10 +829,8 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
                 recover_gate_record(path)
             except GateRefused as error:
                 if directory == own_directory:
-                    if isinstance(error, RollbackRecoveryRefused):
-                        refusals.append(str(error))
-                        continue
-                    raise
+                    refusals.append(error)
+                    continue
                 report_key = (os.getpid(), path)
                 if report_key not in _reported_foreign_gate_refusals:
                     reason = " ".join(str(error).splitlines())
@@ -841,7 +839,10 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     finally:
         os.close(descriptor)
     if refusals:
-        raise RollbackRecoveryRefused("\n".join(refusals))
+        message = "\n".join(str(error) for error in refusals)
+        if all(isinstance(error, RollbackRecoveryRefused) for error in refusals):
+            raise RollbackRecoveryRefused(message)
+        raise GateRefused(message)
 
 
 def recover_gate_record(path: Path) -> None:

@@ -163,7 +163,9 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     legacy = pass_notices.LegacyNoticeStamp(saved_stamp, incoming_stamp)
     if notice_type:
         notice = pass_notices.Notice(message, sender, pass_notices.NoticeKind.RESULT)
-        pass_notices.stage_result(run, route, notice_type, notice, legacy=legacy)
+        # A stopped notice saved before the late reply gives way to the text with the reply path.
+        staged = pass_notices.StagedText.REPLACES_UNSETTLED if saved_reply_path else pass_notices.StagedText.FIRST
+        pass_notices.stage_result(run, route, notice_type, notice, legacy=legacy, staged=staged)
         if defer_notice:
             return TurnDecision(outcome, _no_notice)
         return TurnDecision(outcome, lambda: pass_notices.deliver(run, instance, (notice_type,)))
@@ -230,7 +232,7 @@ def _recorded_stop_notice(run: Path, notice: progress_history.StoppedPassNotice)
         raise ValueError(f"{notice.director_id}: stopped pass notice recipient is not in staff")
     row = record.by_id(notice.worker_id)
     completion = progress_history.hook_completion(passed)
-    # The first staged text is the notice text, so stage the saved reply path first.
+    # A saved late reply puts its path in the notice text.
     if (row is not None and isinstance(completion, progress_history.HookCompletion)
             and completion.stopped_reply == progress_history.StoppedReplyDisposition.SAVED):
         decision = _stopped_notice(row, director, run, passed, completion)
@@ -537,7 +539,7 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     if stopped:
         _defer_stopped_diagnostics(hold, run, row.id)
     elif isinstance(pane, worker.CloseCompletedPane):
-        pass_notices.deliver_diagnostics(run, instance)
+        _ = pass_notices.deliver_diagnostics(run, instance)
     if closed and completion.recording_done:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
         if isinstance(pane, worker.CloseCompletedPane):
@@ -1029,14 +1031,16 @@ def _send_stopped_diagnostics(run: Path, receipt: progress_history.StoppedPassRe
             row = staff.snapshot().by_id(route.worker_id)
             if row is not None and receipt.worker_session == row.current_session:
                 sender_id = progress_history.stopped_sender_native_id(row)
+        # A saved notice needs a sender; the unavailable stamp marks one that no record names.
+        sender = sender_id or "unavailable"
         try:
-            _ = send.read_sender_stamp(sender_id or "unavailable")
+            _ = send.read_sender_stamp(sender)
         except ValueError as error:
             raise worker_lifecycle.WorkerStateUnreadable(pass_recorder.state_path(run), str(error)) from error
         pass_notices.import_legacy_diagnostics(run, pass_notices.Route(instance, route.director_id, route.worker_name),
-                                               sender_id)
+                                               sender)
     try:
-        delivery = pass_notices.deliver_diagnostics_unless_busy(run, instance)
+        delivery = pass_notices.deliver_diagnostics(run, instance, busy=pass_notices.BusyDelivery.LEAVE_PENDING)
     except SystemExit as error:
         raise ValueError(f"diagnostic delivery exited with status {error}") from error
     if delivery is pass_notices.DiagnosticsDelivery.PENDING:
@@ -1276,13 +1280,11 @@ def _handle_locked(event: WorkerEvent,
                           for receipt in progress_history.stopped_pass_receipts(directory, row.id)]
 
         notice_handled_here = False
-        retry_excluded_diagnostics = False
 
         def retry_notices() -> None:
             for directory in directories:
                 excluded = instance if notice_handled_here and directory == run else ""
-                pass_notices.retry(directory, exclude_instance=excluded,
-                                   retry_excluded_diagnostics=retry_excluded_diagnostics)
+                pass_notices.retry(directory, exclude_instance=excluded)
 
         _ = after_unlock.callback(retry_notices)
         for directory in dict.fromkeys(directory for directory, _ in archived_stops):
@@ -1330,7 +1332,6 @@ def _handle_locked(event: WorkerEvent,
                     return TurnOutcome.STOPPED
                 receipt = progress_history.stopped_pass_receipt(run, passed)
                 notice_handled_here = True
-                retry_excluded_diagnostics = True
                 if event.kind == EventKind.RUN_FINISHED or (
                         event.kind == EventKind.TURN_END and marker in ("", receipt.completion_id)):
                     recovered = _record_stopped_reply(row, parent, run, receipt, stopped)
@@ -1351,7 +1352,6 @@ def _handle_locked(event: WorkerEvent,
                     else:
                         stopped = recovered
                     decision = _stopped_notice(row, parent, run, passed, stopped)
-                    retry_excluded_diagnostics = False
                     return _close_stopped_after_notice(row, parent, run, instance, decision, event.kind)
                 return _stopped_notice(row, parent, run, passed, stopped)
             return _ignored(event, "the recorder has not ended the stopped pass", row.name)

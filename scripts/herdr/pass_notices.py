@@ -56,6 +56,11 @@ class LegacyNoticeStamp:
                       NoticeKind.STATUS, settled=True, legacy_stamp=self.saved)
 
 
+class StagedText(Enum):
+    FIRST = "keep the first staged text"
+    REPLACES_UNSETTLED = "replace a saved text that is not settled"
+
+
 @dataclass(frozen=True)
 class Route:
     instance_id: str
@@ -105,6 +110,7 @@ class PassNotices:
                 continue
             route = _read_route(path, fields)
             notices = pass_record.object_dict(fields.get("notices")) or {}
+            replaces = fields.get("replaces_unsettled") is True
             if record is None:
                 record = cls(route, {})
                 # Apply the legacy event only to the first complete publication.
@@ -112,6 +118,8 @@ class PassNotices:
                 notices = {**initial, **{key: value for key, value in notices.items() if key not in initial}}
             for key, value in notices.items():
                 if key in seen:
+                    if replaces and (saved := record.notices.get(key)) is not None and not saved.settled:
+                        record.notices[key] = _read_notice(path, key, value)
                     continue
                 seen.add(key)
                 notice = _read_notice(path, key, value)
@@ -154,19 +162,23 @@ def _append(path: Path, content: dict[str, object]) -> None:
         os.close(descriptor)
 
 
-def _publish(path: Path, route: Route, notices: dict[str, Notice], *, initial: dict[str, Notice] | None = None) -> None:
+def _publish(path: Path, route: Route, notices: dict[str, Notice], *, initial: dict[str, Notice] | None = None,
+             staged: StagedText = StagedText.FIRST) -> None:
     content: dict[str, object] = {"route": asdict(route),
                                  "notices": {key: asdict(notice) for key, notice in notices.items()}}
     if initial:
         content["initial"] = {key: asdict(notice) for key, notice in initial.items()}
+    if staged is StagedText.REPLACES_UNSETTLED:
+        content["replaces_unsettled"] = True
     _append(path, content)
 
 
-def stage_result(run: Path, route: Route, key: str, notice: Notice, *, legacy: LegacyNoticeStamp) -> None:
+def stage_result(run: Path, route: Route, key: str, notice: Notice, *, legacy: LegacyNoticeStamp,
+                 staged: StagedText = StagedText.FIRST) -> None:
     path = _path(run, route.instance_id)
     initial = {key if legacy.matches_replay else "status:1": legacy.settled_event(notice)} if legacy.saved else {}
     with _locked(path, "record"):
-        _publish(path, route, {key: notice}, initial=initial)
+        _publish(path, route, {key: notice}, initial=initial, staged=staged)
 
 
 def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNoticeStamp) -> str:
@@ -372,42 +384,40 @@ def _pending_diagnostics(path: Path) -> tuple[str, ...]:
                  if notice.kind == NoticeKind.DIAGNOSTIC and not notice.settled)
 
 
-def deliver_diagnostics(run: Path, instance: str) -> None:
-    path = _path(run, instance)
-    if pending := _pending_diagnostics(path):
-        _deliver(path, pending)
-
-
 class DiagnosticsDelivery(Enum):
     SETTLED = "every diagnostic of the pass is settled"
     PENDING = "a diagnostic of the pass waits for delivery"
 
 
-def deliver_diagnostics_unless_busy(run: Path, instance: str) -> DiagnosticsDelivery:
-    """Deliver the pending diagnostics; a delivery in progress leaves them pending."""
+class BusyDelivery(Enum):
+    WAIT = "wait for a delivery in progress"
+    LEAVE_PENDING = "leave the diagnostics pending while another delivery runs"
+
+
+def deliver_diagnostics(run: Path, instance: str, *, busy: BusyDelivery = BusyDelivery.WAIT) -> DiagnosticsDelivery:
+    """Deliver the pending diagnostics of one pass."""
     path = _path(run, instance)
     pending = _pending_diagnostics(path)
     if not pending:
         return DiagnosticsDelivery.SETTLED
     with _lock_path(path, "delivery").open("a") as lock:
-        # A notice send can start this recovery before its sender releases the lock.
+        # A notice send can start a recovery before its sender releases the lock.
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if busy is BusyDelivery.LEAVE_PENDING else 0))
         except BlockingIOError:
             return DiagnosticsDelivery.PENDING
         _deliver_held(path, pending)
     return DiagnosticsDelivery.PENDING if _pending_diagnostics(path) else DiagnosticsDelivery.SETTLED
 
 
-def retry(run: Path, worker: str = "", *, exclude_instance: str = "", retry_excluded_diagnostics: bool = False) -> None:
+def retry(run: Path, worker: str = "", *, exclude_instance: str = "") -> None:
     for path in run.glob(NOTICE_FILES):
         try:
             record = PassNotices.read(path)
-            if record is None or (worker and record.route.worker_name != worker):
+            if (record is None or (worker and record.route.worker_name != worker)
+                    or record.route.instance_id == exclude_instance):
                 continue
-            excluded = record.route.instance_id == exclude_instance
-            pending = tuple(key for key, notice in record.notices.items() if not notice.settled
-                            and (not excluded or retry_excluded_diagnostics and notice.kind == NoticeKind.DIAGNOSTIC))
+            pending = tuple(key for key, notice in record.notices.items() if not notice.settled)
             if pending:
                 _deliver(path, pending, retry=True)
         except (OSError, ValueError, staff.StaffRefused) as error:
