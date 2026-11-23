@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import hashlib
 import json
 import math
@@ -49,6 +50,14 @@ ASSIGNMENT_MAX_BYTES = 1024 * 1024
 
 def _no_test_width() -> records.NoTestWidth:
     return records.NoTestWidth()
+
+
+class QueryPatience(Enum):
+    """How long a read waits for the answer of a service that took the connection."""
+    # A page or a probe gives up after query_timeout_seconds, so it never hangs.
+    SHORT = auto()
+    # A person waits: a live, slow service gets up to unreachable_limit_seconds to answer.
+    LIVE = auto()
 
 
 class AdmissionUnavailable(RuntimeError):

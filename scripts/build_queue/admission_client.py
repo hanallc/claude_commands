@@ -392,7 +392,8 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest,
+           patience: status_wire.QueryPatience = status_wire.QueryPatience.SHORT) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None)
@@ -402,10 +403,13 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-    timeout = records.read_memory_config().query_timeout_seconds
-    deadline = CLOCK.monotonic() + timeout
+    config = records.read_memory_config()
+    started = CLOCK.monotonic()
+    # A down service refuses the connection at once; only the answer can take longer.
+    timeout = config.query_timeout_seconds if patience is status_wire.QueryPatience.SHORT else config.unreachable_limit_seconds
+    deadline = started + timeout
     try:
-        with _connect(_remaining_seconds(deadline)) as connection:
+        with _connect(_remaining_seconds(started + config.query_timeout_seconds)) as connection:
             outgoing = wire.encode_request(request).encode()
             connection.settimeout(_remaining_seconds(deadline))
             connection.sendall(outgoing)
@@ -638,9 +642,9 @@ def build_history_generation(configuration: records.MemoryConfig | ReadConfigura
     return records.BuildHistoryGeneration(reply.generation)
 
 
-def view() -> records.QueueRead | wire.CloudQueueRead:
+def view(patience: status_wire.QueryPatience = status_wire.QueryPatience.SHORT) -> records.QueueRead | wire.CloudQueueRead:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    reply = _query(wire.ViewRequest())
+    reply = _query(wire.ViewRequest(), patience)
     if not isinstance(reply, wire.ViewReply):
         raise wire.AdmissionUnavailable("invalid view answer")
     records.warn_configuration_diagnostics(reply.reading.diagnostics)

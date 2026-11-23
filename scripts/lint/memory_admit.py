@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
-from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records as records, admission_wire, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -3140,9 +3140,10 @@ def sampling_context(row: Reservation) -> dict[str, object]:
 
 
 class QueueServiceReader(Protocol):
-    def view(self) -> QueueRead: ...
+    def view(self, patience: admission_wire.QueryPatience = ...) -> QueueRead: ...
 
 
 def queue_read() -> QueueRead:
+    """Read the queue for a person, who waits while a live service is slow."""
     client = cast(QueueServiceReader, cast(object, importlib.import_module("scripts.build_queue.admission_client")))
-    return client.view()
+    return client.view(admission_wire.QueryPatience.LIVE)
