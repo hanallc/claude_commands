@@ -956,15 +956,15 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
 def _mac_mirror_name(source: "MacSourceRepository") -> str:
     """Name the mirror after the last checkout in the lending chain that has the same origin.
 
-    A prepared or merged copy is a shared clone in a folder named for the copy.
-    A task clone is a shared clone too, so a copy of a task clone borrows twice.
+    A prepared or merged copy is a clone in a folder named for the copy.
+    A task clone is a clone too, so a copy of a task clone has two lenders.
     The folder names of these clones are not the repository name; the first lender's name is.
     """
     from scripts.buildlog import repository
 
     named = source.git_dir
     seen = {named}
-    lender = repository.borrowed_git_dir(named)
+    lender = _lending_git_dir(named)
     while lender is not None and lender not in seen:
         seen.add(lender)
         try:
@@ -974,8 +974,33 @@ def _mac_mirror_name(source: "MacSourceRepository") -> str:
         if not isinstance(lent, repository.MacSourceRepository) or lent.key != source.key:
             break
         named = lent.git_dir
-        lender = repository.borrowed_git_dir(lender)
+        lender = _lending_git_dir(lender)
     return Path(named).parent.name
+
+
+def _lending_git_dir(git_dir: str) -> str | None:
+    """Find the checkout a clone came from: its alternates file, else its local "source" remote.
+
+    copies.initialize_git clones with --shared, or with --no-local while a gate runs on the
+    source. A --no-local clone has no alternates file; its "source" remote names the checkout.
+    """
+    from scripts.buildlog import repository
+
+    borrowed = repository.borrowed_git_dir(git_dir)
+    if borrowed is not None:
+        return borrowed
+    try:
+        lines = (Path(git_dir) / "config").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    in_source = False
+    for line in lines:
+        text = line.strip()
+        if text.startswith("["):
+            in_source = text == '[remote "source"]'
+        elif in_source and text.partition("=")[0].strip() == "url":
+            return repository.local_origin_git_dir(text.partition("=")[2].strip())
+    return None
 
 
 def has_mac_worktree(worktree: str) -> bool:

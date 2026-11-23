@@ -740,8 +740,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         return cast(str, values["variable"])
 
 
-    def test_shared_copy_folder_takes_the_mirror_name_of_its_source_checkout(self) -> None:
-        # copies.py puts a prepared or merged copy at <tool folder>/copies-source/source as a shared clone.
+    def test_each_copy_folder_takes_the_mirror_name_of_its_source_checkout(self) -> None:
+        # copies.py puts a prepared or merged copy at <tool folder>/copies-source/source as a clone.
         origin = "https://fixture.invalid/hana"
         source = self.repository("hana")
         copy = self.root / "tmp" / "copies-source" / "source"
@@ -759,9 +759,21 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                            env=self.environment, check=True)
         _ = subprocess.run(["git", "-C", str(task_copy), "remote", "set-url", "origin", origin],
                            env=self.environment, check=True)
+        # While a gate runs on the source, copies.py clones with --no-local and adds a local "source" remote.
+        unshared = self.root / "gate-tmp" / "copies-source" / "source"
+        _ = subprocess.run(["git", "clone", "-q", "--no-local", "--no-checkout", str(source), str(unshared)],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(unshared), "remote", "set-url", "origin", origin],
+                           env=self.environment, check=True)
+        _ = subprocess.run(["git", "-C", str(unshared), "remote", "add", "source", str(source)],
+                           env=self.environment, check=True)
+        # A Git worktree shares the Git folder of its checkout.
+        worktree = self.root / "worktrees" / "hana-feature"
+        _ = subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", "--detach", str(worktree)],
+                           env=self.environment, check=True)
         expected = claim_state.mac_repository_identity(str(source))
         assert isinstance(expected, claim_state.MacMirrorIdentity)
-        for checkout in (copy, task, task_copy):
+        for checkout in (copy, task, task_copy, unshared, worktree):
             with self.subTest(checkout=checkout.relative_to(self.root)):
                 mirror = claim_state.mac_repository_identity(str(checkout))
                 assert isinstance(mirror, claim_state.MacMirrorIdentity)
