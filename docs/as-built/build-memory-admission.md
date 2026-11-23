@@ -2296,8 +2296,12 @@ A running row's `Target` cell shows only the machine that runs the step, such as
 The feed's `machine` field is the one source for that machine.
 The row hover lists the other machines that the step named, under `Named targets`.
 A waiting row's `Target` cell lists each machine that can take the step, joined by `or`.
-The waiting lists size the `Target` column too, so each list shows on one line; a new list can move the `vCPU` and `Tokens` columns.
-In a tight pane only running rows size the column, and a waiting list breaks between machines, never inside a machine name.
+Waiting rows size the `Step` and `Target` columns too, so each step and each list shows on one line; a new waiting row can move the columns to their right.
+In a tight pane only running rows size these columns. A waiting step then breaks between words, and a waiting list breaks between machines, never inside a machine name.
+Each machine name on the page shows in its machine color: in the `Target` cells, the hover's `Runs on` and `Named targets`, Target availability, and the top costs.
+The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
+`mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` is the AWS box, so it uses the `aws` color.
+The hover words `Mac` and `AWS` match their machines without case.
 The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. With no room, the heading ends in an ellipsis and its hover gives the full text.
 `Verify` shows the Rust verify verb when the feed records a Verify call.
 `Step` shows the feed's `title.step`, which uses the build step names from `config/build_steps.conf`.
@@ -2326,7 +2330,8 @@ The label column is as wide as the widest running label or the Free row.
 A longer queued name wraps inside that width.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
-`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage cell is cut, or the label column is wider than its labels.
+`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
+It also fails when a `Target` machine name has no machine color, or a `mac-linux` cell does not show the `mac` color.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.

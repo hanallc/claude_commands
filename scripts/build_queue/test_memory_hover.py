@@ -198,8 +198,13 @@ class MemoryHoverTests(unittest.TestCase):
         waiting_target = root.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
         assert waiting_target is not None
         self.assertEqual("".join(waiting_target.itertext()), "natedev or mac-linux or hana-aws")
-        self.assertIn("<dt>Named targets</dt><dd>natedev or mac-linux or hana-aws</dd>", rendered[3])
-        self.assertIn("<dt>Named targets</dt><dd>Mac or natedev or mac-linux or hana-aws</dd>", rendered[4])
+        # Each machine name in the hover shows in its machine color.
+        def machines(*names: str) -> str:
+            return " or ".join(f'<span class="machine" data-machine="{name}">{name}</span>' for name in names)
+
+        self.assertIn(f"<dt>Runs on</dt><dd>{machines('mac-linux')}</dd>", rendered[3])
+        self.assertIn(f"<dt>Named targets</dt><dd>{machines('natedev', 'mac-linux', 'hana-aws')}</dd>", rendered[3])
+        self.assertIn(f"<dt>Named targets</dt><dd>{machines('Mac', 'natedev', 'mac-linux', 'hana-aws')}</dd>", rendered[4])
         self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='name']"), "hana CI")
         self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='owner']"), "")
         self.assertEqual(root.findtext(".//tr[@data-tip='row:fixture-run-1']/th[@class='step']/span"), "")
@@ -248,10 +253,11 @@ class MemoryHoverTests(unittest.TestCase):
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
         grid = ElementTree.fromstring(body)
-        for label in ("Because", "Runs on"):
-            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
-            self.assertEqual(value.text, "builder")
-            self.assertEqual(list(value), [])
+        because = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Because")
+        self.assertEqual((because.text, list(because)), ("builder", []))
+        # Runs on names machines, so its words take the machine colors and never a staff color.
+        runs_on = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Runs on")
+        self.assertEqual([(span.get("class"), span.text) for span in runs_on.iter("span")], [("machine", "builder")])
         for label, name in (("Showrunner", "helper"), ("Worker", "builder")):
             value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
             self.assertEqual(value.findtext("span"), name)
@@ -794,7 +800,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(owner.text, "hana")
                 tooltip = ElementTree.fromstring(result[1])
                 labels = [cell.text for cell in tooltip.findall("dt")]
-                values = [cell.text for cell in tooltip.findall("dd")]
+                values = ["".join(cell.itertext()) for cell in tooltip.findall("dd")]
                 self.assertEqual(labels, ["trunk · hana nextest", "Showrunner", "Runs on", "Uses", "Reading age", "In queue cap"])
                 self.assertEqual(values, ["running 2 min", "hana", "Mac", "3.5 GiB", "<1 min", "no"])
 

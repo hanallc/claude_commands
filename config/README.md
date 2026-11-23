@@ -604,9 +604,9 @@ Rsync replaces complete files and preserves this host's append files.
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
 | `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
-| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
-| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
-| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac and mac-linux names. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws and hana-aws names. |
 
 Configuration values use six hexadecimal digits without `#`.
 The text colors exceed 4.5:1 contrast against both backgrounds in their theme.

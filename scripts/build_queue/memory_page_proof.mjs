@@ -499,10 +499,12 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
-        if (queueRowsProof) {
+        if (queueRowsProof || !focusedProof) {
           // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it, and a running row's
-          // Target shows only its machine. A fourth argument names a published page to shoot as the before view.
+          // Target shows only its machine. The gate checks these rows too; only --queue-rows takes the shot.
+          // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
+          const shootBefore = queueRowsProof && beforePage;
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
@@ -523,7 +525,7 @@ try {
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
-          await navigate(beforePage ? 'before.html' : 'memory_live.html');
+          await navigate(shootBefore ? 'before.html' : 'memory_live.html');
           const rows = await evaluate(`(() => {
             const walk = document.querySelector('#walk');
             const name = row => row.querySelector('.name').textContent;
@@ -546,9 +548,15 @@ try {
                 const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                 return label.scrollWidth > label.clientWidth;
               })(),
+              cutSteps:[...walk.querySelectorAll('tbody .step .cell-text')]
+                .filter(text => text.scrollWidth > text.clientWidth).map(text => text.textContent),
+              // A machine name is a Target cell with no list in it, or one name in a waiting list.
+              machineColors:[...walk.querySelectorAll('tbody td.machine:not(:has(.machine)), tbody td.machine .machine')]
+                .filter(name => !['', '—'].includes(name.textContent)).map(name => [name.textContent, getComputedStyle(name).color,
+                  getComputedStyle(name.closest('tr')).color]),
               clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
           })()`);
-          if (!beforePage) {
+          if (!shootBefore) {
             await assertRowCenters(evaluate);
             assert.deepEqual(rows.headers, runningHeaders);
             assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest','natedev'],
@@ -557,12 +565,22 @@ try {
             assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
             assert.equal(rows.waitingTargetLines, 1, 'The waiting Target list wraps.');
             assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+            assert.deepEqual(rows.cutSteps, [], 'A Step cell is cut.');
+            assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
+              'A Target machine name has no machine color.');
+            const macColor = 'rgb(' + reading.colors.dark.machines.mac.slice(1).match(/../g)
+              .map(part => parseInt(part, 16)).join(', ') + ')';
+            assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
+              'The mac-linux Target has no mac color.');
           }
-          const output = join(folder, beforePage ? 'before.png' : 'after.png');
-          const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
-          await writeFile(output, Buffer.from(shot.data,'base64'));
-          console.log(JSON.stringify({pass:true,rows:rows.names,output}));
-          break browserProof;
+          if (queueRowsProof) {
+            const output = join(folder, shootBefore ? 'before.png' : 'after.png');
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
+            await writeFile(output, Buffer.from(shot.data,'base64'));
+            console.log(JSON.stringify({pass:true,rows:rows.names,output}));
+            break browserProof;
+          }
+          await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         }
         await checkQueueDrag(navigate, evaluate, call);
         if (queueDragProof) {

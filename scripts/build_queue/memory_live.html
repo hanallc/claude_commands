@@ -181,9 +181,11 @@ __PAGE_FRAME_STYLE__
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
+/* The one machine color map. A name matches without case, so the hover words "Mac" and "AWS" match too.
+   mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws is the AWS box, so it takes the aws color. */
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
-.machine[data-machine="mac"] { color: var(--machine-mac); }
-.machine[data-machine="aws"] { color: var(--machine-aws); }
+.machine:is([data-machine="mac" i], [data-machine="mac-linux"]) { color: var(--machine-mac); }
+.machine:is([data-machine="aws" i], [data-machine="hana-aws"]) { color: var(--machine-aws); }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
@@ -338,15 +340,16 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
+.walk-table .step { width: var(--step); min-width: var(--step); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
-.walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
-.walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; }
-/* A waiting step's targets size the Target column (fitWalkDetails). In a tight pane they wrap inside it,
-   and a line breaks only between machines, never inside a name such as hana-aws. */
+/* A waiting step and its targets size the Step and Target columns (fitWalkDetails). In a tight pane they wrap
+   inside them. A step breaks between words, and a target list breaks only between machines, never inside hana-aws. */
+.walk-table .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; }
+.walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; white-space: normal; }
 .walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
 .walk-table .wait-target .machine { white-space: nowrap; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
@@ -572,7 +575,20 @@ function roleName(text) {
   return globalThis.staffNames?.parts(text) ?? esc(text);
 }
 function nameParts(parts) {
-  return parts.map(part => part.kind === 'staff' ? staffName(part.text) : esc(part.text)).join('');
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text)
+    : part.kind === 'machine' ? machineName(part.text) : esc(part.text)).join('');
+}
+// A machine name shows in its machine color (the .machine rules).
+function machineName(name) {
+  return `<span class="machine" data-machine="${esc(name)}">${esc(name)}</span>`;
+}
+// "natedev or Mac" and "natedev only" give each machine name its color.
+function machineParts(text) {
+  return text.split(/( or | only$)/).map((part, index) => ({kind: index % 2 ? 'text' : 'machine', text: part}))
+    .filter(part => part.text);
+}
+function machineField(label, text) {
+  return {...field(label, text), valueParts: machineParts(text)};
 }
 function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
@@ -881,7 +897,7 @@ function becauseRows(reason, parts) {
     : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
 function routeFields(row) {
-  return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
+  return [machineField('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
     ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
@@ -906,10 +922,10 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
-  const guestFields = row.guest_run ? [field('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
+  const guestFields = row.guest_run ? [machineField('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && namesGuest
-    ? [field('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
+    ? [machineField('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable && !row.guest_run ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
@@ -967,7 +983,7 @@ function stepTooltip(key, data) {
     }
   } else {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(field('Runs on', machine), ...namedTargets);
+    rows.push(machineField('Runs on', machine), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1039,7 +1055,7 @@ function renderTargets(rows) {
   box.hidden = !rows.length;
   box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
     const owner = row.state === "Unavailable" ? "" : targetOwner(row);
-    return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
+    return `<div class="target-row"><div class="target-head">${machineName(row.target)}` +
       `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
       `<div class="target-until">${esc(sentence(row.until))}</div>` +
       `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
@@ -1572,7 +1588,7 @@ function renderReport(report) {
   const days = report.days;
   $("cost-window").textContent = `Last ${report.recent_days} days: ${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone}`;
   $("top-costs").innerHTML = report.top.length ? report.top.map(row =>
-    `<p class="report-top-row"><strong>${esc(row.cause)} on ${esc(row.machine)}: ${esc(costRange(row))}.</strong>${row.window.state === "matches recent" ? "" : ` ${days}-day mean: ${esc(reportCost(row.window))}.`}${row.share ? ` ${esc(row.share)}` : ""}<span class="action">${esc(row.action)}</span></p>`).join("") : "No data yet for this window.";
+    `<p class="report-top-row"><strong>${esc(row.cause)} on ${machineName(row.machine)}: ${esc(costRange(row))}.</strong>${row.window.state === "matches recent" ? "" : ` ${days}-day mean: ${esc(reportCost(row.window))}.`}${row.share ? ` ${esc(row.share)}` : ""}<span class="action">${esc(row.action)}</span></p>`).join("") : "No data yet for this window.";
   restoreReportView(view);
 }
 
@@ -1824,7 +1840,7 @@ function renderWalk(d) {
   // A step that runs shows only its machine; the row tooltip names the other targets. A step that waits lists them all.
   const targetCell = (machine, named) => {
     if (machine || !named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
-    const labels = named.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ");
+    const labels = named.map(machineName).join(" or ");
     return `<td class="machine" data-machine="${esc(named.join(" or "))}"><span class="wait-target">${labels || "—"}</span></td>`;
   };
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
@@ -1955,9 +1971,9 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    // Waiting targets size the column, so each list stays on one line. In a tight pane they wrap between machines.
-    const machines = walk.classList.contains("tight") ? "tr:not(.wait) > .machine" : "tr > .machine";
-    const widths = [...table.querySelectorAll(name === "machine" ? machines : `.${name}`)].map(cell => {
+    // Waiting steps and targets size their columns, so each stays on one line. In a tight pane they wrap.
+    const rows = name !== "duration" && walk.classList.contains("tight") ? "tr:not(.wait)" : "tr";
+    const widths = [...table.querySelectorAll(`${rows} > .${name}`)].map(cell => {
       context.font = canvasFont(cell);
       return context.measureText(cell.textContent).width + parseFloat(getComputedStyle(cell).paddingRight);
     });
@@ -1969,6 +1985,7 @@ function fitWalkDetails() {
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
+  measureColumn("step");
   measureColumn("machine");
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
@@ -2003,6 +2020,7 @@ function fitWalkDetails() {
   }
   if (fit.remainingWidth < minimumTrackWidth) {
     walk.classList.add("tight");
+    measureColumn("step");
     measureColumn("machine");
     fit = measure(labelWidth);
   }
