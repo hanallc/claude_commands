@@ -330,7 +330,8 @@ def run_attempt(
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
-    _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
+    # place-step reads `what` from this file, so the Builds row shows `<owner>: <what>`.
+    _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid, "what": args.what}))
     assignment_file.chmod(0o600)
     with run_directory(episode) as directory, contextlib.ExitStack() as mirror, contextlib.ExitStack() as ssh:
         argv_file = directory / "argv.json"

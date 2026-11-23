@@ -487,8 +487,14 @@ class JobStartTests(unittest.TestCase):
             write_process(proc, 50, parent=1, start="40", name="Runner.Listener")
             write_process(proc, 100, parent=50, start="12345", name="Runner.Worker")
             write_process(proc, 200, parent=100, start="12400", name="bash")
-            write_process(proc, 300, parent=200, start="12500", name="python3")
+            write_process(proc, 300, parent=200, start="12500", name="a) (b c")
             self.assertEqual(ci_cargo_front.job_start(300, proc), 12345 / os.sysconf("SC_CLK_TCK"))
+
+    def test_a_missing_parent_stat_means_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 300, parent=200, start="12500", name="python3")
+            self.assertIsNone(ci_cargo_front.job_start(300, proc))
 
     def test_a_parent_cycle_without_a_runner_worker_means_no_job_start(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -520,9 +526,9 @@ class JobStartTests(unittest.TestCase):
                     status, errors, held = self.run_front_call(proc, Path(folder), GITHUB_ACTIONS=actions)
                 self.assertEqual(status, 1)
                 self.assertEqual(cast(float, held.call_args.kwargs["wait_until"]), math.inf)
-                self.assertEqual(errors.splitlines()[0].startswith("::warning::"), bool(warning), errors)
+                self.assertEqual(errors.count("::warning::"), 1 if warning else 0, errors)
                 if warning:
-                    self.assertIn(warning, errors)
+                    self.assertTrue(errors.startswith(warning), errors)
 
     def test_a_missing_or_bad_key_in_a_runner_job_exits_1_with_its_reason(self) -> None:
         for setting in ("", "# whole: 1..\nci_job_wait_limit_minutes=0\n", "# whole: 1..\nci_job_wait_limit_minutes=soon\n"):

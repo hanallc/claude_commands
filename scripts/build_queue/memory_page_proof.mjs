@@ -1720,7 +1720,7 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
+            assert.deepEqual(macProof.map(row=>row.name),['hana: build','trunk: nextest','cargo-liner: nextest']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
@@ -2647,7 +2647,7 @@ try {
               scroll:tip.scrollWidth,client:tip.clientWidth};
           })()`);
           if(version==='after') {
-            assert.equal(state.title,'fps nextest');
+            assert.equal(state.title,'fps: nextest');
             assert.equal(state.duration,'running 10 min');
             assert.ok(state.width<=24*16+22,JSON.stringify(state));
             assert.ok(state.scroll<=state.client,JSON.stringify(state));

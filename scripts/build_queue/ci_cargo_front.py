@@ -127,7 +127,7 @@ def end_with_front(front_pid: int) -> None:
 
 
 def job_start(pid: int, proc_root: Path) -> float | None:
-    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None outside a runner.
+    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None without a readable Runner.Worker ancestor.
 
     A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
     """
