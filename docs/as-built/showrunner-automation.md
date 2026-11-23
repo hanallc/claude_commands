@@ -604,7 +604,9 @@ For example, use `--start '2026-11-30T09:00[America/Los_Angeles]'` to keep 09:00
 Use `--repeat 'FREQ=WEEKLY;BYDAY=MO'` to repeat on Mondays.
 The CLI prints the rule in words before it saves the schedule.
 The schedule stores its start and instruction in the `schedule` field.
-A series also stores its RRULE, run progress, and changes or skips by run number.
+A series also stores its RRULE, run allowance, and run progress.
+It stores changes and skips by run number.
+Delivery uses the saved allowance.
 Old records without the field have no schedule.
 The `list` command shows the start, repeat rule in words, and next run.
 

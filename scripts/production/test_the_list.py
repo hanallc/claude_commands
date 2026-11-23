@@ -287,17 +287,19 @@ class TheListTests(unittest.TestCase):
                 saved = the_list.load(MORTY.id, identity).schedule
                 self.assertEqual(saved, progress)
                 assert isinstance(saved, the_list.ScheduledSeries)
-                self.assertEqual(tuple((run.number, run.run.start) for run in saved.runs(the_list.series_run_limit())),
+                self.assertEqual(tuple((run.number, run.run.start) for run in saved.runs()),
                                  expected)
                 rows = self.command("list")[1].splitlines()
                 row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
                 self.assertIn(f"· next {expected[0][1].isoformat()}", row)
 
+        settings = self.list_config.read_text()
         for label, offset, old_cursor, expected_finished in (
             ("6de0503120 split", 1, {}, frozenset({1})),
             ("9eb8ed1201 cursor", 0, {"runs_used": 2}, frozenset({1})),
         ):
             with self.subTest(label=label):
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", "series_run_limit=4"))
                 code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY;COUNT=4")
                 self.assertEqual((code, errors), (0, ""))
                 identity = output.splitlines()[-1]
@@ -314,9 +316,16 @@ class TheListTests(unittest.TestCase):
                 assert isinstance(series, the_list.ScheduledSeries)
                 self.assertEqual((series.finished_runs, series.skipped_runs, series.runs_used),
                                  (expected_finished, frozenset({2}), 2))
+                self.assertEqual(series.run_number_offset, offset)
                 event = saved.log[-1].what
                 assert isinstance(event, the_list.FieldChange)
                 self.assertEqual(event.fields.get("schedule"), series)
+                self.assertEqual(series.run_allowance, 4)
+                _ = the_list.update(MORTY.id, identity, {"title": "Check the totals"}, source="nate")
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", "series_run_limit=2"))
+                migrated = the_list.load(MORTY.id, identity)
+                self.assertEqual(migrated.schedule, series)
+                self.assertEqual(migrated.log[-2], saved.log[-1])
 
         parked = self.add("A parked item")
         _ = the_list.park(MORTY.id, parked.id, START + timedelta(days=1), source="nate")
@@ -418,12 +427,14 @@ else:
                     for path in (sent, attempted):
                         _ = path.write_text("")
                     scheduled = the_list.ScheduledRun(START, "Compare the account predictions.")
-                    schedule = the_list.ScheduledSeries(scheduled, repeat_rule.parse(rule)) if rule else scheduled
+                    schedule = the_list.ScheduledSeries(scheduled, repeat_rule.parse(rule), limit) if rule else scheduled
                     item = self.add(case, changes={"state": the_list.ItemState.SCHEDULED,
                                                    "schedule": schedule, "producer": BOB.id})
+                    if case == "cap":
+                        _ = self.list_config.write_text(config.replace("series_run_limit=730", "series_run_limit=1"))
                     due = START + timedelta(days=missed_days)
                     tick = due + timedelta(minutes=1) if missed_days else due
-                    if case == "confirmed":
+                    if case in {"confirmed", "cap"}:
                         path = the_list.folder(MORTY.id) / f"{item.id}.md"
                         _ = path.write_text("".join(line for line in path.read_text().splitlines(keepends=True)
                                                     if not line.startswith("scheduled_check:")))
@@ -659,7 +670,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
 
     def check_overlapping_scheduled_runs(self, sent: Path, attempted: Path, case: str) -> None:
         first = the_list.ScheduledRun(START.replace(hour=17), "First words.")
-        schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"))
+        schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"), 730)
         item = self.add("Lose receipt in moved run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
         second = first.start + timedelta(days=1)
         moved = second + timedelta(minutes=1)
@@ -676,7 +687,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 assert isinstance(remaining, the_list.ScheduledSeries)
                 self.assertEqual(remaining.finished_runs, frozenset({2}))
                 self.assertEqual(remaining.runs_used, 1)
-                self.assertEqual([(run.number, run.run.start) for run in remaining.runs(730)], [(1, moved)])
+                self.assertEqual([(run.number, run.run.start) for run in remaining.runs()], [(1, moved)])
                 if case == "state changed":
                     self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered",
                                                   "--source", "nate"), (0, "", ""))
@@ -719,7 +730,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
         days = "MO,TU,WE" if pending_instruction else "MO,TU"
         rule = repeat_rule.parse(f"FREQ=WEEKLY;BYDAY={days};COUNT={4 if pending_instruction else 3}")
         item = self.add("Manual settlement", changes={"state": the_list.ItemState.SCHEDULED,
-                                                     "schedule": the_list.ScheduledSeries(first, rule)})
+                                                     "schedule": the_list.ScheduledSeries(first, rule, 730)})
         due = (START, START + timedelta(days=1), START + timedelta(days=2))
         for tick in due[:2]:
             with patch.object(the_list, "now", return_value=tick):
@@ -817,10 +828,10 @@ the_list.fire_scheduled(timedelta(minutes=2))
 
     def test_repeat_series_limit_uses_the_live_setting(self) -> None:
         start = "2026-11-30T17:00:00Z"
+        original_settings = self.list_config.read_text()
         for limit in (730, 2):
             with self.subTest(limit=limit):
-                text = self.list_config.read_text()
-                _ = self.list_config.write_text(text.replace("series_run_limit=730", f"series_run_limit={limit}"))
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={limit}"))
                 code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
                 self.assertEqual((code, errors), (0, ""))
                 saved = the_list.load(MORTY.id, output.splitlines()[-1])
@@ -834,6 +845,28 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 refused, message, errors = self.add_scheduled(start, "--repeat", f"FREQ=DAILY;COUNT={limit + 1}")
                 self.assertEqual((refused, message), (1, ""))
                 self.assertIn(f"COUNT exceeds the series limit of {limit} runs", errors)
+
+                for numbers, unissued in (((1, 999), 999), ((1,), 0)):
+                    with self.subTest(finish=numbers):
+                        if unissued:
+                            with self.assertRaisesRegex(the_list.ListError, f"the series did not issue run {unissued}"):
+                                _ = series.finish_runs(numbers)
+                        else:
+                            completed = series.finish_runs(numbers)
+                            self.assertEqual((completed.finished_runs, completed.runs_used), (frozenset({1}), 1))
+                            self.assertIs(completed.finish_runs(numbers), completed)
+
+                if limit == 2:
+                    with self.subTest(finish="the live limit changes after selection"):
+                        selected = tuple(series.runs())[-1]
+                        settings = self.list_config.read_text()
+                        _ = self.list_config.write_text(settings.replace("series_run_limit=2", "series_run_limit=1"))
+                        try:
+                            self.assertEqual(the_list.series_run_limit(), 1)
+                            completed = series.finish_runs((selected.number,))
+                            self.assertEqual((completed.finished_runs, completed.runs_used), (frozenset({2}), 1))
+                        finally:
+                            _ = self.list_config.write_text(settings)
 
                 for progress in ("exhausted", "skipped"):
                     with self.subTest(progress=progress):
@@ -860,14 +893,102 @@ the_list.fire_scheduled(timedelta(minutes=2))
                             self.assertEqual((code, errors), (0, ""))
                             updated = the_list.load(MORTY.id, saved.id).schedule
                             assert isinstance(updated, the_list.ScheduledSeries)
-                            self.assertEqual([(run.number, run.run.start) for run in updated.runs(limit)],
+                            self.assertEqual([(run.number, run.run.start) for run in updated.runs()],
                                              [(limit, new_start + timedelta(days=limit - 1))])
+
+        for end, next_start, expected in (
+            ("", "2026-12-01T09:00:00+00:00", (2, 3, 4)),
+            (";UNTIL=20261201T090000Z", "2026-12-04T10:00:00+00:00", (2, 6, 7)),
+        ):
+            with self.subTest(end=end):
+                initial_limit = 2 if end else 4
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={initial_limit}"))
+                code, output, errors = self.add_scheduled("2026-11-30T09:00+00:00", "--repeat", f"FREQ=DAILY{end}")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                if end:
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                  "--start", next_start), (0, "Repeats: Daily until 2026-12-01 09:00:00 UTC\n", ""))
+                    _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "following", "--source", "nate",
+                                                  "--repeat", "FREQ=DAILY"), (0, "Repeats: Daily\n", ""))
+                for live_limit in (4, 2, 1, 9):
+                    with self.subTest(live_limit=live_limit):
+                        _ = self.list_config.write_text(original_settings.replace("series_run_limit=730",
+                                                                                f"series_run_limit={live_limit}"))
+                        reloaded = the_list.load(MORTY.id, identity).schedule
+                        assert isinstance(reloaded, the_list.ScheduledSeries)
+                        self.assertEqual(tuple(run.number for run in reloaded.runs()), expected)
+                        self.assertEqual(reloaded.finish_runs(expected).finished_runs, frozenset((1, *expected)))
+                        code, output, errors = self.command("list")
+                        self.assertEqual((code, errors), (0, ""))
+                        row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
+                        self.assertIn(f"· next {next_start}", row)
+                        if live_limit == 1 and end:
+                            code, _, errors = self.command("update", "--id", identity, "--scope", "following",
+                                                           "--source", "nate", "--repeat", "FREQ=DAILY")
+                            self.assertEqual((code, errors), (0, ""))
+                            self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
+                            code, output, errors = self.command("update", "--id", identity, "--scope", "following",
+                                                                "--source", "nate", "--repeat", "FREQ=DAILY;COUNT=1")
+                            self.assertEqual((code, output), (1, ""))
+                            self.assertIn("no runs left under the limit of 1", errors)
+                            self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
+
+        moved_start = "2026-12-01T18:00:00+00:00"
+        moved_words = "Read the figures at the new time."
+        for rule, words, start_flags, expected_exceptions in (
+            ("FREQ=DAILY", "Read the figures.\nSend the total.", (), ()),
+            ("FREQ=DAILY;UNTIL=20261203T170000Z", "Read the December figures.", (), ()),
+            ("FREQ=DAILY;COUNT=4", "Send the December total.", (), ()),
+            ("FREQ=DAILY", moved_words, ("--start", moved_start),
+             (the_list.RunException(2, the_list.ScheduledRun(datetime.fromisoformat(moved_start), moved_words)),)),
+        ):
+            with self.subTest(words_only=rule, start_flags=start_flags):
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+                code, output, errors = self.add_scheduled(start, "--repeat", rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                if start_flags:
+                    code, _, errors = self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                   *start_flags)
+                    self.assertEqual((code, errors), (0, ""))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=2"))
+                code, _, errors = self.command("update", "--id", identity, "--scope", "following", "--source", "nate",
+                                               "--do", words, *start_flags)
+                self.assertEqual((code, errors), (0, ""))
+                after = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(after, the_list.ScheduledSeries)
+                self.assertEqual(after, replace(before, first=replace(before.first, words=words),
+                                                exceptions=expected_exceptions))
+                self.assertEqual(tuple((run.number, run.run.start) for run in after.runs()),
+                                 tuple((run.number, run.run.start) for run in before.runs()))
+                self.assertEqual(tuple(run.run.words for run in after.runs()), (words, words, words))
+
+        with self.subTest(allowance="above sys.maxsize"):
+            allowance = sys.maxsize + 1
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={allowance}"))
+            code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
+            self.assertEqual((code, errors), (0, ""))
+            identity = output.splitlines()[-1]
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+            code, output, errors = self.command("list")
+            self.assertEqual((code, errors), (0, ""))
+            row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
+            self.assertIn("· next 2026-11-30T17:00:00+00:00", row)
+            after = the_list.load(MORTY.id, identity).schedule
+            assert isinstance(after, the_list.ScheduledSeries)
+            self.assertEqual(after.run_allowance, allowance)
 
     def test_repeated_item_updates_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
         second = start + timedelta(days=1)
         moved = second + timedelta(hours=1)
-        for scope, now_at, first, runs_before, next_words in (
+        for scope, now_at, first, run_number_offset, next_words in (
             ("this", second, start, 0, "Read the figures.\nSend the total."),
             ("following", second, moved, 1, "Read new figures."),
             ("all", START, moved, 0, "Read new figures."),
@@ -887,11 +1008,11 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 item = the_list.load(MORTY.id, identity)
                 series = item.schedule
                 assert isinstance(series, the_list.ScheduledSeries)
-                self.assertEqual((series.first.start, series.runs_before), (first, runs_before))
-                next_run = series.next_run(the_list.series_run_limit())
+                self.assertEqual((series.first.start, series.run_number_offset), (first, run_number_offset))
+                next_run = series.next_run()
                 assert isinstance(next_run, the_list.SeriesRun)
                 self.assertEqual(next_run.run, the_list.ScheduledRun(moved, "Read new figures."))
-                after = series.finish_runs((next_run.number,)).next_run(the_list.series_run_limit())
+                after = series.finish_runs((next_run.number,)).next_run()
                 assert isinstance(after, the_list.SeriesRun)
                 self.assertEqual(after.run.words, next_words)
                 self.assertEqual(len(tuple(series.rule.runs(series.first.start, the_list.series_run_limit()))),
@@ -901,6 +1022,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
 
         original_words = "Read the figures.\nSend the total."
         moved_first = start + timedelta(hours=1)
+        reanchored_start = moved + timedelta(hours=1)
         for label, now_at, finished, prepare, scope, change, number, expected in (
             ("following keeps the pending move", second, frozenset({1}), ("update", "--start", moved.isoformat()),
              "following", ("--repeat", "FREQ=DAILY;INTERVAL=2"), 2, the_list.ScheduledRun(moved, original_words)),
@@ -916,9 +1038,9 @@ the_list.fire_scheduled(timedelta(minutes=2))
             ("following uses the moved Monday for a new weekday rule", start, frozenset({1}),
              ("update", "--start", moved_first.isoformat()), "following", ("--repeat", "FREQ=WEEKLY;BYDAY=MO"), 2,
              the_list.ScheduledRun(moved_first, original_words)),
-            ("following after run 2 finishes keeps a delayed run 1", second, frozenset({2}),
-             ("update", "--start", moved.isoformat()), "following", ("--start", moved.isoformat()), 3,
-             the_list.ScheduledRun(moved, original_words)),
+            ("following changes the start of a delayed run after run 2 finishes", second, frozenset({2}),
+             ("update", "--start", moved.isoformat()), "following", ("--start", reanchored_start.isoformat()), 3,
+             the_list.ScheduledRun(reanchored_start, original_words)),
         ):
             with self.subTest(label=label):
                 code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=4")
@@ -941,9 +1063,72 @@ the_list.fire_scheduled(timedelta(minutes=2))
                     self.assertEqual(item.schedule, expected)
                 else:
                     assert isinstance(item.schedule, the_list.ScheduledSeries)
-                    pending = item.schedule.next_run(the_list.series_run_limit())
+                    pending = item.schedule.next_run()
                     assert isinstance(pending, the_list.SeriesRun)
                     self.assertEqual((pending.number, pending.run), (number, expected))
+
+        settings = self.list_config.read_text()
+        for rule, old_end, moves, end, limits, description, expected in (
+            ("FREQ=DAILY", "", ("2026-12-01T10:00+00:00",), "COUNT=3", (730, 730), "Daily for 3 runs",
+             ((2, "2026-12-01T10:00+00:00"), (3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"))),
+            ("FREQ=WEEKLY;BYDAY=MO", "", ("2026-12-08T09:00+00:00",), "COUNT=3", (730, 730), "Weekly on Monday for 3 runs",
+             ((2, "2026-12-08T09:00+00:00"), (3, "2026-12-14T09:00+00:00"), (4, "2026-12-21T09:00+00:00"))),
+            ("FREQ=DAILY", "", ("2026-12-01T10:00+00:00",), "UNTIL=20261203T090000Z", (730, 730),
+             "Daily until 2026-12-03 09:00:00 UTC",
+             ((2, "2026-12-01T10:00+00:00"), (3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"))),
+            ("FREQ=DAILY", "", ("2026-12-04T10:00+00:00",), "COUNT=1", (730, 730), "Daily for 1 run",
+             ((3, "2026-12-02T09:00+00:00"),)),
+            ("FREQ=DAILY", "", ("2026-12-04T10:00+00:00", "2026-12-01T08:00+00:00"),
+             "UNTIL=20261201T120000Z", (730, 730), "Daily until 2026-12-01 12:00:00 UTC",
+             ((3, "2026-12-01T08:00+00:00"),)),
+            ("FREQ=DAILY", "COUNT=3", ("2026-12-10T10:00+00:00",), "COUNT=2", (730, 730), "Daily for 2 runs",
+             ((3, "2026-12-02T09:00+00:00"), (2, "2026-12-10T10:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=3", ("2026-12-10T10:00+00:00",), "COUNT=3", (730, 730), "Daily for 3 runs",
+             ((3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"), (2, "2026-12-10T10:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=2", ("2026-12-10T10:00+00:00",), "COUNT=2", (3, 3), "Daily for 2 runs",
+             ((2, "2026-12-10T10:00+00:00"), (12, "2026-12-11T09:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=2", ("2026-12-10T10:00+00:00",), "UNTIL=20261211T090000Z", (3, 3),
+             "Daily until 2026-12-11 09:00:00 UTC",
+             ((2, "2026-12-10T10:00+00:00"), (12, "2026-12-11T09:00+00:00"))),
+            ("FREQ=DAILY", "UNTIL=20261201T090000Z", ("2026-12-04T10:00+00:00",), "", (4, 4), "Daily",
+             ((2, "2026-12-04T10:00+00:00"), (6, "2026-12-05T09:00+00:00"), (7, "2026-12-06T09:00+00:00"))),
+            ("FREQ=DAILY", "UNTIL=20261202T090000Z", ("2026-12-04T10:00+00:00",),
+             "UNTIL=20261202T090000Z", (4, 2), "Daily until 2026-12-02 09:00:00 UTC",
+             ((3, "2026-12-02T09:00+00:00"),)),
+        ):
+            saved_limit, live_limit = limits
+            with self.subTest(rule=rule, old_end=old_end, moves=moves, end=end, limits=limits):
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", f"series_run_limit={saved_limit}"))
+                anchor = "2026-11-30T09:00+00:00"
+                code, output, errors = self.add_scheduled(anchor, "--repeat", f"{rule};{old_end}" if old_end else rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                for moved_at in moves:
+                    code, _, errors = self.command("update", "--id", identity, "--source", "nate",
+                                                   "--scope", "this", "--start", moved_at)
+                    self.assertEqual((code, errors), (0, ""))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", f"series_run_limit={live_limit}"))
+                now_at = START if end else datetime(2026, 12, 3, 9, tzinfo=UTC)
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", identity, "--source", "nate",
+                                                          "--scope", "following", "--repeat", f"{rule};{end}" if end else rule)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output, f"Repeats: {description}\n")
+                item = the_list.load(MORTY.id, identity)
+                changed = item.schedule
+                assert isinstance(changed, the_list.ScheduledSeries)
+                self.assertEqual(changed.first.start, datetime.fromisoformat(anchor))
+                self.assertEqual(changed.run_allowance, saved_limit)
+                self.assertEqual(changed.exceptions, before.exceptions)
+                self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"schedule": changed}))
+                self.assertEqual(tuple((run.number, run.run.start.isoformat(timespec="minutes"))
+                                       for run in changed.runs()), expected)
+                rows = self.command("list")[1].splitlines()
+                row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
+                self.assertIn(f"· {description} · next ", row)
 
     def test_repeated_item_removals_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
@@ -975,7 +1160,7 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 if scope == "this":
                     series = item.schedule
                     assert isinstance(series, the_list.ScheduledSeries)
-                    next_run = series.next_run(the_list.series_run_limit())
+                    next_run = series.next_run()
                     assert isinstance(next_run, the_list.SeriesRun)
                     self.assertEqual((next_run.number, next_run.run.start), (1, delayed) if reorder else (3, third))
                     skip = the_list.RunException(2, the_list.SkippedRun("Skip this check"))
@@ -1016,6 +1201,11 @@ the_list.fire_scheduled(timedelta(minutes=2))
             (("update", "--scope", "all", "--repeat", "FREQ=DAILY;COUNT=3"),
              START, 0, ("update", "--start", (second + timedelta(days=1)).isoformat()),
              "another run already uses this time", "FREQ=DAILY;COUNT=2"),
+            (("update", "--scope", "following", "--repeat", "FREQ=DAILY;UNTIL=20261130T170000Z"),
+             START, 1, (), "UNTIL must be on or after the selected run", "FREQ=DAILY"),
+            (("update", "--scope", "following", "--repeat", "FREQ=DAILY;UNTIL=20261201T170000Z"),
+             START, 1, ("update", "--start", "2026-12-04T17:00:00+00:00"), "UNTIL must be on or after the selected run",
+             "FREQ=DAILY;UNTIL=20261201T170000Z"),
             (("update", "--scope", "all", "--start", "9999-12-30T23:00-05:00"),
              START, 0, (), "COUNT crosses the supported date limit", "FREQ=DAILY;COUNT=2"),
         ):

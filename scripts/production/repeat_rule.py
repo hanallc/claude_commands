@@ -10,6 +10,9 @@ from enum import StrEnum
 from itertools import islice
 
 
+MAX_RUN_DATES = date.max.toordinal()
+
+
 class Frequency(StrEnum):
     DAILY = "DAILY"
     WEEKLY = "WEEKLY"
@@ -142,7 +145,7 @@ class RepeatRule:
 
     def _dates(self, start: date) -> Iterator[date]:
         first = start.toordinal()
-        last = date.max.toordinal()
+        last = MAX_RUN_DATES
         match self.frequency:
             case Frequency.DAILY:
                 for day in range(first, last + 1, self.interval):
@@ -183,7 +186,7 @@ class RepeatRule:
                 if local.replace(tzinfo=None) == run.replace(tzinfo=None):
                     yield run
 
-        runs = islice(valid_runs(), max(0, count))
+        runs = islice(valid_runs(), min(MAX_RUN_DATES, max(0, count)))
         if not isinstance(self.end, RunCount):
             return runs
 
