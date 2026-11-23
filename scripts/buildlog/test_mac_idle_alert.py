@@ -125,12 +125,12 @@ class SavedAlertTests(unittest.TestCase):
 class MacIdleConfigTests(unittest.TestCase):
     def test_conf_dir_values_apply_without_a_second_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = write_idle_config(Path(directory), "alert_seconds=7\npush_seconds=11\n"
+            path = write_idle_config(Path(directory), "alert_seconds=7\n"
                                      + "stale_seconds=13\nrepeat_minutes=17\nsend_timeout_s=19\n")
             with mock.patch.dict(os.environ, {"CONF_DIR": directory, "MAC_TEST_CONFIG": "/unused"}), \
                  mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read:
                 settings = mac_idle_alert.read_idle_config()
-            self.assertEqual(settings, mac_idle_alert.MacIdleConfig(7, 11, 13, 17, 19))
+            self.assertEqual(settings, mac_idle_alert.MacIdleConfig(7, 13, 17, 19))
             self.assertEqual([call.args[0] for call in read.call_args_list], [path])
 
     def test_invalid_values_recover_from_history_without_code_defaults(self) -> None:
@@ -153,7 +153,7 @@ class MacIdleConfigTests(unittest.TestCase):
             path = Path(directory) / "mac_test.conf"
             with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
                 _ = mac_idle_alert.read_idle_config()
-            for key in ("alert_seconds", "push_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s"):
+            for key in ("alert_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s"):
                 for value in ("0", "-1", "nan", "inf", "bad"):
                     with self.subTest(key=key, value=value):
                         _ = write_idle_config(Path(directory), f"{key}={value}\n")

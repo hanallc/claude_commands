@@ -97,6 +97,12 @@ ENTRIES = (
         (PushExample("one_test", {"minutes": "10", "tests": waiting_tests(1)}),
          PushExample("three_tests", {"minutes": "12", "tests": waiting_tests(3)})),
         purpose="The Mac does not answer while natedev tests wait for it."),
+    PushText("machine_watch.unreachable", "Machine watch", "blocked", "Builds cannot reach {machine}",
+        ActionTemplate("Turn on the {machine} build machine and check its network connection."),
+        "For {minutes} min, the build queue could not connect to the {machine} build machine. "
+        + "Until {machine} answers again, its build steps wait or run more slowly on natedev instead.",
+        (PushExample("guest", {"machine": "mac-linux", "minutes": "60"}),),
+        purpose="Builds cannot connect to a machine in use."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "

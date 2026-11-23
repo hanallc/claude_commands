@@ -1,4 +1,7 @@
-"""Repair known reasons an eligible verify call waits while the Mac is idle."""
+"""Save the Mac idle reading, message builds about its outage and repair known waits.
+
+The machine watch reads the saved reading and sends the phone push.
+"""
 
 from __future__ import annotations
 try:
@@ -374,6 +377,7 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
 
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
+    """Send the unreachable phone push. The machine watch decides when it goes."""
     from scripts.notify import push_texts
     from scripts.notify.push_catalog import waiting_tests
     from scripts.lib.process_failure import failure_detail
@@ -468,7 +472,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")
         saved: mac_idle_alert.SavedAlert = {"version": 1, "written": now, "state": "busy", "since": 0.0, "changed": 0.0,
             "waiting": len(calls), "cause": "", "holder": "", "detail": "", "until": 0.0,
-            "messaged": False, "pushed": False}
+            "messaged": False}
         kept: mac_idle_alert.SavedAlert | None = None
         if isinstance(reading, NatedevJobOnMac):
             idle_file.unlink(missing_ok=True)
@@ -517,16 +521,10 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             saved["detail"] = (saved["detail"] + "; " if saved["detail"] else "") + "Mac disk exclusion"
         saved["changed"] = saved["since"]
         if kept is not None:
-            saved["pushed"] = kept["pushed"]
             saved["changed"] = (kept["changed"]
                                 if (kept["cause"], kept["holder"]) == (saved["cause"], saved["holder"]) else now)
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
-        off = mac_off_on_purpose()
-        if saved["pushed"] and off:
-            # Only a Mac that the user turned off ends a sent push here, so it goes again when the Mac is in use.
-            # Other ends stay with the clear check: one outage sends one push.
-            saved["pushed"] = False
         write_record(paths.state / "alert.json", saved)
         if (not isinstance(reading, IdleMac | MacUnreachable)
                 or now - saved["since"] < settings.alert_seconds or not calls):
@@ -542,11 +540,6 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
         if not saved["messaged"]:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
-            write_record(paths.state / "alert.json", saved)
-        # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
-        if (isinstance(reading, MacUnreachable) and now - saved["since"] >= settings.push_seconds
-                and not off and not saved["pushed"]):
-            saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
             return

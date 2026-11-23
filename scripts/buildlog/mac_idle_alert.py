@@ -21,7 +21,6 @@ class MacIdleConfig:
     """Validated timing policy shared by the idle watch and its views."""
 
     alert_seconds: float
-    push_seconds: float
     stale_seconds: float
     repeat_minutes: float
     send_timeout_s: float
@@ -33,8 +32,7 @@ MacIdleConfigError = conf.Unusable
 
 def idle_config(config: conf.ConfigRead) -> MacIdleConfig:
     """Read the idle policy from one validated configuration file."""
-    return MacIdleConfig(config.number("alert_seconds"), config.number("push_seconds"),
-                         config.number("stale_seconds"), config.number("repeat_minutes"),
+    return MacIdleConfig(config.number("alert_seconds"), config.number("stale_seconds"), config.number("repeat_minutes"),
                          config.number("send_timeout_s"))
 
 
@@ -66,7 +64,6 @@ class SavedAlert(TypedDict):
     detail: str
     until: float
     messaged: bool
-    pushed: bool
     admission_error: NotRequired[str]
     kept_claims: NotRequired[int]
 
@@ -112,9 +109,8 @@ def read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert:
             return UnreadableAlert(f"invalid {field}")
     if "admission_error" in row and not isinstance(row["admission_error"], str):
         return UnreadableAlert("invalid admission_error")
-    for field in ("messaged", "pushed"):
-        if type(row.get(field)) is not bool:
-            return UnreadableAlert(f"invalid {field}")
+    if type(row.get("messaged")) is not bool:
+        return UnreadableAlert("invalid messaged")
     return cast(SavedAlert, cast(object, row))
 
 

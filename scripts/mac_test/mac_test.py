@@ -609,11 +609,13 @@ NO_ASKING_SESSION = NoAskingSession()
 
 def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAskingSession = NO_ASKING_SESSION
                            ) -> OffOnPurpose | MachineInUse:
-    """The one rule for every outage push: the user turned the named target off.
+    """The one rule for every machine notice and outage push: the user turned the named target off.
 
-    Each target reads enabled.<target>=off. The Mac also reads its block and offload=off. A block is a lease that
-    a showrunner gives to one session, so it does not count when its holder asks. An unreadable record or setting
-    proves nothing, so the target counts as in use and a real outage still pushes.
+    Each target reads enabled.<target>=off. An SSH target also reads the block in its own state folder and one
+    switch in its settings file: offload=off for a macOS target, and enabled=off for another target. Hana and the
+    cloud gate keep their enabled key in their settings files. A block is a lease that a showrunner gives to one
+    session, so it does not count when its holder asks. An unreadable record or setting proves nothing, so the
+    target counts as in use and a real outage still sends its notice.
     """
     enabled = f"enabled.{target}"
     try:
@@ -622,20 +624,39 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
             return OffOnPurpose(f"{enabled}=off")
     except ConfigError:
         pass
-    if target != "mac":
+    try:
+        configured = target_config.configured_ssh_target(target)
+    except ConfigError:
+        # The local target has no block and no settings switch.
         return MACHINE_IN_USE
     try:
-        block = read_block(state_paths().block)
+        block = read_claim_block(StatePaths(target_config.ssh_target_state_directory(target), target))
         if not isinstance(block, NoMacBlock) and asking_session != AskingSession(block.holder):
             return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
     except StateReadError:
         pass
+    switch = "offload" if target_config.uses_legacy_mac_layout(configured.platform) else "enabled"
     try:
-        settings = conf.read("mac_test")
         # A missing key reads the committed file, as the router does. A bad value counts as in use.
-        if not settings.value("offload", conf.on_off, recover_invalid=False):
-            return OffOnPurpose("offload=off")
+        if not conf.read(configured.settings).value(switch, conf.on_off, recover_invalid=False):
+            return OffOnPurpose(f"{switch}=off")
     except ConfigError:
+        pass
+    return gpu_route_off(configured)
+
+
+def gpu_route_off(configured: target_config.SshTarget) -> OffOnPurpose | MachineInUse:
+    """The GPU route has its own switch, hana_gpu_route_enabled. Only "off" counts; another value is a setup fault."""
+    from scripts.aws_target import hana_placement
+    from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+
+    switch = "hana_gpu_route_enabled"
+    try:
+        transport = hana_placement.read_execution_transport(configured)
+        if (isinstance(transport, HanaGpuNextestTransport)
+                and conf.read(transport.settings).value(switch, str, default="", recover_invalid=False) == "off"):
+            return OffOnPurpose(f"{switch}=off")
+    except (ConfigError, OSError, ValueError):
         pass
     return MACHINE_IN_USE
 

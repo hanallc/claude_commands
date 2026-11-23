@@ -168,7 +168,7 @@ The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 | Key | Default | Purpose |
 |---|---:|---|
 | `alert_seconds` | 180 | Delay before the view alert and showrunner message |
-| `push_seconds` | 600 | Delay before the phone push |
+| `push_seconds` | 600 | Not read. The machine watch uses `excluded_notice_seconds.mac` in `build_targets.conf` |
 | `stale_seconds` | 300 | Maximum age of a saved reading |
 | `repeat_minutes` | 1440 | Minimum repeat window for an outage |
 | `send_timeout_s` | 180 | Timeout for a phone send |
@@ -204,14 +204,18 @@ The views place the same `MAC IDLE` alert first.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.
 The unreadable state sends no message or phone push.
 
-A free Mac, idle claim, block, or disk exclusion sends no phone push.
+The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
+It reads the saved alert of the same pass.
+The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
+A free Mac or an idle claim with waiting steps sends no phone push. After 600 s of waiting, the machine watch sends one message to bob and the builds showrunner.
+A block or a disk exclusion sends no phone push.
 These states keep the message to builds.
-The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `push_seconds` while eligible steps wait.
 A Mac that the user turned off sends no phone push: a Mac block, `offload=off` or `enabled.mac=off`.
-`mac_test.machine_off_on_purpose` holds this one rule for every outage push and takes any target name.
-Each target reads `enabled.<machine>` in `build_targets.conf`; only the Mac also reads its block and `offload`.
+`mac_test.machine_off_on_purpose` holds this one rule for every outage notice and takes any target name.
+Each target reads `enabled.<machine>` in `build_targets.conf`.
+An SSH target also reads its block and one switch in its settings file: `offload` for a macOS target, `enabled` for another target.
 Only an explicit `off` counts. A missing `enabled.<machine>` key, an unusable value or an unreadable record counts as in use.
-A missing live `mac_test.conf` or a missing `offload` key reads the committed file, as the router does, so the committed `offload` value counts.
+A missing live settings file or a missing switch key reads the committed file, as the router does, so the committed `offload` value counts.
 A block is a lease that a showrunner gives to one session. It does not count when its holder asks.
 `mac.locked` in `send.py` asks with its `sender=` value, so the block holder still reaches the user.
 For a Mac that is off on purpose, `send.py` prints `SKIPPED: the Mac is off on purpose (<reason>)` and exits 0.
@@ -224,9 +228,9 @@ The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
 `mac_idle.push_retired` is the clear-check rule: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
 `mac_idle.py cleared` exits 0 on this rule, and the push stops its repeats.
-The watch saves `pushed` as false only for a Mac that is off on purpose, before its early return.
+The machine watch removes its saved `sent` mark only for a Mac that is off on purpose or an outage that ended.
 Otherwise one outage sends one phone push, also across a pass with no waiting steps or a short free-Mac reading.
-The watch reads the off-on-purpose state once per pass.
+The machine watch reads the off-on-purpose state once per pass.
 The clear check retires the key, so the same `mac-idle-<since>` key pushes again when the Mac is in use again.
 The title is "Mac tests stopped".
 The action is "Wake the Mac or check its network."
@@ -253,7 +257,7 @@ Delivery takes precedence over loss in that gap.
 This policy covers process stops, including SIGTERM, SIGKILL, and session stops.
 It does not cover power loss or promise filesystem synchronization.
 
-The watch saves `messaged` and `pushed` only after accepted delivery.
+The Mac idle watch saves `messaged`, and the machine watch saves `sent`, only after accepted delivery.
 The unreachable push uses `mac_idle.py cleared --since <since>`.
 That check reads only the saved result.
 It clears when the saved state is no longer unreachable, the outage changes, or no steps wait.

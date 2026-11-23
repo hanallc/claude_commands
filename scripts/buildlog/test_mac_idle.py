@@ -22,14 +22,14 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.buildlog import cli
 from scripts.buildlog import index
-from scripts.buildlog import mac_idle, mac_idle_alert, machine_facts, sample
+from scripts.buildlog import mac_idle, mac_idle_alert, machine_watch
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog.mac_idle_test_support import write_idle_alert
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
+from scripts.build_targets import target_config
 from scripts.direct import step_record
 from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings, memory_gate_shell_environment
@@ -75,7 +75,7 @@ class MacIdleTests(NotificationGuardedTestCase):
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
-                                 "offload=on\nalert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+                                 "offload=on\nalert_seconds=180\nstale_seconds=300\n")
         _ = write_config_fixture(self.root / "build_targets.conf")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
@@ -127,6 +127,26 @@ class MacIdleTests(NotificationGuardedTestCase):
     def two_passes(self) -> None:
         mac_idle.watch_once(self.paths, 1180)
         mac_idle.watch_once(self.paths, 1240)
+
+    def watch(self, now: float) -> None:
+        """Run one pass: the Mac idle watch, then the machine watch rule for the Mac."""
+        mac_idle.watch_once(self.paths, now)
+        machine_watch.watch_machine(target_config.configured_ssh_target("mac"),
+                                    machine_watch.WatchPaths(self.root / "machine-watch", self.paths), now,
+                                    conf.read("build_targets"))
+
+    def forget_outage(self) -> None:
+        """Remove the saved idle reading and the saved push mark, so the next pass starts a new outage."""
+        (self.paths.state / "alert.json").unlink(missing_ok=True)
+        (self.root / "machine-watch/mac.json").unlink(missing_ok=True)
+
+    def pushed(self) -> bool:
+        saved = machine_watch.read_notice(self.root / "machine-watch/mac.json")
+        return saved is not None and saved["sent"]
+
+    def mark(self, name: str) -> bool:
+        """Read the builds message mark from the idle reading and the push mark from the machine watch."""
+        return self.pushed() if name == "pushed" else bool(mac_idle.read_record(self.paths.state / "alert.json")[name])
 
     def test_alert_waits_for_the_call_limit_and_restarts_after_a_state_change(self) -> None:
         self.hooked_waiter()
@@ -391,7 +411,7 @@ done
         self.unreachable()
         for stage in ("notify_outage", "push_outage"):
             with self.subTest(stage=stage):
-                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                self.forget_outage()
                 other = "push_outage" if stage == "notify_outage" else "notify_outage"
                 # This inner tripwire makes the regression safe even if the setUp guard is removed.
                 transport = REAL_NOTIFY_OUTAGE if stage == "notify_outage" else REAL_PUSH_OUTAGE
@@ -399,7 +419,7 @@ done
                      mock.patch.object(mac_idle, stage, side_effect=transport), \
                      mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unguarded spawn")):
                     with self.assertRaises(NotificationTransportBlocked):
-                        mac_idle.watch_once(self.paths, 1600)
+                        self.watch(1600)
 
     def sender_command(self, command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if "--key" not in command:
@@ -431,7 +451,7 @@ done
         settings = mac_idle_alert.read_idle_config()
         for stage, mark in (("notify_outage", "messaged"), ("push_outage", "pushed")):
             with self.subTest(stage=stage, after_sender_record=after_sender_record):
-                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                self.forget_outage()
                 other = "push_outage" if stage == "notify_outage" else "notify_outage"
                 with private_sender_acceptance(self.root / stage) as fixture, \
                      mock.patch.object(mac_idle, other, return_value=True), \
@@ -439,15 +459,15 @@ done
                      mock.patch.object(subprocess, "run", side_effect=self.sender_command):
                     target = "log" if after_sender_record else "run"
                     with mock.patch.object(send, target, side_effect=stop), self.assertRaises(Stopped):
-                        mac_idle.watch_once(self.paths, 1600)
+                        self.watch(1600)
                     fixture.end_owner()
                     self.assertEqual(fixture.count(), 1 if after_sender_record else 0)
-                    self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], False)
+                    self.assertIs(self.mark(mark), False)
                     current = 1600 + settings.repeat_minutes * 120
-                    mac_idle.watch_once(self.paths, current)
-                    mac_idle.watch_once(self.paths, current + 60)
+                    self.watch(current)
+                    self.watch(current + 60)
                     self.assertEqual(fixture.count(), 1)
-                self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], True)
+                self.assertIs(self.mark(mark), True)
 
     def test_notification_marks_survive_stop_after_delivery_before_return(self) -> None:
         self.check_interrupted_delivery(after_sender_record=True)
@@ -459,11 +479,11 @@ done
         self.unreachable()
         for stage, mark, channel in (("notify_outage", "messaged", "message"), ("push_outage", "pushed", "push")):
             with self.subTest(stage=stage):
-                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                self.forget_outage()
                 other = "push_outage" if stage == "notify_outage" else "notify_outage"
                 def while_held() -> None:
-                    mac_idle.watch_once(self.paths, 1600)
-                    self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], False)
+                    self.watch(1600)
+                    self.assertIs(self.mark(mark), False)
 
                 with private_sender_acceptance(self.root / stage, before_accept=while_held) as fixture, \
                      mock.patch.object(mac_idle, other, return_value=True), \
@@ -474,9 +494,9 @@ done
                     if channel == "message":
                         options = options._replace(recipient_identity=send.LogicalRecipientIdentity("showrunner:builds"))
                     self.assertEqual(send.send(options).outcome, "sent")
-                    mac_idle.watch_once(self.paths, 1660)
+                    self.watch(1660)
                     self.assertEqual(fixture.count(), 1)
-                    self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")[mark], True)
+                    self.assertIs(self.mark(mark), True)
 
     def test_restoring_subprocess_transports_cannot_bypass_notification_guard(self) -> None:
         # The script paths are inert arguments to -c, so removing the guard cannot send anything.
@@ -608,21 +628,22 @@ done
     def test_config_changes_apply_to_live_outage_views_push_and_clear_check(self) -> None:
         self.unreachable()
         config = self.root / "mac_test.conf"
-        _ = write_config_fixture(config, "alert_seconds=240\npush_seconds=300\n"
+        _ = write_config_fixture(self.root / "build_targets.conf", "excluded_notice_seconds.mac=300\n")
+        _ = write_config_fixture(config, "alert_seconds=240\n"
                               + "stale_seconds=30\nrepeat_minutes=37\nsend_timeout_s=9\n")
         path = self.paths.state / "alert.json"
         with mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
-            mac_idle.watch_once(self.paths, 1180)
+            self.watch(1180)
             notify.assert_not_called()
             self.assertIsNone(mac_idle_alert.alert_line(path, 1180, ZoneInfo("UTC")))
-            mac_idle.watch_once(self.paths, 1240)
+            self.watch(1240)
             notify.assert_called_once()
             self.assertIn("MAC UNREACHABLE until", mac_idle_alert.alert_line(path, 1240, ZoneInfo("UTC")) or "")
             run.assert_not_called()
             # The watch reads the changed file on the next pass.
-            _ = config.write_text(config.read_text().replace("push_seconds=300", "push_seconds=241"))
-            mac_idle.watch_once(self.paths, 1241)
+            _ = write_config_fixture(self.root / "build_targets.conf", "excluded_notice_seconds.mac=241\n")
+            self.watch(1241)
             run.assert_called_once()
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(command[command.index("--repeat-minutes") + 1], "37")
@@ -634,8 +655,8 @@ done
     def test_ten_minutes_pushes_once_and_next_outage_uses_new_key(self) -> None:
         self.unreachable()
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
-            mac_idle.watch_once(self.paths, 1600)
-            mac_idle.watch_once(self.paths, 1660)
+            self.watch(1600)
+            self.watch(1660)
             run.assert_called_once()
             command = cast(list[str], run.call_args.args[0])
             for flag, value in (("--text-id", "mac_idle.unreachable"), ("--need", "blocked"), ("--key", "mac-idle-1000")):
@@ -643,15 +664,15 @@ done
             self.assertEqual(command[command.index("--clears-when") + 1],
                 f"{mac_idle.SCRIPTS}/lib/py {mac_idle.SCRIPTS}/buildlog/mac_idle.py cleared --since 1000")
             _ = self.claim(working=True)
-            mac_idle.watch_once(self.paths, 1700)
+            self.watch(1700)
             (self.paths.mac_state / "claims/research.json").unlink()
-            mac_idle.watch_once(self.paths, 1760)
-            mac_idle.watch_once(self.paths, 2360)
+            self.watch(1760)
+            self.watch(2360)
             self.assertEqual(run.call_count, 2)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(command[command.index("--key") + 1], "mac-idle-1760")
         saved = mac_idle.read_record(self.paths.state / "alert.json")
-        self.assertEqual((saved["messaged"], saved["pushed"]), (True, True))
+        self.assertEqual((saved["messaged"], self.pushed()), (True, True))
 
     def test_mac_off_on_purpose_sends_no_push_and_a_mac_in_use_still_pushes(self) -> None:
         def offload_off() -> None:
@@ -672,7 +693,7 @@ done
         self.unreachable()
         for signal_name, turn_off, turn_on in (("block", self.block, unblock), ("offload", offload_off, offload_on),
                                                ("enabled", mac_disabled, mac_enabled)):
-            (self.paths.state / "alert.json").unlink(missing_ok=True)
+            self.forget_outage()
             mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
             turn_off()
             with self.subTest(signal=signal_name), \
@@ -680,38 +701,38 @@ done
                  mock.patch.object(subprocess, "run",
                                    return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
                 for now in (1180, 1600, 1660):
-                    mac_idle.watch_once(self.paths, now)
+                    self.watch(now)
                 run.assert_not_called()
                 notify.assert_called_once()
                 saved = mac_idle.read_record(self.paths.state / "alert.json")
-                self.assertEqual((saved["state"], saved["pushed"]), ("unreachable", False))
+                self.assertEqual((saved["state"], self.pushed()), ("unreachable", False))
                 line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1660, ZoneInfo("UTC"))
                 self.assertIn("MAC UNREACHABLE", line or "")
                 turn_on()
-                mac_idle.watch_once(self.paths, 1720)
+                self.watch(1720)
                 run.assert_called_once()
                 command = cast(list[str], run.call_args.args[0])
                 self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
-                self.assertTrue(mac_idle.read_record(self.paths.state / "alert.json")["pushed"])
+                self.assertTrue(self.pushed())
 
     def test_a_push_ended_by_turning_the_mac_off_goes_again_when_the_mac_is_in_use(self) -> None:
         self.unreachable()
 
         def pushed() -> bool:
-            return bool(mac_idle.read_record(self.paths.state / "alert.json")["pushed"])
+            return bool(self.pushed())
 
         with (mock.patch.object(mac_idle, "notify_outage", return_value=True),
               mock.patch.object(subprocess, "run",
                                 return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run):
-            mac_idle.watch_once(self.paths, 1600)
+            self.watch(1600)
             run.assert_called_once()
             self.assertTrue(pushed())
             _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
-            mac_idle.watch_once(self.paths, 1660)
+            self.watch(1660)
             run.assert_called_once()
             self.assertFalse(pushed())
             _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
-            mac_idle.watch_once(self.paths, 1720)
+            self.watch(1720)
             self.assertEqual(run.call_count, 2)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(command[command.index("--key") + 1], "mac-idle-1000")
@@ -722,21 +743,21 @@ done
         with (mock.patch.object(mac_idle, "notify_outage", return_value=True),
               mock.patch.object(subprocess, "run",
                                 return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run):
-            mac_idle.watch_once(self.paths, 1600)
+            self.watch(1600)
             run.assert_called_once()
             _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
             for record in (self.root / "steps").glob("*.json"):
                 record.unlink()
             (self.paths.mac_state / "unreachable_until").unlink()
-            mac_idle.watch_once(self.paths, 1660)
+            self.watch(1660)
             saved = mac_idle.read_record(self.paths.state / "alert.json")
-            self.assertEqual((saved["since"], saved["pushed"]), (1000, False))
+            self.assertEqual((saved["since"], self.pushed()), (1000, False))
             with mock.patch.object(time, "time", return_value=1660):
                 self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
             _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
             self.step()
             self.unreachable()
-            mac_idle.watch_once(self.paths, 1720)
+            self.watch(1720)
             self.assertEqual(run.call_count, 2)
             command = cast(list[str], run.call_args.args[0])
             self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
@@ -745,23 +766,23 @@ done
     def test_one_outage_sends_one_push_across_no_waiting_steps_and_a_free_mac_reading(self) -> None:
         def saved() -> tuple[str, str, int, bool]:
             alert = mac_idle.read_record(self.paths.state / "alert.json")
-            return (str(alert["state"]), str(alert["cause"]), cast(int, alert["waiting"]), bool(alert["pushed"]))
+            return (str(alert["state"]), str(alert["cause"]), cast(int, alert["waiting"]), self.pushed())
 
         self.unreachable()
         with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True),
               mock.patch.object(mac_idle, "push_outage", return_value=True) as push):
-            mac_idle.watch_once(self.paths, 1600)
+            self.watch(1600)
             self.assertEqual(saved(), ("unreachable", "", 1, True))
             for record in (self.root / "steps").glob("*.json"):
                 record.unlink()
-            mac_idle.watch_once(self.paths, 1660)
+            self.watch(1660)
             self.assertEqual(saved(), ("unreachable", "", 0, True))
             self.step()
             (self.paths.mac_state / "unreachable_until").unlink()
-            mac_idle.watch_once(self.paths, 1720)
+            self.watch(1720)
             self.assertEqual(saved(), ("idle", "free", 1, True))
             self.unreachable()
-            mac_idle.watch_once(self.paths, 1780)
+            self.watch(1780)
             self.assertEqual(saved(), ("unreachable", "", 1, True))
         push.assert_called_once()
 
@@ -796,10 +817,10 @@ done
                 subprocess.CompletedProcess[str]([], code, "not delivered", ""),
                 subprocess.CompletedProcess[str]([], 0, "SENT", "")]) as run, redirect_stderr(io.StringIO()) as errors:
                 mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000 + code})
-                mac_idle.watch_once(self.paths, 1700)
-                self.assertIs(mac_idle.read_record(self.paths.state / "alert.json")["pushed"], False)
-                mac_idle.watch_once(self.paths, 1760)
-                mac_idle.watch_once(self.paths, 1820)
+                self.watch(1700)
+                self.assertIs(self.pushed(), False)
+                self.watch(1760)
+                self.watch(1820)
                 self.assertEqual(run.call_count, 2)
                 commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
                 self.assertEqual([command[command.index("--key") + 1] for command in commands],
@@ -994,14 +1015,14 @@ done
             path = self.paths.mac_state / name
             path.parent.mkdir(exist_ok=True)
             _ = path.write_text(content)
-            (self.paths.state / "alert.json").unlink(missing_ok=True)
+            self.forget_outage()
             with self.subTest(name=name, waiting=total), mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
                  mock.patch.object(mac_idle, "notify_showrunner") as repair, \
                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
-                mac_idle.watch_once(self.paths, 1179)
+                self.watch(1179)
                 notify.assert_not_called()
                 run.assert_not_called()
-                mac_idle.watch_once(self.paths, 1180)
+                self.watch(1180)
                 saved = mac_idle.read_record(self.paths.state / "alert.json")
                 self.assertEqual(saved["state"], state)
                 self.assertTrue(mac_idle_alert.alert_line(self.paths.state / "alert.json", 1180, ZoneInfo("UTC")))
@@ -1010,10 +1031,10 @@ done
                 else:
                     notify.assert_not_called()
                 run.assert_not_called()
-                mac_idle.watch_once(self.paths, 1599)
+                self.watch(1599)
                 run.assert_not_called()
-                mac_idle.watch_once(self.paths, 1600)
-                mac_idle.watch_once(self.paths, 1660)
+                self.watch(1600)
+                self.watch(1660)
                 if state == "unreachable":
                     notify.assert_called_once()
                     run.assert_called_once()
@@ -1127,7 +1148,7 @@ done
                                ("changed", None), ("changed", True), ("changed", "1000"), ("changed", -1),
                                ("changed", float("nan")), ("changed", float("inf")), ("changed", 10 ** 400),
                                ("waiting", True), ("state", "other"), ("cause", "other"), ("holder", 1),
-                               ("detail", []), ("until", -1), ("until", 10 ** 400), ("messaged", 1), ("pushed", "no"))
+                               ("detail", []), ("until", -1), ("until", 10 ** 400), ("messaged", 1))
         for field, invalid in invalid_values:
             with self.subTest(field=field):
                 mac_idle.write_record(path, {**saved, field: invalid})
@@ -1437,15 +1458,6 @@ done
         with closing(sqlite3.connect(index.index_path())) as connection:
             self.assertEqual(connection.execute("SELECT call_id, cause, action FROM mac_idle").fetchall(),
                              [(self.call.call_id, "missing_leave_hook", "recorded")])
-
-    def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
-        with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
-             mock.patch.object(mac_idle, "watch_once") as watch, \
-             mock.patch.object(machine_facts, "sample_once") as facts:
-            self.assertEqual(cli.main(["sample"]), 0)
-        watch.assert_called_once()
-        self.assertEqual(watch.call_args.args[1], 1000)
-        facts.assert_called_once_with(machine_facts.state_path(), 1000)
 
     def test_memory_wait_reads_the_marker_when_its_normal_hook_is_empty(self) -> None:
         self.admission.free(0)
