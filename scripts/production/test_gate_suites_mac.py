@@ -301,10 +301,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.placement_status.side_effect = partial(self.fixture_status, queue)
         return request, reply
 
-    def fixture_status(self, queue: placement_fixture.PlacementFixture, episode: str, attempt: str, *,
-                       wait_for_service: bool) -> admission_wire.PlacementStatusReply:
+    def fixture_status(self, queue: placement_fixture.PlacementFixture, episode: str, attempt: str
+                       ) -> admission_wire.PlacementStatusReply:
         """Read the placement status from the fixture queue in place of the admission socket."""
-        self.assertFalse(wait_for_service)
         status, = queue.connect(admission_wire.PlacementStatusRequest(episode, attempt)).replies()
         assert isinstance(status, admission_wire.PlacementStatusReply), status
         return status
@@ -322,8 +321,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         return reply, admitted
 
     def queue_state(self, reply: admission_wire.LocalPlacementGranted) -> placement.AssignmentState:
-        status = admission_client.placement_status(
-            reply.assignment.episode, reply.assignment.attempt, wait_for_service=False).status
+        status = admission_client.placement_status(reply.assignment.episode, reply.assignment.attempt).status
         assert isinstance(status, admission_wire.KnownPlacementStatus), status
         return status.state
 
@@ -649,7 +647,8 @@ class MacGateSuitesTests(GateSuitesFixture):
               mock.patch.object(admission_client, "CLOCK", clock),
               mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
               redirect_stderr(io.StringIO()) as errors):
-            target = gate.current_gate_target(SuiteMode.GATE, StepJob("integrate", unit="fixture"))
+            placed = gate.current_gate_placement(SuiteMode.GATE, StepJob("integrate", unit="fixture"))
+        target = gate.placement_target(placed)
         self.assertEqual(target, "mac-linux")
         self.assertGreater(clock.monotonic(), admission_records.read_memory_config().query_timeout_seconds)
         self.assertIn("admission service not answering", errors.getvalue())
@@ -760,12 +759,11 @@ class MacGateSuitesTests(GateSuitesFixture):
             admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest_assignment.episode, guest_assignment.since),
                 first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
-            def guest_or_queue_status(episode: str, attempt: str, *,
-                                      wait_for_service: bool) -> admission_wire.PlacementStatusReply:
+            def guest_or_queue_status(episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
                 if attempt == guest_assignment.attempt:
                     return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
                         guest_assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
-                return self.fixture_status(queue, episode, attempt, wait_for_service=wait_for_service)
+                return self.fixture_status(queue, episode, attempt)
 
             def settle(refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
                 self.assertEqual((refusal.assignment, refusal.reason), (guest_assignment, MAC_LINUX_NO_ANSWER))
