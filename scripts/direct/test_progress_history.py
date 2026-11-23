@@ -202,8 +202,6 @@ class ProgressHistoryTests(unittest.TestCase):
         script.parent.mkdir(parents=True)
         _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
         script.chmod(0o755)
-        digest = cast(Callable[[], str], vars(pass_recorder)["config_digest"])
-        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
         reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
@@ -214,17 +212,16 @@ class ProgressHistoryTests(unittest.TestCase):
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
                 "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
             }):
+                # The two subtests call the digest in one process with a changed environment and file,
+                # as verify_helper.py does in two calls.
                 _ = self.models_config_file.write_text(original + "# later edit\n")
-                clear()
-                try:
-                    text = original if inherited else self.models_config_file.read_text()
-                    with conf_reads.record_reads(reads):
-                        self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
-                    self.assertIn("direct", reads.read_text().splitlines())
-                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
-                    self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
-                finally:
-                    clear()
+                text = original if inherited else self.models_config_file.read_text()
+                with conf_reads.record_reads(reads):
+                    self.assertEqual(pass_recorder.config_digest(),
+                                     hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                self.assertIn("direct", reads.read_text().splitlines())
+                self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
@@ -393,7 +390,6 @@ for number in (1, 2):
     events = [json.loads(line) for line in history.read_text().splitlines()]
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
-    assert pass_recorder.config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})

@@ -7,7 +7,7 @@ from scripts.production.staff_test_support import foreign_hostname
 from scripts.herdr import herdr_types
 
 from scripts.lib import names
-from scripts.lib.test_names import fixture_names
+from scripts.lib.test_names import clear_runtime_names, fixture_names, new_command_errors
 from scripts.agents.test_support import write_machine_config
 
 import io
@@ -107,8 +107,8 @@ class RosterTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        names.runtime_names.cache_clear()
-        self.addCleanup(names.runtime_names.cache_clear)
+        clear_runtime_names()
+        self.addCleanup(clear_runtime_names)
         _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         # Fixture processes run as this test's own pid: never read the real account it runs on.
         _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
@@ -1407,7 +1407,7 @@ class RosterTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(names, "runtime_names", wraps=names.runtime_names), \
                 mock.patch.object(names, "load_names", return_value=error), \
-                mock.patch.object(names, "_reported_errors", set[names.NamesError]()), redirect_stderr(output):
+                mock.patch.object(names, "_reported_errors", new_command_errors()), redirect_stderr(output):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
                     self.assertEqual(roster.shown_name(entry).render(), "session:identity")
@@ -2890,6 +2890,12 @@ class RosterTests(unittest.TestCase):
 
 
 class PaneRosterTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # Fixture processes run as this test's own pid: never read the real account it runs on.
+        _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
+
     def test_worker_with_an_unreadable_pane_list_cannot_use_its_registry_route(self) -> None:
         fixture = self.row_production()
         worker = fixture_worker("unproved", fixture.unit.id, backend=staff.ClaudeBackend())
@@ -2927,7 +2933,6 @@ class PaneRosterTests(StaffTestCase):
         write_machine_config(config)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
-             mock.patch.object(account, "process_config_dir", return_value=None), \
              mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertEqual([problem for problem in found.problems if problem.startswith("pane workers:")],

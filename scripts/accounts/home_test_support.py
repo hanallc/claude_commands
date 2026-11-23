@@ -18,7 +18,7 @@ from scripts.whoami.credit_accounts_test_support import TEST_CREDIT_ACCOUNTS, se
 
 def clear_notes_directory_cache() -> None:
     """Clear the notes folder when a test changes the configuration."""
-    configured = cast(object, getattr(note_file, "_configured_notes_dir"))
+    configured = cast(object, getattr(note_file, "_notes_dir_at"))
     clear = cast(Callable[[], None], getattr(configured, "cache_clear"))
     clear()
 
