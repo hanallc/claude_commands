@@ -10,7 +10,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import git_rescue
+from scripts.lib import git_environment, git_rescue
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -33,6 +33,8 @@ class GitRescueTests(unittest.TestCase):
             return run(arguments, input=input, stdout=stdout, stderr=stderr,
                        env=env, check=check, pass_fds=pass_fds)
 
+        # The process reads the Git repository variable list once. Read it before the patch.
+        _ = git_environment.repository_environment()
         with mock.patch.object(subprocess, 'run', side_effect=execute):
             _ = git_rescue.rescue(self.slot, 'inherited', pass_fds=(descriptor,))
         self.assertTrue(observed)

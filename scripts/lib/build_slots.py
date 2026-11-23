@@ -24,7 +24,7 @@ from typing import cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, copy_record, git_files, git_remotes, git_rescue
+from scripts.lib import build_folders, conf, copy_record, git_environment, git_files, git_remotes, git_rescue
 from scripts.lib.slot_root import configured_slot_root as configured_slot_root
 
 
@@ -75,7 +75,7 @@ def _run_git(source: Path, arguments: Sequence[str], *, data: bytes | None = Non
     try:
         result = subprocess.run(["git", "-C", str(source), *arguments], input=data, capture_output=True,
                                 pass_fds=tuple(dict.fromkeys((*pass_fds, *build_folders.held_build_folder_descriptors()))),
-                                timeout=timeout)
+                                env=git_environment.repository_environment(), timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode not in accepted:

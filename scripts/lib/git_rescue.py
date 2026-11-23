@@ -11,7 +11,7 @@ import shlex
 import subprocess
 import tempfile
 
-from scripts.lib import git_files, git_index
+from scripts.lib import git_environment, git_files, git_index
 
 RESCUE_DESCRIPTORS: ContextVar[tuple[int, ...]] = ContextVar('rescue_descriptors', default=())
 _RESCUE_IDENTITY = {
@@ -68,7 +68,7 @@ def _git(work_tree: Path, *arguments: str, data: bytes = b"", index: Path | None
     # The commands inherit the copy locks. Keep automatic maintenance synchronous, so no detached child keeps them.
     command = ["git", "--no-optional-locks", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
                "-C", str(work_tree), *arguments]
-    environment = dict(os.environ)
+    environment = git_environment.repository_environment()
     if arguments[:1] == ("commit-tree",):
         environment.update(_RESCUE_IDENTITY)
     if index is not None:

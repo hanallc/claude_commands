@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 
 from urllib.parse import urlsplit
 
-from scripts.lib import build_folder_lock, git_files, process_start
+from scripts.lib import build_folder_lock, git_environment, git_files, process_start
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.conf import UseConfiguredValue
 
@@ -415,7 +415,7 @@ def repo_word(repository: Path) -> str:
         origin = subprocess.run(
             ["git", "-C", str(repository), "remote", "get-url", "origin"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
-            timeout=repository_git_timeout(),
+            env=git_environment.repository_environment(), timeout=repository_git_timeout(),
         ).stdout.rstrip("\n")
         if "://" in origin:
             location = urlsplit(origin).path
@@ -1652,6 +1652,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                             str(path), spec.slot_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                           env=git_environment.repository_environment(),
                                            timeout=repository_git_timeout())
                         if spec.kind == "copy":
                             form = BuildCopy(spec.repository, spec.unit, spec.slot)

@@ -168,6 +168,30 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertTrue((failed / ".git" / "HEAD").is_file())
         self.assertEqual(self.git(failed, "remote", "get-url", "origin"), str(self.source))
 
+    def test_an_inherited_git_dir_never_reaches_the_pool_git_commands(self) -> None:
+        other = self.root / "other-repository"
+        other.mkdir()
+        _ = self.git(other, "init", "-q", "-b", "main")
+        _ = self.git(other, "remote", "add", "origin", "git@example.invalid:group/other.git")
+        _ = (other / "other.txt").write_text("other\n")
+        _ = commit_repository(other, "other first")
+
+        def snapshot() -> dict[str, bytes]:
+            return {str(path.relative_to(other)): path.read_bytes() for path in sorted(other.rglob("*"))
+                    if path.is_file() and not path.is_symlink()}
+
+        before = (self.git(other, "for-each-ref"), snapshot())
+        # A hook or a test runner can export the Git folder of another repository.
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}), \
+                self.take_queue_copy() as copy:
+            path = copy.path
+        self.assertEqual(Path(self.git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+                         self.pool() / ".git")
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(build_folders.pool_source(self.pool()), self.source)
+        self.assertEqual(self.git(self.pool(), "rev-parse", "HEAD"), self.base)
+        self.assertEqual((self.git(other, "for-each-ref"), snapshot()), before)
+
     def test_a_new_stage_skips_a_suffix_that_a_failed_clone_folder_has(self) -> None:
         parent = self.pool().parent
         parent.mkdir(parents=True, exist_ok=True)
