@@ -1470,7 +1470,7 @@ column-gap:24px;row-gap:0;border:0;padding:0}
 .review-box .review-panel>div{min-width:0}
 .review-box :is([data-title-fallback],[data-empty-review-section],.list-log-panel:has(.list-log:empty)){display:none}
 /* The box scrolls as one area, so its log takes its full height. */
-.review-box .review-log-column>.list-log-panel{flex:none;contain:none}.review-box .list-log-scroll{max-height:none;overflow:visible}
+.review-box .review-log-column>.list-log-panel{flex:none;contain:none;min-height:0}.review-box .list-log-scroll{max-height:none;overflow:visible}
 .review-box .review-panel:not(:has(.review-handoff,[data-review-body]>:not([data-empty-review-section])))
 >div:nth-child(2){grid-column:1/-1}
 .review-box .review-source{margin:12px 0 0!important}
