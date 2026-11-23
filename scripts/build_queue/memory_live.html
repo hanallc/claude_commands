@@ -1366,15 +1366,20 @@ function limitWaitFields(waits) {
 function limitGpuCount(gpu, words) {
   return gpu?.used != null && gpu.limit != null ? limitWords(words, "count", gpu) : "";
 }
+function macClaimText(words, used, kept) {
+  const working = used - kept;
+  return [working ? limitWords(words, "occupied", {count: working}) : "",
+    kept ? limitWords(words, "kept", {count: kept}) : ""].filter(Boolean).join(" · ");
+}
 function limitCell(cell, words, machine) {
-  const {limit, used, other_used, merge_above, waits, note, policy, show_marks = true} = cell;
+  const {limit, used, other_used, kept = 0, merge_above, waits, note, policy, show_marks = true} = cell;
   const gpu = machine === "natedev" ? limitGpuCount(cell.gpu, words) : "";
   const noLimit = limit == null && policy === "no_limit";
   const onlyOther = limit == null && used == null;
   const waiting = limitWaitCount(waits);
   const count = limit == null ? (used || other_used || "")
     : limitWords(words, used == null ? "limit" : "count", {used, limit});
-  const runs = onlyOther ? other_used : Math.max(0, (used ?? 0) - merge_above.length);
+  const runs = onlyOther ? other_used : Math.max(0, (used ?? 0) - merge_above.length - kept);
   const marks = (show_marks ? limitPlaceMarks(used, limit, runs, merge_above.length) : "")
     + (noLimit ? limitMarks("unlimited") : "");
   const detail = count === "" && !marks && !waiting && !gpu && note;
@@ -1406,11 +1411,13 @@ function limitTooltipRows(key, limits) {
   }
   const cell = limits.repositories.find(row => row.name === identity)?.[machine];
   if (!cell) return [];
-  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, verify_used} = cell;
+  const {limit, used, runs, merge_above, other, other_used, waits, note, policy, verify_used, kept = 0} = cell;
   const gpu = machine === "natedev" ? cell.gpu : null;
   const policyText = limit != null ? (used == null ? limit : limitWords(words, "count", {used, limit}))
     : policy === "no_limit" ? words.no_limit : policy === "configured" ? words.limit_set : "";
-  const rows = [field("Limit", policyText), field(machine === "mac" ? "In use" : "Run count", limit == null ? used || "" : ""),
+  const count = machine === "mac" ? field("Claims", limit == null || kept ? macClaimText(words, used ?? 0, kept) : "")
+    : field("Run count", limit == null ? used || "" : "");
+  const rows = [field("Limit", policyText), count,
     field("Verify runs", verify_used || ""),
     ...(gpu ? [field(words.gpu, limitGpuCount(gpu, words)), field("GPU limit", words.gpu_limit)] : []),
     staffField("Running", runs.filter(Boolean)),
@@ -1442,8 +1449,9 @@ function renderBuildLimits(limits) {
     ${data.state ? `<span class="build-limit-state">${esc(data.state)}</span>` : ""}
     ${data.facts ? `<div class="build-limit-facts">${esc(data.facts)}</div>` : ""}
     ${!data.unattributed ? "" : key === "mac"
-      ? `<div class="build-limit-count"><span class="build-limit-marks">${limitMarks("run", data.unattributed)}</span>
-        <span>${esc(limitWords(words, "occupied", {count: data.unattributed}))}</span></div>`
+      ? `<div class="build-limit-count">${data.unattributed > data.unattributed_kept
+        ? `<span class="build-limit-marks">${limitMarks("run", data.unattributed - data.unattributed_kept)}</span>` : ""}
+        <span>${esc(macClaimText(words, data.unattributed, data.unattributed_kept))}</span></div>`
       : `<div class="build-limit-note">${esc(limitWords(words, "other_running", {count: data.unattributed}))}</div>`}
     ${data.shared.map(metric => limitMetric(metric, words, `limit:metric:${key}:${metric.label}`)).join("")}
     ${limitWaitBadge(data.waits, `limit:machine:${key}`)}</th>`;

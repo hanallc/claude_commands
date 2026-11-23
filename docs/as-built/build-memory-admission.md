@@ -447,6 +447,9 @@ The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
+A Mac claim without a repository row shows under the Mac heading as `1 in use`.
+A kept claim (`mac_test.run_is_kept()`: the leftovers of a stopped run) shows as `1 kept (leftover of a stopped run)` and has no run mark. Both kinds show as `1 in use · 1 kept (leftover of a stopped run)`.
+`limits_view.read_mac()` carries the kind as `MacClaimUse`. A kept claim still counts in the limit. A repository cell counts it in `used` and in `kept`, and its hover names it under `Claims`.
 The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
 `limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
 Examples: natedev `load 52.7/32 · battery 100% charged · not in use`, Mac `link 3 ms · load 19.6/12 · battery 85% · in use`, AWS `no box running`.
