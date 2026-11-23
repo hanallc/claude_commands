@@ -150,7 +150,7 @@ async function sendSaved() {
    check(dialog.open && dialog.matches(':modal'), 'The dialog opens as a native modal.');
    check(document.activeElement.id === 'new-item-title' &&
          dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug is selected when the dialog opens.');
-   check([...dialog.querySelectorAll('[name="kind"]')].length === 5, 'Five keyboard-selectable types are present.');
+   check([...dialog.querySelectorAll('[name="kind"]')].length === 6, 'Six keyboard-selectable types are present.');
    check(!!recipient() && recipient().tabIndex === 0, 'To uses native keyboard-selectable radios.');
    check(send.disabled, 'Send needs words and a recipient.');
    dialog.querySelector('[name="include_page"]').click();
@@ -329,7 +329,7 @@ async function sendSaved() {
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
-    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'The owner dialog has all five types.');
+    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Scheduled', 'The dialog has all six types.');
    }
    async function sendOwner() {
     selectType('feedback');
@@ -661,7 +661,7 @@ OWNER_OPTIONS_PROBE = r"""
   if (!dialog.open) throw new Error('The owner button must open the dialog.');
   await loaded;
   const types = [...dialog.querySelectorAll('[data-kind-label]')].map(label => label.textContent);
-  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'All five types appear in order.');
+  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Scheduled', 'All six types appear in order.');
   check(dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug starts selected.');
   const inputs = () => [...recipients.querySelectorAll('input')];
   check(inputs().map(input => input.value).join() === __RECIPIENTS__.map(row => row.id).join(),
@@ -700,7 +700,20 @@ OWNER_OPTIONS_PROBE = r"""
   words.value = 'Check a proposal for this recipient.';
   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
   check(!send.disabled, 'The alternate recipient enables Send.');
+  dialog.querySelector('[data-kind="scheduled"] input').click();
+  const scheduled = dialog.querySelector('[data-scheduled-help]');
+  const command = scheduled.querySelector('code');
+  words.value = 'Check the queue. Start 2027-01-15T13:00.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  check(!scheduled.hidden && command.textContent === '/new_item scheduled cargo-liner ' + words.value,
+        'Scheduled displays a command with the selected recipient and instruction.');
+  const hidden = element => getComputedStyle(element).display === 'none';
+  check(hidden(send) && send.disabled && hidden(dialog.querySelector('[data-sent-details]')) &&
+        hidden(dialog.querySelector('[data-saved-controls]')),
+        'Scheduled uses the command to file the item.');
   dialog.querySelector('[data-kind="proposal"] input').click();
+  check(scheduled.hidden && !send.hidden && !dialog.querySelector('[data-sent-details]').hidden,
+        'The other types can send from the dialog.');
   check(inputs().length === 1 && !selected() && send.disabled && !status.hidden &&
         status.textContent === 'The recipient you chose is not available. Choose a recipient.',
         'Proposal clears the selection and asks for another recipient.');
@@ -1433,20 +1446,21 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual(fixture.results, [])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:
+    def test_owner_button_opens_six_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in (1440, 390)}
         capture_dialogs(temporary / "options.png", fixtures,
                         pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
         self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: []})
 
-    def test_render_mounts_one_dialog_with_five_types(self) -> None:
+    def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
-        self.assertEqual(markup.count('type="radio" name="kind"'), 5)
-        self.assertEqual(markup.count('<span data-button-face>'), 5)
+        self.assertEqual(markup.count('type="radio" name="kind"'), 6)
+        self.assertEqual(markup.count('<span data-button-face>'), 6)
         self.assertIn('data-kind="bug"', markup)
+        self.assertIn('data-kind="scheduled"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-sent-details aria-labelledby="sent-details-title"', markup)

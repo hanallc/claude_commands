@@ -760,7 +760,8 @@ KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          (SubmissionKind.QUESTION, "Question", "circle-help"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
-         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"))
+         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
+         ("scheduled", "Scheduled", "clock-alert"))
 
 
 def render() -> str:
@@ -784,6 +785,10 @@ def render() -> str:
    </fieldset>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
+   <section data-scheduled-help hidden>
+    <p>Run this command in a session to save the item. Add a start time and an optional repeat.</p>
+    <code data-scheduled-command></code>
+   </section>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
     <div data-bug-page-state hidden>
@@ -871,6 +876,8 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
 #review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
+#review-new-item .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
+#review-new-item [data-scheduled-command] { overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item [data-recipient-group] { display: flow-root; }
@@ -925,7 +932,7 @@ STYLE = '''
  border: 1px solid #6c6b66; border-radius: 5px; background: #1a1a19; color: #f0efec;
 }
 #review-new-item footer { padding-block: 0 20px; }
-#review-new-item footer > div {
+#review-new-item footer > div:not([hidden]) {
  display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line, #34332f);
  padding-top: 14px;
 }
@@ -956,6 +963,7 @@ SCRIPT = r'''(() => {
  const ownerReason = dialog.querySelector('[data-owner-reason]');
  const ownerReasonText = ownerReason.querySelector('#review-new-item-owner-reason');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
+ const wordsPlaceholder = words.placeholder;
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
  const slot = dialog.querySelector('[data-capture-slot]'), shot = slot.querySelector('[data-shot]');
@@ -964,6 +972,8 @@ SCRIPT = r'''(() => {
  const fallbackText = fallback.textContent;
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
+ const scheduledCommand = scheduledHelp.querySelector('[data-scheduled-command]');
  const sendNotice = dialog.querySelector('[data-send-disabled]');
  const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
@@ -990,9 +1000,23 @@ SCRIPT = r'''(() => {
   error.hidden = !reason;
  }
 
+ function isScheduled() {
+  return !pendingItem && form.elements.kind.value === 'scheduled';
+ }
+
  function updateSend() {
-  send.disabled = !!savedItem || sending || !token || (!pendingItem &&
-    (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
+  const recipient = recipientChips.querySelector('input:checked');
+  const scheduled = isScheduled();
+  send.hidden = sentDetails.hidden = scheduled;
+  scheduledHelp.hidden = !scheduled;
+  words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
+  if (scheduled) {
+   const owner = recipient?.value || '<assignee>';
+   const instruction = words.value.trim() || 'Enter the instruction. Start YYYY-MM-DD HH:MM.';
+   scheduledCommand.textContent = '/new_item scheduled ' + owner + ' ' + instruction;
+  }
+  send.disabled = scheduled || !!savedItem || sending || !token || (!pendingItem &&
+    (!recipient || !words.value.trim() || words.value.length > words.maxLength));
  }
 
  function showRecipients() {
@@ -1036,6 +1060,8 @@ SCRIPT = r'''(() => {
   if (event?.target.name === 'kind') {
    showRecipients();
    showBugPage();
+   if (isScheduled()) discardCapture();
+   else if (!scheduledHelp.hidden) startCapture();
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
@@ -1060,7 +1086,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
-  if (sending) return;
+  if (sending || isScheduled()) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1320,7 +1346,7 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  if (isScheduled() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
   const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
   const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,

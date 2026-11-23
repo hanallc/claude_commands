@@ -8,10 +8,12 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.production import producer_map, staff, the_list
 from scripts.lib import main_publish
@@ -117,20 +119,23 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual(code, new_item.Outcome.USAGE)
         self.assertEqual(output.splitlines(), [
             "/new_item <type> <assignee> <description> [extra, such as a time]",
-            "Types: bug, question, investigation, proposal, efficiency, feedback",
+            "Types: bug, question, investigation, proposal, efficiency, feedback, scheduled",
             "Assignee: a producer, a showrunner or a unit",
+            "/new_item scheduled natedev Set the time zone back to Eastern time. Start Fri Nov 27 13:00.",
         ])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
-    def test_six_types_and_each_files_as_a_server_kind(self) -> None:
+    def test_six_review_types_file_as_server_kinds(self) -> None:
         self.assertEqual([kind.value for kind in new_item.ItemType],
-                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback"])
+                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback", "scheduled"])
         investigation = new_item_dialog.SubmissionKind.INVESTIGATION
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.FEEDBACK], investigation)
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.EFFICIENCY], investigation)
         for kind in new_item_dialog.SubmissionKind:
             self.assertEqual(new_item.FILED_KINDS[new_item.ItemType(kind.value)], kind)
         for item_type in new_item.ItemType:
+            if item_type is new_item.ItemType.SCHEDULED:
+                continue
             with self.subTest(item_type=item_type):
                 code, output, _ = self.run_main(item_type.value.upper(), "bob", "Check the chart.")
                 self.assertEqual(code, 0)
@@ -141,6 +146,101 @@ class NewItemTests(unittest.TestCase):
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
             _ = self.run_main("chore", "bob", "Check the chart.")
+
+    def test_scheduled_menu_and_custom_rules_save_the_named_owner_and_read_back(self) -> None:
+        folder = self.config.parent
+        staff_file = folder / "staff.json"
+        members = staff.StaffSnapshot((*MEMBERS.rows, MORTY))
+        _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [
+            row.to_json() for row in staff.active(members, "producer")
+        ]}))
+        _ = (folder / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
+        self.map_row(NATEDEV, DWIGHT)
+        self.map_row(POSTMASTER, BOB)
+        now = datetime(2026, 11, 23, 18, tzinfo=UTC)
+        first_words = "Set the time zone back to Eastern time."
+        words = "Check the account predictions."
+        monday = "Start Mon Nov 30 09:00."
+        cases = (
+            (NATEDEV, DWIGHT, first_words, "Start Fri Nov 27 13:00.", "",
+             "2026-11-27T13:00:00-08:00", "", "Does not repeat"),
+            (NATEDEV, DWIGHT, words, monday, "Does not repeat.",
+             "2026-11-30T09:00:00-08:00", "", "Does not repeat"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat Daily.",
+             "2026-11-30T09:00:00-08:00", "FREQ=DAILY", "Repeats: Daily"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat Weekly on Monday.",
+             "2026-11-30T09:00:00-08:00", "FREQ=WEEKLY;BYDAY=MO", "Repeats: Weekly on Monday"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat Monthly on the last Monday.",
+             "2026-11-30T09:00:00-08:00", "FREQ=MONTHLY;BYDAY=-1MO", "Repeats: Monthly on the last Monday"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat Annually on November 30.",
+             "2026-11-30T09:00:00-08:00", "FREQ=YEARLY", "Repeats: Annually on November 30"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat Every weekday (Monday to Friday).",
+             "2026-11-30T09:00:00-08:00", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+             "Repeats: Every weekday (Monday to Friday)"),
+            (POSTMASTER, BOB, words, monday, "Repeat every 2 weeks on Monday and Thursday.",
+             "2026-11-30T09:00:00-08:00", "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH",
+             "Repeats: Every 2 weeks on Monday and Thursday"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat every 3 months on the same day number. Ends after 13 occurrences.",
+             "2026-11-30T09:00:00-08:00", "FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=30;COUNT=13",
+             "Repeats: Every 3 months on day 30 for 13 runs"),
+            (NATEDEV, DWIGHT, words, monday, "Repeat every 3 months on the same weekday of the month. Ends never.",
+             "2026-11-30T09:00:00-08:00", "FREQ=MONTHLY;INTERVAL=3;BYDAY=-1MO",
+             "Repeats: Every 3 months on the last Monday"),
+            (BOB, BOB, words, "Start 2026-11-30T09:00 America/New_York.",
+             "Repeat every 2 days. Ends on Mar 15, 2027.", "2026-11-30T09:00:00-05:00",
+             "FREQ=DAILY;INTERVAL=2;UNTIL=20270316T035959Z", "Repeats: Every 2 days until 2027-03-16 03:59:59 UTC"),
+            (NATEDEV, DWIGHT, words, "Start 2026-11-30T09:00+02:00.", "Repeat every 2 years.",
+             "2026-11-30T09:00:00+02:00", "FREQ=YEARLY;INTERVAL=2", "Repeats: Every 2 years on November 30"),
+        )
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(folder / "state"),
+                                          "STAFF_FILE": str(staff_file), "USER_ZONE": "America/Los_Angeles"}),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(the_list, "now", return_value=now)):
+            for number, (owner, producer, instruction, start_words, repeat, stamp, rule, readback) in enumerate(cases, 1):
+                with self.subTest(start=start_words, repeat=repeat):
+                    arguments = ("scheduled", owner.name, f"{instruction} {start_words} {repeat}".strip())
+                    code, preview, errors = self.run_main(*arguments, "--preview")
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual(len(the_list.records(MORTY.id)), number - 1)
+                    code, output, errors = self.run_main(*arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    item = the_list.load(MORTY.id, f"L{number}")
+                    self.assertIs(item.state, the_list.ItemState.SCHEDULED)
+                    schedule = item.schedule
+                    if isinstance(schedule, the_list.ScheduledSeries):
+                        run, rrule = schedule.first, schedule.rule.rrule
+                    else:
+                        assert isinstance(schedule, the_list.ScheduledRun)
+                        run, rrule = schedule, ""
+                    self.assertEqual((item.owner, run.words, run.start.isoformat(), rrule),
+                                     (owner.id, instruction, stamp, rule))
+                    self.assertEqual(item.producer, producer.id)
+                    self.assertEqual(item.unit, owner.name if owner.kind == "unit" else "")
+                    zone = ("America/New_York" if owner is BOB else "America/Los_Angeles")
+                    if not start_words.endswith("+02:00."):
+                        self.assertEqual(run.start.tzinfo, ZoneInfo(zone))
+                    self.assertEqual(preview.splitlines()[1:], [readback])
+                    self.assertIn(stamp[11:16], preview.splitlines()[0])
+                    self.assertEqual(output.splitlines()[:2], preview.splitlines())
+                    self.assertIn(f"List item {number}.", output.splitlines()[2])
+        self.assertEqual((self.server.reads, self.server.posts, self.assignee_updates), (0, [], []))
+
+    def test_scheduled_refuses_past_times_and_repeats_outside_the_menu(self) -> None:
+        self.map_row(NATEDEV, BOB)
+        now = datetime(2026, 11, 23, 18, tzinfo=UTC)
+        cases = (
+            ("Start Fri Nov 20 13:00.", "The start must be in the future."),
+            ("Start Fri Nov 27 13:00. Repeat twice a day.", "Use a repeat from the List menu or a Custom repeat."),
+        )
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.config.parent / "state"),
+                                          "USER_ZONE": "America/Los_Angeles"}),
+              mock.patch.object(the_list, "now", return_value=now)):
+            for start, reason in cases:
+                with self.subTest(start=start):
+                    code, output, errors = self.run_main("scheduled", "natedev", f"Check the chart. {start}")
+                    self.assertEqual((code, output, errors), (new_item.Outcome.REFUSED, "", f"new_item: {reason}\n"))
+            self.assertEqual(the_list.records(MORTY.id), [])
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
     def test_a_producer_assignee_has_no_lookup(self) -> None:
         code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
@@ -255,7 +355,8 @@ class NewItemTests(unittest.TestCase):
         arguments = ["bug", "models", "Fix the chart.", "Today."]
         output = io.StringIO()
         with (mock.patch("platform.system", return_value="Darwin"),
-                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CLAUDE_CODE_SESSION_ID": "mac-session"}),
+                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CLAUDE_CODE_SESSION_ID": "mac-session",
+                                             "CODEX_THREAD_ID": ""}),
                 mock.patch.object(main_publish, "forward", return_value=0) as forward, redirect_stdout(output)):
             self.assertEqual(new_item.main(arguments), 0)
             self.assertEqual(new_item.main([]), new_item.Outcome.USAGE)
