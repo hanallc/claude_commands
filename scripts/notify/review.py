@@ -458,6 +458,97 @@ def run_process(argv: list[str], *, timeout: float,
                           timeout=timeout, env=env)
 
 
+@dataclass(frozen=True)
+class StructuredAnswer:
+    """The model answered; the value is not yet checked against the schema."""
+    value: object
+
+
+@dataclass(frozen=True)
+class ModelTimeout:
+    """The model call passed its deadline."""
+
+
+@dataclass(frozen=True)
+class ModelExit:
+    """The model program exited with a status other than 0."""
+    code: int
+
+
+@dataclass(frozen=True)
+class ModelError:
+    """The model program reported an error in its reply."""
+
+
+@dataclass(frozen=True)
+class BadJson:
+    """The reply or its result is not a JSON object."""
+
+
+@dataclass(frozen=True)
+class ShellRefused:
+    """The nix shell of the current folder did not load."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class ModelUnavailable:
+    """The model name or the model program failed with an OSError or a ValueError."""
+    reason: str
+
+
+StructuredOutcome = StructuredAnswer | ModelTimeout | ModelExit | ModelError | BadJson | ShellRefused | ModelUnavailable
+
+
+@dataclass(frozen=True)
+class StructuredCall:
+    """The model that the account resolved, and the outcome of the call."""
+    model: str
+    outcome: StructuredOutcome
+
+
+def structured_call(runner: ProcessRunner, binary: Path, environment: dict[str, str], *, model: str, effort: str,
+                    system_prompt: str, schema: Mapping[str, object], prompt: str, deadline: float) -> StructuredCall:
+    """Ask the model once for a JSON answer in the schema, with no tools, no session and no settings.
+
+    The deadline is a time.monotonic() value. This is the one form of a headless model check.
+    """
+    loaded = nix_env.ensure(Path.cwd(), environment)
+    if isinstance(loaded, nix_env.Refused):
+        return StructuredCall(model, ShellRefused(loaded.reason))
+    environment = models_registry.agent_environment(loaded.env)
+    try:
+        model = models_registry.claude_model(model, environment)
+    except (OSError, ValueError) as error:
+        return StructuredCall(model, ModelUnavailable(str(error)))
+    command = [str(binary), "-p", "--model", model, "--effort", effort, "--system-prompt", system_prompt,
+               "--json-schema", json.dumps(schema), "--output-format", "json",
+               "--tools", "", "--no-session-persistence", "--setting-sources", "", prompt]
+    try:
+        result = runner(command, timeout=max(0.001, deadline - time.monotonic()), env=environment)
+    except subprocess.TimeoutExpired:
+        return StructuredCall(model, ModelTimeout())
+    except (OSError, ValueError) as error:
+        return StructuredCall(model, ModelUnavailable(str(error)))
+    if result.returncode != 0:
+        return StructuredCall(model, ModelExit(result.returncode))
+    try:
+        envelope = cast(object, json.loads(result.stdout))
+        if not isinstance(envelope, dict):
+            return StructuredCall(model, BadJson())
+        fields = cast(dict[str, object], envelope)
+        if fields.get("is_error") is True:
+            return StructuredCall(model, ModelError())
+        value: object = fields
+        if "structured_output" in fields:
+            value = fields["structured_output"]
+        elif isinstance(text := fields.get("result"), str):
+            value = cast(object, json.loads(text))
+    except json.JSONDecodeError:
+        return StructuredCall(model, BadJson())
+    return StructuredCall(model, StructuredAnswer(value))
+
+
 def state_path() -> Path:
     return Path(os.environ.get("NOTIFY_STATE_DIR", str(STATE_DIR)))
 
@@ -661,14 +752,15 @@ def validate(value: object, draft: Draft, revision: bool,
         return Unreviewed(str(error), metadata, tuple(failures))
 
 
-def reviewer_environment() -> tuple[dict[str, str], str]:
+def reviewer_environment(group: accounts.ClaudeGroup = "units") -> tuple[dict[str, str], str]:
+    """The environment and account label of a headless model call on the account of the group."""
     # Import the shared account modules from this checkout, not the writer's login.
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
     environment = dict(os.environ)
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
-    selected = accounts.role_account("unit")
+    selected = accounts.group_account(group)
     prepared = accounts.prepare_claude_launch(selected.label, resume=False)
     for name in prepared.remove:
         _ = environment.pop(name, None)
@@ -759,30 +851,26 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         draft_prompt = zone_line() + "\n" + draft_prompt
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
-        loaded = nix_env.ensure(Path.cwd(), environment)
-        if isinstance(loaded, nix_env.Refused):
-            return Unreviewed(loaded.reason, details())
-        from scripts.lib.models_registry import agent_environment
-
-        environment = agent_environment(loaded.env)
-        model = models_registry.claude_model(model, environment)
-        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
-                   "--system-prompt", guide.stdout + "\n" + prompt,
-                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
-                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
-        result = runner(command, timeout=remaining(), env=environment)
-        if result.returncode != 0:
-            return Unreviewed(f"reviewer exit {result.returncode}", details())
-        value = cast(object, json.loads(result.stdout))
-        envelope = _object(value)
-        if envelope.get("is_error") is True:
-            return Unreviewed("reviewer error", details())
-        if "structured_output" in envelope:
-            value = envelope["structured_output"]
-        elif "result" in envelope and isinstance(envelope["result"], str):
-            value = cast(object, json.loads(envelope["result"]))
-        return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
-                        question=isinstance(context, QuestionReview))
+        call = structured_call(runner, binary.path, environment, model=model, effort=effort,
+                               system_prompt=guide.stdout + "\n" + prompt, schema=SCHEMA, prompt=draft_prompt,
+                               deadline=started + timeout)
+        model = call.model
+        match call.outcome:
+            case StructuredAnswer(value=value):
+                return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
+                                question=isinstance(context, QuestionReview))
+            case ModelTimeout():
+                return Unreviewed("timeout", details())
+            case ModelExit(code=code):
+                return Unreviewed(f"reviewer exit {code}", details())
+            case ModelError():
+                return Unreviewed("reviewer error", details())
+            case BadJson():
+                return Unreviewed("bad JSON", details())
+            case ShellRefused(reason=reason):
+                return Unreviewed(reason, details())
+            case ModelUnavailable(reason=reason):
+                return Unreviewed(f"review unavailable: {reason}", details())
     except subprocess.TimeoutExpired:
         return Unreviewed("timeout", details())
     except json.JSONDecodeError:
@@ -1506,7 +1594,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
-                          rendered.title, rendered.action, rendered.body, False, rendered.session)
+                          rendered.posted_title, rendered.action, rendered.posted_body, False, rendered.session)
             if timeout_seconds is None:
                 timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
@@ -1547,7 +1635,7 @@ def ask_text(text_id: str) -> int:
         print(f"review: cannot save the ask. {error}", file=sys.stderr)
         return 2
     for name, rendered in examples:
-        print(f"{entry.id}/{name}\n{rendered.title}\n{rendered.message}")
+        print(f"{entry.id}/{name}\n{push_texts.shown_title(rendered)}\n{rendered.message}")
     return 0
 
 

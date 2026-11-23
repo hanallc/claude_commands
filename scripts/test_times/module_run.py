@@ -20,7 +20,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from inspect import currentframe
+from inspect import currentframe, getsource
 from pathlib import Path
 import resource
 import select
@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import gate_parent_pid
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, gate_parent
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
@@ -204,6 +204,127 @@ class RepositoryReadAudit:
         except (OSError, ValueError):
             # Observation cannot change a test's result.
             return
+
+
+def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> None:
+    """Reject Python writes to the live config and record the first attempt."""
+    canonical = os.path.realpath
+
+    def entry_path(path: str) -> str:
+        parent, name = os.path.split(path.rstrip(os.sep) or os.sep)
+        return os.path.normpath(os.path.join(canonical(parent), name))
+
+    roots = (entry_path(folder), canonical(folder))
+    prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
+    reported = False
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def descriptor_path(descriptor: int) -> str:
+        if sys.platform == "darwin":
+            # macOS uses command 50 for F_GETPATH.
+            raw = fcntl.fcntl(descriptor, 50, bytes(1024)).split(b"\0", 1)[0]
+            return os.fsdecode(raw)
+        return os.readlink(f"/proc/self/fd/{descriptor}")
+
+    def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
+        nonlocal reported
+        try:
+            if isinstance(value, int):
+                path = descriptor_path(value)
+            elif isinstance(value, (str, bytes)):
+                path = os.fsdecode(value)
+                if not os.path.isabs(path) and isinstance(directory_fd, int) and directory_fd >= 0:
+                    path = os.path.join(descriptor_path(directory_fd), path)
+            else:
+                return
+            absolute = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+            resolved = canonical(absolute) if follow_entry else entry_path(absolute)
+        except (OSError, ValueError):
+            return
+        if resolved in roots or resolved.startswith(prefixes):
+            if not os.path.isfile(startup_hook):
+                return
+            if not reported:
+                try:
+                    with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
+                        _ = log.write(f"{absolute}\n")
+                except FileNotFoundError:
+                    if not os.path.isfile(startup_hook):
+                        return
+                    raise
+                reported = True
+            raise AssertionError(f"Test attempted to write live configuration at {absolute}")
+
+    def check_entry(value: object, directory_fd: object = -1) -> None:
+        check(value, directory_fd, follow_entry=False)
+
+    def audit(event: str, arguments: tuple[object, ...]) -> None:
+        if event == "open":
+            path, _, flags = arguments
+            # The event omits dir_fd. The working directory may be wrong.
+            if isinstance(flags, int) and flags & write_flags and isinstance(path, (str, bytes)) and os.path.isabs(path):
+                exclusive = flags & os.O_CREAT and flags & os.O_EXCL
+                check(path, follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
+        elif event in {"os.rename", "os.link"}:
+            check_entry(arguments[0], arguments[2])
+            check_entry(arguments[1], arguments[3])
+        elif event == "os.symlink":
+            check_entry(arguments[1], arguments[2])
+        elif event in {"os.mkdir", "os.remove", "os.rmdir", "shutil.rmtree", "os.chmod", "os.chown", "os.utime"}:
+            check_entry(arguments[0], arguments[-1])
+        elif event in {"os.setxattr", "os.removexattr"}:
+            check_entry(arguments[0])
+        elif event == "os.truncate":
+            check(arguments[0], follow_entry=True)
+
+    sys.addaudithook(audit)
+
+
+@contextmanager
+def guard_live_config(folder: Path, startup_folder: Path, violation_log: Path) -> Generator[None]:
+    """Use the same guard in the runner and its Python child processes."""
+    folder = folder.absolute()
+    violation_log = violation_log.absolute()
+    hook = startup_folder.absolute() / "sitecustomize.py"
+    _ = hook.write_text(
+        """from __future__ import annotations
+import fcntl
+import os
+import sys
+from importlib.machinery import PathFinder
+from importlib.util import module_from_spec
+
+""" + getsource(install_live_config_guard)
+        + f"\ninstall_live_config_guard({str(folder)!r}, {str(violation_log)!r}, __file__)\n"
+        + """
+# Keep the primary hook registered while the next hook runs.
+directory = os.path.realpath(os.path.dirname(__file__))
+search = iter(sys.path)
+for entry in search:
+    if os.path.realpath(entry) == directory:
+        break
+spec = PathFinder.find_spec("sitecustomize", list(search))
+if spec is not None and spec.loader is not None:
+    module = module_from_spec(spec)
+    if __file__ == sys.modules["sitecustomize"].__file__:
+        sys.modules["sitecustomize"] = module
+    spec.loader.exec_module(module)
+""", encoding="utf-8")
+    previous = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (str(hook.parent) if previous is None
+                                else os.pathsep.join((str(hook.parent), previous)))
+    install_live_config_guard(str(folder), str(violation_log), str(hook))
+    try:
+        yield
+    finally:
+        if previous is None:
+            _ = os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous
+        hook.unlink(missing_ok=True)
+        if violation_log.exists():
+            with violation_log.open(encoding="utf-8") as log:
+                raise AssertionError(f"Test attempted to write live configuration at {log.readline().rstrip()}")
 
 
 @dataclass(frozen=True)
@@ -558,9 +679,8 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
             yield folder
 
 
-def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
-    if owner is None:
-        owner = StandaloneModuleRun()
+def main(owner: GateModuleLease | StandaloneModuleRun, run_root: Path) -> None:
+    violation_log = (owner.root if isinstance(owner, GateModuleLease) else run_root) / "live-config-writes"
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -568,7 +688,7 @@ def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
 
         if find_spec("scripts.lib.conf_reads") is not None:
             raise
-        run_module(NoConfigReadLog())
+        run_module(NoConfigReadLog(), run_root, violation_log)
         return
 
     with ExitStack() as cleanup:
@@ -577,10 +697,10 @@ def main(owner: GateModuleLease | StandaloneModuleRun | None = None) -> None:
         log = temporary / "reads"
         log.touch()
         with conf_reads.record_reads(log):
-            run_module(log)
+            run_module(log, run_root, violation_log)
 
 
-def run_module(config_log: Path | NoConfigReadLog) -> None:
+def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log: Path) -> None:
     if len(sys.argv) != 3:
         print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
         sys.exit(2)
@@ -598,13 +718,15 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
-        if isinstance(TimedRunner.destination, TimesOutput):
-            TimedRunner.scanned_folders = set()
-            TimedRunner.read_contents = set()
-            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
-                                                TimedRunner.read_contents))
-        suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-        result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
+        # The guard reads this file, so the read audit starts after it.
+        with guard_live_config(Path.home() / ".claude" / "config", run_root, violation_log):
+            if isinstance(TimedRunner.destination, TimesOutput):
+                TimedRunner.scanned_folders = set()
+                TimedRunner.read_contents = set()
+                sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                    TimedRunner.read_contents))
+            suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+            result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
     except SystemExit:
         if "scripts.message.session_send_test_support" in sys.modules:
@@ -617,7 +739,7 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator[None]:
+def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator[Path]:
     """Keep imported run roots and child processes under one private folder."""
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
@@ -627,7 +749,7 @@ def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator
             _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
         try:
             os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-            yield
+            yield root
         finally:
             for name in names:
                 _ = os.environ.pop(name, None)
@@ -639,11 +761,10 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
-    parent = gate_parent_pid(consume=True)
     if not adopt_descendants():
-        cleanup.enter_context(private_run_roots(owner))
-        main(owner)
+        main(owner, cleanup.enter_context(private_run_roots(owner)))
         return
+    parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -656,12 +777,12 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    if parent:
+    if not isinstance(parent, UnverifiedGateParent):
         # No test child exists before the parent-death handoff completes.
-        parent_fds.append(os.pidfd_open(int(parent)))
+        parent_fds.append(os.pidfd_open(int(parent.pid)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
-    cleanup.enter_context(private_run_roots(owner))
+    run_root = cleanup.enter_context(private_run_roots(owner))
     usage = resource.getrusage(resource.RUSAGE_SELF)
     supervisor = os.getpid()
     test_pid = os.fork()
@@ -675,7 +796,7 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main(owner)
+        main(owner, run_root)
         return
     status = 0
     received = 0

@@ -20,6 +20,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 GATE_COMMAND = ("python3", "scripts/production/gate.py", "--tests-only", "--type-dirs", "scripts")
@@ -70,7 +71,7 @@ class FirstStepTests(unittest.TestCase):
                 "kind.mac-linux=ssh", "platform.mac-linux=linux", "settings.mac-linux=guest.conf",
                 "kind.natedev=local", "platform.natedev=linux",
                 "kind.mac=ssh", "platform.mac=macos", "settings.mac=mac.conf", "",
-            )))
+            )) + UNREACHABLE_WAIT_FIXTURE)
             remote = placement.PlacementCandidate(
                 placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", claim_state.WHOLE_MAC, 1))
             local = local_candidate(fixture)

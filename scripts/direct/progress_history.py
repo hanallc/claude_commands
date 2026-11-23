@@ -1704,7 +1704,9 @@ def load_events(event_types: Collection[str] = (), *,
         record = staff.initial_snapshot()
     ignored = 0
     runs_dir = plan_history.history_root() / "runs"
-    wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, event_types)) + r')"')
+    # A checkpoint read also reads the voids that cancel checkpoints.
+    read_types = (*event_types, pass_recorder.CHECKPOINT_VOIDED) if "checkpoint" in event_types else tuple(event_types)
+    wanted = re.compile(r'"event_type"\s*:\s*"(?:' + "|".join(map(re.escape, read_types)) + r')"')
     if not runs_dir.exists():
         return events, ignored
     for path in sorted(runs_dir.glob("*.jsonl")):
@@ -1716,6 +1718,7 @@ def load_events(event_types: Collection[str] = (), *,
         except OSError:
             ignored += 1
             continue
+        run_events: list[dict[str, object]] = []
         for line in lines:
             if event_types and not wanted.search(line):
                 continue
@@ -1723,8 +1726,10 @@ def load_events(event_types: Collection[str] = (), *,
             if event is None or pass_recorder.integer(event.get("schema_version")) != pass_recorder.SCHEMA_VERSION:
                 ignored += 1
                 continue
-            if not event_types or event.get("event_type") in event_types:
-                events.append(pass_recorder.staff_directory(event, record))
+            run_events.append(event)
+        events.extend(pass_recorder.staff_directory(event, record)
+                      for event in pass_recorder.without_voided_checkpoints(run_events)
+                      if not event_types or event.get("event_type") in event_types)
     return events, ignored
 
 
@@ -2358,6 +2363,13 @@ def _run_events(state: dict[str, object], *,
     Read only this run for its phase table.
     The read cost depends on this run's history.
     """
+    return pass_recorder.without_voided_checkpoints(_recorded_run_events(state, record=record))
+
+
+def _recorded_run_events(state: dict[str, object], *,
+                         record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL
+                         ) -> list[dict[str, object]]:
+    """Every line this run recorded, voided checkpoints included, oldest first."""
     history_file = pass_recorder.string(state.get("history_file"))
     if not history_file:
         return []
@@ -5280,12 +5292,60 @@ def _checkpoint(args: argparse.Namespace) -> None:
     if phase is None:
         raise SystemExit("checkpoint requires the named open phase")
     events = _run_events(state)
+    working_dir = _phase_working_dir(state, events, phase)
+    if not _is_commit(working_dir, commit):
+        raise SystemExit(f"checkpoint refused: {commit} is not a commit in {working_dir}")
     for event in events:
         if (event.get("event_type") == "checkpoint" and event.get("checkpoint_commit") == commit
                 and event.get("phase_instance_id") == phase.get("instance_id")):
+            print(pass_recorder.string(event.get("event_id")))
             return
     event = pass_recorder.record_event(state, "checkpoint", pass_recorder.now_epoch(), phase_record=phase)
     event.update(checkpoint_commit=commit, session_dir=str(pass_recorder.argument_session_dir(args)))
+    pass_recorder.append_event(state, event)
+    print(event["event_id"])
+
+
+def _phase_working_dir(state: dict[str, object], events: list[dict[str, object]], phase: dict[str, object]) -> Path:
+    """The first folder that exists: the phase_started record, the run's current folder, the current directory."""
+    recorded = next((pass_recorder.string(event.get("working_dir")) for event in events
+                     if event.get("event_type") == "phase_started"
+                     and event.get("phase_instance_id") == phase.get("instance_id")), "")
+    current = pass_recorder.string(state.get("working_dir"))
+    return next((Path(folder) for folder in (recorded, current) if folder and Path(folder).is_dir()), Path.cwd())
+
+
+def _is_commit(working_dir: Path, commit: str) -> bool:
+    """The hash names a commit object itself in the repository of the working dir; a tag hash does not."""
+    found = subprocess.run(["git", "-C", str(working_dir), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                           capture_output=True, text=True, check=False)
+    return found.returncode == 0 and found.stdout.strip() == commit
+
+
+def _void_checkpoint(args: argparse.Namespace) -> None:
+    if os.environ.get(PROBE_ENV) == "1":
+        return
+    reason = pass_recorder.arg_string(args, "reason").strip()
+    if not reason:
+        raise SystemExit("void-checkpoint requires a reason")
+    session_dir = pass_recorder.argument_session_dir(args)
+    state = pass_recorder.read_state(session_dir)
+    event_id = pass_recorder.arg_string(args, "event_id")
+    events = _recorded_run_events(state)
+    checkpoint = next((event for event in events if event.get("event_id") == event_id), None)
+    if checkpoint is None:
+        raise SystemExit(f"void-checkpoint refused: event {event_id} is not in this run")
+    if checkpoint.get("event_type") != "checkpoint":
+        raise SystemExit(f"void-checkpoint refused: event {event_id} is a "
+                         + f"{pass_recorder.string(checkpoint.get('event_type'))} event, not a checkpoint")
+    if any(event.get("event_type") == pass_recorder.CHECKPOINT_VOIDED and event.get("voided_event_id") == event_id
+           for event in events):
+        raise SystemExit(f"void-checkpoint refused: checkpoint {event_id} is already voided")
+    event = pass_recorder.record_event(state, pass_recorder.CHECKPOINT_VOIDED, pass_recorder.now_epoch())
+    event.update({key: checkpoint[key] for key in
+                  ("phase_instance_id", "phase_id", "phase_title", "phase_started_at", "checkpoint_commit")
+                  if key in checkpoint})
+    event.update(voided_event_id=event_id, reason=reason, session_dir=str(session_dir))
     pass_recorder.append_event(state, event)
 
 
@@ -6425,6 +6485,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = checkpoint.add_argument("--phase", "--phase-id", dest="phase_id", default="")
     _ = checkpoint.add_argument("--commit", required=True)
     checkpoint.set_defaults(handler=_checkpoint)
+
+    void_checkpoint = subparsers.add_parser("void-checkpoint")
+    _ = void_checkpoint.add_argument("--session-dir", required=True)
+    _ = void_checkpoint.add_argument("--event-id", required=True)
+    _ = void_checkpoint.add_argument("--reason", required=True)
+    void_checkpoint.set_defaults(handler=_void_checkpoint)
 
     for verb in ("start-checkpoint-wait", "start-handoff-wait"):
         external_wait = subparsers.add_parser(verb)

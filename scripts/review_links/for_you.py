@@ -319,17 +319,28 @@ def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"
 
 
+@dataclass(frozen=True)
+class ConsoleAddress:
+    host: str
+    port: int
+
+
+def console_address() -> ConsoleAddress:
+    """Use the host override or the Tailscale address of the console host, with the server port."""
+    host = os.environ.get("REVIEW_LINKS_HOST")
+    if not host:
+        peer = conf.read_or_repository("console").text("for_you.host")
+        address = subprocess.check_output(
+            ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
+        host = str(IPv4Address(address.strip()))
+    return ConsoleAddress(host, conf.read_or_repository("review_links").whole("server_port"))
+
+
 def _console_count_payload() -> dict[str, object]:
     """Read the count view from the console host."""
     try:
-        host = os.environ.get("REVIEW_LINKS_HOST")
-        if not host:
-            peer = conf.read_or_repository("console").text("for_you.host")
-            address = subprocess.check_output(
-                ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
-            host = str(IPv4Address(address.strip()))
-        port = conf.read_or_repository("review_links").whole("server_port")
-        connection = HTTPConnection(host, port, timeout=2)
+        address = console_address()
+        connection = HTTPConnection(address.host, address.port, timeout=2)
         try:
             connection.request("GET", "/console/for-you.json?view=count")
             response = connection.getresponse()
