@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 import argparse
 import hashlib
+import html
 import importlib
 import json
 import os
@@ -256,12 +257,72 @@ def page_link() -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class _PageSection:
+    """One Builds page section that a heading button opens in a dialog."""
+    action: str
+    icon: str
+    label: str
+    title: str
+    body: str
+
+    @property
+    def dialog_id(self) -> str:
+        return f"{self.action}-dialog"
+
+
+_PAGE_SECTIONS = (
+    _PageSection("builds-swap", "memory-stick", "Swap and memory pressure",
+                 '<span data-tip="swaphead">Swap and memory pressure</span>', """
+<p class="pressure-reason" id="pressure-reason"></p>
+<div class="gauges" id="gauges">
+  <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
+  <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
+  <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span></div></div></div>
+</div>
+<p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
+<h3>Swap by group</h3>
+<div class="swaprows" id="swaprows"></div>
+"""),
+    _PageSection("builds-costs", "chart-bar-decreasing", "Top 3 costs", "Top 3 costs", """
+<div id="report-top">
+  <p class="report-window" id="cost-window"></p>
+  <div id="top-costs">Reading…</div>
+  <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
+</div>
+"""),
+    _PageSection("builds-leftovers", "ghost", "Leftover processes", "Leftover processes",
+                 '<div id="leftover-rows">Reading…</div>'),
+)
+
+
+def _page_action_button(action: str, icon: str, label: str, dialog_id: str) -> str:
+    # Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button
+    # and the owner control's actions argument.
+    label = html.escape(label, quote=True)
+    return (f'<button type="button" class="page-action" data-page-action="{action}" aria-label="{label}" '
+            + f'title="{label}" aria-haspopup="dialog" aria-controls="{dialog_id}">'
+            + page_frame.icon_svg(icon) + '</button>')
+
+
+def page_document(interval_seconds: float) -> str:
+    """Fill the Builds page template: the frame, the section buttons and dialogs, and the refresh interval."""
+    source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
+    actions = "".join(_page_action_button(section.action, section.icon, section.label, section.dialog_id)
+                      for section in _PAGE_SECTIONS)
+    # console_dialog adds the shared dialog style and script to each dialog; the page needs them once.
+    dialogs = page_frame.CONSOLE_DIALOG_ASSETS + "".join(
+        page_frame.console_dialog(section.dialog_id, f"{section.action}-title", section.title, section.body)
+        .removeprefix(page_frame.CONSOLE_DIALOG_ASSETS) for section in _PAGE_SECTIONS)
+    page = (page_frame.template(source, "Builds", "builds")
+            .replace("__BUILDS_PAGE_ACTIONS__", actions).replace("__BUILDS_PAGE_DIALOGS__", dialogs)
+            .replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(interval_seconds)))
+    return page.replace('</head>', staff_names.script({}) + '</head>', 1)
+
+
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
-    page = page_frame.template(source, "Builds", "builds").replace(
-        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
-    page = page.replace('</head>', staff_names.script({}) + '</head>', 1)
+    page = page_document(configuration.interval_seconds)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 

@@ -455,10 +455,52 @@ class MemoryFeedTests(unittest.TestCase):
                                  + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
 
     def expected_page(self, seconds: float = 0.125) -> str:
-        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        page = memory_feed.page_document(seconds)
         self.assertIn(console_theme.TOKENS, page)
-        return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace('</head>', staff_names.script({}) + '</head>', 1))
+        self.assertIn(f"const SECONDS = {json.dumps(seconds)};", page)
+        self.assertNotRegex(page, r"__[A-Z_]+__")
+        return page
+
+    def test_page_sections_open_from_heading_buttons(self) -> None:
+        page = self.expected_page()
+        # The user, 11-22: the swap, Top 3 costs and leftover process sections are icon buttons at the top right;
+        # each button has a tooltip and opens its section in a dialog.
+        sections = (("builds-swap", "Swap and memory pressure", "memory-stick",
+                     ("pressure-reason", "gauges", "gf-some", "gl-some", "gv-some", "limit-some", "gf-full", "gl-full",
+                      "gv-full", "limit-full", "swap-sum", "gf-swap", "gv-swap", "swap-reserve", "swaprows")),
+                    ("builds-costs", "Top 3 costs", "chart-bar-decreasing", ("report-top", "cost-window", "top-costs")),
+                    ("builds-leftovers", "Leftover processes", "ghost", ("leftover-rows",)))
+        actions = page[page.index('<div class="page-heading-actions" data-page-actions>'):page.index("</div>", page.index("data-page-actions>"))]
+        self.assertEqual(re.findall(r'<button [^>]*>', actions), [
+            f'<button type="button" class="page-action" data-page-action="{action}" aria-label="{label}" '
+            + f'title="{label}" aria-haspopup="dialog" aria-controls="{action}-dialog">'
+            for action, label, _icon, _ids in sections])
+        self.assertEqual(re.findall(r'class="lucide lucide-([a-z-]+)"', actions), [icon for _action, _label, icon, _ids in sections])
+        main = page[page.index("<main"):page.index("</main>")]
+        self.assertEqual(page.count(page_frame.CONSOLE_DIALOG_ASSETS), 1)
+        for action, label, _icon, ids in sections:
+            start = page.index(f'<dialog id="{action}-dialog" aria-labelledby="{action}-title" data-console-dialog>')
+            dialog = page[start:page.index("</dialog>", start)]
+            self.assertIn(f'<h2 id="{action}-title">', dialog)
+            self.assertIn(label, dialog)
+            for element in ids:
+                self.assertIn(f'id="{element}"', dialog)
+                self.assertNotIn(f'id="{element}"', main)
+        for removed in ('id="swap"', 'id="report-charts"', 'id="leftovers"', 'href="#swap"'):
+            self.assertNotIn(removed, page)
+        self.assertIn('id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog"', main)
+        render = page[page.index("function renderLeftovers("):page.index("function reportCost(")]
+        javascript = render + """
+const elements = {};
+const $ = id => (elements[id] ??= {innerHTML: ""});
+renderLeftovers({leftovers: []});
+process.stdout.write($("leftover-rows").innerHTML);
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], text=True, capture_output=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "No leftover processes.")
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()

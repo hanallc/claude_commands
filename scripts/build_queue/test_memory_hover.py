@@ -862,7 +862,7 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_a_hidden_console_frame_reads_nothing_until_the_console_shows_it(self) -> None:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        loop = html[(start := html.index("const consoleHidden =")):html.index("</script>", start)]
         javascript = """
 const calls = [];
 const listeners = [];
@@ -899,7 +899,7 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
     def test_space_pauses_every_read_and_space_again_resumes(self) -> None:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn('<div class="paused-badge" id="paused" role="status" hidden>', html)
-        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        loop = html[(start := html.index("const consoleHidden =")):html.index("</script>", start)]
         javascript = """
 const calls = [];
 const handlers = {};
@@ -1046,7 +1046,7 @@ function fitLabels() {}
             "g-builds", *builds, "cap", "g-builds", "reserved", "room", "cap",
             "g-free", "reserved", "room", "system", "safety", "swap", "shortfall", "g-else", *other])
         # The user, 11-15: the waiting and progress key sits under the Running and Queued chart.
-        walk_card = page[page.index('<div class="walk" id="walk">'):page.index('<section class="card" id="leftovers"')]
+        walk_card = page[page.index('<div class="walk" id="walk">'):page.index('</main>')]
         key = walk_card[walk_card.index('<div class="walk-key">'):]
         self.assertEqual([part.split('"')[0] for part in key.split('data-tip="')[1:]], ["waiting", "progress"])
         # The user, 11-16: the legend starts collapsed; a click opens it.

@@ -172,7 +172,7 @@ th, td { text-align: left; padding: 5px 0; border-bottom: 1px solid var(--line);
 th { color: var(--ink-2); font-weight: 600; }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td small { color: var(--ink-3); }
-.pill { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--ink-2); font-weight: 600; text-decoration: none; cursor: pointer; }
+.pill { font: inherit; margin-left: auto; display: inline-flex; gap: 6px; align-items: center; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--ink-2); font-weight: 600; text-decoration: none; cursor: pointer; }
 .pill .pd { width: 8px; height: 8px; border-radius: 50%; background: var(--room); }
 .pill.neutral .pd { background: var(--ink-3); }
 .pill.as-of .pd { display: none; }
@@ -372,15 +372,47 @@ body.queue-unavailable .card { display: none; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
 .report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+/* Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button and the owner control's actions argument. */
+.page-action { display: grid; place-items: center; flex: none; width: 36px; height: 36px; min-height: 36px; margin: 0; padding: 7px;
+  background: var(--card); color: var(--ink-2); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.page-action svg { width: 18px; height: 18px; }
+/* The swap rows and the cost lines need more width than the 560 px console dialog. */
+#builds-swap-dialog, #builds-costs-dialog { width: min(760px, calc(100vw - 32px)); }
 </style>
 </head>
 <body>
 <main class="page-wide">
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
   __PAGE_TITLE__
+  <div class="page-heading-actions" data-page-actions>__BUILDS_PAGE_ACTIONS__</div>
+  <script>
+  // Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button and the owner control's actions argument.
+  // The buttons move into the heading between the owner name and New item; a button opens its dialog, and a close returns focus to it.
+  (() => {
+    const actions = document.currentScript.previousElementSibling;
+    const heading = document.querySelector(".page-heading-actions:not([data-page-actions])");
+    if (heading) {
+      const newItem = heading.querySelector("[data-owner-new]");
+      if (newItem) newItem.before(...actions.children); else heading.append(...actions.children);
+      heading.toggleAttribute("data-page-actions", true);
+      actions.remove();
+    }
+    const bound = new WeakSet();
+    document.addEventListener("click", event => {
+      const button = event.target.closest("[data-page-action]");
+      const dialog = button && document.getElementById(button.getAttribute("aria-controls"));
+      if (!dialog) return;
+      if (!bound.has(dialog)) {
+        bound.add(dialog);
+        bindConsoleDialog(dialog, () => { dialog.close(); button.focus({preventScroll: true}); });
+      }
+      dialog.showModal();
+    });
+  })();
+  </script>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
-  <div class="pressure"><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
+  <div class="pressure"><button type="button" class="pill" id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog"><span class="pd"></span><span id="pill-t">pressure –</span></button></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -475,33 +507,8 @@ body.queue-unavailable .card { display: none; }
       <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
     </div>
   </section>
-
-  <section class="card" id="leftovers" hidden>
-    <div class="section-head">Leftover processes</div>
-    <div id="leftover-rows"></div>
-  </section>
-
-  <section class="card" id="swap">
-    <div class="walk-head"><span class="section-head" data-tip="swaphead">Swap and memory pressure</span></div>
-    <p class="pressure-reason" id="pressure-reason"></p>
-    <div class="gauges">
-      <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
-      <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
-      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span></div></div></div>
-    </div>
-    <p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
-    <h3>Swap by group</h3>
-    <div class="swaprows" id="swaprows"></div>
-  </section>
-  <section class="card" id="report-charts">
-    <div class="section-head">Top 3 costs</div>
-    <div id="report-top">
-      <p class="report-window" id="cost-window"></p>
-      <div id="top-costs">Reading…</div>
-      <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
-    </div>
-  </section>
 </main>
+__BUILDS_PAGE_DIALOGS__
 <div id="tip" role="tooltip"></div>
 <script>
 let latest = null;
@@ -1099,7 +1106,12 @@ function hoverTips(tip, content) {
 }
 // shared:step-tip:end
 const tip = document.getElementById("tip");
-const tips = hoverTips(tip, key => latest ? tooltipHtml(key, latest) : "");
+// A modal dialog covers the page, so the tooltip shows from inside the open dialog.
+const tips = hoverTips(tip, key => {
+  const host = document.querySelector("dialog[open]") ?? document.body;
+  if (tip.parentElement !== host) host.append(tip);
+  return latest ? tooltipHtml(key, latest) : "";
+});
 const showTip = tips.show, hideTip = tips.hide;
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
@@ -1296,12 +1308,16 @@ document.addEventListener("click", (e) => {
   toggle.setAttribute("aria-expanded", String(toggle.getAttribute("aria-expanded") !== "true"));
   renderSwap(latest);
 });
+// The pressure pill opens the swap dialog through its heading button; the pill tooltip stays off over the dialog.
+$("pill").addEventListener("click", event => {
+  event.stopPropagation();
+  document.querySelector('[data-page-action="builds-swap"]').click();
+});
 
 function renderLeftovers(d) {
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
     `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
-  $("leftovers").hidden = rows.length === 0;
-  $("leftover-rows").innerHTML = rows.join("");
+  $("leftover-rows").innerHTML = rows.length ? rows.join("") : "No leftover processes.";
 }
 
 function reportCost(value, unit = "h/day") {
@@ -1368,7 +1384,8 @@ function placeLimitLabels() {
     placeBarLabels(label.parentElement, trackBounds.width);
   }
 }
-window.addEventListener("resize", placeLimitLabels);
+// The labels measure the gauges, so they move again when the swap dialog opens or changes width.
+new ResizeObserver(placeLimitLabels).observe($("gauges"));
 
 const queueMovePath = "/console/builds/queue-move";
 let queueAccess = null;

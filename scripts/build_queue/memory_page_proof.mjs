@@ -861,8 +861,9 @@ try {
           return true;
         };
         // The same step keeps its screen position and hover after work above it changes.
+        // The last twelve steps stay below the moved ones, so the page can scroll to keep the viewed step in place.
         const steady = structuredClone(base);
-        steady.waiters = Array.from({length: 12}, (_, index) => ({...steady.waiters[0],
+        steady.waiters = Array.from({length: 24}, (_, index) => ({...steady.waiters[0],
           key: 'steady-wait-' + index, pid: 8000 + index, name: 'steady waiting ' + index}));
         servedReading = steady;
         await call('Emulation.setDeviceMetricsOverride', {width:1400,height:700,deviceScaleFactor:1,mobile:false});
@@ -882,7 +883,8 @@ try {
         const changedSteady = structuredClone(steady);
         changedSteady.walk.unshift(...[1,2].map(index => ({...changedSteady.walk.find(row=>row.queued),
           key:'steady-new-'+index, pid:9000+index, name:'new running '+index})));
-        changedSteady.waiters = [...changedSteady.waiters.slice(6), ...changedSteady.waiters.slice(0,6)];
+        changedSteady.waiters = [...changedSteady.waiters.slice(6,12), ...changedSteady.waiters.slice(0,6),
+          ...changedSteady.waiters.slice(12)];
         servedReading = changedSteady;
         const afterSteady = await evaluate(`(async () => {
           await tick();
@@ -977,6 +979,8 @@ try {
                 return values[0]*0.2126+values[1]*0.7152+values[2]*0.0722;
               };
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
+              // The swap rows and gauges have a layout only while their dialog is open.
+              document.querySelector('[data-page-action="builds-swap"]').click();
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
               // A long detail wraps at phone width, so compare the first text lines, not the boxes.
@@ -1031,7 +1035,7 @@ try {
                 headingLeft:rect(card.querySelector('.section-head')).left,
                 reservedAmount:getComputedStyle(row.querySelector('.reserved-amount')).color,
                 dimColor:color('--ink-2'),
-                leftover:text('#leftover-rows'), history:text('#report-charts'), top:text('#report-top'),
+                leftover:text('#leftover-rows'), history:text('#builds-costs-dialog'), top:text('#report-top'),
                 costWindow:text('#cost-window'), pressureReason:text('#pressure-reason'),
                 charts:document.querySelectorAll('#history-charts svg').length,
                 progress:progress?rect(progress):null, capLine:rect(cap),
@@ -1046,10 +1050,11 @@ try {
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
                 amountHeader:document.querySelector('.walk-amount-head')?.textContent||document.querySelector('#walk').textContent,
-                swapBars:document.querySelectorAll('#swap .gt').length,
-                legacySwapBar:!!document.querySelector('#swap .swapbar'),
+                swapBars:document.querySelectorAll('#builds-swap-dialog .gt').length,
+                legacySwapBar:!!document.querySelector('#builds-swap-dialog .swapbar'),
                 scroll:document.documentElement.scrollWidth, client:document.documentElement.clientWidth,
               };
+              document.querySelector('#builds-swap-dialog [data-close]').click();
               return metrics;
             })()`);
             assert.deepEqual(proof.headings, runningHeaders);
@@ -1121,6 +1126,31 @@ try {
             await checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,
               'The room pixels differ at '+theme+' '+width+' px.');
             if (comparisonImages) proofs.push({theme,width,metrics:proof});
+            // The user, 11-22: each section opens from its heading button in a dialog; Escape closes it and returns focus.
+            for (const action of ['builds-swap','builds-costs','builds-leftovers']) {
+              const button=await evaluate(`(() => {
+                const box=document.querySelector('[data-page-action="${action}"]').getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent',{type:'mousePressed',...button,button:'left',buttons:1,clickCount:1});
+              await call('Input.dispatchMouseEvent',{type:'mouseReleased',...button,button:'left',buttons:0,clickCount:1});
+              const opened=await evaluate(`(() => {
+                const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
+                return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
+                  sideways:body.scrollWidth-body.clientWidth};
+              })()`);
+              assert.ok(opened.modal, action+' does not open its dialog.');
+              assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
+              assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              const closed=await evaluate(`({open:document.querySelector('#${action}-dialog').open,
+                focus:document.activeElement.dataset.pageAction})`);
+              assert.deepEqual(closed,{open:false,focus:action},action+' does not close or return focus.');
+            }
+            await evaluate("document.querySelector('#pill').click()");
+            assert.ok(await evaluate("document.querySelector('#builds-swap-dialog').open"),'The pressure pill does not open the swap dialog.');
+            await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
             slotReview.walk=[
@@ -1892,7 +1922,7 @@ try {
             }
             for (const name of ['empty_report','missing_report']) {
               await show(readings[name]);
-              const state=await evaluate(`({history:document.querySelector('#report-charts').textContent,
+              const state=await evaluate(`({history:document.querySelector('#builds-costs-dialog').textContent,
                 top:document.querySelector('#report-top').textContent, rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.ok(state.rows>0);
               if(name==='missing_report') {
@@ -2981,11 +3011,12 @@ try {
           await show(base);
           await evaluate('hideTip()');
           const endClip=await evaluate(`(() => {
-            const start=document.querySelector('#swap').getBoundingClientRect();
-            const bottom=document.querySelector('main').getBoundingClientRect().bottom;
-            return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
+            document.querySelector('[data-page-action="builds-swap"]').click();
+            const box=document.querySelector('#builds-swap-dialog').getBoundingClientRect();
+            return {x:box.left,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
           })()`);
           await saveScreenshot('after-dark-desktop',{captureBeyondViewport:true,clip:endClip});
+          await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
         }
 
         if (comparisonImages) {
