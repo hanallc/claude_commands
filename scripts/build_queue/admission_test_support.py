@@ -7,7 +7,7 @@ from scripts.lib import cancellation, test_phase
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
@@ -28,7 +28,10 @@ import time
 import unittest
 import uuid
 from unittest import mock
-from typing import ClassVar, cast, override
+from typing import TYPE_CHECKING, ClassVar, Self, cast, overload, override
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsKeysAndGetItem
 
 from scripts.lint import memory_admit as gate
 
@@ -358,6 +361,88 @@ class SocketPeer:
         self.socket.close()
 
 
+class LoopEnvironment(MutableMapping[str, str]):
+    """os.environ for the test; each thread reads a snapshot that changes only after a whole change.
+
+    A patch.dict exit empties os.environ with clear() and then fills it again with update().
+    Only the thread that calls clear() reads the live mapping until its update(); other threads read the old snapshot.
+    Limit: a child process started with env=None gets the C environment, which is empty in that moment.
+    Limit: a default argument bound to os.environ at import reads the old object, not this one.
+    """
+    def __init__(self, live: MutableMapping[str, str]) -> None:
+        self.live: MutableMapping[str, str] = live
+        self.lock: threading.Lock = threading.Lock()
+        self.snapshot: dict[str, str] = dict(live)
+        self.refilling: int | None = None
+
+    def view(self) -> Mapping[str, str]:
+        return self.live if threading.get_ident() == self.refilling else self.snapshot
+
+    def publish(self) -> None:
+        """Replace the snapshot; the caller holds the lock. A reader keeps the old dict while it reads it."""
+        if self.refilling is None:
+            self.snapshot = dict(self.live)
+
+    @override
+    def __getitem__(self, key: str) -> str:
+        return self.view()[key]
+
+    @override
+    def __setitem__(self, key: str, value: str) -> None:
+        with self.lock:
+            self.live[key] = value
+            self.publish()
+
+    @override
+    def __delitem__(self, key: str) -> None:
+        with self.lock:
+            del self.live[key]
+            self.publish()
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.view())
+
+    @override
+    def __len__(self) -> int:
+        return len(self.view())
+
+    @override
+    def clear(self) -> None:
+        # The snapshot does not change until this thread calls update(), which patch.dict always does next.
+        with self.lock:
+            self.refilling = threading.get_ident()
+            self.live.clear()
+
+    @overload
+    def update(self, values: SupportsKeysAndGetItem[str, str], /, **keywords: str) -> None: ...
+    @overload
+    def update(self, values: Iterable[tuple[str, str]], /, **keywords: str) -> None: ...
+    @overload
+    def update(self, /, **keywords: str) -> None: ...
+    @override
+    def update(self, values: SupportsKeysAndGetItem[str, str] | Iterable[tuple[str, str]] = (), /,
+               **keywords: str) -> None:
+        with self.lock:
+            self.live.update(values, **keywords)
+            if self.refilling == threading.get_ident():
+                self.refilling = None
+            self.publish()
+
+    def copy(self) -> dict[str, str]:
+        return dict(self.view())
+
+    def __or__(self, other: Mapping[str, str]) -> dict[str, str]:
+        return {**self.view(), **other}
+
+    def __ror__(self, other: Mapping[str, str]) -> dict[str, str]:
+        return {**other, **self.view()}
+
+    def __ior__(self, other: Mapping[str, str]) -> Self:
+        self.update(other)
+        return self
+
+
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
@@ -368,48 +453,50 @@ class AdmissionFixture(ExitStack):
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
-        self.temporary: Path = self.root / "tmp"
-        self.temporary.mkdir(parents=True, exist_ok=True)
-        # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
-        self.socket_dir: Path = Path(self.enter_context(
-            short_socket_directory()))
-        logs = log_dir if log_dir is not None else self.root / "log"
-        self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.socket_path: Path = self.socket_dir / "admission.sock"
-        self.scenery_reservations: set[str] = set()
-        self.skip_idle_spacing: bool = skip_idle_spacing
-        self.clock: FakeClock = FakeClock()
-        self.fault: Faults = Faults()
-        self.proc: TestProcesses = TestProcesses(self.root / "proc")
-        _ = self.callback(self.proc.close)
-        pressure = self.root / "pressure"
-        if not pressure.exists():
-            write_pressure_reading(pressure)
-        memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
-                   "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
-                  if (self.root / "meminfo").exists() else fake_memory_readings(
-                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-        environment = {**gate_isolation_environment(self.root), **memory,
-            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
-            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
-            "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
-            "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
-            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
-            "BUILDLOG_RUN": "",
-            "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
-            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root), "TMPDIR": str(self.temporary),
-            **interpreter_cache_environment(self.root / "cache")}
-        self.enter_context(mock.patch.dict(os.environ, environment))
-        if not (self.root / "build_admission.conf").exists():
-            write_memory_config(self.root / "build_admission.conf")
-        self.readings: PrivateReadings = PrivateReadings(self.root)
-        self.turn_gate: threading.Lock = threading.Lock()
-        self.loop_access: threading.RLock = threading.RLock()
-        self.serving_active: threading.Event = threading.Event()
-        self.loop_permission: threading.local = threading.local()
         try:
+            self.temporary: Path = self.root / "tmp"
+            self.temporary.mkdir(parents=True, exist_ok=True)
+            # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
+            self.socket_dir: Path = Path(self.enter_context(
+                short_socket_directory()))
+            logs = log_dir if log_dir is not None else self.root / "log"
+            self.state_dir: Path = state_dir if state_dir is not None else logs / "admission"
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self.socket_path: Path = self.socket_dir / "admission.sock"
+            self.scenery_reservations: set[str] = set()
+            self.skip_idle_spacing: bool = skip_idle_spacing
+            self.clock: FakeClock = FakeClock()
+            self.fault: Faults = Faults()
+            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            _ = self.callback(self.proc.close)
+            pressure = self.root / "pressure"
+            if not pressure.exists():
+                write_pressure_reading(pressure)
+            memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
+                       "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
+                      if (self.root / "meminfo").exists() else fake_memory_readings(
+                          self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
+            environment = {**gate_isolation_environment(self.root), **memory,
+                "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
+                "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
+                "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),
+                "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(logs),
+                "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+                "BUILDLOG_RUN": "",
+                "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
+                "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
+                "HOME": str(self.root), "TMPDIR": str(self.temporary),
+                **interpreter_cache_environment(self.root / "cache")}
+            self.enter_context(mock.patch.dict(os.environ, environment))
+            self.environment: LoopEnvironment = LoopEnvironment(os.environ)
+            _ = self.enter_context(mock.patch.object(os, "environ", self.environment))
+            if not (self.root / "build_admission.conf").exists():
+                write_memory_config(self.root / "build_admission.conf")
+            self.readings: PrivateReadings = PrivateReadings(self.root)
+            self.turn_gate: threading.Lock = threading.Lock()
+            self.loop_access: threading.RLock = threading.RLock()
+            self.serving_active: threading.Event = threading.Event()
+            self.loop_permission: threading.local = threading.local()
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
             self.close()

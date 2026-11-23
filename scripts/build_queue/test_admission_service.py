@@ -5196,6 +5196,39 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(os.environ.get("USER_ZONE", ""), zone)
                 self.assertEqual("USER_ZONE" in os.environ, bool(zone))
 
+    def test_serving_loop_never_reads_the_empty_environment_inside_a_patch_dict_exit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture_cgroup = gate.builds_slice_cgroup()
+            probing = threading.Event()
+            probed = threading.Event()
+            loop_reads: list[Path] = []
+            serve_once = fixture.server.run_once
+
+            def probe_or_serve(timeout: float) -> None:
+                # The probe turn reads the environment and does no other work.
+                if not probing.is_set():
+                    serve_once(timeout)
+                elif not probed.is_set():
+                    loop_reads.append(gate.builds_slice_cgroup())
+                    # The loop starts its own threads too, for example the reading alert and the roster.
+                    started = threading.Thread(target=lambda: loop_reads.append(gate.builds_slice_cgroup()))
+                    started.start()
+                    started.join(test_hang_guard.TEST_HANG_GUARD_SECS)
+                    probed.set()
+
+            with mock.patch.object(fixture.server, "run_once", probe_or_serve), fixture.serving():
+                # A patch.dict exit calls clear() and then update(); the probe reads between the two calls.
+                saved = dict(os.environ)
+                os.environ.clear()
+                try:
+                    probing.set()
+                    loop_read = probed.wait(test_hang_guard.TEST_HANG_GUARD_SECS)
+                finally:
+                    os.environ.update(saved)
+                probing.clear()
+            self.assertTrue(loop_read)
+            self.assertEqual(loop_reads, [fixture_cgroup, fixture_cgroup])
+
     def test_each_pass_publishes_captured_readings_and_remaining_waiters(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
