@@ -583,6 +583,15 @@ def guest_attempt_command(mode: Literal['lock', 'start', 'cancel'], armed: Armed
                        armed.attempt, armed.boot_id, str(armed.deadline_ns), Path(RUN_LOCK_PATH).name, str(descriptor)))
 
 
+def guest_group_signal_command() -> str:
+    """The guest command that sends SIGNAL to process group GROUP through the shared check in process_group.py.
+
+    Append the GROUP and SIGNAL arguments. The guest can run it before its checkout has scripts, so the command
+    carries the source of the module.
+    """
+    return shlex.join(('python3', '-I', '-S', '-c', Path(process_group.__file__).read_text(encoding='utf-8')))
+
+
 def run_shell(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
     checkout = f'''set -euo pipefail
@@ -620,7 +629,10 @@ if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
     exit 1
 fi
 # natedev holds the link open for the run. If the link ends first, end the run group, which frees the run lock.
-{{ while read -r _; do :; done; kill -KILL 0; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
+# The watcher is in the run group, so a group kill ends it too; the EXIT trap ends it after a normal end.
+# At the link end it moves to a new session, because the shared check refuses the caller's own group.
+read -r group _ < "/proc/$$/fd/{RUN_LOCK_FD}"
+{{ while read -r _; do :; done; exec setsid {guest_group_signal_command()} "$group" KILL; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
 watcher=$!
 trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
 exec </dev/null
@@ -650,9 +662,7 @@ exec timeout --signal=KILL {settings.guest_timeout_seconds} {start} "$BASHPID" {
 
 def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
     cancel = guest_attempt_command('cancel', armed, 8)
-    # Cleanup can run before the guest has a checkout with scripts.
-    group_helper = Path(process_group.__file__).read_text(encoding='utf-8')
-    send_group = shlex.join(('python3', '-I', '-S', '-c', group_helper))
+    send_group = guest_group_signal_command()
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
 prove_end() {{
