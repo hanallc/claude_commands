@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.accounts import accounts
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.showrunner_registry_test_support import scratch_showrunner_registry
 from scripts.whoami import note_file
@@ -82,7 +83,7 @@ def scratch_account_home(home: Path, environment: Mapping[str, str], *, clear: b
         with (scratch_accounts_config() as config,
               patch.object(accounts, "trust_settings_file", return_value=settings),
               # A missing herdr path keeps the host herdr out of the fixture; the gate uses the same path.
-              patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr", **environment, "HOME": str(home),
+              patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN, **environment, "HOME": str(home),
                                       "CONF_DIR": str(config)}, clear=clear),
               scratch_showrunner_registry(home)):
             yield
