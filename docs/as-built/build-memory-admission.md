@@ -120,6 +120,9 @@ The owner uses `host:pid:start_time`.
 Absent fields use `-`.
 The command returns 0 for current, 1 for closed or unknown, and 2 for an unreachable service.
 A live service that answers slowly makes it wait, as the placement requests do. A missing socket or a refused connection returns 2 at once.
+A service that stays silent until `unreachable_limit_seconds` returns 2 with "build queue unreachable for <time>".
+A query holds no step and no cargo token, so its reason does not say "step stopped; cargo token given back".
+`_query` does not print a refusal. The caller prints the reason once.
 The Mac cargo gate runs this check over ssh. A failed check refuses the call with the status and the last error line of the check.
 The check grants no permission and records no caller version.
 The status and replay paths share the same placement lifetime check.

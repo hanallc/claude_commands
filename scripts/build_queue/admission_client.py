@@ -395,7 +395,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
            | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
-        reply = _call(request, lambda _wait: None)
+        reply = _call(request, lambda _wait: None, report_refusal=False)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
         if isinstance(reply, wire.Refused):
@@ -941,9 +941,9 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         _ACQUISITION_RETRY.reset(token)
 
 
-def _unreachable(configuration: records.MemoryConfig | wire.AcquisitionTiming) -> _QueueUnreachable:
-    duration = _unreachable_duration(configuration.unreachable_limit_seconds)
-    return _QueueUnreachable(f"build queue unreachable for {duration}; step stopped; cargo token given back")
+def _unreachable(configuration: records.MemoryConfig | wire.AcquisitionTiming, *, holds_step: bool) -> _QueueUnreachable:
+    reason = f"build queue unreachable for {_unreachable_duration(configuration.unreachable_limit_seconds)}"
+    return _QueueUnreachable(f"{reason}; step stopped; cargo token given back" if holds_step else reason)
 
 
 def _begin_unreachable(retry: AcquisitionRetry, configuration: records.MemoryConfig | wire.AcquisitionTiming) -> None:
@@ -1025,7 +1025,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     def deadline_reply(expired: DeadlineStop = AcquisitionDeadline.LAUNCH) -> wire.Refused | wire.RepositorySlotExpired:
         if expired is AcquisitionDeadline.UNREACHABLE:
             assert not isinstance(configuration, wire.CleanupTiming)
-            raise _unreachable(configuration)
+            raise _unreachable(configuration, holds_step=not placement_control)
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
@@ -1240,7 +1240,7 @@ def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
     if cause is AcquisitionDeadline.LAUNCH:
         return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
     if cause is AcquisitionDeadline.UNREACHABLE:
-        raise _unreachable(configuration)
+        raise _unreachable(configuration, holds_step=True)
     if isinstance(cause, _QueueUnreachable):
         raise cause
     assert isinstance(cause, CheckerFailure)
