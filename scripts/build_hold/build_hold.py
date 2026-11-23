@@ -1470,6 +1470,16 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
     return CycleNoticesToSend(cycle, entries, unresolved)
 
 
+def unsent_text(entries: Sequence[ReleaseEntry], recipients: Mapping[str, str]) -> str:
+    """Name each unsent recipient once, with the count of its stopped runs."""
+    runs: dict[str, int] = {}
+    for entry in entries:
+        name = entry["name"] if "run" in entry else recipients[entry["session_id"]]
+        runs[name] = runs.get(name, 0) + int("run" in entry)
+    return ", ".join(f"{name} ({count} stopped run{'s' if count > 1 else ''})" if count else name
+                     for name, count in runs.items()) or "none"
+
+
 def pending_release_status_lines() -> list[str]:
     """Name unfinished notices without locking, migrating or changing release state."""
     lines: list[str] = []
@@ -1480,8 +1490,7 @@ def pending_release_status_lines() -> list[str]:
                 continue
             pending = release_notices(intent)
             notices = intent["notices"]
-            unsent = (", ".join(entry["run"]["label"] if "run" in entry else notices["recipients"][entry["session_id"]]
-                               for entry in pending.entries) or "none"
+            unsent = (unsent_text(pending.entries, notices["recipients"])
                       if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
                       else "every session (broadcast)")
             if isinstance(pending, CycleNoticesToSend) and pending.unresolved_stops:

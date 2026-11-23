@@ -1749,6 +1749,44 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertNotIn("phases-0", notice)
         self.assertEqual(self.run_deliveries(), ["Delivered"] * 3)
 
+    def test_release_finishes_another_holders_pending_runs_with_one_notice_each(self) -> None:
+        # One release finishes every pending record, as the fps release did for the builds record.
+        director = fixture_member("showrunner", name="director")
+        phases = fixture_member("worker", name="phases", parent=director.id)
+        self.leave_release_pending("builds", [(phases.name, f"codex:{phases.current_session}")])
+        runs = self.stopped_runs(phases, 5)
+        self.pending_runs(runs)
+        cycle = self.cycle()
+        cycle["entries"].extend({**entry, "delivery": "Delivered"} for entry in runs[:2])
+        build_hold.save_cycle(cycle)
+        self.leave_release_pending("fps", [("fps waiter", "codex:fps-waiter")])
+        sent: list[tuple[str, str]] = []
+        with mock.patch.object(build_hold, "send_release_to", side_effect=self.recorder(sent)):
+            result = invoke_hold(["release", "--holder", "fps"], dict(os.environ))
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(sorted(to for to, _ in sent), sorted(["codex:fps-waiter", f"codex:{phases.current_session}"]))
+        notice, = [notice for to, notice in sent if to != "codex:fps-waiter"]
+        self.assertIn("Restart the 3 stopped runs for phases: python3.13 unittest "
+                      + "(Run IDs phases-2, phases-3, phases-4).", notice)
+        self.assertNotIn("phases-0", notice)
+        self.assertNotIn("phases-1", notice)
+        with build_hold.release_lock() as held:
+            self.assertFalse(any(record.state == "pending" for record in build_hold.recorded_releases(held)))
+
+    def test_status_counts_the_unsent_stopped_runs_of_each_recipient(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        phases = fixture_member("worker", name="phases", parent=director.id)
+        self.leave_release_pending("builds", [(phases.name, f"codex:{phases.current_session}"), ("waiting", "one")])
+        runs = self.stopped_runs(phases, 4)
+        self.pending_runs(runs)
+        cycle = self.cycle()
+        cycle["entries"].append({**runs[0], "delivery": "Delivered"})
+        build_hold.save_cycle(cycle)
+        result = invoke_hold(["status"], dict(os.environ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line, = [line for line in result.stdout.splitlines() if line.startswith("release pending:")]
+        self.assertIn(" - unsent: phases (3 stopped runs), waiting; run /build:hold release to finish it", line)
+
     def test_closed_codex_result_stays_pending_until_the_worker_can_receive_it(self) -> None:
         parent = fixture_member("showrunner", name="runner")
         unit = fixture_member("unit", name="unit", parent=parent.id)
