@@ -25,7 +25,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
 from scripts.build_hold.test_override_guard import installed_script
-from scripts.mac_test import mac_queue_run, mac_test
+from scripts.mac_test import mac_queue_run, mac_test, mac_transport
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -108,7 +108,8 @@ def plain_ssh_builds(root: Path) -> list[str]:
 
 
 # The queue releases on process end, so these files set no signal handler (user rule, 2026-11-14).
-NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/cargo_gate/gate.zsh")
+NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/mac_transport.py",
+                    "mac_test/cargo_gate/gate.zsh")
 SIGNAL_HANDLER = re.compile(r"\bsignal\.(?:signal|SIG_IGN|SIG_DFL|pthread_sigmask|setitimer)\b|\bfrom signal import\b"
                             + r"|^\s*trap\b|\bTRAP[A-Z]+\b")
 
@@ -691,7 +692,7 @@ else:
                         + ("exec sleep 60" if closes else "exit 7"))
                 on_close = (f"kill -0 $(<{root}/work) 2>/dev/null && print alive > {root}/order"
                             + f" || print ended > {root}/order; kill -TERM $(<{root}/app)")
-                wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
+                wrapper = mac_transport.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
                 # Its own session stands in for the SSH session on the Mac.
                 with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True, start_new_session=True) as process:

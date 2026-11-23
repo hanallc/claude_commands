@@ -15,7 +15,7 @@ from urllib.parse import quote
 from scripts.build_targets import target_config
 from scripts.buildlog import repository, store
 from scripts.lib import conf
-from scripts.mac_test import cargo_manifest
+from scripts.mac_test import cargo_manifest, claim_state
 
 
 MAC_LINUX_TARGET = "mac-linux"
@@ -32,6 +32,7 @@ def step_kind(verb: str) -> str:
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
+    "history_key_unavailable",
     "linux_only",
     "backoff",
     "blocked",
@@ -94,10 +95,11 @@ DEFAULT_MAC_SETTINGS = DefaultMacSettings()
 
 @dataclass(frozen=True)
 class SshConnectionSettings:
-    """The connection settings hold the SSH host and connection and cleanup timeouts."""
+    """The connection settings hold the SSH host, the connection and cleanup timeouts and the unreachable wait."""
     host: str
     connect_timeout_s: float
     leftover_timeout_s: float
+    unreachable_wait_s: int
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,10 @@ class OffloadConfig:
         return self.connection.leftover_timeout_s
 
     @property
+    def unreachable_wait_s(self) -> int:
+        return self.connection.unreachable_wait_s
+
+    @property
     def fetch_limit_mib(self) -> float:
         return float(self.values["fetch_limit_mib"])
 
@@ -148,6 +154,7 @@ class SshProbeSettings:
     """Read only the settings needed by an SSH evidence probe."""
 
     configuration: conf.ConfigRead
+    unreachable_wait_s: int
 
     @property
     def host(self) -> str:
@@ -194,8 +201,24 @@ NO_BACKOFF = NoBackoff()
 ACTIVE_BACKOFF = ActiveBackoff()
 
 
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+
+
 def config_path() -> Path:
     return conf.path("mac_test")
+
+
+def unreachable_wait_seconds(registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
+    """Read how long a machine can stay silent before its run ends as unreachable."""
+    if isinstance(registry, conf.UseConfiguredValue):
+        registry = conf.read_or_repository("build_targets")
+    return registry.whole(UNREACHABLE_WAIT_KEY)
+
+
+def probe_settings(configuration: conf.ConfigRead,
+                   registry: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> SshProbeSettings:
+    """Build SSH probe settings from target settings and the build target registry."""
+    return SshProbeSettings(configuration, unreachable_wait_seconds(registry))
 
 
 def configured_ssh_target(target: str) -> target_config.SshTarget:
@@ -231,19 +254,22 @@ def state_directory(target: str = "mac") -> Path:
     return ssh_target_state_directory(target)
 
 
+def read_target_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> conf.ConfigRead:
+    """Read only the target settings file. A policy check uses this read; it needs no registry and no wait."""
+    return conf.read(config_path() if isinstance(path, DefaultMacSettings) else path.expanduser())
+
+
 def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    return connection_settings(conf.read(settings))
+    return connection_settings(read_target_settings(path))
 
 
 def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
     return SshConnectionSettings(config.text("host"), config.number("connect_timeout_s"),
-                                 config.number("leftover_timeout_s"))
+                                 config.number("leftover_timeout_s"), unreachable_wait_seconds())
 
 
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
-    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    config = conf.read(settings)
+    config = read_target_settings(path)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
@@ -255,7 +281,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
         free_floor_gib=config.number("free_floor_gib"),
         default_target_budget_gib=config.text("target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
         values=values,
-        source=settings,
+        source=config.source,
         settings=config,
     )
 
@@ -465,15 +491,23 @@ def recorded_step_kind(step: str) -> str:
 
 def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
-                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF,
+                         mac_repository: claim_state.MacMirrorIdentity | claim_state.WholeMacScope
+                         | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
+                         ) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
     if not enabled:
         return IneligibleMacStep("off")
-    repository = repository_identity(repo_root)
-    if isinstance(repository, UnknownRepository):
-        return IneligibleMacStep("repo")
     platform = configured_ssh_target(target).platform if target else "macos"
+    if platform == "macos":
+        if isinstance(mac_repository, claim_state.ResolveMacRepository):
+            mac_repository = claim_state.mac_repository_identity(str(repo_root))
+        if isinstance(mac_repository, claim_state.WholeMacScope):
+            return IneligibleMacStep("repo")
+        repository = KnownRepository(mac_repository.mirror_name, mac_repository.key)
+    else:
+        repository = repository_identity(repo_root)
     policy = configured_step_policy(config, platform, repository, repo_root, package, kind or verb_kind(verb))
     if isinstance(policy, IneligibleMacStep):
         return policy

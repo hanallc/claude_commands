@@ -50,7 +50,7 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
-from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, commit_config_fixture, config_environment, write_config_fixture, write_pressure_reading
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(records.EstimateExpired(1), 1, "head", "estimate expired")
@@ -207,6 +207,42 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(client.placement_status("unseen", "unseen"),
                     status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("unseen", "unseen")))
             self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+
+    def test_launch_permission_cli_reads_available_consumed_not_started_and_unknown(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            consumed = placement.PermissionConsumed(1.0)
+            settled, pending = placement.DispatchPathSettled(), placement.DispatchPathPending("cleanup remains")
+            refused = placement.PrelaunchRefused("runner")
+            cases: tuple[tuple[placement.LaunchPermission, placement.TerminalAttemptReport | placement.NoTerminalReport, str, int], ...] = (
+                (placement.PermissionAvailable(), placement.NoTerminalReport(), "available", 0),
+                (consumed, placement.NoTerminalReport(), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(refused, pending, 2.0), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(placement.AttemptDeclined("lost"), settled, 2.0), "consumed", 0),
+                (consumed, placement.TerminalAttemptReport(refused, settled, 2.0), "not_started", 0),
+                (consumed, placement.TerminalAttemptReport(execution_identity.HanaCommandAdmissionRefused("hana"),
+                    settled, 2.0), "not_started", 0))
+            for permission, report, word, code in cases:
+                with self.subTest(permission=permission, report=report), fixture.loop_turn():
+                    fixture.server.assignments[key] = records.SavedPlacementAssignment(assignment,
+                        placement.CurrentAssignment(), permission=permission, provider=claim, terminal_report=report)
+                with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(["placement-status", "--launch-only", "--episode", assignment.episode,
+                        "--attempt", assignment.attempt]), code)
+                self.assertEqual(output.getvalue(), word + "\n")
+            with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(client.main(["placement-status", "--launch-only", "--episode", assignment.episode,
+                    "--attempt", "unseen"]), 1)
+            self.assertEqual(output.getvalue(), "unknown\n")
 
     def test_placement_status_cli_returns_two_when_the_service_is_unreachable(self) -> None:
         with AdmissionFixture() as fixture, mock.patch.dict(os.environ,
@@ -688,7 +724,7 @@ class ClientTests(unittest.TestCase):
                         f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                     _ = (fixture.root / "build_targets.conf").write_text(
                         "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.natedev=local\nplatform.natedev=linux\n")
+                        + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
                 occupied = fixture.occupy_host()
                 fixture.free(0)
                 request = fixture.request()
@@ -900,7 +936,7 @@ class ClientTests(unittest.TestCase):
                     f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                    + "kind.natedev=local\nplatform.natedev=linux\n")
+                    + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
                 request = fixture.request(step="check")
                 finish_probe = threading.Event()
                 _ = fixture.callback(finish_probe.set)
@@ -973,7 +1009,7 @@ class ClientTests(unittest.TestCase):
                 f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                + "kind.natedev=local\nplatform.natedev=linux\n")
+                + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                 key, fixture.clock.now(), "provider evidence is not ready")
@@ -1011,7 +1047,7 @@ class ClientTests(unittest.TestCase):
                 f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                + "kind.natedev=local\nplatform.natedev=linux\n")
+                + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
             request = fixture.request(step="check")
             fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                 key, fixture.clock.now(), "the test has not published provider evidence")
@@ -1042,7 +1078,7 @@ class ClientTests(unittest.TestCase):
                 _ = write_config_fixture(fixture.root / "mac_test.conf",
                     f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 request = fixture.request(step="check")
                 fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
                     key, fixture.clock.now(), "the test has not published provider evidence")
@@ -1076,8 +1112,10 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
     def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
+        # A terminal family gives no name, so the worktree folder names the caller.
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
-                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}):
+                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}), \
+                mock.patch.object(records, "family_owner_name", return_value=""):
             identity = client.step_identity("nextest", "/work/queue-fixture")
         self.assertEqual(identity.name, "terminal · queue-fixture")
 
@@ -1100,7 +1138,7 @@ class ClientTests(unittest.TestCase):
                 with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
                     **environment, "CLAUDE_CODE_SESSION_ID": session,
                     "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
-                }):
+                }), mock.patch.object(records, "family_owner_name", return_value=""):
                     identity = client.step_identity("nextest", "")
                     self.assertEqual((identity.name, identity.unit), (name, owner_unit))
                     self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
@@ -1587,6 +1625,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
                     self.assertEqual(errors.getvalue().count(
                         "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("queue reached again", errors.getvalue())
                     self.assertNotIn("step refused", errors.getvalue())
                     self.doCleanups()
 
@@ -2698,14 +2737,17 @@ class ClientTests(unittest.TestCase):
     def test_closed_connection_reconnects_immediately_with_same_episode_and_since(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
+            gpu_wait = reply_bytes(wait_reply(records.GpuSlotWait(1, 1), 1, "head", "GPU test slot"))
             transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), b""),
-                Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
+                Exchange(gpu_wait, gpu_wait, b""), Exchange(reply_bytes(WAIT) + reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()) as output:
                 result = client.admit(request, lambda _wait: None, lambda: request)
             self.assertEqual(result, GRANTED)
             self.assertEqual(transport.requests, [request] * 3)
             self.assertEqual(transport.attempts, [0, 0, 0])
             self.assertEqual(output.getvalue().count("admission service restarted; waiting again"), 1)
+            self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("queue reached again")],
+                ["queue reached again: GPU test slot", "queue reached again: free memory"])
 
     def test_silent_service_reports_after_120_seconds_and_keeps_waiting(self) -> None:
         with AdmissionFixture() as fixture:

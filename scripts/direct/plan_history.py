@@ -145,6 +145,7 @@ def _read_run_history(path: Path) -> CompleteRunHistory | IncompleteRunHistory:
         ):
             complete = False
         events.append(fields)
+    events = pass_recorder.without_voided_checkpoints(events)
     if complete and events and events[0].get("event_type") == "run_started":
         return CompleteRunHistory(events)
     return IncompleteRunHistory(events)

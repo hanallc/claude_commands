@@ -157,7 +157,7 @@ buildlog_begin() {
     buildlog_read_context ${1+"$@"}
     buildlog_now
     BUILDLOG_START="${BUILDLOG_NOW:-}"
-    if [[ "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
+    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" \
           && -r /proc/self/cgroup ]] && command -v systemd-run >/dev/null 2>&1; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
     fi
@@ -194,13 +194,21 @@ buildlog_exec() {
         return
     fi
     local status=0
-    systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- \
+    systemd-run --user --scope --quiet --collect --expand-environment=no \
+        --slice="${DETACHED_RUN_SLICE:-builds.slice}" -- \
         /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@" 3>&2 2>/dev/null
     status=$?
     if [[ -e "$BUILDLOG_PEAK" ]]; then
         return $status
     fi
     "$@"
+}
+
+close_verify_exit_stderr() {
+    if [[ ${VERIFY_EXIT_STDERR_FD:-} =~ ^[1-9][0-9]+$ ]]; then
+        eval "exec $VERIFY_EXIT_STDERR_FD>&-"
+    fi
+    unset VERIFY_EXIT_STDERR_FD
 }
 
 buildlog_write_step() {
@@ -223,8 +231,11 @@ buildlog_end() {
     if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
         buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"}
     else
-        ( trap '' HUP
-          buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} & )
+        (
+            trap '' HUP
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_write_step "$status" "$BUILDLOG_START" "${BUILDLOG_NOW:-}" "$tty" "$held" "${BUILDLOG_PEAK:-}" ${1+"$@"} &
+        )
     fi
     BUILDLOG_START="" BUILDLOG_TREE="" BUILDLOG_TEST_PHASE_FILE=""
     return 0
@@ -592,6 +603,7 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         local fd
         local -a copy_lease_fds=()
         IFS=, read -r -a copy_lease_fds <<< "${COPIES_COMMAND_LEASE_FDS:-},${COPIES_MIRROR_LEASE_FDS:-}"
@@ -617,7 +629,10 @@ sweep_after_step() {
 # Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
     local error
-    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+    if ! error=$(
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo nextest --version 2>&1 >/dev/null
+    ); then
         echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
@@ -794,13 +809,19 @@ fmt_cargo() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
-            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+            (
+                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+                cargo +nightly fmt --version
+            ) > "$version_file" 2>/dev/null || : > "$version_file"
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
             exit 2
         fi
-    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    elif ! (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        cargo +nightly fmt --version
+    ) >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi

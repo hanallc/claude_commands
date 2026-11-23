@@ -125,6 +125,17 @@ class JobTests(unittest.TestCase):
         self.assertLessEqual(calls[0], after)
         self.assertEqual(output.getvalue(), "fixture sitting reminder\nfixture safety reminder\n")
 
+    def test_notes_part_prints_a_role_activity_error_and_still_succeeds(self) -> None:
+        from scripts.accounts import role_activity
+        from scripts.whoami import agent_notes
+
+        with (patch.object(agent_notes, "update", return_value=["fixture note"]),
+              patch.object(role_activity, "sample_now", side_effect=OSError("disk\nfull")) as sample,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(job._perform(Part.NOTES), 0)  # pyright: ignore[reportPrivateUsage]
+        sample.assert_called_once_with(ANY)
+        self.assertEqual(output.getvalue(), "fixture note\nrole activity: disk full\n")
+
     def test_logins_part_uses_its_configured_interval_and_deadline_in_the_job(self) -> None:
         original = self.config.read_text()
         self.assertEqual(settings().parts[Part.LOGINS], Schedule(120, 45))
