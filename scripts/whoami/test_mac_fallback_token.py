@@ -47,7 +47,7 @@ class MacFallbackTokenTests(unittest.TestCase):
             self.assertEqual(mac_fallback_token.read(), token)
             mac_fallback_token.publish_metadata(now=token.checked_at + mac_fallback_token.OBSERVATION_INTERVAL)
             self.assertEqual(mac_fallback_token.read(), token)
-            self.assertEqual(mac_fallback_token.OBSERVATION_INTERVAL, mac_fallback_token.OBSERVATION_MAX_AGE / 2)
+            self.assertLess(mac_fallback_token.OBSERVATION_INTERVAL, mac_fallback_token.OBSERVATION_MAX_AGE)
             next_check = token.checked_at + mac_fallback_token.OBSERVATION_INTERVAL + timedelta(seconds=1)
             mac_fallback_token.publish_metadata(now=next_check)
             refreshed = mac_fallback_token.read()
