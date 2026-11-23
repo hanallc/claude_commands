@@ -1641,7 +1641,7 @@ A showrunner or unit registers each image, or a before and after pair, with one 
 ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
 ```
 
-- The caption says what changed and what to look at.
+- The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
@@ -1663,13 +1663,16 @@ Each card shows, in this order:
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
+5. The answer buttons: **Approved** and **Send Feedback**.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
 It fits the view with a 16px margin and never exceeds the image's natural size.
 Escape or a click on the backdrop or image closes it.
-The page keeps its scroll position and returns focus to the image link.
+In a pair zoom, a badge above the image says Before or After.
+The left arrow key shows the before image and the right arrow key shows the after image.
+A single image has no badge and ignores the arrow keys. An arrow key with a modifier keeps the browser action.
+The page keeps its scroll position and returns focus to the image link that opened the zoom.
 Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
 Middle clicks and the right-click menu retain the browser's link action.
 `page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.
@@ -1701,7 +1704,9 @@ An older script does not bind the new card forms, so a form would post outside t
 
 Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.
 The server checks the token.
-**Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
+**Approved** needs no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
+Feedback always means that the image is not approved, so the page has no separate **Not Approved** button.
+A card loaded before that change can still post `not approved`; the server refuses it with **Not Approved was removed. Use Send Feedback.**
 Otherwise the card leaves the page at once, and the request runs in the background.
 The page skips its refresh while a send runs.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
@@ -1710,7 +1715,7 @@ A failed or uncertain delivery returns the card with a delivery notice.
 When the owner answers the last open question, the card returns and the console shows a new update.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
+The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
 A `Feedback:` line follows when the user wrote text.
 Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.

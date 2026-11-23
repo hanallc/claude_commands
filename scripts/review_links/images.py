@@ -31,8 +31,8 @@ PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 LOCK = image_store.LOCK
 SENDER = Path(__file__).stem
 # Each answer button and the first line of the message that it sends to the owner.
-ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
-           "feedback": "feedback on your image."}
+# Feedback always means the image is not approved.
+ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not approved. The feedback follows."}
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
@@ -135,7 +135,7 @@ def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
              *, before: Path | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
-        raise ValueError("the caption is empty; say what changed and what to look at")
+        raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
@@ -169,10 +169,11 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 
 
 def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
-    """Link one image to the shared zoom; show its pair label above it."""
+    """Link one image to the shared zoom; show its pair label above it and in the zoom."""
     path = html.escape(image_path(record, file), quote=True)
     alt = record["caption"].splitlines()[0]
-    linked = (f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" '
+    zoom_label = f' data-image-zoom-label="{html.escape(label, quote=True)}"' if label else ''
+    linked = (f'<a data-image-zoom{zoom_label} href="{path}" target="_blank" rel="noopener"><img src="{path}" '
               + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
@@ -200,7 +201,6 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
     closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
-                       '<button type="submit" name="action" value="not approved">Not Approved</button>'
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
     returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
@@ -210,7 +210,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
-            + (f'<div class="image-pair">{pictures}</div>' if pair else pictures)
+            + (f'<div class="image-pair" data-image-zoom-group>{pictures}</div>' if pair else pictures)
             + ''.join(question_html(question, open_questions) for question in questions)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
@@ -271,6 +271,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise question_record.AnswerRefused("the image token does not match this page")
     action = fields.get("action", ["delete"])[0]
+    if action == "not approved":
+        # A card loaded before I21 can still show the removed button.
+        raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
@@ -586,7 +589,7 @@ def main(arguments: list[str]) -> int:
     _ = add.add_argument("--image", type=Path, help="the image file to copy")
     _ = add.add_argument("--before", type=Path, help="the before image of a pair; give --after with it")
     _ = add.add_argument("--after", type=Path, help="the after image of a pair; give --before with it")
-    _ = add.add_argument("--caption", required=True, help="what changed and what to look at")
+    _ = add.add_argument("--caption", required=True, help="the change in the fewest plain words that stay accurate")
     _ = add.add_argument("--owner", required=True, help="the staff id that owns the image")
     subject = add.add_mutually_exclusive_group(required=True)
     _ = subject.add_argument("--change", help="the change id, such as sdlc/C12")

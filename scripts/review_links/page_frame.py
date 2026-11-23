@@ -570,34 +570,54 @@ document.addEventListener('click',async event=>{
 });
 })();'''
 
-# A plain click on a data-image-zoom link shows its image over the page; Escape returns.
+# A plain click on a data-image-zoom link shows its image over the page; Escape returns focus to that link.
 # A click with a modifier key, or any other button, keeps the browser's link action.
+# In a data-image-zoom-group, the left and right arrow keys show the previous and next image,
+# and a badge names the shown image (Before or After for a pair).
+# The zoom keeps hrefs, not link nodes, so a page refresh while it is open changes nothing.
 ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
 [data-image-zoom]{cursor:zoom-in}
 [data-image-zoom-dialog]{position:fixed;inset:0;box-sizing:border-box;width:100vw;height:100dvh;
 max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;outline:none;overflow:hidden}
-[data-image-zoom-dialog][open]{display:grid;place-items:center}
+[data-image-zoom-dialog][open]{display:grid;place-items:center;align-content:center;gap:8px}
+[data-image-zoom-dialog] [data-image-zoom-badge]{padding:4px 12px;border-radius:8px;background:#000c;color:#fff;
+font:600 14px/20px system-ui,sans-serif}
+[data-image-zoom-dialog]:has([data-image-zoom-badge]:not([hidden])) img{max-height:calc(100dvh - 68px)}
 [data-image-zoom-dialog]::backdrop{background:transparent}
 [data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100dvh - 32px);
 border:0;border-radius:0;cursor:zoom-out}
 '''
 
 ZOOM_SCRIPT = r'''(() => {
-const dialog=document.createElement('dialog'), image=document.createElement('img');
+const dialog=document.createElement('dialog'), image=document.createElement('img'), badge=document.createElement('div');
 dialog.dataset.imageZoomDialog='';dialog.setAttribute('role','dialog');
 dialog.setAttribute('aria-modal','true');dialog.tabIndex=-1;
-dialog.append(image);document.body.append(dialog);
-let source=null, position=[0,0];
+badge.dataset.imageZoomBadge='';badge.setAttribute('aria-live','polite');badge.hidden=true;
+dialog.append(badge,image);document.body.append(dialog);
+let opener='', shown='', position=[0,0];
+const live=href=>[...document.querySelectorAll('a[data-image-zoom]')].find(link=>link.getAttribute('href')===href);
+function show(link){
+ const thumbnail=link.querySelector('img');
+ shown=link.getAttribute('href');image.alt=thumbnail.alt;image.src=link.href;
+ badge.textContent=link.dataset.imageZoomLabel || '';badge.hidden=!badge.textContent;
+ dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
+}
 function close(){
  if(!dialog.open) return;
  dialog.close();image.removeAttribute('src');
- if(source?.isConnected) source.focus({preventScroll:true});
- window.scrollTo(...position);source=null;
+ live(opener)?.focus({preventScroll:true});
+ window.scrollTo(...position);opener=shown='';
 }
 dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
 dialog.addEventListener('keydown',event=>{
- if(event.key==='Escape'){event.preventDefault();close();}
+ if(event.key==='Escape'){event.preventDefault();close();return;}
+ const step={ArrowLeft:-1,ArrowRight:1}[event.key];
+ if(!step || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+ const current=live(shown), group=current?.closest('[data-image-zoom-group]');
+ const links=group ? [...group.querySelectorAll('a[data-image-zoom]')].filter(item=>item.querySelector('img')) : [];
+ const next=links[links.indexOf(current)+step];
+ if(next){event.preventDefault();show(next);}
 });
 document.addEventListener('click',event=>{
  if(dialog.open && (event.target===dialog || event.target===image)){close();return;}
@@ -605,9 +625,8 @@ document.addEventListener('click',event=>{
  const link=event.target instanceof Element ? event.target.closest('a[data-image-zoom]') : null;
  const thumbnail=link?.querySelector('img');
  if(!thumbnail) return;
- event.preventDefault();source=link;position=[window.scrollX,window.scrollY];
- image.alt=thumbnail.alt;image.src=link.href;
- dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
+ event.preventDefault();position=[window.scrollX,window.scrollY];
+ opener=link.getAttribute('href');show(link);
  dialog.showModal();dialog.focus({preventScroll:true});
 });
 })();'''
