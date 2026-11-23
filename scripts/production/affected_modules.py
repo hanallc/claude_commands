@@ -73,7 +73,7 @@ def git_output(repo: Path, *arguments: str) -> str:
 
 # Bump the extractor version whenever source-fact semantics change.
 CACHE_FORMAT_VERSION = 3
-EXTRACTOR_VERSION = 12
+EXTRACTOR_VERSION = 14
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_.\-/]+")
 
 
@@ -155,6 +155,7 @@ class ScanScope:
     bindings: tuple[tuple[str, ScanPath | UnrootedPath], ...]
     scans: tuple[ScanPattern, ...]
     calls: tuple[ScanCall, ...]
+    defaults: tuple[tuple[str, ScanPath | UnrootedPath], ...] = ()
 
 
 @dataclass(frozen=True, order=True)
@@ -185,15 +186,6 @@ class SourceGraph:
 
 def path_tokens(text: str) -> frozenset[str]:
     return frozenset(match.group().removeprefix("./") for match in PATH_TOKEN.finditer(text))
-
-
-def scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
-    """Visit one lexical scope without entering a nested scope."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-        return
-    yield node
-    for child in ast.iter_child_nodes(node):
-        yield from scope_nodes(child)
 
 
 def scan_path(node: ast.AST, bindings: dict[str, ScanPath | UnrootedPath],
@@ -282,18 +274,25 @@ def literal_strings(node: ast.expr) -> tuple[str, ...] | None:
     return strings if len(strings) == len(node.elts) else None
 
 
-def scope_parts(node: ast.AST) -> Iterator[ast.AST]:
-    """Visit one scope, and the parts of a nested scope that run in it, such as decorators and defaults."""
-    yield node
-    body: list[ast.AST] = []
+def scope_children(node: ast.AST) -> Iterator[ast.AST]:
+    """Give the children of a node that run in its scope.
+
+    The body of a nested scope runs later, in its own scope. Its decorators and defaults run now.
+    """
     if isinstance(node, ast.Lambda):
-        body = [node.body]
+        skipped = {id(node.body)}
     elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        body = list(node.body)
-    skipped = {id(statement) for statement in body}
-    for child in ast.iter_child_nodes(node):
-        if id(child) not in skipped:
-            yield from scope_parts(child)
+        skipped = {id(statement) for statement in node.body}
+    else:
+        return ast.iter_child_nodes(node)
+    return (child for child in ast.iter_child_nodes(node) if id(child) not in skipped)
+
+
+def scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """Visit the nodes of one scope, and the parts of a nested scope that run in it."""
+    yield node
+    for child in scope_children(node):
+        yield from scope_nodes(child)
 
 
 def scope_constants(definition: Definition, declared: frozenset[str]) -> dict[str, tuple[str, ...]]:
@@ -301,11 +300,14 @@ def scope_constants(definition: Definition, declared: frozenset[str]) -> dict[st
 
     A tuple cannot change. A nested scope can bind the name only through a name in `declared`,
     which holds every global or nonlocal declaration in the module.
+    A class body reads a module name until the class binds it, so a class scope has no constants.
     """
+    if isinstance(definition, ast.ClassDef):
+        return {}
     counts: Counter[str] = Counter()
     constants: dict[str, tuple[str, ...]] = {}
     for statement in definition.body:
-        for node in scope_parts(statement):
+        for node in scope_nodes(statement):
             counts.update(bound_names(node))
             if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                     and isinstance(node.value, ast.Tuple) and (strings := literal_strings(node.value)) is not None):
@@ -319,7 +321,7 @@ COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
 NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 STAT_TESTS = frozenset({"is_file", "is_dir", "is_symlink", "exists"})
 OPPOSITES: dict[type[ast.cmpop], type[ast.cmpop]] = {
-    ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In, ast.Is: ast.IsNot, ast.IsNot: ast.Is}
+    ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In}
 
 
 def name_clause(clause: ast.expr, variable: str, constants: dict[str, tuple[str, ...]]) -> NameFilter | None:
@@ -435,16 +437,14 @@ def closure_reads(node: ast.AST, name: str) -> bool:
 
 
 class ScopeLoops:
-    """Find the literal loop values around each call, and the name filter of each consumed glob call, in one scope."""
+    """Visit one scope with the literal loop values around each node, and the name filter of each consumed glob call."""
 
     def __init__(self, definition: Definition, declared: frozenset[str]) -> None:
         self.definition: Definition = definition
         self.declared: frozenset[str] = declared
         self.known_constants: dict[str, tuple[str, ...]] | None = None
         self.known_loads: Counter[str] | None = None
-        self.values: dict[int, LoopValues] = {}
         self.filters: dict[int, NameFilter] = {}
-        self.visited: set[int] = set()
 
     def constants(self) -> dict[str, tuple[str, ...]]:
         if self.known_constants is None:
@@ -461,7 +461,8 @@ class ScopeLoops:
         """Record the name filter that a loop or a comprehension applies to the paths of its glob call."""
         if isinstance(node, (ast.For, ast.AsyncFor)):
             target = node.target
-            if not isinstance(target, ast.Name) or (scan := consumed_scan(node.iter)) is None or node.orelse:
+            if (not isinstance(target, ast.Name) or target.id in self.declared
+                    or (scan := consumed_scan(node.iter)) is None or node.orelse):
                 return
             # After the loop, the loop name holds the last path, which the filter can reject.
             inside = sum(isinstance(child, ast.Name) and child.id == target.id and isinstance(child.ctx, ast.Load)
@@ -470,21 +471,9 @@ class ScopeLoops:
                 self.filters[id(scan)] = name_filter(loop_conditions(node.body), target.id, self.constants())
             return
         for generator in node.generators:
-            if (isinstance(generator.target, ast.Name) and (scan := consumed_scan(generator.iter)) is not None
-                    and not closure_reads(node, generator.target.id)):
+            if (isinstance(generator.target, ast.Name) and generator.target.id not in self.declared
+                    and (scan := consumed_scan(generator.iter)) is not None and not closure_reads(node, generator.target.id)):
                 self.filters[id(scan)] = name_filter(generator.ifs, generator.target.id, self.constants())
-
-    def literal(self, iterable: ast.expr, literal_names: set[str]) -> bool:
-        """Tell whether a loop iterable can be literal strings, from the assignments seen so far."""
-        return literal_strings(iterable) is not None or isinstance(iterable, ast.Name) and iterable.id in literal_names
-
-    def enter(self, node: ast.For | ast.AsyncFor | ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
-              literal_names: set[str]) -> None:
-        """Record the name filter of a loop, and visit a loop over literal strings once."""
-        iterables = [node.iter] if isinstance(node, (ast.For, ast.AsyncFor)) else [item.iter for item in node.generators]
-        if id(node) not in self.visited and any(self.literal(iterable, literal_names) for iterable in iterables):
-            self.visit(node, {})
-        self.filter(node)
 
     def inner(self, target: ast.expr, iterable: ast.expr, bound: LoopValues, body: list[ast.stmt]) -> LoopValues:
         """Bind the loop name, unless the loop body binds it again or a global or nonlocal statement names it."""
@@ -498,31 +487,37 @@ class ScopeLoops:
             result[target.id] = values
         return result
 
-    def visit(self, node: ast.AST, bound: LoopValues) -> None:
-        if isinstance(node, NESTED_SCOPES):
-            return
-        if isinstance(node, ast.Call) and bound:
-            self.values[id(node)] = bound
+    def nodes(self, node: ast.AST, bound: LoopValues, hidden: bool = False) -> Iterator[tuple[ast.AST, LoopValues, bool]]:
+        """Visit the nodes of the scope in order. Record the filter of a loop before its glob call.
+
+        The flag is true for a node that cannot read the class body names, such as a later part of a comprehension.
+        """
+        yield node, bound, hidden
         if isinstance(node, (ast.For, ast.AsyncFor)):
-            self.visited.add(id(node))
+            self.filter(node)
             body = self.inner(node.target, node.iter, bound, node.body)
+            for child in (node.target, node.iter):
+                yield from self.nodes(child, bound, hidden)
             for child in node.body:
-                self.visit(child, body)
-            for child in (node.target, node.iter, *node.orelse):
-                self.visit(child, bound)
+                yield from self.nodes(child, body, hidden)
+            for child in node.orelse:
+                yield from self.nodes(child, bound, hidden)
         elif isinstance(node, COMPREHENSIONS):
-            self.visited.add(id(node))
+            self.filter(node)
             current = bound
-            for generator in node.generators:
-                self.visit(generator.iter, current)
+            for index, generator in enumerate(node.generators):
+                yield from self.nodes(generator.iter, current, hidden)
+                if index == 0 and isinstance(self.definition, ast.ClassDef) and not hidden:
+                    # Only the first iterable runs in the class body. The other parts read module names.
+                    current, hidden = {}, True
                 current = self.inner(generator.target, generator.iter, current, [])
                 for condition in generator.ifs:
-                    self.visit(condition, current)
+                    yield from self.nodes(condition, current, hidden)
             for part in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
-                self.visit(part, current)
+                yield from self.nodes(part, current, hidden)
         else:
-            for child in ast.iter_child_nodes(node):
-                self.visit(child, bound)
+            for child in scope_children(node):
+                yield from self.nodes(child, bound, hidden)
 
 
 class LoopValue(ast.NodeTransformer):
@@ -615,18 +610,29 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
         bindings = dict(inherited)
         aliases = dict(imported)
         parameters: tuple[str, ...] = ()
+        defaults: list[tuple[str, ScanPath | UnrootedPath]] = []
         if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parameters = tuple(argument.arg for argument in (*definition.args.posonlyargs, *definition.args.args,
-                                                             *definition.args.kwonlyargs))
+            arguments = definition.args
+            positional = (*arguments.posonlyargs, *arguments.args)
+            parameters = tuple(argument.arg for argument in (*positional, *arguments.kwonlyargs))
             if parameters and parameters[0] in {"self", "cls"}:
                 parameters = parameters[1:]
+            for argument, default in (*zip(positional[len(positional) - len(arguments.defaults):], arguments.defaults),
+                                      *zip(arguments.kwonlyargs, arguments.kw_defaults)):
+                # A call without the argument cannot scan a None default.
+                if default is None or isinstance(default, ast.Constant) and default.value is None:
+                    continue
+                value = scan_path(default, inherited, imported)
+                # A default that names a parameter of an outer function has no known root in a call.
+                if isinstance(value, ScanPath) and isinstance(value.root, ParameterRoot):
+                    value = UnrootedPath()
+                defaults.append((argument.arg, value))
             bindings.update((parameter, ScanPath(ParameterRoot(parameter))) for parameter in parameters)
         scans: list[ScanPattern] = []
         calls: list[ScanCall] = []
         loops = ScopeLoops(definition, shared)
-        literal_names: set[str] = set()
         for statement in definition.body:
-            for node in scope_nodes(statement):
+            for node, bound, hidden in loops.nodes(statement, {}):
                 if isinstance(node, ast.Import):
                     aliases.update((alias.asname or alias.name, alias.name) for alias in node.names)
                 elif isinstance(node, ast.ImportFrom):
@@ -638,21 +644,16 @@ def source_scan_scopes(tree: ast.Module) -> tuple[ScanScope, ...]:
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     bindings.update((ast.unparse(target), value) for target in targets
                                     if isinstance(target, (ast.Name, ast.Attribute)))
-                    if isinstance(node.value, ast.Tuple) and literal_strings(node.value) is not None:
-                        literal_names.update(target.id for target in targets if isinstance(target, ast.Name))
-                elif isinstance(node, (ast.For, ast.AsyncFor, *COMPREHENSIONS)):
-                    loops.enter(node, literal_names)
                 elif isinstance(node, ast.Call):
-                    bound = loops.values.get(id(node))
                     for variant in loop_variants(node, bound) if bound else [node]:
-                        call, scan = call_facts(variant, name, parent, definitions, bindings, aliases,
-                                                loops.filters.get(id(node), NameFilter()))
+                        call, scan = call_facts(variant, name, parent, definitions, inherited if hidden else bindings,
+                                                aliases, loops.filters.get(id(node), NameFilter()))
                         if call is not None:
                             calls.append(call)
                         if scan is not None:
                             scans.append(scan)
         environments[name] = bindings, aliases
-        scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls)))
+        scopes.append(ScanScope(name, parameters, tuple(bindings.items()), tuple(scans), tuple(calls), tuple(defaults)))
     return tuple(scopes)
 
 
@@ -776,7 +777,7 @@ def decoded_scan_path(value: object) -> ScanPath | UnrootedPath:
 
 def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
     result: list[ScanScope] = []
-    for name, parameters, bindings, scans, calls in scan_rows(value, 5):
+    for name, parameters, bindings, scans, calls, defaults in scan_rows(value, 6):
         if not isinstance(name, str):
             raise ValueError("invalid scan scope name")
         paths: list[tuple[str, ScanPath | UnrootedPath]] = []
@@ -785,6 +786,11 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
             if not isinstance(key, str):
                 raise ValueError("invalid scan binding")
             paths.append((key, directory))
+        given: list[tuple[str, ScanPath | UnrootedPath]] = []
+        for key, path in scan_rows(defaults, 2):
+            if not isinstance(key, str):
+                raise ValueError("invalid scan default")
+            given.append((key, decoded_scan_path(path)))
         patterns: list[ScanPattern] = []
         for path, pattern, recursive, excludes, keeps in scan_rows(scans, 5):
             directory = decoded_scan_path(path)
@@ -801,7 +807,8 @@ def decoded_scan_scopes(value: object) -> tuple[ScanScope, ...]:
                     raise ValueError("invalid scan keyword")
                 named.append((key, decoded_scan_path(path)))
             invocations.append(ScanCall(target, tuple(decoded_scan_path(path) for path in cast(list[object], arguments)), tuple(named)))
-        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations)))
+        result.append(ScanScope(name, scan_strings(parameters), tuple(paths), tuple(patterns), tuple(invocations),
+                                tuple(given)))
     return tuple(result)
 
 
@@ -811,7 +818,8 @@ def encoded_scan_scopes(scopes: tuple[ScanScope, ...]) -> list[object]:
              [[encoded_scan_path(scan.directory), scan.pattern, scan.recursive, scan.names.excludes, scan.names.keeps]
               for scan in scope.scans],
              [[call.target, [encoded_scan_path(path) for path in call.arguments],
-               [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls]] for scope in scopes]
+               [[name, encoded_scan_path(path)] for name, path in call.keywords]] for call in scope.calls],
+             [[name, encoded_scan_path(path)] for name, path in scope.defaults]] for scope in scopes]
 
 
 def decoded_facts(value: object) -> SourceFacts:
@@ -994,6 +1002,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         if key in seen:
             return set()
         seen = seen | {key}
+        # A parameter that the call does not give takes its default.
+        parameters = {**{name: directory(source, value, {}, frozenset()) for name, value in scope.defaults}, **parameters}
         result: set[RepositoryScan] = set()
         for scan in scope.scans:
             root = directory(source, scan.directory, parameters, frozenset())

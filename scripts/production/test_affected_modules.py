@@ -1008,11 +1008,18 @@ class RepositoryScanInferenceTests(unittest.TestCase):
                    + "                 and (path.suffix != '.py' or not path.name.startswith('test_') or path.name in helpers))\n")
         pages = ("def pages():\n    for path in (ROOT / 'docs').glob('*'):\n"
                  + "        if not path.is_file() or path.name.startswith('draft_'):\n            continue\n        yield path.read_text()\n")
+        suffix = pages.replace("not path.is_file() or path.name.startswith('draft_')", "path.suffix == '.txt'")
+        named = pages.replace("not path.is_file() or path.name.startswith('draft_')", "path.name not in ('a.md',)")
+        whole_body = ("def pages():\n    for path in (ROOT / 'docs').glob('*'):\n"
+                      + "        if not path.name.startswith('draft_'):\n            print(path.read_text())\n")
         cases = (
             (runtime, "scripts/x/test_x.py", False), (runtime, "scripts/a.py", True),
             (runtime, "scripts/x/test_support.py", True), (runtime, "scripts/x/test_notes.txt", True),
             (runtime, "config/gate.conf", True),
             (pages, "docs/draft_a.md", False), (pages, "docs/a.md", True),
+            (suffix, "docs/a.txt", False), (suffix, "docs/a.md", True),
+            (named, "docs/b.md", False), (named, "docs/a.md", True),
+            (whole_body, "docs/draft_a.md", False), (whole_body, "docs/a.md", True),
             (runtime.replace("('test_support.py',)", "{'test_support.py'}"), "scripts/x/test_x.py", True),
             (pages.replace("        yield path.read_text()\n", "        yield path.read_text()\n    else:\n        pass\n"),
              "docs/draft_a.md", True),
@@ -1026,9 +1033,43 @@ class RepositoryScanInferenceTests(unittest.TestCase):
             with self.subTest(body=body, changed=changed):
                 self.assertEqual(self.selects(body, changed), selected)
 
-    def test_each_review_snippet_reads_its_changed_path(self) -> None:
-        # A name filter counts the same as a glob pattern, so the two sibling snippets of finding 1 are not here.
+    def test_a_missing_argument_takes_the_parameter_default(self) -> None:
         cases = (
+            ("def scan(root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "docs/a.md", True),
+            ("def scan(root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "notes/a.md", False),
+            ("def scan(*, root=ROOT / 'docs'):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "docs/a.md", True),
+            ("def scan(root=Path.cwd()):\n    return list(root.glob('*.md'))\ndef test():\n    return scan()\n",
+             "notes/a.md", True),
+            ("def scan(root=None):\n    return list(root.glob('*.md'))\ndef test():\n    return scan(ROOT / 'docs')\n",
+             "notes/a.md", False),
+            ("def scan(root=None):\n    return list(root.glob('*.md'))\ndef test():\n    return scan(ROOT / 'docs')\n",
+             "docs/a.md", True),
+        )
+        for body, changed, selected in cases:
+            with self.subTest(body=body, changed=changed):
+                self.assertEqual(self.selects(body, changed), selected)
+
+    def test_unproven_reads_keep_their_scan(self) -> None:
+        cases = (
+            ("f = 'notes'\nclass Folders:\n    for f in ('docs',):\n"
+             + "        FILES = [q for x in ('a',) for q in (ROOT / f).glob('*')]\n", "notes/a.md"),
+            ("f = 'notes'\nclass Folders:\n    for f in ('docs',):\n"
+             + "        FILES = [list((ROOT / f).glob('*')) for x in ('a',)]\n", "notes/a.md"),
+            ("FOLDER = ROOT / 'notes'\nclass Folders:\n    FOLDER = ROOT / 'docs'\n"
+             + "    FILES = [q for x in ('a',) for q in FOLDER.glob('*')]\n", "notes/a.md"),
+            ("def collect():\n    global p\n    for p in (ROOT / 'docs').glob('*'):\n"
+             + "        if p.name.startswith('draft_'):\n            continue\n"
+             + "def later():\n    return p.read_text()\n", "docs/draft_a.md"),
+            ("def outer():\n    p = None\n    def collect():\n        nonlocal p\n"
+             + "        for p in (ROOT / 'docs').glob('*'):\n            if p.name.startswith('draft_'):\n"
+             + "                continue\n    collect()\n    return p.read_text()\n", "docs/draft_a.md"),
+            ("FOLDERS = ('docs', 'notes')\nclass Folders:\n    FOLDERS = ('docs',)\n"
+             + "    FILES = [p for x in ('a',) for f in FOLDERS for p in (ROOT / f).glob('*.md')]\n", "notes/a.md"),
+            ("FOLDERS = ('docs', 'notes')\nclass Folders:\n    for x in ('a',):\n        for f in FOLDERS:\n"
+             + "            FOUND = list((ROOT / f).glob('*.md'))\n    FOLDERS = ('docs',)\n", "notes/a.md"),
             ("def f():\n    return [p for p in (ROOT / 'docs').glob('*') if p.read_text() if not p.name.startswith('draft_')]\n",
              "docs/draft_a.md"),
             ("def f():\n    for p in (ROOT / 'docs').glob('*'):\n        if 'x' in p.read_text() and not p.name.startswith('draft_'):\n"

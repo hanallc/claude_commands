@@ -529,21 +529,29 @@ The selector finds `glob`, `rglob`, `os.walk` and `git ls-files` calls, and the 
 A `walk` call on the imported `ast` module is not a folder scan.
 A scan root is known when the code builds it from `__file__`, an absolute path or an imported root.
 A scan with an unknown root, for example `Path.home()` or `Path()`, reads the whole repository.
+A helper call without an argument uses the parameter default as the folder.
+A default that is not a known path is an unknown root. A `None` default gives no folder, because the scan cannot use it.
 A `for` loop or a comprehension over a literal tuple, list or set of strings gives one scan root for each string.
-A name that its scope binds only once, to a literal tuple of strings, also gives one scan root for each string.
+In a function or module scope, a name that the scope binds only once, to a literal tuple of strings, also gives one scan root for each string.
+A class body can read a module name before the class binds it, so a class scope has no tuple names.
+In a class body, only the first iterable of a comprehension reads the class loop values.
 The loop body must not bind the loop name again.
 No `global` or `nonlocal` statement in the module can name the loop name or the tuple name.
-A call that reads more than 32 combinations of loop values keeps the unknown root.
+A call with more than 32 combinations of loop values keeps the unknown root.
 A name filter on the scanned paths counts the same as a glob pattern.
 The selector trusts that the scan reads only the files whose names pass the filter, as it trusts a pattern such as `*.md`.
 The selector reads a name filter from the `if` parts of a comprehension.
 In a loop, it reads a first `if ...: continue`, or an `if` that is the whole loop body.
-It keeps the tests `not path.name.startswith("...")`, `path.suffix != "..."` and `path.name in (...)`.
-The kept names must be a literal or a tuple name that the scope binds only once.
-The tests count in order, and the first test that can read a file stops the filter.
+The `if` must have no `else` or `elif`.
+For the `continue` form, the selector uses the opposite test, because the loop skips the paths that pass the test.
+It reads these tests: `not path.name.startswith("...")`, `path.suffix != "..."` and `path.name in (...)`.
+The names in `path.name in (...)` must be a literal, or a tuple name that a function or module scope binds only once.
+The tests count in order. A test after the first test that can read a file does not count.
 These tests cannot read a file: `is_file()`, `is_dir()`, `is_symlink()`, `exists()` and `"..." not in path.parts`.
-A walrus in the tests stops the filter.
-A loop gets no filter when it has an `else`, when code after the loop reads the loop name, or when a lambda or nested function reads it.
+A walrus in the tests removes the filter.
+A loop has no filter when it has an `else`, or when code outside the loop reads the loop name.
+A loop or a comprehension has no filter when a lambda or a nested function reads the loop name.
+A loop or a comprehension has no filter when a `global` or `nonlocal` statement names the loop name.
 
 Only test modules have graph rows. All Python paths can resolve imports.
 A removed Python file uses import facts from the base.
