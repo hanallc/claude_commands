@@ -633,7 +633,7 @@ placement_once
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
             self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
-            self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_slots.lease_path(gate_copy)])
+            self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_folders.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
                 self.assertNotIn(request.episode, self.queue.caller_reservations())
@@ -1099,7 +1099,7 @@ placement_once
                                 "hold", "--repo", request.constraints.repository, "--tree", tree,
                                 "--step", "test", "--",
                             ])
-                            lease = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+                            lease = cast(dict[str, object], json.loads(build_folders.lease_path(checkout).read_text()))
                             self.assertEqual(lease["pid"], pid)
                             os.kill(pid, signal.SIGKILL)
                             self.assertTrue(select.select([launcher_exit], [], [], 30)[0])
@@ -1191,7 +1191,7 @@ placement_once
         checkout = self.slot_root / "verify/slot-order/1"
         self.assertEqual(Path(published[0]).read_text(), f"doc from {checkout}\n")
         self.assertEqual((checkout / asset).read_bytes(), Path(published[0]).read_bytes())
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_shell_wrapped_verify_doc_refuses_edits_outside_the_index(self) -> None:
@@ -1228,7 +1228,7 @@ placement_once
         self.assertEqual(copies.git(checkout, "show", ":src/lib.rs").decode(), applied)
         self.assertTrue((checkout / "target/ignored").is_file())
         self.assertEqual(sum(event["args"][:1] == ["doc"] for event in tools.cargo_events()), 1)
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
 
     def test_shell_wrapped_verify_doc_refuses_an_assume_unchanged_edit(self) -> None:
         tools = self.verify_source()
