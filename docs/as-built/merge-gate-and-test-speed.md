@@ -105,7 +105,9 @@ A private sccache server starts in the limit through `SCCACHE_SERVER_UDS`; it co
 The root of the limit is read only, and each entry under `/etc`, `/bin` and `/usr` that root does not own is hidden.
 The limit binds no path that holds the home folder or has a symbolic link in it, except a read only link into `/nix/store`. A checkout `target` link is bound only when it names the build folder that `cargo_folder.assigned_output` gives for the checkout. Any other output folder with a link refuses the run.
 The program has no network and no display. `CARGO_NET_OFFLINE` is `true`. When cargo exits with a status other than 0 and the last 64 KiB of its output has a cargo offline text, the attempt ends as the no network refusal. The output passes at once and unchanged.
-natedev refuses a checkout that holds, or is in, a folder of the tools that check the run: the repository of the checker code, the build-hold cargo wrapper folder, or the config folder.
+natedev refuses a run when a path that it writes (the checkout, the cargo folders, `SCCACHE_DIR` or the output folder) holds, or is in, a tool folder.
+The tool folders are the repository of the checker code, the config folder, and the python path cache folder that `scripts/lib/py --cache-folder` gives.
+When the first `cargo` on `PATH` is the build-hold cargo wrapper, the wrapper folder and its `lib` folder are tool folders too.
 When `bwrap` is missing or cannot set up the limit, the attempt ends as a refusal and the program does not start.
 
 The guest route has a second request form, `GuestCommandRequest`, for a hand made run (`scripts/production/hand_made_guest.py`).

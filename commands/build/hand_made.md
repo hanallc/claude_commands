@@ -51,7 +51,11 @@ On natedev (Read limit):
 - `SCCACHE_SERVER_UDS` names a socket in the temp folder, so the sccache client starts a private sccache server in the limit. The cache folder is the same, so cache hits stay. The private sccache server counts in the program scope memory and ends with the run.
 - A hand made run has no network and no display. A run that needs the network or a display is not a hand made run. The program has its own loopback only, so it reaches no socket or port of another process.
 - `CARGO_NET_OFFLINE` is `true`. When the program is `cargo`, its status is not 0, and the last 64 KiB of its output has a cargo offline text, the attempt ends as a refusal with no give back. The refusal comes after the program output and says: "a hand made run has no network, so cargo cannot fetch a dependency; a normal run of this line must fetch the dependency first". The output passes at once and unchanged.
-- natedev refuses a checkout that holds, or is in, a folder of the tools that check the run: the repository of the checker code, the build-hold cargo wrapper folder, or the config folder. The run can write its checkout, so it could change the check of the next run. The refusal says: "the checkout holds the tools that check the run; use a worktree". A worktree of the same repository passes.
+- natedev refuses a run when a path that it writes holds, or is in, a tool folder. The paths that it writes are the checkout, the cargo folders, `SCCACHE_DIR` and the output folder. The run could change the check of the next run through such a path. The refusal names the path: "the run writes <path>, which holds or is in the tools that check the run; use a worktree, and give CARGO_TARGET_DIR, SCCACHE_DIR and CARGO_HOME other folders". A worktree of the same repository passes. The tool folders are:
+  - the repository of the checker code;
+  - the config folder;
+  - the python path cache folder that `scripts/lib/py --cache-folder` gives;
+  - the build-hold cargo wrapper folder and its `lib` folder, only when the first `cargo` on `PATH` is the wrapper.
 - `~/.ssh`, the ssh agent socket and `~/.config/git` are hidden.
 - The rest of the home folder, other repositories, `/home`, `/run/user`, `/build` (except the folders above) and the `/tmp` of other processes are hidden.
 - When `bwrap` is not on `PATH`, or it cannot set up the limit, the program does not start, and the attempt ends with a refusal that names `bwrap`. The run never starts without the limit.

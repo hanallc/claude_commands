@@ -456,16 +456,30 @@ class OutputFolderTests(unittest.TestCase):
         hold.mkdir(parents=True)
         (hold / "cargo").touch(mode=0o755)
         checker = Path(hand_made_limit.__file__).resolve().parents[2]
-        refused = hand_made_limit.TOOLS_REFUSAL
-        cases: tuple[tuple[Path, dict[str, str]], ...] = (
-            (checker, {}), (checker / "scripts", {}), (root, {"PATH": str(hold)}),
-            (root, {"CONF_DIR": str(root / "config")}))
-        for checkout, values in cases:
-            with self.subTest(checkout=checkout, values=values), mock.patch.dict(os.environ, values):
-                program = Program(("true",), checkout, None, ())
-                self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(program), refused)
+        for checkout in (checker, checker / "scripts"):
+            with self.subTest(checkout=checkout):
+                self.assertEqual(hand_made.ROUTES[hand_made.LOCAL_MACHINE].refusal(Program(("true",), checkout, None, ())),
+                                 hand_made_limit.TOOLS_REFUSAL.format(bind=checkout))
+        refused = hand_made_limit.TOOLS_REFUSAL.format(bind=root)
+        self.assertEqual(hand_made_limit.tools_refusal(root, {"PATH": str(hold)}), refused)
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config")}):
+            self.assertEqual(hand_made_limit.tools_refusal(root, {}), refused)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config")}):
             self.assertEqual(hand_made_limit.tools_refusal(root / "worktree", {"PATH": str(root / "bin")}), "")
+
+    def test_an_output_or_sccache_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktree"
+        checkout.mkdir()
+        scripts = Path(hand_made_limit.__file__).resolve().parents[1]
+        cases = (({"CARGO_TARGET_DIR": str(scripts)}, scripts), ({"SCCACHE_DIR": str(root / "config")}, root / "config"),
+                 ({"SCCACHE_DIR": str(root / "cache")}, root / "cache"))
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config"), "XDG_CACHE_HOME": str(root / "cache")}):
+            for values, bind in cases:
+                with self.subTest(values=values):
+                    self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root), **values}),
+                                     hand_made_limit.TOOLS_REFUSAL.format(bind=bind))
+            self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root)}), "")
 
     def test_natedev_takes_no_run_that_names_another_output_folder(self) -> None:
         program = Program(("cargo", "build", "--target-dir", "other"), Path("/fixture/checkout"), None, ())

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 
 from scripts.build_hold import cargo_folder
 from scripts.lib import conf
@@ -38,7 +39,8 @@ EXIT_STATUS = re.compile(rb'"exit-code"\s*:')
 TARGET_REFUSAL = "the run builds in {place}; leave out --target-dir, or give that folder"
 OUTPUT_REFUSAL = ("the run cannot build in {place}, because {reason}; make the checkout target link name the build "
                   + "folder of this checkout, or set CARGO_TARGET_DIR to a real folder that does not hold the home folder")
-TOOLS_REFUSAL = "the checkout holds the tools that check the run; use a worktree"
+TOOLS_REFUSAL = ("the run writes {bind}, which holds or is in the tools that check the run; use a worktree, and "
+                 + "give CARGO_TARGET_DIR, SCCACHE_DIR and CARGO_HOME other folders")
 # The texts of the cargo errors that offline mode causes, from cargo 1.99.1 runs with CARGO_NET_OFFLINE=true:
 # a git source, a registry resolve, and a crate download.
 OFFLINE_TEXTS = (b"you are in the offline mode (--offline)", b"offline mode (via `--offline`)",
@@ -100,14 +102,32 @@ def bindable(path: Path, home: Path, *, read: bool) -> bool:
             and (real == Path(os.path.normpath(path)) or (read and real.is_relative_to(STORE))))
 
 
+def python_cache_folder() -> Path:
+    """The folder of the python path cache that scripts/lib/py reads and runs, from scripts/lib/py itself."""
+    launcher = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "py"
+    result = subprocess.run([str(launcher), "--cache-folder"], stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, check=True)
+    return Path(result.stdout.strip())
+
+
+def tool_folders(environment: Mapping[str, str]) -> list[Path]:
+    """The real folders of the tools that check the run: the repository of this code, the build-hold cargo
+    wrapper folder and its lib folder, the config folder, and the python path cache folder."""
+    return [Path(os.path.realpath(folder)) for folder in (
+        Path(__file__).resolve().parents[2], *wrapper_folders(environment.get("PATH", "")), conf.directory(),
+        python_cache_folder())]
+
+
 def tools_refusal(checkout: Path, environment: Mapping[str, str]) -> str:
-    """The refusal of a checkout that holds, or is in, a folder of the tools that check the run: the repository
-    of this code, the build-hold cargo wrapper folder, or the config folder. The run can write its checkout, so it
-    could change the check of the next run. Empty for none."""
-    real = Path(os.path.realpath(checkout))
-    tools = (Path(__file__).resolve().parents[2], *wrapper_folders(environment.get("PATH", "")),
-             Path(os.path.realpath(conf.directory())))
-    return TOOLS_REFUSAL if any(tool.is_relative_to(real) or real.is_relative_to(tool) for tool in tools) else ""
+    """The refusal of a write bind that holds, or is in, a tool folder; empty for none. The run can write each
+    write bind, so it could change the check of the next run. The checkout comes first, before the build folder
+    model gives the output folder."""
+    tools = tool_folders(environment)
+    for bind in write_binds(checkout, environment):
+        real = Path(os.path.realpath(bind))
+        if any(tool.is_relative_to(real) or real.is_relative_to(tool) for tool in tools):
+            return TOOLS_REFUSAL.format(bind=bind)
+    return ""
 
 
 def limit_refusal(argv: Sequence[str], checkout: Path, environment: Mapping[str, str]) -> str:
@@ -194,6 +214,16 @@ def hidden_words() -> list[str]:
     return words
 
 
+def write_binds(checkout: Path, environment: Mapping[str, str]) -> Iterator[Path]:
+    """The paths that the run reads and writes, the checkout first."""
+    home = home_folder(environment)
+    cargo_home = Path(environment.get("CARGO_HOME") or home / ".cargo")
+    yield checkout
+    yield from (cargo_home / "registry", cargo_home / "git", *(cargo_home / name for name in CARGO_LOCKS),
+                Path(environment.get("SCCACHE_DIR") or home / ".cache" / "sccache"))
+    yield bound_output(checkout, environment)
+
+
 def limit_argv(bwrap: str, program: Program, temp: Path, environment: Mapping[str, str], status_fd: int) -> list[str]:
     """The bwrap words that start the program in its checkout under the read limit.
 
@@ -215,9 +245,7 @@ def limit_argv(bwrap: str, program: Program, temp: Path, environment: Mapping[st
     read = [Path(environment.get("RUSTUP_HOME") or home / ".rustup"), cargo_home / "bin",
             cargo_home / "config.toml", *(folder for folder in folders if shown(folder, kept)),
             *wrapper_folders(path), *(file for file in files if not in_checkout(file, checkout))]
-    write = [checkout, cargo_home / "registry", cargo_home / "git", *(cargo_home / name for name in CARGO_LOCKS),
-             Path(environment.get("SCCACHE_DIR") or home / ".cache" / "sccache"),
-             bound_output(checkout, environment)]
+    write = list(write_binds(checkout, environment))
     words = [bwrap, "--json-status-fd", str(status_fd), "--die-with-parent", "--unshare-pid", "--unshare-net",
              "--dev", "/dev",
              "--proc", "/proc", "--bind", str(temp), str(TEMP)]
