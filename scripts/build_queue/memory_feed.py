@@ -504,6 +504,8 @@ class RowQueueNotes(CallNotes):
     mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
     guest_run: NotRequired[ConfirmedGuestRun]
+    # A guest run whose gate consumed its launch permission before the queue confirmed the guest attempt.
+    guest_unconfirmed: NotRequired[Literal[True]]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
@@ -645,6 +647,14 @@ def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRu
     if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
         return {"target": MAC_LINUX_TARGET, "attempt": attempt}
     return None
+
+
+def unconfirmed_guest_run(step: admission_records.RunningStep) -> bool:
+    """Tell whether a guest gate holds its consumed launch permission and the queue has not confirmed the attempt.
+
+    The queue sets started_at of a remote step from the consume time, so a consumed permission gives a start time.
+    """
+    return step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0 and confirmed_guest_run(step) is None
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -2969,6 +2979,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
+            unconfirmed = unconfirmed_guest_run(step)
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
@@ -2991,7 +3002,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": guest["target"] if guest else admission_records.execution_host(step, machine),
+                "machine": MAC_LINUX_TARGET if guest or unconfirmed else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(local_job(step), names, step=step.step, verify=step.verify,
@@ -3006,6 +3017,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 remote_row["guest_run"] = guest
                 if step.mac_placement:
                     guest_placements.add(step.mac_placement)
+            elif unconfirmed:
+                remote_row["guest_unconfirmed"] = True
             walk.append(remote_row)
             continue
         service = (isinstance(memory, admission_records.CompilerServiceMemory)

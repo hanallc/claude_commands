@@ -891,6 +891,10 @@ function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
 }
 function ciRow(row) { return row.ci || !!row.ci_label; }
+// A guest row is the queue row of a gate run on mac-linux. Its gate consumed the launch permission.
+// An unconfirmed row has no confirmed guest attempt yet.
+function guestRow(row) { return !!row.guest_run || !!row.guest_unconfirmed; }
+function guestState(row) { return row.guest_unconfirmed ? "not confirmed" : "running"; }
 const STEP_TABLE_HEADERS = {machine: "Machine", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
@@ -960,12 +964,13 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
-  const guestFields = row.guest_run ? [machineField('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
+  const guestFields = guestRow(row) ? [machineField('Runs on', row.machine),
+    field('Guest attempt', row.guest_run?.attempt || guestState(row))] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && namesGuest
     ? [machineField('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
-    : stepTitle(row, unavailable && !row.guest_run ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+    : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
@@ -1909,7 +1914,7 @@ function renderWalk(d) {
       target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
       (className.startsWith("wait") ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
-  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.guest_run || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
