@@ -3563,6 +3563,22 @@ process.stdout.write(JSON.stringify({
                     {"job": None, "runs": 2, "cost_usd": "6.00", "per_run_usd": "3.00"},
                 ])
 
+    def test_aws_cost_feed_names_the_job_from_the_mode_when_the_row_has_no_gate_job(self) -> None:
+        book = write_aws_cost_fixture(self.root, first_job=None)
+        with (self.root / "build_steps.conf").open("a") as names:
+            _ = names.write("names.test-all=test all\n")
+        modes = {"fixture-0": "gate", "fixture-1": "gate", "fixture-2": "test-affected"}
+        rows = [cast(dict[str, object], json.loads(line)) for line in book.launch_history_path.read_text().splitlines()]
+        for row in rows:
+            row["mode"] = modes[str(row["attempt"])]
+            if row["attempt"] == "fixture-2":
+                del row["gate_job"]
+        _ = book.launch_history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        billed = aws_costs.read_saved_costs(AWS_COST_TIME)["days"][1]
+        # fixture-1 keeps a gate_job that says the job is not recorded, so its mode does not name a job.
+        self.assertEqual([(run["id"], run["job"]) for run in billed["runs_list"]],
+                         [("fixture-0", "test all"), ("fixture-1", None), ("fixture-2", "test affected")])
+
     def test_aws_cost_feed_uses_the_same_day_amount_as_the_guard(self) -> None:
         book = write_aws_cost_fixture(self.root)
         settings = aws_config.read_settings(self.root / "aws_target.conf")

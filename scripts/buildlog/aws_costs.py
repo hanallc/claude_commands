@@ -107,6 +107,8 @@ CENT = Decimal("0.01")
 REGIONAL_ZONE = re.compile(r"([a-z]{2}(?:-[a-z0-9]+)+-[0-9]+)[a-z]")
 CARRIED_BILL_COSTS = "newest bill non-compute"
 COST_READ = "GetCostAndUsage"
+# Launch rows before the gate job was recorded name the job by their mode.
+MODE_STEPS = {"gate": "test-all", "test-affected": "test-affected"}
 KEY_REFUSALS = frozenset({"UnrecognizedClientException", "InvalidClientTokenId", "InvalidAccessKeyId",
                           "ExpiredToken", "ExpiredTokenException", "SignatureDoesNotMatch"})
 
@@ -230,7 +232,10 @@ def runs_by_day(state: ledger.LedgerEvidence, rows: Sequence[dict[str, object]],
                      or (zone_region[1] if zone_region is not None else home))
         mode = str(launch.get("mode") or (reservation.mode if reservation is not None else ""))
         identity = recorded_job(launch.get("gate_job"))
-        job = names.get(identity.step) if identity is not None else None
+        step = identity.step if identity is not None else None
+        if "gate_job" not in launch:
+            step = MODE_STEPS.get(str(launch.get("mode") or ""))
+        job = names.get(step) if step is not None else None
         unit = recorded_unit(launch.get("unit")) or recorded_unit(identity.unit if identity else None) or None
         first = date.fromisoformat(bill_day(start))
         last = date.fromisoformat(bill_day(max(start, end - 1)))

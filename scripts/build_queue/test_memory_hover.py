@@ -1778,7 +1778,13 @@ process.stdout.write(JSON.stringify(steps));
         self.assertEqual(cells, ["0", "no record"])
 
     def test_aws_cost_csv_joins_run_parts_across_bill_days(self) -> None:
-        csv_text = cast(str, self.page_expression("awsRunsCsv(data.days)", aws_cost_fixture(), walk=True))
+        fixture = aws_cost_fixture()
+        csv_text = cast(str, self.page_expression("awsRunsCsv(data.days)", fixture, walk=True))
+        # The run that crosses midnight has one part on Nov 17 and one on Nov 18. Its CSV row costs both parts.
+        parts = [run for day in cast(list[dict[str, list[dict[str, object]]]], fixture["days"])
+                 for run in day["runs_list"] if run["id"] == "midnight"]
+        joined_cents = sum(round(float(str(run["cost_usd"])) * 100) for run in parts)
+        self.assertEqual((len(parts), joined_cents), (2, 5))
         lines = csv_text.splitlines()
         self.assertEqual(lines[0], '"UTC day","Start (Eastern)","Job","Unit","Region","Zone","Machine type",'
                                     + '"Time on AWS (seconds)","Cost (USD)","Mode"')
@@ -1786,7 +1792,7 @@ process.stdout.write(JSON.stringify(steps));
         self.assertTrue(lines[1].startswith('"2026-11-19","2026-11-19T04:07:00-05:00",'))
         self.assertIn('"integrate","report","us-east-1","us-east-1a","c7i.8xlarge",574,0.02,"Spot"', lines[1])
         self.assertRegex(csv_text, r'"m7a\.8xlarge",574,\d+\.\d{2},"On-Demand"')
-        self.assertIn('"2026-11-17","2026-11-17T18:59:00-05:00","","","us-east-1","","c7i.8xlarge",120,0.02,"Spot"',
+        self.assertIn('"2026-11-17","2026-11-17T18:59:00-05:00","","","us-east-1","","c7i.8xlarge",120,0.05,"Spot"',
                       lines)
         self.assertIn('"2026-11-08"', lines[-1])
         self.assertNotIn("Costs with no run", csv_text)
