@@ -534,7 +534,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
-                                     selected=TreeSelection((LIB_SECOND,), tree), gate_job=job, type_dirs=())
+                                     selected=TreeSelection((LIB_SECOND,), tree), gate_job=job, type_dirs=(),
+                                     assignment=assignment)
         output = self.output.getvalue()
         self.assertEqual(output.count("affected: "), 1, output)
         self.assertIn("affected: 1 of 2 modules (base ", output)

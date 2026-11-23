@@ -660,7 +660,7 @@ fi
 
     def test_a_targeted_run_without_the_natedev_module_list_fails_before_ssh(self) -> None:
         result = mac_linux.route(self.repo, mode=SuiteMode.TARGETED, full=False, selected=ALL_MODULES,
-                                 module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED)
+                                 module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
         self.assertEqual(result, 'mac-linux: the targeted run has no module list from the natedev selection')
         self.assert_guest_clean()
 
