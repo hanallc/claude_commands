@@ -1247,7 +1247,8 @@ fi
         with (patch.object(Path, 'read_text', read_with_delay),
               patch.object(mac_linux, 'monotonic', lambda: now)):
             result = self.route()
-        self.assertEqual(now, 1.25)
+        # The run command and the cleanup command each read the helper once; the cleanup read passes the deadline.
+        self.assertEqual(now, 2.5)
         self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assert_guest_clean('probe', 'arm', 'run')
 
