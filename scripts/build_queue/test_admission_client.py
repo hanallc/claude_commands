@@ -2971,7 +2971,9 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(result, 2)
                     self.assertEqual(fixture.clock.monotonic(), limit)
                     duration = "1 min" if limit == 60 else f"{limit} s"
-                    self.assertIn(f"build queue unreachable for {duration}; step stopped", errors.getvalue())
+                    # A placement control request holds no step and no token, so its reason has no token words.
+                    self.assertEqual(errors.getvalue().count(f"build queue unreachable for {duration}"), 1, errors.getvalue())
+                    self.assertNotIn("step stopped", errors.getvalue())
                     self.assertEqual(len(transport.attempts), len(exchanges))
                     self.assertTrue(transport.requests)
                     self.assertTrue(all(request == transport.requests[0] for request in transport.requests))
