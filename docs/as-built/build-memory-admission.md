@@ -1281,13 +1281,25 @@ It captures outermost gates that work, CI `Runner.Worker` processes, and builds 
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
 `remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
-A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+A drain does not keep a routed gate. A later natedev step of that call waits for the release, unless its run took natedev.
 An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
-A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
+The drain also keeps each run that natedev took, also between its steps (`hold_enforcer.taken_runs`).
+A kept run is its run controller process. A later step under that process is kept.
+A taken run is one of these:
+- the owner of a verify run slot, which holds natedev from the first local grant to the end of the outer verify call;
+- the run of a live local reservation;
+- the owner of a live local reservation with no run.
+The drain keeps the run and the outermost working process of its step, so a step stays kept when its run controller exits.
+A run that only waits has no slot and no reservation, so the drain does not keep it.
+A gate that only waits, under no taken run, is not kept. It waits for the release like new work, and the drain does not wait for it.
+Work under no taken run is kept by its own identity.
 Unreadable claims or admission state keep every outermost gate.
+With unreadable admission state, the drain reads each run from `BUILDLOG_RUN` (`pid:start`) of the working process or an ancestor, and keeps it when that run is a live ancestor.
+The unit in `max_runs.exempt_unit` gets no verify run slot, so the drain keeps its run only while a step has a local reservation.
+Between its steps the drain does not keep it. A slot for exempt runs is a queue change.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
-A second scan adds only identities whose start ticks do not exceed that bound.
+A second scan adds only identities that started before that bound.
 The command merges those identities under the release lock before starting the enforcer.
 If release removes the holder file during discovery, the command ends without restoring the file.
 Each keep entry has a PID and a start time.
