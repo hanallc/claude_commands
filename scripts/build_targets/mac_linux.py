@@ -1282,6 +1282,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     from scripts.production import gate
 
     try:
+        # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
+        # run_gate_suites always sends a list for a targeted run without --full, so this guard protects only a future caller.
+        if mode is SuiteMode.TARGETED and not full and isinstance(selected, AllModules):
+            raise GuestUnavailable('the targeted run has no module list from the natedev selection')
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings

@@ -634,6 +634,12 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
+    def test_a_targeted_run_without_the_natedev_module_list_fails_before_ssh(self) -> None:
+        result = mac_linux.route(self.repo, mode=SuiteMode.TARGETED, full=False, selected=ALL_MODULES,
+                                 module_time_limit_s=3, gate_job=GATE_JOB_NOT_RECORDED)
+        self.assertEqual(result, 'mac-linux: the targeted run has no module list from the natedev selection')
+        self.assert_guest_clean()
+
     def test_mac_claim_refuses_another_sessions_block(self) -> None:
         paths = claim_state.state_paths('mac')
         paths.directory.mkdir()
