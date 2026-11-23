@@ -20,6 +20,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.test_accounts_page import newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
@@ -270,7 +271,7 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
+        self.assertIn("status.textContent = saveTimeoutWords(error) || 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -291,14 +292,14 @@ class ImagesTests(ImagesFixture):
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(images.images_root(self.root) / older["id"], older)
         current = images.render(self.status).decode()
-        marker = f'data-script="{images.SCRIPT_VERSION}"'
+        marker = f'data-script-version="{images.SCRIPT_VERSION}"'
         self.assertEqual(current.count(marker), 1)
         probe = """<script>
 (async () => {
  const wait = ms => new Promise(done => setTimeout(done, ms));
  const report = failures => fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
  const list = () => document.querySelector('[data-images]');
- if (list().dataset.script === 'older-script') {
+ if (document.querySelector('[data-page-status]').dataset.scriptVersion === 'older-script') {
   document.dispatchEvent(new Event('visibilitychange'));
   await wait(5000);
   await report(['an update from a newer script did not reload the page']);
@@ -451,7 +452,7 @@ class ImagesTests(ImagesFixture):
                     self.send_error(503, "The list is unavailable.")
                     return
                 if len(gets) == 1:
-                    page = current.replace(marker, 'data-script="older-script"')
+                    page = current.replace(marker, 'data-script-version="older-script"')
                 elif words == "Routine feedback.":
                     page = images.render(fixture.status).decode()
                 else:
@@ -507,6 +508,33 @@ class ImagesTests(ImagesFixture):
             (["feedback"], ["Retry after refresh fails."]), (["feedback"], ["Keep until next feedback."]),
             (["feedback"], ["Routine feedback."]),
         ])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(self.temporary / "config/review_links.conf", "page_request_timeout_seconds=5\n")
+        for caption in ("First shot", "Second shot", "Third shot"):
+            _ = self.register(caption)
+        current = images.render(self.status).decode()
+        self.assertEqual(current.count(f'data-script-version="{images.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(current.replace(images.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        place = "scrollTo({top:120,behavior:'instant'});"
+        field = "document.querySelectorAll('[data-images] textarea')[1]"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, start=f"type({field},'typed words');",
+                end=f"type({field},'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, holds=False,
+                start=f"type({field},'typed words');{field}.closest('article').hidden=true;"), [[]])
+        with self.subTest(hold="an Approved save that never answers"):
+            # The last card leaves and comes back below the viewport, so the scroll place stays.
+            save = ("const form=[...document.querySelectorAll('[data-images] form[data-image-form]')].at(-1);"
+                    + "form.requestSubmit(form.querySelector('[value=\"approved\"]'));")
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, start=save, saves=True), [[]])
 
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")

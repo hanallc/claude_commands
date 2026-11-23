@@ -10,6 +10,7 @@ from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Literal, cast
 
+from scripts.lib import conf
 from scripts.production import staff
 from scripts.review_links import page_frame, reply_tokens
 
@@ -774,7 +775,9 @@ def render() -> str:
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
                          "sectionRows": MAX_PAGE_SECTION_ROWS,
-                         "pageUrlLength": MAX_PAGE_URL_LENGTH})
+                         "pageUrlLength": MAX_PAGE_URL_LENGTH,
+                         "requestTimeoutSeconds": conf.read_or_repository("review_links").whole(
+                             "page_request_timeout_seconds")})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
@@ -1142,9 +1145,10 @@ SCRIPT = r'''(() => {
   showRecipients();
  }
 
- async function post(payload, keepalive = false) {
+ // A `signal` ends a save after page_request_timeout_seconds. A screenshot request has no time limit.
+ async function post(payload, keepalive = false, signal = undefined) {
   const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(payload), keepalive});
+                                          body: JSON.stringify(payload), keepalive, signal});
   return responseData(response, 'Could not send this item.');
  }
 
@@ -1557,7 +1561,7 @@ SCRIPT = r'''(() => {
   try {
    const item = await submissionPayload();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => post({...item, token});
+   const sendItem = () => post({...item, token}, false, AbortSignal.timeout(limits.requestTimeoutSeconds * 1000));
    let result;
    try {
     result = await sendItem();

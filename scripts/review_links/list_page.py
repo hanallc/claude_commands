@@ -23,7 +23,8 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_question, page_version
+from scripts.review_links import record_table, review_link
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -1054,7 +1055,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + page_frame.title("The List", "list")
+    content = (STYLE + page_frame.title("The List", "list", SCRIPT_VERSION)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
@@ -1079,14 +1080,14 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
-               + counts + '</div>'
-               + page_frame.CONSOLE_DIALOG_ASSETS
-               + '<dialog data-list-review-dialog aria-label="Review card">'
-               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
-               + record_table.render_inline_detail()
-               + '<script>' + SCRIPT + '</script>')
+               + counts + '</div>' + DIALOGS + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
+
+DIALOGS = (page_frame.CONSOLE_DIALOG_ASSETS
+           + '<dialog data-list-review-dialog aria-label="Review card">'
+           + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
+           + record_table.render_inline_detail())
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));
@@ -1584,7 +1585,7 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    const response=await fetch(location.pathname,{method:'POST',body:data,signal:listRequestSignal()});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1738,7 +1739,7 @@ function bindFeedbackForm(form){
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
      await tableView.rowSettled(item);
-    saving--;
+    saving--;pageRefresh.changed();
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
      if(!stale && listOwnsFocus()){
@@ -1823,7 +1824,6 @@ function updateLinkedRows(rows,updates){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || dateTimePickerOpen(document)) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
  const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
@@ -1831,9 +1831,11 @@ async function refresh(_supersede=false,current=()=>true){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
- if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving || dateTimePickerOpen(document) || !current()) return;
+ if(!current()) return;
+ const newer=reloadForNewScript(page,()=>saving>0);
+ if(newer || saving || dateTimePickerOpen(document)) return newer;
+ if(!fresh) throw new Error('The page has no list.');
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
@@ -1997,3 +1999,5 @@ document.addEventListener('review-item-saved',refreshAfterNewItem);
 document.addEventListener('review-item-created',refreshAfterNewItem);
 void loadListCounts();
 })();''')
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, DIALOGS, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

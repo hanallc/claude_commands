@@ -13,7 +13,7 @@ from urllib.parse import parse_qs
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, staff
-from scripts.review_links import change_browser, change_page, console, page_frame, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_version, review_link
 from scripts.review_links import question_record
 from scripts.review_links import staff_names
 
@@ -97,9 +97,12 @@ def render(root: Path) -> bytes:
     owners = {item.owner: owner_name(members, item.owner) for item in items}
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}"{names.style(owner)}>{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
-    seconds = conf.read("review_links").number("page_refresh_seconds")
-    content = (STYLE + page_frame.title("Investigations", "review")
-               + f'<div data-investigations data-refresh-seconds="{seconds}">'
+    settings = conf.read("review_links")
+    seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
+    content = (STYLE + page_frame.title("Investigations", "review", SCRIPT_VERSION)
+               + f'<div data-investigations data-refresh-seconds="{seconds}"'
+               + f' data-request-timeout-seconds="{request_timeout}">'
                + '<div data-filters><label for="investigation-owner">Owner:</label>'
                + f'<select id="investigation-owner"><option value="">All</option>{options}</select>'
                + '<label for="investigation-show">Show:</label><select id="investigation-show">'
@@ -159,25 +162,28 @@ function bind(){
   const status=form.querySelector('[data-save-status]'), button=form.querySelector('button');
   button.disabled=true;status.textContent='';let saved=false;
   try{
-   const response=await fetch(location.pathname,{method:'POST',body:new URLSearchParams(new FormData(form))});
+   const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
+    body:new URLSearchParams(new FormData(form))});
    if(!response.ok){const body=await response.json();throw new Error(body.reason || 'HTTP '+response.status);}
    const card=form.closest('article'), list=card.parentNode;
    card.dataset.state='read';form.remove();
    const firstRead=[...list.children].find(other=>other!==card && other.dataset.state==='read');
    list.insertBefore(card,firstRead || null);apply();saved=true;
-  }catch(error){status.textContent='Not saved: '+error.message;button.disabled=false;}
-  finally{delete form.dataset.sending;sending--;if(saved) void pageRefresh.refresh(true);}
+  }catch(error){status.textContent=saveTimeoutWords(error) || 'Not saved: '+error.message;button.disabled=false;}
+  finally{delete form.dataset.sending;sending--;pageRefresh.changed();if(saved) void pageRefresh.refresh(true);}
  }));
 }
 async function refresh(supersede=false,current=()=>true){
- if(sending || (active && !supersede)) return;
+ if(active && !supersede) return;
  const request=++generation;active=true;
  try{
   const response=await fetch(location.pathname,{cache:'no-store'});
   if(!response.ok) throw new Error('HTTP '+response.status);
   const page=new DOMParser().parseFromString(await response.text(),'text/html');
   const fresh=page.querySelector('[data-investigations]');
-  if(sending || request!==generation || !current()) return;
+  if(request!==generation || !current()) return;
+  const newer=reloadForNewScript(page,()=>sending>0);
+  if(newer || sending) return newer;
   if(!fresh) throw new Error('The page has no investigation list.');
   const top=scrollY, focus=document.activeElement?.id;
   content.replaceWith(fresh);content=fresh;bind();apply();
@@ -192,3 +198,5 @@ window.addEventListener('hashchange',()=>{
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

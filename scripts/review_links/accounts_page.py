@@ -18,7 +18,7 @@ from typing import Literal, TypedDict, cast
 
 from scripts.accounts import accounts, next_moves, role_activity
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
-from scripts.review_links import change_page, console_theme, page_frame, review_link
+from scripts.review_links import change_page, console_theme, page_frame, page_version, review_link
 from scripts.whoami import mac_fallback_token, quota_alert, run_out, token_expiry
 # The alias keeps the module apart from this page's quota_state() path function.
 from scripts.whoami import quota_state as worker_quota_state
@@ -873,10 +873,13 @@ def page() -> bytes:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
     body = board(reading, alerts) + models_board(reading) + tokens_board(reading)
-    refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
+    settings = conf.read("review_links")
+    refresh_seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
+            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"'
+            + f' data-request-timeout-seconds="{request_timeout}">' + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
             + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
@@ -1271,13 +1274,14 @@ function keepStepFocus(){
   ?.querySelectorAll('summary,.token-command')[index]?.focus({preventScroll:true});
 }
 async function refresh(supersede=false,current=()=>true) {
-  if (hold()) return;
   const request = ++newestRequest;
   const response = await fetch(location.pathname, {cache: 'no-store'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
-  if (request !== newestRequest || !current() || hold()) return;
+  if (request !== newestRequest || !current()) return;
+  const newer = reloadForNewScript(page, () => Boolean(hold()));
+  if (newer || hold()) return newer;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus();
@@ -1338,17 +1342,22 @@ popup.addEventListener('keydown',event=>{
 async function publish(save){
  const pending=queue(save.key);
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams({key:save.key,value:save.value}).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The color could not be saved.');
   for(const button of swatches(save.key)) button.dataset.savedColor=save.value;
  }catch(error){
-  for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
-  paint(save.key,save.oldColor);
-  if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
-  message.textContent=save.name+': '+(error.message || 'The color could not be saved.');message.hidden=false;
+  // After a timeout the save can still finish, so the color stays. The next refresh shows the true color.
+  const unknown=saveTimeoutWords(error);
+  if(unknown){for(const button of swatches(save.key)) button.dataset.savedColor=save.value;}
+  else{
+   for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
+   paint(save.key,save.oldColor);
+   if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
+  }
+  message.textContent=save.name+': '+(unknown || error.message || 'The color could not be saved.');message.hidden=false;
  }finally{
   pending.shift();pendingSaves.delete(save);
   const next=pending[0];
@@ -1408,13 +1417,13 @@ async function saveMove(form){
  const group=form.group, save={form};
  pendingMoves.add(save);message.textContent='';message.hidden=true;
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams(form).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
  }catch(error){
-  message.textContent=group+': '+(error.message || 'The move could not be saved.');message.hidden=false;
+  message.textContent=group+': '+(saveTimeoutWords(error) || error.message || 'The move could not be saved.');message.hidden=false;
  }finally{
   pendingMoves.delete(save);updates.changed();
   if(!hold()) void updates.refresh(true);
@@ -1485,9 +1494,9 @@ document.addEventListener('keydown',event=>{
 quotaClear.addEventListener('click',async()=>{
  if(!quotaButton || quotaSaving) return;
  const button=quotaButton, {quotaAccount,quotaLevel,quotaReset}=button.dataset;
- quotaSaving=true;quotaClear.disabled=true;message.hidden=true;
+ quotaSaving=true;quotaClear.disabled=true;message.hidden=true;updates.abandon();
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams({quota_account:quotaAccount,quota_level:quotaLevel,quota_reset:quotaReset})});
   const result=await response.json();
@@ -1500,14 +1509,17 @@ quotaClear.addEventListener('click',async()=>{
   if(hadFocus){cell.tabIndex=-1;cell.focus({preventScroll:true});}
   window.parent.postMessage('accounts-quota-cleared',location.origin);
  }catch(error){
-  message.textContent=error.message || 'The quota alert could not be cleared.';message.hidden=false;
+  message.textContent=saveTimeoutWords(error) || error.message || 'The quota alert could not be cleared.';message.hidden=false;
  }finally{
   quotaSaving=false;quotaClear.disabled=false;updates.changed();
+  if(!hold()) void updates.refresh(true);
  }
 });
 for(const name of ['resize','scroll']) addEventListener(name,()=>closeQuota(false),{passive:true});
 for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
 })();"""
+VERSION_PARTS = (POPUP, MENU, QUOTA_PANEL, STYLE, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)
 
 
 if __name__ == "__main__":
