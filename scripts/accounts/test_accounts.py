@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -41,6 +43,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, set_config_credits, write_account_settings
+from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, session_state
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
@@ -54,6 +57,7 @@ from scripts.agents.test_support import write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -267,6 +271,11 @@ def provider_fixture_login(_login: str) -> bool:
     return False
 
 
+def create_claude_move_account(label: str, login: str) -> None:
+    create_claude_account(label, login)
+    write_claude_move_credentials(accounts.account_dir(label))
+
+
 class McpProjectFixture(TypedDict):
     disabledMcpServers: list[str]
 
@@ -382,11 +391,11 @@ class AccountsTests(unittest.TestCase):
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex3",
-            "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
+            "why": "weekly refusal", "scope": "group", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
         moves.append_move(request)
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-a", run="run-one"))
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-b", run="run-one"))
-        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
+        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude", "scope": "session"}
         moves.append_move(failed)
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
             kind="failed", reason="still on claude1"))
@@ -1191,7 +1200,7 @@ class AccountsTests(unittest.TestCase):
                      agent_session=herdr.ReportedAgentSession("idle-thread")),
                   herdr.AgentOccupant(pane_id="w1:p3", agent="codex", agent_status=herdr.AgentStatus.STARTING,
                      agent_session=herdr.ReportedAgentSession("starting-thread"))]
-        with (patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"),
+        with (patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN),
               patch.object(herdr.Herdr, "agents", return_value=agents) as activity,
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({
                   "busy-thread": (990,), "idle-thread": (991,), "starting-thread": (992,)}, ())) as conversations):
@@ -1812,7 +1821,7 @@ class AccountsTests(unittest.TestCase):
             (self.main_dir / name).mkdir(exist_ok=True)
         if not (self.home / ".claude.json").exists():
             _ = (self.home / ".claude.json").write_text("{}")
-        create_claude_account(label, login)
+        create_claude_move_account(label, login)
         if default:
             _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8")
         if note_label:
@@ -2049,16 +2058,112 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("exec", "claude2", "--resume", "same-id"), (0, "", ""))
         launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "same-id"], expected)
 
-    def test_move_reports_an_unreadable_login_and_continues(self) -> None:
+    def test_move_refuses_a_target_without_a_local_login_before_stop(self) -> None:
+        from scripts.agents import inventory
+
         self.login_directory("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        with (patch.object(accounts, "account_identity", return_value=agent_accounts.UnreadableIdentity(directory, "fixture read failed")),
-              redirect_stderr(io.StringIO()) as errors):
-            result = accounts.check_move_target("claude3", datetime.now(timezone.utc))
-        self.assertIsInstance(result, accounts.MoveTargetReady)
-        self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn("anomaly:", errors.getvalue())
-        self.assertIn("fixture read failed", errors.getvalue())
+        agent_accounts.claude_config_file(directory).unlink()
+        owner = inventory.ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        with (patch.object(inventory, "listing", return_value=[owner]),
+              patch.object(stop_resume, "move_sessions", return_value=[]) as moved):
+            code, output, error = self.run_cli("move", owner.name, "claude3")
+        self.assertEqual((code, output), (1, ""))
+        command = f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude"
+        self.assertEqual(error.splitlines(), [
+            "accounts: claude3 has no sign-in on this machine; sign in first. "
+            + f"Run {command}, then /login",
+        ])
+        moved.assert_not_called()
+
+    def test_move_refuses_missing_credentials_before_stop(self) -> None:
+        from scripts.agents import inventory
+
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        (directory / ".credentials.json").unlink()
+        owner = inventory.ListedSession("move-id", 998071, "fixture", "fixture session", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(inventory, "listing", return_value=[owner]),
+              patch.object(stop_resume, "move_sessions", return_value=[]) as moved):
+            code, output, error = self.run_cli("move", owner.name, "claude3")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("claude3 has no sign-in on this machine", error)
+        self.assertNotIn("Login end date is unknown", error)
+        self.assertNotIn("@", error)
+        moved.assert_not_called()
+
+    def test_move_target_refuses_a_record_without_refresh_expiry(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "refreshToken": "fixture", "expiresAt": 4102444800000,
+        }}))
+        result = accounts.check_move_target("claude3", datetime(2026, 11, 20, tzinfo=timezone.utc))
+        self.assertIsInstance(result, accounts.MoveRefused)
+        assert isinstance(result, accounts.MoveRefused)
+        self.assertIn("claude3 has no sign-in on this machine", result.reason)
+        self.assertIn("Login end date is unknown", result.reason)
+        self.assertNotIn("@", result.reason)
+
+    def test_move_target_checks_token_expiry_before_usage(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        cutoff = int(now.timestamp() * 1000)
+        for token_key, expiry_key, expires in (("refreshToken", "refreshTokenExpiresAt", cutoff),
+                                               ("accessToken", "expiresAt", cutoff + 60_000),
+                                               ("refreshToken", "refreshTokenExpiresAt", cutoff + 60_000)):
+            with self.subTest(token_key=token_key, expires=expires):
+                _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+                    token_key: "fixture", expiry_key: expires,
+                }}))
+                with (patch.object(agent_accounts, "claude_credentials", wraps=agent_accounts.claude_credentials) as metadata,
+                      patch.object(refusals, "stored_reading", return_value=refusals.NoReading()) as usage):
+                    result = accounts.check_move_target("claude3", now)
+                metadata.assert_called_once_with(directory)
+                if expires <= cutoff:
+                    self.assertIsInstance(result, accounts.MoveRefused)
+                    assert isinstance(result, accounts.MoveRefused)
+                    self.assertIn("claude3 has no sign-in on this machine", result.reason)
+                    self.assertNotIn("unit@example.invalid", result.reason)
+                    usage.assert_not_called()
+                else:
+                    self.assertEqual(result, accounts.MoveTargetReady(accounts.NamedAccount("claude3", directory),
+                        ("no fresh usage reading for claude3 (last reading unknown)",)))
+                    usage.assert_called_once_with("claude", "unit@example.invalid", now)
+
+    def test_move_target_refuses_an_expired_access_token_without_a_refresh_token(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        cutoff = int(now.timestamp() * 1000)
+        _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture", "expiresAt": cutoff - 1, "refreshTokenExpiresAt": cutoff + 60_000,
+        }}))
+        with patch.object(refusals, "stored_reading") as usage:
+            result = accounts.check_move_target("claude3", now)
+        self.assertIsInstance(result, accounts.MoveRefused)
+        assert isinstance(result, accounts.MoveRefused)
+        self.assertIn("claude3 has no sign-in on this machine", result.reason)
+        usage.assert_not_called()
+
+    def test_move_target_refuses_future_refresh_expiry_without_tokens(self) -> None:
+        self.login_directory("claude3", "unit@example.invalid")
+        directory = accounts.account_dir("claude3")
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        for tokens in ({}, {"accessToken": "", "refreshToken": None}):
+            _ = (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+                **tokens, "refreshTokenExpiresAt": int(now.timestamp() * 1000) + 60_000,
+            }}))
+            with patch.object(refusals, "stored_reading") as usage:
+                result = accounts.check_move_target("claude3", now)
+            self.assertIsInstance(result, accounts.MoveRefused)
+            assert isinstance(result, accounts.MoveRefused)
+            self.assertIn("claude3 has no sign-in on this machine", result.reason)
+            usage.assert_not_called()
 
     def test_prepared_account_named_ready_returns_only_launch_changes_without_exec(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2677,7 +2782,7 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
-    def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
+    def test_single_session_move_rechecks_inventory_for_the_same_account(self) -> None:
         from scripts.agents.inventory import (
             AttributedSessionConfiguration, ListedSession, ShowrunnerRegistration, ShowrunnerRegistrations,
         )
@@ -2707,7 +2812,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(stop_resume, "move_sessions") as moved):
                 result = self.run_cli("move", owner.name, "claude1", *(["--dry-run"] if dry_run else []))
                 self.assertEqual(result, (0, "fixture session: already on claude1\n", ""))
-                listing.assert_called_once_with()
+                self.assertEqual(listing.call_count, 1 if dry_run else 2)
                 checked.assert_not_called()
                 moved.assert_not_called()
 
@@ -7527,9 +7632,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 journal_snapshot: list[moves.MoveEntry] = []
 
                 def request(identity: str, target_label: str) -> moves.RequestedMove:
-                    entry = moves.RequestedMove(kind="requested", at="2026-11-10T22:00:00Z",
-                        tool="codex", subject="workers", move_id=identity, cause="auto", why="auto: " + identity,
-                        **{"from": "codex2", "to": target_label}, window="weekly")
+                    entry: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": "2026-11-10T22:00:00Z",
+                        "tool": "codex", "subject": "workers", "move_id": identity, "cause": "auto", "why": "auto: " + identity,
+                        "from": "codex2", "to": target_label, "window": "weekly"}
                     moves.append_move(entry)
                     return entry
 
@@ -7596,9 +7701,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 reading = refusals.FreshReading(refusals.ReadingWindow(weekly_left, refusals.KnownReset(now + timedelta(days=2)), now),
                                                 refusals.NoWindow(), "200")
                 _ = accounts.accounts_config_file().write_text('{"workers": "codex2"}\n')
-                moves.append_move(moves.RequestedMove(kind="requested", at=now.isoformat(), tool="codex", subject="workers",
-                    move_id="request-" + case, cause="refusal", why="codex2 refused",
-                    **{"from": "codex2", "to": "codex1"}, window="weekly"))
+                moves.append_move({"kind": "requested", "scope": "group", "at": now.isoformat(), "tool": "codex",
+                    "subject": "workers", "move_id": "request-" + case, "cause": "refusal", "why": "codex2 refused",
+                    "from": "codex2", "to": "codex1", "window": "weekly"})
                 calls: list[staff.StaffId] = []
 
                 def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
@@ -7805,6 +7910,48 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
+    def test_workers_swap_records_producer_group_scope_and_retry_keeps_target(self) -> None:
+        source, _ = self.workers_fixture()
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
+            doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+            worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+        identity = str(producer.current_session)
+
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(stop_resume, "_read_move_source", return_value=stop_resume.StoppedMoveSource()),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(identity)),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_alert_pending_moves"),
+              patch.object(stop_resume, "_resume_move", side_effect=[
+                  stop_results.ResumeFailed(identity, "fixture resume failed"),
+                  stop_results.ClaudeUp(identity, "w1:p1", "codex1"),
+              ]) as resume,
+              redirect_stdout(io.StringIO())):
+            swapped = accounts.swap("workers", "codex1")
+            assert isinstance(swapped, accounts.WorkersSwapStarted)
+            self.assertEqual(swapped.outcomes, (stop_results.ResumePending(identity, "codex1", "fixture resume failed"),))
+            requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+            self.assertEqual([(entry["subject"], entry["to"], entry.get("scope")) for entry in requests],
+                             [(f"{identity}: {producer.name}", "codex1", "group")])
+            pending = moves.read_latest_request(identity)
+            assert isinstance(pending, moves.LatestMoveRequest)
+            self.assertEqual(pending.target, "codex1")
+
+            role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture swap", datetime.now(timezone.utc).isoformat()))
+            with stop_resume.detached_moves(), patch.object(stop_resume, "_detach") as detach:
+                self.assertEqual(stop_resume.main(["retry", pending.request_id]), 0)
+            detach.assert_called_once()
+            command = cast(list[str], detach.call_args.args[0])
+            self.assertEqual(stop_resume.main([command[0], "--log", str(self.root / "producer-move.log"), *command[1:]]), 0)
+
+        self.assertEqual([entry.args[1] for entry in resume.call_args_list], ["codex1", "codex1"])
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([(entry["to"], entry.get("scope")) for entry in requests], [("codex1", "group"), ("codex1", "group")])
+        self.assertEqual(moves.pending_move_requests(), ())
+
     def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         for missing_settings in (False, True):
             with self.subTest(missing_settings=missing_settings):
@@ -7861,7 +8008,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in stopped.call_args_list}, {failed.id, pending.id})
                 self.assertEqual(stopped.call_count, 2)
                 producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="by hand",
-                                                     cause="by hand", source_accounts={})
+                                                     cause="by hand", source_accounts={},
+                                                     intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT)
                 self.assertEqual(observed, [target, target])
                 self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
                 lines = output.splitlines()
@@ -8208,6 +8356,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     """Move native workers with isolated staff, accounts, processes, and panes."""
 
     def __init__(self, methodName: str = "runTest") -> None:
+        from scripts.agents import restart
         from scripts.herdr.test_worker_panes import PaneWorld
 
         super().__init__(methodName)
@@ -8218,6 +8367,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.owner_id = staff.StaffId("")
         self.stop = MagicMock()
         self.target_check = MagicMock()
+        self.saved_session_launch = restart.session_launch
 
     @property
     def owner(self) -> staff.StaffRow:
@@ -8236,9 +8386,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def setUp(self) -> None:
         from scripts.production.staff_test_support import StaffTestCase
 
-        self.fixture = StaffTestCase()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.agents import restart
@@ -8361,7 +8509,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                     f"End your final reply with this line alone: DONE {instance}\n"
                     "A reply that waits on a detached run is not final.")
             progress_history.save_dispatch_delivery(self.run_dir, instance,
-                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+                pass_recorder.DispatchDelivery(line, instance, str(self.root / "reply.md")))
             backend = staff.backend(row)
             assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
             entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}
@@ -8437,21 +8585,60 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(moves.read_moves(), [])
 
     def test_move_elapsed_time_includes_stopping_the_worker(self) -> None:
-        row = self.worker()
-        self.dispatch(row)
-        with patch.object(time, "monotonic", return_value=100.0) as clock:
-            def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
-                stopped = self.stop_worker(row, client, deadline=deadline)
-                clock.return_value = 102.5
-                return stopped
+        from scripts.agents import restart
+        from scripts.herdr import pane_launch
+        from scripts.production import worker_admission
 
-            self.stop.side_effect = stop
-            result = self.move("claude2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        outcome = result.outcomes[0]
-        assert isinstance(outcome, stop_results.ClaudeUp)
-        self.assertEqual(outcome.elapsed_seconds, 2.5)
-        self.assertIn("Claude is up on claude2 in w1:p1 (2.5 s)", result.stdout)
+        for name, pane, saved_model, role_effort, turn_model, turn_effort, expected_effort in (
+            ("implementer", "w1:p1", "", "", "", "", ""),
+            ("reviewer", "w1:p2", "", "high", "opus", "xhigh", "xhigh"),
+            ("tester", "w1:p3", "", "high", "opus", "", "high"),
+            ("saved-opus", "w1:p4", "opus", "high", "claude-opus-5-5", "", "high"),
+            ("empty-saved-model", "w1:p5", "", "medium", "opus", "", "medium"),
+        ):
+            with self.subTest(worker=name):
+                row = self.worker(name)
+                self.dispatch(row)
+                source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                final_turn: dict[str, object] = {}
+                if turn_model:
+                    records = pane_launch.record_directory() / f"{self.world.session}.json"
+                    entry = pane_launch.read_strict(records)[pane]
+                    entry["model"] = saved_model
+                    pane_launch.write(records, entry)
+                    _ = write_registry(self.root / "conf/models.conf", {
+                        "assignments": {"direct": "claude"}, "direct.claude": {"impl": f"sonnet:{role_effort}"},
+                    })
+                    final_turn = {"type": "assistant", "message": {"model": turn_model}}
+                    if turn_effort:
+                        final_turn["effort"] = turn_effort
+                    with source.open("a") as stream:
+                        _ = stream.write(json.dumps({
+                            "type": "assistant", "message": {"model": "sonnet"}, "effort": "high",
+                        }) + "\n")
+                launch = self.saved_session_launch if final_turn else restart.session_launch
+                with (patch.object(time, "monotonic", return_value=100.0) as clock,
+                      patch.object(restart, "session_launch", launch)):
+                    def stop(worker: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+                        stopped = self.stop_worker(worker, client, deadline=deadline)
+                        if final_turn:
+                            with source.open("a") as stream:
+                                _ = stream.write(json.dumps(final_turn) + "\n")
+                        clock.return_value = 102.5
+                        return stopped
+
+                    self.stop.side_effect = stop
+                    result = self.move("claude2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcome = next(item for item in result.outcomes if item.session_id == row.id)
+                assert isinstance(outcome, stop_results.ClaudeUp)
+                self.assertEqual(outcome.elapsed_seconds, 2.5)
+                self.assertIn(f"Claude is up on claude2 in {pane} (2.5 s)", result.stdout)
+                if final_turn:
+                    arguments = self.world.requests[-1][1]
+                    self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], turn_model)
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], expected_effort)
 
     def test_codex_move_reads_the_process_account_and_resumes_the_same_thread(self) -> None:
         row = self.worker(family="codex")
@@ -8470,14 +8657,40 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertTrue(accounts.session_on_account(member, "codex2"))
 
     def test_stopped_worker_resumes_in_the_same_pane(self) -> None:
-        row = self.worker(live=False)
-        self.dispatch(row)
-        result = self.move("claude2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.stop.assert_not_called()
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
+        from scripts.agents import pane_record, restart
+        from scripts.herdr import pane_launch
+        from scripts.production import worker_admission
 
-        self.assertEqual(self.world.closed, [])
+        for index, (model, effort) in enumerate((("", ""), ("opus", "xhigh")), start=1):
+            with self.subTest(model=model):
+                row = self.worker("implementer" if index == 1 else "reviewer", live=False)
+                self.dispatch(row)
+                launch = restart.session_launch
+                if model:
+                    pane = f"w1:p{index}"
+                    records = pane_launch.record_directory() / f"{self.world.session}.json"
+                    pane_launch.retire_launch(records, pane, pane_launch.read_strict(records)[pane])
+                    self.assertIsNone(pane_record.launch_for_session(str(row.current_session)))
+                    source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                    transcript = self.root / "home/.claude1/projects/project" / f"{row.current_session}.jsonl"
+                    transcript.parent.mkdir(parents=True, exist_ok=True)
+                    _ = source.rename(transcript)
+                    with transcript.open("a") as stream:
+                        _ = stream.write(json.dumps({
+                            "type": "assistant", "message": {"model": model}, "effort": effort}) + "\n")
+                    launch = self.saved_session_launch
+                with patch.object(restart, "session_launch", launch):
+                    result = self.move("claude2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.stop.assert_not_called()
+                self.assertEqual(self.world.launches, [
+                    herdr.ExistingPane(f"w1:p{pane}", f"terminal-w1:p{pane}") for pane in range(1, index + 1)])
+                if model:
+                    arguments = self.world.requests[-1][1]
+                    self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], "xhigh")
+                self.assertEqual(self.world.closed, [])
 
     def test_stopped_idle_worker_move_closes_the_pane_and_keeps_the_conversation(self) -> None:
         row = self.worker(live=False)
@@ -8618,6 +8831,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         with live_detached_run(self.run_dir, kept):
             moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
         self.assertIsInstance(moved, stop_results.ClaudeUp)
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested" and entry["subject"] == kept.id]
+        self.assertEqual([entry.get("scope") for entry in requests], ["group"])
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
         self.assertEqual(self.world.stops, [kept.current_session])
@@ -8958,7 +9173,7 @@ class PickerTests(unittest.TestCase):
 
     def claude(self, label: str, login: str) -> None:
         if label != "default":
-            create_claude_account(label, login)
+            create_claude_move_account(label, login)
             return
         config = self.home / ".claude.json"
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
@@ -9116,7 +9331,7 @@ class PickerTests(unittest.TestCase):
         self.codex("default", "worker@example.invalid")
         common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="workers", move_id="account-move")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex2",
-            "why": "manual", "window": "unknown", "cause": "by hand"}
+            "why": "manual", "scope": "group", "window": "unknown", "cause": "by hand"}
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",

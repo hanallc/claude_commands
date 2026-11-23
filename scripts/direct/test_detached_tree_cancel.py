@@ -11,9 +11,12 @@ from pathlib import Path
 from typing import Callable, cast
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
 from scripts.agents import detached_runs
 from scripts.production import session_staff, staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import (
+    build_fixture_sessions, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership,
+)
 from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
@@ -56,8 +59,10 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
+        build_sessions = build_fixture_sessions("")
         native = fixture_runtime_id(identity)
         environment = {**fixture.environment, "CODEX_THREAD_ID": native,
+                       "CLAUDE_CODE_SESSION_ID": "",
                        "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
                        "DESIGN_ROLES_STATE": str(fixture.root / "roles")}
         done_flags: list[str] = []
@@ -65,11 +70,15 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
             done = fixture.root / "done-message.txt"
             _ = done.write_text("pass-only completion message")
             done_flags = ["--done-message-file", str(done)]
-        # Retain each real process handle until fixture cleanup reaps it.
+        wrapper = fixture.root / "detached-tools/agents/detached_runs.py"
+        # Keep the real process handles for fixture cleanup.
         spawn = cast(Callable[..., subprocess.Popen[bytes] | subprocess.Popen[str]], subprocess.Popen)
 
-        def capture(*arguments: object, **options: object) -> subprocess.Popen[bytes] | subprocess.Popen[str]:
-            process = spawn(*arguments, **options)
+        def capture(command: object, **options: object) -> subprocess.Popen[bytes] | subprocess.Popen[str]:
+            if isinstance(command, list) and cast(list[object], command)[1:3] == [str(wrapper), "supervise"]:
+                # The supervisor passes the runner session to Verify for the build hold.
+                options["env"] = {**os.environ, **build_sessions}
+            process = spawn(command, **options)
             fixture.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
             return process
 
@@ -86,7 +95,6 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
             state = cast(dict[str, object], json.loads(state_path.read_text())) if state_path.exists() else {}
             state["owner_staff_id"] = parent.id
             write_text_atomic(state_path, json.dumps(state))
-            wrapper = fixture.root / "detached-tools/agents/detached_runs.py"
             wrapper.parent.mkdir(parents=True, exist_ok=True)
             library = wrapper.parents[1] / "lib"
             library.mkdir(parents=True, exist_ok=True)
@@ -126,11 +134,8 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         return cast(dict[str, object], json.loads(self.inbox_path(fixture, identity).read_text()))
 
     def test_two_simultaneous_callers_receive_only_their_own_cancellation_or_pass(self) -> None:
-        VerifyTreeCancelFixture.setUpClass()
-        self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
-        other = VerifyTreeCancelFixture()
-        other.setUp()
-        self.addCleanup(other.doCleanups)
+        register_fixture_class_cleanup(self.addCleanup, VerifyTreeCancelFixture).setUpClass()
+        other = set_up_fixture(self.addCleanup, VerifyTreeCancelFixture())
         self.addCleanup(other.tearDown)
         first_identity, second_identity = "edited-worker", "stable-worker"
         first_path = self.start_detached(self, first_identity, done_message=True)
@@ -158,6 +163,7 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         _ = (other.control / "release").touch()
         second = self.finished_record(second_path)
         self.assertEqual(second.get("exit_code"), 0, Path(second["log"]).read_text())
+        self.assertNotEqual(first["staff_id"], second["staff_id"])
         other.assert_resources_released()
         self.assertEqual(len(list((other.board / "verify_cache").glob("*.pass"))), 1)
         cancelled = self.inbox(self, first_identity)

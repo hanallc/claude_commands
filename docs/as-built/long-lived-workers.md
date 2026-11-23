@@ -61,6 +61,8 @@ An unproved Codex prompt returns uncertain when this bound passes or the process
 A recorded prompt remains submitted after a process exit.
 Claude can record the prompt later.
 A failed delivery command returns an error.
+The launcher copies captured worker output to stderr on a nonzero exit.
+Assignment recovery prints the reason if pending pane cleanup prevents submission.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
 A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
@@ -101,21 +103,25 @@ With an active pass, changed content returns busy and names that pass without pr
 This refusal applies when the launcher arguments change.
 The recorder repeats the content check under its lock before it changes the pass.
 The intentional second review stage keeps its existing pass across its separate prompt path.
-An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+An identical rerun of a completed dispatch uses the saved pass notice.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
-A successful completed rerun sets its status file to `done` after it sends the notice.
-Native duplicate hook events still send no second message.
+A completed rerun sets its status file to `done` before it checks the notice.
+A replay of a settled hook event sends no second message.
+This includes a legacy status replay that arrives after a different status.
 Each completion notice ends its first line with `; pass <dispatch instance id>`.
-An explicit rerun repeats the saved completion text with the same pass id.
+An explicit rerun can retry a pending notice with its original delivery key.
+An explicit rerun leaves settled notices alone.
 Each notice uses the worker's native identity and name, including a notice from the director's rerun.
 The saved completion supplies the sender identity for a retired managed Astra reviewer.
 The sender identity remains the same after a session change and retirement.
-Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
-A changed waiting outcome, reply, or run ID sends one notice.
-The completion notice records delivery separately from the reply text.
-After delivery, recovery can replace the saved reply without sending another completion notice.
+Each status transition gets a sequence ID and a delivery key.
+A repeated native turn ID uses its existing event.
+Without a native turn ID, an unchanged status uses the current event.
+A transition back to an earlier status gets a new event.
+The pass keeps notices separately from the saved reply.
+Recovery can replace the saved reply after the notice settles.
 Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
@@ -208,6 +214,9 @@ If the reply ends with a different DONE ID, the no DONE notice names both IDs.
 The pass stays active and the pane stays open until the reply contains the matching DONE.
 A saved stage ID controls pane closure and reuse.
 The reply on disk must match the completed receipt.
+If the report path resolves to the reply path, the hook keeps the raw reply there.
+If the caller requests a distinct report path, the hook writes the report there.
+The report includes the heading when the assignment has a summary.
 The completion hook saves the reply and records the pending notice for the exact pass.
 Live detached work delays normal and late DONE notices.
 Restart restores a selected live worker before it removes the worker from the restart record.
@@ -231,11 +240,32 @@ Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
 Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
-The hook records closure diagnostic delivery separately from the diagnostic text.
-A later recovery retries an undelivered diagnostic with the same delivery key.
-The hook ends `scratch.worker_task(row.id)` before it closes the pane.
-This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+Each pass keeps an append-only notice record in its run directory.
+The record holds each event ID, notice, route, and settlement.
+The record retains event IDs so a retry can recognize a duplicate.
+The first notice for a pass with a legacy stamp imports the stamp as one settled event.
+The record keeps the stamp for that status even if a different status arrives first.
+The progress recorder keeps the stopped pass receipt for late reply recovery.
+The hook saves pending diagnostics in the completion checkpoint before it writes the notice record.
+The hook sets `recording_done` after all pending diagnostics are durable in the notice record.
+If the notice write fails, the next hook publishes the saved diagnostics.
+A new assignment can use an open, stopped, or closed idle worker while the old notice remains pending.
+The new assignment still requires valid completion evidence and safe pane reuse.
+A new assignment can append notices without reading the notice record or taking a message lock.
+A later hook or reap retries the pending notices with their original delivery keys.
+The stopped pass can retry its diagnostics while it waits for a matching DONE.
+The retry checks for a director receipt with the same delivery key.
+A matching receipt settles the notice without a send.
+A receipt lookup failure leaves the notice pending.
+A repeat-guard hold settles the notice after the guard queues a notice for the owner.
+Peer delivery preserves the repeat-guard hold reason. Other holds leave the notice pending.
+The hook marks `scratch.worker_task(row.id)` ended before it closes the pane.
+The worker's scratch folders remain for manual removal.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.
+The hook saves each retained scratch path and reason separately from the notice text.
+Each send checks the saved paths and omits confirmed missing folders.
+The notice omits legacy scratch details that have only text.
+A failure to read or check the saved paths leaves the notice pending without a send.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
@@ -690,27 +720,101 @@ The run record saves the caller's staff ID. The supervisor starts in a separate 
 `send.py` uses the saved staff ID to deliver the result to the current session or queue it during a move.
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
-The supervisor waits for this process before it marks the run finished.
-The command runs in its own session, including through a systemd scope prefix.
+The supervisor records the command exit before it starts delivery.
+After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
+A failed push saves the send error as pending delivery.
+The finished run leaves the live-run limit and keeps its record and log.
+The start lock serializes orphan scans.
+The reaper saves an ended orphan as finished before it makes one delivery attempt.
+The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
+Before the reaper alerts for an unconfirmed push, it checks for a receipt.
+A failed turn-end replay waits for the next start or launcher reap to send its alert.
+A deferred replay keeps a saved push failure.
+The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
+The supervisor sends again only when the previous attempt sent nothing.
+If a pane or relay does not confirm delivery, the supervisor checks only for a receipt.
+After the last retry, the supervisor sends the delivery state to the director.
+The alert holds the delivery lock through submission and records the outcome after sender acceptance or a logged failure.
+The next reap can recover an alert if the process exits before the record saves its outcome.
+A rare exit or a retirement can repeat the alert once. It never repeats the result.
+The alert for an unconfirmed push says that the result may have arrived.
+If an alert fails, the sender prints one anomaly and keeps the result pending.
+The command runs in its own session.
+On natedev, the launcher starts the command scope in `builds-detached-<id>.slice`.
+The slice name uses the run ID without dashes.
+Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
+The limits and anonymous memory totals of `builds.slice` include the nested scopes.
+The queue charges each unowned scope inside a run slice.
+The launcher indexes the run record and saves the slice identity before it starts the command.
+It exports `DETACHED_RUN_SLICE` to the command.
+The index lets the live-run reader find the slice after its supervisor exits.
+The reader also checks records named by live supervisors and legacy stop markers.
+It matches older records without an index to their slice names.
+An index without its record gives a read error.
+The supervisor or reaper removes the slice index after it saves the finished record.
+The scope launchers use the run slice when the variable is set.
+Transient services keep their usual placement.
+`detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
+Other `systemd-run` forms return exit 2.
+With a run slice, the launcher uses the user manager and adds `--slice-inherit` to this scope wrapper.
+The guard skips `env` assignments and the two-word `-u` and `--unset` options.
+If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
+To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
-The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group.
-Each checks the supervisor and the command leader identity before it signals the group.
-Each stages the stop reason before it sends TERM.
+
+1. Wait for the stop lock.
+2. Read the current run record.
+3. Check whether the slice is populated.
+4. Check that the caller's stop route still applies.
+5. Save the stop reason and pane cancellation if both checks pass.
+6. Send TERM through pidfds to processes that still belong to the run slice.
+7. Give the processes the stop grace to exit.
+8. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+9. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+
+An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
+The record stays running until the supervisor or recovery can confirm that the slice is empty.
+The supervisor saves the exit code and cleanup intent before it releases the watcher.
+The run record saves `finished_at` when it records the confirmed end of the slice.
+The caller saves the stop commit before it sends a signal. The stop commit is final.
+Recovery syncs the record directory before it signals a slice for a saved stop commit.
+A sync error leaves the record available for another attempt.
+A read error before the commit leaves the run record unchanged.
+After supervisor loss, the watcher retries slice reads within the stop grace.
+The hold enforcer checks the active holder set again after it acquires the stop lock.
+If pruning removes the run during the lock wait, the stop returns a refusal.
+Builds Kill recovery uses the same locked route check for a first commit.
+It can finish the commit for its action.
+The stop commit saves the notice ID in the run record.
+Pruning keeps a finished run while its notice ID is present.
+Builds acknowledges the notice ID after it saves `SendingNotice` or confirms that the action was abandoned.
+Builds recovery uses the saved run path to acknowledge notices after either event.
+An acknowledgment confirms the run directory sync even when the notice ID is absent.
+An acknowledgment error does not block notice delivery.
+After acknowledgment, the usual pruning rules apply.
+A run that ends by itself just after the stop commit reports as stopped.
+Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
+On Linux with pidfds, a run without a saved slice can receive TERM and reports an unconfirmed stop.
+On systems without pidfds, the stop checks the saved leader identity and sends TERM to the group.
+The watcher confirms the command group from its own membership before it leaves the group.
+It can send TERM to surviving members after the leader exits.
+The watcher waits for the saved leader and the group to end before it reaps the run.
+The stop grace limits this wait.
+After a normal command exit, the supervisor gives the slice members the stop grace to exit.
+It stops any processes that remain and reports them as a cleanup in the result.
+A build hold records the run as stopped after the same slice stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
-The result uses the command's exit status and includes the saved reason.
-A self-stop requires a native Claude session record or Codex pane report for the caller.
-The caller's worker staff ID must match the run's owner.
-Missing records, unreadable records, and conflicting identities prevent a self-stop.
-The self-stop saves `self_stop: true` with the stop reason.
-The supervisor keeps the pass active and sends the result to the owning worker.
+A run with a saved stop reason reports `STOPPED` and includes the reason.
+The result includes the command's exit status.
+Exits 76 and 77 also include instructions for the next action.
+A committed slice stop cancels the verified owning pass.
+A group stop with `self_stop: true` keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
-A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
 An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-For either stop kind, the supervisor records the leader's exit status.
+The supervisor records the leader's exit status.
 The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.

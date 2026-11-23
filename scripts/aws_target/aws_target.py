@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
+from functools import partial
 import json
 from pathlib import Path
 import re
@@ -26,7 +27,7 @@ from typing import cast, final
 from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
-from scripts.aws_target.config import read_settings
+from scripts.aws_target.config import AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
@@ -49,6 +50,11 @@ SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
 HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
+
+
+def machine_settings() -> tuple[conf.ConfigRead, conf.ConfigRead]:
+    """Read the cloud gate and Hana settings, whose enabled keys switch the two AWS machines."""
+    return conf.read_or_repository('cloud_gate'), conf.read_or_repository('hana_aws')
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -415,10 +421,11 @@ def read_snapshot_quota_requests(regions: tuple[str, ...], timeout: float,
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
              notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
-             force: bool = False) -> int:
+             force: bool = False, allow_aws_unavailable: bool = False) -> int:
     """Replace successful regional reads and preserve failed regional reads.
 
-    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
+    Use force to read early without moving the refresh interval.
+    Use allow_aws_unavailable to accept AWS read failures."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
@@ -447,6 +454,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        aws_unavailable = False
         read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
@@ -477,7 +485,10 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
                 print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
                 failures[region] = SnapshotFailure(region, now, read_name, type(error).__name__, reason)
-                status = 1
+                if isinstance(error, AwsUnavailable):
+                    aws_unavailable = True
+                else:
+                    status = 1
         current_failures = tuple(failures[region] for region in regions if region in failures)
         output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
             dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
@@ -521,7 +532,9 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             _ = lock.seek(0)
             _ = lock.truncate()
             _ = lock.write(str(now))
-        return status
+        if aws_unavailable and allow_aws_unavailable:
+            print('aws_target: AWS not available', file=sys.stderr)
+        return status or int(aws_unavailable and not allow_aws_unavailable)
 
 
 USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
@@ -585,6 +598,8 @@ class AccountRefresh:
         self.clock = clock
 
     def tick(self) -> None:
+        if not isinstance(aws_switch(*machine_settings()), AwsOn):
+            return
         now = int(self.clock())
         configuration = conf.read(self.settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
@@ -636,15 +651,25 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
     return 0
 
 
-def hourly(settings_path: Path, directory: Path) -> int:
-    """Read prices and placement scores and check billed hours."""
+def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool = False) -> int:
+    """Read prices and placement scores and check billed hours, only while AWS is on."""
+    cloud_gate_settings, hana_settings = machine_settings()
+    # With AWS off, no charge refresh runs, so a provisional bill would give false hours-gap notices.
+    if not isinstance(aws_switch(cloud_gate_settings, hana_settings), AwsOn):
+        return 0
     status = 0
-    for label, operation in (('price snapshot', snapshot), ('hours-gap check', hours_gap_notices)):
+    read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot
+    for label, operation in (('price snapshot', read_prices), ('hours-gap check', hours_gap_notices)):
         try:
             status = max(status, operation(settings_path, directory))
         except Exception as error:
+            if allow_aws_unavailable and isinstance(error, AwsUnavailable):
+                print(f'aws_target: {label}: AWS not available', file=sys.stderr)
+                continue
             print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
             status = max(status, 1)
+    if not isinstance(aws_switch(cloud_gate_settings), AwsOn):
+        return status
     try:
         placement_snapshot(settings_path, directory)
     except Exception as error:

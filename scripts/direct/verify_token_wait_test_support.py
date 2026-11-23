@@ -9,7 +9,8 @@ from dataclasses import replace
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_pressure_reading,
+                                              write_config_fixture)
 
 
 import json
@@ -29,7 +30,8 @@ from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
-from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.production import staff
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -159,6 +161,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
+    *"rev-list --max-parents=0"*) printf "fixture-root-commit\n" ;;
     *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
@@ -385,6 +388,14 @@ esac
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
         admission = caller_admission(self, self.root, self.environment)
+        runner = staff.caller_identity()
+        if runner:
+            board = Path(environment["UNIT_RUN_DIR"])
+            # Bind the runner when Verify starts. Token history can assign it to a different worker.
+            if (board / "impl_worker_fixture-impl.json").is_file():
+                record_wait_workers(self.root, board, environment, {"fixture-impl": "thread-impl"},
+                                    runtime_ids={"fixture-impl": runner})
+            environment.update(build_fixture_sessions(""))
         with admission.loop_turn():
             if not admission.server.reservations and not admission.server.slots:
                 _ = admission.occupy_host()
@@ -439,7 +450,7 @@ esac
         if wait_status == 75:
             _ = (self.root / "build_targets.conf").write_text(
                 "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
+                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n" + UNREACHABLE_WAIT_FIXTURE)
             _ = write_config_fixture(self.root / "mac-settings",
                 f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
             from scripts.direct.verify_step_routes_test_support import RUNNER
@@ -580,7 +591,8 @@ exit "$status"
                             + "with open(os.environ['TEST_DETACHED_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
                             + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                             + "raise SystemExit(int(os.environ['TEST_DETACHED_RUNS_STATUS']))\n")
-        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": "thread-worker", "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
+        return {**self.environment, "UNIT_DETACHED_RUN": "", "CODEX_THREAD_ID": staff.caller_identity() or "thread-worker",
+                "VERIFY_DETACHED_RUNS_SCRIPT": str(stub),
                 "TEST_DETACHED_RUNS_CALLS": str(self.root / "detached-runs-calls"), "TEST_DETACHED_RUNS_STATUS": str(status)}
 
     def detached_runs_calls(self) -> list[list[str]]:

@@ -7,12 +7,13 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from http.client import HTTPConnection, HTTPException
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, cast
 
-from scripts.for_you.action import ActionStore
+from scripts.for_you.action import ActionStore, UserAction
 from scripts.direct import recorder_state
 from scripts.lib import conf
 from scripts.production import staff
@@ -51,6 +52,8 @@ class ForYouRow:
     completion: Literal["manual", "automatic"]
     evidence: str
     requests: tuple[RebuildRequest, ...] = ()
+    updated_at: str = ""
+    requester_reference: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,17 +78,36 @@ class UnavailableOpenCount:
     known_open: int
 
 
+class OtherActionCountUnavailable(StrEnum):
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class StatusLineActions:
+    """The waiting rebuilds and the count of other open actions."""
+
+    rebuild_machines: tuple[str, ...] = ()
+    other_count: int | OtherActionCountUnavailable = OtherActionCountUnavailable.UNAVAILABLE
+
+
 @dataclass(frozen=True)
 class ForYouSnapshot:
     """The available rows and explicit failures from one read."""
 
     rows: tuple[ForYouRow, ...]
     unavailable: tuple[UnavailableSource, ...]
+    rebuild_machines: tuple[str, ...] = ()
 
     @property
     def open_count(self) -> KnownOpenCount | UnavailableOpenCount:
         count = sum(row.status == "open" for row in self.rows)
         return UnavailableOpenCount(count) if self.unavailable else KnownOpenCount(count)
+
+    def status_line_actions(self) -> StatusLineActions:
+        if self.unavailable:
+            return StatusLineActions(self.rebuild_machines)
+        count = sum(row.kind == "action" and row.status == "open" for row in self.rows)
+        return StatusLineActions(self.rebuild_machines, count)
 
 
 def _request(value: Mapping[str, object], names: Mapping[str, str], waiting_work: Callable[[str], str],
@@ -124,14 +146,53 @@ def _completed_requests(names: Mapping[str, str], waiting_work: Callable[[str], 
     return tuple(records)
 
 
-def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
-         rebuild: rebuild_row.RebuildAnswer | None = None) -> ForYouSnapshot:
+def action_row(record: UserAction, requester: str) -> ForYouRow:
+    """Project one stored action for Review and the notifier."""
+    return ForYouRow(record.key, "action", record.title, record.command, record.machine, record.cwd,
+                     requester, record.reason, record.waits, record.created_at, record.status, record.completion,
+                     record.evidence or record.withdraw_reason, updated_at=record.updated_at,
+                     requester_reference=record.requested_by)
+
+
+def rebuild_config() -> Path:
+    return conf.path("statusline") if "CONF_DIR" in os.environ else rebuild_row.DEFAULT_CONFIG
+
+
+def source_paths() -> tuple[Path, ...]:
+    """Watch the native action sources and the rebuild comparison."""
+    config = rebuild_config()
+    paths = (ActionStore().folder, need.needs_folder(), need.needs_folder() / "done", config)
+    try:
+        return (*paths, rebuild_row.cache_path(config))
+    except (OSError, ValueError, KeyError):
+        return paths
+
+
+def _comparison_reason(machine: str, changes: Mapping[str, rebuild_row.ComparedChanges], configured: str) -> str:
+    change = changes.get(machine)
+    reason = "The running system differs from the configured system."
+    if change is not None:
+        if change.switch_revision.endswith("-dirty"):
+            return (f"The running system has local changes on {change.switch_revision[:7]}. "
+                    f"It differs from the configured revision {configured[:7]}.")
+        if change.commits:
+            return "\n".join(("Pending commits", *(f"{commit.commit[:7]} {commit.reason}" for commit in change.commits)))
+        reason += f" The running revision is {change.switch_revision[:7]}."
+    if configured:
+        reason += f" The configured revision is {configured[:7]}."
+    return reason
+
+
+def read(config: Path | None = None, *,
+         rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
+         include_comparison_reason: bool = True) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
+    config = rebuild_config() if config is None else config
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
     members_by_reference: dict[str, staff.StaffRow] = {}
     try:
-        members = staff.snapshot()
+        members = staff.snapshot() if members is None else members
         for member in members.rows:
             names[str(member.id)] = member.name
             members_by_reference[str(member.id)] = member
@@ -165,10 +226,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
     rows: list[ForYouRow] = []
     try:
         for record in ActionStore().list():
-            rows.append(ForYouRow(record.key, "action", record.title, record.command, record.machine, record.cwd,
-                                  names.get(record.requested_by, record.requested_by), record.reason, record.waits,
-                                  record.created_at, record.status, record.completion,
-                                  record.evidence or record.withdraw_reason))
+            rows.append(action_row(record, names.get(record.requested_by, record.requested_by)))
     except (OSError, ValueError) as error:
         unavailable.append(UnavailableSource("actions", str(error)))
 
@@ -219,6 +277,8 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
     except (OSError, ValueError, KeyError, TypeError) as error:
         unavailable.append(UnavailableSource("rebuild comparison", str(error)))
 
+    changes = (rebuild_row.read_compared_changes(config, answer)
+               if include_comparison_reason and comparison_current and compared else {})
     machines = {request.machine for request in (*pending, *history)} | set(compared)
     for machine in sorted(machines):
         active = tuple(request for request in pending if request.machine == machine)
@@ -227,56 +287,94 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
         status: Literal["open", "done", "unknown"] = (
             "open" if active or machine in compared else "done"
             if comparison_current and probes.succeeded(machine) and needs_available else "unknown")
-        current = active if active else completed
         reason = "\n".join(f"{request.reason} Requester: {request.requested_by or 'Not recorded'}. "
-                           + f"Concerns: {request.concerns or 'Not recorded'}." for request in current)
-        if machine in compared:
-            reason = (reason + "\n" if reason else "") + "The running system differs from the configured system."
+                           + f"Concerns: {request.concerns or 'Not recorded'}." for request in active)
+        if include_comparison_reason and machine in compared:
+            reason = (reason + "\n" if reason else "") + _comparison_reason(machine, changes, answer.configured_revision())
         rows.append(ForYouRow(
             f"rebuild/{machine}", "rebuild", f"Rebuild {machine}", "rebuild", machine, working_directories.get(machine, ""),
-            ", ".join(dict.fromkeys(request.requested_by for request in current if request.requested_by)),
+            ", ".join(dict.fromkeys(request.requested_by for request in active if request.requested_by)),
             reason, "; ".join(dict.fromkeys(request.waits for request in active)) or "Not recorded",
             requests[0].created_at if requests else "", status, "automatic",
             "\n".join(request.evidence for request in completed), requests))
-    return ForYouSnapshot(tuple(rows), tuple(unavailable))
+    return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines)
+
+
+def read_for_status_line(config: Path = rebuild_row.DEFAULT_CONFIG, *,
+                         rebuild: rebuild_row.RebuildAnswer | None = None) -> ForYouSnapshot:
+    """Keep the waiting rebuild names if a read exceeds the recursion limit."""
+    try:
+        return read(config, rebuild=rebuild, include_comparison_reason=False)
+    except RecursionError as error:
+        answer = rebuild if rebuild is not None else rebuild_row.read(config)
+        return ForYouSnapshot((), (UnavailableSource("For you", str(error)),), answer.machines)
 
 
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).open_count
+        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_comparison_reason=False).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"
 
 
-def console_action_count() -> str:
-    """Read the global count from the console host."""
+@dataclass(frozen=True)
+class ConsoleAddress:
+    host: str
+    port: int
+
+
+def console_address() -> ConsoleAddress:
+    """Use the host override or the Tailscale address of the console host, with the server port."""
+    host = os.environ.get("REVIEW_LINKS_HOST")
+    if not host:
+        peer = conf.read_or_repository("console").text("for_you.host")
+        address = subprocess.check_output(
+            ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
+        host = str(IPv4Address(address.strip()))
+    return ConsoleAddress(host, conf.read_or_repository("review_links").whole("server_port"))
+
+
+def _console_count_payload() -> dict[str, object]:
+    """Read the count view from the console host."""
     try:
-        host = os.environ.get("REVIEW_LINKS_HOST")
-        if not host:
-            peer = conf.read_or_repository("console").text("for_you.host")
-            address = subprocess.check_output(
-                ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
-            host = str(IPv4Address(address.strip()))
-        port = conf.read_or_repository("review_links").whole("server_port")
-        connection = HTTPConnection(host, port, timeout=2)
+        address = console_address()
+        connection = HTTPConnection(address.host, address.port, timeout=2)
         try:
             connection.request("GET", "/console/for-you.json?view=count")
             response = connection.getresponse()
             if response.status != 200:
-                return "unavailable"
+                return {}
             payload = cast(object, json.loads(response.read()))
         finally:
             connection.close()
     except (HTTPException, OSError, ValueError, subprocess.SubprocessError):
-        return "unavailable"
-    if isinstance(payload, dict):
-        fields = cast(dict[str, object], payload)
-        count = fields.get("count")
-        if fields.get("available") is True and type(count) is int and count >= 0:
-            return str(count)
-    return "unavailable"
+        return {}
+    return cast(dict[str, object], payload) if isinstance(payload, dict) else {}
+
+
+def console_action_count() -> str:
+    """Read the global count from the console host."""
+    fields = _console_count_payload()
+    count = fields.get("count")
+    return str(count) if fields.get("available") is True and type(count) is int and count >= 0 else "unavailable"
+
+
+def console_status_line_actions() -> StatusLineActions:
+    """Read the rebuild machines and other action count from the console host."""
+    fields = _console_count_payload()
+    machines = fields.get("rebuild_machines")
+    supplied = cast(list[object], machines) if isinstance(machines, list) else []
+    rebuilds = tuple(machine for machine in rebuild_row.MACHINES if machine in supplied)
+    if fields.get("available") is True:
+        if "other_count" not in fields and "rebuild_machines" not in fields:
+            count = fields.get("count")
+        else:
+            count = fields.get("other_count")
+        if type(count) is int and count >= 0:
+            return StatusLineActions(rebuilds, count)
+    return StatusLineActions(rebuilds)
 
 
 def action_count(source: str, rebuild: rebuild_row.RebuildAnswer | None = None) -> str:

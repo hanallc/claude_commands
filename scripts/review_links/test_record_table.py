@@ -50,7 +50,7 @@ window.fetch=(path,options={})=>{
   const liveRow=row=>document.querySelector('[data-list-item][data-key="'+CSS.escape(row.dataset.key)+'"]');
   const open=row=>{
    row=liveRow(row);
-   if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
    return row;
   };
   const startSave=async row=>{
@@ -58,7 +58,7 @@ window.fetch=(path,options={})=>{
    for(const animation of animations) animation.finish();
    await Promise.allSettled(animations.map(animation=>animation.finished));
    row=open(row);
-   const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
+   const form=action==='works' ? await readyReviewCard(row) : recordDetails(row).querySelector('form');
    const settled=new Promise(resolve=>{
     const observe=new MutationObserver(()=>{
      if(!form.dataset.sending){observe.disconnect();resolve();}
@@ -87,7 +87,7 @@ window.fetch=(path,options={})=>{
   };
   const failure=(row,reason)=>{
    // A lost Remove restores the row. Collapse it to check the table notice.
-   if(action==='remove' && !row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(action==='remove' && recordIsOpen(row)) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,
@@ -184,20 +184,20 @@ assert.deepEqual(changes,['two']);
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        _, start, callbacks = review_page.SCRIPT.partition('function matches(entry,')
-        callbacks = start + callbacks.split("\naddEventListener('scroll'", 1)[0]
-        callbacks = callbacks.replace('const view=createRecordTable(', 'const view=createStaticTable(')
+        _, start, rest = review_page.SCRIPT.partition('function allEntries(){')
+        table_script = start + rest.partition('\nasync function afterRowAnimations(')[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
- setAttribute(key,value){this[key]=value;},
+ setAttribute(key,value){this[key]=value;},getAttribute(key){return this[key] ?? null;},
  toggleAttribute(key,present){if(present)this[key]='';else delete this[key];return present;},
  classList:{toggle(){}},
  addEventListener(type,listener){this[type]=listener;}});
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
 const search=element();
+const actionNotices={...element(),children:[]};
 const makeChips=(group,values)=>values.map(value=>{
  const count=element();
  return {...element(),dataset:{[group+'Chip']:value},
@@ -215,27 +215,29 @@ const rows=[
  {key:'other/C9',state:'Done',type:'change',owner:'two',parked:'false'},
 ].map((data,index)=>{
  const detail=element(),toggle=element(),row=element();
- return {...element(),dataset:{...data,order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()},
+ const dataset={...data,id:data.key,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
+  order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()};
+ return {...element(),dataset,
   querySelector:selector=>selector==='[data-detail]' ? detail : selector==='.list-toggle' ? toggle : row};
 });
-const index=new Map(rows.map(({dataset})=>[dataset.key,{...dataset,id:dataset.key,
- hiddenUntil:dataset.parked==='true' ? Date.now()+60000 : 0}]));
+const index=new Map(rows.map(({dataset})=>[dataset.key,dataset]));
 const table={append(){},addEventListener(){},getAttribute:()=> 'Review'};
 const content={
  dataset:{},addEventListener(){},
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
-  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
+  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice,'[data-for-you-notices]':actionNotices})[selector],
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
-const document={createElement:element};
+const document={createElement:element,getElementById:()=>null};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,pendingSaves=new Map(),saved=new Map();
-let selectedShow='all';
-const reviewPlace=()=>{},loadBodies=()=>{},allEntries=()=>[...index.values()];
-const summary=()=>{throw new Error('The static fixture must use its existing rows.');};
-function createStaticTable(options){return createRecordTable({...options,entries:undefined,mount:undefined});}
-''' + record_table.SCRIPT + '\n' + callbacks + r'''
+const reviewPlace=()=>{},loadBodies=()=>{},rememberItem=()=>{};
+''' + record_table.SCRIPT + r'''
+const createTable=createRecordTable;
+{
+const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});
+''' + table_script + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
  view.opened.add('sdlc/C1830');view.apply(false);
@@ -250,7 +252,7 @@ if(closedItem){
 console.log(JSON.stringify({
  itemInUrl:new URLSearchParams(history.url?.split('#')[1]).get('item'),
  shown:rows.filter(row=>!row.hidden).map(row=>row.dataset.key),
- expanded:rows.filter(row=>!row.querySelector('[data-detail]').hidden).map(row=>row.dataset.key),
+ expanded:rows.filter(recordIsOpen).map(row=>row.dataset.key),
  missing:notice && !notice.hidden ? notice.textContent : '',
  counts:Object.fromEntries(shows.map(chip=>[chip.dataset.showChip,chip.querySelector('b').textContent])),
  chips:Object.fromEntries(chips.map(chip=>[chip.dataset.typeChip,chip.querySelector('b').textContent])),
@@ -259,6 +261,7 @@ console.log(JSON.stringify({
   return [value,(value || 'All')+' ('+chip.querySelector('b').textContent+')'];
  })),
 }));
+}
 '''
         result = subprocess.run([node, '-e', source], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)

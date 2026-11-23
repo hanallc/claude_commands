@@ -1,10 +1,8 @@
 """Real-Git acceptance tests for the standing gate checkout contract."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping
-from contextvars import copy_context
-from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr
 import fcntl
 import io
 import json
@@ -18,21 +16,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from threading import Event
 import unittest
 from typing import ClassVar, TextIO, cast, override
 from unittest import mock
 
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.build_queue.admission_test_support import AdmissionFixture
-from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.copies.workspace_test_support import registered_workspace
+from scripts.build_queue import slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
+from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
 from scripts.mac_test import floor_claims, offload
@@ -40,6 +37,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.lib import removal_guard
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
@@ -47,20 +45,6 @@ from scripts.production.staff_test_support import isolated_staff_file, fixture_m
 SSH_SOURCE_TRUST = copies.SshSourceTrust(trusted_caller=offload.trusted_linux_source, trusted_root=nix_env.trusted_root,
                                         registered_worktree=nix_env.registered_worktree)
 
-
-class WaitNotice(io.StringIO):
-    """Signal when the third caller has announced its blocking acquisition."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.noticed: Event = Event()
-
-    @override
-    def write(self, text: str) -> int:
-        count = super().write(text)
-        if "wait" in self.getvalue().lower():
-            self.noticed.set()
-        return count
 
 
 class ImportTests(unittest.TestCase):
@@ -100,7 +84,8 @@ class StandingTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="copies-source-seed-"))).resolve()
+        root = Path(tempfile.mkdtemp(prefix="copies-source-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, root)
         home = root / "home"
         home.mkdir()
         environment = {key: value for key, value in os.environ.items()
@@ -127,7 +112,8 @@ class StandingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.base = Path(tempfile.mkdtemp(prefix="copies-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.base)
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
@@ -141,7 +127,6 @@ locks.probe_retry_seconds=1
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 names.suffix_length=8
-patterns.editable={repository}-{owner}/{purpose}
 patterns.legacy-stable={purpose}
 patterns.legacy-unique={purpose}{suffix}
 patterns.scratch={purpose}-{suffix}
@@ -159,7 +144,6 @@ record_lock_attempts=3
 repo_depth=3
 repo_skip=target node_modules .git
 suffix_length=6
-visible_root={home / 'rust/repro'}
 """)
         _ = write_config_fixture(configuration / "nix_env.conf", """\
 command_timeout_seconds=600
@@ -199,10 +183,11 @@ source_check_seconds=1
                          "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10", "guard_choice_limit": "32"}
         self.write_config(self.settings)
-        # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
+        # The test's gates lease their own Cargo cache.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_")
-                       and key not in ("UNIT_RUN_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR")}
+                       if not key.startswith(("GIT_", "COPIES_STEP_")) and key not in (
+                           "UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR", "COPIES_RUN_PID",
+                           "BASH_ENV", "STAFF_CONFIG")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
@@ -226,19 +211,7 @@ source_check_seconds=1
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
         self.source = self.base / "checkout"
         self.source_seed.copy_to(self.source, self.base / "origin.git")
-        self.gates = slot_configuration.slots
-
-    @contextmanager
-    def queue_service(self) -> Generator[AdmissionFixture]:
-        original = dict(os.environ)
-        service_root = self.base / "admission-service"
-        service_root.mkdir()
-        configuration = Path(original["CONF_DIR"]) / "build_admission.conf"
-        _ = (service_root / "build_admission.conf").write_text(configuration.read_text())
-        with AdmissionFixture(root=service_root) as fixture:
-            fixture.clock.epoch = time.time()
-            with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), fixture.serving():
-                yield fixture
+        self.gates = self.base / "build/origin/copy-owner"
 
     def lease_machine(self) -> str:
         from scripts.buildlog.store import host_name
@@ -246,7 +219,12 @@ source_check_seconds=1
         return host_name()
 
     def write_config(self, settings: Mapping[str, str]) -> None:
-        _ = self.configuration.write_text("[copies]\n" + "".join(f"{key}={value}\n" for key, value in settings.items()))
+        lines = ["[copies]"]
+        for key, value in settings.items():
+            if key == "git_timeout_seconds":
+                lines.append("# range: 5e-324..")
+            lines.append(f"{key}={value}")
+        _ = self.configuration.write_text("\n".join(lines) + "\n")
 
     def git(self, path: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(path), *arguments], capture_output=True,
@@ -280,10 +258,10 @@ source_check_seconds=1
                 self.assertEqual(result.returncode, 0, result.stderr)
                 folder, owner = cast(list[str], json.loads(location.read_text()))
                 self.assertEqual(owner, str(unit.id))
-                self.assertFalse(Path(folder).exists())
-                self.assertFalse(self.gates.exists())
+                self.assertEqual(Path(folder), self.gates / "1")
+                self.assertEqual(build_folders.build_folder_state(Path(folder)), "free")
                 with copies.standing(owner, self.source, copies.CommittedSource(self.head)) as tree:
-                    self.assertEqual(self.lease(tree)["unit"], self.owner_id)
+                    self.assertEqual(self.lease(tree)["unit"], self.gates.name)
                 removed = self.cli("remove")
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 self.assertTrue(tree.exists())
@@ -296,39 +274,26 @@ source_check_seconds=1
                 merge = copies.MergeRevision(self.git(self.source, "rev-parse", "HEAD")) if merging else copies.NO_MERGE
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource(revision), merge=merge, step=step) as tree:
                     lease = self.lease(tree)
-                    self.assertEqual(lease["unit"], self.owner_id)
+                    self.assertEqual(lease["unit"], tree.parent.name)
                     self.assertEqual((lease["work"], lease["purpose"]), (step, purpose))
 
-    def test_a_renamed_unit_reuses_and_removes_its_copy_without_changing_the_folder(self) -> None:
-        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-            _ = (tree / "target/artifact").write_text("warm")
-        before = self.snapshot(tree)
+    def test_a_renamed_unit_uses_its_current_name(self) -> None:
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as original:
+            _ = (original / "target/artifact").write_text("warm")
         _ = staff.rename(staff.StaffId(self.owner_id), "renamed")
-        listing = io.StringIO()
-        with redirect_stdout(listing):
-            copies.list_trees()
-        self.assertIn("\trenamed\t", listing.getvalue())
-        self.assertEqual(self.snapshot(tree), before)
-        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as reused:
-            self.assertEqual(reused, tree)
-            self.assertEqual(reused, tree)
-            self.assertEqual((reused / "target/artifact").read_text(), "warm")
-        copies.remove_trees(self.owner_id)
-        self.assertTrue(tree.exists())
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as renamed:
+            self.assertEqual(renamed, original.parent.with_name("renamed") / "1")
+            self.assertEqual((original / "target/artifact").read_text(), "warm")
 
-    def test_same_named_units_have_separate_folders_and_removal(self) -> None:
+    def test_distinct_units_use_their_own_first_copy(self) -> None:
         parent = fixture_member("showrunner", name="another-production")
-        other = fixture_member("unit", name="copy-owner", parent=parent.id)
+        other = fixture_member("unit", name="other-owner", parent=parent.id)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(str(other.id), self.source, copies.CommittedSource(self.head)) as second:
-                self.assertNotEqual(first, second)
-                self.assertEqual(first.name, "origin-slot1")
-                self.assertEqual(second.name, "origin-slot2")
-        copies.remove_trees(self.owner_id)
-        self.assertTrue(first.exists())
+                self.assertEqual(first, self.gates / "1")
+                self.assertEqual(second, self.gates.with_name("other-owner") / "1")
         with copies.standing(str(other.id), self.source, copies.CommittedSource(self.head)) as reused:
-            self.assertNotEqual(reused, second)
-            self.assertEqual(reused, first)
+            self.assertEqual(reused, second)
             self.assertEqual(self.git(reused, "rev-parse", "HEAD"), self.head)
 
     def test_a_role_keeps_its_copy_when_a_staff_row_changes_name(self) -> None:
@@ -381,7 +346,6 @@ source_check_seconds=1
         output = self.base / "slot-tree"
         args = copies.CopyArguments()
         args.tree = requested_tree
-        args.capacity_file = str(self.base / "capacity")
         args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "slot-command", str(output)]
         with mock.patch.object(copies, "git", side_effect=git):
             self.assertEqual(copies.run_slot_step(self.source, args), 0)
@@ -393,30 +357,10 @@ source_check_seconds=1
         tree = self.git(self.source, "rev-parse", "HEAD^{tree}")
         output = self.base / "slot-head"
         result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
-                          "--capacity-file", str(self.base / "capacity"), "--", "sh", "-eu", "-c",
+                          "--", "sh", "-eu", "-c",
                           'git rev-parse HEAD > "$1"', "slot-command", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text().strip(), self.head)
-
-    def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
-        _ = write_config_fixture(self.base / "config/build_folders.conf",
-            f"# whole: 1..\nslots.{self.lease_machine()}.origin.max=1\n")
-        marker = self.base / "not-started"
-        gate = self.base / "merge_gate.py"
-        _ = gate.write_text("import sys; from pathlib import Path; Path(sys.argv[1]).touch()")
-        with self.queue_service() as fixture:
-            def expire_after_wait(reply: wire.Reply) -> wire.Reply:
-                if isinstance(reply, wire.RepositorySlotWaiting):
-                    fixture.clock.advance(60)
-                return reply
-
-            with mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait):
-                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                    result = self.run_cli(command=(sys.executable, str(gate), str(marker)))
-        self.assertEqual(result.returncode, 75, result.stderr)
-        self.assertIn("wait ended for origin", result.stderr)
-        self.assertIn("slots.", result.stderr)
-        self.assertFalse(marker.exists())
 
     def lease(self, tree: Path) -> dict[str, object]:
         return cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))
@@ -446,7 +390,7 @@ source_check_seconds=1
     def test_fresh_gate_holds_the_commit_and_lock_then_removes_its_task_folder(self) -> None:
         base = self.fresh_base()
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(base)) as tree:
-            self.assertEqual(tree, self.gates / 'origin-slot1')
+            self.assertEqual(tree, self.gates / '1')
             self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), base)
             self.assertEqual(build_folders.build_folder_state(tree), 'held')
             self.assertEqual(list(scratch.registered_copy_paths()), [])
@@ -458,9 +402,9 @@ source_check_seconds=1
         base = self.fresh_base()
         _ = staff.rename(staff.StaffId(self.owner_id), 'unit.test')
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(base)) as tree:
-            self.assertEqual(tree.name, 'origin-slot1')
+            self.assertEqual(tree.name, '1')
             self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), base)
-            self.assertEqual(self.lease(tree)['unit'], self.owner_id)
+            self.assertEqual(self.lease(tree)['unit'], tree.parent.name)
             listing = self.cli('list')
             self.assertIn('unit.test', listing.stdout)
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
@@ -511,8 +455,8 @@ source_check_seconds=1
             with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as second:
                 second_output = Path(os.environ['CARGO_BUILD_BUILD_DIR'])
                 self.assertNotEqual(first_output, second_output)
-                self.assertEqual(first_output, self.base / 'cargo' / first.name)
-                self.assertEqual(second_output, self.base / 'cargo' / second.name)
+                self.assertEqual(first_output, first / "target")
+                self.assertEqual(second_output, second / "target")
                 for tree in (first, second):
                     self.assertFalse((tree / 'target').is_symlink())
                     self.assertEqual(self.git(tree, 'status', '--porcelain'), '')
@@ -525,15 +469,15 @@ source_check_seconds=1
         outer = str(self.base / "cargo" / "outer-slot1")
         with mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": outer}):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
-                self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(self.base / 'cargo' / first.name))
+                self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(first / "target"))
             self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], outer)
         for output in (str(self.base / "explicit-output"), "relative-output"):
             with self.subTest(output=output), mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": output}):
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
-                    self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], output)
-                    with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')):
-                        self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], output)
-                    self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], output)
+                    self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(first / "target"))
+                    with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as second:
+                        self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(second / "target"))
+                    self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(first / "target"))
 
     def test_rescued_workspace_retry_removes_unchanged_source_and_keeps_new_edits(self) -> None:
         for changed in (False, True):
@@ -544,13 +488,14 @@ source_check_seconds=1
                 manifest = self.base / f"{name}.json"
                 _ = manifest.write_text(json.dumps({"version": 2, "canonical": str(self.source), "base": self.head,
                     "crates": {"saved": {"checkout": str(tree), "stage": "abandoned"}}}))
-                with copies.workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
-                                      task=task, run_manifest=manifest):
+                created: dict[Path, os.stat_result] = {}
+                with registered_workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
+                                      task=task, run_manifest=manifest, on_create=created.__setitem__):
                     _ = (tree / "tracked.txt").write_text("saved dirty workspace\n")
                 with (mock.patch.object(copies, "rescue_workspace", wraps=copies.rescue_workspace) as rescue,
                       mock.patch.object(scratch, "remove", side_effect=OSError("stop after intent"))):
                     with self.assertRaisesRegex(copies.CopyError, "stop after intent"):
-                        copies.end_workspaces(task, [tree])
+                        copies.end_workspaces(task, [tree], created=created)
                     rescue.assert_called_once()
                 self.assertTrue(scratch.removal_mark(tree).is_file())
                 if changed:
@@ -558,9 +503,9 @@ source_check_seconds=1
                 with mock.patch.object(copies, "rescue_workspace", side_effect=AssertionError("duplicate rescue")):
                     if changed:
                         with self.assertRaisesRegex((copies.CopyError, scratch.ScratchError), "uncommitted changes"):
-                            copies.end_workspaces(task, [tree])
+                            copies.end_workspaces(task, [tree], created=created)
                     else:
-                        copies.end_workspaces(task, [tree])
+                        copies.end_workspaces(task, [tree], created=created)
                 if changed:
                     self.assertEqual((tree / "tracked.txt").read_text(), "new edit after rescue\n")
                     self.assertTrue(scratch.removal_mark(tree).is_file())
@@ -583,12 +528,14 @@ source_check_seconds=1
                 for key in ("user.name", "user.email"):
                     _ = self.git(source, "config", key, self.git(self.source, "config", key))
                 name = f"rescue-{source_gone}-{export_failure}"
+                task = f"gate:{name}"
                 tree = copies.workspace_path(self.owner_id, source, name)
                 manifest = self.base / f"{name}.json"
                 _ = manifest.write_text(json.dumps({"version": 2, "canonical": str(source), "base": self.head,
                     "crates": {"saved": {"checkout": str(tree), "stage": "abandoned"}}}))
-                with copies.workspace(self.owner_id, source, self.head, name=name, branch="worker",
-                                      task=f"gate:{name}", run_manifest=manifest):
+                created: dict[Path, os.stat_result] = {}
+                with registered_workspace(self.owner_id, source, self.head, name=name, branch="worker",
+                                      task=task, run_manifest=manifest, on_create=created.__setitem__):
                     _ = (tree / "tracked.txt").write_text("unpublished clean commit\n")
                     _ = self.git(tree, "commit", "-qam", "workspace commit")
                     tip = self.git(tree, "rev-parse", "HEAD")
@@ -611,10 +558,10 @@ source_check_seconds=1
                 if export_failure:
                     with mock.patch.object(copies, "git", side_effect=refuse_export):
                         with self.assertRaisesRegex(copies.CopyError, "stash rescue export refused"):
-                            copies.end_workspaces(f"gate:{name}", [tree])
+                            copies.end_workspaces(task, [tree], created=created)
                     self.assertTrue(tree.exists())
                     self.assertEqual(self.git(tree, "reflog", "show", "--format=%H", "refs/stash").splitlines(), stashes)
-                copies.end_workspaces(f"gate:{name}", [tree])
+                copies.end_workspaces(task, [tree], created=created)
                 self.assertFalse(tree.exists())
                 root = copy_record.copies_root()
                 destination = (root.with_name(root.name + "-rescues.git") if source_gone
@@ -670,7 +617,7 @@ source_check_seconds=1
     def test_fresh_gate_removal_failure_preserves_the_caller_exception(self) -> None:
         base = self.fresh_base()
         failure = ValueError('the gate failed')
-        tree = self.gates / 'origin-slot1'
+        tree = self.gates / '1'
         with self.assertRaises(ValueError) as raised:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(base)) as held:
                 self.assertEqual(held, tree)
@@ -681,8 +628,14 @@ source_check_seconds=1
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
     def test_clone_cli_creates_a_task_owned_checkout_without_a_root_busy_mark(self) -> None:
-        result = self.cli("clone", str(self.source), "--task", "gate:camera", "--name", "camera")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = ("clone", str(self.source), "--task", "gate:camera")
+        blocked_registry = self.base / "unwritable-registry"
+        blocked_registry.touch()
+        self.write_config({**self.settings, "remote_registry": str(blocked_registry)})
+        with self.subTest(holder="unwritable registry"):
+            result = self.cli(*arguments, "--name", "camera")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.write_config(self.settings)
         checkout = Path(result.stdout.strip())
         self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
@@ -693,9 +646,173 @@ source_check_seconds=1
         self.assertIs(record.fields["test_hana_clone"], True)
         self.assertEqual(record.fields["source_path"], str(self.source))
         self.assertEqual(record.fields["source_commit"], self.git(checkout, "rev-parse", "HEAD"))
-        self.assertEqual(scratch.end("gate:camera"), [checkout])
-        self.assertFalse(checkout.exists())
+        self.assertEqual([entry.path for entry in scratch.end("gate:camera")], [checkout])
+        self.assertTrue(checkout.is_dir())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+        for holder in ("gone", "implicit owner", "live", "registration exited", "another owner",
+                       "another host", "reused", "unreadable", "malformed start", "replaced clone",
+                       "protected checkout", "wrong clone path", "invalid repository", "same owner replacement",
+                       "unusual start", "session command", "lease after setup", "implicit lease after setup"):
+            with self.subTest(holder=holder), tempfile.TemporaryDirectory(prefix="lease case ",
+                                                                         dir=checkout.parent) as directory, \
+                    mock.patch.dict(os.environ, {copy_record.ROOT_ENV: directory}), ExitStack() as scope:
+                root = Path(directory)
+                self.write_config({**self.settings, "remote_registry": str(root / "mirrors")})
+                owner = "another-owner" if holder == "another owner" else self.owner_id
+                saved_session = "--flag-like" if holder == "session command" else "fixture"
+                parent = root
+                setup: list[Path] = []
+                if holder == "session command":
+                    session_root = root / "sessions"
+                    parent = session_root / "clone maker"
+                    parent.mkdir(parents=True)
+                    _ = cast(object, scope.enter_context(mock.patch.dict(os.environ, {session_folder.ROOT_ENV: str(session_root)})))
+                if holder in ("lease after setup", "implicit lease after setup"):
+                    owner_options = ("--owner", owner) if holder == "lease after setup" else ()
+                    result = self.cli(*arguments, "--name", "previous", "--repository", "origin",
+                                      "--session", saved_session, *owner_options)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    completed = Path(result.stdout.strip())
+                    self.assertEqual((completed / "tracked.txt").read_text(), "source HEAD\n")
+                    setup.append(completed)
+                with self.clone_lease_fixture(parent, owner, saved_session, setup, second=holder == "gone") as (maker, existing):
+                    assert maker.stdin is not None
+                    if holder not in ("live", "registration exited"):
+                        maker.stdin.close()
+                        self.assertEqual(maker.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                    tree = existing[0]
+                    if holder in ("registration exited", "protected checkout", "wrong clone path", "malformed start",
+                                  "invalid repository", "another host", "same owner replacement"):
+                        # The registrar runs separately from the folder lease holder.
+                        registration = subprocess.run([
+                            sys.executable, str(Path(copies.__file__).resolve()), "register-remote",
+                            "--host", "localhost", "--path", str(tree), "--owner", owner,
+                            "--repository", "origin", "--session", "fixture",
+                        ], text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(registration.returncode, 0, registration.stderr)
+                    if holder in ("reused", "unreadable", "malformed start", "unusual start"):
+                        fields = copies.clone_lease_fields(tree)
+                        if holder == "unreadable":
+                            fields["pid"] = "unknown"
+                        elif holder == "malformed start":
+                            fields.update(pid=os.getpid(), process_start="bad identity")
+                        elif holder == "unusual start":
+                            current = process_start.process_start(os.getpid())
+                            assert isinstance(current, process_start.Started)
+                            fields.update(pid=os.getpid(), process_start=(
+                                "0" + current.start if os.uname().sysname == "Linux" else "Sun Feb 31 22:00:00 2020"))
+                        else:
+                            fields.update(pid=os.getpid(), process_start=(
+                                "0" if os.uname().sysname == "Linux" else "Wed Nov  4 22:00:00 2020"))
+                        _ = build_folders.lease_path(tree).write_text(json.dumps(fields))
+                    elif holder in ("another host", "invalid repository"):
+                        path = copies.remote_record_path(copies.RemoteMirror(owner, copies.SelectedRepository("origin"),
+                                                                           "localhost", str(tree), saved_session))
+                        fields = cast(dict[str, object], json.loads(path.read_text()))
+                        if holder == "another host":
+                            fields["host"] = "other-host"
+                        else:
+                            del fields["repo"]
+                        _ = path.write_text(json.dumps(fields))
+                    elif holder == "replaced clone":
+                        copies.mark_mirror(tree, "another-owner", "origin", "fixture")
+                    elif holder == "same owner replacement":
+                        copies.mark_mirror(tree, owner, "origin", "replacement")
+                        copies.register_scratch_clone(tree, copies.CloneSource.UNAPPROVED,
+                                                     owner=owner, repository="origin", session="replacement")
+                    elif holder == "wrong clone path":
+                        _ = scratch.update_record(tree, lambda current: {
+                            **(current.fields if isinstance(current, copy_record.Registered) else {}),
+                            "clone_path": str(root / "different clone"),
+                        })
+
+                    if holder in ("gone", "implicit owner", "reused", "session command", "lease after setup",
+                                  "implicit lease after setup"):
+                        before = sorted(root.rglob("*"))
+                        contents = self.snapshot(root)
+                        owner_options = () if holder in ("implicit owner", "implicit lease after setup") else ("--owner", self.owner_id)
+                        result = self.cli(*arguments, "--name", "camera", *owner_options)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        lines = result.stderr.splitlines()
+                        self.assertEqual(lines[1:1 + len(existing)], [str(path) for path in existing])
+                        self.assertEqual(lines[1 + len(existing)], "Run one removal command per path.")
+                        commands = [shlex.split(line) for line in lines[2 + len(existing):]]
+                        session_options = ([f"--session={saved_session}"] if holder == "session command"
+                                           else ["--session", saved_session])
+                        self.assertEqual(commands, [[
+                            "~/.claude/scripts/lib/py", "~/.claude/scripts/copies/copies.py", "mirror-remove",
+                            "--path", str(path), "--owner", self.owner_id, "--repository", "origin",
+                            *session_options, "--host", "localhost",
+                        ] for path in existing])
+                        for path, command in zip(existing, commands, strict=True):
+                            removal = copies.parse_copy_arguments(command[2:])
+                            self.assertEqual((removal.action, removal.path, removal.owner, removal.repository,
+                                              removal.session, removal.host),
+                                             ("mirror-remove", str(path), self.owner_id, "origin", saved_session, "localhost"))
+                        self.assertEqual(sorted(root.rglob("*")), before)
+                        self.assertEqual(self.snapshot(root), contents)
+                    else:
+                        # The name check runs after the guard and before Git creates another clone.
+                        options = [*arguments, "--name", "invalid/name"]
+                        result = invoke_cli(copies, lambda: copies.main(options), options, dict(os.environ),
+                                            tree if holder == "protected checkout" else self.base)
+                        self.assertIn("a name is letters, digits, - and _", result.stderr)
+
+    @contextmanager
+    def clone_lease_fixture(self, root: Path, owner: str, session: str, setup: list[Path], *, second: bool
+                            ) -> Generator[tuple[subprocess.Popen[str], list[Path]]]:
+        """Hold real folder leases until the fixture closes the maker's input."""
+        program = """
+import json
+from contextlib import ExitStack
+from pathlib import Path
+import sys
+import time
+from scripts.copies import copies
+from scripts.lib import build_folders, scratch
+
+root, owner, session, *names = sys.argv[1:]
+with ExitStack() as leases:
+    paths = []
+    for name in names:
+        if Path(name).is_absolute():
+            checkout = Path(name)
+            spec = build_folders.BuildFolderSpec(kind="legacy-stable", parent=checkout.parent,
+                                                suffix_length=0, purpose=checkout.name, owner=owner)
+            path = leases.enter_context(build_folders.leased_build_folder(spec))
+        else:
+            spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=Path(root),
+                                                suffix_length=0, suffix=copies.clone_owner_prefix(owner) + name, owner=owner)
+            path = leases.enter_context(build_folders.leased_build_folder(spec))
+            scratch.write_record(path, "gate:previous", time.time())
+            copies.register_scratch_clone(path, copies.CloneSource.UNAPPROVED, owner=owner,
+                                         repository="origin", session=session)
+            copies.mark_mirror(path, owner, "origin", session)
+            copies.record_clone_setup_lease(path)
+        paths.append(str(path))
+    print(json.dumps(paths), flush=True)
+    sys.stdin.read(1)
+"""
+        names = tuple(map(str, setup)) if setup else ("old-clone-1", "old-clone-2") if second else ("old-clone",)
+        maker: subprocess.Popen[str] = subprocess.Popen(
+            [sys.executable, "-c", program, str(root), owner, session, *names],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        with maker:
+            assert maker.stdout is not None and maker.stdin is not None
+            output = cast(TextIO, maker.stdout)
+            self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "The maker did not report the leases.")
+            line = output.readline()
+            self.assertTrue(line, "The maker exited before it reported the leases.")
+            paths = [Path(path) for path in cast(list[str], json.loads(line))]
+            try:
+                yield maker, paths
+            finally:
+                if not maker.stdin.closed:
+                    maker.stdin.close()
+                    self.assertEqual(maker.wait(timeout=TEST_HANG_GUARD_SECS), 0)
 
     def test_task_end_during_clone_setup_keeps_completion_fields(self) -> None:
         task = "gate:clone-setup"
@@ -703,7 +820,7 @@ source_check_seconds=1
         initialize = copies.initialize_git
 
         def end_during_setup(path: Path, source: Path) -> None:
-            self.assertEqual(scratch.end(task, now=ended), [])
+            self.assertEqual([entry.path for entry in scratch.end(task, now=ended)], [path])
             self.assertTrue(path.is_dir())
             initialize(path, source)
 
@@ -955,14 +1072,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(build_folders.build_folder_state(checkout), "held")
                 with scratch.busy_path(checkout).open("rb") as other, self.assertRaises(BlockingIOError):
                     fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                result = scratch.end(task)
-                self.assertEqual(result, [])
-                self.assertEqual(result.kept, [scratch.KeptFolder(checkout, scratch.BUSY_REASON)])
+                result = scratch.remove_task_copy(checkout, task, time.time())
+                self.assertEqual(result, scratch.KeptFolder(checkout, scratch.BUSY_REASON))
                 self.assertTrue(checkout.is_dir())
                 release.close()
                 self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not exit")
                 self.assertEqual(ready.read(), "")
-                self.assertEqual(scratch.end(task), [checkout])
+                self.assertTrue(scratch.end_copy(checkout, task, time.time()))
                 self.assertFalse(checkout.exists())
             finally:
                 release.close()
@@ -974,7 +1090,8 @@ with patch.object(subprocess, 'run', pause_clone):
         task = "gate:retry-source"
         clone = copies.clone(self.source, task, "source")
         with mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")):
-            self.assertTrue(scratch.end(task).kept)
+            with self.assertRaisesRegex(OSError, "stop after removal intent"):
+                _ = scratch.remove_task_copy(clone, task, time.time())
         self.assertTrue(scratch.removal_mark(clone).is_file())
         busy = scratch.busy_path(clone)
         busy.unlink()
@@ -989,9 +1106,8 @@ with patch.object(subprocess, 'run', pause_clone):
         work = clone / "new-work" / scratch.BUSY
         work.parent.mkdir()
         _ = work.write_text("Keep this file")
-        kept = scratch.end(task)
-        self.assertEqual(kept, [])
-        self.assertTrue(kept.kept)
+        kept = scratch.remove_task_copy(clone, task, time.time())
+        self.assertIsInstance(kept, scratch.KeptFolder)
         self.assertEqual(work.read_text(), "Keep this file")
         work.unlink()
         work.parent.rmdir()
@@ -1008,7 +1124,7 @@ with patch.object(subprocess, 'run', pause_clone):
             remove(path)
 
         with mock.patch.object(scratch, "remove", side_effect=check_retry):
-            self.assertEqual(scratch.end(task), [clone])
+            self.assertTrue(scratch.end_copy(clone, task, time.time()))
         self.assertFalse(scratch.removal_mark(clone).exists())
         self.assertFalse(destination.exists())
 
@@ -1189,14 +1305,19 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertFalse(task_mark.exists())
         self.assertFalse(cargo_mark.exists())
 
-    def test_temporary_sweep_clears_clone_trust(self) -> None:
+    def test_temporary_review_keeps_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:sweep-trust")
         self.add_clone_project_settings(checkout, paths)
+        before = tuple(path.read_bytes() for path in paths)
         entry = tmp_sweep.RemovableEntry(str(checkout), str(checkout.parent), time.time(), 1)
-        self.assertTrue(tmp_sweep.remove_entry(entry, tmp_sweep.Sweep(), False))
-        self.assertFalse(checkout.exists())
-        self.assert_clone_project_removed(checkout, paths)
+        result = tmp_sweep.Sweep()
+        plan = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
+        self.assertFalse(tmp_sweep.remove_entry(entry, result, False, plan=plan))
+        self.assertEqual(list(plan.rows), [checkout])
+        self.assertTrue(checkout.is_dir())
+        self.assertEqual(result.kept.get("manual review"), [str(checkout)])
+        self.assertEqual(tuple(path.read_bytes() for path in paths), before)
 
     def test_folder_audit_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
@@ -1210,10 +1331,10 @@ with patch.object(subprocess, 'run', pause_clone):
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:end-trust")
         self.add_clone_project_settings(checkout, paths)
-        self.assertEqual(scratch.end("gate:end-trust"), [checkout])
+        self.assertTrue(scratch.end_copy(checkout, "gate:end-trust", time.time()))
         self.assert_clone_project_removed(checkout, paths)
 
-    def test_mirror_metadata_allows_task_cleanup_but_user_changes_keep_the_clone(self) -> None:
+    def test_mirror_removal_checks_for_user_changes(self) -> None:
         for state in ("untracked", "tracked"):
             with self.subTest(state=state):
                 task = f"gate:mirror-work-{state}"
@@ -1225,19 +1346,16 @@ with patch.object(subprocess, 'run', pause_clone):
                 work = checkout / ("new-work.txt" if state == "untracked" else "tracked.txt")
                 original = work.read_text() if work.exists() else ""
                 _ = work.write_text("user work in a registered mirror")
-                output, error = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(error):
-                    code = scratch.main(["end", "--task", task])
-                self.assertNotEqual(code, 0)
+                result = scratch.remove_task_copy(checkout, task, time.time())
+                self.assertIsInstance(result, scratch.KeptFolder)
+                assert isinstance(result, scratch.KeptFolder)
                 self.assertEqual(work.read_text(), "user work in a registered mirror")
-                self.assertIn("uncommitted changes", error.getvalue())
-                self.assertNotIn(f"removed {checkout}", output.getvalue())
+                self.assertIn("uncommitted changes", result.reason)
                 if state == "untracked":
                     work.unlink()
                 else:
                     _ = work.write_text(original)
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    self.assertEqual(scratch.main(["end", "--task", task]), 0)
+                self.assertTrue(scratch.end_copy(checkout, task, time.time()))
                 self.assertFalse(checkout.exists())
 
     def test_old_mirror_cleanup_checks_user_work_without_metadata_exclusions(self) -> None:
@@ -1266,22 +1384,19 @@ with patch.object(subprocess, 'run', pause_clone):
                     _ = work.write_text(json.dumps({**fields, "user_note": "keep this work"}))
                 elif state != "clean":
                     _ = work.write_text("keep this work")
-                output, error = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(error):
-                    code = scratch.main(["end", "--task", task])
+                result = scratch.remove_task_copy(checkout, task, time.time())
                 if state == "clean":
-                    self.assertEqual(code, 0, error.getvalue())
+                    self.assertIsInstance(result, scratch.RemovedCopy)
                     self.assertFalse(checkout.exists())
-                    self.assertIn(f"removed {checkout}", output.getvalue())
                 else:
-                    self.assertNotEqual(code, 0)
+                    self.assertIsInstance(result, scratch.KeptFolder)
+                    assert isinstance(result, scratch.KeptFolder)
                     self.assertTrue(checkout.is_dir())
-                    self.assertIn("uncommitted changes", error.getvalue())
-                    self.assertNotIn(f"removed {checkout}", output.getvalue())
+                    self.assertIn("uncommitted changes", result.reason)
                     self.assertIn("keep this work", work.read_text())
                     self.assertFalse(scratch.removal_mark(checkout).exists())
 
-    def test_task_end_retains_the_clone_when_a_read_only_account_denies_trust_removal(self) -> None:
+    def test_removal_keeps_the_clone_when_a_read_only_account_denies_trust_removal(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:denied-trust")
         _ = self.enterContext(fake_cargo_output_roots(CargoOutputRoots(checkout, checkout / "target", checkout / "target")))
@@ -1289,30 +1404,22 @@ with patch.object(subprocess, 'run', pause_clone):
         blocked.chmod(0o444)
         blocked.parent.chmod(0o555)
         try:
-            output, error = io.StringIO(), io.StringIO()
-            with redirect_stdout(output), redirect_stderr(error):
-                code = scratch.main(["end", "--task", "gate:denied-trust"])
-            self.assertNotEqual(code, 0)
+            with self.assertRaisesRegex(scratch.ScratchError, "PermissionError") as failure:
+                _ = scratch.remove_task_copy(checkout, "gate:denied-trust", time.time())
             self.assertTrue(checkout.is_dir())
             self.assertFalse(scratch.removal_mark(checkout).exists())
-            self.assertIn(f"kept {checkout}", error.getvalue())
-            self.assertIn(str(blocked), error.getvalue())
-            self.assertIn("PermissionError", error.getvalue())
+            self.assertIn(str(blocked), str(failure.exception))
             self.assertIn(str(checkout.resolve()), self.trust_projects(blocked))
-            self.assertNotIn(f"removed {checkout}", output.getvalue())
         finally:
             blocked.parent.chmod(0o755)
             blocked.chmod(0o640)
-        output, error = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(error):
-            code = scratch.main(["end", "--task", "gate:denied-trust"])
-        self.assertEqual((code, error.getvalue()), (0, ""))
+        self.assertTrue(scratch.end_copy(checkout, "gate:denied-trust", time.time()))
         self.assertFalse(checkout.exists())
         self.assertFalse(scratch.removal_mark(checkout).exists())
         for path in paths:
             self.assertNotIn(str(checkout.resolve()), self.trust_projects(path))
 
-    def test_task_end_rechecks_unsaved_work_after_a_denied_trust_write(self) -> None:
+    def test_removal_rechecks_unsaved_work_after_a_denied_trust_write(self) -> None:
         paths = self.clone_trust_files()
         task = "gate:retry-unsaved"
         checkout = copies.clone(self.source, task)
@@ -1322,12 +1429,9 @@ with patch.object(subprocess, 'run', pause_clone):
         blocked.parent.chmod(0o555)
         work = checkout / "new-work.txt"
         try:
-            output, error = io.StringIO(), io.StringIO()
-            with redirect_stdout(output), redirect_stderr(error):
-                code = scratch.main(["end", "--task", task])
-            self.assertNotEqual(code, 0)
+            with self.assertRaisesRegex(scratch.ScratchError, "PermissionError"):
+                _ = scratch.remove_task_copy(checkout, task, time.time())
             self.assertTrue(checkout.is_dir())
-            self.assertIn("PermissionError", error.getvalue())
             record = scratch.task_of(checkout)
             assert isinstance(record, copy_record.Registered)
             self.assertEqual(record.fields["claude_trust_folder"], str(checkout.resolve()))
@@ -1335,24 +1439,20 @@ with patch.object(subprocess, 'run', pause_clone):
         finally:
             blocked.parent.chmod(0o755)
             blocked.chmod(0o640)
-        output, error = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(error):
-            code = scratch.main(["end", "--task", task])
-        self.assertNotEqual(code, 0)
+        result = scratch.remove_task_copy(checkout, task, time.time())
+        self.assertIsInstance(result, scratch.KeptFolder)
+        assert isinstance(result, scratch.KeptFolder)
         self.assertEqual(work.read_text(), "work written after the failed trust update")
-        self.assertIn(f"kept {checkout}", error.getvalue())
-        self.assertIn("uncommitted changes", error.getvalue())
-        self.assertNotIn(f"removed {checkout}", output.getvalue())
+        self.assertIn("uncommitted changes", result.reason)
         self.assertFalse(scratch.removal_mark(checkout).exists())
         self.assertIn(str(checkout.resolve()), self.trust_projects(blocked))
         work.unlink()
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            self.assertEqual(scratch.main(["end", "--task", task]), 0)
+        self.assertTrue(scratch.end_copy(checkout, task, time.time()))
         self.assertFalse(checkout.exists())
         for path in paths:
             self.assertNotIn(str(checkout.resolve()), self.trust_projects(path))
 
-    def test_task_end_rechecks_unsaved_work_after_cargo_output_cleanup_refuses(self) -> None:
+    def test_removal_rechecks_unsaved_work_after_cargo_review_fails(self) -> None:
         task = "gate:retry-cargo-cleanup"
         checkout = copies.clone(self.source, task)
         cache = self.base / "external-cargo-output"
@@ -1360,47 +1460,32 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = (cache / "output").write_text("saved build output")
         roots = CargoOutputRoots(checkout, checkout / "target", cache)
         _ = self.enterContext(fake_cargo_output_roots(roots))
-        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.base / "cargo-state")}))
-        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
+        with mock.patch.object(scratch, "cargo_checkout_peers", return_value=()):
+            with (mock.patch.object(removal_guard.RemovalList, "publish", side_effect=OSError("Cargo review failed")),
+                  self.assertRaisesRegex(OSError, "Cargo review failed")):
+                _ = scratch.remove_task_copy(checkout, task, time.time())
+            self.assertTrue(checkout.is_dir())
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            work = checkout / "new-work.txt"
+            _ = work.write_text("work written after Cargo review failed")
 
-        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
-            self.assertEqual(saved[0].roots, roots)
-            folder_audit.clean_checkout_cargo_output(path)
-
-        with (mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
-              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])),
-              mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean)):
-            with (cache / ".cargo-lock").open("w") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                output, error = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(error):
-                    code = scratch.main(["end", "--task", task])
-                self.assertNotEqual(code, 0)
-                self.assertIn("Cargo output is locked", error.getvalue())
-                self.assertTrue(checkout.is_dir())
-                self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
-                work = checkout / "new-work.txt"
-                _ = work.write_text("work written after Cargo cleanup refused")
-
-            output, error = io.StringIO(), io.StringIO()
-            with redirect_stdout(output), redirect_stderr(error):
-                code = scratch.main(["end", "--task", task])
-            self.assertNotEqual(code, 0)
-            self.assertTrue(work.is_file(), "The retry must retain work written after the refusal.")
-            self.assertEqual(work.read_text(), "work written after Cargo cleanup refused")
-            self.assertIn(f"kept {checkout}", error.getvalue())
-            self.assertIn("uncommitted changes", error.getvalue())
-            self.assertNotIn(f"removed {checkout}", output.getvalue())
+            result = scratch.remove_task_copy(checkout, task, time.time())
+            self.assertIsInstance(result, scratch.KeptFolder)
+            assert isinstance(result, scratch.KeptFolder)
+            self.assertEqual(work.read_text(), "work written after Cargo review failed")
+            self.assertIn("uncommitted changes", result.reason)
             self.assertFalse(scratch.removal_mark(checkout).exists())
             self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
             self.assertEqual((cache / "output").read_text(), "saved build output")
 
             work.unlink()
-            output, error = io.StringIO(), io.StringIO()
-            with redirect_stdout(output), redirect_stderr(error):
-                self.assertEqual(scratch.main(["end", "--task", task]), 0, error.getvalue())
+            self.assertTrue(scratch.end_copy(checkout, task, time.time()))
         self.assertFalse(checkout.exists())
-        self.assertFalse(cache.exists())
+        self.assertEqual((cache / "output").read_text(), "saved build output")
+        [plan] = (Path.home() / removal_guard.LIST_DIRECTORY).glob("*.jsonl")
+        [line] = plan.read_text().splitlines()
+        row = removal_guard.ListedEntry.parse(line)
+        self.assertEqual((row.tool, row.path, row.fingerprint), (removal_guard.Tool.CARGO, cache, ""))
         self.assertFalse(scratch.removal_mark(checkout).exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
@@ -1434,7 +1519,7 @@ with patch.object(subprocess, 'run', pause_clone):
         record = scratch.task_of(folder)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["claude_trust_folder"], str(folder.resolve()))
-        self.assertEqual(scratch.end("gate:stop-before-trust"), [folder])
+        self.assertTrue(scratch.end_copy(folder, "gate:stop-before-trust", time.time()))
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
     def test_removal_without_a_recorded_trust_key_keeps_account_trust(self) -> None:
@@ -1442,7 +1527,7 @@ with patch.object(subprocess, 'run', pause_clone):
         checkout = copies.clone(self.source, "gate:no-trust-field")
         self.assertIsInstance(accounts.set_claude_folder_trust(checkout, trusted=True), accounts.FolderTrustComplete)
         before = {path: path.read_bytes() for path in paths}
-        self.assertEqual(scratch.end("gate:no-trust-field"), [checkout])
+        self.assertTrue(scratch.end_copy(checkout, "gate:no-trust-field", time.time()))
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
     def test_clone_trust_key_survives_task_transfer_and_renewal(self) -> None:
@@ -1477,7 +1562,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_workspace_selects_a_detached_commit_that_exists_only_in_its_shared_source(self) -> None:
         source, commit = self.shared_source_commit()
-        with copies.workspace(self.owner_id, source, commit, name="detached", branch="worker") as tree:
+        with registered_workspace(self.owner_id, source, commit, name="detached", branch="worker") as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
             self.assertEqual((tree / "tracked.txt").read_text(), "shared source commit\n")
             record = scratch.task_of(tree)
@@ -1497,8 +1582,8 @@ with patch.object(subprocess, 'run', pause_clone):
             records.append(record)
         self.assertNotEqual(records[0].task, records[1].task)
 
-        self.assertEqual(scratch.end(records[0].task), [checkouts[0]])
-        self.assertFalse(checkouts[0].exists())
+        self.assertEqual([entry.path for entry in scratch.end(records[0].task)], [checkouts[0]])
+        self.assertTrue(checkouts[0].is_dir())
         self.assertEqual((checkouts[1] / "tracked.txt").read_text(), "source HEAD\n")
         self.assertEqual(self.git(checkouts[1], "rev-parse", "HEAD"), self.head)
         self.assertEqual(scratch.task_of(checkouts[1]), records[1])
@@ -1522,8 +1607,8 @@ with patch.object(subprocess, 'run', pause_clone):
                          str((checkout / ".git").resolve()))
         self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
-        self.assertEqual(scratch.end("gate:symlink"), [checkout])
-        self.assertFalse(checkout.exists())
+        self.assertEqual([entry.path for entry in scratch.end("gate:symlink")], [checkout])
+        self.assertTrue(checkout.is_dir())
 
     def test_symlink_scratch_clone_refuses_foreign_git_directory(self) -> None:
         _ = self.symlink_scratch_root()
@@ -1552,9 +1637,9 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_borrower_order_resolves_stored_git_directory(self) -> None:
         alias = self.symlink_scratch_root()
-        with copies.workspace(self.owner_id, self.source, self.head, name="a-parent", branch="parent") as parent:
+        with registered_workspace(self.owner_id, self.source, self.head, name="a-parent", branch="parent") as parent:
             pass
-        with copies.workspace(self.owner_id, parent, self.head, name="z-child", branch="child") as child:
+        with registered_workspace(self.owner_id, parent, self.head, name="z-child", branch="child") as child:
             pass
         link = alias / "parent"
         link.symlink_to(parent, target_is_directory=True)
@@ -1569,7 +1654,7 @@ with patch.object(subprocess, 'run', pause_clone):
         before = {key: value for key, value in self.snapshot(self.source).items() if not key.startswith(".git/")}
         source_index = (self.source / ".git/index").read_bytes()
         with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")) as tree:
-            self.assertEqual(tree, self.gates / "origin-slot1")
+            self.assertEqual(tree, self.gates / "1")
             self.assertTrue(tree.is_relative_to(self.gates))
             self.assertFalse((tree / "target").is_symlink())
             self.assertTrue((tree / ".git").is_file())
@@ -1587,7 +1672,7 @@ with patch.object(subprocess, 'run', pause_clone):
         origin = self.git(self.source, "remote", "get-url", "origin")
         with ExitStack() as stack:
             trees = [stack.enter_context(copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head))),
-                     stack.enter_context(copies.workspace(self.owner_id, self.source, self.head,
+                     stack.enter_context(registered_workspace(self.owner_id, self.source, self.head,
                                                          name="upstream", branch="worker")),
                      copies.clone(self.source, task="gate:upstream", word="upstream")]
             for tree in trees:
@@ -1617,7 +1702,7 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/builds", self.published)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as standing:
             pass
-        with copies.workspace(self.owner_id, self.source, self.head, name="heal", branch="worker") as workspace:
+        with registered_workspace(self.owner_id, self.source, self.head, name="heal", branch="worker") as workspace:
             pass
         for tree in (workspace,):
             _ = self.git(tree, "remote", "set-url", "origin", str(self.source))
@@ -1627,7 +1712,7 @@ with patch.object(subprocess, 'run', pause_clone):
             _ = self.git(tree, "remote", "remove", "source")
         with ExitStack() as stack:
             trees = [stack.enter_context(copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head))),
-                     stack.enter_context(copies.workspace(self.owner_id, self.source, self.head,
+                     stack.enter_context(registered_workspace(self.owner_id, self.source, self.head,
                                                          name="heal", branch="worker"))]
             self.assertEqual(trees[0], standing)
             self.assertEqual(trees[0], standing)
@@ -1667,7 +1752,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_end_of_use_refreshes_source_branches_for_the_copy_sweep(self) -> None:
         with ExitStack() as stack:
             trees = [stack.enter_context(copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head))),
-                     stack.enter_context(copies.workspace(self.owner_id, self.source, self.head,
+                     stack.enter_context(registered_workspace(self.owner_id, self.source, self.head,
                                                          name="saved", branch="worker"))]
             incoming = self.incoming()
         self.assertTrue(trees[0].exists())
@@ -1679,7 +1764,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_source_without_origin_keeps_local_url_and_branch_tracking(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
         _ = self.git(self.source, "branch", "builds", self.head)
-        with copies.workspace(self.owner_id, self.source, self.head, name="no-origin", branch="no-origin") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="no-origin", branch="no-origin") as tree:
             self.assertEqual(self.git(tree, "remote", "get-url", "origin"), str(self.source))
             self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.head)
             self.assertEqual(self.git(tree, "remote", "get-url", "source"), str(self.source))
@@ -1690,14 +1775,14 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/retired", self.published)
         with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as standing:
             pass
-        with copies.workspace("verify-unit", self.source, self.head, name="refs", branch="worker") as workspace:
+        with registered_workspace("verify-unit", self.source, self.head, name="refs", branch="worker") as workspace:
             pass
         _ = self.git(self.source, "branch", "-D", "retired")
         _ = self.git(self.source, "update-ref", "-d", "refs/remotes/origin/retired")
         _ = self.git(self.source, "update-ref", "refs/remotes/origin/main", self.head)
         with ExitStack() as stack:
             trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
-                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                     stack.enter_context(registered_workspace("verify-unit", self.source, self.head,
                                                          name="refs", branch="worker"))]
             self.assertEqual(trees[0], standing)
             self.assertEqual(trees[0], standing)
@@ -1713,14 +1798,14 @@ with patch.object(subprocess, 'run', pause_clone):
         retired = self.incoming()
         with copies.standing("verify-unit", self.source, copies.CommittedSource(self.head)) as standing:
             pass
-        with copies.workspace("verify-unit", self.source, self.head, name="pruned", branch="worker") as workspace:
+        with registered_workspace("verify-unit", self.source, self.head, name="pruned", branch="worker") as workspace:
             pass
         _ = self.git(self.source, "branch", "-D", "incoming")
         _ = self.git(self.source, "reflog", "expire", "--expire=now", "--all")
         _ = self.git(self.source, "gc", "--prune=now")
         with ExitStack() as stack:
             trees = [stack.enter_context(copies.standing("verify-unit", self.source, copies.CommittedSource(self.head))),
-                     stack.enter_context(copies.workspace("verify-unit", self.source, self.head,
+                     stack.enter_context(registered_workspace("verify-unit", self.source, self.head,
                                                          name="pruned", branch="worker"))]
             self.assertEqual(trees[0], standing)
             self.assertEqual(trees[0], standing)
@@ -1768,59 +1853,22 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_held_first_tree_sends_second_caller_to_second_tree(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
-                self.assertEqual(second, first.with_name('origin-slot2'))
+                self.assertEqual(second, first.with_name('2'))
                 self.assertEqual(build_folders.build_folder_state(first), 'held')
                 self.assertEqual(build_folders.build_folder_state(second), 'held')
             self.assertEqual(build_folders.build_folder_state(second), 'free')
 
-    def test_third_caller_waits_for_first_without_creating_a_third_tree(self) -> None:
-        notice = WaitNotice()
-        def third_use() -> Path:
-            with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-                return tree
-        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
-            holder_context = copy_context()
-            with ExitStack() as primary:
-                first = holder_context.run(primary.enter_context, copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)))
-                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                    with redirect_stderr(notice):
-                        third = executor.submit(third_use)
-                        self.assertTrue(notice.noticed.wait(TEST_HANG_GUARD_SECS))
-                        self.assertFalse(third.done())
-                        self.assertIn('origin slot (2 of 2', notice.getvalue())
-                    holder_context.run(primary.close)
-                    _ = queue.run_pass()
-                    self.assertEqual(third.result(timeout=TEST_HANG_GUARD_SECS), first)
-        self.assertEqual(len([line for line in notice.getvalue().splitlines() if line.strip()]), 1)
-        self.assertEqual(sorted(path.name for path in self.gates.iterdir() if path.is_dir()),
-                         ['origin-slot1', 'origin-slot2'])
-
-    def test_waiting_caller_uses_second_tree_when_it_is_released_first(self) -> None:
-        notice = WaitNotice()
-        def third_use() -> Path:
-            with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-                return tree
-        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
-            with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
-                    with redirect_stderr(notice):
-                        third = executor.submit(third_use)
-                        self.assertTrue(notice.noticed.wait(TEST_HANG_GUARD_SECS))
-                        self.assertFalse(third.done())
-                _ = queue.run_pass()
-                self.assertEqual(third.result(timeout=TEST_HANG_GUARD_SECS), second)
-
     def test_configured_root_contains_only_the_two_standing_checkouts(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
-                self.assertEqual(first, self.gates / 'origin-slot1')
-                self.assertEqual(second, self.gates / 'origin-slot2')
+                self.assertEqual(first, self.gates / '1')
+                self.assertEqual(second, self.gates / '2')
                 self.assertEqual(sorted(path.name for path in self.gates.iterdir() if path.is_dir()),
-                                 ['origin-slot1', 'origin-slot2'])
+                                 ['1', '2'])
                 for tree in (first, second):
                     self.assertTrue((tree / '.git').is_file())
                     self.assertTrue((tree / 'tracked.txt').is_file())
-                    self.assertEqual(self.lease(tree)['unit'], self.owner_id)
+                    self.assertEqual(self.lease(tree)['unit'], tree.parent.name)
 
     def test_missing_or_invalid_required_configuration_refuses_before_clone(self) -> None:
         variants = [
@@ -1837,6 +1885,16 @@ with patch.object(subprocess, 'run', pause_clone):
                 result = self.run_cli()
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
+        for legacy in ("absent", "empty", "relative"):
+            with self.subTest(legacy_root=legacy):
+                settings = {key: value for key, value in self.settings.items() if key != "root"}
+                if legacy != "absent":
+                    settings["root"] = "" if legacy == "empty" else "unused-relative-root"
+                self.write_config(settings)
+                result = self.run_cli()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
+                    self.assertEqual(tree, self.gates / "1")
 
     def test_copy_roots_use_build_folders(self) -> None:
         scratch_root = self.base / "configured-scratch"
@@ -1854,7 +1912,7 @@ with patch.object(subprocess, 'run', pause_clone):
         linked = self.base / "linked-worktree"
         _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.published)
         with copies.standing(self.owner_id, linked, copies.CommittedSource("HEAD")) as tree:
-            self.assertEqual(tree, self.gates / "origin-slot1")
+            self.assertEqual(tree, self.gates / "1")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
             self.assertTrue((tree / ".git").is_file())
 
@@ -1902,15 +1960,15 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
         for source in (self.source, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
-                self.assertEqual(tree.name, "origin-slot1")
+                self.assertEqual(tree.name, "1")
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
-    def test_separate_git_directory_uses_the_main_checkout_without_origin(self) -> None:
+    def test_separate_git_directory_uses_the_main_checkout_origin(self) -> None:
         main = self.base / "widget"
         metadata = self.base / "state" / "widget-index"
         metadata.parent.mkdir()
         _ = self.git(self.base, "clone", "-q", "--separate-git-dir", str(metadata), str(self.source), str(main))
-        _ = self.git(main, "remote", "remove", "origin")
+        _ = self.git(main, "remote", "set-url", "origin", "https://example.invalid/widget.git")
         self.assertEqual(copies.repository_name(main), "widget")
         # Linked worktrees need the main path recorded when Git metadata lives elsewhere.
         _ = self.git(main, "config", "core.worktree", str(main))
@@ -1919,7 +1977,7 @@ with patch.object(subprocess, 'run', pause_clone):
         for source in (main, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
                 self.assertEqual(copies.main_checkout(source), main)
-                self.assertEqual(tree.name, "widget-slot1")
+                self.assertEqual(tree.name, "1")
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
     def test_gate_borrows_the_last_store_and_keeps_source_commits_after_clones_are_deleted(self) -> None:
@@ -1983,7 +2041,7 @@ with patch.object(subprocess, 'run', pause_clone):
         selector = self.base / "selector"
         _ = self.git(self.base, "clone", "-q", str(self.source), str(selector))
         _ = self.git(selector, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
-        with copies.workspace(self.owner_id, self.source, "HEAD", name="worker", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, "HEAD", name="worker", branch="worker") as tree:
             pass
         _ = self.git(tree, "repack", "-a", "-d")
         (tree / ".git/objects/info/alternates").unlink()
@@ -1993,7 +2051,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertFalse(tree.exists())
 
     def test_remove_reports_a_filesystem_failure_as_a_copy_error(self) -> None:
-        with copies.workspace(self.owner_id, self.source, 'HEAD', name='removal', branch='removal') as tree:
+        with registered_workspace(self.owner_id, self.source, 'HEAD', name='removal', branch='removal') as tree:
             pass
         with mock.patch.object(scratch, 'remove', side_effect=OSError('removal interrupted')):
             with self.assertRaisesRegex(copies.CopyError, 'removal interrupted'):
@@ -2004,10 +2062,23 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertFalse(tree.exists())
         self.assertIsInstance(scratch.pending_removal(tree), copy_record.NotRegistered)
 
+    def test_new_editable_workspace_points_to_the_worktree_tool(self) -> None:
+        destination = copies.workspace_path(self.owner_id, self.source, "new-editor")
+        for present in (False, True):
+            with self.subTest(present=present):
+                if present:
+                    destination.mkdir(parents=True)
+                with (self.assertRaisesRegex(copies.CopyError, "worktrees.py make <repo> <unit> <short-name>"),
+                      copies.workspace(self.owner_id, self.source, self.head, name="new-editor", branch="editor")):
+                    self.fail("an unregistered workspace reached the caller")
+                self.assertEqual(destination.exists(), present)
+                if present:
+                    self.assertEqual(list(destination.iterdir()), [])
+
     def test_workspace_records_ownership_and_preserves_edits_on_resume(self) -> None:
         name = "crate-run-package"
         branch = "style-crate/run/package"
-        with copies.workspace(self.owner_id, self.source, self.head, name=name, branch=branch) as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name=name, branch=branch) as tree:
             record = scratch.task_of(tree)
             self.assertIsInstance(record, copy_record.Registered)
             assert isinstance(record, copy_record.Registered)
@@ -2022,7 +2093,7 @@ with patch.object(subprocess, 'run', pause_clone):
             with scratch.busy_locks(tree, create=False) as idle:
                 self.assertFalse(idle)
             with self.assertRaisesRegex(copies.CopyError, "busy"):
-                with copies.workspace(self.owner_id, self.source, self.head, name=name, branch=branch):
+                with registered_workspace(self.owner_id, self.source, self.head, name=name, branch=branch):
                     self.fail("a concurrent caller entered the workspace")
         with copies.workspace(self.owner_id, self.source, self.head, name=name, branch=branch) as resumed:
             self.assertEqual(resumed, tree)
@@ -2057,16 +2128,16 @@ with patch.object(subprocess, 'run', pause_clone):
                     return result
                 with mock.patch.object(scratch, "register_copy", side_effect=register), mock.patch.object(copies, "git", side_effect=git):
                     with self.assertRaisesRegex(RuntimeError, "interrupted init"):
-                        with copies.workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker"):
+                        with registered_workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker"):
                             self.fail("initialization reached the caller")
                 record = scratch.task_of(tree)
                 assert isinstance(record, copy_record.Registered)
                 self.assertEqual(record.fields["copy_commit"], "")
                 self.assertEqual(copies.workspace_repository(record), copies.repository_name(self.source))
-                with copies.workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker") as resumed:
+                with registered_workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker") as resumed:
                     self.assertEqual(self.git(resumed, "rev-parse", "HEAD"), self.head)
                     _ = (resumed / "tracked.txt").write_text("finished workspace edit\n")
-                with copies.workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker") as resumed:
+                with registered_workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker") as resumed:
                     self.assertEqual((resumed / "tracked.txt").read_text(), "finished workspace edit\n")
 
     def test_workspace_reads_identity_after_the_checkout(self) -> None:
@@ -2080,11 +2151,11 @@ with patch.object(subprocess, 'run', pause_clone):
             return result
 
         with mock.patch.object(copies, "git", side_effect=git):
-            with copies.workspace(self.owner_id, self.source, self.head, name="identity", branch="worker") as tree:
+            with registered_workspace(self.owner_id, self.source, self.head, name="identity", branch="worker") as tree:
                 self.assertEqual(self.git(tree, "config", "user.name"), "Checkout Hook")
                 self.assertEqual(self.git(tree, "config", "user.email"), "hook@example.invalid")
 
-    def test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds(self) -> None:
+    def test_legacy_workspace_keeps_commits_index_journal_and_the_checkout_at_task_end(self) -> None:
         tree = self.base / "old-run/worker"
         tree.mkdir(parents=True)
         copies.initialize_git(tree, self.source)
@@ -2097,22 +2168,21 @@ with patch.object(subprocess, 'run', pause_clone):
         journal = tree / ".git/style-batch-intent.json"
         _ = journal.write_text("journal\n")
         _ = (tree / "pending.txt").write_text("pending\n")
-        with copies.workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker",
+        with registered_workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker",
                               task="gate:legacy-run", path=tree) as resumed:
             self.assertEqual(resumed, tree)
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
             self.assertEqual(self.git(tree, "diff", "--cached", "--name-only"), "tracked.txt")
             self.assertEqual(journal.read_text(), "journal\n")
             self.assertEqual((tree / "pending.txt").read_text(), "pending\n")
-        _ = self.git(self.source, "fetch", "-q", str(tree), "worker:refs/heads/legacy")
-        _ = self.git(tree, "reset", "--hard", self.head)
-        (tree / "pending.txt").unlink()
-        with copies.workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker",
-                              task="gate:legacy-run", path=tree):
-            pass
-        copies.end_workspaces("gate:legacy-run", [tree])
-        self.assertNotIn(str(tree), scratch.holds())
-        self.assertFalse(tree.exists())
+        with redirect_stderr(io.StringIO()) as errors:
+            copies.end_workspaces("gate:legacy-run", [tree])
+        self.assertGreater(scratch.holds()[str(tree)]["ended"], 0)
+        self.assertIn(f"kept for a manual removal list: {tree} (scratch, task gate:legacy-run ended)", errors.getvalue())
+        self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.git(tree, "diff", "--cached", "--name-only"), "tracked.txt")
+        self.assertEqual(journal.read_text(), "journal\n")
+        self.assertEqual((tree / "pending.txt").read_text(), "pending\n")
 
     def test_legacy_workspace_refuses_matching_relative_urls_for_different_repositories(self) -> None:
         tree = self.base / "old-run/worker"
@@ -2124,7 +2194,7 @@ with patch.object(subprocess, 'run', pause_clone):
             _ = self.git(repo, "remote", "set-url", "origin", "../origin.git")
 
         with self.assertRaisesRegex(copies.CopyError, "legacy workspace source differs"):
-            with copies.workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker", path=tree):
+            with registered_workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker", path=tree):
                 self.fail("the unrelated workspace reached the caller")
 
         self.assertIsInstance(scratch.task_of(tree), copy_record.NotRegistered)
@@ -2132,7 +2202,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(self.git(tree, "remote", "get-url", "origin"), "../origin.git")
 
     def test_workspace_uses_the_existing_copy_sweep(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.published,
+        with registered_workspace(self.owner_id, self.source, self.published,
                               name="sweep-package", branch="worker") as tree:
             self.assertIn(tree, list(scratch.copy_paths()))
             record = scratch.task_of(tree)
@@ -2144,7 +2214,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertFalse(tree.exists())
 
         with self.subTest(ended_workspace="unlinked native copy with unsaved work"):
-            with copies.workspace(self.owner_id, self.source, self.published,
+            with registered_workspace(self.owner_id, self.source, self.published,
                                   name="unsaved-sweep-package", branch="worker", task="gate:unlinked-run") as unsaved:
                 _ = (unsaved / "pending.txt").write_text("keep unsaved work\n")
             record = scratch.task_of(unsaved)
@@ -2159,12 +2229,12 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual((unsaved / "pending.txt").read_text(), "keep unsaved work\n")
 
     def test_workspace_refuses_another_base_or_branch_without_resetting(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="reserved", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="reserved", branch="worker") as tree:
             _ = (tree / "tracked.txt").write_text("keep these edits\n")
         for revision, branch in ((self.published, "worker"), (self.head, "other")):
             with self.subTest(revision=revision, branch=branch):
                 with self.assertRaises(copies.CopyError):
-                    with copies.workspace(self.owner_id, self.source, revision, name="reserved", branch=branch):
+                    with registered_workspace(self.owner_id, self.source, revision, name="reserved", branch=branch):
                         self.fail("a different request entered the workspace")
                 self.assertEqual((tree / "tracked.txt").read_text(), "keep these edits\n")
 
@@ -2178,9 +2248,9 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_worker_proof_uses_the_source_repository_gate_pool(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as frozen:
-            with copies.workspace(self.owner_id, self.source, self.head, name="package", branch="worker") as worker:
+            with registered_workspace(self.owner_id, self.source, self.head, name="package", branch="worker") as worker:
                 with copies.standing(self.owner_id, worker, copies.CommittedSource(self.head)) as proof:
-                    self.assertEqual(proof, frozen.with_name("origin-slot2"))
+                    self.assertEqual(proof, frozen.with_name("2"))
 
     def test_apply_uncommitted_captures_staged_unstaged_and_untracked(self) -> None:
         _ = (self.source / "tracked.txt").write_text("staged edit\n")
@@ -2266,7 +2336,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("tracked.txt", result.stdout + result.stderr)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-            self.assertEqual(tree, self.gates / "origin-slot1")
+            self.assertEqual(tree, self.gates / "1")
             self.assertEqual((tree / "tracked.txt").read_text(), "source HEAD\n")
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
             self.assertFalse((tree / ".git/MERGE_HEAD").exists())
@@ -2277,9 +2347,54 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("tracked.txt", result.stdout + result.stderr)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
-            self.assertEqual(tree, self.gates / "origin-slot1")
+            self.assertEqual(tree, self.gates / "1")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
+
+    def test_direct_cargo_uses_the_numbered_copy_and_its_lock(self) -> None:
+        cargo = self.base / "cargo"
+        _ = cargo.write_text(f"#!{sys.executable}\n" + dedent("""\
+            import os
+            import sys
+            from pathlib import Path
+
+            assert sys.argv[1] == "test"
+            assert Path(os.environ["CARGO_TARGET_DIR"]) == Path.cwd() / "target"
+            os.fstat(int(os.environ["NUMBERED_COPY_LOCK_FD"]))
+            Path(sys.argv[2]).write_text(str(Path.cwd()))
+            """))
+        cargo.chmod(0o700)
+        evidence = self.base / "cargo-cwd"
+        result = self.run_cli(command=(str(cargo), "test", str(evidence)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(evidence.read_text().strip()).resolve(), self.gates / "1")
+
+    def test_run_publishes_identical_bytes_after_a_repeat_build(self) -> None:
+        program = dedent("""\
+            import os
+            import sys
+            from pathlib import Path
+
+            path = Path(os.environ["CARGO_TARGET_DIR"]) / "debug/artifact"
+            content = b"same artifact"
+            if sys.argv[1] == "repeat":
+                assert path.read_bytes() == content
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            """)
+        cargo = self.base / "cargo"
+        _ = cargo.write_text('#!/bin/sh\nexec "$@"\n')
+        cargo.chmod(0o700)
+        for build in ("first", "repeat"):
+            with self.subTest(build=build):
+                result = self.run_cli("--publish", "target/debug/artifact",
+                                      command=(str(cargo), sys.executable, "-c", program, build))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = [line for line in result.stdout.splitlines() if line.startswith("published: ")]
+                self.assertEqual(len(lines), 1, result.stderr)
+                path, commit = lines[0].removeprefix("published: ").rsplit(" ", 1)
+                self.assertEqual(commit, self.head)
+                self.assertEqual(Path(path).read_bytes(), b"same artifact")
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
@@ -2299,13 +2414,14 @@ with patch.object(subprocess, 'run', pause_clone):
             + "str(Path('target').resolve())]))",
             "sys.exit(int(sys.argv[4]))",
         ])
-        slot_program = dedent("""\
-            python=$1 script=$2 capacity=$3
-            shift 3
+        verifier = self.base / "verify.sh"
+        _ = verifier.write_text(dedent("""\
+            python=$1 script=$2
+            shift 2
             tree=$(git write-tree)
             exec "$python" "$script" hold --repo "$COPIES_STEP_SOURCE" --tree "$tree" \
-                --capacity-file "$capacity" -- "$python" -c "$@"
-            """)
+                -- "$python" -c "$@"
+            """))
         slot_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
             "Path('target/debug/broken')", "(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/broken')")
         cases = (
@@ -2328,6 +2444,9 @@ with patch.object(subprocess, 'run', pause_clone):
         )
         for label, requested, command_exit, apply in cases:
             with self.subTest(case=label):
+                previous_target = self.gates / "1/target"
+                if previous_target.is_dir():
+                    shutil.rmtree(previous_target)
                 options = [part for path in requested for part in ("--publish", path)]
                 if apply:
                     _ = (self.source / "untracked.txt").write_text("gate publication\n")
@@ -2360,8 +2479,8 @@ with patch.object(subprocess, 'run', pause_clone):
                             path.write_bytes(b"replacement")
                             """)
                     result = self.run_cli(*options, command=(
-                        "sh", "-eu", "-c", slot_program, "copies-test-slot", sys.executable,
-                        str(Path(copies.__file__).resolve()), str(self.base / "capacity"), slot_command, *arguments,
+                        "sh", "-eu", str(verifier), sys.executable,
+                        str(Path(copies.__file__).resolve()), slot_command, *arguments,
                     ))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
@@ -2377,7 +2496,8 @@ with patch.object(subprocess, 'run', pause_clone):
                     else:
                         self.assertEqual(len(published), 1, result.stderr)
                         self.assertEqual(published[0].read_bytes(), b"binary\x00x")
-                    self.assertEqual(old.read_bytes(), b"old binary")
+                    expected = b"binary\x00x" if label in ("retained-slot-file", "touched-slot-file") else b"old binary"
+                    self.assertEqual(old.read_bytes(), expected)
                     continue
                 if label in ("explicit-target-dir", "two-changed-target-dirs"):
                     inherited = self.base / label
@@ -2388,12 +2508,12 @@ with patch.object(subprocess, 'run', pause_clone):
                         "Path(relative)", "Path(sys.argv[-1]) / Path(relative).relative_to('target')",
                     ).replace("Path('target/debug/broken')", "(Path(sys.argv[-1]) / 'debug/broken')")
                     target_directory = "target"
-                    inherited_bytes = b"stale inherited binary"
                     if label == "two-changed-target-dirs":
-                        target_directory = "override"
-                        inherited_bytes = b"new inherited binary"
+                        target_directory = "target/override"
                         target_program = ("import os; from pathlib import Path\n"
-                            + "Path(os.environ['CARGO_TARGET_DIR'], 'debug/x').write_bytes(b'new inherited binary')\n"
+                            + "path = Path(os.environ['CARGO_TARGET_DIR'], 'debug/x')\n"
+                            + "path.parent.mkdir(parents=True, exist_ok=True)\n"
+                            + "path.write_bytes(b'new default binary')\n"
                             + target_program)
                     with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(inherited)}):
                         result = self.run_cli(*options, command=(
@@ -2404,16 +2524,15 @@ with patch.object(subprocess, 'run', pause_clone):
                                  for line in result.stdout.splitlines() if line.startswith("published: ")]
                     self.assertEqual(len(published), 1, result.stderr)
                     self.assertEqual(published[0].read_bytes(), b"binary\x00x")
-                    self.assertEqual(stale.read_bytes(), inherited_bytes)
+                    self.assertEqual(stale.read_bytes(), b"stale inherited binary")
                     continue
                 result = self.run_cli(*options, command=(sys.executable, "-c", program, *arguments))
                 self.assertEqual(result.returncode, command_exit, result.stderr)
                 row = cast(list[str], json.loads(output.read_text()))
                 checkout = Path(row[0])
                 self.assertEqual(row, [str(checkout), f"checkout={checkout}/tracked.txt"])
-                self.assertEqual(checkout.name, "source")
-                self.assertFalse(checkout.exists())
-                self.assertFalse(self.gates.exists())
+                self.assertEqual(checkout, self.gates / "1")
+                self.assertEqual(build_folders.build_folder_state(checkout), "free")
                 commit, target = cast(list[str], json.loads(evidence.read_text()))
                 self.assertEqual(Path(target), checkout / "target")
                 if apply:
@@ -2505,9 +2624,9 @@ with patch.object(subprocess, 'run', pause_clone):
                     before = self.snapshot(tree)
                     result = self.cli('list')
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(tree.name, 'origin-slot1')
+                    self.assertEqual(tree.name, '1')
                     self.assertEqual(self.snapshot(tree), before)
-                    self.assertIn('renamed' if staff_read == 'readable' else 'unavailable', result.stdout)
+                    self.assertIn(f"\t{tree.parent.name}\t", result.stdout)
 
     def test_remove_refuses_busy_tree_then_deletes_both_idle_trees_and_repeats(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
@@ -2528,7 +2647,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_owner_removal_deletes_a_gate_while_its_workspace_is_live(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as gate:
             pass
-        with copies.workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
             with self.assertRaises(copies.CopyError) as refusal:
                 copies.remove_trees(self.owner_id)
             self.assertIn(str(tree), str(refusal.exception))
@@ -2545,7 +2664,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_preserves_a_gate_and_its_busy_workspace_borrower(self) -> None:
         gate = self.idle_gate_source()
-        with copies.workspace(self.owner_id, gate, self.head, name='borrower', branch='worker') as tree:
+        with registered_workspace(self.owner_id, gate, self.head, name='borrower', branch='worker') as tree:
             with self.assertRaises(copies.CopyError) as refusal:
                 copies.remove_trees(self.owner_id)
             self.assertIn(str(tree), str(refusal.exception))
@@ -2557,7 +2676,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_deletes_an_idle_workspace_before_its_gate_source(self) -> None:
         gate = self.idle_gate_source()
-        with copies.workspace(self.owner_id, gate, self.head, name="borrower", branch="worker") as tree:
+        with registered_workspace(self.owner_id, gate, self.head, name="borrower", branch="worker") as tree:
             pass
         copies.remove_trees(self.owner_id)
         self.assertFalse(tree.exists())
@@ -2565,7 +2684,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_preserves_a_gate_borrowed_by_another_owners_workspace(self) -> None:
         gate = self.idle_gate_source()
-        with copies.workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
+        with registered_workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
             pass
         copies.remove_trees(self.owner_id)
         self.assertTrue(gate.exists())
@@ -2576,7 +2695,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_reads_relative_alternates_despite_a_damaged_workspace_record(self) -> None:
         gate = self.idle_gate_source()
-        with copies.workspace(self.owner_id, gate, self.head, name='borrower', branch='worker') as tree:
+        with registered_workspace(self.owner_id, gate, self.head, name='borrower', branch='worker') as tree:
             pass
         objects = tree / '.git/objects'
         common = Path(self.git(gate, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
@@ -2591,7 +2710,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_checks_the_borrowed_path_of_a_gate_tombstone(self) -> None:
         gate = self.idle_gate_source()
-        with copies.workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
+        with registered_workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
             pass
         legacy = self.base / 'old-gate.removing'
         legacy.mkdir(parents=True)
@@ -2618,7 +2737,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_remove_cli_reports_a_kept_workspace_and_a_removed_gate(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as gate:
             pass
-        with copies.workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
             result = self.cli("remove")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn(str(tree), result.stderr)
@@ -2629,7 +2748,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_owner_removal_reports_each_workspace_with_unsaved_work_on_a_separate_line(self) -> None:
         trees: list[Path] = []
         for name in ("first", "second"):
-            with copies.workspace(self.owner_id, self.source, self.head, name=name, branch="worker") as tree:
+            with registered_workspace(self.owner_id, self.source, self.head, name=name, branch="worker") as tree:
                 _ = (tree / "tracked.txt").write_text(f"unsaved {name}\n")
                 trees.append(tree)
         with self.assertRaises(copies.CopyError) as refusal:
@@ -2654,14 +2773,14 @@ with patch.object(subprocess, 'run', pause_clone):
             pass
         with copies.standing(self.owner_id, other, copies.CommittedSource("HEAD")) as second:
             pass
-        with copies.workspace(self.owner_id, self.source, self.head,
+        with registered_workspace(self.owner_id, self.source, self.head,
                               name="worker", branch="worker") as worker:
             pass
         legacy = self.base / "legacy-run/worker"
         legacy.mkdir(parents=True)
         copies.initialize_git(legacy, self.source)
         _ = self.git(legacy, "checkout", "-q", "-B", "legacy", self.head)
-        with copies.workspace(self.owner_id, self.source, self.head, name="legacy", branch="legacy",
+        with registered_workspace(self.owner_id, self.source, self.head, name="legacy", branch="legacy",
                               task="gate:legacy-run", path=legacy):
             pass
         with copies.standing("other-unit", self.source, copies.CommittedSource(self.head)) as kept:
@@ -2680,7 +2799,7 @@ with patch.object(subprocess, 'run', pause_clone):
         copies.remove_trees(self.owner_id)
 
     def test_owner_removal_retries_busy_and_interrupted_trees_without_a_source(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name='removal-retry', branch='removal-retry') as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name='removal-retry', branch='removal-retry') as tree:
             result = self.cli('remove')
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('busy', result.stderr)
@@ -2698,7 +2817,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(self.cli('remove').returncode, 0)
 
     def test_owner_removal_finishes_a_deleted_editable_copy(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head,
+        with registered_workspace(self.owner_id, self.source, self.head,
                               name="deleted-worker", branch="worker") as tree:
             pass
         record = scratch.task_of(tree)
@@ -2722,7 +2841,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(self.cli("remove").returncode, 0)
 
     def test_busy_editable_copy_identifies_its_holder(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head,
+        with registered_workspace(self.owner_id, self.source, self.head,
                               name="busy-worker", branch="worker") as tree:
             with mock.patch.object(sessions, "running_sessions", return_value=[]):
                 result = self.cli("remove")
@@ -2734,7 +2853,7 @@ with patch.object(subprocess, 'run', pause_clone):
         other = ImmutableGitSeed.create(self.base / "other", "main", "Gate Tests",
                                         "gate-tests@example.invalid", {"Cargo.toml": "[workspace]\n", "other.txt": "content"}).checkout
         other = other.rename(other.with_name("unrelated-repository"))
-        with copies.workspace(self.owner_id, other, "HEAD", name="other-worker", branch="worker") as kept:
+        with registered_workspace(self.owner_id, other, "HEAD", name="other-worker", branch="worker") as kept:
             pass
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             pass
@@ -2762,7 +2881,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertTrue(tree.exists())
 
     def test_owner_removal_allows_an_ordinary_copy_with_a_crate_name(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="crate-notes", branch="notes") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="crate-notes", branch="notes") as tree:
             pass
         copies.remove_trees(self.owner_id)
         self.assertFalse(tree.exists())
@@ -2776,10 +2895,10 @@ with patch.object(subprocess, 'run', pause_clone):
                           "active": {"checkout": str(active), "stage": "selected"}}
                 manifest = {"version": 2, "canonical": str(self.source), "base": self.head, "crates": crates}
                 _ = manifest_path.write_text(json.dumps(manifest))
-                with copies.workspace(self.owner_id, self.source, self.head, name=name,
+                with registered_workspace(self.owner_id, self.source, self.head, name=name,
                                       branch="worker", run_manifest=manifest_path):
                     pass
-                with copies.workspace(self.owner_id, self.source, self.head, name=name + "-active",
+                with registered_workspace(self.owner_id, self.source, self.head, name=name + "-active",
                                       branch="worker", run_manifest=manifest_path):
                     pass
                 with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
@@ -2792,14 +2911,67 @@ with patch.object(subprocess, 'run', pause_clone):
                 copies.remove_trees(self.owner_id)
                 self.assertFalse(active.exists())
 
+    def test_owner_removal_preserves_a_crate_copy_without_terminal_evidence(self) -> None:
+        name = "crate-recovery"
+        tree = copies.workspace_path(self.owner_id, self.source, name)
+        manifest_path = self.base / "crate-recovery.json"
+        manifest = json.dumps({
+            "version": 2, "canonical": str(self.source), "base": self.head,
+            "crates": {"sample": {"checkout": str(tree), "stage": "selected"}},
+        })
+        _ = manifest_path.write_text(manifest)
+        with registered_workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
+                                  run_manifest=manifest_path) as worker:
+            self.assertEqual(worker, tree)
+        _ = scratch.hold(tree, f"gate:{name}", copies.LEGACY_WORKER_HOLD_REASON)
+        scratch.hand_over(tree, self.owner_id, "gate:changed-task")
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+
+        with self.subTest(evidence="blank run link"):
+            _ = scratch.update_record(tree, lambda _: {**record.fields, "crate_run": ""})
+            with self.assertRaisesRegex(copies.CopyError, "repair crate run link"):
+                copies.remove_trees(self.owner_id)
+            self.assertTrue(tree.is_dir())
+            self.assertEqual(manifest_path.read_text(), manifest)
+            self.assertIn(str(tree), scratch.holds())
+        _ = scratch.update_record(tree, lambda _: record.fields.copy())
+
+        for evidence in ("missing", "corrupt"):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    manifest_path.unlink()
+                else:
+                    _ = manifest_path.write_text("{invalid")
+                with self.assertRaisesRegex(copies.CopyError, "repair crate run") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertTrue(tree.is_dir())
+            _ = manifest_path.write_text(manifest)
+
+        with mock.patch.object(scratch, "remove", side_effect=OSError("interrupted removal")):
+            with self.assertRaisesRegex(OSError, "interrupted removal"):
+                scratch.remove_marked(tree)
+        marker = scratch.removal_mark(tree)
+        saved = marker.read_bytes()
+        for missing in (tree / ".git", tree):
+            with self.subTest(missing=missing.name):
+                shutil.rmtree(missing)
+                with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertEqual(marker.read_bytes(), saved)
+                self.assertEqual(manifest_path.read_text(), manifest)
+                self.assertEqual(tree.exists(), missing != tree)
+
     def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:
+        with registered_workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:
             pass
         child = self.base / "adopted/borrower"
         child.mkdir(parents=True)
         copies.initialize_git(child, parent)
         _ = self.git(child, "checkout", "-q", "-B", "borrower", self.head)
-        with copies.workspace("other-unit", parent, self.head, name="borrower", branch="borrower", path=child):
+        with registered_workspace("other-unit", parent, self.head, name="borrower", branch="borrower", path=child):
             pass
         with self.assertRaisesRegex(copies.CopyError, "borrowed") as refusal:
             copies.remove_trees(self.owner_id)
@@ -2823,7 +2995,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_owner_removal_matches_transferred_names_without_constructing_unsafe_paths(self) -> None:
         for owner in ("Verify", "unit_name"):
             with self.subTest(owner=owner):
-                with copies.workspace(self.owner_id, self.source, self.head, name=owner, branch="worker") as tree:
+                with registered_workspace(self.owner_id, self.source, self.head, name=owner, branch="worker") as tree:
                     pass
                 record = scratch.task_of(tree)
                 assert isinstance(record, copy_record.Registered)
@@ -2839,7 +3011,7 @@ with patch.object(subprocess, 'run', pause_clone):
         tree.mkdir(parents=True)
         copies.initialize_git(tree, self.source)
         _ = self.git(tree, "checkout", "-q", "-B", "worker", self.head)
-        with copies.workspace(self.owner_id, self.source, self.head, name="adopted", branch="worker", path=tree):
+        with registered_workspace(self.owner_id, self.source, self.head, name="adopted", branch="worker", path=tree):
             pass
         record = scratch.task_of(tree)
         assert isinstance(record, copy_record.Registered)
@@ -2850,7 +3022,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertNotIn(str(tree), scratch.holds())
 
     def test_owner_transfer_after_selection_preserves_the_new_owners_copy(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="transfer", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="transfer", branch="worker") as tree:
             pass
         select_workspaces = copies.owned_workspaces
 
@@ -2869,22 +3041,22 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertNotIn("ended_task", record.fields)
 
     def test_owner_removal_deletes_borrowers_before_their_sources(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="a-parent", branch="worker") as parent:
+        with registered_workspace(self.owner_id, self.source, self.head, name="a-parent", branch="worker") as parent:
             pass
-        with copies.workspace(self.owner_id, parent, self.head, name="z-child", branch="worker") as child:
+        with registered_workspace(self.owner_id, parent, self.head, name="z-child", branch="worker") as child:
             pass
         copies.remove_trees(self.owner_id)
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
 
     def test_owner_removal_preserves_an_external_borrower_and_does_not_end_a_busy_copy(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name="a-source", branch="worker") as parent:
+        with registered_workspace(self.owner_id, self.source, self.head, name="a-source", branch="worker") as parent:
             with self.assertRaisesRegex(copies.CopyError, "busy"):
                 copies.remove_trees(self.owner_id)
             record = scratch.task_of(parent)
             assert isinstance(record, copy_record.Registered)
             self.assertNotIn("ended_task", record.fields)
-        with copies.workspace("other-unit", parent, self.head, name="borrower", branch="worker") as child:
+        with registered_workspace("other-unit", parent, self.head, name="borrower", branch="worker") as child:
             pass
         with self.assertRaisesRegex(copies.CopyError, "borrowed"):
             copies.remove_trees(self.owner_id)
@@ -2894,7 +3066,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_owner_removal_refuses_a_damaged_record_until_repaired(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as gate:
             pass
-        with copies.workspace(self.owner_id, self.source, self.head, name="damaged", branch="worker") as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name="damaged", branch="worker") as tree:
             pass
         path = tree / copy_record.RECORD
         record = path.read_text()
@@ -2915,7 +3087,7 @@ with patch.object(subprocess, 'run', pause_clone):
                     self.fail("invalid owner started a tree")
                 self.assertFalse(self.gates.exists())
 
-    def test_underscore_owner_succeeds_in_a_private_checkout(self) -> None:
+    def test_underscore_owner_succeeds_in_a_numbered_copy(self) -> None:
         member = fixture_member("unit", name="unit_name",
             parent=next(row.id for row in staff.local_snapshot().rows if row.kind == "showrunner"))
         result_file = self.base / "command-owner"
@@ -2927,15 +3099,17 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 0, result.stderr)
         owner, checkout = cast(list[str], json.loads(result_file.read_text()))
         self.assertEqual(owner, str(member.id))
-        self.assertEqual(Path(checkout).name, "source")
-        self.assertFalse(Path(checkout).exists())
+        self.assertEqual(Path(checkout), self.gates.with_name("unit_name") / "1")
+        self.assertEqual(build_folders.build_folder_state(Path(checkout)), "free")
+        with copies.standing(owner, self.source, copies.CommittedSource(self.head)) as tree:
+            self.assertEqual(tree, self.gates.with_name("unit_name") / "1")
         self.assertFalse(self.gates.exists())
 
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
         with copies.standing(self.owner_id, str(self.source), copies.CommittedSource(self.head)) as tree:
             stable = (tree / 'stable.txt').stat()
             record = self.lease(tree)
-            self.assertEqual(record['unit'], self.owner_id)
+            self.assertEqual(record['unit'], self.gates.name)
             self.assertEqual(record['repository'], 'origin')
             self.assertEqual(record['commit'], self.head)
             self.assertEqual(record['pid'], os.getpid())
@@ -2949,7 +3123,7 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(self.git(reused, 'status', '--porcelain'), '')
         self.assertEqual(list((self.base / 'workspaces').glob('**/.scratch.json')), [])
 
-    def test_interrupted_first_record_publication_recovers_on_next_use(self) -> None:
+    def test_interrupted_first_record_publication_preserves_the_unregistered_folder(self) -> None:
         program = dedent("""
         import os, sys
         from pathlib import Path
@@ -2966,16 +3140,17 @@ with patch.object(subprocess, 'run', pause_clone):
         """)
         interrupted = self.python_run(program, str(self.source))
         self.assertEqual(interrupted.returncode, 19, interrupted.stderr)
-        tree = self.gates / 'origin-slot1'
+        tree = self.gates / '1'
         self.assertFalse(tree.with_name(tree.name + '.lease.json').exists())
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as recovered:
-            self.assertEqual(recovered, tree)
-            self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), self.head)
-            self.assertTrue(self.lease(recovered)['ready'])
-        self.assertEqual(build_folders.build_folder_state(tree), 'free')
+            self.assertEqual(recovered, tree.with_name("2"))
+            self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), self.head)
+            self.assertTrue(self.lease(recovered)["ready"])
+        self.assertTrue(tree.is_dir())
+        self.assertFalse(tree.with_name(tree.name + ".lease.json").exists())
 
     def test_interrupted_remove_finishes_even_after_record_is_deleted(self) -> None:
-        with copies.workspace(self.owner_id, self.source, self.head, name='deleted-record', branch='deleted-record') as tree:
+        with registered_workspace(self.owner_id, self.source, self.head, name='deleted-record', branch='deleted-record') as tree:
             pass
         def interrupt(path: Path) -> None:
             (path / copy_record.RECORD).unlink()
@@ -2988,7 +3163,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(tree.exists())
 
-    def test_relocated_source_rebuilds_git_metadata_and_keeps_target(self) -> None:
+    def test_relocated_source_keeps_the_old_copy_and_uses_a_new_copy(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / 'target/compiled'
             _ = cache.write_text('warm')
@@ -2997,12 +3172,13 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.source.rename(relocated)
         _ = self.git(relocated, 'worktree', 'repair', str(tree))
         with copies.standing(self.owner_id, relocated, copies.CommittedSource(self.head)) as reused:
-            self.assertEqual(reused, tree)
-            self.assertEqual(cache.read_text(), 'warm')
-            self.assertEqual(self.git(reused, 'rev-parse', '--path-format=absolute', '--git-common-dir'), str(relocated / '.git'))
+            self.assertEqual(reused, tree.with_name("2"))
+            self.assertEqual(cache.read_text(), "warm")
+            self.assertFalse((reused / "target/compiled").exists())
+            self.assertEqual(self.git(reused, "rev-parse", "--path-format=absolute", "--git-common-dir"), str(relocated / ".git"))
             self.assertEqual(self.git(reused, 'remote', 'get-url', 'origin'), self.git(relocated, 'remote', 'get-url', 'origin'))
 
-    def test_deleted_borrowed_objects_are_recovered_from_replacement_source(self) -> None:
+    def test_replacement_source_keeps_the_copy_with_missing_git_metadata(self) -> None:
         origin = self.git(self.source, 'remote', 'get-url', 'origin')
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / 'target/compiled'
@@ -3010,9 +3186,10 @@ with patch.object(subprocess, 'run', pause_clone):
         shutil.rmtree(self.source)
         _ = self.git(self.base, 'clone', '-q', '--branch', 'main', origin, str(self.source))
         self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD'), self.published)
-        with self.assertRaises(ValueError):
-            with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')):
-                self.fail('a slot with missing Git metadata must not reset its source')
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")) as fresh:
+            self.assertEqual(fresh, tree.with_name("2"))
+            self.assertEqual(self.git(fresh, "rev-parse", "HEAD"), self.published)
+            self.assertFalse((fresh / "target/compiled").exists())
         self.assertEqual(cache.read_text(), 'warm')
         self.assertTrue(tree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
@@ -3029,7 +3206,7 @@ with patch.object(subprocess, 'run', pause_clone):
         tree = copies.workspace_path(self.owner_id, self.source, 'refresh')
         with mock.patch.object(copies, 'mark_target', side_effect=OSError('refresh failed')):
             with self.assertRaises(copies.PostUseError) as raised:
-                with copies.workspace(self.owner_id, self.source, self.head, name='refresh', branch='refresh') as held:
+                with registered_workspace(self.owner_id, self.source, self.head, name='refresh', branch='refresh') as held:
                     self.assertEqual(held, tree)
                     raise failure
         self.assertIs(raised.exception.caller_error, failure)
@@ -3037,7 +3214,7 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertTrue(idle)
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
-        slot = self.gates / "origin-slot1"
+        slot = self.gates / "1"
         for verdict in ("green", "red"):
             with self.subTest(verdict=verdict):
                 with ExitStack() as patches, self.assertRaises(copies.PostUseError) as raised:
@@ -3096,41 +3273,13 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(list(partial.iterdir()), [])
 
     def test_claim_state_distinguishes_owned_and_busy_checkout(self) -> None:
-        tree = self.gates / "origin-slot1"
+        tree = self.gates / "1"
         with copies.claim_tree(tree, create=True) as first:
             self.assertIs(first, copies.ClaimState.ACQUIRED)
             with copies.claim_tree(tree, create=False) as second:
                 self.assertIs(second, copies.ClaimState.BUSY)
         with copies.claim_tree(tree, create=False) as released:
             self.assertIs(released, copies.ClaimState.ACQUIRED)
-
-    def test_waiter_wakes_on_first_release_without_fast_polling(self) -> None:
-        _ = self.fresh_base()
-        notice = WaitNotice()
-        def waiting_use(source: Path, revision: str) -> Path:
-            with copies.standing(self.owner_id, source, copies.CommittedSource(revision)) as tree:
-                return tree
-        settings = self.base / 'config/build_folders.conf'
-        _ = write_config_fixture(settings, f"# whole: 1..\nslots.{self.lease_machine()}.origin.max=1\n")
-        new_revision = self.incoming()
-        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
-            holder_context = copy_context()
-            with ExitStack() as primary:
-                first = holder_context.run(primary.enter_context, copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)))
-                with ExitStack() as proof_scope:
-                    identical = holder_context.run(proof_scope.enter_context,
-                        copies.standing(self.owner_id, first, copies.CommittedSource(self.head)))
-                    self.assertEqual(identical, first)
-                    holder_context.run(proof_scope.close)
-                with redirect_stderr(notice):
-                    future = executor.submit(waiting_use, first, new_revision)
-                    self.assertTrue(notice.noticed.wait(TEST_HANG_GUARD_SECS))
-                    self.assertFalse(future.done())
-                self.assertEqual(self.git(first, 'rev-parse', 'HEAD'), self.head)
-                holder_context.run(primary.close)
-                _ = queue.run_pass()
-                self.assertEqual(future.result(timeout=TEST_HANG_GUARD_SECS), first)
-                self.assertEqual(self.git(first, 'rev-parse', 'HEAD'), new_revision)
 
     def test_applied_untracked_files_have_current_mtime_and_preserve_mode(self) -> None:
         source = self.source / "untracked-build-input"
@@ -3255,11 +3404,11 @@ with copies.standing(copies.caller_owner(), pathlib.Path(sys.argv[1]), copies.Co
             process.kill()
             _ = process.wait(timeout=10)
             os.kill(child, 0)
-            first = self.gates / "origin-slot1"
+            first = self.gates / "1"
             self.assertEqual(build_folders.build_folder_state(first), "held",
                              "wrapper death released a surviving command's checkout")
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
-                self.assertEqual(second, first.with_name("origin-slot2"))
+                self.assertEqual(second, first.with_name("2"))
         finally:
             if process.stdin is not None:
                 _ = process.stdin.write("x")

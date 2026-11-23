@@ -3,7 +3,6 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
-import re
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -12,7 +11,7 @@ import unittest
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import limits_view, memory_feed, progress_profile as progress, snapshot_codec
 from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
@@ -40,6 +39,108 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_build_limits_move_names_and_wait_reasons_to_hover(self) -> None:
+        wait = limits_view.WaitGroup(limits_view.WaitWords("1 run waits for space.", "{count} runs wait for space."),
+                                     ["Test <one>", "Test two"])
+        waits = {"disk": wait}
+        cell = limits_view.Cell(limit=2, used=1, runs=["Build <one>"], waits=waits)
+        disk = limits_view.Metric("disk", 20, 31, "GiB", "minimum", waits)
+        machine = limits_view.MachineLimits("In use", (disk,), waits)
+        empty = limits_view.MachineLimits("", (), {})
+        mac = limits_view.MachineLimits("On", (), {}, 1, "A Mac claim has no repository name that this page can show.")
+        hana = limits_view.Cell(limit=2, used=2, gpu=limits_view.Metric("gpu", 0, 2), verify_used=2)
+        section = limits_view.BuildLimits(machine, mac, empty,
+            (limits_view.RepositoryRow("repo:example", natedev=cell),
+             limits_view.RepositoryRow("hana", natedev=hana, mac=limits_view.Cell(waits=waits))), False, {})
+        keys = ("limit:cell:natedev:repo:example", "limit:machine:natedev", "limit:metric:natedev:disk",
+                "limit:cell:natedev:hana", "limit:machine:mac", "limit:cell:mac:hana")
+        rendered, tooltip, heading, metric, hana_tip, mac_tip, mac_wait_tip = cast(list[str], self.page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return [$('build-limits-content').innerHTML, ...data.keys.map(key => pageTooltipHtml(key, data))];
+        })()""", {"build_limits": snapshot_codec.snapshot_value(section), "keys": keys}, limits=True))
+        table = ElementTree.fromstring(f"<root>{rendered}</root>")
+        detail = table.find(f".//td[@data-tip='{keys[0]}']/span")
+        assert detail is not None
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-loader-circle", "lucide lucide-hourglass"])
+        self.assertEqual([mark.get("class") for mark in detail.findall("span/span")],
+                         ["build-limit-mark free", "build-limit-mark line", None])
+        self.assertEqual(detail.findtext("span[2]"), "1 of 2")
+        self.assertNotIn("Test two", rendered)
+        self.assertNotIn("wait for space", rendered)
+        pending = table.find(f".//td[@data-tip='{keys[5]}']/span/span[@data-wait-count='2']")
+        assert pending is not None
+        self.assertEqual(pending.findtext("span"), "2")
+        self.assertEqual([icon.get("class") for icon in pending.findall("{http://www.w3.org/2000/svg}svg")],
+                         ["lucide lucide-hourglass"])
+        gpu = table.find(f".//td[@data-tip='{keys[3]}']/span/span[@class='build-limit-chip build-limit-gpu']")
+        assert gpu is not None
+        self.assertEqual(gpu.findtext("span"), "0 of 2")
+        self.assertEqual(len(table.findall(".//tbody//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']")), 1)
+        self.assertIsNone(table.find(".//thead//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']"))
+        self.assertIsNotNone(table.find(".//th[@data-tip='limit:machine:mac']"))
+        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, mac_wait_tip)]
+        for column in columns:
+            assert column is not None
+            self.assertIn("Waiting", [row.text for row in column.findall("dt")])
+            self.assertIn("Because", [row.text for row in column.findall("dt")])
+            self.assertIn("Test <one>, Test two", [row.text for row in column.findall("dd")])
+            self.assertIn("2 runs wait for space.", [row.text for row in column.findall("dd")])
+        self.assertIn("Build &lt;one&gt;", tooltip)
+        self.assertNotIn("Build &lt;one&gt;", rendered)
+        self.assertIn("Verify runs", hana_tip)
+        self.assertIn("The GPU limit applies to tests for this repository on natedev.", hana_tip)
+        self.assertIn("A Mac claim has no repository name that this page can show.", mac_tip)
+
+    def test_decoded_work_names_match_the_table_chart_and_hover(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page = fixture.caller_selection_page()
+        expected = (
+            (700001, "recorded cloud", "", "recorded cloud"),
+            (50, "hana CI: nextest", "", "hana CI"),
+            (301, "held caller", "", "held caller"),
+            (302, "unregistered session", "", "unregistered session"),
+            (304, "hana: nextest", "unregistered session", "hana: nextest"),
+            (200, "recorded local", "", "recorded local"),
+            (700002, "recorded cloud", "", "recorded cloud"),
+            (303, "recorded slot", "", "recorded slot"),
+        )
+        self.assertEqual(page["reserved"], 11.0)
+        self.assertEqual([row["pid"] for row in (*page["walk"], *page["waiters"])],
+                         [pid for pid, *_ in expected])
+        keys = [f"{kind}:{row.get('key')}" for kind, table in (("row", page["walk"]), ("wait", page["waiters"]))
+                for row in table]
+        self.assertEqual(len(set(keys)), len(expected))
+        rendered = cast(list[str], self.page_expression(
+            f"(renderWalk(data), [$('walk').innerHTML, ...{json.dumps(keys)}.map(key => tooltipHtml(key, data))])",
+            cast(object, json.loads(memory_feed.page_json(page))), walk=True))
+        table = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
+        for (pid, name, caller, title), key, hover in zip(expected, keys, rendered[1:], strict=True):
+            with self.subTest(pid=pid):
+                cell = table.find(f".//tr[@data-tip='{key}']/th[@class='step']")
+                chart = table.find(f".//div[@data-tip='{key}']")
+                assert cell is not None and chart is not None
+                self.assertEqual("".join(cell.itertext()), name)
+                self.assertEqual(chart.findtext(".//span[@class='name']"), name)
+                owner = chart.find(".//span[@class='owner']")
+                assert owner is not None
+                self.assertEqual("".join(owner.itertext()), caller)
+                self.assertEqual("".join(ElementTree.fromstring(hover)[0].itertext()), title)
+
+    def test_the_second_line_shows_no_owner_that_the_row_name_shows(self) -> None:
+        walk = [{"name": "aws-unit: test affected", "caller": "aws-unit", "queued": True},
+                {"name": "hana CI: nextest", "ci_label": "hana CI · hana-mac-1"},
+                {"kind": "mac-build", "name": "hana: nextest", "showrunner": "hana"},
+                {"kind": "cloud", "name": "held caller", "caller": "held caller"},
+                {"kind": "cloud", "name": "research: nextest", "showrunner": "hana"}]
+        waiters = [{"name": "devtools: cargo check", "caller": "fixture"}]
+        lines = self.page_expression(
+            "[...data.walk.map(row => rowOwner(row)), ...data.waiters.map(row => rowOwner(row, true))]",
+            {"walk": walk, "waiters": waiters})
+        self.assertEqual(lines, ["", "", "", "", "hana", "fixture"])
+
     def test_row_staff_names_have_role_colors_and_free_names_stay_plain(self) -> None:
         unit = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(), current_session=staff.StaffId("builder"))
         names = staff_names.StaffNames(staff.StaffSnapshot((unit,)))
@@ -229,9 +330,9 @@ class MemoryHoverTests(unittest.TestCase):
         data = {"walk": [{"name": "demo nextest", "queued": True, "used": 1,
                           "reserved": 0, "call": "cargo nextest run -p demo"}],
                 "waiters": [{"kind": "repository-slot", "name": "demo test all", "need": 0,
-                             "call": "merge_gate.py --tests-only"}]}
+                             "call": "gate.py --tests-only"}]}
         for key, call in (("row:fixture-run-0", "cargo nextest run -p demo"),
-                          ("wait:fixture-wait-0", "merge_gate.py --tests-only")):
+                          ("wait:fixture-wait-0", "gate.py --tests-only")):
             with self.subTest(key=key):
                 tip = ElementTree.fromstring(str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True)))
                 self.assertEqual(tip[-2].text, "Call")
@@ -350,7 +451,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(amounts["= In queue cap"], "5.2 GiB")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
-        row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
+        row = memory_tests.ProgressKeepAsideTests.reservation("gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
             progress.ProgressCounter("suites:1", 8, 10), memory_tests.ProgressKeepAsideTests.profile("suites:1", 3 * GIB // 2),
@@ -365,10 +466,10 @@ class MemoryHoverTests(unittest.TestCase):
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
         for name, counter, ordering_note in (
-            ("merge-gate", module_counter, True),
+            ("gate", module_counter, True),
             ("merge gate", module_counter, True),
             ("fixture-project merge gate", module_counter, True),
-            ("merge-gate", test_counter, False),
+            ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
@@ -388,7 +489,7 @@ class MemoryHoverTests(unittest.TestCase):
                               ({"used": 1, "reserved": 0, "started_at": 100}, "running 5 min")):
             with self.subTest(row=row):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
-                    "name": "merge-gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
+                    "name": "gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
                     "need": 4.0, "need_part": False, **row}]}))
                 self.assertIn(expected, hover[0])
                 if expected == "unavailable":
@@ -479,7 +580,7 @@ class MemoryHoverTests(unittest.TestCase):
                                  ("setup", progress.NoCounter("no cloud counter")), ("", progress.NoCounter("no cloud counter"))):
             with self.subTest(status=status):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"walk": [{
-                    "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
+                    "kind": "cloud", "machine": "aws", "name": "gate", "unit": "cloud-unit", "showrunner": "fixture",
                     "status": status, "activity": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn("Showrunner  fixture\nRuns on  AWS", hover[1])
                 self.assertEqual("Status  " in hover[1], bool(status))
@@ -806,32 +907,6 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
-    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
-        fixture = test_memory_feed.MemoryFeedTests()
-        self.addCleanup(fixture.doCleanups)
-        fixture.setUp()
-        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
-                                       unit="startup", staff_id="staff-startup")
-        row, = data["waiters"]
-        key = row.get("key")
-        self.assertIsNotNone(key)
-        body = cast(list[str], self.page_expression(
-            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
-            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
-        unit = re.search(r'<tr class="wait wait-first"[^>]*>.*?<td class="unit"><span class="cell-text">([^<]*)</span></td>',
-                         body[0])
-        self.assertIsNotNone(unit)
-        assert unit is not None
-        self.assertEqual(unit[1], "startup")
-        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
-
-    def test_repository_slot_wait_has_no_memory_group(self) -> None:
-        data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,
-                            "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
-        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
-        self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
-        self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
-
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},
                                                 {"unit": "cables", "why": "second"}],
@@ -947,17 +1022,22 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
-    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
+    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
+                        limits: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
+        if limits:
+            functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
+            constants += f"const buildLimitIcons = {json.dumps(memory_feed.build_limit_icons())};\n"
+        if walk or limits:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
 const $ = id => {
-  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}});
+  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}, open: true, querySelector: () => ({})});
   return elements.get(id);
 };
 function fitLabels() {}

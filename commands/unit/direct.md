@@ -169,12 +169,12 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
-  The unit's staff row keeps its one home worktree;
-  where a worker works stays in its run record, not in staff. The director
-  removes each worktree it made when that work ends. In the home worktree, the
-  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
-  never switch to an existing branch.
+- Never modify unrelated files. The unit director creates a separate worktree with `worktrees.py make <repo word> <unit> <short-name>`.
+  The unit's staff row keeps its home worktree. The run record keeps the worker's checkout.
+  When the work ends, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
+  Send the reported paths to the showrunner as a removal list.
+  In the home worktree, create only the branch that <PushCheckpoint/> pushes.
+  Never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly asks.
   Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
@@ -186,6 +186,7 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch except <FastTrack/>.
+  A branch whose hash went to the showrunner is never amended, rebased or force-pushed.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
   phases.
 - A phase reservation is released only by the successful-checkpoint path in
@@ -232,6 +233,8 @@ turn's final line names which one**:
 
 `— holding: waiting on <what is running>` · `gate: <name>` · `decision: <question>` ·
 `blocked: <cause>` · `done: run summary emitted`
+
+In idle update mode (<IdleUpdate/>), a turn with no text for nate carries this line only.
 
 The closed list:
 
@@ -330,6 +333,12 @@ worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
 Records are in `${SESSION_DIR}/detached_runs/`, each log beside its record.
 For Python test runs, pass `--kind python-tests` before `--`.
+To limit memory for the detached command, use this scope form.
+
+```sh
+systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>
+```
+
 `start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.
@@ -519,6 +528,10 @@ Read `~/.claude/docs/direct/authorization.md` in full when an action needs user 
 `<DecisionEconomy/>` is defined by this import, shared with every session:
 
 @~/.claude/docs/decision_criteria.md
+
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
 
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:

@@ -1038,14 +1038,14 @@ Each `copies.py` use does less Git work, with the same trees, remote refs and ex
 #### As-built
 
 - `scripts/lib/inotify.py` is the one inotify binding. It holds `IN_MODIFY` and `read_events(descriptor)`, which does one read; `events` loops on it.
-- `LocalReleaseEvents` and `local_release_waiter` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
+- `LocalReleaseEvents` and `local_release_waiter` in `scripts/lib/release_waiter.py` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
 - `wait_until(..., watch_writes=False)` is the one wait that can watch writes. `VerifyTokenWaitFixture.wait_for_output` is one `wait_until(..., watch_writes=True)` call, then the `assertIn`. The raw-mask patches are gone.
 - `verify_hold_wait_test_support.py` catches only `FileNotFoundError` around `add_watch`.
 - Tests: `test_fixture_releases_a_call_when_a_scanned_directory_disappears`, `ReleaseDeadlineTests.test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop`, and the live-writer test.
 - Same-load pairs show no speed change, as expected.
 
 **Files:**
-- `scripts/lib/inotify.py`, `scripts/direct/local_release_wait.py` (owner verify), `scripts/direct/wait_for_test_state.py` — the binding and the wait
+- `scripts/lib/inotify.py`, `scripts/lib/release_waiter.py`, `scripts/direct/local_release_wait.py` (owner verify), `scripts/direct/wait_for_test_state.py` — the binding and the wait
 - `scripts/direct/verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`, `verify_mac_offload_test_support.py` — fixtures
 - `scripts/direct/test_verify_hold_events.py` (owner verify), `scripts/direct/test_review_launcher.py` — tests
 
@@ -4148,7 +4148,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 #### As-built
 
-- `test_run_folder` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+- `start_test_run` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+  This phase put it in `test_run_folder`. The `--affected` gate also holds that folder, so the targeted gate read an empty module read index and lost its gate record. The code moved to `start_test_run`.
 - Every direct test run of every module keeps its build log in its run folder. The gate already sets `BUILDLOG_DIR` for each module (`merge_gate.py:1129`).
 - `scripts/buildlog/test_log_isolation.py` is removed: it re-ran 5 modules under a new HOME and guarded only those 5. `test_testing_folders` checks the two cases and the restore.
 - `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
@@ -4454,3 +4455,194 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout` keeps one full `mac_run.sh` run for the success case. The two kept-checkout cases call `cleanup_mac_run` through `shell_functions` with `on_mac` stubbed.
 - The scratch-clone loop stays: no function exposes its purpose and owner words.
 - Paired natedev CPU: 35.5/32.0/33.6 to 29.5/34.0/28.1 s (median saving 5.5 s). Commit c8599345f.
+
+### Phase 314 — A queued program starts through a small wrapper that loads only what it uses  · status: done
+**Depends on:** Phase 313
+**Owner:** natest (builds gave a standing go on 11-16 at 06:15 EST: the next worst work by AWS CPU, no floor).
+
+#### As-built
+
+- The wrapper that starts each queued program (`--program-start`, `--scope-start`) is `scripts/build_queue/program_start.py`. It loads the standard library, `atomic_file`, `lib.process_start` and `admission_wire` only: 42.9 ms against about 200 ms.
+- `cleanup_program_starts` and the tests parse `program_start.ProgramStart`; `queue_place.py` keeps no alias. `queue_place.main` sends the two old actions to `program_start.main` for runs that loaded the old file before the merge.
+- The private scope wrapper child imports `program_start_test_support.py`, not the test module.
+- Paired natedev CPU (test_queue_place plus test_bulk_run): 44.6/43.4/40.7 to 37.1/33.0/29.2 s (median saving 10.5 s). Base: queue probebackoff 687230599. Commit 9c4b9fb93.
+
+### Phase 315 — The launcher's three recorder commands load only what they use  · status: done
+**Depends on:** Phase 314
+**Owner:** natest (builds go 11-16 12:4x EST: scripts/direct is natest's to change for this; no other unit owns it).
+
+#### As-built
+
+- `check-launch`, `start-pass` and `finish-pass` run from `scripts/direct/pass_record.py`. It holds the state core (state path, read, write, events, slot and pass records, launch check) and the six `plan_history` helpers the path calls. It does not load `session_staff`, `worker_lifecycle`, `plan_history` or `progress_history`.
+- `progress_history.py` and `plan_history.py` import the core from `pass_record`; no re-export. `review.sh`, the launchers, fixtures, tests and docs call `pass_record.py`.
+- Deploy window: `progress_history.main` sends the three old commands to `pass_record.main`. Remove it on 2026-11-23. The phase 314 `queue_place.main` delegation has the same removal date.
+- Import: `pass_record` 46 ms quiet; at load 25-32, 59 ms median against 146 ms for `progress_history` in the same rounds. The 50 ms target holds only on a quiet host; the per-start CPU is the measure that counts.
+- natedev: 186.0 to 100.5 ms CPU per recorder start over 90 starts. Paired CPU (test_review_launcher plus test_review_launcher_style): 44.6/42.5/44.8 to 36.3/37.7/42.8 s (median saving 4.8 s).
+- The main merge at the hash brought `drop-phase`; it calls the moved helpers through `pass_recorder`. Trial merge against the stale `origin/builds-queue` conflicts, as the base does; builds ruled that branch out 11-14. Commit 8219edf2a.
+
+### Phase 316 — gate.py replaces merge_gate.py, with a targeted mode; the old names stay as small entry points  · status: done
+**Depends on:** Phase 315
+**Owner:** natest writes; sdlc owns scripts/production (gate rename plan chunk 1; user go via morty and builds 11-16 13:50 EST). builds gave natest the matcher edits in build_queue and build_hold (11-16 ~13:55 EST).
+
+#### As-built
+
+- `scripts/production/gate.py` is the gate (git mv from `merge_gate.py`). `gate.py --targeted` runs `run_tests_only(args, SuiteMode.TARGETED)` in a test run folder.
+- `merge_gate.py` is a small entry point: as a script it calls `gate.main()`; imported, it puts `gate` in `sys.modules` under its own name. `targeted_test.py` calls `gate.main(["--targeted", *argv])`. Chunk 6 removes both.
+- `gate.py` run as a script puts itself in `sys.modules["scripts.production.gate"]` before its imports, so `cloud_gate` keeps the targeted selection (review F001).
+- `SuiteMode.GATE` and `SuiteMode.TARGETED`; `MERGE_GATE` and `TARGETED_TEST` stay as Enum aliases for callers outside `scripts/production` until chunk 6. Stored values unchanged until chunk 4.
+- The two support files and 14 test modules moved to gate names; `test_targeted_test.py` is `test_gate_targeted.py`.
+- The five matchers know `gate.py` by its exact base name; `ADMISSION_CODE_PATHS` gained `production/gate.py`, so the admission code version changes at merge. `checkpoint_gate.runs_merge_gate` accepts both names.
+- `config/fast_track.conf` `refused_paths` lists `gate.py` beside `merge_gate.py` (/tune on main 935154e9c). The sensitive-path test requires the `refused path:` text (review F002).
+- Config keys, helper and test method names that hold `merge_gate` are chunk 3 work. Checkpoint 0e19e746f; main merged at 935154e9c.
+
+### Phase 317 — the gate's environment variables and config file take the gate name  · status: done
+**Depends on:** Phase 316
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 3; user go via morty and builds 11-16 13:50 EST, including the config file rename).
+
+#### As-built
+
+- The 16 `MERGE_GATE_<NAME>` environment variables are `GATE_<NAME>`; no name collided with the AWS box names.
+- `sitecustomize.gate_parent_pid(consume=False)` reads `GATE_PARENT_PID`, then `MERGE_GATE_PARENT_PID`. The startup hook and `module_run.py` use it; `module_run.py` clears both names before tests start (review F001). Chunk 6 removes the old read.
+- The gate's own `SUITE_BOOTSTRAP` reads only `GATE_PARENT_PID`: the gate always sets it, and an old gate runs the bootstrap it loaded (review F003).
+- `config/merge_gate.conf` moved to `config/gate.conf`. `merge_gate.conf` stays a symlink to it for `live_state_refusal` reads after a push; `config/README.md` says chunk 6 removes it.
+- `live_state_refusal` reads a target tree's `config/gate.conf`, else its `config/merge_gate.conf`, until chunk 6 (review F002).
+- Prose "merge gate", the state folder and stored step names are unchanged (chunks 4 and 5). Checkpoint 7d9698e43; main merged at af5bd9283.
+
+### Phase 318 — the gate state folder moves to ~/.local/state/gate once, at deploy  · status: done
+**Depends on:** Phase 317
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 items 1, 2 and 5; decision 7; sdlc agreed the move under the land queue lock and the gate locks, 11-16 through builds). The stored step names (chunk 4 item 3) are the next phase: they need report and queue to agree the record migration and the user go for config key renames.
+
+#### As-built
+
+- `land_runs.DEFAULT_STATE_DIR` is `~/.local/state/gate`. `land_runs.state_dir()`, `PassedTreeLedger.path` and `push_record_path` use it as the default; `GATE_PASSED_DIR` and the state-folder variable still override it.
+- The as-built doc names `~/.local/state/gate`.
+- `scripts/production/gate_rename_deploy/move_gate_state.py` moves the live folder during deployment.
+  It requires a natedev drain hold. It waits for each process that holds a file or working directory in the old folder.
+  This includes processes that wait for a lock (review F001). It prints one line for each process with unreadable descriptors.
+  It refuses when a record contains the old path (review F002). It removes `typecheck-venv` before it calls `os.rename`.
+- Set a natedev drain hold after the merge to main. Run the move and release the hold.
+  Chunk 6 deletes the deploy folder. A tests-only run in an old worktree can create a stray `merge-gate` folder.
+  Chunk 6 also deletes that stray folder.
+- Checkpoint acb4ca780; main merged at eb427e1e1.
+
+### Phase 319 — the gate state readers refuse until the folder move has run  · status: done
+**Depends on:** Phase 318
+**Owner:** natest writes; builds asked for it (11-16, ~17:30): after the merge promotes main and before the deploy move runs, `land_queue.py` must not read an empty `~/.local/state/gate` and drop the line.
+
+#### As-built
+
+- `land_runs.default_state_dir()` returns `~/.local/state/gate`. It raises `GateStateMoveRequired(Exception)` while `~/.local/state/merge-gate` exists and the new folder does not; the message names `/build:hold drain natedev` and the move program. Chunk 6 removes the guard.
+- `land_runs.state_dir()`, `PassedTreeLedger.path` and `push_record_path` call it only when `GATE_STATE_DIR` or `GATE_PASSED_DIR` is not set.
+- No caller turns the error into an empty queue, empty results or no record; broad handlers raise again or keep the message in `GateRefused`. `land_queue.py list` and `next` exit 1 with the message.
+- The move program uses explicit paths and imports no guarded reader.
+- Reviews found nothing. Checkpoint 9871162ed; main merged at 8416aab51.
+
+### Phase 320 — the gate step names are gate and test-affected, and the gate mode is --affected  · status: done
+**Depends on:** Phase 319
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). The user chose the names 11-16 17:23 ("Name 1 D Name 2 gate-box"), relayed by morty and builds. The one-off rewrite of the stored records is the next phase.
+
+#### As-built
+
+- The stored step names are `gate` (full run) and `test-affected` (affected-modules run). Every writer and reader uses them: the gate run record, the admission and memory readers, the buildlog index query, `memory_feed.py` `GATE_STEPS`, the `memory_admit.py` progress-profile keys, and the AWS mode values that `cloud_gate.py` writes and `run_cost.py` groups.
+- `gate.py --affected` replaces `--targeted`, with no alias.
+- Ten config keys take the new names, one key per name: `names.*`, `prose.gate`, `owned.*` in `build_steps.conf`, and `program_first_peak_gib.*` and `peak_hold_seconds.*` in `build_admission.conf`. Values stay, except the shown name of an affected-modules run with no owner, which reads `test affected`.
+- No dual read of the old names. Phase 321's program converts the stored records once at deploy. The kept old-name hits (folder paths, the AWS box user, script file names, prose "merge gate") belong to other chunks of the rename plan.
+- An AWS launch reads the tested commit's `SuiteMode` values with `git show` and `ast`, without running its code. A commit that lacks the requested mode gets a local fallback before launch (review F001).
+- Checkpoint cf4ac06c4.
+
+### Phase 321 — the stored step names move to gate and test-affected once, at deploy  · status: done
+**Depends on:** Phase 320
+**Owner:** natest writes; sdlc owns (gate rename plan chunk 4 item 3). Builds ships 320 and 321 as one item and takes the user's go for the service stops (11-16 ~17:30).
+
+#### As-built
+
+- `scripts/production/gate_rename_deploy/rename_step_names.py` converts the stored step names during deployment.
+  Chunk 6 deletes the deploy folder.
+- It changes exact structured fields only: admission records, buildlog month records, pending steps, assignment wait files, AWS ledgers, cloud attempt `request.json`, `current.json`, `remote-result.json` and outcome records, and compressed results. Each file is rewritten through a temporary file and `os.replace`. It renames `merge-gate` progress profile folders to the `gate` key hash and updates the index rows in one transaction. It converts `queue.json` and deletes `memory.json` and `report.json`, which the feed writes again. Affected-test profile folders stay; the profile sweep removes them.
+- It refuses before any write without a natedev drain hold, with an admission or feed service or the buildlog service running, with a process holding an admission file, with a live hold or queue caller (review F001), or with an unfinished old AWS attempt.
+- A copy of the live records converted with 15,237 changes in 169 seconds; a second run changed nothing. The readers kept the same counts under the new names.
+- An old unit worktree can write an old name until it merges main. A later run under the same conditions converts it.
+- Checkpoint 419ef8cad.
+
+### Phase 322 — one deploy command runs the gate folder move and the step-name conversion  · status: done
+**Depends on:** Phase 321
+**Owner:** natest writes; builds asked for it 11-16 18:45 before it asks the user for the go. The user runs one command, not a list of steps.
+
+#### As-built
+
+- Run `bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh`.
+  The command runs the phase 318 folder move and the phase 321 step-name conversion.
+  Chunk 6 deletes the deploy folder and `config/gate_rename_deploy.conf`.
+- Order: check the new code by content, wait for old AWS attempts, set a natedev drain hold unless one is in force, wait for the kept builds, stop `buildlog.timer` and the admission socket, admission and memory feed services, require the buildlog service inactive, run `move_gate_state.py` when needed, convert, convert again and require `changed=0`, start the services, release its own hold. Each step prints its name, its done time and a heartbeat.
+- It finds the assignment and cloud folders again just before each conversion (review F003).
+- A state file in the Git directory keeps the direction and the next step for an interrupted run.
+  Each child that can change the deployment inherits the deployment lock.
+  A separate process holds the lock while each privileged service command runs.
+  The state file records the identity or absence of both gate folders before the first step.
+  Recovery checks the original state before it starts services.
+  It repeats the check after startup, before it releases the owned hold.
+  If that check fails, recovery stops the services again and keeps the hold.
+  The command removes the type-check environment only after both conversion passes succeed.
+  The converter saves the original content digest before it writes.
+  For a profile move, it saves the source identity and the destination state.
+  Recovery clears a pending write when the recorded state still matches.
+  When recovery cannot verify the original state, it keeps the services stopped and the hold in force.
+  The command prints how to continue from the saved step.
+  The command starts each Python child in isolated mode.
+  It resumes release when the holder file or a matching release record exists.
+  An unpublished hold needs no release (F001).
+- Both checks open regular records without following links or waiting on FIFOs.
+  The early check reads the JSON records as UTF-8, including the contents of gzip files.
+- A 16.6 GB copy of the live records: full run passed with a stop time of 187 seconds; a stop after each step resumed; refusal recovery, a completed rerun and an existing hold passed. The two folder searches add about 1 minute of stop time.
+- To reverse the deployment, install the old gate code. Keep the deploy folder and its configuration in the live checkout.
+  Run the same command with `--reverse`. It uses the same hold, service stops and two conversion passes.
+  Reverse converts all matching step names to names the old code can read.
+  It includes values that new code wrote before the forward deployment.
+  Both directions refuse if both profile keys exist.
+- Checkpoint 403ec6239.
+
+#### Recovery regression
+
+A service start creates the destination folder. Run this example with `python3 -m doctest docs/plans/builds-natest.md` from the checkout.
+
+```pycon
+>>> from contextlib import redirect_stdout
+>>> from io import StringIO
+>>> from pathlib import Path
+>>> from tempfile import TemporaryDirectory
+>>> from unittest.mock import patch
+>>> from zoneinfo import ZoneInfo
+>>> from scripts.production.gate_rename_deploy import deploy_gate_rename as deploy
+>>> output = StringIO()
+>>> calls = []
+>>> with TemporaryDirectory() as folder:
+...     home = Path(folder)
+...     settings = deploy.DeploymentSettings(0, 0, 0, ZoneInfo("UTC"), 0)
+...     roots = deploy.rename.RecordRoots(home, home, home, ())
+...     paths = deploy.DeploymentPaths(home, home, home / "journal.json", roots, settings, -1)
+...     old, new = deploy.move_paths(paths)
+...     old.mkdir(parents=True)
+...     failure = deploy.RecoveryRequired(deploy.STOP_STEP + 1, 2, "Buildlog still runs.")
+...     state = deploy.DeploymentState(next_step=failure.step, owns_hold=True, stopped_at=1,
+...                                   gate_folders=deploy.GateFolders.read(old, new), recovery=failure)
+...     deploy.save(paths, state)
+...     def service(_paths, action, unit, *, user):
+...         calls.append((action, unit))
+...         if action == "start" and unit == "buildlog.timer":
+...             new.mkdir()
+...     with (patch.object(deploy, "service", side_effect=service),
+...           patch.object(deploy, "release_owned") as release, redirect_stdout(output)):
+...         status = deploy.recover(paths, state, failure)
+...     saved = deploy.load(paths.journal, reverse=False)
+...     destination_exists = new.is_dir()
+>>> status
+2
+>>> calls[-4:]
+[('stop', 'buildlog.timer'), ('stop', 'build-memory-feed.service'), ('stop', 'build-admission.socket'), ('stop', 'build-admission.service')]
+>>> release.assert_not_called()
+>>> destination_exists and saved.owns_hold and saved.recovery == failure
+True
+>>> "After correcting the cause, continue with:" in output.getvalue()
+True
+
+```

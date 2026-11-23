@@ -20,6 +20,17 @@ Applies to every session when coding and reviewing code. `/unit:direct` imports 
 - when the user says "launch", just launch the app directly — don't try to shut down first. The user has already shut it down.
 - when the user says "relaunch", shut down the app first, then launch it.
 
+## images on the other machine
+- An image on the other machine is readable. Never tell the user that you cannot read it.
+- On natedev, copy a Mac image to a fixed name: `scp 'mac:<path>' <scratch>/shot.png`. On the Mac, use `natedev:<path>` the same way.
+- Put single quotes around the remote path. Screenshot names have spaces.
+- Make a large image smaller before you read it: `magick <scratch>/shot.png -resize 50% <scratch>/shot-small.png`.
+- Read the copy with the Read tool.
+
+## links in session output
+- Write each link as the full URL in plain text, for example http://100.103.14.30:8765/3be7ed/mock.html.
+- Never write a Markdown link or a wikilink. The user's terminal cannot open them.
+
 ## git
 - **`git stash` is denied outright and no flag gets past it.** `permissions.deny` carries `Bash(git stash)`, `Bash(git stash *)` and `Bash(git stash:*)`. **The `allow` entries for `git stash list` do not make the read form runnable** — `Bash(git stash *)` matches it too, and deny wins. Do not soften this into "only the mutating forms are denied": that reads as licence to check for a stash before handing off, and the check itself gets refused.
 - **Never switch a remote to HTTPS to work around an SSH failure.** `url.git@github.com:.insteadOf` in `~/.config/git/config` rewrites an HTTPS URL back to SSH before any transport runs, so the HTTPS remote fails with an SSH error and the change buys nothing. Fix the cause instead — most often a cold gpg-agent, the clause below.

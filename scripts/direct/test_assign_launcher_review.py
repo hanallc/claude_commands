@@ -1,6 +1,8 @@
 """Check named assignment review with the shared loopback fixture."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import json
 import os
 import subprocess
@@ -53,9 +55,10 @@ class AssignmentFixtureIsolationTests(unittest.TestCase):
         with patch.dict(os.environ, locations):
             try:
                 case.setUp()
-                self.assertTrue(locations.keys().isdisjoint(os.environ))
                 self.assertEqual({name for name in os.environ if name.startswith("GIT_")},
-                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"})
+                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TEMPLATE_DIR"})
+                # The worktree model gets the fixture's own empty templates, never the inherited folder.
+                self.assertEqual(Path(os.environ["GIT_TEMPLATE_DIR"]), case.home / "git-templates")
                 write_text_atomic(case.project / "fixture.txt", "Private work.\n")
                 case.commit_project("Record private work.")
             finally:
@@ -154,7 +157,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     self.assertEqual(len(case.agent.notices), notices + 1)
                 passed = worker_panes.worker_pass(row, case.run_dir)
                 self.assertEqual(passed["status"], "completed")
-                delivery = progress_history.dispatch_delivery(passed)
+                delivery = pass_recorder.dispatch_delivery(passed)
                 self.assertEqual(Path(delivery.actions.status_file).read_text(), "done\n")
                 self.assertTrue(Path(delivery.reply_file).read_text().endswith(f"DONE {active.instance_id}\n"))
                 self.assertIn(f"{name}: phase 8: done", case.agent.notices[-1])

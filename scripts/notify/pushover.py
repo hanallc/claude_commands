@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert. Mac pushes and cancellations run on natedev.
 
-  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence]
+  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence] [--user-asked]
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
@@ -28,6 +28,7 @@ A kept push prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later. A kept push with the same --key from the same
 --source replaces the older kept one.
 --through-silence preserves review and priority. A normal push does not repeat or need acknowledgement.
+--user-asked sends a requested nate.adhoc push as written. Silence rules still apply.
 
 New pushes require a registered template before review, credentials, claims, or posting. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
@@ -60,15 +61,19 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
+from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
+from scripts.whoami import token_expiry
 
 API_URL = "https://api.pushover.net/1/messages.json"
 CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
+TOKEN_ALERT_IDS = token_expiry.ALERT_IDS | {token_expiry.LEGACY_MAC_EXPIRY_ID}
+TOKEN_APPROVAL_REQUIRED = "Token alert template needs current approval"
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
@@ -79,7 +84,7 @@ SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
-USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence]"
+USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence] [--user-asked]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/pushover.py"'
 
@@ -146,10 +151,12 @@ def fields(keys: Keys, title: str, message: str, priority: str, key: str = "") -
     body = {
         "token": keys["token"],
         "user": keys["user"],
-        "title": title[:TITLE_MAX],
         "message": message[:MESSAGE_MAX],
         "priority": priority,
     }
+    if title:
+        # With no title, Pushover shows the app name.
+        body["title"] = title[:TITLE_MAX]
     if priority == "2":
         body |= {"retry": str(RETRY_S), "expire": str(EXPIRE_S)}
         if key:
@@ -212,6 +219,7 @@ def log(source: str, priority: str, title: str, message: str, outcome: str, *,
 
 class Arguments(TypedDict):
     silence_policy: silence.SilencePolicy
+    user_asked: bool
     reference: push_reference.PushReference
     need: str
     priority: str
@@ -235,6 +243,7 @@ def parse(argv: list[str]) -> Arguments | None:
     remote_forward = False
     due = ""
     silence_policy = silence.SilencePolicy.KEEP_DURING_SILENCE
+    user_asked = False
     source: str | None = None
     action: str | None = None
     no_action = False
@@ -247,6 +256,10 @@ def parse(argv: list[str]) -> Arguments | None:
         option = argv[index]
         if option == "--through-silence":
             silence_policy = silence.SilencePolicy.SEND_THROUGH_SILENCE
+            index += 1
+            continue
+        if option == "--user-asked":
+            user_asked = True
             index += 1
             continue
         if option == "--ssh-forwarded-reference":
@@ -292,6 +305,9 @@ def parse(argv: list[str]) -> Arguments | None:
         else:
             action = value
         index += 2
+    if user_asked and text_id != NATE_ADHOC_TEXT_ID:
+        print(f"pushover: {REFUSED_BEFORE_SENDING}: --user-asked requires --text-id {NATE_ADHOC_TEXT_ID}", file=sys.stderr)
+        return None
     try:
         _ = decision_priority.read_due(due)
     except ValueError:
@@ -305,6 +321,7 @@ def parse(argv: list[str]) -> Arguments | None:
         push_key = "question:" + reference["path"]
     session: NotificationSession = NO_SESSION_LINE
     header = True
+    one_line = False
     need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
@@ -320,21 +337,24 @@ def parse(argv: list[str]) -> Arguments | None:
             return None
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
-        positionals = [rendered.title, rendered.body]
+        one_line = rendered.one_line
+        positionals = [rendered.posted_title, rendered.posted_body]
         session = rendered.session
-        header = rendered.header
+        header = rendered.header and not one_line
     elif values:
         return None
     try:
         priority = decision_priority.priority(need, due)
     except ValueError:
         return None
-    if len(positionals) != 2 or not positionals[0].strip() or (not text_id and not positionals[1].strip()):
+    if (len(positionals) != 2 or (not one_line and not positionals[0].strip())
+            or (not text_id and not positionals[1].strip())):
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
     return {
         "silence_policy": silence_policy,
+        "user_asked": user_asked,
         "reference": reference,
         "need": need,
         "due": due,
@@ -408,9 +428,10 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
                          arguments["answerable"], arguments["session"], arguments["due"], arguments["reference"])
     header, key = arguments["header"], arguments["key"]
     registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
+    user_asked = arguments["user_asked"]
     claimed = False
     try:
-        found = review.NoHold() if registered_text else review.held_for(source)
+        found = review.NoHold() if registered_text or user_asked else review.held_for(source)
         if isinstance(found, review.LiveHold):
             claimed = review.claim(source)
             if not claimed:
@@ -421,10 +442,18 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         found = review.UnreadableHold(review.held_path(source), str(error))
     detail = ""
     approved = push_texts.approval_date(arguments["text_id"]) if registered_text else ""
-    if approved:
+    if arguments["text_id"] == "quota.claude_expiry" and not approved:
+        return refuse(source, priority, title, message, "Claude expiry template needs current approval")
+    if arguments["text_id"] in TOKEN_ALERT_IDS and not approved:
+        return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
+    if user_asked:
+        detail = "user asked"
+        outcome: review.ReviewOutcome = review.Unreviewed(detail)
+        version = draft
+    elif approved:
         # The text was reviewed and approved ahead of time: no live review, no reviewer wait.
         detail = f"registered text, approved {approved}"
-        outcome: review.ReviewOutcome = review.Unreviewed(detail)
+        outcome = review.Unreviewed(detail)
         version = draft
     elif review.switched_off():
         outcome = review.Unreviewed("review off")
@@ -557,7 +586,10 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail = push["detail"]
-    if priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
+    if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
+        if silence.active():
+            return refuse(source, priority, title, message, "silence is active")
+    elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
         kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
@@ -570,6 +602,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
     reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
+        reason = TOKEN_APPROVAL_REQUIRED
     if reference["kind"] == "question":
         try:
             opening = push_reference.read_question(Path(reference["path"]))
@@ -600,6 +634,8 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
 def post_message(source: str, priority: str, title: str, message: str,
                  keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
     """Every push to the phone goes out here, with its sender and template on one last line."""
+    if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+        return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
     suffix = f", {detail}" if detail else ""
     sender = sender_name(source)
     if not sender:
@@ -609,8 +645,9 @@ def post_message(source: str, priority: str, title: str, message: str,
     message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
     keys = read_keys(keys_file)
     if keys is None:
-        log(source, priority, title, message, "keys missing" + suffix)
-        print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
+        outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}. Set PUSHOVER_USER and PUSHOVER_TOKEN in {keys_file}.", file=sys.stderr)
         return 2
     data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
     try:

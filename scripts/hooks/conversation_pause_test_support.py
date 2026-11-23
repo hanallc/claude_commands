@@ -25,6 +25,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
@@ -294,7 +295,7 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "CLAUDE_CODE_SESSION_ID": SESSION,
             "NOTIFIER_STATE_DIR": str(self.notifier_root),
             "SHOWRUNNER_STATE_DIR": str(self.showrunner_root),
@@ -538,13 +539,13 @@ print("SENT: delivered")
     def invoke(self, command: list[str], *, input: str = "", capture_output: bool = True,
                text: bool = True, check: bool = False,
                env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        # Alarm expiry, blocked flock, re-entrant delivery and executable diagnostics
-        # keep their actual process boundary. Other cases exercise the same scripts
-        # and stand-ins in fresh namespaces, including every write and error path.
+        # Process tests use the executable and its deadline.
         if self.run_in_subprocess:
             return subprocess.run(command, input=input, capture_output=capture_output,
                                   text=text, check=check, env=env, timeout=TEST_HANG_GUARD_SECS)
 
+        # Run the work in this process so it uses the fixture's streams and patches.
+        env = {**env, "CONVERSATION_PAUSE_HOOK_BUDGET": "0"}
         real_run = subprocess.run
 
         def run_child(command: list[str], *, capture_output: bool = False,
@@ -581,8 +582,7 @@ print("SENT: delivered")
             exec(code, vars(module))
             return 0
 
-        # The hook's imported alert module has one import-time path. Rebind it
-        # under the temporary home, and restore the caller's alarm and stdin.
+        # Set the alert module's state path to the temporary home.
         with patch.dict(os.environ, environment, clear=True):
             from scripts.message import escalate
 

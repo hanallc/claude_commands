@@ -7,6 +7,7 @@ import fcntl
 import io
 import subprocess
 import sys
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import partial
@@ -17,6 +18,7 @@ from unittest import mock
 from scripts.agents import worker_lifecycle
 from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
+from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import claude_worker
@@ -50,8 +52,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         self.assertEqual(str(missing_caller.exception), "the caller has no staff row and names no unit or production")
 
     def test_parent_prints_a_state_read_anomaly_once(self) -> None:
-        unit_runs.report_anomaly.cache_clear()
-        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        start_new_command(self)
         _, unit, _ = self.tree()
         run = self.root / "bad-state"
         run.mkdir()
@@ -338,6 +339,36 @@ class FamilyHandoffTests(StaffTestCase):
                     self.assertEqual(len(errors.getvalue().splitlines()), int(malformed), errors.getvalue())
                     if malformed:
                         self.assertIn(allowed.name, errors.getvalue())
+
+    def test_codex_patch_with_escaped_backticks_compiles_without_warnings(self) -> None:
+        source = Path(worker_admission.__file__)
+        patch = "*** Begin Patch\n*** Update File: part`one.py\n*** End Patch"
+        literal = json.dumps(patch).replace("`", r"\`").replace("one", r"\one")
+        changed: set[str] = set()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            _ = compile(source.read_bytes(), str(source), "exec")
+            _ = worker_admission.transcript_entry({"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "input": f"await tools.apply_patch({literal});"}}, changed)
+        self.assertEqual(changed, {"part`one.py"})
+
+    def test_codex_patch_paths_with_surrogates_keep_the_handoff_readable(self) -> None:
+        allowed, source, _ = self.source("codex")
+        assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
+        with source.open("a", encoding="utf-8") as transcript:
+            for name in (r"paired\uD83D\uDE00.py", r"lone-high\uD83D.py", r"lone-low\uDE00.py"):
+                patch = f"*** Begin Patch\\n*** Update File: {name}\\n*** End Patch"
+                _ = transcript.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "custom_tool_call", "name": "exec", "input": f"await tools.apply_patch(`{patch}`);"}}) + "\n")
+        with warnings.catch_warnings(), redirect_stderr(io.StringIO()) as errors:
+            warnings.simplefilter("error", SyntaxWarning)
+            handoff = worker_admission.extract_transcript(allowed.slot.row, allowed.run,
+                staff.CodexBackend(self.root / "codex"))
+        assert isinstance(handoff, worker_admission.TranscriptHandoff)
+        text = handoff.extract.read_text(encoding="utf-8")
+        self.assertIn("paired😀.py", text)
+        self.assertNotIn("lone-", text)
+        self.assertEqual(errors.getvalue(), "")
 
     def test_codex_source_uses_the_newest_saved_transcript_mtime(self) -> None:
         identity = fixture_runtime_id("archived-source")

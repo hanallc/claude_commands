@@ -44,7 +44,7 @@ from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 
-from scripts.review_links import new_item_dialog, review_events
+from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.usage import agents_log
 
 from scripts.lib import conf, names
@@ -1264,14 +1264,6 @@ def _publish_question(record: QuestionRecord, *, record_history: Callable[[], No
         return identity
 
 
-def question_review_id(record: QuestionRecord) -> str:
-    """Give a legacy Question its stored ID under the owner's lock."""
-    if identity := _numbered_question_id(record):
-        return identity
-    with _question_number_lock(record.owner):
-        return _publish_question(_current_legacy_question(record))
-
-
 def _numbered_question_id(record: QuestionRecord) -> str:
     identity = record.item.get("review_id", "")
     return identity if re.fullmatch(r"Q[1-9][0-9]*", identity) else ""
@@ -1304,9 +1296,9 @@ def _file_question(record: QuestionRecord,
             filed = replace(record, path=path, item={**record.item, "review_id": identity})
             text = _question_text(filed, new_record=True)
             assert text is not None
-            before_write(identity, path)
             try:
-                with numbers.write(path, identity, record.owner, new_record=True):
+                with numbers.write(path, identity, record.owner, new_record=True,
+                                   before_write=lambda: before_write(identity, path)):
                     try:
                         record_store.create_record_text(path, text)
                     except record_store.ReusedReviewRecord:
@@ -1321,12 +1313,15 @@ def _file_question(record: QuestionRecord,
             return filed
 
 
-def write_question_record(record: QuestionRecord, *, assign_id: bool = False) -> None:
+def write_question_record(record: QuestionRecord, *, assign_id: bool = False,
+                          before_write: Callable[[], None] | None = None) -> None:
     if assign_id and not _numbered_question_id(record):
         with _question_number_lock(record.owner):
-            _ = _publish_question(record)
+            _ = _publish_question(record, record_history=before_write)
         return
     text = _question_text(record)
+    if before_write is not None:
+        before_write()
     _write_question_text(record, text)
 
 
@@ -1374,7 +1369,12 @@ def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str |
             item["review_log"] = stored[0].item.get("review_log", "")
     if "question" not in item:
         raise RegistrationFailure("questions", f"{record.path}: the question text is missing")
-    if stored and record == stored[0]:
+    value = item.get("review_submission")
+    if value is not None and "reply_token" in value:
+        details = new_item_dialog.read_submission(value)
+        item = item.copy()
+        item["review_submission"] = new_item_dialog.hashed_submission_fields(value, details)
+    if stored and replace(record, item=item) == stored[0]:
         return None
     return "\n".join([
         "---", "record_type: question", "tags: [question]", f"status: {record.status}",
@@ -1382,6 +1382,39 @@ def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str |
         "registration: " + json.dumps(item, ensure_ascii=False), "---", "",
         f"# {item['text']}", "", item["question"], "",
     ])
+
+
+def write_review_submission(record: QuestionRecord, fields: dict[str, object]) -> QuestionRecord:
+    """Replace submission fields under the Question locks."""
+    item = record.item.copy()
+    item["review_submission"] = fields
+    path = record.path
+    with path.open(encoding="utf-8", newline="") as stream:
+        text = stream.read()
+    end = text.index("\n") + 1
+    lines = record_store.lines_with_endings(text[end:])
+    for index, line in enumerate(lines):
+        if line.rstrip("\r\n") == "---":
+            break
+        if line.startswith("registration:"):
+            newline = line[len(line.rstrip("\r\n")):]
+            lines[index] = "registration: " + json.dumps(item, ensure_ascii=False) + newline
+            _write_question_text(record, text[:end] + "".join(lines))
+            return replace(record, item=item)
+    raise RegistrationFailure("questions", f"{path}: the registration field is missing")
+
+
+def scrub_reply_token(path: Path, owner: staff.StaffId) -> bool:
+    with wrap_question_locks(owner):
+        record = read_review_question(path, owner)
+        if record.owner != owner:
+            raise RegistrationFailure("questions", f"{path}: the question owner changed")
+        value = record.item.get("review_submission")
+        if value is None or "reply_token" not in value:
+            return False
+        details = new_item_dialog.read_submission(value)
+        _ = write_review_submission(record, new_item_dialog.hashed_submission_fields(value, details))
+        return True
 
 
 def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate", *,
@@ -2146,7 +2179,7 @@ def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, ac
             if action not in ("answer", "mark-important"):
                 raise RegistrationFailure(action, "This command cannot change a sent Question. Use Review.")
             scope = production if selected.owner == production.owner.id else question_scope(selected.owner, identities.record)
-            review_sent_question(selected, scope, "read" if action == "answer" else "mark-important", "", "")
+            review_sent_question(selected, scope, "read" if action == "answer" else "mark-important", "")
             report(action, "ok", f"Marked {open_item_key(selected)} {'read' if action == 'answer' else 'important'}.")
             return _NO_QUESTION_RELAY
 
@@ -2254,11 +2287,13 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
 
 
 def review_sent_question(record: QuestionRecord, scope: QuestionScope,
-                         action: Literal["answer", "feedback", "question", "read", "mark-important"], words: str, token: str) -> None:
+                         action: Literal["answer", "feedback", "question", "read", "mark-important"], words: str,
+                         new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof
+                         = reply_tokens.MINT_REPLY_PROOF) -> None:
     """Apply the user's action to the exact sent question under its locks."""
     with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
         current = current_open_question(record, "mark-important" if action == "mark-important" else "answer")
-        details = new_item_dialog.read_submission(current.item.get("review_submission"))
+        fields = current.item.get("review_submission", {})
         if action == "read" and "followup" in current.item:
             raise RegistrationFailure(action, "The recipient still needs to reply.")
         now = datetime.now(scope.zone)
@@ -2271,9 +2306,10 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         if pending is not None:
             events = review_events.append(events, review_events.ReviewLog(now, "nate", "Superseded followup: " + pending["text"]))
         if action == "question":
-            current.item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+            current.item["followup"] = PendingFollowup(text=words, sent=now.strftime("%Y-%m-%dT%H:%M"))
             current.item["waiting_why"] = review_events.require_waiting_why(words)
-            current.item["review_submission"] = new_item_dialog.stored_submission(replace(details, reply_token=token))
+            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+            current.item["review_submission"] = new_item_dialog.renewed_submission_fields(fields, proof)
         else:
             current = replace(current, status="closed")
         label = "feedback sent" if action == "feedback" else action
@@ -2295,7 +2331,7 @@ def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, wo
         exchanges = current.item.get("followups", [])
         repeated = current.status == "open" and "followup" not in current.item and bool(
             exchanges and exchanges[-1]["reply"] == words)
-        if not repeated and (current.status != "open" or "followup" not in current.item):
+        if not repeated and not pending_review_reply(current):
             raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
         if repeated:
             return False

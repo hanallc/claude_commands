@@ -11,6 +11,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
+from scripts.aws_target.config import AwsOn, aws_switch
 from scripts.lib import conf
 
 
@@ -65,10 +66,18 @@ def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permi
         configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
 
 
+def _hana_on(configuration: conf.ConfigRead) -> bool:
+    """Read the Hana switch through aws_switch: an unattended reader counts an invalid value as off.
+
+    On natedev, the enabled value that hana_guest.read_settings gives is not used."""
+    return isinstance(aws_switch(configuration), AwsOn)
+
+
 def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
     """Read spending and guest safety limits before execution."""
     safety = hana_guest.read_settings(configuration)
-    start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
+    start = _read_start_settings(configuration, enabled=_hana_on(configuration),
+                                 permit_max_seconds=safety.permit_max_seconds)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
         start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
         start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
@@ -169,7 +178,7 @@ class _PlacementPreview:
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
                 permit = hana_guest.read_permit_window(configuration)
-                settings = _read_start_settings(configuration, enabled=permit.enabled,
+                settings = _read_start_settings(configuration, enabled=_hana_on(configuration),
                                                 permit_max_seconds=permit.permit_max_seconds)
                 try:
                     max_age = configuration.whole('preview_max_age_s')

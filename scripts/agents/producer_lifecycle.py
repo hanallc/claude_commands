@@ -15,6 +15,7 @@ from scripts.agents import pane_record, producer_creation, remote, restart, rest
 from scripts.herdr import herdr
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, models_registry
+from scripts.maintenance.vault_save import install_producer_media_rules
 from scripts.message import roster
 from scripts.production import staff, the_list, update_registration
 
@@ -185,6 +186,7 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
             producer_creation.sync_profile(name)
         _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
         _create_readme(folder / "README.md", _text(saved, "readme"))
+        install_producer_media_rules(folder)
         request = stop_resume.ProducerFirstStart(name, folder)
         result = stop_resume._locked_first_producer_resume(request, to="")  # pyright: ignore[reportPrivateUsage]
         if not isinstance(result, stop_resume.ClaudeUp):

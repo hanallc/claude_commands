@@ -5,7 +5,6 @@ import tempfile
 import unittest
 import io
 import json
-import tempfile
 from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -22,6 +21,7 @@ from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.lib import process_start as process_identity
 from scripts.message import unit_labels
 from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 MAC = SshTarget("mac", "macos", Path("/fixture/mac.conf"))
 NATEDEV = LocalTarget("natedev", "linux")
@@ -120,7 +120,7 @@ class MacRouteTests(unittest.TestCase):
         _ = (root / "build_targets.conf").write_text(
             "targets=mac,natedev\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n",
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE,
             encoding="utf-8",
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root)})))
@@ -146,7 +146,7 @@ class MacRouteTests(unittest.TestCase):
     def test_a_busy_mac_holds_a_repository_only_with_its_own_claims(self) -> None:
         self.use_target_config()
         cargo_liner = claim_state.RepositoryScope("cargo-liner", "github.com/natepiano/cargo-liner")
-        hana = claim_state.RepositoryScope("hana", "github.com/natepiano/hana")
+        hana = claim_state.RepositoryScope("hana", "github.com/hanallc/hana")
         organon = claim_state.RepositoryScope("organon", "github.com/natepiano/organon")
         claims = (claim(hana, "nextest hana"), claim(cargo_liner, "check cargo-handler"))
         scopes = {"/fixture/cargo-liner-tile": cargo_liner, "/fixture/organon": organon}
@@ -161,6 +161,7 @@ class MacRouteTests(unittest.TestCase):
         self.assertEqual(scope.call_count, 2)
 
     def test_a_kept_claim_does_not_hold_its_repository_while_another_runs(self) -> None:
+        self.use_target_config()
         first = claim_state.RepositoryScope("first")
         second = claim_state.RepositoryScope("second")
         live = claim(second, "live check")

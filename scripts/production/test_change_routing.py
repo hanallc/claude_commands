@@ -553,7 +553,7 @@ class StaffRoutingTests(unittest.TestCase):
             config.mkdir()
             config_env = config_environment(config)
             _ = write_config_fixture(config / "scratch.conf",
-                                     f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
+                                     f"holds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
             _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
@@ -608,11 +608,11 @@ class StaffRoutingTests(unittest.TestCase):
 
 class MergeWriterRoutingTests(ProducerFixture):
     def test_a_gate_written_producer_routes_to_the_unit_and_receives_return_feedback(self) -> None:
-        from scripts.production import merge_gate
+        from scripts.production import gate
         from scripts.review_links import change_page
 
         _ = self.merge()
-        merge_gate.record_changes(self.repo, self.listing, self.doc, "main")
+        gate.record_changes(self.repo, self.listing, self.doc, "main")
         row = change_review.pending(self.listing)[0]
         owner = change_routing.StaffRouting(staff.snapshot(), {}).owner(row, self.listing)
         self.assertIsInstance(owner, change_routing.StaffRoutedChange)

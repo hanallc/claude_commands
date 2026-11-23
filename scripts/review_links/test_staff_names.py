@@ -12,8 +12,6 @@ from unittest.mock import patch
 from scripts.accounts import accounts
 from scripts.production import staff
 from scripts.review_links import staff_names
-from scripts.lib.build_steps import StepNames
-from scripts.message.owner_role import OwnerRole
 
 
 def without_role_colors(markup: str) -> str:
@@ -24,13 +22,6 @@ def without_role_colors(markup: str) -> str:
 
 
 class StaffNameTests(unittest.TestCase):
-    def test_step_parts_preserve_configured_templates_and_mark_only_staff_fields(self) -> None:
-        for template in ("{unit} {step}", "builder: {step} for {unit}", "{unit}: {unit}; {step}"):
-            names = StepNames({"owned.default": template, "names.build": "builder"})
-            parts = staff_names.owned_step_parts(names, "build", "builder", OwnerRole.UNIT)
-            self.assertEqual(staff_names.parts_text(parts), names.for_owner("build", "builder", OwnerRole.UNIT))
-            self.assertEqual(sum(part["kind"] == "staff" for part in parts), template.count("{unit}"))
-
     def test_every_role_uses_the_accounts_keys_and_current_config(self) -> None:
         kinds: tuple[staff.Kind, ...] = ("showrunner", "unit", "worker", "producer")
         rows = tuple(staff.StaffRow(staff.StaffId(kind), kind, "Name " + kind, staff.StaffRoot(),

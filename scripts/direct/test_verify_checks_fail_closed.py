@@ -7,8 +7,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import textwrap
-import unittest
 from typing import cast, override
+import unittest
+from unittest import mock
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
@@ -16,6 +17,8 @@ from scripts.build_queue import placement
 from scripts.build_queue import admission_protocol as wire
 
 from scripts.direct import test_verify_mac_offload as offload_tests
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -63,10 +66,30 @@ source = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2]
 if command == "constraints" and os.environ.get("TEST_ELIGIBLE_MAC"):
     Path(os.environ["CONF_DIR"], "build_targets.conf").write_text(
         "targets=mac,natedev\\nkind.natedev=local\\nplatform.natedev=linux\\n"
-        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n")
+        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n"
+        + "# whole: 1..86400\\nunreachable_wait_seconds=45\\n")
 runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
 '''
 
+
+
+class FixtureSetupTests(unittest.TestCase):
+    def test_failed_setup_releases_the_root_for_the_next_test(self) -> None:
+        class RouteCheck(VerifyStepRoutesFixture):
+            def check_root(self) -> None:
+                self.assertTrue(self.fixture.root.is_dir())
+
+        first = RouteCheck("check_root")
+        second = RouteCheck("check_root")
+        result = unittest.TestResult()
+        with mock.patch.object(first.fixture, "fixture_paths", side_effect=RuntimeError("fixture setup failed")):
+            _ = unittest.TestSuite([first, second]).run(result)
+
+        self.assertEqual(result.testsRun, 2)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIs(result.errors[0][0], first)
+        self.assertIn("RuntimeError: fixture setup failed", result.errors[0][1])
 
 
 class VerifyChecksFailClosedTests(unittest.TestCase):
@@ -80,8 +103,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
-        self.addCleanup(self.clean_fixture)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         scripts = self.fixture.home / ".claude/scripts"
         lint = scripts / "lint"
         _ = copy_helpers(self.fixture.home, *VERIFY_HELPERS)
@@ -132,9 +154,6 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         return {"empty": "\n", "invalid": "admit\n", "unknown": '{"kind":"deny"}\n',
                 "numeric": '{"kind":"admitted","need":"bad"}\n',
                 "untracked": '{"kind":"admitted"}\n'}.get(mode, line)
-
-    def clean_fixture(self) -> None:
-        self.assertTrue(self.fixture.doCleanups(), "fixture cleanup failed")
 
     def reset_observations(self) -> None:
         self.fixture.cargo_events_path.unlink(missing_ok=True)

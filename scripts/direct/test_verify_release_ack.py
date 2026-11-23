@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import admission_records
@@ -36,9 +37,11 @@ class VerifyReleaseAckTests(unittest.TestCase):
     root: Path = Path()
     cycle_file: Path = Path()
     environment: dict[str, str] = {}
+    runner_session: str = ""
 
     @override
     def setUp(self) -> None:
+        self.runner_session = staff.caller_identity()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         holders = self.root / "holders"
         release = self.root / "release"
@@ -90,7 +93,7 @@ PY
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-            "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("unit-director"),
+            "CLAUDE_CODE_SESSION_ID": self.runner_session or fixture_runtime_id("unit-director"),
             "LINT_CONFIG_READER": str(lint_reader),
             "CYCLE_FILE": str(self.cycle_file),
             "STEP_STATE_LOG": str(self.root / "step-states"),
@@ -130,7 +133,7 @@ PY
             row = fixture_member("showrunner", name="unit-director", runtime_id=fixture_runtime_id("unit-director"))
             _ = staff.set_run(row.id, staff.OpenRun(run))
         self.environment["UNIT_RUN_DIR"] = str(run)
-        self.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
+        self.environment["CLAUDE_CODE_SESSION_ID"] = self.runner_session or "stale-session"
 
     def release_memory_after_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -170,6 +173,7 @@ PY
 class VerifyRoutingTests(unittest.TestCase):
     fixture: test_verify_untested_examples.UntestedExampleTests
     cycle_file: Path = Path()
+    runner_session: str = ""
 
     @override
     def __init__(self, methodName: str = "runTest") -> None:
@@ -178,8 +182,8 @@ class VerifyRoutingTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.runner_session = staff.caller_identity()
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         self.addCleanup(self.fixture.tearDown)
         root = self.fixture.root
         self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root / "buildlog")}))
@@ -205,7 +209,7 @@ class VerifyRoutingTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
-            "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("unit-director"),
+            "CLAUDE_CODE_SESSION_ID": self.runner_session or fixture_runtime_id("unit-director"),
         })
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "0.01"
         self.fixture.environment["BUILD_TARGETS_NOW"] = ""
@@ -223,16 +227,18 @@ class VerifyRoutingTests(unittest.TestCase):
             row = fixture_member("showrunner", name="unit-director", runtime_id=fixture_runtime_id("unit-director"))
             _ = staff.set_run(row.id, staff.OpenRun(run))
         self.fixture.environment["UNIT_RUN_DIR"] = str(run)
-        self.fixture.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
+        self.fixture.environment["CLAUDE_CODE_SESSION_ID"] = self.runner_session or "stale-session"
+        self.reset_cycle(owner_session=row.current_session)
 
-    def reset_cycle(self) -> None:
+    def reset_cycle(self, *, owner_session: str = "") -> None:
+        owner = owner_session or self.runner_session or fixture_runtime_id("unit-director")
         now = datetime.now().astimezone().isoformat()
         cycle: dict[str, object] = {
             "id": CYCLE_ID, "opened_at": now, "release_started_at": "",
             "holders": {"holder": {"since": now, "released_at": ""}},
-            "recipients": {fixture_runtime_id("unit-director"): "unit"},
+            "recipients": {owner: "unit"},
             "entries": [{
-                "session_id": fixture_runtime_id("unit-director"), "name": "unit", "delivery": "NotAttempted",
+                "session_id": owner, "name": "unit", "delivery": "NotAttempted",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")

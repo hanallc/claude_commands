@@ -24,6 +24,7 @@ from typing import Literal, NotRequired, TypedDict
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import read_step_names
 from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
@@ -66,6 +67,7 @@ class SnapshotLine(TypedDict):
 class RunCostData(TypedDict):
     scope: str
     label: str
+    noun: str
     explanation: str
     tables: list[TableData]
     # Keep the standard Gate table at index 0 for pages that are already open.
@@ -368,7 +370,8 @@ def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) ->
                '32 vCPU break-even (USD/min)')
     rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
                  for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
-    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+    gate = read_step_names().shown('gate')
+    return spot_table.Table(f'32-vCPU {gate} break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:
@@ -407,11 +410,11 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
-def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
+def launch_state(records: Sequence[dict[str, object]], gate_switch: aws_config.AwsSwitch) -> LaunchState:
     """Show the switch state or the latest launch evidence."""
-    if gate_switch is cloud_gate.CloudGateSwitch.OFF:
+    if isinstance(gate_switch, aws_config.AwsOff):
         return {'kind': 'off'}
-    if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
+    if isinstance(gate_switch, aws_config.AwsSwitchUnusable):
         return {'kind': 'invalid'}
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
@@ -545,10 +548,13 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
     return data
 
 
+GATE_SWITCH_ON = aws_config.AwsOn()
+
+
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
-              gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
+              gate_switch: aws_config.AwsSwitch = GATE_SWITCH_ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = {row[0] for row in placement.rows} | tables.hours.checked_regions
@@ -575,7 +581,8 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'quota_history': quota_history_data(tables, now),
         'cached_spot_status': {read.region: 'read failed' if read.failure else 'old'
                                for read in tables.regions if read.failure or read.stale},
-        'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
+        'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'noun': costs.scope.noun,
+                  'explanation': costs.explanation,
                   'tables': [table_data(without_prices(table)) for table in costs.tables],
                   'prices': [table_rows_data(costs.gate_prices)],
                   'estimates': [{'region': entry.region, 'summary': costs.summary_of(entry)} for entry in costs.estimates],
@@ -638,8 +645,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
-                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
-    comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
+                     settled_notes=settled_amount_notes(watched), gate_switch=aws_config.aws_switch(values))
+    comparisons = run_cost.gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}

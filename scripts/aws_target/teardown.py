@@ -381,7 +381,10 @@ class TargetRemoval:
         return remove_regional_gates(self.api, self.directory, include_home=True)
 
     def gate_image(self) -> bool:
-        return remove_gate_images(self.api, self.directory, self.clock)
+        outcome = remove_gate_images(self.api, self.directory, self.clock)
+        if isinstance(outcome, GateImageRemovalRefused):
+            raise ValueError(outcome.reason)
+        return outcome
 
     def _kept_image(self) -> None:
         path = self.directory / 'image.json'
@@ -491,11 +494,32 @@ def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = 
     return changed
 
 
-def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float]) -> bool:
+def _gate_image_folder_identity(folder: Path) -> tuple[int, int]:
+    from stat import S_ISDIR
+
+    if folder.parent.resolve() != folder.parent:
+        raise ValueError('the state directory path must be canonical and contain no links')
+    status = folder.lstat()
+    if not S_ISDIR(status.st_mode):
+        raise ValueError('gate-image must be a directory and cannot be a link')
+    return status.st_dev, status.st_ino
+
+
+@dataclass(frozen=True)
+class GateImageRemovalRefused:
+    reason: str
+
+
+def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float]) -> bool | GateImageRemovalRefused:
     """Delete the saved gate images before their snapshots and drop their cost row."""
-    folder = directory / 'gate-image'
-    if not folder.exists():
+    folder = directory.absolute() / 'gate-image'
+    try:
+        original = _gate_image_folder_identity(folder)
+    except FileNotFoundError:
         return False
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f'kept for a manual removal list: {folder} (teardown, {error})')
+        return GateImageRemovalRefused(str(error))
     from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
     _ = box.cleanup_images(api, {}, GATE_IMAGE_OWNER_TAG)
     book = ledger.CostLedger(directory)
@@ -505,6 +529,14 @@ def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float])
         book.record_inventory(ledger.ResourceInventory(int(clock()),
             tuple(item for item in previous.resources if item.name != 'gate-image'), 'gate image removed',
             builder_removed=previous.builder_removed))
+    try:
+        if _gate_image_folder_identity(folder) != original:
+            raise ValueError('the gate-image directory changed during teardown')
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f'kept for a manual removal list: {folder} (teardown, {error})')
+        return GateImageRemovalRefused(str(error))
     shutil.rmtree(folder)
     return True
 

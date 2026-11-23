@@ -26,9 +26,11 @@ from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, build_slots, conf, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -69,7 +71,7 @@ from scripts.sample import item
 class ChangedValueTests(unittest.TestCase):
     def test_changed_value(self):
         self.assertEqual(item.VALUE, "after")
-        self.assertEqual(os.environ["HERDR_BIN"], "/nonexistent/herdr")
+        self.assertEqual(os.environ["HERDR_BIN"], ''' + repr(MISSING_HERDR_BIN) + ''')
         for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)
@@ -281,7 +283,7 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/sample/test_item.py": DIRECT_TEST,
             "scripts/sample/test_item_extra.py": DIRECT_TEST,
             "scripts/sample/test_unrelated.py": "raise AssertionError('full suite ran')\n",
-            "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
+            "scripts/production/gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
         copy_startup(self.checkout)
@@ -311,17 +313,17 @@ class FastTrackTests(MergeCheckpointFixture):
         bounded_git = self.bin / "bounded-git"
         self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
         self.env.update({
-            "MERGE_GATE_BASEDPYRIGHT": "basedpyright",
+            "GATE_BASEDPYRIGHT": "basedpyright",
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
-            "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
+            "GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
         })
         _ = self.env.pop("FAST_TRACK_TEST_RECORD_GIT", None)
         self.settings = {
             "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
             "max_push_attempts": 2, "fetch_lock_attempts": 3, "fetch_lock_wait_seconds": 0,
-            "refused_paths": ["scripts/production/add_unit.py", "scripts/agents/*.py",
+            "refused_paths": ["scripts/production/add_unit.py", "scripts/production/gate.py", "scripts/agents/*.py",
                               "private-hooks/", "**/staff.json"],
         }
         self.save_config()
@@ -343,6 +345,7 @@ names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
 roots.system={self.root / 'system'}
 roots.gate={self.root / 'gates'}
+roots.build={self.root / 'build'}
 roots.temporary=${{TMPDIR}}/builds
 roots.scratch={self.root / 'scratch'}
 roots.copies={self.root / 'copies'}
@@ -369,7 +372,7 @@ slots.unused_days=7
 slots.wait_seconds=30
 """,
         )
-        _ = Path(self.env["COPIES_CONFIG"]).write_text(
+        _ = write_config_fixture(Path(self.env["COPIES_CONFIG"]),
             f"""remote_registry={self.root / 'remote-mirrors'}
 wait_seconds=0.01
 git_timeout_seconds=10
@@ -1178,7 +1181,8 @@ owner.verify=verify
         self.assertTrue(any(row["value"] == "after" for row in self.observations("import")))
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
-            self.assertEqual(clone.parent, self.root.resolve() / "slots")
+            self.assertEqual(clone.parent.parent, self.root.resolve() / "build/origin")
+            self.assertTrue(clone.name.isdecimal())
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
             self.assertTrue(clone.exists())
             self.assertEqual(self.build_folder_state(clone), "free")
@@ -1228,10 +1232,13 @@ owner.verify=verify
         self.assert_refused(self.fast_track(str(outside)))
 
     def test_sensitive_paths_are_refused_before_any_check(self) -> None:
-        for path in ("scripts/production/add_unit.py", "scripts/agents/fixture.py",
-                     "private-hooks/nested/check.py", "state/private/staff.json"):
+        paths = (
+            "scripts/production/add_unit.py", "scripts/production/gate.py",
+            "scripts/agents/fixture.py", "private-hooks/nested/check.py", "state/private/staff.json",
+        )
+        for path in paths:
             with self.subTest(path=path):
-                self.write(self.unit, path, "refused edit\n")
+                self.write(self.unit, path, "VALUE = 1\n")
                 self.assert_refused(self.fast_track(path), f"refused path: {path}")
         self.assertEqual(self.observations("types"), [])
 

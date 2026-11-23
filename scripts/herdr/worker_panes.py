@@ -1,9 +1,12 @@
 """Start, observe, and close staff workers through proved native panes."""
 from __future__ import annotations
+
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
+
+from scripts.direct import pass_record as pass_recorder
 
 import argparse
 import errno
@@ -20,6 +23,7 @@ import time
 from threading import Event
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from functools import cache, partial
@@ -31,11 +35,10 @@ from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
-from scripts.direct import recorder_state
+from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
+from scripts.direct import progress_history, recorder_state
 
 if TYPE_CHECKING:
-    from scripts.direct import progress_history
     from scripts.accounts import accounts
 
 StaffId = staff.StaffId
@@ -333,6 +336,27 @@ class LaunchPolicy:
 
 
 @dataclass(frozen=True)
+class CheckedRolePolicy:
+    """The launch policy that passed the check for this worker role."""
+
+    role: WorkerRole
+    launch: LaunchPolicy
+
+
+_checked_resume_policies: ContextVar[Mapping[StaffId, CheckedRolePolicy]] = ContextVar("checked_resume_policies")
+
+
+@contextmanager
+def use_checked_resume_policies(policies: Mapping[StaffId, CheckedRolePolicy]) -> Generator[None]:
+    """Keep the checked launch policy for each native conversation."""
+    token = _checked_resume_policies.set(policies)
+    try:
+        yield
+    finally:
+        _checked_resume_policies.reset(token)
+
+
+@dataclass(frozen=True)
 class PaneEvidence:
     panes: list[dict[str, object]]
     scan: herdr.RowPaneScan
@@ -392,8 +416,22 @@ def _text(row: dict[str, object], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+_DEFER_WORKER_ANOMALIES: ContextVar[bool] = ContextVar("_DEFER_WORKER_ANOMALIES", default=False)
+
+
+@contextmanager
+def defer_worker_anomalies() -> Generator[None]:
+    """Let the caller report the reason from the returned worker state."""
+    token = _DEFER_WORKER_ANOMALIES.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_WORKER_ANOMALIES.reset(token)
+
+
 def _uncertain(row: staff.StaffRow, reason: str) -> UncertainWorker:
-    print(f"anomaly: {row.name}: {' '.join(reason.splitlines())}; correct the evidence and retry", file=sys.stderr)
+    if not _DEFER_WORKER_ANOMALIES.get():
+        print(f"anomaly: {row.name}: {' '.join(reason.splitlines())}; correct the evidence and retry", file=sys.stderr)
     return UncertainWorker(row, reason)
 
 
@@ -618,7 +656,6 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
     workers = record.find(kind="worker")
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
-    from scripts.direct import progress_history
 
     scanned = parent_run_index(record) if scanned is None else scanned
     linked = progress_history.recorded_dispatch_runs()
@@ -665,7 +702,6 @@ def worker_run(member: staff.StaffRow, *,
     first = runs[0] if runs else worker_fallback_run(parent, record=record)
     if member.kind != "worker":
         return first
-    from scripts.direct import progress_history
 
     dispatched = progress_history.recorded_dispatch_run(member.id)
     linked = dispatched.directory if isinstance(dispatched, progress_history.RecordedDispatchRun) else None
@@ -769,19 +805,18 @@ class PassDetachedResults:
 
 
 class RecordedCompletionEvidence(Protocol):
-    def completion_close_evidence(self, row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+    def completion_close_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                                   run: Path, reply_file: str) -> CloseAllowed | Kept: ...
 
-    def pass_reply_evidence(self, row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+    def pass_reply_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                             run: Path, reply_file: str, require_completion: bool,
                             detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
 
 def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
     """Require the saved stage and its reply before a pass can release its evidence."""
-    from scripts.direct import progress_history
 
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     if not delivery.line or not delivery.completion_id:
         return Kept("the dispatch has no saved completion id")
     completion = progress_history.hook_completion(passed)
@@ -790,12 +825,15 @@ def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, 
     return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
 
 
+NO_FINAL_REPLY = "last turn does not end with an assistant reply"
+
+
 def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
     messages = _transcript_messages(row)
     if isinstance(messages, Kept):
         return messages
     if not messages or not messages[-1].startswith("assistant:\n"):
-        return Kept("last turn does not end with an assistant reply")
+        return Kept(NO_FINAL_REPLY)
     return CloseAllowed()
 
 
@@ -863,7 +901,6 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
                           read: Callable[[Path], dict[str, object]] = run_state,
                           ) -> WorkerDispatchState:
     """Check the worker lock, detached runs, and all saved passes for this worker."""
-    from scripts.direct import progress_history
 
     locked = check_worker_lock(row, lock)
     if isinstance(locked, Kept):
@@ -912,9 +949,7 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
 def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, object], status: object,
                          dispatch: object, *, live_runs_checked: bool) -> WorkerDispatchState:
-    from scripts.direct import progress_history
-
-    delivery = progress_history.dispatch_delivery(passed)
+    delivery = pass_recorder.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
     finished = isinstance(completion, progress_history.HookCompletion) and completion.finished
@@ -974,11 +1009,10 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
         return Kept(state.blocker)
-    from scripts.direct import progress_history
 
     if isinstance(state, CompletedWorkerPass):
         passed = worker_pass(worker.row, directory)
-        if progress_history.dispatch_delivery(passed).line:
+        if pass_recorder.dispatch_delivery(passed).line:
             completion = recorded_completion_close(worker.row, directory, passed)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
@@ -990,7 +1024,7 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
                 and isinstance(worker, OpenWorker) and not worker.status.idle):
             return Kept(f"agent state is {worker.status.value}")
-        delivery = progress_history.dispatch_delivery(passed)
+        delivery = pass_recorder.dispatch_delivery(passed)
         if delivery.line:
             completion = recorded_completion_close(worker.row, directory, passed)
         elif isinstance(worker, StoppedWorker):
@@ -1018,6 +1052,19 @@ def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
     return _launch_policy(settings, sandbox)
+
+
+def checked_role_policy(role: WorkerRole | WorkerRoleUnavailable,
+                        family: Literal["claude", "codex", "assigned"] = "assigned") -> CheckedRolePolicy | StartRefused:
+    """Read the role policy or give the reason it cannot start a worker."""
+    if isinstance(role, WorkerRoleUnavailable):
+        return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
+    if role not in staff.WORKER_ROLES:
+        return StartRefused(StartRefusal.UNKNOWN_ROLE, str(role))
+    try:
+        return CheckedRolePolicy(role, launch_policy(role, family))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, f"{role}: {error}")
 
 
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
@@ -1064,8 +1111,20 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
     return arguments + _turn_end_arguments(settings.kind)
 
 
+def _claude_worker_settings(settings: models_registry.LaunchSettings,
+                            preferred: pane_record.ClaudeTurnSettings | pane_record.NoClaudeTurn
+                            | pane_record.ClaudeResumeSettings) -> models_registry.LaunchSettings:
+    resume = pane_record.claude_resume_settings(preferred,
+        fallback=pane_record.ClaudeResumeSettings(settings.model, settings.effort))
+    return settings._replace(model=resume.model, effort=resume.effort)
+
+
 def kept_settings(settings: models_registry.LaunchSettings, arguments: Sequence[str]) -> models_registry.LaunchSettings:
-    """Keep the model, effort and tier that a saved launch passed; a launch without a model keeps the given settings."""
+    """Keep the saved launch settings and use the role for missing Claude flags."""
+    if settings.kind == "claude":
+        saved = pane_record.parse_claude_flags(arguments).values
+        return _claude_worker_settings(settings, pane_record.ClaudeResumeSettings(
+            saved.get("--model", ""), saved.get("--effort", "")))
     recorded = {"--model": "", "--effort": "", "model_reasoning_effort": "", "service_tier": ""}
     for flag, value in zip(arguments, arguments[1:]):
         name, _, setting = value.partition("=") if flag == "-c" else (flag, "", value)
@@ -1263,10 +1322,12 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     keep_model = isinstance(policy, UseRolePolicy)
-    try:
-        policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
+    if isinstance(policy, UseRolePolicy):
+        saved = _checked_resume_policies.get({}).get(existing.current_session) if existing is not None else None
+        checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
+        if isinstance(checked, StartRefused):
+            return checked
+        policy = checked.launch
     try:
         with ExitStack() as operations:
             held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
@@ -1493,7 +1554,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_evidence = fresh
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
-        arguments = launch_arguments(policy, identity, directory)
+        resume_policy = policy
+        if (identity and row is not None and keep_model and policy.settings.kind == "claude"
+                and row.role == staff.KnownWorkerRole(role)):
+            homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
+            if target_home := environment.get("CLAUDE_CONFIG_DIR"):
+                homes.append(Path(target_home))
+            turn = pane_record.claude_turn_settings(identity, *homes)
+            resume_policy = replace(policy, settings=_claude_worker_settings(policy.settings, turn))
+        arguments = launch_arguments(resume_policy, identity, directory)
         def launch_at(selected: herdr.SplitPane | herdr.ExistingPane) -> herdr.AgentLaunched:
             return launch(client.session, selected, prepared, policy.settings.kind,
                 arguments, herdr.NoOpeningPrompt(),

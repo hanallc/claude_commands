@@ -89,7 +89,7 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
-`drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
+`drain` keeps existing runs that work until they finish, also between their steps; a run that only waits waits for the release.
 Both accept `--keep PID` and require `--release-eta HH:MM --zone IANA`.
 The dated form `YYYY-MM-DDTHH:MM` permits a later date in that zone.
 The release time must be in the future.
@@ -125,7 +125,12 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
-- After the last holder file is gone, each recipient gets one release notice.
+- After the last holder file is gone, release sends each live recipient one notice.
+  It records a confirmed missing session as `RecipientGone`.
+  If the staff row is also absent, it removes the recipient from the cycle's recipient list.
+  Release omits that recipient from `Not reached` and skips it on retry.
+  It records `WorkerClosed` when the sender finds a closed Codex worker with no route.
+  The next assignment resumes a closed worker.
   The notice names each hold, its purpose, and its start time in the user zone.
   For example: `fps hold for frame capture, from 07:33:20 EST`.
   An old cycle without a purpose still names the hold and its start time.
@@ -185,7 +190,7 @@ It saves no pass because a saved pass describes this machine.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
 - `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
-- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:mac unblock` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the live local block, claim and backoff files. A saved line that the live state does not agree with shows no Mac condition until the next sample. The watch message uses the reading that the watch just wrote, so it does not read the live state again. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes an unreachable Mac sends one phone push per outage, cleared when the saved outage ends. A block, an idle claim and a free Mac send no push. An unreachable Mac that the user turned off (a Mac block, `offload=off` or `enabled.<machine>=off`) sends no push either. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
 - Repairs still run only when no block or live claim exists. Buildlog schema 21 includes `mac_idle`, one row per cause per call; `message_showrunner` names its message action and failed sends stay pending without more rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
 - Exports for the build log: `BUILDLOG_TARGET` is `mac` from the start of a Mac attempt and for a call that ends there, empty after a decline or a lost run, `natedev` once tests start locally (a Mac pass confirmed on natedev is `natedev` with `BUILDLOG_MAC=passed`). `BUILDLOG_HOLD_WAIT_S` sums every wait a hold caused: routing sleeps, each declined Mac retry's seconds, and `wait-local`'s; memory waits are not counted. `BUILDLOG_MAC_HOLDER` carries a `busy` decline's `holder=` value and is passed on the `record.py call` line, never exported.
 
@@ -490,7 +495,7 @@ the run; the floor sweep discovers the configured gates root and may reclaim
 idle marked caches. See `gate-checkouts.md` for configuration and removal.
 The sweep still reads Cargo's general `build.build-dir` templates.
 
-The copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev, `/tmp/claude/copies` on the Mac) is a kept root, with copies at `<pair>/<copy>`. On natedev the tmp sweep also drains the former `/tmp/claude/copies`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
+The copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev and on the Mac) is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
@@ -604,13 +609,13 @@ No configuration maps repositories to unit gates.
 `read_metadata` uses `GATE_METADATA` or runs `cargo metadata --no-deps --format-version 1`.
 `load_metadata` decodes it once through `verify_metadata.py` and saves the shell answers.
 The helper reads JSON on stdin and writes shell-quoted `NAME=value` answers.
-Requests cover members, example features, test targets, check targets, build targets, untested examples, workspace root, and target directory.
+Requests cover members, example features, test targets, build targets, untested examples, workspace root, and target directory.
 Queries and early doc exits need no metadata helper.
 `dev_features.py` reads the root manifest directly in the per-run helper, so an invalid dev-feature list refuses before Cargo.
 
-`take_check_targets` includes `--lib` only when a workspace member has a library target.
-A binary-only workspace therefore checks successfully.
-A dependency's library cannot select `--lib`, because this metadata read excludes dependencies.
+`verify.sh check` passes `--all-targets`, so it compiles test, example and bench code as well as libraries and binaries.
+A compile error in test code therefore stops at check, before lint or a gate.
+`--all-targets` selects only the targets that exist, so a binary-only workspace checks successfully.
 
 `hash_stream` uses `sha256sum`, or `shasum -a 256` when the former is unavailable.
 It returns failure when the hash command fails.
@@ -768,6 +773,7 @@ Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER
 The helper imports each Python program once and calls its existing `main` on the main thread.
 Each request carries the arguments, environment, working directory, and input text.
 The helper restores this state after each call.
+Each call runs in a copy of the helper's context, so a `ContextVar` value lasts for one call, as in its own process.
 It returns the exit status and captured output to the caller.
 The helper replays stderr when each call ends.
 The helper exits when its input pipe closes.
@@ -782,7 +788,7 @@ The detached step recorders from `invoke.sh` also keep their own processes.
 Shell fixtures and scripts with no line that starts `def main(` use their original process path.
 The helper finds that line with a text search, not a parse.
 The helper changes only the environment names that differ between calls.
-A failed helper request also uses that path.
+A failed helper request also uses that path. A `SystemExit` while the helper loads a program is a failed request.
 The change does not wrap or re-execute `verify.sh`.
 
 `VERIFY_PY_TRACE` retains one timing row for each helper call.

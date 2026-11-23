@@ -17,7 +17,7 @@ import tempfile
 from textwrap import dedent
 import threading
 import time
-from typing import NotRequired, TypedDict, cast, override
+from typing import ClassVar, NotRequired, TypedDict, cast, override
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import unittest
@@ -31,33 +31,64 @@ from scripts.build_targets import target_config
 from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
 from scripts.build_queue import step_estimator
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, offload
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots, conf
+from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
 from scripts.production.production_doc import Production
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 GATE_COMMAND = """from pathlib import Path
 import json, os, sys, time
 sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
 from scripts.build_queue.queue_place import queue_place
 
 for phase in range(2):
-    with queue_place('merge-gate', Path.cwd()):
+    with queue_place('gate', Path.cwd()):
         print(json.dumps({'phase': phase, 'cwd': str(Path.cwd()), 'run': os.environ.get('BUILDLOG_RUN', ''), 'at': time.monotonic()}), flush=True)
         if not sys.stdin.buffer.read(1):
             break
+"""
+
+# Use the real placement and copy APIs for callers that need no Cargo process.
+CAPACITY_CALLER = """from pathlib import Path
+import os
+from socket import AF_UNIX, SOCK_STREAM, socket
+import sys
+import time
+
+from scripts.build_queue import admission_client as client
+from scripts.lib import build_slots
+
+endpoint, caller, source_key, folder = sys.argv[1:]
+source = Path(folder)
+os.chdir(source)
+assignment = Path(os.environ["TMPDIR"]) / "assignment.json"
+status = client.main(["place-step", "--pid", str(os.getpid()), "--episode", f"capacity-{os.getpid()}",
+    "--since", str(time.time()), "--repo-root", str(source), "--source-key", source_key,
+    "--kind", "test", "--package", "sample", "--local-only", "--assignment-file", str(assignment),
+    "--", "cargo", "nextest", "run"])
+if status:
+    raise SystemExit(status)
+try:
+    with build_slots.take_copy(source, "HEAD", showrunner="builds", unit="slot-order", work="test",
+            purpose="competing copy") as copy:
+        with socket(AF_UNIX, SOCK_STREAM) as ready:
+            ready.connect(endpoint)
+            ready.sendall(f"{caller}\\t{copy.path}\\n".encode())
+            ready.recv(1)
+finally:
+    client.finish_step(assignment, 0)
 """
 
 
@@ -70,51 +101,54 @@ class StartedStep(TypedDict):
 
 
 class SlotOrderTests(unittest.TestCase):
+    repository_seed: ClassVar[ImmutableGitSeed]
     root: Path = Path()
     source: Path = Path()
     slot_root: Path = Path()
     owner: str = ""
-    session_environment: dict[str, str] = {}
+    build_sessions: dict[str, str] = {}
     queue: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     processes: list[subprocess.Popen[str]] = []
     requests: list[wire.Request] = []
     request_times: list[tuple[wire.Request, float]] = []
     replies: list[wire.Reply] = []
     waiting: threading.Event = threading.Event()
-    slot_waiting: threading.Event = threading.Event()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
+        cls.repository_seed = ImmutableGitSeed.create(seed, "main", "Slot Tests", "slots@example.invalid",
+            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "gate.py": GATE_COMMAND,
+             ".gitignore": "target/\n"})
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
-        runner_session = staff.caller_identity()
-        self.session_environment = {key: os.environ.get(key, "") for key in SESSION_VARIABLES}
-        environment = {**copies_environment(self.root, repository="origin"), **self.session_environment}
+        environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
-            "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": ""})))
+            "HERDR_BIN": MISSING_HERDR_BIN, "BUILDLOG_RUN": ""})))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=runner_session)
+        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=staff.caller_identity())
         self.owner = str(member.id)
-        if not runner_session:
-            self.session_environment["CLAUDE_CODE_SESSION_ID"] = member.current_session
-            os.environ.update(self.session_environment)
-        seed = ImmutableGitSeed.create(self.root / "repository", "main", "Slot Tests", "slots@example.invalid",
-            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
-             ".gitignore": "target/\n"})
-        self.source = seed.checkout
-        self.slot_root = self.root / "slots"
+        self.build_sessions = build_fixture_sessions(member.current_session)
+        os.environ.update(self.build_sessions)
+        self.source = self.root / "repository" / "checkout"
+        self.repository_seed.copy_to(self.source, self.source.parent / "origin.git")
+        self.slot_root = self.root / "build"
         self.processes = []
         self.requests = []
         self.request_times = []
         self.replies = []
         self.waiting = threading.Event()
-        self.slot_waiting = threading.Event()
         handle_request = self.queue.server.handle_request
 
         def observe_request(request: wire.Request, connection: admission_service.Connection | admission_service.NoConnection
@@ -127,8 +161,8 @@ class SlotOrderTests(unittest.TestCase):
             self.replies.append(reply)
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
-            if isinstance(reply, wire.RepositorySlotWaiting):
-                self.slot_waiting.set()
+                # Wake a file waiter that also ends when its process exits.
+                (self.root / "queue-wait").touch()
             return reply
 
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
@@ -177,8 +211,88 @@ class SlotOrderTests(unittest.TestCase):
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
 
+    def start_shell_cargo(self, runtime: Path) -> subprocess.Popen[str]:
+        config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        _ = config.write_text(config.read_text().replace("folders.check=report", "folders.check=enforce"))
+        self.assertEqual(conf.read("build_folders").text("folders.check"), "enforce")
+        front, tools = self.root / "front", self.root / "tools"
+        front.mkdir()
+        tools.mkdir()
+        (front / "cargo").symlink_to(CHECKOUT / "scripts/build_hold/cargo")
+        systemd = tools / "systemd-run"
+        _ = systemd.write_text("#!/bin/sh\nexit 99\n")
+        systemd.chmod(0o700)
+        cargo = tools / "cargo"
+        _ = cargo.write_text(f"#!{sys.executable}\n" + dedent(r"""
+            import json, os, sys
+            from pathlib import Path
+
+            assert sys.argv[1:] == ["build", "--manifest-path", str(Path.cwd() / "Cargo.toml")]
+            assert Path(sys.argv[-1]).is_file()
+            assert os.environ["CARGO_FOLDER_CHECKED"] == "1"
+            target = Path(os.environ["CARGO_TARGET_DIR"])
+            assert target == Path.cwd() / "target"
+            print(json.dumps({"cwd": str(Path.cwd())}), flush=True)
+            assert sys.stdin.buffer.read(1) == b"x"
+            app = target / "debug/app"
+            app.parent.mkdir(parents=True, exist_ok=True)
+            app.write_text("#!/bin/sh\necho app-ran\n")
+            app.chmod(0o700)
+            """).lstrip("\n"))
+        cargo.chmod(0o700)
+        environment = {
+            "PATH": os.pathsep.join((str(front), str(tools), os.environ["PATH"])),
+            "BUILD_HOLD_DIR": str(self.root / "holds"),
+            "CARGO_WRAPPER_CGROUP_FILE": str(self.root / "unscoped-cgroup"),
+            "BUILDLOG_SCOPE": "0",
+            "BUILDLOG_STEP_SCOPE": "",
+            "CARGO_FOLDER_CHECKED": "",
+            "XDG_RUNTIME_DIR": str(runtime),
+        }
+        with mock.patch.dict(os.environ, environment):
+            return self.start(("bash", "-c", 'cargo build --manifest-path "$PWD/Cargo.toml" && ./target/debug/app'),
+                              "--publish", "target/debug/app")
+
+    def assert_shell_cargo_finishes(self, process: subprocess.Popen[str], checkout: Path) -> None:
+        self.finish_step(process)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("app-ran", output.splitlines())
+        publication, = [line.removeprefix("published: ").rsplit(" ", 1)[0]
+                        for line in output.splitlines() if line.startswith("published: ")]
+        self.assertEqual(Path(publication).read_bytes(), (checkout / "target/debug/app").read_bytes())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertTrue(self.queue.callers_released())
+        self.assertFalse((self.source / "target/debug/app").exists())
+
+    def test_shell_cargo_admits_in_its_leased_copy_and_runs_the_app(self) -> None:
+        self.queue.hold_starts()
+        runtime = self.queue.socket_dir
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bus:
+            bus.bind(str(runtime / "bus"))
+            process = self.start_shell_cargo(runtime)
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "Cargo did not enter admission")
+        checkout = self.slot_root / "origin/slot-order/1"
+        self.assertEqual(build_folders.build_folder_state(checkout), "held")
+        self.assertFalse((checkout / "target/debug/app").exists())
+        write_pressure_reading(self.queue.root / "pressure")
+        self.queue.server.wake_loop()
+        self.assertEqual(Path(self.next_step(process)["cwd"]), checkout)
+        self.assertEqual(build_folders.build_folder_state(checkout), "held")
+        self.assertEqual(len(self.queue.caller_reservations()), 1)
+        self.assert_shell_cargo_finishes(process, checkout)
+
+    def test_shell_cargo_direct_uses_its_leased_copy_and_runs_the_app(self) -> None:
+        self.queue.hold_starts()
+        process = self.start_shell_cargo(self.root / "no-bus")
+        checkout = self.slot_root / "origin/slot-order/1"
+        self.assertEqual(Path(self.next_step(process)["cwd"]), checkout)
+        self.assertEqual(build_folders.build_folder_state(checkout), "held")
+        self.assert_shell_cargo_finishes(process, checkout)
+        self.assertEqual(self.requests, [])
+
     def report(self) -> slots.SlotReport:
-        return slots.read_slots(self.slot_root, self.root / "cargo", conf.read("build_folders"),
+        return slots.read_slots(self.slot_root, conf.read("build_folders"),
             self.queue.server.host, None, self.queue.clock.now(), build_folders.build_folder_state,
             owners=lambda owner: owner)
 
@@ -188,7 +302,7 @@ class SlotOrderTests(unittest.TestCase):
         production = Production(self.root / "production.md", owner.name, "main", self.source,
                                 self.root / "production.log", ZoneInfo("UTC"), owner)
         unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
-        command = shlex.join((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        command = shlex.join((sys.executable, str(self.source / "gate.py"), "--tests-only"))
         execute = mock.Mock(side_effect=AssertionError("the scratch command started before admission"))
         with (mock.patch.object(waiting, "named_unit", return_value=unit),
               mock.patch.object(waiting, "subprocess", SimpleNamespace(run=execute, STDOUT=subprocess.STDOUT)),
@@ -199,7 +313,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
-        command = [sys.executable, str(self.source / "merge_gate.py"), "--tests-only"]
+        command = [sys.executable, str(self.source / "gate.py"), "--tests-only"]
         record: checkpoint_gate.BumpGateRecord = {
             "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
             "owner_id": self.owner, "unit_id": self.owner, "name": "fixture", "merge_branch": "main",
@@ -258,7 +372,7 @@ class SlotOrderTests(unittest.TestCase):
                         os.environ["UNIT_DETACHED_RUN"] = previous
                     else:
                         _ = os.environ.pop("UNIT_DETACHED_RUN", None)
-                    command = (sys.executable, str(self.source / "merge_gate.py"), "--tests-only")
+                    command = (sys.executable, str(self.source / "gate.py"), "--tests-only")
                     with self.assertRaisesRegex(ValueError, "private command failed") if fails else nullcontext():
                         with first_step.admitted_run(command, self.source) as admitted:
                             self.assertEqual(os.environ["UNIT_DETACHED_RUN"], "1")
@@ -271,6 +385,21 @@ class SlotOrderTests(unittest.TestCase):
                         self.assertEqual(os.environ["UNIT_DETACHED_RUN"], previous)
                     else:
                         self.assertNotIn("UNIT_DETACHED_RUN", os.environ)
+
+    def test_affected_commands_reserve_memory_for_the_affected_gate(self) -> None:
+        gate = str(self.source / "gate.py")
+        for command, expected in (
+            ((sys.executable, gate, "--affected", "--full"), "test-affected"),
+            ((sys.executable, str(self.source / "targeted_test.py")), "test-affected"),
+            ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
+        ):
+            with self.subTest(command=command):
+                offset = len(self.requests)
+                with first_step.admitted_run(command, self.source) as admitted:
+                    admitted.handoff(self.source)
+                requests = [request for request in self.requests[offset:] if isinstance(request, wire.AdmitRequest)]
+                self.assertTrue(requests)
+                self.assertEqual({request.profile.step for request in requests}, {expected})
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
@@ -324,7 +453,7 @@ placement_once
 
     def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
         self.queue.hold_starts()
-        process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+        process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                              separate_command=False)
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the copy run did not enter the memory queue")
         with self.queue.loop_turn():
@@ -339,7 +468,7 @@ placement_once
         process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*.lease.json")))
+        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
 
     def test_first_step_and_later_steps_reuse_the_run_and_keep_its_slot(self) -> None:
         occupied = self.queue.occupy_host()
@@ -357,14 +486,17 @@ placement_once
         scripts = self.root / "bin"
         scripts.mkdir()
         wrapper = scripts / "git"
-        _ = wrapper.write_text(f"#!{sys.executable}\nimport os,sys\n"
-            + "if 'worktree' in sys.argv and 'add' in sys.argv:\n"
-            + f" with open({str(ready)!r}, 'w') as notice: notice.write('ready\\n')\n"
-            + f" with open({str(proceed)!r}, 'rb') as permission: permission.read(1)\n"
-            + f"os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])\n")
+        _ = wrapper.write_text("#!/bin/sh\n"
+            + "worktree=0 add=0\n"
+            + 'for word do case "$word" in worktree) worktree=1;; add) add=1;; esac; done\n'
+            + 'if [ "$worktree$add" = 11 ]; then\n'
+            + f"  printf 'ready\\n' > {shlex.quote(str(ready))}\n"
+            + f"  read -r permission < {shlex.quote(str(proceed))} || :\n"
+            + "fi\n"
+            + f'exec {shlex.quote(binary)} "$@"\n')
         wrapper.chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": str(scripts) + os.pathsep + os.environ["PATH"]}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                 "--apply-uncommitted", str(self.source))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         self.assertFalse(self.slot_root.exists())
@@ -382,17 +514,17 @@ placement_once
         # Keep the held slot alive across the handoff, independent of scheduling.
         with mock.patch.object(self.queue.clock, "advance", return_value=None):
             self.waiting.clear()
-            _ = os.write(proceed_fd, b"x")
+            _ = os.write(proceed_fd, b"x\n")
             first = self.next_step(process)
         self.assertEqual(first["phase"], 0)
         self.assertFalse(self.waiting.is_set(), "the first command step entered the memory queue again")
         self.assertTrue(first["run"].startswith(f"{process.pid}:"), first)
         tree = Path(first["cwd"])
-        self.assertEqual(tree, self.slot_root / "origin-slot1")
+        self.assertEqual(tree, self.slot_root / "origin/slot-order/1")
         self.assertEqual((tree / "tracked.txt").read_text(), "applied after admission\n")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
         memory_requests = [request for request in self.requests if isinstance(request, wire.AdmitRequest)
-            and request.profile.step == "merge-gate"]
+            and request.profile.step == "gate"]
         self.assertGreaterEqual(len(memory_requests), 2)
         self.assertEqual({request.run for request in memory_requests},
             {wire.RunIdentity(process.pid, first["run"].split(":", 1)[1])})
@@ -414,30 +546,39 @@ placement_once
 
     def test_leaving_before_admission_returns_without_a_slot(self) -> None:
         leave = self.root / "leave"
-        _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
         self.queue.hold_starts()
         with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
-        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the caller did not enter the memory queue")
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the queue did not report a wait")
+        # The client prints this notice after it receives the wait reply.
+        assert process.stderr is not None
+        descriptor = process.stderr.fileno()
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        notice = bytearray()
+        while b"waiting for memory since " not in notice:
+            remaining = deadline - time.monotonic()
+            self.assertTrue(remaining > 0 and select.select([descriptor], [], [], remaining)[0],
+                notice.decode(errors="replace"))
+            chunk = os.read(descriptor, 4096)
+            self.assertTrue(chunk, notice.decode(errors="replace"))
+            notice.extend(chunk)
         leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*.lease.json")))
+        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
         with self.queue.loop_turn():
             self.assertFalse(self.queue.server.waiters)
             self.assertFalse(self.queue.caller_reservations())
 
-    def test_a_lost_slot_race_keeps_the_admitted_episode_and_since(self) -> None:
-        _ = write_config_fixture(self.root / "config/build_folders.conf",
-            f"# whole: 1..\nslots.{self.queue.server.host}.origin.max=1\n")
+    def test_a_busy_copy_keeps_the_admitted_episode_and_since(self) -> None:
         for since_age in (0.0, 120.0):
             with self.subTest(since_age=since_age):
-                self.lost_slot_race(since_age)
+                self.busy_copy_race(since_age)
 
-    def lost_slot_race(self, since_age: float) -> None:
+    def busy_copy_race(self, since_age: float) -> None:
         self.queue.allow_next_start()
-        self.slot_waiting.clear()
         request_offset = len(self.requests)
         granted, deliver = threading.Event(), threading.Event()
         self.addCleanup(deliver.set)
@@ -452,127 +593,93 @@ placement_once
 
         with mock.patch.object(self.queue.server, "reply_filter", side_effect=pause_grant):
             started_at = time.time()
-            process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"), since_age=since_age)
+            process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"), since_age=since_age)
             self.assertTrue(granted.wait(TEST_HANG_GUARD_SECS))
-            with build_slots.take_slot(self.source, "HEAD", showrunner="builds", unit=self.owner,
-                    work="race", purpose="competing run", wait_policy=build_slots.SlotWaitPolicy.REFUSE):
+            with build_slots.take_copy(self.source, "HEAD", showrunner="builds", unit="slot-order",
+                    work="race", purpose="competing run") as peer:
+                self.assertEqual(peer.path, self.slot_root / "origin/slot-order/1")
                 deliver.set()
-                self.assertTrue(self.slot_waiting.wait(TEST_HANG_GUARD_SECS))
-                memory = [request for request in self.requests[request_offset:] if isinstance(request, wire.AdmitRequest)]
-                slot = [request for request in self.requests[request_offset:] if isinstance(request, wire.RepositorySlotRequest)]
-                self.assertTrue(memory)
-                self.assertTrue(slot)
-                self.assertEqual({(request.episode, request.since) for request in slot},
-                    {(memory[0].episode, memory[0].since)})
-                self.assertTrue(all(request.deadline > time.time() for request in slot), slot)
-                if since_age:
-                    self.assertLess(memory[0].since, started_at - since_age / 2)
-                with self.queue.loop_turn():
-                    preparation, = self.queue.caller_reservations().values()
-                    self.assertEqual(preparation.owner.pid, process.pid)
-            started = self.next_step(process)
-            self.assertEqual(Path(started["cwd"]), self.slot_root / "origin-slot1")
-            self.finish(process)
+                started = self.next_step(process)
+                copy = Path(started["cwd"])
+                self.assertEqual(copy, self.slot_root / "origin/slot-order/2")
+                self.assertEqual(build_folders.build_folder_state(peer.path), "held")
+                self.assertEqual(build_folders.build_folder_state(copy), "held")
+                self.finish(process)
 
-    def drain_full_folder_callers(self) -> None:
-        self.queue.free(60 * 1024**3)
-        # Close the gate's stdin before waiting for the step that needs its folder.
-        for process in self.processes:
-            if process.returncode is None:
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            requests = self.requests[request_offset:]
+            memory = [request for request in requests if isinstance(request, wire.AdmitRequest)]
+            self.assertGreaterEqual(len(memory), 2)
+            first = memory[0]
+            self.assertEqual(first.owner.pid, process.pid)
+            self.assertEqual({request.run for request in memory}, {first.run})
+            preparation = [request for request in memory if request.episode == first.episode]
+            self.assertEqual({request.since for request in preparation}, {first.since})
+            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in requests))
+            if since_age:
+                self.assertLess(first.since, started_at - since_age / 2)
 
-    def test_full_folder_returns_memory_until_the_gate_releases_it(self) -> None:
+    def test_verify_waits_for_memory_while_the_gate_keeps_its_copy(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
-        self.addCleanup(self.drain_full_folder_callers)
-        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
-            f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max=1\nslots.wait_seconds=120\n")
-        environment.update(fake_memory_readings(self.queue.root, available_kib=60 * 1024**2))
-        _ = write_config_fixture(self.queue.root / "build_admission.conf",
-            "recovery_start_seconds=1\nwaiting_pass_seconds=0.05\nrunning_pass_seconds=0.1\n"
-            + "program_first_peak_gib.merge-gate=4\nslot_gap_seconds=1\n")
-        gate = self.root / "merge_gate.py"
-        held = self.root / "gate-holds-folder"
-        _ = gate.write_text(GATE_COMMAND.replace("for phase in range(2):",
-            f"Path({str(held)!r}).touch()\nsys.stdin.buffer.read(1)\nfor phase in range(1):"))
+        started, release = self.pause_cargo_check(tools)
+        gate = self.root / "gate.py"
+        _ = gate.write_text(GATE_COMMAND)
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
-        board = self.root / "step-board"
-        waiters = board / "token_waiters"
-        waiters.mkdir(parents=True)
-        peer = [str(board), "peer", "cargo", "--pid", str(os.getpid())]
-        board_helper = str(CHECKOUT / "scripts/direct/board.sh")
-        _ = subprocess.run(["bash", board_helper, "acquire", *peer], env=environment,
-            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
         with locked_environment({**os.environ, **environment}, self.queue.loop_access):
             gate_process = self.start((sys.executable, str(gate), "--tests-only"))
-            try:
-                wait_until(held.exists, held.parent, processes=(gate_process,))
-                with locked_environment({**os.environ, "UNIT_RUN_DIR": str(board)}, self.queue.loop_access):
-                    step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
-                wait_until(lambda: any(waiters.iterdir()), waiters, processes=(step,))
-                with self.queue.loop_turn():
-                    first_grant, = self.queue.caller_reservations()
-                self.queue.free(10 * 1024**3)
-                self.waiting.clear()
-                self.finish_step(gate_process)
-                self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the gate did not wait for memory")
-            finally:
-                _ = subprocess.run(["bash", board_helper, "release", *peer], env=environment,
-                    capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertTrue(self.slot_waiting.wait(TEST_HANG_GUARD_SECS), "the step did not wait for its folder")
-            with self.queue.loop_turn():
-                slot, = self.queue.server.repository_slot_waiters.values()
-                self.assertEqual(slot.request.episode, first_grant)
-                self.assertNotIn(first_grant, self.queue.caller_reservations())
-                self.assertFalse((board / "locks/cargo.d").exists())
+            gate_copy = Path(self.next_step(gate_process)["cwd"])
+            self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
+            self.queue.hold_starts()
+            self.waiting.clear()
+            step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
+            self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
-            member = Path(request.constraints.repository) / "src/lib.rs"
-            admitted_content = member.read_bytes()
-            _ = member.write_text("pub fn edit_during_the_wait() {}\n")
-            started = self.next_step(gate_process)
-            folder = Path(started["cwd"])
-            self.assertEqual(build_folders.build_folder_state(folder), "held")
+            self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_slots.lease_path(gate_copy)])
+            self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
-                self.assertNotIn(first_grant, self.queue.caller_reservations())
-            self.queue.free(60 * 1024**3)
-            self.finish(gate_process)
+                self.assertNotIn(request.episode, self.queue.caller_reservations())
+            write_pressure_reading(self.queue.root / "pressure")
+            self.queue.server.wake_loop()
+            cargo = wait_for_pid(started, processes=(step,))
+            checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
+            self.assertEqual(checkout, gate_copy.with_name("2"))
+            self.assertEqual(build_folders.build_folder_state(checkout), "held")
+            self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
+            self.assertEqual(request.constraints.source_key,
+                             execution_identity.SourceKeyKnown(treekey.tree_key(str(checkout)) or ""))
+            release.touch()
             self.finish(step)
-            self.assertEqual(build_folders.build_folder_state(folder), "free")
-            self.assertEqual((folder / "src/lib.rs").read_bytes(), admitted_content)
-            self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(treekey.tree_key(str(folder)) or ""))
-        placements = [request for request in self.requests if isinstance(request, wire.PlacementRequest)]
-        self.assertGreaterEqual(len(placements), 2)
-        self.assertEqual({(request.episode, request.since) for request in placements},
-                         {(slot.request.episode, slot.request.since)})
-        self.assertFalse(self.queue.caller_reservations())
+            self.finish(gate_process)
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual(build_folders.build_folder_state(gate_copy), "free")
 
-    def test_other_commands_use_a_private_snapshot_without_a_queue_request(self) -> None:
+    def test_other_commands_use_a_numbered_copy_without_a_queue_request(self) -> None:
         self.queue.hold_starts()
         program = "import json,os,sys; print(json.dumps({'phase':0,'cwd':os.getcwd(),'run':os.environ.get('BUILDLOG_RUN','')}),flush=True); sys.stdin.read(1)"
         process = self.start((sys.executable, "-c", program))
         started = self.next_step(process)
-        snapshot = Path(started["cwd"])
-        self.assertEqual(snapshot.name, "source")
-        self.assertEqual(build_folders.build_folder_state(snapshot.parent), "held")
-        self.assertFalse(self.slot_root.exists())
+        checkout = Path(started["cwd"])
+        self.assertEqual(checkout, self.slot_root / "origin/slot-order/1")
+        self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assertEqual(self.requests, [])
         self.finish(process)
-        self.assertFalse(snapshot.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual(self.requests, [])
 
     def test_snapshot_command_inherits_the_runner_session(self) -> None:
-        program = ("import json, os\n"
-                   f"print(json.dumps({{key: os.getenv(key, '') for key in {SESSION_VARIABLES!r}}}))")
+        keys = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+        program = "import json, os\n" + f"print(json.dumps({{key: os.getenv(key, '') for key in {keys!r}}}))"
         process = self.start((sys.executable, "-c", program))
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual(output.strip(), json.dumps(self.session_environment))
+        self.assertEqual(output.strip(), json.dumps({key: self.build_sessions[key] for key in keys}))
 
     def verify_source(self) -> VerifyMacOffloadFixture:
         tools = VerifyMacOffloadFixture()
         tools.root = self.root / "verify"
         tools.root.mkdir()
         tools.build_fixture()
-        tools.environment.update(self.session_environment)
+        tools.environment.update(self.build_sessions)
         real_git = shutil.which("git")
         assert real_git is not None
         shutil.rmtree(tools.root / ".git")
@@ -580,7 +687,9 @@ placement_once
         (tools.bin_directory / "git").symlink_to(real_git)
         _ = (tools.root / ".gitignore").write_text("/*\n!/Cargo.toml\n!/src/\n")
         _ = (tools.root / "src/main.rs").write_text("fn main() {}\n")
-        for arguments in (("init", "-q", "-b", "main"), ("add", "Cargo.toml", "src"),
+        origin = self.root / "remotes" / "verify.git"
+        for arguments in (("init", "-q", "--bare", str(origin)), ("init", "-q", "-b", "main"),
+                ("remote", "add", "origin", str(origin)), ("add", "Cargo.toml", "src"),
                 ("-c", "user.name=Test", "-c", "user.email=slots@example.invalid", "commit", "-qm", "fixture")):
             _ = subprocess.run([real_git, *arguments], cwd=tools.root, env=tools.environment,
                 capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
@@ -606,7 +715,8 @@ placement_once
         environment = {**tools.environment, **{key: os.environ[key] for key in (
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
-            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
+            "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "LINT_SKIP_SWEEP": "1"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -637,10 +747,14 @@ placement_once
                             step_estimator.git_identity(["cargo", "check"], str(checkout))[0])
                         self.assertEqual(treekey.tree_key(str(snapshot)), treekey.tree_key(str(checkout)))
                         self.assertEqual(copies.slot_source(snapshot), canonical)
-                        with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")) as tree:
-                            pool = "origin" if origin else source.name
-                            self.assertEqual(tree, self.slot_root / (pool + "-slot1"))
-                            self.assertEqual(build_slots.source_checkout(tree), canonical)
+                        if not origin:
+                            with self.assertRaisesRegex(build_folders.InvalidFolderForm, "cannot read the origin URL"):
+                                with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")):
+                                    self.fail("A numbered copy needs a Git origin.")
+                        else:
+                            with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")) as tree:
+                                self.assertEqual(tree, self.slot_root / "origin/slot-order/1")
+                                self.assertEqual(build_slots.source_checkout(tree), canonical)
                     self.assertFalse(copies.ADMISSION_SOURCE_COPIES.get())
 
     def test_working_changes_leave_no_source_objects_while_waiting_or_after_leaving(self) -> None:
@@ -708,19 +822,17 @@ placement_once
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*.lease.json")))
+        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
         self.assertFalse(list((self.root / "session").rglob("Cargo.toml")))
         with self.queue.loop_turn():
             self.assertFalse(self.queue.server.waiters)
             self.assertFalse(self.queue.caller_reservations())
         self.assertTrue(any(isinstance(request, wire.CancelPlacement) for request in self.requests))
 
-    def test_seven_folders_waiting_steps_hold_none(self) -> None:
+    def test_waiting_steps_take_numbered_copies_after_admission(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
-        maximum = 7
-        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
-            f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max={maximum}\nslots.wait_seconds=120\n")
+        caller_count = 7
         self.queue.configure(recovery_start_seconds=1, waiting_pass_seconds=0.05, running_pass_seconds=0.1)
         memory = fake_memory_readings(self.queue.root, available_kib=256 * 1024**2, total_kib=256 * 1024**2)
         hold = Path(environment["BUILD_HOLD_DIR"])
@@ -757,21 +869,7 @@ placement_once
         memory_waiters: set[str] = set()
         hold_waiters: set[str] = set()
         mac_waiters: set[str] = set()
-        slot_requests: dict[str, int] = {}
-        slot_request_count = 0
-        handle = self.queue.server.handle_request
         reply_filter = self.queue.server.reply_filter
-
-        def observe(request: wire.Request, connection: admission_service.Connection | admission_service.NoConnection
-                    = admission_service.NO_CONNECTION) -> list[wire.Reply]:
-            nonlocal slot_request_count
-            replies = handle(request, connection)
-            if isinstance(request, wire.RepositorySlotRequest):
-                with condition:
-                    slot_requests[request.episode] = slot_requests.get(request.episode, 0) + 1
-                    slot_request_count += 1
-                    condition.notify_all()
-            return replies
 
         def observe_wait(reply: wire.Reply) -> wire.Reply:
             if isinstance(reply, wire.PlacementWait):
@@ -788,44 +886,68 @@ placement_once
 
         def wait_for_callers(callers: set[str], count: int) -> None:
             with condition:
-                self.assertTrue(condition.wait_for(lambda: len(callers) >= count, timeout=60),
-                    f"Only {len(callers)} of {count} callers entered the wait.")
+                ready = condition.wait_for(lambda: len(callers) >= count, timeout=60)
+            if not ready:
+                self.fail(f"Only {len(callers)} of {count} callers entered the wait. " + caller_diagnostics())
 
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
-        boards: dict[int, Path] = {}
+        capacity_caller = self.root / "capacity-caller.py"
+        _ = capacity_caller.write_text(CAPACITY_CALLER)
+        source_key = treekey.committed_tree_key(copies.git(tools.root, "rev-parse", "HEAD^{tree}").strip())
 
-        def start_verify(variant: str = "") -> subprocess.Popen[str]:
+        def caller_diagnostics() -> str:
+            statuses = [process.poll() for process in self.processes]
+            errors = {}
+            for number, process in enumerate(self.processes):
+                if statuses[number] is not None:
+                    output, errors[number] = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    errors[number] += output
+            return f"Callers: {statuses}. Output: {errors}. Waits: {memory_waiters}, {hold_waiters}, {mac_waiters}."
+
+        def start_caller(variant: str) -> subprocess.Popen[str]:
             caller = len(self.processes)
-            board = boards[caller] = self.root / f"board-{caller}"
+            board = self.root / f"board-{caller}"
             temporary = self.root / f"caller-{caller}-tmp"
             temporary.mkdir()
-            local = ("test", "sample", "--local", "fixture", "--no-cache")
-            command = ("bash", verify, *local)
-            if variant == "env":
-                command = ("env", "MODE=ci", *command)
+            capacity_command = ("env", f"PYTHONPATH={CHECKOUT}", sys.executable, str(capacity_caller), str(endpoint), str(caller),
+                                source_key, str(tools.root))
+            caller_environment = {**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
+                                  "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}
+            if variant == "capacity":
+                process = subprocess.Popen(capacity_command,
+                    cwd=tools.root, env=caller_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.processes.append(process)
+                return process
             if variant == "mac":
                 remote = 'bash "$VERIFY_SCRIPT" test sample --mac fixture --no-cache'
-                local_command = 'bash "$VERIFY_SCRIPT" ' + shlex.join(local)
-                command = ("bash", "-c", remote + " && " + local_command)
-            options = ("--publish", "report.txt") if caller == 0 else ()
-            with locked_environment({**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
-                                     "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}, self.queue.loop_access):
+                local = 'exec bash "$VERIFY_SCRIPT" test sample --local fixture --no-cache'
+                command = ("bash", "-c", remote + " && " + local)
+                options = ()
+            else:
+                command = ("bash", verify, "test", "sample", "--local", "fixture", "--no-cache")
+                options = ()
+                if variant == "env":
+                    command = ("env", "MODE=ci", *command)
+                    options = ("--publish", "report.txt")
+            with locked_environment(caller_environment, self.queue.loop_access):
                 return self.start(command, *options)
 
         def held_folders() -> set[Path]:
-            return {path for path in self.slot_root.glob(f"{tools.root.name}-slot*")
-                    if path.is_dir() and build_folders.build_folder_state(path) == "held"}
+            return {path for path in self.slot_root.glob("*/*/[0-9]*")
+                    if path.name.isdecimal() and path.is_dir() and build_folders.build_folder_state(path) == "held"}
 
         with (mock.patch.object(self.queue.server, "host_probe", side_effect=read_host),
-              mock.patch.object(self.queue.server, "handle_request", side_effect=observe),
               mock.patch.object(self.queue.server, "reply_filter", side_effect=observe_wait),
               socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ExitStack() as steps):
             listener.bind(str(endpoint))
-            listener.listen(maximum + 1)
+            listener.listen()
             listener.settimeout(60)
 
             def next_running_step() -> tuple[Path, tuple[socket.socket, subprocess.Popen[str]]]:
-                connection = steps.enter_context(listener.accept()[0])
+                try:
+                    connection = steps.enter_context(listener.accept()[0])
+                except TimeoutError:
+                    self.fail("A caller did not reach Cargo. " + caller_diagnostics())
                 connection.settimeout(60)
                 with connection.makefile("r") as response:
                     caller, folder = response.readline().rstrip("\n").split("\t", 1)
@@ -838,99 +960,76 @@ placement_once
             peer = [str(first_board), "peer", "cargo", "--pid", str(os.getpid())]
             _ = subprocess.run(["bash", board_helper, "acquire", *peer], env=environment,
                 capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
-            token_caller = start_verify()
+            self.queue.hold_starts()
+            env_caller = start_caller("env")
             try:
-                wait_until(lambda: any(first_waiters.iterdir()), first_waiters, processes=(token_caller,))
+                wait_for_callers(memory_waiters, 1)
+                env_folders = held_folders()
+                self.assertEqual(len(env_folders), 1, "the env wrapper needs its copy before its memory wait")
+                write_pressure_reading(self.queue.root / "pressure")
+                self.queue.server.wake_loop()
+                wait_until(lambda: any(first_waiters.iterdir()), first_waiters, processes=(env_caller,))
                 with self.subTest(wait="Cargo token"):
-                    self.assertEqual(len(held_folders()), 0, "the Cargo token waiter holds a folder")
+                    self.assertEqual(held_folders(), env_folders)
+                with condition:
+                    memory_waiters.clear()
                 self.queue.hold_starts()
-                _ = start_verify("env")
+                verify_caller = start_caller("verify")
                 for _ in range(2):
-                    _ = start_verify()
+                    _ = start_caller("capacity")
                 wait_for_callers(memory_waiters, 3)
                 with self.subTest(wait="memory"):
-                    self.assertEqual(len(held_folders()), 0, "a memory waiter holds a folder")
+                    self.assertEqual(held_folders(), env_folders, "the plain Verify caller holds a copy during its wait")
                 _ = local_hold.write_text(json.dumps({"holder": "other", "for": "fixture",
                     "since": "2026-11-18T00:00:00Z", "release_eta": "unknown"}))
-                _ = start_verify("mac")
+                _ = start_caller("mac")
                 wait_for_callers(mac_waiters, 1)
                 with self.queue.loop_turn():
                     mac_request = next(request for request in self.requests
                         if isinstance(request, wire.PlacementRequest) and request.episode in mac_waiters)
+                wrapper_checkout = Path(mac_request.constraints.repository)
+                wrapper_folders = env_folders | {wrapper_checkout}
                 with self.subTest(wait="Mac", wrapper="bash -c"):
-                    self.assertNotIn(Path(mac_request.constraints.repository), held_folders(),
-                                     "the bash -c caller holds a folder during its Mac wait")
-                for _ in range(4):
-                    _ = start_verify()
-                wait_for_callers(hold_waiters, 7)
-                waiting_folders = held_folders()
-                print(f"Waiting: {len(waiting_folders)} of {maximum} held; {len(slot_requests)} slot waiters.", flush=True)
-                self.assertEqual(len(waiting_folders), 0)
-                self.assertEqual(len(slot_requests), 0)
+                    self.assertEqual(len(wrapper_folders), 2)
+                    self.assertEqual(held_folders(), wrapper_folders)
+                    self.assertEqual(build_slots.source_checkout(wrapper_checkout), tools.root)
+                for _ in range(2):
+                    _ = start_caller("capacity")
+                mac_ready.touch()
+                self.queue.server.wake_loop()
+                _ = subprocess.run(["bash", board_helper, "release", *peer], env=environment,
+                    capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                wait_for_callers(hold_waiters, caller_count)
+                with self.queue.loop_turn():
+                    waiting_owners = {self.queue.server.placement_requests[episode].owner.pid
+                                      for episode in hold_waiters}
+                    self.assertEqual(len(waiting_owners), caller_count)
+                    self.assertTrue(hold_waiters.isdisjoint(self.queue.server.current_assignments))
+                self.assertEqual(held_folders(), wrapper_folders)
             finally:
                 _ = subprocess.run(["bash", board_helper, "release", *peer], env=environment,
                     capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 local_hold.unlink(missing_ok=True)
 
-            mac_ready.touch()
             write_pressure_reading(self.queue.root / "pressure")
             self.queue.server.wake_loop()
-            running = dict(next_running_step() for _ in range(maximum))
-            self.assertEqual(len(running), maximum)
+            self.assertEqual(len(self.processes), caller_count)
+            running = dict(next_running_step() for _ in range(caller_count))
+            self.assertEqual(len(running), caller_count)
             self.assertEqual(set(running), held_folders())
-            print(f"Running: {len(running)} of {maximum} held.", flush=True)
-
-            deadline = time.monotonic() + 60
-            while True:
-                with condition:
-                    observed_count = slot_request_count
-                with self.queue.loop_turn():
-                    waiters = list(self.queue.server.repository_slot_waiters.values())
-                    if len(waiters) >= 2:
-                        self.assertEqual(len(waiters), 2)
-                        reservations = self.queue.caller_reservations()
-                        active = {self.processes.index(process) for process in (step[1] for step in running.values())}
-                        self.assertEqual(len(reservations), maximum)
-                        for waiter in waiters:
-                            self.assertNotIn(waiter.request.episode, reservations)
-                        for number in set(boards) - active:
-                            self.assertFalse((boards[number] / "locks/cargo.d").exists())
-                        break
-                with condition:
-                    changed = condition.wait_for(lambda: slot_request_count != observed_count,
-                                                 timeout=deadline - time.monotonic())
-                    if not changed:
-                        statuses = [process.poll() for process in self.processes]
-                        errors: dict[int, str] = {}
-                        for number, process in enumerate(self.processes):
-                            if statuses[number] is None or process.stderr is None:
-                                continue
-                            descriptor = process.stderr.fileno()
-                            if select.select([descriptor], [], [], 0)[0]:
-                                errors[number] = os.read(descriptor, 8192).decode(errors="replace")
-                        self.fail(f"Expected two live slot waiters, saw {len(waiters)}. "
-                                  + f"Slot requests: {slot_requests}. Caller statuses: {statuses}. Errors: {errors}.")
-            print("Capacity: two waiters hold no memory, token or folder.", flush=True)
+            self.assertIn(wrapper_checkout, running)
+            self.assertEqual({folder for folder, (_, process) in running.items() if process is env_caller}, env_folders)
+            verify_checkout, = (folder for folder, (_, process) in running.items() if process is verify_caller)
+            self.assertNotIn(verify_checkout, wrapper_folders)
+            self.assertEqual(build_slots.source_checkout(verify_checkout), tools.root)
+            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in self.requests))
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
-                if process is token_caller:
+                if process is env_caller:
                     self.assertIn("published: ", output)
                     self.assertNotIn("report.txt not built", errors)
-
-            released: set[Path] = set()
-            for folder in tuple(running)[-2:]:
-                connection, process = running.pop(folder)
-                connection.sendall(b"x")
-                finish_caller(process)
-                released.add(folder)
-            for _ in range(2):
-                replacement, step = next_running_step()
-                self.assertIn(replacement, released)
-                running[replacement] = step
-            self.assertEqual(len(running), maximum)
-            self.assertEqual(set(running), held_folders())
 
             folder, (connection, process) = running.popitem()
             connection.sendall(b"x")
@@ -942,10 +1041,7 @@ placement_once
             for _connection, process in running.values():
                 finish_caller(process)
             self.assertTrue(tools.runner_events(), "The Mac runner did not run.")
-            print(f"Lost folder races: {sum(count - 1 for count in slot_requests.values())}.", flush=True)
-            remaining = held_folders()
-            print(f"Complete: {len(remaining)} of {maximum} held.", flush=True)
-            self.assertFalse(remaining)
+            self.assertFalse(held_folders())
 
     def test_cargo_keeps_the_folder_after_its_launcher_dies(self) -> None:
         tools = self.verify_source()
@@ -971,6 +1067,8 @@ placement_once
                     ready.recv(1)
             ''').strip()
         _ = cargo.write_text(cargo.read_text().replace('if arguments[:2] == ["nextest", "run"]:', pause))
+        tree = copies.git(tools.root, "rev-parse", "HEAD^{tree}").decode().strip()
+        verify_command = ("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "test", "sample", "--local", "fixture")
         with (mock.patch.dict(os.environ, environment),
               socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener):
             listener.bind(str(endpoint))
@@ -978,9 +1076,9 @@ placement_once
             listener.settimeout(TEST_HANG_GUARD_SECS)
             for stop in ("launcher SIGKILL", "copies TERM"):
                 with self.subTest(stop=stop):
+                    first_request = len(self.requests)
                     with mock.patch.dict(os.environ, {"TEST_COPY_STOP": stop}):
-                        process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "test", "sample",
-                                              "--local", "fixture"))
+                        process = self.start(verify_command)
                     with listener.accept()[0] as connection:
                         connection.settimeout(TEST_HANG_GUARD_SECS)
                         with connection.makefile("r") as data:
@@ -993,7 +1091,15 @@ placement_once
                         checkout = Path(folder)
                         self.assertEqual(build_folders.build_folder_state(checkout), "held")
                         if stop == "launcher SIGKILL":
-                            self.assertIn(b"copies.py", (Path("/proc") / launcher / "cmdline").read_bytes())
+                            request = next(request for request in self.requests[first_request:]
+                                           if isinstance(request, wire.PlacementRequest))
+                            arguments = (Path("/proc") / launcher / "cmdline").read_text().split("\0")
+                            hold = arguments.index("hold")
+                            self.assertEqual(Path(arguments[hold - 1]).name, "copies.py")
+                            self.assertEqual(arguments[hold:hold + 8], [
+                                "hold", "--repo", request.constraints.repository, "--tree", tree,
+                                "--step", "test", "--",
+                            ])
                             lease = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
                             self.assertEqual(lease["pid"], pid)
                             os.kill(pid, signal.SIGKILL)
@@ -1028,6 +1134,145 @@ placement_once
         heading = 'if arguments[:1] == ["metadata"]:'
         _ = cargo.write_text(cargo.read_text().replace(heading, pause + heading))
         return started, release
+
+    def test_direct_verify_waits_in_a_snapshot_and_builds_in_a_numbered_copy(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        started, release = self.pause_cargo_check(tools)
+        self.queue.hold_starts()
+        with mock.patch.dict(os.environ, {**environment, "SLOT_ORDER_CHECK": str(started)}):
+            process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "check", "sample"))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+        request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+        snapshot = Path(request.constraints.repository)
+        self.assertEqual(snapshot.name, "source")
+        self.assertEqual(build_folders.build_folder_state(snapshot.parent), "held")
+        self.assertFalse(self.slot_root.exists())
+
+        write_pressure_reading(self.queue.root / "pressure")
+        self.queue.server.wake_loop()
+        cargo = wait_for_pid(started, processes=(process,))
+        checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
+        self.assertEqual(checkout, self.slot_root / "verify/slot-order/1")
+        self.assertEqual(build_folders.build_folder_state(checkout), "held")
+        release.touch()
+        self.finish(process)
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertFalse(snapshot.exists())
+
+    def test_shell_wrapped_verify_doc_publishes_from_its_only_numbered_copy(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        cargo = tools.bin_directory / "cargo"
+        stub = dedent(r"""
+            if arguments[:1] == ["doc"]:
+                target = Path(os.environ["CARGO_TARGET_DIR"])
+                assert target == Path.cwd() / "target"
+                assert len(list(Path.cwd().parent.glob("*.lease.json"))) == 1
+                output = target / "doc/sample/index.html"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(f"doc from {Path.cwd()}\n")
+                raise SystemExit(0)
+            """).lstrip("\n")
+        heading = 'if arguments[:2] == ["nextest", "--version"]:'
+        program = cargo.read_text()
+        self.assertIn(heading, program)
+        _ = cargo.write_text(program.replace(heading, stub + heading, 1))
+
+        verify = str(CHECKOUT / "scripts/direct/verify.sh")
+        asset = "target/doc/sample/index.html"
+        with mock.patch.dict(os.environ, environment):
+            process = self.start(("bash", "-c", 'exec bash "$1" doc sample --local fixture', "verify-doc", verify),
+                                 "--publish", asset)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        published = [line.removeprefix("published: ").rsplit(" ", 1)[0]
+                     for line in output.splitlines() if line.startswith("published: ")]
+        self.assertEqual(len(published), 1, output + errors)
+        checkout = self.slot_root / "verify/slot-order/1"
+        self.assertEqual(Path(published[0]).read_text(), f"doc from {checkout}\n")
+        self.assertEqual((checkout / asset).read_bytes(), Path(published[0]).read_bytes())
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+
+    def test_shell_wrapped_verify_doc_refuses_edits_outside_the_index(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        environment["UNIT_DETACHED_RUN"] = "1"
+        verify = str(CHECKOUT / "scripts/direct/verify.sh")
+        command = 'printf "edited\\n" > "$2" && exec bash "$1" doc sample --local fixture'
+        for edited in ("src/lib.rs", "src/untracked.rs"):
+            with self.subTest(edited=edited), mock.patch.dict(os.environ, environment):
+                process = self.start(("bash", "-c", command, "verify-doc", verify, edited))
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 2, output + errors)
+                self.assertEqual(errors.splitlines(), [
+                    "verify.sh: the prepared copy has edits outside the index. Stage or commit them first.",
+                ])
+                self.assertFalse(tools.cargo_events())
+                self.assertFalse(self.requests)
+
+    def test_shell_wrapped_verify_doc_builds_after_apply_uncommitted(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        environment["UNIT_DETACHED_RUN"] = "1"
+        applied = "pub fn applied() {}\n"
+        _ = (tools.root / "src/lib.rs").write_text(applied)
+        verify = str(CHECKOUT / "scripts/direct/verify.sh")
+        command = 'touch target/ignored && exec bash "$1" doc sample --local fixture'
+        with mock.patch.dict(os.environ, environment):
+            process = self.start(("bash", "-c", command, "verify-doc", verify),
+                                 "--apply-uncommitted", str(tools.root))
+        self.finish(process)
+
+        checkout = self.slot_root / "verify/slot-order/1"
+        self.assertEqual(copies.git(checkout, "show", ":src/lib.rs").decode(), applied)
+        self.assertTrue((checkout / "target/ignored").is_file())
+        self.assertEqual(sum(event["args"][:1] == ["doc"] for event in tools.cargo_events()), 1)
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+
+    def test_shell_wrapped_verify_doc_refuses_an_assume_unchanged_edit(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        environment["UNIT_DETACHED_RUN"] = "1"
+        verify = str(CHECKOUT / "scripts/direct/verify.sh")
+        command = ('git update-index --assume-unchanged -- src/lib.rs && '
+                   + 'printf "edited\\n" > src/lib.rs && exec bash "$1" doc sample --local fixture')
+        with mock.patch.dict(os.environ, environment):
+            process = self.start(("bash", "-c", command, "verify-doc", verify))
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 2, output + errors)
+        self.assertEqual(errors.splitlines(), [
+            "verify.sh: the prepared copy has edits outside the index. Stage or commit them first.",
+        ])
+        self.assertFalse(tools.cargo_events())
+        self.assertFalse(self.requests)
+
+    def test_shell_wrapped_verify_doc_records_no_pass_if_cargo_edits_the_copy(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        environment["UNIT_DETACHED_RUN"] = "1"
+        cargo = tools.bin_directory / "cargo"
+        heading = 'if arguments[:2] == ["nextest", "--version"]:'
+        program = cargo.read_text()
+        self.assertIn(heading, program)
+        edit = dedent("""
+            if arguments[:1] == ["doc"]:
+                Path("src/lib.rs").write_text("pub fn edited_during_doc() {}\\n")
+                raise SystemExit(0)
+            """).lstrip("\n")
+        _ = cargo.write_text(program.replace(heading, edit + heading, 1))
+
+        verify = str(CHECKOUT / "scripts/direct/verify.sh")
+        with mock.patch.dict(os.environ, environment):
+            process = self.start(("bash", "-c", 'exec bash "$1" doc sample --local fixture', "verify-doc", verify))
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 77, output + errors)
+        self.assertIn("verify.sh: the prepared copy changed during the build. No doc pass was recorded.",
+                      errors.splitlines())
+        self.assertEqual(sum(event["args"][:1] == ["doc"] for event in tools.cargo_events()), 1)
+        records = Path(environment["HOME"]) / ".local/state/verify/doc_pass"
+        self.assertFalse(list(records.glob("*.json")))
 
     def test_older_commit_admits_a_package_absent_from_the_current_checkout(self) -> None:
         tools = self.verify_source()
@@ -1064,6 +1309,7 @@ placement_once
             STEP_TARGET_TABLE='' MAC_ONLY=0 MAC_PASSED=0
             PLACEMENT_COMMAND=(cargo nextest run)
             release_token() { :; }
+            admit_verify_run() { :; }
             check_routing_hold() { :; }
             collect_routing_wait() { :; }
             placement_once() {
@@ -1089,6 +1335,33 @@ placement_once
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["open", "dispatch", "close"])
+
+    def assert_ssh_source(self, source: Path, caller: Path, revision: str, scenario: str) -> None:
+        with copies.requested_source(source, copies.WorktreeSource("HEAD", str(source)),
+                                     copies.MergeRevision(revision)) as snapshot:
+            self.assertEqual((snapshot / "src/lib.rs").read_text(), "pub fn changed() {}\n")
+            self.assertEqual((snapshot / "src/merged.rs").read_text(), "pub fn merged() {}\n")
+            self.assertFalse((source / "src/merged.rs").exists())
+            if scenario != "clean-linux":
+                _ = (snapshot / "src/main.rs").write_text("fn main() { let _ = 1; }\n")
+            tree = copies.staged_tree(snapshot, include_worktree=True)
+            trust = copies.SshSourceTrust(offload.trusted_linux_source, nix_env.trusted_root, nix_env.registered_worktree)
+            trusted = scenario in ("clean-linux", "trusted-linux", "trusted-envrc")
+            self.assertEqual(offload.trusted_linux_source(caller), trusted or scenario == "mismatched-linux")
+            with copies.remote_step_source(snapshot, tree, caller, trust) as checkout:
+                self.assertEqual(checkout.parent, copy_record.root().resolve())
+                record = copy_record.read_record(checkout / copy_record.RECORD)
+                self.assertIsInstance(record, copy_record.Registered)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual("generated_source" in record.fields, trusted)
+                self.assertEqual(offload.trusted_linux_source(checkout), trusted)
+                if scenario in ("trusted-envrc", "untrusted-envrc"):
+                    self.assertIsNotNone(copy_record.record_path(checkout))
+                    self.assertEqual(record.fields.get("source_commit"), copies.commit_at(source, "HEAD") if trusted else None)
+                self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
+                self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
+                self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
+            self.assertFalse(self.slot_root.exists())
 
     def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
         tools = self.verify_source()
@@ -1135,7 +1408,8 @@ placement_once
                 request = original(arguments)
                 root = request.source_root
                 row = [str(Path.cwd()), str(root), treekey.tree_key(str(root)),
-                       (root / "src/lib.rs").read_text(), (root / "src/merged.rs").read_text()]
+                       (root / "src/lib.rs").read_text(), (root / "src/merged.rs").read_text(),
+                       (root / "src/main.rs").read_text()]
                 if "TEST_REMOTE_ASSIGNMENT" in os.environ:
                     observed.with_suffix(".assignment").write_bytes(Path(arguments.assignment_file).read_bytes())
                 if "TEST_TRUST_CALLER" in os.environ:
@@ -1154,11 +1428,8 @@ placement_once
                         observed.with_suffix(".doc").write_text(json.dumps([
                             str(repo), isinstance(request.source, offload.StagedDocSnapshot),
                             (root / "src/main.rs").read_text(),
+                            record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None,
                         ]))
-                    if (root / ".envrc").exists():
-                        marker = copy_record.record_path(root)
-                        commit = record.fields.get("source_commit") if isinstance(record, copy_record.Registered) else None
-                        observed.with_suffix(".record").write_text(json.dumps([marker is not None, commit]))
                     if not accepted:
                         os.environ.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75", TEST_RUNNER_REASON="repo")
                 temporary = observed.with_suffix(".tmp")
@@ -1178,7 +1449,7 @@ placement_once
         other = self.root / "other-trusted"
         _ = copies.git(tools.root, "clone", "-q", str(tools.root), str(other))
         tools.write_executable(tools.bin_directory / "direnv", "#!/bin/sh\nexit 1\n")
-        for scenario in ("prepared", "modified", "clean-linux", "linux-doc", "trusted-linux",
+        for scenario in ("prepared", "clean-linux", "linux-doc", "trusted-linux",
                          "untrusted-linux", "trusted-envrc",
                          "untrusted-envrc", "mismatched-linux", "source-record", "retry"):
             with self.subTest(source=scenario):
@@ -1201,18 +1472,27 @@ placement_once
                 ready = self.root / f"remote-{scenario}-ready"
                 words = ("bash", str(verify), "doc" if doc else "check", "sample",
                          "--target", "peer" if linux else "mac")
-                if scenario == "modified" or (linux and scenario != "clean-linux"):
-                    dirty_command = "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs"
-                    if mismatch:
-                        dirty_command += "; export COPIES_STEP_REPOSITORY=" + shlex.quote(str(other))
-                    if source_record:
-                        dirty_command += "; printf '{}' > .scratch.json && git add -f .scratch.json"
-                    words = ("bash", "-c", dirty_command + ' && exec "$@"', "verify", *words)
-                elif scenario == "retry":
-                    words = words[:-2]
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
                                     "TEST_REMOTE_SOURCE": str(observed), "SLOT_ORDER_CHECK": str(started),
                                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
+                if scenario == "retry":
+                    words = words[:-2]
+                if scenario == "retry" or (linux and scenario != "clean-linux"):
+                    startup = self.root / f"{scenario}-verify-startup.sh"
+                    commands = [
+                        f'if [[ "$0" == {shlex.quote(str(verify))} && "$PWD" == "${{COPIES_STEP_SOURCE:-}}" ]]; then',
+                        "unset BASH_ENV",
+                        "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs",
+                    ]
+                    if mismatch:
+                        commands.append("export COPIES_STEP_REPOSITORY=" + shlex.quote(str(other)))
+                    if source_record:
+                        admitted = shlex.quote(str(observed.with_suffix(".source")))
+                        commands.append("printf '{}' > .scratch.json && git add -f .scratch.json"
+                                        + " && git add src/main.rs src/lib.rs && "
+                                        + f"(git rev-parse --show-toplevel && git write-tree) > {admitted}")
+                    _ = startup.write_text("\n".join([*commands, "fi", ""]))
+                    case_environment["BASH_ENV"] = str(startup)
                 if scenario == "prepared":
                     case_environment["TEST_REMOTE_ASSIGNMENT"] = "1"
                 if linux:
@@ -1221,6 +1501,10 @@ placement_once
                     case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
                                             TEST_TRUST_CALLER=str(other if mismatch else tools.root))
                     ready.touch()
+                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux"):
+                    with locked_environment({**os.environ, **case_environment}, self.queue.loop_access):
+                        self.assert_ssh_source(tools.root, other if mismatch else tools.root, revision, scenario)
+                    continue
                 if scenario == "retry":
                     case_environment.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75",
                         TEST_RUNNER_REASON="source_changed", TEST_PROVIDER_ALLOW_RUNNER_REFUSALS="1",
@@ -1247,13 +1531,25 @@ placement_once
                         self.assertIn("the admitted tree contains .scratch.json", stderr)
                         self.assertFalse(observed.exists())
                         self.assertFalse(self.slot_root.exists())
+                        caller, tree = observed.with_suffix(".source").read_text().splitlines()
+                        request = next(request for request in self.requests[first_request:]
+                                       if isinstance(request, wire.PlacementRequest))
+                        self.assertEqual(request.constraints.repository, caller)
+                        expected = execution_identity.SourceKeyKnown(treekey.committed_tree_key(tree.encode("ascii")))
+                        self.assertEqual(request.constraints.source_key, expected)
+                        grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
+                        self.assertEqual(grant.assignment.destination.provider, "ssh")
+                        self.assertEqual(grant.assignment.source_key, expected)
                         continue
                     if scenario == "retry" or linux:
                         wait_until(lambda: observed.exists() or process.poll() is not None, self.root,
                                    timeout=45, processes=(process,))
                         self.assertTrue(observed.exists(), process.communicate(timeout=5) if process.poll() is not None else "")
                     else:
-                        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+                        wait_until(lambda: self.waiting.is_set() or process.poll() is not None, self.root,
+                                   processes=(process,))
+                        self.assertTrue(self.waiting.is_set(),
+                                        process.communicate(timeout=5) if process.poll() is not None else "")
                     request = next(request for request in self.requests[first_request:]
                                    if isinstance(request, wire.PlacementRequest))
                     snapshot = Path(request.constraints.repository)
@@ -1281,11 +1577,6 @@ placement_once
                         self.assertEqual(runner_trusted, trusted, "Linux source approval changed in the copy")
                         self.assertTrue(under_scratch and registered, "The SSH checkout needs a scratch record")
                         self.assertEqual(marked, trusted)
-                        if envrc:
-                            record_found, pinned = cast(
-                                tuple[bool, str | None], json.loads(observed.with_suffix(".record").read_text()))
-                            self.assertTrue(record_found, "The envrc proof needs a discoverable clone record")
-                            self.assertEqual(pinned, copies.commit_at(tools.root, "HEAD") if trusted else None)
                         self.assertEqual(process.returncode, 0 if trusted else 2, stdout + stderr)
                         if not trusted:
                             self.assertIn("target peer refused: repo", stderr)
@@ -1303,14 +1594,18 @@ placement_once
                                             for row in records), records)
                     else:
                         self.assertFalse(self.slot_root.exists())
-                    cwd, supplied_root, executed_key, library, merged = cast(list[str], json.loads(observed.read_text()))
+                    cwd, supplied_root, executed_key, library, merged, binary = cast(
+                        list[str], json.loads(observed.read_text()))
                     self.assertEqual(cwd, supplied_root)
+                    if scenario == "retry":
+                        self.assertEqual(binary, "fn main() { let _ = 1; }\n")
                     if doc:
-                        repo, staged, main = cast(
-                            tuple[str, bool, str], json.loads(observed.with_suffix(".doc").read_text()))
+                        repo, staged, main, caller = cast(
+                            tuple[str, bool, str, str], json.loads(observed.with_suffix(".doc").read_text()))
                         self.assertTrue(staged)
                         self.assertEqual(repo, supplied_root)
                         self.assertEqual(main, "fn main() {}\n")
+                        self.assertEqual(caller, str(tools.root))
                     self.assertEqual(library, "pub fn changed() {}\n")
                     self.assertEqual(merged, "pub fn merged() {}\n")
                     grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
@@ -1342,7 +1637,7 @@ placement_once
             with self.subTest(arguments=arguments):
                 request_file = tools.root / f"first-step-{number}.json"
                 episode, since = f"verify-first-{number}", time.time()
-                environment = {**tools.environment, "HERDR_BIN": "/nonexistent/herdr", "UNIT_RUN_DIR": "",
+                environment = {**tools.environment, "HERDR_BIN": MISSING_HERDR_BIN, "UNIT_RUN_DIR": "",
                     "UNIT_SESSION_DIR": "", "UNIT_DETACHED_RUN": "1", "BUILDLOG_FIRST_STEP_REQUEST": str(request_file),
                     "BUILDLOG_FIRST_STEP_PID": str(os.getpid()), "BUILDLOG_FIRST_STEP_EPISODE": episode,
                     "BUILDLOG_FIRST_STEP_SINCE": str(since), "ADMISSION_SOCKET": str(self.queue.socket_path)}
@@ -1364,7 +1659,7 @@ placement_once
                 self.assertIsInstance(request.local, wire.LocalAdmissionContext)
                 assert isinstance(request.local, wire.LocalAdmissionContext)
                 self.assertEqual(request.local.argv, request.constraints.command)
-                self.assertFalse((tools.root / "slots").exists())
+                self.assertFalse((tools.root / "build").exists())
                 self.assertTrue(all(isinstance(request, wire.BuildHistoryRequest) for request in self.requests),
                     self.requests)
                 print(f"verify {arguments[0]} startup to its first placement request: {elapsed:.3f} s")

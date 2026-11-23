@@ -45,6 +45,7 @@ from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, recorded_unit
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.direct import phase_table
 from scripts.direct import plan_history, progress_history, recorder_state
 from scripts.direct.findings_test_support import invoke_findings
@@ -164,7 +165,7 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue"),
                                                     "XDG_STATE_HOME": str(self.root / "state"),
-                                                    "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
+                                                    "GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 
@@ -449,7 +450,7 @@ class UnitPhasesTests(unittest.TestCase):
             event.update(schema_version=progress_history.SCHEMA_VERSION, run_id=run.name, working_dir=str(self.root))
         _ = history.write_text("".join(json.dumps(event) + "\n" for event in events))
         _ = state.write_text(json.dumps(converted))
-        commit = "a" * 40
+        commit = self.repository()
         checkpoint = progress("checkpoint", "--commit", commit, "--phase-id", "visible")
         self.assertEqual(checkpoint.returncode, 0, checkpoint.stderr)
         history_before = history.read_bytes()
@@ -970,6 +971,35 @@ class UnitPhasesTests(unittest.TestCase):
                                      else "Waits for build queue; holder not recorded")
                         self.assertIn(("Now", "Check delivery (work)", state + "; since 17:58"), detail_rows(rendered, "style"))
 
+    def test_partial_census_identity_does_not_join_shell_work(self) -> None:
+        machine = remote.local_machine()
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        units: list[live_units.LiveUnit] = []
+        rows: list[dict[str, object]] = []
+        for name, pid, command in (("verified", 321, "Verified command"), ("partial", 322, "Unverified command")):
+            member = self.member(name)
+            generation = session_staff.ProvedProcessGeneration(pid, "30352793")
+            claude = live(name)._replace(session_id=member.current_session, pid=pid, activity="idle")
+            units.append(unit(name, claude)._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation)))
+            rows.append({"session": member.current_session, "machine": machine, "pid": pid,
+                         "process_start": generation.started, "shells": [{"name": command}]})
+        verified, partial = rows
+
+        for missing in ("machine", "pid", "process_start"):
+            with self.subTest(missing=missing):
+                read = census.parse(json.dumps({
+                    "schema": 2, "machines": [{"name": machine, "reachable": True}], "workers": [],
+                    "sessions": [verified, {key: value for key, value in partial.items() if key != missing}],
+                }))
+                output = unit_phases.table(units, {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
+                                           census_read=read)
+                self.assertIn("working 1", output.splitlines()[0])
+                self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+                self.assertIn(("Now", "Verified command", "Runs in the background"), detail_rows(output, "verified"))
+                self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"),
+                              detail_rows(output, "partial"))
+                self.assertNotIn("Unverified command", output)
+
     def test_notes_name_verified_background_commands_and_a_sent_checkpoint(self) -> None:
         member = self.member("shells")
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
@@ -991,13 +1021,12 @@ class UnitPhasesTests(unittest.TestCase):
         codex = unit_lookup.LabeledSession("shells", unit_lookup.ClaudeUnknown("no Claude registry record"),
             HerdrPlace("codex", "w1:p1"), process=session_staff.ProvedCodexPaneProcess(generation.pid, "codex"),
             identity=unit_lookup.LiveSession(member.current_session), generation=generation)
-        verified = read.sessions[0]._replace(machine=machine,
-            process=census.CensusProcessIdentity(generation.pid, generation.started))
-        pid_mismatch = verified._replace(process=census.CensusProcessIdentity(322, generation.started))
-        start_mismatch = verified._replace(process=census.CensusProcessIdentity(generation.pid, "30352794"))
+        verified = read.sessions[0]._replace(machine=machine, pid=generation.pid, process_start=generation.started)
+        pid_mismatch = verified._replace(pid=322)
+        start_mismatch = verified._replace(process_start="30352794")
         machine_mismatch = verified._replace(machine=other_machine)
         stale_shell = machine_mismatch._replace(shells=(census.CensusShell("Old command", None),))
-        pair_absent = verified._replace(process=census.CensusProcessUnreported())
+        pair_absent = verified._replace(pid=census.CensusProcessUnreported(), process_start=census.CensusProcessUnreported())
         for owner in (unit_lookup.ProvedLiveUnit(claude, generation), unit_lookup.ProvedLiveUnit(codex)):
             for case, sessions, matches in (
                     ("match", (verified,), True),
@@ -1061,15 +1090,15 @@ class UnitPhasesTests(unittest.TestCase):
             self.assertIn(("Now", "Unnamed background command", "Runs in the background"),
                           detail_rows(output, "shells"))
 
-        # A half pair fails parsing before the board can use any shell rows.
-        half_pair = census.parse(json.dumps({
+        # A malformed start prevents the board from using the census.
+        malformed = census.parse(json.dumps({
             "schema": 2, "machines": [], "workers": [],
             "sessions": [{"session": member.current_session, "machine": machine, "pid": generation.pid,
-                          "shells": [{"name": "Run the AWS gate"}]}],
+                          "process_start": None, "shells": [{"name": "Run the AWS gate"}]}],
         }))
-        self.assertIsInstance(half_pair, census.CensusFailed)
+        self.assertIsInstance(malformed, census.CensusFailed)
         output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
-            repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=half_pair)
+            repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=malformed)
         self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
         self.assertNotIn("Run the AWS gate", output)
         self.assertNotIn("Nothing to do", output)
@@ -1077,7 +1106,7 @@ class UnitPhasesTests(unittest.TestCase):
         paused = replace(member, paused=staff.Paused("2026-11-15T17:00:00+00:00", "showrunner", "review the board"))
         idle_owner = unit_lookup.ProvedLiveUnit(claude._replace(activity="idle"), generation)
         paused_unit = selected._replace(member=paused, owner=idle_owner, lifecycle="paused")
-        for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (half_pair, "idle 0 · unknown 1")):
+        for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (malformed, "idle 0 · unknown 1")):
             with self.subTest(case="paused with live owner", census_failed=isinstance(evidence, census.CensusFailed)):
                 output = unit_phases.table([paused_unit], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
                     census_read=evidence)
@@ -2865,7 +2894,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads,
               patch.object(census, "read", wraps=census.read) as census_reads,
               patch.object(io, "open", wraps=io.open) as opened,
-              patch.object(plan_history, "now_epoch", return_value=230),
+              patch.object(pass_recorder, "now_epoch", return_value=230),
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         self.assertCountEqual([call.args[0] for call in headers.call_args_list], run_files)

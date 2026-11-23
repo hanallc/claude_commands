@@ -23,9 +23,9 @@ EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
     ("agents/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
     ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
-    ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
+    ("notify/review.py", "reviewer_environment"): "a headless model check uses the account of its group through group_account",
 }
-SELECTORS = frozenset({"pick", "placement", "role_account", "group_label"})
+SELECTORS = frozenset({"pick", "placement", "role_account", "group_account", "group_label"})
 RENDERERS = frozenset({"prepared_account", "account_prefix", "named_account_environment", "account_dir"})
 
 
@@ -99,8 +99,8 @@ def launch_account_violations(source: str, path: str) -> list[str]:
         for node in nodes:
             if called(node) in SELECTORS:
                 reviewer_role = ((path, name) == ("notify/review.py", "reviewer_environment")
-                                 and called(node) == "role_account" and node.args
-                                 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "unit")
+                                 and called(node) == "group_account" and node.args
+                                 and isinstance(node.args[0], ast.Name) and node.args[0].id == "group")
                 if not reviewer_role:
                     problems.append(f"{path}:{node.lineno}: {name} selects with {called(node)} instead of account_for_group_launch")
         if (path, name) in EXCEPTIONS:

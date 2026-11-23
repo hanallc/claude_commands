@@ -1,6 +1,6 @@
 # Folder names expected in ~/rust on natedev and on the Mac, one per line. folder_audit.py names
 # every other folder there that is idle for a day. Add a name here when a long-lived checkout or
-# worktree comes; scratch goes in ~/rust/repro through scratch.py, never here.
+# worktree comes; scratch goes through scratch.py, never here.
 .claude
 bevy
 bevy-0.20.0

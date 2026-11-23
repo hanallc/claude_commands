@@ -16,17 +16,19 @@ from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
+from scripts.lib import copy_record, scratch
+from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import floor_claims
+from scripts.mac_test import claim_state, floor_claims
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -111,6 +113,13 @@ case $command in
         if (( ${@[(Ie)merge-base]} && ${@[(Ie)--is-ancestor]} )); then
             [[ -n $MAC_RUN_CLONE_DESCENDANT && ${@[-2]} == $MAC_RUN_SHA && ${@[-1]} == $MAC_RUN_CLONE_DESCENDANT ]]
             exit $?
+        fi
+        if (( ${@[(Ie)remote]} && ${@[(Ie)get-url]} )); then
+            # Each fixture repository has a distinct origin, so it has a history key.
+            folder=${@[$((${@[(Ie)-C]} + 1))]}
+            [[ -e $folder/.git ]] || exit 2
+            print -r -- "https://example.invalid/${folder:t}.git"
+            exit 0
         fi
         if (( ${@[(Ie)rev-parse]} )); then
             code=0
@@ -231,6 +240,36 @@ def run_mac_test(*arguments):
     return mac_test.main()
 
 if args[0] == "place-step":
+    wait_reply = os.environ.get("MAC_RUN_QUEUE_WAIT_REPLY")
+    if wait_reply and not (wait_reply == "pending-evidence" and (state / "wait-reply").exists()):
+        from unittest.mock import patch
+        from scripts.build_queue import admission_client, admission_wire as wire, placement
+        from scripts.mac_test import claim_state
+
+        if (state / "wait-reply").exists():
+            raise SystemExit("the runner retried the wait reply")
+        (state / "wait-reply").touch()
+        episode, since = option("--episode"), float(option("--since"))
+        destination = placement.PlacementDestination("mac", "mac", "natemccoy@mac", claim_state.WHOLE_MAC)
+        if wait_reply in ("busy", "blocked"):
+            eligibility = placement.CandidateEligibility(destination, placement.TemporaryExclusion(wait_reply))
+            diagnostics = ()
+            if wait_reply == "busy" and os.environ.get("MAC_RUN_QUEUE_BUSY_DIAGNOSTIC") != "0":
+                diagnostics = (placement.BusyProviderDiagnostic("mac", "unit tests", "2026-11-17T11:00:00+00:00"),)
+            if wait_reply == "blocked":
+                print("fixture queue warning", file=sys.stderr)
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,),
+                wire.PlacementResourceWait("mac", wait_reply), provider_diagnostics=diagnostics)
+        elif wait_reply == "pending-evidence":
+            eligibility = placement.CandidateEligibility(destination, placement.EvidenceNeeded("host evidence is pending"))
+            reply = wire.PlacementWait(episode, since, 1, (eligibility,))
+        elif wait_reply == "damaged-claim":
+            claim_state.state_paths().run.write_text("damaged\n")
+            reply = wire.PlacementWait(episode, since, 1, ())
+        else:
+            raise SystemExit("unknown wait reply in the fixture")
+        with patch.object(admission_client, "request_placement", return_value=reply):
+            raise SystemExit(admission_client.main(args))
     with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
         status = run_mac_test("claim", "--identity", "--pid", option("--pid"),
             "--what", "mac run " + os.environ["MAC_RUN_SHA"][:9], "--worktree", option("--repo-root"), "--wait", "0")
@@ -313,6 +352,10 @@ class MacRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
+        environment = fixture_git_environment(self.root)
+        environment.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                            "CLAUDE_SESSION_NAME": FIXTURE_OWNER})
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         installed = self.home / ".claude"
         installed.mkdir(parents=True)
         helpers = self.helper_home / ".claude"
@@ -352,8 +395,7 @@ class MacRunTests(unittest.TestCase):
         # The runner's session must not own the fixture's Mac block.
         seed_interpreter_cache(self.root / "cache")
         self.environment = {
-            **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
-            "HOME": str(self.home),
+            **{name: value for name, value in memory_gate_shell_environment().items() if name not in SESSION_SELECTORS},
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             **fixture_zsh_environment(),
@@ -455,6 +497,12 @@ class MacRunTests(unittest.TestCase):
 
     def assert_claim_released(self) -> None:
         self.assertFalse((self.state_directory / "run.json").exists())
+
+    def assert_placement_wait_cancelled(self) -> None:
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "cancel-placement"])
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
 
     def wait_for_path(self, path: Path, process: subprocess.Popen[str]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
@@ -562,6 +610,81 @@ class MacRunTests(unittest.TestCase):
         self.assert_no_build_started()
         self.assert_claim_released()
 
+    def test_queue_busy_reply_exits_nine_without_starting_build(self) -> None:
+        for diagnostic in ("1", "0"):
+            with self.subTest(diagnostic=diagnostic):
+                self.clear_events()
+                (self.stub_state / "wait-reply").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "busy",
+                                             "MAC_RUN_QUEUE_BUSY_DIAGNOSTIC": diagnostic},
+                                      timeout=TEST_HANG_GUARD_SECS)
+
+                self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                busy_lines = [line for line in result.stderr.splitlines()
+                              if line.startswith("busy:") or line == "Mac is busy"]
+                self.assertEqual(len(busy_lines), 1, result.stderr)
+                if diagnostic == "1":
+                    self.assertRegex(busy_lines[0], r"busy: unit tests since \d\d:\d\d")
+                else:
+                    self.assertEqual(busy_lines[0], "Mac is busy")
+                self.assert_placement_wait_cancelled()
+                self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+                self.assert_no_build_started()
+                self.assert_claim_released()
+                self.assertEqual(list((self.state_directory / "claims").glob("*.json")), [])
+
+    def test_queue_blocked_reply_exits_nine_without_starting_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "blocked"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("fixture queue warning", result.stderr.splitlines())
+        self.assertEqual(result.stderr.splitlines().count("Mac is blocked"), 1, result.stderr)
+        self.assert_placement_wait_cancelled()
+        self.assert_no_build_started()
+        self.assert_claim_released()
+
+    def test_pending_host_evidence_retries_placement_and_starts_the_build(self) -> None:
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence",
+                                     "MAC_TEST_ADVANCE_WAIT": "1"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        queue_events = [cast(list[str], json.loads(line))
+                        for line in (self.stub_state / "queue-events").read_text().splitlines()]
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "place-step", "cancel-placement"])
+        self.assertEqual(queue_events[0], queue_events[1])
+        self.assertTrue(any(event["command"] == "ssh" and "cargo build" in event["args"][-1]
+                            for event in self.events()))
+        self.assertEqual(list((self.home / ".local/state/mac-queue/receipts").iterdir()), [])
+        self.assert_claim_released()
+
+    def test_damaged_claim_exits_nine_without_starting_build(self) -> None:
+        self.state_directory.mkdir()
+        _ = (self.state_directory / "run.json").write_text("damaged\n", encoding="utf-8")
+
+        result = self.mac_run(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assertFalse((self.stub_state / "queue-events").exists())
+
+    def test_damaged_claim_during_placement_exits_nine_without_retry(self) -> None:
+        self.state_directory.mkdir()
+
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "damaged-claim"}, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assert_damaged_claim_refusal(result)
+        self.assert_placement_wait_cancelled()
+
+    def assert_damaged_claim_refusal(self, result: subprocess.CompletedProcess[str]) -> None:
+        claim = self.state_directory / "run.json"
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, f"state unreadable: {claim}\n")
+        self.assertEqual(list(self.state_directory.iterdir()), [claim])
+        self.assertEqual(claim.read_text(), "damaged\n")
+        self.assertEqual([event["args"][-1] for event in self.events() if event["command"] == "ssh"], ["true"])
+        self.assert_no_build_started()
+
     def test_smoke_uses_the_shared_refused_port_and_host(self) -> None:
         self.write_production_config(
             smoke_ready_seconds="300", smoke_exit_seconds="30", smoke_connect_seconds="1",
@@ -599,7 +722,7 @@ class MacRunTests(unittest.TestCase):
         )
         self.assert_claim_released()
 
-    def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
+    def test_claim_file_keyed_by_repository_lets_another_repository_run_beside_it(self) -> None:
         (self.repository / ".git").mkdir()
         other = self.root / "other"
         (other / ".git").mkdir(parents=True)
@@ -607,15 +730,18 @@ class MacRunTests(unittest.TestCase):
                                      "--worktree", str(other))
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
         claims = self.state_directory / "claims"
-        before = (claims / "other.json").read_bytes()
+        # A Mac claim file takes its name from the repository key.
+        other_key = "git-dir:" + str(other.resolve() / ".git")
+        other_claim = claims / f"{claim_state.mac_claim_stem(other_key, 0)}.json"
+        before = other_claim.read_bytes()
         self.clear_events()
 
         result = self.mac_run()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertGreater(len([event for event in self.events() if event["command"] in {"ssh", "scp"}]), 1)
-        self.assertEqual(sorted(path.name for path in claims.iterdir()), ["other.json"])
-        self.assertEqual((claims / "other.json").read_bytes(), before)
+        self.assertEqual(sorted(claims.iterdir()), [other_claim])
+        self.assertEqual(other_claim.read_bytes(), before)
         self.assert_claim_released()
 
     def test_success_releases_claim(self) -> None:
@@ -820,7 +946,7 @@ cleanup_mac_run
                     for mirror in copies.remote_mirrors()]
 
     def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
-                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> None:
+                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> str:
         source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
                                          {"source.txt": "content\n"}).checkout
         head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
@@ -855,7 +981,8 @@ cleanup_mac_run
             self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
             self.assertEqual(before_local[0]["host"], "natemccoy@mac")
             self.assertEqual(before_remote[0]["host"], "localhost")
-            prepare_cleanup(Path(str(before_local[0]["path"])))
+            with mock.patch.dict(os.environ, {"COPIES_CONFIG": local_environment["COPIES_CONFIG"]}):
+                prepare_cleanup(Path(str(before_local[0]["path"])))
             send_process_group(process.pid, signal.SIGTERM)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
@@ -875,11 +1002,12 @@ cleanup_mac_run
                     self.assertIn(before[0], records)
                 else:
                     self.assertEqual(records, [])
+        return after.stderr
 
     def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
-        self.assert_clone_records_after_cleanup(0)
+        _ = self.assert_clone_records_after_cleanup(0)
 
-    def test_old_mirror_cleanup_removes_the_clone_and_both_registry_records(self) -> None:
+    def test_old_mirror_cleanup_keeps_the_clone_and_removes_both_registry_records(self) -> None:
         checkouts: list[Path] = []
 
         def remove_exclusions(checkout: Path) -> None:
@@ -891,12 +1019,20 @@ cleanup_mac_run
             status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
             self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
 
-        self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
+        errors = self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
         self.assertEqual(len(checkouts), 1)
-        self.assertFalse(checkouts[0].exists())
+        [checkout] = checkouts
+        self.assertEqual((checkout / "source.txt").read_text(), "content\n")
+        record = copy_record.read_record(checkout / copy_record.RECORD)
+        self.assertIsInstance(record, copy_record.Registered)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(record))
+        expected = f"kept for a manual removal list: {checkout} (scratch, task {record.task} ended)"
+        self.assertEqual([line for line in errors.splitlines() if line.startswith(
+            f"kept for a manual removal list: {checkout} (")], [expected])
 
     def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
-        self.assert_clone_records_after_cleanup(23)
+        _ = self.assert_clone_records_after_cleanup(23)
 
     def test_build_marker_wait_reports_a_failed_child(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],

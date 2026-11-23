@@ -34,6 +34,16 @@ class ScriptPromptTests(unittest.TestCase):
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
             self.assertTrue(script_prompts.typed_here("/resume where you stopped."))
 
+    def test_script_typed_prose_classifies_as_scheduled(self) -> None:
+        from scripts.hooks import conversation_pause
+
+        text = "yes i approve it"
+        script_prompts.record("w1:p1", text)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "CLAUDE_CODE_SESSION_ID": ""}):
+            source = conversation_pause.prompt_source(text, lambda: frozenset(), lambda: ())
+        self.assertIs(source, conversation_pause.PromptSource.SCHEDULED)
+        self.assertFalse(script_prompts.typed_by_script("w1:p1", text))
+
     def test_old_record_classifies_as_script_until_the_hook_consumes_it(self) -> None:
         from scripts.hooks import conversation_pause
 

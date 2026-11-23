@@ -24,9 +24,14 @@ from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
+SCRIPTS = Path(__file__).resolve().parents[1]
+STICKY_HEADING = re.compile(rb':is\(\.page-heading,main>\.page-heading-actions\)\{[^}]*\}')
+PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
+                            current_session=staff.StaffId("session-owner"))
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
+    ("aws_machines", "AWS Machines", "server", "AWS Machines", 3900),
     ("builds", "Builds", "hammer", "Builds", 15),
     ("disks", "Disks", "hard-drive", "Disks", 600),
     ("images", "Images", "image", "Images", 45),
@@ -107,6 +112,359 @@ class PageStatusTests(unittest.TestCase):
         self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
         self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
+
+    def test_list_owner_setting_keeps_morty_in_new_item_recipients(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(root)}))
+        config = conf.path("console")
+        self.assertEqual(config, root / "console.conf")
+        repository = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        identity = staff.StaffId(conf.read(repository).text("page.list.owner"))
+        morty = staff.StaffRow(identity, "producer", "morty", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("current-morty-session"),
+                               doc=staff.LiveDoc("natedev", config.parent / "missing.md"))
+        members = staff.StaffSnapshot((morty,))
+        with patch.object(review_submissions, "local_machine", return_value="natedev"):
+            _ = config.write_text("page.list.owner=producer-staff\n", encoding="utf-8")
+            self.assertEqual(review_submissions.recipient_options(members), [])
+            _ = config.write_text(f"page.list.owner={identity}\n", encoding="utf-8")
+            self.assertEqual(review_submissions.recipient_options(members),
+                             [{"id": identity, "name": "morty", "proposal": False}])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
+    def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        page = long_open_row_page()
+        reference = json.dumps(main_heading(page).decode()).replace('<', r'\u003c').encode()
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  frameElement.style.height='800px';
+  const button=document.querySelector('[data-owner-new]');
+  const owner=button.closest('.page-owner'), name=owner.querySelector('.page-owner-name');
+  const heading=document.querySelector('.page-heading');
+  const reference=document.createElement('iframe');
+  reference.style.cssText='position:fixed;left:-10000px;top:0;border:0;height:800px';
+  const referenceReady=new Promise(resolve=>reference.addEventListener('load',resolve,{once:true}));
+  reference.srcdoc=MAIN_PAGE;
+  document.body.append(reference);
+  await referenceReady;
+  const title=document.querySelector('h1'), banner=document.querySelector('[data-page-status]');
+  const main=document.querySelector('main'), table=document.querySelector('table'), row=table.querySelector('.list-row');
+  const detail=document.querySelector('[data-detail]');
+  banner.dataset.state='Late';
+  banner.querySelector('[data-status-word]').textContent='Late';
+  const reason=banner.querySelector('[data-status-reason]');
+  reason.hidden=false;
+  reason.textContent='The feed has stopped.';
+  reason.style.flexBasis='100%';
+  const view=createRecordTable({content:()=>document.querySelector('[data-test-list]'),
+   shows:['all'],defaultShow:'all',visible:()=>true,applied:()=>{detail.hidden=false;}});
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const boxes=doc=>['.page-owner-name','[data-owner-new]'].map(selector=>{
+   const {x,y,width,height}=doc.querySelector(selector).getBoundingClientRect();
+   return [x,y,width,height];
+  });
+  const columns=()=>JSON.stringify([main,table].map(element=>{
+   const {left,width}=element.getBoundingClientRect();
+   return [left,width];
+  }));
+  const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
+  const line=()=>getComputedStyle(heading).boxShadow, lineColor=getComputedStyle(button).borderTopColor;
+  const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
+  const statusCovered=()=>{
+   const box=banner.getBoundingClientRect(), top=Math.max(box.top,0);
+   return [box.left+2,(box.left+box.right)/2,box.right-2].some(x=>[top+1,(top+box.bottom)/2,box.bottom-1]
+    .some(y=>!banner.contains(document.elementFromPoint(x,y))));
+  };
+  for(const width of [1440,1024,320]){
+   const verify=(ok,message)=>check(ok,width+' px: '+message);
+   frameElement.style.width=width+'px';
+   reference.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   const first=JSON.stringify(boxes(document)), layout=columns(), headingHeight=heading.getBoundingClientRect().height;
+   verify(first===JSON.stringify(boxes(reference.contentDocument)),
+    'The name and button match the original heading at scroll zero.');
+   const background=getComputedStyle(heading).backgroundColor;
+   verify(opaque(background) && background===getComputedStyle(document.body).backgroundColor,
+    'The heading row has the opaque page background.');
+   verify(line()==='none' && !heading.hasAttribute('data-page-heading-stuck'),'The heading row has no line at scroll zero.');
+   const statusEnd=Math.ceil(banner.getBoundingClientRect().bottom+headingHeight);
+   for(let top=0;top<=statusEnd;top+=2){
+    scrollTo({top,behavior:'instant'});
+    await painted();
+    if(statusCovered()){verify(false,'The heading row covers the Late status at scroll '+top+'.');break;}
+   }
+   for(const top of [1,Math.floor(bottom()/2),bottom()]){
+    scrollTo({top,behavior:'instant'});
+    await painted();
+    verify(scrollY===top && columns()===layout,'The content keeps its left edge and width at scroll '+top+'.');
+   }
+   const last=owner.getBoundingClientRect(), status=banner.getBoundingClientRect(), headingBox=heading.getBoundingClientRect();
+   const nameBox=name.getBoundingClientRect(), buttonBox=button.getBoundingClientRect();
+   verify(innerWidth===width && scrollY>innerHeight && scrollY===bottom(),'The page scrolls to the bottom of the long row.');
+   const state=banner.querySelector('.page-status-state').getBoundingClientRect();
+   verify(Math.abs(status.top-headingBox.bottom)<1 && reason.getBoundingClientRect().top>=state.bottom,
+    'The sticky status spans two lines directly below the heading row.');
+   verify(Math.abs(headingBox.top-8)<1 && heading.contains(title),'The heading row sticks 8 px below the top.');
+   verify(Math.abs(last.right-headingBox.right)<1 && last.top>=headingBox.top && last.bottom<=status.top
+    && last.bottom<=innerHeight,'The owner stays at the top right above the status.');
+   verify(nameBox.width>0 && Math.abs(buttonBox.left-nameBox.right-8)<0.1 && buttonBox.width===36,
+    'The name stays beside the full button.');
+   verify(detail.getBoundingClientRect().top<headingBox.top,'The open row scrolls under the heading row.');
+   verify(heading.hasAttribute('data-page-heading-stuck') && line().includes(lineColor) && line().includes('0px 1px 0px'),
+    'The stuck heading row shows the header line.');
+   verify(headingBox.height===headingHeight,'The line does not change the heading row height.');
+   let hidden=true;
+   for(let x=Math.ceil(last.left);x<last.right-1;x+=4){
+    for(let y=Math.ceil(last.top);y<last.bottom-1;y+=4){
+     hidden=hidden && heading.contains(document.elementFromPoint(x,y));
+    }
+   }
+   verify(hidden,'No table text shows under the owner.');
+   const x=(buttonBox.left+buttonBox.right)/2;
+   verify(button.contains(document.elementFromPoint(x,buttonBox.top+1))
+    && button.contains(document.elementFromPoint(x,buttonBox.bottom-1)),'The whole button is clickable.');
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   verify(JSON.stringify(boxes(document))===first && line()==='none','The original heading returns at scroll zero.');
+   verify(view.revealMatchingItem('open'),'The item jump finds the row.');
+   await painted();
+   verify(document.activeElement===row.querySelector('button') && scrollY>0 &&
+    row.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom &&
+    banner.getBoundingClientRect().top>=heading.getBoundingClientRect().bottom,
+    'The item jump from scroll zero focuses the row below the heading row and the status.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace(b'MAIN_PAGE', reference)
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner under a sticky status.")
+    def test_late_or_failed_status_never_covers_the_owner(self) -> None:
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('[data-detail]').hidden=false;
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const heading=document.querySelector('.page-heading'), banner=document.querySelector('[data-page-status]');
+  const name=document.querySelector('.page-owner-name'), button=document.querySelector('[data-owner-new]');
+  const main=document.querySelector('main'), table=document.querySelector('table');
+  const reason=banner.querySelector('[data-status-reason]');
+  const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+  const background=getComputedStyle(document.body).backgroundColor;
+  const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
+  const layout=()=>JSON.stringify([main,table].map(element=>{
+   const {top,left,width}=element.getBoundingClientRect();
+   return [top+scrollY,left,width];
+  }));
+  // A box is clear when it is fully in view and a hit test at its corners and center finds it.
+  const clear=(element,inset)=>{
+   const box=element.getBoundingClientRect();
+   const points=[[box.left+inset,box.top+inset],[box.right-inset,box.top+inset],[box.left+inset,box.bottom-inset],
+    [box.right-inset,box.bottom-inset],[(box.left+box.right)/2,(box.top+box.bottom)/2]];
+   return box.width>0 && box.top>=0 && box.left>=0 && box.bottom<=innerHeight && box.right<=innerWidth
+    && points.every(([x,y])=>element.contains(document.elementFromPoint(x,y)));
+  };
+  const statusShown=()=>{
+   const box=banner.getBoundingClientRect();
+   return box.top>=0 && box.bottom<=innerHeight && [box.left+2,(box.left+box.right)/2,box.right-2]
+    .every(x=>[box.top+1,(box.top+box.bottom)/2,box.bottom-1].every(y=>banner.contains(document.elementFromPoint(x,y))));
+  };
+  const band=()=>getComputedStyle(heading,'::before');
+  for(const [state,text] of [['Late','The feed has stopped.'],['Failed','The read failed with HTTP 502.']]){
+   banner.dataset.state=state;
+   banner.querySelector('[data-status-word]').textContent=state;
+   reason.hidden=false;
+   reason.textContent=text;
+   for(const width of [1440,320]){
+    const found=new Set();
+    const verify=(ok,message,top)=>{
+     if(!ok && !found.has(message)){found.add(message);failures.push(state+', '+width+' px, scroll '+top+': '+message);}
+    };
+    frameElement.style.width=width+'px';
+    scrollTo({top:0,behavior:'instant'});
+    await painted();
+    const start=layout();
+    const positions=[];
+    for(let top=0;top<=200;top+=2) positions.push(top);
+    positions.push(Math.floor(bottom()/2),bottom());
+    let previous=null;
+    for(const top of positions){
+     scrollTo({top,behavior:'instant'});
+     await painted();
+     const row=heading.getBoundingClientRect(), status=banner.getBoundingClientRect();
+     const stuck=heading.hasAttribute('data-page-heading-stuck');
+     verify(scrollY===top && innerWidth===width,'The page scrolls to the position.',top);
+     verify(clear(name,1),'The owner name is fully in view and not covered.',top);
+     verify(clear(button,3),'The New item button is fully in view and not covered.',top);
+     verify(statusShown(),'The status line is fully in view and not covered by the row.',top);
+     verify(row.bottom<=status.top+0.5,'The row stays above the status line.',top);
+     verify(layout()===start,'The content does not move.',top);
+     if(previous){
+      // Each part moves up by at most the scroll distance and never moves down, so nothing steps.
+      const distance=top-previous.top;
+      verify([[row.top,previous.row],[status.top,previous.status]].every(([now,before])=>before-now>=-0.5 && before-now<=distance+0.5),
+       'The row and the status line move by no more than the scroll distance.',top);
+     }
+     previous={top,row:row.top,status:status.top};
+     if(top===0) verify(!stuck && band().content==='none','The row is not stuck and has no space band at scroll zero.',top);
+     if(stuck){
+      verify(Math.abs(row.top-space)<1,'The stuck row is 8 px below the top.',top);
+      const fill=band().backgroundColor;
+      verify(band().content!=='none' && parseFloat(band().height)===space && opaque(fill) && fill===background,
+       'The stuck row has an opaque 8 px band above it.',top);
+      verify(heading.contains(document.elementFromPoint((row.left+row.right)/2,row.top-space/2)),
+       'The band covers the content above the stuck row.',top);
+     }else{
+      verify(band().content==='none','A row that is not stuck has no space band.',top);
+     }
+    }
+    verify(heading.hasAttribute('data-page-heading-stuck') && Math.abs(heading.getBoundingClientRect().top-space)<1
+     && Math.abs(banner.getBoundingClientRect().top-heading.getBoundingClientRect().bottom)<1,
+     'At the bottom the row sticks 8 px below the top and the status line sticks directly below it.',bottom());
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
+    def test_aws_region_filter_sticks_below_the_heading_row(self) -> None:
+        from scripts.review_links import console_theme
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        source = console_theme.with_theme((SCRIPTS / "aws_target" / "aws_prices.html").read_text(encoding="utf-8"))
+        page = (page_frame.template(source, "AWS", "aws").replace("__AWS_QUOTA_HELP__", "", 1)
+                .replace("__AWS_PRICES_DATA__", "null").replace("__AWS_GATE_TIME_DATA__", "null"))
+        markup = page_frame.with_owner(page.encode(), "aws", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
+  document.querySelector('#geographies').textContent='Geography';
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const heading=document.querySelector('.page-heading'), regions=document.querySelector('nav.regions');
+  const banner=document.querySelector('[data-page-status]');
+  for(const state of ['Live','Late']){
+   for(const width of [1440,320]){
+    frameElement.style.width=width+'px';
+    banner.dataset.state=state;
+    scrollTo({top:2000,behavior:'instant'});
+    await painted();
+    const bar=regions.getBoundingClientRect(), row=heading.getBoundingClientRect();
+    // A Late status line sticks directly below the heading row, so the filter sticks below the status line.
+    const above=state==='Late' ? banner.getBoundingClientRect().bottom : row.bottom;
+    const hit=document.elementFromPoint((bar.left+bar.right)/2,bar.top+1);
+    if(scrollY<1000 || Math.abs(bar.top-above)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
+     failures.push(width+' px, '+state+': the region filter must stick fully in view below the heading row and the status and take a click at its top.');
+    }
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
+    def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
+        from scripts.build_queue import memory_feed
+        from scripts.review_links import console_theme
+        from scripts.review_links.test_accounts_page import firefox_probe_results
+
+        source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
+        page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
+                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
+        markup = page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+        # The page stays paused, so the status line does not stick and nothing moves.
+        paused = (b'<script>document.addEventListener("DOMContentLoaded",()=>setPaused(true));</script>'
+                  + b'<style>*,*::before,*::after{animation:none!important;transition:none!important}</style></head>')
+        markup = markup.replace(b'</head>', paused, 1)
+        still = markup.replace(b'<head>', b'<head><script>window.fetch=()=>new Promise(()=>{});</script>', 1)
+        for width in (1440, 320):
+            with self.subTest(width=width):
+                self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(main_heading(still), width, 800),
+                                "At scroll zero the paused page must match the page without the sticky heading row.")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.height='800px';
+  document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  const badge=document.querySelector('#paused');
+  // The badge takes no clicks; a hit test with clicks on shows what is drawn on top.
+  badge.style.pointerEvents='auto';
+  for(const width of [1440,320]){
+   frameElement.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   const start=badge.getBoundingClientRect();
+   scrollTo({top:1200,behavior:'instant'});
+   await painted();
+   const box=badge.getBoundingClientRect(), inset=box.height/2;
+   const shown=[box.left+inset,(box.left+box.right)/2,box.right-inset].every(x=>[box.top+2,(box.top+box.bottom)/2,box.bottom-2]
+    .every(y=>badge.contains(document.elementFromPoint(x,y))));
+   if(badge.hidden || scrollY!==1200 || box.top!==start.top || box.height===0 || !shown){
+    failures.push(width+' px: the paused badge must stay in place and in view when the page scrolls.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+
+    def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = root / "console.conf"
+        document = root / "production.md"
+        showrunner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "natedev", staff.STAFF_ROOT,
+                                    current_session=staff.StaffId("session-showrunner"),
+                                    doc=staff.LiveDoc("natedev", document))
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "accounts", staff.ReportsTo(showrunner.id),
+                              current_session=staff.StaffId("session-unit"), unit_type=staff.UnitDetails("direct"))
+        producer = staff.StaffRow(staff.StaffId("producer"), "producer", "producer", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("session-producer"))
+        rows = staff.StaffSnapshot((unit, showrunner, producer))
+        content = b'<html><head></head><body><main><h1>Accounts</h1></main></body></html>'
+        cases = (
+            ("unit", unit, rows, unit, showrunner, "role.unit-director"),
+            ("showrunner", showrunner, rows, showrunner, showrunner, "role.showrunner"),
+            ("producer", producer, rows, producer, producer, "role.producer"),
+            ("inactive unit", unit, replace(rows, pending_retire=(unit.id,)), showrunner, showrunner, "role.showrunner"),
+        )
+        for case, configured, members, shown, route, color in cases:
+            with self.subTest(case=case):
+                _ = config.write_text(f"page.accounts.owner={configured.id}\n", encoding="utf-8")
+                settings = conf.read(config)
+                self.assertEqual(review_submissions.page_owner("accounts", settings, members), route)
+                with (patch.object(staff, "local_snapshot", return_value=members),
+                      patch.dict(os.environ, {"CONF_DIR": str(root)})):
+                    page = serve.owned_document(content, "accounts").decode()
+                self.assertIn('data-page-owner="accounts"', page)
+                self.assertRegex(page, r'<span class="page-owner-name"><span class="staff-name" ' +
+                                 rf'data-color-text="{re.escape(color)}" [^>]+>{shown.name}</span></span>')
+                label = f"New item for {route.name}"
+                self.assertIn(f'aria-label="{label}" title="{label}"', page)
+
+        _ = config.write_text(f"page.accounts.owner={unit.id}\n", encoding="utf-8")
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((unit,))),
+              patch.dict(os.environ, {"CONF_DIR": str(root)})):
+            page = serve.owned_document(content, "accounts")
+        self.assertIn(b'>accounts</span></span>', page)
+        self.assertNotIn(b'data-owner-new', page)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
         for page, *_ in STATUS_PAGES:
@@ -245,6 +603,45 @@ function advanceTime(ms){
 const setInterval=run=>{intervals.set(++id,run);return id;},clearInterval=key=>intervals.delete(key);
 const requestAnimationFrame=run=>run();
 '''
+
+
+def long_open_row_page() -> bytes:
+    """Render a List page whose open row is long enough to scroll far past the heading row."""
+    from scripts.review_links import change_page, record_table
+
+    detail = "".join(f'<p>Open row line {index}</p>' for index in range(60))
+    table = ('<div data-test-list><input id="list-search"><div id="list-owner"></div><div id="list-show"></div>'
+             + '<div class="list-table"><table><tbody><tr><td style="height:800px">Above the item</td></tr></tbody>'
+             + '<tbody data-list-item data-key="open" data-order="1"><tr class="list-row">'
+             + '<td><button class="list-toggle" aria-expanded="true">Open row</button></td></tr>'
+             + f'<tr data-detail><td style="text-align:right">{detail}</td></tr></tbody></table>'
+             + '<p data-empty hidden>No items</p></div></div>')
+    content = record_table.STYLE + page_frame.title("The List", "list") + table
+    markup = change_page.document(content + '<script>' + record_table.SCRIPT + '</script>', "The List")
+    return page_frame.with_owner(markup, "list", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+
+
+def main_heading(page: bytes) -> bytes:
+    """Remove the sticky heading row, so the page shows the heading as it was before."""
+    assert STICKY_HEADING.search(page) is not None
+    return STICKY_HEADING.sub(b'', page.replace(page_frame.HEADING_POSITION.encode(), b'', 1))
+
+
+def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
+    """Load one page in a headless Firefox window and return its PNG."""
+    with tempfile.TemporaryDirectory(prefix="page-frame-shot-") as temporary:
+        root = Path(temporary)
+        (root / "profile").mkdir()
+        document = root / "page.html"
+        _ = document.write_bytes(page)
+        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
+                              "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
+                              document.as_uri()],
+                             capture_output=True, text=True, timeout=45,
+                             env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
+        if run.returncode:
+            raise AssertionError(run.stderr)
+        return (root / "page.png").read_bytes()
 
 
 def assert_component_states(case: unittest.TestCase, markup: str) -> None:
