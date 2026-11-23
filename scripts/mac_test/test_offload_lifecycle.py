@@ -16,6 +16,7 @@ import sys
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from collections.abc import Sequence
@@ -42,6 +43,72 @@ def install_hardware_fixture(root: Path, value: str) -> Path:
 
 
 class PendingDispatchTests(unittest.TestCase):
+    def test_runner_rejects_missing_fence_on_a_replacement_mac(self) -> None:
+        from scripts.mac_test import eligibility
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = install_hardware_fixture(root, "287558c9-a05b-48ab-aca7-d895bbb2cf72")
+            boot: claim_state.MacClaimBoot = {
+                "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+                "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+            }
+            controller = offload.ProcessController()
+            controller.claim_identity = claim_state.ClaimIdentity("claim", "nextest", "attempt")
+            controller.pending = offload.PendingStartOperation()
+            controller.mac_boot = boot
+            sysctl = root / "sysctl"
+            _ = sysctl.write_text("#!/bin/sh\ncase \"$2\" in\n"
+                + f"kern.bootsessionuuid) echo {boot['boot_id']} ;;\n"
+                + "kern.boottime) echo '{ sec = 100, usec = 0 }' ;;\n"
+                + "*) exit 1 ;;\nesac\n")
+            sysctl.chmod(0o700)
+            environment = {**config_environment(root), "HOME": str(root),
+                           "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            run = subprocess.run
+
+            def remote(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                return run(["bash", "-c", arguments[-1]], cwd=root, env={**os.environ, **environment},
+                           text=True, capture_output=True, timeout=5, check=False)
+
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(offload, "leftover_check_script", return_value="printf 'leftovers=0\\nrc=0\\n'"),
+                  mock.patch.object(subprocess, "run", side_effect=remote)):
+                config = eligibility.read_config()
+                result = offload.settle_pending_start(controller, config, "fixture-mac",
+                                                       eligibility.KnownRepository("alpha"))
+            self.assertIsInstance(result, offload.StartUnsettled)
+            assert isinstance(result, offload.StartUnsettled)
+            self.assertEqual(result.leftovers, offload.LeftoverCheckFailed("The Mac hardware or boot differs from the claim"))
+            self.assertIsInstance(controller.pending, offload.PendingStartOperation)
+
+    def test_expired_revocation_cannot_reopen_a_delayed_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = claim_state.ClaimIdentity("claim", "nextest", "old")
+            current = claim_state.ClaimIdentity("claim", "nextest", "current")
+            fence = root / offload.start_fence_relative(old, "mac")
+            boot = {"hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+                    "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000}
+            environment = {**os.environ, "HOME": str(root)}
+
+            def shell(command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(["bash", "-c", command], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=5)
+
+            with mock.patch.object(time, "time", return_value=time.time() - 32 * 86400):
+                delayed = offload.prepare_start_fence_command(old, "mac")
+            fence.parent.mkdir(parents=True)
+            revoked = fence.with_suffix(".revoked")
+            expires = int(time.time()) - 31 * 86400
+            _ = revoked.write_text(json.dumps({"state": "ended", "boot": boot, "prepare_until": expires}))
+            os.utime(revoked, (expires, expires))
+            cleaned = shell(offload.clean_start_fences_command(current, "mac"))
+            self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+            self.assertFalse(revoked.exists())
+            self.assertEqual(shell(delayed).returncode, 75)
+            self.assertFalse(fence.with_suffix(".lock").exists())
+
     def test_used_mac_fence_is_revoked_before_a_late_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1520,7 +1520,10 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     """
 
     with locked(paths.lock):
-        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+        saved = read_claims(paths)
+        if paths.platform == "macos":
+            expire_mac_release_receipts(paths, saved, utc_now())
+        claims = tuple(claim for claim in saved if run_is_live(claim.record))
     if not claims:
         return False
     if paths.platform == "linux":
@@ -1553,6 +1556,21 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
             if watch_claim(paths, config, claim, activity[host], now):
                 watched = True
     return watched
+
+
+def expire_mac_release_receipts(paths: StatePaths, claims: tuple[HeldClaim, ...], now: datetime) -> None:
+    """Keep receipts for current claims and for recent releases."""
+    active = {claim_state.mac_release_receipt_path(paths, claim.path.stem, claim_state.claim_identity(claim.record))
+              for claim in claims}
+    cutoff = now.timestamp() - claim_state.MAC_RELEASE_RETENTION_SECONDS
+    for receipt in (paths.directory / "release-receipts").glob("*.json"):
+        if receipt in active:
+            continue
+        try:
+            if receipt.stat().st_mtime < cutoff:
+                receipt.unlink(missing_ok=True)
+        except FileNotFoundError:
+            continue
 
 
 def record_watcher_release(paths: StatePaths, path: Path, record: RemoteJobClaim, boot: claim_state.MacClaimBoot,
@@ -1615,18 +1633,21 @@ def watch_claim(
         fence_identity = claim_state.claim_fence_identity(current)
         fence = offload.start_fence_relative(fence_identity, paths.target, scope_key=claim.path.stem)
         if ("remote_host" in current and "mac_boot" in current and "hardware_uuid" in current["mac_boot"]
-                and claim_holder_ended(current) and record_watcher_release(
-                    paths, claim.path, current, current["mac_boot"], confirmed=str(fence) in ended)):
-            remove_settled_claim(claim.path, offload.pending_start_path(paths.target, fence_identity))
-            block_present = not isinstance(read_block(paths.block), NoMacBlock)
-            proof = True
-        elif isinstance(activity, ActivityCheckFailed):
-            if changed:
-                write_json(claim.path, current)
-            print(f"Mac claim activity check failed: {activity.reason}", flush=True)
-            return True
-        elif keep_watching_for_idle(claim.path, current, activity, config, now, changed) or boot_recorded:
-            return True
+                and claim_holder_ended(current)):
+            with lock_if_available(paths.stopped_copy_lock) as acquired:
+                if acquired and record_watcher_release(
+                        paths, claim.path, current, current["mac_boot"], confirmed=str(fence) in ended):
+                    remove_settled_claim(claim.path, offload.pending_start_path(paths.target, fence_identity))
+                    block_present = not isinstance(read_block(paths.block), NoMacBlock)
+                    proof = True
+        if not proof:
+            if isinstance(activity, ActivityCheckFailed):
+                if changed:
+                    write_json(claim.path, current)
+                print(f"Mac claim activity check failed: {activity.reason}", flush=True)
+                return True
+            if keep_watching_for_idle(claim.path, current, activity, config, now, changed) or boot_recorded:
+                return True
     if proof:
         if block_present:
             start_watcher(paths)
@@ -2216,6 +2237,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
+    requested_watcher = False
     while True:
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
@@ -2224,6 +2246,10 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
             return attempt.status
+        if (not requested_watcher and isinstance(attempt, ClaimBusy) and paths.platform == "macos"
+                and mac_watcher_owns_release(attempt.holder)):
+            start_claim_watcher(paths)
+            requested_watcher = True
         if isinstance(attempt, ClaimHeldByCopy):
             # Signal outside state.lock, then wait for each copy's runner to
             # clean up and release; the lock is never held while waiting.
@@ -2289,6 +2315,26 @@ def remove_settled_claim(path: Path, pending: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def stop_watcher_owned_copy(paths: StatePaths, path: Path, record: RunRecord,
+                            settings: str, work: EndStoppedWork) -> None:
+    """Stop the copy while the watcher keeps the repository assigned to it."""
+    from scripts.mac_test import eligibility, offload
+
+    if ("remote_host" not in record or "mac_boot" not in record or not record.get("copy")
+            or not claim_holder_ended(record)):
+        return
+    with locked(paths.stopped_copy_lock):
+        with locked(paths.lock):
+            current = read_run(path)
+            if (isinstance(current, NoRun) or claim_owner(current) != claim_owner(record)
+                    or current.get("remote_host") != record["remote_host"] or current.get("mac_boot") != record["mac_boot"]
+                    or claim_state.claim_fence_identity(current) != claim_state.claim_fence_identity(record)):
+                return
+        connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
+        _ = offload.check_leftovers(connection, record["remote_host"], work.repository, paths.target,
+                                    record.get("slot", 0) or 1, mac_boot=record["mac_boot"])
+
+
 def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
@@ -2306,11 +2352,16 @@ def release_exact_claims(
             except StateReadError:
                 continue
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
-                if mac_watcher_owns_release(record):
-                    return ClaimReleaseRefused("the Mac claim requires watcher proof")
                 owned.append((path, record))
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
+        if mac_watcher_owns_release(record):
+            if isinstance(remote_work, EndStoppedWork) and not provider_lock_held:
+                try:
+                    stop_watcher_owned_copy(paths, path, record, settings, remote_work)
+                finally:
+                    start_claim_watcher(paths)
+            return ClaimReleaseRefused("the Mac claim requires watcher proof")
         fence_identity = claim_state.claim_fence_identity(record)
         pending = offload.pending_start_path(paths.target, fence_identity)
         if "remote_host" in record and pending.exists():
@@ -2320,7 +2371,9 @@ def release_exact_claims(
             command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
                        + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
                        else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
-            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+            boot = record.get("mac_boot", claim_state.MAC_BOOT_NOT_RECORDED)
+            observed = offload.read_leftovers(connection, record["remote_host"],
+                                             offload.check_mac_cleanup_boot(boot) + command, paths.target)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
             if "dispatch_start_settled=" + offload.pending_start_key(fence_identity) not in observed.output.splitlines():

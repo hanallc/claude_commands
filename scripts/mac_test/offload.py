@@ -562,6 +562,17 @@ def mac_boot():
 '''
 
 
+def check_mac_cleanup_boot(boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded) -> str:
+    """Check the saved Mac and boot before a reconnect can clean or settle work."""
+    if isinstance(boot, claim_state.MacBootNotRecorded) or "hardware_uuid" not in boot:
+        return ""
+    program = MAC_BOOT_READER + '''import sys
+if mac_boot() != json.loads(sys.argv[1]):
+    sys.exit("The Mac hardware or boot differs from the claim")
+'''
+    return shlex.join(["python3", "-c", program, json.dumps(boot)]) + " || exit 75\n"
+
+
 MAC_FENCE_RECORDS = '''import json, os, tempfile
 
 def sync_directory(directory):
@@ -614,6 +625,18 @@ def revoke_fence(fence, record):
     save_fence_record(fence.with_suffix(".revoked"), record)
     fence.with_suffix(".lock").unlink(missing_ok=True)
     fence.with_suffix(".group").unlink(missing_ok=True)
+'''
+
+MAC_FENCE_PREPARE_SECONDS = 86400
+
+MAC_FENCE_EXPIRY = '''import time
+
+def prepare_expired(directory, deadline):
+    try:
+        floor = json.loads((directory / ".prepare-floor").read_text())["deadline"]
+    except FileNotFoundError:
+        floor = 0
+    return deadline <= max(time.time(), floor)
 '''
 
 
@@ -677,7 +700,11 @@ with ExitStack() as locks:
         else:
             if lock is None or not os.path.samestat(current, os.fstat(lock.fileno())):
                 continue
-        revoke_fence(fence, {"state": "ended", "boot": boot})
+        try:
+            record = read_fence_record(fence) or {}
+        except (OSError, ValueError):
+            record = {}
+        revoke_fence(fence, {**record, "state": "ended", "boot": boot})
         ended.append(name)
 print(json.dumps(ended))
 '''
@@ -687,7 +714,7 @@ print(json.dumps(ended))
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Remove inactive fences from older claims in this exact provider scope."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
-    program = '''import fcntl, pathlib, sys
+    program = MAC_FENCE_RECORDS + MAC_FENCE_EXPIRY + '''import fcntl, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 for path in base.parent.glob("*.lock"):
     if path == base.with_suffix(".lock"):
@@ -703,8 +730,33 @@ for path in base.parent.glob("*.lock"):
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         continue
+cutoff = time.time() - int(sys.argv[2])
+expired = []
+for path in base.parent.glob("*.revoked"):
+    if path == base.with_suffix(".revoked") or path.with_suffix(".lock").exists():
+        continue
+    try:
+        if path.stat().st_mtime >= cutoff:
+            continue
+        deadline = json.loads(path.read_text()).get("prepare_until")
+        if type(deadline) is int and deadline < cutoff:
+            expired.append((path, deadline))
+    except (FileNotFoundError, ValueError, AttributeError):
+        continue
+if expired:
+    floor = base.parent / ".prepare-floor"
+    with floor.with_suffix(".guard").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            previous = json.loads(floor.read_text())["deadline"]
+        except FileNotFoundError:
+            previous = 0
+        deadline = max(previous, max(item[1] for item in expired))
+        save_fence_record(floor, {"deadline": deadline})
+        for path, _ in expired:
+            path.unlink(missing_ok=True)
 '''
-    return shlex.join(["python3", "-c", program, encoded])
+    return shlex.join(["python3", "-c", program, encoded, str(claim_state.MAC_RELEASE_RETENTION_SECONDS)])
 
 
 def prepare_start_fence_command(
@@ -712,26 +764,28 @@ def prepare_start_fence_command(
 ) -> str:
     """Create the start identity before the probe acknowledges preparation."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
-    program = (MAC_BOOT_READER + MAC_FENCE_RECORDS if read_mac_boot else "") + '''import pathlib, sys
+    program = (MAC_BOOT_READER if read_mac_boot else "") + MAC_FENCE_RECORDS + MAC_FENCE_EXPIRY + '''import pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
-if base.with_suffix(".revoked").exists():
+deadline = int(sys.argv[2])
+if prepare_expired(base.parent, deadline) or base.with_suffix(".revoked").exists():
     sys.exit(75)
 '''
     if read_mac_boot:
         program += '''boot = mac_boot()
-prepared = {"boot": boot, "state": "unused"}
+prepared = {"boot": boot, "state": "unused", "prepare_until": deadline}
 try:
     save_fence_record(base.with_suffix(".lock"), prepared, create=True)
 except FileExistsError:
-    if read_fence_record(base) != prepared:
+    previous = read_fence_record(base)
+    if not previous or previous.get("boot") != boot or previous.get("state") != "unused":
         sys.exit(75)
-if base.with_suffix(".revoked").exists():
+if prepare_expired(base.parent, deadline) or base.with_suffix(".revoked").exists():
     sys.exit(75)
 print("mac_boot=" + json.dumps(boot))
 '''
     else:
         program += 'base.parent.mkdir(parents=True, exist_ok=True)\nbase.with_suffix(".lock").touch()\n'
-    return shlex.join(["python3", "-c", program, encoded])
+    return shlex.join(["python3", "-c", program, encoded, str(int(time.time()) + MAC_FENCE_PREPARE_SECONDS)])
 
 
 def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
@@ -790,19 +844,22 @@ def fenced_start_command(
     """Remove the prepared identity after the existing remote command ends."""
     record_group = ""
     if not isinstance(mac_boot, claim_state.MacBootNotRecorded):
-        program = MAC_BOOT_READER + MAC_FENCE_RECORDS + '''import pathlib, sys
+        program = MAC_BOOT_READER + MAC_FENCE_RECORDS + MAC_FENCE_EXPIRY + '''import pathlib, sys
 boot = mac_boot()
 group = os.getpgrp()
 if boot != json.loads(sys.argv[2]) or group <= 1:
     sys.exit(75)
 fence = pathlib.Path.home() / sys.argv[1]
-if read_fence_record(fence) != {"boot": boot, "state": "unused"}:
+record = read_fence_record(fence)
+if (not record or record.get("boot") != boot or record.get("state") != "unused"
+        or type(record.get("prepare_until")) is not int or prepare_expired(fence.parent, record["prepare_until"])):
     sys.exit(75)
-save_fence_record(fence.with_suffix(".group"), {"boot": boot, "state": "started", "group": group}, create=True)
+save_fence_record(fence.with_suffix(".group"), {**record, "state": "started", "group": group}, create=True)
 '''
         path = start_fence_relative(identity, target, scope_key=scope_key)
         record_group = shlex.join(["python3", "-c", program, str(path), json.dumps(mac_boot)]) + " || exit 75\n"
-    return (start_fence_command(identity, target, scope_key=scope_key)
+    return (check_mac_cleanup_boot(mac_boot)
+            + start_fence_command(identity, target, scope_key=scope_key)
             + record_group
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
@@ -2787,9 +2844,12 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
 
 
 def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
-                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
+                   target: str = "mac", slot: int = 1, *,
+                   mac_boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded = claim_state.MAC_BOOT_NOT_RECORDED,
+                   ) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
-    return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
+    script = check_mac_cleanup_boot(mac_boot) + leftover_check_script(repository, target, slot)
+    return read_leftovers(config, host, script, target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
@@ -2803,7 +2863,8 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
-    command = (start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
+    command = (check_mac_cleanup_boot(controller.mac_boot)
+               + start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
                + leftover_check_script(repository, target, slot))
     observed = read_leftovers(connection, host, command, target)
     if (isinstance(observed.result, LeftoversEnded)
@@ -2829,14 +2890,15 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_current_leftovers(
-    config: OffloadConfig, host: str, repository: KnownRepository, target: str = "mac", slot: int = 1,
+    config: OffloadConfig, host: str, repository: KnownRepository, target: str = "mac", slot: int = 1, *,
+    mac_boot: claim_state.MacClaimBoot | claim_state.MacBootNotRecorded = claim_state.MAC_BOOT_NOT_RECORDED,
 ) -> LeftoverCheckResult:
     """Read the current connection settings before checking retained work."""
     try:
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return LeftoverCheckFailed(f"cleanup settings unavailable: {error}")
-    return check_leftovers(connection, host, repository, target, slot)
+    return check_leftovers(connection, host, repository, target, slot, mac_boot=mac_boot)
 
 
 def check_taken_over_claim(
@@ -3071,7 +3133,8 @@ def claimed_run(
             elif not isinstance(controller.pending, SettledDispatchOperations):
                 return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
             else:
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                                  mac_boot=controller.mac_boot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3092,7 +3155,7 @@ def claimed_run(
         if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
             cleanup = controller.stream_mac_run([
                 *ssh_prefix(config),
-                copies.remote_use_command(request_mirror(config, request, repository),
+                check_mac_cleanup_boot(controller.mac_boot) + copies.remote_use_command(request_mirror(config, request, repository),
                     f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
             ])
             remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
@@ -3102,7 +3165,8 @@ def claimed_run(
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
                        free_floor_gib=config.free_floor_gib)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                              mac_boot=controller.mac_boot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3124,7 +3188,8 @@ def claimed_run(
     except OffloadInterrupted:
         controller.stop()
         if not release_allowed and isinstance(controller.pending, SettledDispatchOperations):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot,
+                                              mac_boot=controller.mac_boot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)

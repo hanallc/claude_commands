@@ -3761,6 +3761,81 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 fcntl.flock(claim_lock.fileno(), fcntl.LOCK_UN)
         activity.assert_not_called()
 
+    def test_busy_claim_restarts_the_watcher_after_natedev_restart(self) -> None:
+        _ = self.write_claim(mac_boot={
+            "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+            "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+        }, mac_command_fence={"episode": "fixture-episode", "attempt": "fixture-attempt"})
+        args = mac_test.CliArguments()
+        args.pid, args.worktree, args.remote = 42, str(self.root), "claim-mac"
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(mac_test.command_claim(args, self.paths, watch_claim=False), 11)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][-1], "watch-claim")
+        self.assertTrue(self.paths.run.is_file())
+
+    def test_watcher_owned_copy_runs_stopped_work_cleanup_without_generic_release(self) -> None:
+        from scripts.mac_test import eligibility, offload
+
+        claim = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        _ = self.write_claim(copy=True, mac_boot={
+            "hardware_uuid": "f1c0117c-365d-4df4-be2a-04b0fafff9c7",
+            "boot_id": "b75adc32-d178-493b-b7cd-88f740989f65", "boot_at_us": 100_000_000,
+        }, mac_command_fence={"episode": claim.episode, "attempt": claim.attempt})
+        config = mac_test.read_config()
+        proof = mac_test.MacClaimActivity(mac_test.MacIdle(),
+            frozenset({str(offload.start_fence_relative(claim, "mac"))}))
+
+        def clean(_connection: eligibility.SshConnectionSettings, host: str, script: str,
+                  _target: str) -> offload.LeftoverObservation:
+            self.assertEqual(host, "claim-mac")
+            self.assertLess(script.index("Invalid Mac hardware"), script.index('kill "$leftover_pid"'))
+            self.assertTrue(mac_test.claim_watch_pass(self.paths, config))
+            self.assertTrue(self.paths.run.is_file())
+            return offload.LeftoverObservation(offload.LeftoversEnded(), "")
+
+        with (mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(mac_test, "start_claim_watcher") as restart,
+              mock.patch.object(mac_test, "check_mac_activity", return_value=proof),
+              mock.patch.object(mac_test, "send_message", return_value=True), redirect_stdout(io.StringIO()),
+              mock.patch.object(offload, "read_leftovers", side_effect=clean) as read):
+            result = mac_test.release_exact_claims(self.paths, os.getpid(), claim, "",
+                remote_work=mac_test.EndStoppedWork(eligibility.KnownRepository("alpha")))
+            read.assert_called_once()
+            restart.assert_called_once_with(self.paths)
+            self.assertIsInstance(result, mac_test.ClaimReleaseRefused)
+            self.assertTrue(self.paths.run.is_file())
+            self.assertFalse(mac_test.claim_watch_pass(self.paths, config))
+        self.assertFalse(self.paths.run.exists())
+
+    def test_expired_watcher_receipts_keep_evidence_for_current_claims(self) -> None:
+        active = claim_state.ClaimIdentity("fixture-claim", "fixture-episode", "fixture-attempt")
+        _ = self.write_claim()
+        old = claim_state.ClaimIdentity("old", "nextest", "attempt")
+        recent = claim_state.ClaimIdentity("recent", "nextest", "attempt")
+        paths = [claim_state.mac_release_receipt_path(self.paths, "run", identity)
+                 for identity in (active, old, recent)]
+        paths[0].parent.mkdir()
+        for path, age in zip(paths, (31, 31, 1), strict=True):
+            timestamp = (self.now - timedelta(days=age)).timestamp()
+            _ = path.write_text("{}")
+            os.utime(path, (timestamp, timestamp))
+        with (mock.patch.object(mac_test, "utc_now", return_value=self.now),
+              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle())):
+            self.assertTrue(mac_test.claim_watch_pass(self.paths, mac_test.read_config()))
+        self.assertTrue(paths[0].exists())
+        self.assertFalse(paths[1].exists())
+        self.assertTrue(paths[2].exists())
+
+    def test_offload_docs_cover_a_watcher_claim_and_a_replaced_mac(self) -> None:
+        docs = Path(__file__).resolve().parents[2] / "docs/as-built/mac-test-offload.md"
+        text = docs.read_text()
+        self.assertIn("### Recover a claim after Mac replacement", text)
+        self.assertIn("A watcher-owned claim remains busy", text)
+        self.assertIn("Revoke the exact command fence", text)
+
     def test_start_claim_watcher_skips_unit_when_claim_watch_lock_is_held(self) -> None:
         with (self.paths.directory / "claim_watch.lock").open("a+") as claim_lock:
             fcntl.flock(claim_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -3375,6 +3375,8 @@ class AdmissionServer:
         executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
         with claim_state.locked(paths.lock):
             held = claim_state.read_claims(paths)
+        if paths.platform == "macos" and any(mac_test.mac_watcher_owns_release(claim.record) for claim in held):
+            mac_test.start_claim_watcher(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)

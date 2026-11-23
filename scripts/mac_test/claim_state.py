@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from scripts.buildlog.transfer_bytes import TransferBytes
 
 
+MAC_RELEASE_RETENTION_SECONDS = 30 * 86400
+
+
 SubmittingSession = OwningSession | NoOwningSession
 
 
@@ -387,6 +390,7 @@ class StatePaths:
         self.control_lock: Path = directory / "control.lock"
         self.watch_lock: Path = directory / "watch.lock"
         self.claim_watch_lock: Path = directory / "claim_watch.lock"
+        self.stopped_copy_lock: Path = directory / "stopped-copy.lock"
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
         self.block: Path = directory / "block.json"
