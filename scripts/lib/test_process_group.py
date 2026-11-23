@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.helper_tree_test_support import verify_test_environment
-from scripts.lib.shell_test_support import refusing_bash_startup
+from scripts.lib.shell_test_support import refusing_bash_startup, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -284,10 +284,8 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             + f"raise SystemExit({status})\n")
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        definition = re.search(rf"^{function}\(\) \{{\n.*?^\}}", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(definition)
-        assert definition is not None
+        verify = self.root / "scripts/direct/verify.sh"
+        definitions = shell_functions(verify, "save_verify_exit_stderr", "finish_exit_diagnostics", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -305,10 +303,20 @@ note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
 final_pass_finish() { :; }
+finish_verify_run() { :; }
+stop_interrupted_run_log() { :; }
+"""
+        if function == "verify_interrupted":
+            driver += """
+VERIFY_START_DIR="$4"
+PY="$VERIFY_START_DIR/../lib/py"
+save_verify_exit_stderr
+exit_diagnostics="$TREE_WATCH_DIR/exit-diagnostics"
 """
         return subprocess.run(
-            ["bash", "-c", driver + definition.group() + f"\n{function} 15\n", "fixture",
-             str(child.pid), str(self.root / "scripts/direct/step_record.py"), str(watch)],
+            ["bash", "-c", definitions + driver + f"\n{function} 15\n", "fixture",
+             str(child.pid), str(verify.with_name("step_record.py")), str(watch),
+             str(Path(__file__).resolve().parents[1] / "direct")],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
