@@ -135,7 +135,7 @@ class ObservedAdmissionServer(service.AdmissionServer):
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
                  check_access: Callable[[str], None], before_admission: Callable[[], None],
                  host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
-                 job_start_reader: Callable[[int], records.CiJobStart] | None = None) -> None:
+                 job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         self.check_access: Callable[[str], None] = check_access
         self.before_admission: Callable[[], None] = before_admission
         self.wake_lock: threading.Lock = threading.Lock()
@@ -459,8 +459,8 @@ class AdmissionFixture(ExitStack):
             server.start()
         return server
 
-    def read_job_start(self, pid: int) -> records.CiJobStart:
-        return self.job_starts.get(pid, records.NO_JOB_START)
+    def read_job_start(self, owner: wire.Owner) -> records.CiJobStart:
+        return self.job_starts.get(owner.pid, records.NO_JOB_START)
 
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         return placement.HostEvidenceUnavailable(key, self.clock.now(), "the fixture has no provider transport")

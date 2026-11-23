@@ -9572,6 +9572,26 @@ class CiJobStartPlaceTests(unittest.TestCase):
             self.assertEqual(fixture.server.waiters[ci.episode].row.get("ci_job_start"), records.JobStart(now - 900))
             self.assertEqual(fixture.server.waiters[ci.episode].row["since"], ci.since)
 
+    def test_a_recovered_job_start_stays_when_a_later_read_finds_none(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.NO_JOB_START)
+            fixture.job_starts[ci.owner.pid] = records.JobStart(now - 900)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            fixture.server.persist()
+            # A later read fails, and the older front sends NoJobStart again after a reload.
+            fixture.job_starts.clear()
+            fixture.restart()
+            fixture.clock.advance(1)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
+            self.assertEqual(fixture.server.waiters[ci.episode].row.get("ci_job_start"), records.JobStart(now - 900))
+
     def test_the_service_reads_no_job_start_for_a_request_with_no_runner(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)

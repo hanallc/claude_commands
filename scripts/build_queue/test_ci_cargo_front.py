@@ -410,13 +410,25 @@ class JobStartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             proc = Path(folder)
             boot_start = time.clock_gettime(time.CLOCK_BOOTTIME) - 900
-            write_process(proc, 100, parent=1, start=str(int(boot_start * os.sysconf("SC_CLK_TCK"))), name="Runner.Worker")
-            write_process(proc, 300, parent=100, start="1", name="python3")
+            worker_start = int(boot_start * os.sysconf("SC_CLK_TCK"))
+            write_process(proc, 100, parent=1, start=str(worker_start), name="Runner.Worker")
+            write_process(proc, 300, parent=100, start=str(worker_start + 1), name="python3")
             before = time.time()
-            started = ci_job_start.read_queue_job_start(300, proc)
+            started = ci_job_start.read_queue_job_start(300, str(worker_start + 1), proc)
             assert isinstance(started, records.JobStart)
             self.assertAlmostEqual(started.started_at, before - 900, delta=2)
-            self.assertEqual(ci_job_start.read_queue_job_start(100_000, proc), records.NO_JOB_START)
+            self.assertEqual(ci_job_start.read_queue_job_start(100_000, "1", proc), records.NO_JOB_START)
+
+    def test_a_reused_pid_gives_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 100, parent=1, start="12345", name="Runner.Worker")
+            write_process(proc, 300, parent=100, start="12500", name="python3")
+            # The request process started at 12400, so pid 300 now belongs to another process.
+            self.assertEqual(ci_job_start.read_queue_job_start(300, "12400", proc), records.NO_JOB_START)
+            # A Runner.Worker that started after the process below it took a reused parent pid.
+            write_process(proc, 100, parent=1, start="12600", name="Runner.Worker")
+            self.assertIsNone(ci_job_start.job_start(300, proc))
 
     def test_a_ci_step_reads_its_job_start_once_and_sends_it_on_the_queue_clock(self) -> None:
         class FixedClock:
