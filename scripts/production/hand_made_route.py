@@ -9,8 +9,10 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import fcntl
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 from typing import BinaryIO, Protocol, TextIO, Unpack
@@ -22,6 +24,9 @@ from scripts.build_queue.queue_place import HeldReservation, PopenArguments
 PROGRAM_VARIABLES = frozenset({"HOME", "USER", "LOGNAME", "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM",
                                "TZ", "TMPDIR", "XDG_RUNTIME_DIR", "SHELL", "NIX_PATH", "LOCALE_ARCHIVE",
                                "SSL_CERT_FILE", "NIX_SSL_CERT_FILE"})
+
+# The most output bytes that one read copies.
+CHUNK_BYTES = 65536
 
 # The answer of the queue that gives the run to one machine.
 Placed = wire.LocalPlacementGranted | wire.Assignment
@@ -54,8 +59,24 @@ class Refused(Exception):
 class MachineFailed(Exception):
     """The machine failed before the program gave a status, and no work of the run is left on it.
 
-    The run goes back to the other named machines.
+    The run goes back to the other named machines. The queue gets queue_reason, or the text when it is empty.
     """
+
+    def __init__(self, text: str, queue_reason: str = "") -> None:
+        super().__init__(text)
+        self.queue_reason: str = queue_reason or text
+
+
+def start_unknown(machine: str, detail: str) -> Refused:
+    """The machine got the command, and no answer tells if the program started.
+
+    The run does not go to another machine, because the program can run there too.
+    """
+    return Refused(f"{machine} start unknown: {detail}")
+
+
+def in_checkout(path: Path, repo: Path) -> bool:
+    return Path(os.path.normpath(path)).is_relative_to(repo)
 
 
 @dataclass(frozen=True)
@@ -72,6 +93,55 @@ class Output(Protocol):
     """The log of the row and the caller, which get the output as it comes."""
 
     def write(self, chunk: bytes) -> None: ...
+
+
+def copy_ready(descriptor: int, output: Output, limit: int) -> bool:
+    """Copy up to limit bytes that are in the pipe now; False at the end of the output."""
+    while limit > 0:
+        try:
+            chunk = os.read(descriptor, min(limit, CHUNK_BYTES))
+        except BlockingIOError:
+            return True
+        if not chunk:
+            return False
+        output.write(chunk)
+        limit -= len(chunk)
+    return True
+
+
+def exit_descriptor(process: subprocess.Popen[bytes]) -> int | None:
+    """A pidfd that is ready when the program exits, or None when the place reaped the program first."""
+    if process.returncode is not None:
+        return None
+    try:
+        return os.pidfd_open(process.pid)
+    except ProcessLookupError:
+        return None
+
+
+def stream(process: subprocess.Popen[bytes], output: Output) -> int:
+    """Copy the output as it comes, and return the status when the program exits.
+
+    A child that keeps the pipe open after the program exits does not hold the run: after the exit,
+    only the bytes that are in the pipe then are copied.
+    """
+    pipe = process.stdout
+    assert pipe is not None
+    descriptor = pipe.fileno()
+    os.set_blocking(descriptor, False)
+    exited = exit_descriptor(process)
+    try:
+        while exited is not None:
+            ready, _, _ = select.select([descriptor, exited], [], [])
+            if exited in ready:
+                break
+            if not copy_ready(descriptor, output, CHUNK_BYTES):
+                return process.wait()
+        _ = copy_ready(descriptor, output, fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ))
+        return process.wait()
+    finally:
+        if exited is not None:
+            os.close(exited)
 
 
 class ProgramPlace(Protocol):

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import BinaryIO, Unpack, cast, final, override
+from typing import BinaryIO, Literal, Unpack, cast, final, override
 import unittest
 from unittest import mock
 
@@ -56,9 +56,12 @@ class FakePlace:
         return self.processes[-1]
 
 
+PROVIDERS: dict[str, Literal["local", "mac", "ssh"]] = {"natedev": "local", "mac-linux": "ssh"}
+
+
 def assignment(target: str) -> placement.PlacementAssignment:
     return placement.PlacementAssignment("fixture-episode", f"attempt-{target}",
-        placement.PlacementDestination("local" if target == "natedev" else "mac", target, f"{target}-host", WholeMacScope()),
+        placement.PlacementDestination(PROVIDERS.get(target, "mac"), target, f"{target}-host", WholeMacScope()),
         execution_identity.SourceKeyUnavailable("a hand made run names no commit"),
         placement.SubmittingOwner("natedev", os.getpid(), "fixture-start"), NoOwningSession(), 1.0)
 
@@ -599,6 +602,9 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.read(str(outside)), [outside])
         # A wrapper starts a text file with no #! with /bin/sh.
         self.assertEqual(self.read("timeout", "600", "plain"), [plain])
+        # A later word with a slash outside the checkout reads each file that is not compiled.
+        self.assertEqual(self.read("bash", str(plain)), [plain])
+        self.assertEqual(self.read("bash", str(self.bin / "compiled")), [])
         self.assertEqual(self.read("timeout", "600", "compiled"), [])
         self.assertEqual(self.read(sys.executable, "-c", "print(1)"), [])
 
@@ -647,10 +653,6 @@ class ProgramFileTests(unittest.TestCase):
     def test_a_word_that_names_a_plain_folder_is_not_refused(self) -> None:
         (self.repo / "test").mkdir()
         self.assertEqual(self.read("cargo", "test"), [])
-
-    def test_a_later_path_outside_the_checkout_with_no_start_line_is_read(self) -> None:
-        script = self.write(self.root / "outside.sh", "rm -rf ~/work\n")
-        self.assertEqual(self.read("sh", str(script)), [script])
 
     def test_a_wrapper_word_from_path_with_no_start_line_is_read(self) -> None:
         helper = self.write(self.bin / "helper", "rm -rf ~/work\n")
@@ -709,11 +711,16 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 2)
         return errors.getvalue()
 
-    def test_machine_is_required_and_only_natedev_and_the_mac_are_accepted_in_this_phase(self) -> None:
+    def test_machine_is_required_and_only_natedev_the_mac_and_the_guest_are_accepted_in_this_phase(self) -> None:
         self.assertIn("--machine", self.parse("--why", "trial", "--", "true"))
-        self.assertIn("machine mac-linux comes in a later phase; this phase accepts only natedev, mac",
-                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "mac-linux", "--", "true"))
+        self.assertIn("machine hana-aws comes in a later phase; this phase accepts only natedev, mac, mac-linux",
+                      self.parse("--why", "trial", "--machine", "natedev", "--machine", "hana-aws", "--", "true"))
         self.assertIn("give the command after --", self.parse("--why", "trial", "--machine", "natedev"))
+
+    def test_a_run_can_name_the_guest_with_another_machine(self) -> None:
+        request = hand_made.parse_request(["--why", "trial", "--machine", "natedev", "--machine", "mac-linux",
+                                           "--repo", str(REPOSITORY), "--", "true"])
+        self.assertEqual(request.machines, ("natedev", "mac-linux"))
 
     def test_repo_must_be_the_top_folder_of_a_git_work_tree(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -749,18 +756,21 @@ class BuildsPageTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog")}), \
                     mock.patch.object(queue_place, "place_setup", side_effect=setup):
-                for machines in (("natedev", "mac"), ("mac",)):
+                for machines in (("natedev", "mac"), ("mac",), ("natedev", "mac-linux")):
                     with self.subTest(machines=machines), hand_made.placement_line(
                             hand_made.Request("trial", machines, REPOSITORY, ("cargo", "test"))) as line:
                         assert isinstance(line, hand_made.PlacementLine)
                         constraints = line.request.constraints
                         self.assertEqual(sorted(item.destination.target for item in constraints.candidates), sorted(machines))
                         self.assertEqual(constraints.command_kind, "run")
+                        # The guest line takes a hand made run as it takes a gate step.
+                        self.assertNotIn(placement.FixedExclusion("command"),
+                                         [item.eligibility for item in constraints.candidates])
                         self.assertEqual((line.request.episode, line.folder), ("fixture-episode", folder))
                         profile = line.request.profile
                         assert isinstance(profile, admission_records.ProgramProfile)
                         self.assertEqual(profile.step, "hand-made")
-        self.assertEqual(seen, [("hand-made", REPOSITORY)] * 2)
+        self.assertEqual(seen, [("hand-made", REPOSITORY)] * 3)
 
     def test_a_held_natedev_gives_a_wait_and_no_run(self) -> None:
         from scripts.build_hold import build_hold

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a hand command with a model, run it in a queue place, and record the attempt.
 
-  hand_made.py --why '<why>' --machine natedev [--machine mac] [--repo <checkout>] -- <argv...>
+  hand_made.py --why '<why>' --machine <natedev|mac|mac-linux> [--machine ...] [--repo <checkout>] -- <argv...>
 
 Four steps: the model check, the place in the line of a named machine, the run, and one
 row in the build log. A no, a check without an answer, or a checked file that changed
@@ -23,14 +23,12 @@ import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
-import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path, PurePath
 import re
-import select
 import subprocess
 import sys
 import time
@@ -42,20 +40,20 @@ from scripts.build_hold.owning_session import owning_session
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
 from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
 from scripts.build_targets import build_targets
+from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, main_folder
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
-from scripts.production import hand_made_mac
+from scripts.production import hand_made_guest, hand_made_mac
 from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineFailed, MachineRun, Output,
-                                                Placed, Program, ProgramPlace, Refused, discard, note)
+                                                Placed, Program, ProgramPlace, Refused, discard, in_checkout, note,
+                                                stream)
 
 DESCRIPTION = "Check a hand command with a model, run it in a queue place, and record the attempt."
 SECTION = "cli.hand_made"
 # The exit status of an attempt with no program status. The record row tells it from a program exit 2.
 REFUSED_EXIT = 2
-# Folders of installed tools. A program found in one of them is a tool, not a program file of the check.
-TOOL_FOLDERS = (Path("/nix/store"), Path("/usr"), Path("/bin"), Path("/sbin"))
 PYTHON = re.compile(r"python[0-9.]*")
 # Short options of env and of uv run that take the next word, or the rest of their cluster, as their value.
 ENV_VALUE_LETTERS = "CSau"
@@ -68,8 +66,6 @@ SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PAT
                              "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
 PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
-# The most output bytes that one read copies.
-CHUNK_BYTES = 65536
 
 SCHEMA = {
     "type": "object",
@@ -169,14 +165,10 @@ def exec_path(name: str, repo: Path) -> Path | None:
     return repo / name if "/" in name else next(iter(path_programs(name)), None)
 
 
-def in_checkout(path: Path, repo: Path) -> bool:
-    return Path(os.path.normpath(path)).is_relative_to(repo)
-
-
 def outside_program(path: Path, any_text: bool) -> bool:
     """A program file outside the checkout that the check reads; the tool folders hold no program file.
 
-    With any_text, each file that is not compiled (first bytes \\x7fELF) is one. Else only a text program
+    With any_text, each file that is not compiled (first bytes COMPILED_START) is one. Else only a text program
     (first bytes #!) is one.
     """
     real = path.resolve()
@@ -184,22 +176,22 @@ def outside_program(path: Path, any_text: bool) -> bool:
         return False
     try:
         with real.open("rb") as handle:
-            start = handle.read(4)
+            start = handle.read(len(COMPILED_START))
     except OSError:
         return False
-    return start != b"\x7fELF" if any_text else start[:2] == b"#!"
+    return start != COMPILED_START if any_text else start[:2] == b"#!"
 
 
 def program_files(argv: Sequence[str], repo: Path) -> tuple[Path, ...]:
     """Each file that the command can run. A wrapper such as timeout or env starts a later word with execvp,
     and an interpreter opens a later word as a path, so each later word gives both files.
 
-    The execvp of a wrapper runs a text file with no #! with /bin/sh, so a later word found on PATH reads
-    each file that is not compiled. The execvp of a wrapper also goes on to a later PATH match when a start
-    fails, for example for a #! line with a missing interpreter, so a later word reads each match. The run
+    The execvp of a wrapper runs a text file with no #! with /bin/sh, and an interpreter reads a file with
+    no #!, so a later word reads each file that is not compiled: from PATH, and from its path outside the
+    checkout. The execvp of a wrapper also goes on to a later PATH match when a start fails, for example
+    for a #! line with a missing interpreter, so a later word reads each match. The run
     starts the first word by its exec_path, with no PATH search and no /bin/sh, so the first word reads only
-    that file and only a #! script. An interpreter reads a later word with a slash as a script, with or
-    without a #! line, so that word reads each file that is not compiled.
+    that file and only a #! script; the model sees a word with a slash in the command.
     """
     found: list[Path] = []
     for index, word in enumerate(argv):
@@ -301,21 +293,6 @@ def sets_variable(argv: Sequence[str]) -> bool:
     return False
 
 
-def main_folder(path: str) -> bool:
-    """Tell if python runs a file of the folder when it gets the folder as its script.
-
-    Python imports __main__ from the folder, so each entry with that name and any suffix counts, for example
-    __main__.py or __main__.pyc. A folder that cannot be listed counts too, because python can still open a
-    file in it by its name.
-    """
-    if not os.path.isdir(path):
-        return False
-    try:
-        return any(name.startswith("__main__") for name in os.listdir(path))
-    except OSError:
-        return True
-
-
 def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[CheckedFile, ...]:
     """Read each program file of the command; max_bytes limits the sum of all files."""
     if runs_module(argv):
@@ -359,8 +336,9 @@ def checked_files(argv: Sequence[str], repo: Path, max_bytes: int) -> tuple[Chec
 def check_prompt(argv: Sequence[str], files: Sequence[CheckedFile], machines: Sequence[str], repo: Path) -> str:
     lines = [f"Repository checkout: {repo}", f"Machines: {', '.join(machines)}",
              f"Command (JSON argv): {json.dumps(list(argv))}"]
+    # Only natedev gives the program these variables; another machine gives its own.
     shown = {name: os.environ[name] for name in sorted(SHOWN_VARIABLES) if name in os.environ}
-    if shown:
+    if shown and LOCAL_MACHINE in machines:
         lines.append("Variables that the program gets and that can change the code it runs (JSON): "
                      + json.dumps(shown))
     if not files:
@@ -459,55 +437,6 @@ class OutputCopy:
             discard(caller)
 
 
-def copy_ready(descriptor: int, output: Output, limit: int) -> bool:
-    """Copy up to limit bytes that are in the pipe now; False at the end of the output."""
-    while limit > 0:
-        try:
-            chunk = os.read(descriptor, min(limit, CHUNK_BYTES))
-        except BlockingIOError:
-            return True
-        if not chunk:
-            return False
-        output.write(chunk)
-        limit -= len(chunk)
-    return True
-
-
-def exit_descriptor(process: subprocess.Popen[bytes]) -> int | None:
-    """A pidfd that is ready when the program exits, or None when the place reaped the program first."""
-    if process.returncode is not None:
-        return None
-    try:
-        return os.pidfd_open(process.pid)
-    except ProcessLookupError:
-        return None
-
-
-def stream(process: subprocess.Popen[bytes], output: Output) -> int:
-    """Copy the output as it comes, and return the status when the program exits.
-
-    A child that keeps the pipe open after the program exits does not hold the run: after the exit,
-    only the bytes that are in the pipe then are copied.
-    """
-    pipe = process.stdout
-    assert pipe is not None
-    descriptor = pipe.fileno()
-    os.set_blocking(descriptor, False)
-    exited = exit_descriptor(process)
-    try:
-        while exited is not None:
-            ready, _, _ = select.select([descriptor, exited], [], [])
-            if exited in ready:
-                break
-            if not copy_ready(descriptor, output, CHUNK_BYTES):
-                return process.wait()
-        _ = copy_ready(descriptor, output, fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ))
-        return process.wait()
-    finally:
-        if exited is not None:
-            os.close(exited)
-
-
 def program_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in PROGRAM_VARIABLES | SHOWN_VARIABLES}
 
@@ -546,11 +475,14 @@ def natedev_route(line: Line, placed: Placed, program: Program) -> Generator[Mac
         line.close(placed, held.status, "")
 
 
-# One entry for each machine. A later phase adds the Mac Linux guest.
-ROUTES: Mapping[str, Machine] = {"natedev": Machine(natedev_route),
-                                 "mac": Machine(hand_made_mac.mac_route, hand_made_mac.mac_refusal)}
-# The command kind of each candidate: a Mac run kind, so the Mac takes the run with no repository step policy.
-COMMAND_KIND = "run"
+# The machine that runs the command with the files that the check read. Another machine runs the
+# command in its own copy of the checkout, and finds the first word in that copy or on its own PATH.
+LOCAL_MACHINE = "natedev"
+# One entry for each machine.
+ROUTES: Mapping[str, Machine] = {
+    LOCAL_MACHINE: Machine(natedev_route),
+    "mac": Machine(hand_made_mac.mac_route, hand_made_mac.mac_refusal),
+    hand_made_guest.MACHINE: Machine(hand_made_guest.guest_route, hand_made_guest.guest_refusal)}
 
 
 @dataclass
@@ -588,8 +520,8 @@ class PlacementLine:
 
 def placement_request(request: Request, local: wire.AdmitRequest) -> wire.PlacementRequest:
     """One placement request with a candidate for each named machine; the first free machine takes the run."""
-    constraints = build_targets.fixed_placement_constraints(request.repo, "", COMMAND_KIND, request.argv,
-        owning_session(), execution_identity.SourceKeyUnavailable("a hand made run names no commit"))
+    constraints = build_targets.fixed_placement_constraints(request.repo, "", build_targets.HAND_MADE_KIND,
+        request.argv, owning_session(), execution_identity.SourceKeyUnavailable("a hand made run names no commit"))
     candidates = tuple(item for item in constraints.candidates if item.destination.target in request.machines)
     missing = [name for name in request.machines if all(item.destination.target != name for item in candidates)]
     if missing:
@@ -721,7 +653,7 @@ def run_attempt(request: Request, fields: record.HandMadeFields, record_id: str,
                         line.close(placed, None, str(failure))
                         raise Refused(f"{machine} failed: {failure}") from failure
                     note(f"{machine} failed: {failure}; the run goes back to the lines of the other machines")
-                    line.give_back(placed, str(failure))
+                    line.give_back(placed, failure.queue_reason)
                     continue
                 try:
                     fields["log"] = record.keep_log(line.folder / "output.log", store.host_name(), started, record_id)
