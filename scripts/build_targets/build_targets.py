@@ -401,6 +401,35 @@ def mac_run_bypasses_repository_policy(target: LocalTarget | SshTarget, kind: st
     return isinstance(target, SshTarget) and target.platform == "macos" and kind in MAC_RUN_KINDS
 
 
+def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...]:
+    """Select the enabled targets that can run a Claude gate."""
+    from scripts.build_queue import placement
+    from scripts.build_targets import target_config
+    from scripts.lib import build_folders
+    from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, parse_command_program
+
+    try:
+        if build_folders.repo_word(repo_root) != "claude":
+            return ()
+    except build_folders.InvalidFolderForm:
+        return ()
+    program = parse_command_program(command)
+    routing = (target_config.LOCAL_CALLER
+               if not isinstance(program, OtherCommand) and gate_natedev_only_flag(program[1])
+               else ANY_ELIGIBLE_TARGET)
+    registry = conf.read("build_targets")
+    names: list[str] = []
+    for target in read_targets(purpose=RegistryRead.PLACEMENT, configuration=registry):
+        if not registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False):
+            continue
+        fixed = fixed_placement_constraints(repo_root, "", "final", command, NoOwningSession(),
+            execution_identity.SourceKeyUnavailable("candidate check"), routing, Pinned(target.name))
+        if any(candidate.destination.target == target.name and isinstance(candidate.eligibility, placement.AllowedHost)
+               for candidate in fixed.candidates):
+            names.append(target.name)
+    return tuple(names)
+
+
 def fixed_placement_constraints(
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
     session: SubmittingSession, source_key: str | execution_identity.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,

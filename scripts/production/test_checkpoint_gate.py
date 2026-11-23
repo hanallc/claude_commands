@@ -19,6 +19,7 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.queue_fixture import write_process
 from scripts.copies import copies
+from scripts.lib import build_folders
 from scripts.lib.build_steps import gate_job_from_process
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate
@@ -69,6 +70,7 @@ class CheckpointGateTests(unittest.TestCase):
     def test_gate_without_targets_starts_directly(self) -> None:
         folder = Path("/fixture")
         with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+              mock.patch.object(build_folders, "repo_word", return_value="hana"),
               mock.patch.object(subprocess, "run",
                   return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
             _ = checkpoint_gate.run_test_command(list(GATE), folder)

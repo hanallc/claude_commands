@@ -119,7 +119,7 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
     submitted = command
-    targets = gate_targets(command)
+    targets = gate_targets(command, folder)
     if targets:
         scripts = Path(__file__).resolve().parents[1]
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",

@@ -256,12 +256,16 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
-def gate_targets(command: Sequence[str], requested: str = "") -> tuple[str, ...]:
-    """Read the targets for a gate from the caller."""
+def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
+    """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
-    return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    if names:
+        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+    eligible = cast(Callable[[Path, tuple[str, ...]], tuple[str, ...]],
+        getattr(import_module('scripts.build_targets.build_targets'), 'eligible_gate_targets'))
+    return eligible(source, tuple(command))
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],

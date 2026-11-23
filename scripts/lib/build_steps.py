@@ -141,6 +141,17 @@ def _count(arguments: Sequence[str], name: str) -> int:
     return sum(1 for argument in arguments if argument == name or argument.startswith(name + "="))
 
 
+def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
+    """Return the gate option that requires natedev."""
+    if _count(arguments, "--module"):
+        return "--module"
+    if "--nightly" in arguments:
+        return "--nightly"
+    if "--promote-only" in arguments:
+        return "--promote-only"
+    return None
+
+
 # A program that runs the script named after its options.
 INTERPRETER = re.compile(r"python[0-9.]*|py|bash|sh")
 # Interpreter options that take the next argument, or the rest of their cluster, as their value.

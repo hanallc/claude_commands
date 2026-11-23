@@ -82,7 +82,8 @@ from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-                                     gate_job_for_command, gate_job_from_process, read_step_names)
+                                     gate_job_for_command, gate_job_from_process, gate_natedev_only_flag,
+                                     read_step_names)
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -3144,7 +3145,7 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_start_target(args: GateArguments) -> GateTarget:
+def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
@@ -3153,7 +3154,7 @@ def gate_start_target(args: GateArguments) -> GateTarget:
     """
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
-    flag = natedev_only_flag(args)
+    flag = gate_natedev_only_flag(arguments)
     if flag is not None and not isinstance(placed, NoGateAssignment) and target != "natedev":
         raise GateAssignmentRefused(
             f"gate.py {flag} runs only on natedev and cannot take the {placed.assignment.destination.target} assignment")
@@ -3165,17 +3166,6 @@ def gate_start_target(args: GateArguments) -> GateTarget:
         if isinstance(ended, admission_wire.Refused):
             raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {ended.reason}")
     return target
-
-
-def natedev_only_flag(args: GateArguments) -> str | None:
-    """Return the flag of a mode that cannot route the gate, or None when the mode can route it."""
-    if args.modules:
-        return "--module"
-    if args.nightly:
-        return "--nightly"
-    if args.promote_only:
-        return "--promote-only"
-    return None
 
 
 def placement_target(
@@ -3613,7 +3603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        target = gate_start_target(args)
+        target = gate_start_target(args, arguments)
     except GateRefused as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

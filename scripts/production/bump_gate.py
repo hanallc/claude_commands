@@ -47,8 +47,8 @@ def run_gate(path: Path) -> int:
             steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
                                tuple(tuple(command) for command in record["merge_tests"]))
             command = steps[0].command if steps else []
-            # The checkpoint caller places each named gate under its own process.
-            if gate_targets(command):
+            # The checkpoint caller places each gate that has targets.
+            if gate_targets(command, source):
                 command = []
             with copies.command_tree(record["owner_id"], source, copies.CommittedSource("HEAD"),
                                      command, step="integrate") as clone:
