@@ -16,7 +16,7 @@ from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.production import investigation, staff
-from scripts.review_links import change_page, review_page, test_review_page
+from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
 
 RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "showrunner", "show", staff.StaffRoot(),
                         current_session=staff.StaffId("2b7d4419-b8d4-4c43-b9b2-48bed9337f27"))
@@ -34,9 +34,11 @@ class InvestigationTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))
+        _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(staff_file), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "REVIEW_LINKS_ROOT": str(self.root / 'reviews'),
+            "XDG_STATE_HOME": str(self.root / "key-state"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": OWNER.current_session})))
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -211,6 +213,25 @@ class InvestigationTests(unittest.TestCase):
             self.assertIsInstance(case.status.slots(delivery.page, delivery.row).question, change_page.AnsweredQuestion)
         finally:
             case.doCleanups()
+
+    def test_answering_a_sent_investigation_uses_only_the_note_hash(self) -> None:
+        kind = new_item_dialog.SubmissionKind.INVESTIGATION
+        request = f"r1-{'0' * 32}-{kind}-{OWNER.id}"
+        proof = reply_tokens.mint()
+        token = reply_tokens.derive(proof)
+        details = new_item_dialog.ReviewSubmission(request, "b" * 64, new_item_dialog.NoEvidence(), (),
+                                                   proof.sha256, reply_token_nonce=proof.nonce)
+        report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
+                                    waiting_why="The owner answers.", submission=details)
+        path = investigation.folder(OWNER.id) / f"{report.id}.md"
+        key = new_item_dialog.submission_key(kind, OWNER.id, report.id, request)
+        note = path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(proof.nonce, note)
+        reply_tokens.path().unlink()
+        self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
+                                                        "The first check failed.", token, owner=OWNER.id))
+        self.assertFalse(reply_tokens.path().exists())
 
     def test_all_owners_number_records_under_one_lock(self) -> None:
         def file_one(number: int) -> str:
