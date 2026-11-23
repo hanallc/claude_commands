@@ -3699,6 +3699,28 @@ process.stdout.write(JSON.stringify({
                  "region": "us-east-1", "zone": None, "machine": "m7a.8xlarge", "mode": "Spot"}
             ])
 
+    def test_aws_cost_feed_names_the_user_zone_and_the_failed_read(self) -> None:
+        book = write_aws_cost_fixture(self.root)
+        read_at = int(datetime(2026, 1, 2, tzinfo=UTC).timestamp())
+
+        def refused(at: int, code: str, operation: str) -> dict[str, object]:
+            return {"time": at, "attempt": f"refused-{at}", "result": "fallback", "error_code": code,
+                    "reason": f"aws: [ERROR]: An error occurred ({code}) when calling the {operation} "
+                              + "operation: The security token included in the request is invalid."}
+
+        with book.launch_history_path.open("a") as history:
+            for row in (refused(read_at - 60, "Throttling", "GetCostAndUsage"),
+                        refused(read_at + 60, "UnrecognizedClientException", "GetCostAndUsage"),
+                        refused(read_at + 120, "Blocked", "RunInstances")):
+                _ = history.write(json.dumps(row) + "\n")
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}):
+            actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+        self.assertEqual((actual["zone"], actual["read_at"], actual["read_error"]),
+                         ("America/Los_Angeles", read_at, "AWS refuses the key"))
+        self.assertEqual(aws_costs.read_error([refused(read_at + 60, "Throttling", "GetCostAndUsage")], read_at),
+                         "AWS refuses the read (Throttling)")
+        self.assertIsNone(aws_costs.read_error([refused(read_at - 60, "Throttling", "GetCostAndUsage")], read_at))
+
     def test_aws_cost_feed_keeps_bill_days_in_utc(self) -> None:
         instant = int(datetime(2026, 2, 1, 2, tzinfo=UTC).timestamp())
         _ = write_aws_cost_fixture(self.root, instant=instant)

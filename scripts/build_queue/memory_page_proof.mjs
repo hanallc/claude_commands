@@ -503,6 +503,9 @@ try {
               .find(button => button.textContent.trim() === 'Hana check and lint');
             const hanaCells = hana.closest('tr').cells;
             const groupTime = hanaCells[2].textContent;
+            const hanaRuns = day.runs_list.filter(run => run.kind === 'hana');
+            const expectedGroupTime = hanaRuns.length
+              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : 'no record';
             const perRun = hanaCells[4].textContent;
             const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
             hana.click();
@@ -513,7 +516,7 @@ try {
             const ids = awsCostReport.days.flatMap(day => day.runs_list.map(run => run.id));
             pane.scrollIntoView({block:'start'});
             return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
-              groupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[7].textContent),
+              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[7].textContent),
               idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
               csvHeader:csv[0], csvRows:csv.length - 2,
               recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
@@ -522,7 +525,7 @@ try {
           const reconciled = Object.values(result.totals).every(({sum, displayed}) =>
             sum === result.dayCents && displayed === result.dayCents);
           if (!reconciled || !result.fits || result.runs !== result.expectedRuns || result.idleRows !== result.expectedIdleRows ||
-              result.groupTime !== 'no record' || result.idleTimes.some(time => time !== 'no record') ||
+              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== 'no record') ||
               !result.hasRunIds || result.csvRows !== result.recordedRuns) {
             throw new Error('The live Day image or CSV is incomplete. ' + JSON.stringify(result));
           }
@@ -579,6 +582,7 @@ try {
         assert.ok(summary.fits, 'The AWS history scrolls inside the pane.');
         assert.match(summary.body, /AWS amounts read Wed Nov 18, 1:43 PM EST/);
         assert.match(summary.body, /Thu Nov 19 · started Wed 7:00 PM EST · ends Thu 7:00 PM EST/);
+        assert.match(summary.body, /In Eastern time, a day starts at 7:00 PM on the day before and ends at 7:00 PM\./);
         assert.match(summary.body, /The next AWS read is due Thu Nov 19, 12:43 PM EST/);
         assert.match(summary.body, /Group by.*Download CSV.*Hana check and lint.*Costs with no run.*Total 193/);
         assert.match(summary.body, /Kept resources now cost \$28.20 each month/);
@@ -665,9 +669,9 @@ try {
         assert.deepEqual([result.count,result.missing,result.runCount,result.rawRows], [18,'no record',84,196]);
         assert.deepEqual(result.zero, ['$0.00','Billed, not final']);
         assert.deepEqual(result.runFields, ['integrate','report','us-east-1','us-east-1a','c7i.8xlarge','Spot','9 min 34 s','~$0.02']);
-        assert.equal(result.hanaTime, 'no record');
+        assert.equal(result.hanaTime, '21 s');
         assert.equal(result.hanaPerRun, '—');
-        assert.equal(result.totalTime, '29 h 39 min 24 s');
+        assert.equal(result.totalTime, '29 h 39 min 45 s');
         assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','no record']);
         assert.deepEqual(result.idleTimes, ['no record','no record','no record']);
         assert.deepEqual(result.regions, ['us-east-1','us-west-2']);

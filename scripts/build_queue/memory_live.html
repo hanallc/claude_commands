@@ -741,18 +741,31 @@ const AWS_STATES = {
 const AWS_DAY_NAME = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", weekday:"short", month:"short", day:"numeric"});
 const AWS_SHORT_DAY = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"short", day:"numeric"});
 const AWS_MONTH = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"long"});
-const AWS_EASTERN = new Intl.DateTimeFormat("en-US", {timeZone:"America/New_York", weekday:"short",
-  month:"short", day:"numeric", hour:"numeric", minute:"2-digit", timeZoneName:"short"});
+// The user zone from the feed. renderAwsCosts sets it before the pane shows a time.
+let awsZone = "UTC";
+const awsZoneFormats = new Map();
+function awsZoneParts(date, locale, options) {
+  const key = `${awsZone} ${locale} ${JSON.stringify(options)}`;
+  if (!awsZoneFormats.has(key)) awsZoneFormats.set(key, new Intl.DateTimeFormat(locale, {...options, timeZone:awsZone}));
+  return Object.fromEntries(awsZoneFormats.get(key).formatToParts(date).map(({type,value}) => [type,value]));
+}
+const AWS_LOCAL = {weekday:"short", month:"short", day:"numeric", hour:"numeric", minute:"2-digit", timeZoneName:"short"};
 const awsDate = day => new Date(day + "T00:00:00Z");
 const awsIso = time => time.toISOString().slice(0,10);
 const awsDayName = date => AWS_DAY_NAME.format(date).replace(",", "");
-const awsEastern = date => {
-  const parts = Object.fromEntries(AWS_EASTERN.formatToParts(date).map(({type,value}) => [type,value]));
+const awsLocal = date => {
+  const parts = awsZoneParts(date, "en-US", AWS_LOCAL);
   return {day:parts.weekday, clock:`${parts.hour}:${parts.minute} ${parts.dayPeriod}`, zone:parts.timeZoneName,
-    date:`${parts.weekday} ${parts.month} ${parts.day}`};
+    date:`${parts.weekday} ${parts.month} ${parts.day}`, shortDate:`${parts.month} ${parts.day}`,
+    dayNumber:Number(parts.day)};
 };
+// The zone as a word: "Pacific" for America/Los_Angeles. A zone with no such name keeps its IANA name.
+function awsZoneName() {
+  const name = awsZoneParts(new Date(), "en-US", {timeZoneName:"longGeneric"}).timeZoneName ?? "";
+  return name.endsWith(" Time") ? name.slice(0, -5) : awsZone;
+}
 function awsDateTime(date) {
-  const time = awsEastern(date);
+  const time = awsLocal(date);
   return `${time.date}, ${time.clock} ${time.zone}`;
 }
 const awsCents = amount => Math.round(Number(amount) * 100);
@@ -850,16 +863,32 @@ function awsTile(label, amount, note, state, limit) {
     ${limit ? `<span class="aws-meter" aria-hidden="true"><i style="width:${awsPercent(limit.used, limit.cents)}%"></i></span>` : ""}
     <div class="aws-total-note">${note}</div></div>`;
 }
+// The UTC bill day in the user zone. West of UTC it starts on the day before; east of UTC it ends on the next day.
+function awsDayRule(today) {
+  const start = awsDate(today), first = awsLocal(start), last = awsLocal(awsPeriodEnd("day", start));
+  const zoneChange = first.zone !== last.zone;
+  const [from, to] = [first, last].map(time => time.clock + (zoneChange ? " " + time.zone : ""));
+  const before = first.dayNumber !== start.getUTCDate();
+  return `In ${awsZoneName()} time, a day starts at <b>${from}${before ? " on the day before" : ""}</b> and ends at
+    ${to}${before ? "" : " on the next day"}.`;
+}
+// When the next read time is past, the read failed: name the last read day and the recorded AWS error.
+function awsNextRead(costs) {
+  if (costs.next_read_at * 1000 > Date.now()) {
+    return `The next AWS read is due ${awsDateTime(new Date(costs.next_read_at * 1000))}`;
+  }
+  const since = costs.read_at == null ? "" : ` since ${awsLocal(new Date(costs.read_at * 1000)).shortDate}`;
+  return `No AWS read${since}${costs.read_error ? ": " + esc(costs.read_error) : ""}`;
+}
 function awsCostTiles(costs, monthTotal, tips) {
   const start = awsDate(costs.today), end = awsPeriodEnd("day", start);
   const yesterday = new Date(+start - AWS_DAY_MS);
   const current = costs.days.find(day => day.day === costs.today);
   const previous = costs.days.find(day => day.day === awsIso(yesterday));
   const month = awsPeriodStart("month", costs.today);
-  const [first, last, before] = [start, end, yesterday].map(awsEastern);
+  const [first, last, before] = [start, end, yesterday].map(awsLocal);
   const change = before.zone === first.zone ? "" : " " + before.zone;
-  const nextRead = costs.next_read_at != null && previous?.state === "estimate"
-    ? ` · The next AWS read is due ${awsDateTime(new Date(costs.next_read_at * 1000))}` : "";
+  const nextRead = costs.next_read_at != null && previous?.state === "estimate" ? " · " + awsNextRead(costs) : "";
   const tileAmount = row => awsMoney(row?.amount_usd == null ? null : awsCents(row.amount_usd), row?.state === "estimate");
   const limit = (id, title, amount, used, reset) => {
     const cents = awsCents(amount);
@@ -880,9 +909,10 @@ function awsCostTiles(costs, monthTotal, tips) {
 }
 
 const AWS_RUN_GROUPS = {job:"Job", unit:"Unit", region:"Region", machine:"Machine", none:"None"};
-const AWS_RUN_HEADERS = ["Start (Eastern)", "Job", "Unit", "Region", "Zone", "Machine type", "Mode", "Time on AWS", "Cost"];
-const AWS_CSV_TIME = new Intl.DateTimeFormat("en-CA", {timeZone:"America/New_York", timeZoneName:"longOffset",
-  year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"});
+const awsRunHeaders = () =>
+  [`Start (${awsZoneName()})`, "Job", "Unit", "Region", "Zone", "Machine type", "Mode", "Time on AWS", "Cost"];
+const AWS_CSV_TIME = {timeZoneName:"longOffset", year:"numeric", month:"2-digit", day:"2-digit",
+  hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"};
 const AWS_HANA_LABEL = "Hana check and lint";
 const AWS_HANA_IDLE = "Hana machine with no run";
 const AWS_HANA_GROUP = JSON.stringify(["hana"]);
@@ -915,7 +945,7 @@ function awsRunTable(runs, estimated, extraRows = []) {
       awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
   });
   return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
-    ${awsTable(AWS_RUN_HEADERS, [...rows, ...extraRows], [7,8])}</div>`;
+    ${awsTable(awsRunHeaders(), [...rows, ...extraRows], [7,8])}</div>`;
 }
 
 function awsRunGroups(runs, groupBy, hanaIdle) {
@@ -966,7 +996,7 @@ function awsDayRuns(day, view) {
       aria-hidden="true"></span>${esc(group.name)}</button>`;
     const note = group.unitUnknown ?
       '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
-    const time = group.key === AWS_HANA_GROUP ? "no record" : count ? awsRunTime(group.seconds) : "—";
+    const time = count ? awsRunTime(group.seconds) : group.key === AWS_HANA_GROUP ? "no record" : "—";
     const idleRows = group.idle ? [runCharge(idleCharge)] : [];
     return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows) : "",
       values:[name + note, count ? awsCount(count) : "—", time,
@@ -974,10 +1004,9 @@ function awsDayRuns(day, view) {
         count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
   });
   rows.push(...charges.map(({name, cents, time}) => ({values:[name, "—", time, awsMoney(cents, estimated), "—"]})));
-  const timedRuns = day.runs_list.filter(run => run.kind !== "hana");
-  const seconds = timedRuns.reduce((total, run) => total + run.seconds, 0);
+  const seconds = day.runs_list.reduce((total, run) => total + run.seconds, 0);
   rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
-    timedRuns.length ? awsRunTime(seconds) : day.runs ? "no record" : "—", amount(day.amount_usd), ""]});
+    day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
   return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
     ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
 }
@@ -999,10 +1028,10 @@ function awsDayDetail(day, priceDay, view = awsNewRunView()) {
 function awsRunsCsv(days) {
   const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const start = seconds => {
-    const time = Object.fromEntries(AWS_CSV_TIME.formatToParts(new Date(seconds * 1000)).map(({type,value}) => [type,value]));
+    const time = awsZoneParts(new Date(seconds * 1000), "en-CA", AWS_CSV_TIME);
     return `${time.year}-${time.month}-${time.day}T${time.hour}:${time.minute}:${time.second}${time.timeZoneName.slice(3)}`;
   };
-  const header = ["UTC day", ...AWS_RUN_HEADERS.slice(0,6), "Time on AWS (seconds)", "Cost (USD)", "Mode"].map(quote).join(",");
+  const header = ["UTC day", ...awsRunHeaders().slice(0,6), "Time on AWS (seconds)", "Cost (USD)", "Mode"].map(quote).join(",");
   const runs = new Map();
   for (const {day, runs_list} of days) {
     for (const run of runs_list) {
@@ -1877,7 +1906,7 @@ function awsHistoryRow(row, depth, costs, largest, openPeriods, tips) {
   return `<tr data-period="${row.id}">
     <td class="aws-period" style="padding-left:${indent}px"><button type="button" class="aws-toggle" aria-expanded="${open}"
       data-tip="aws-cost:${row.id}"><span class="aws-chev" aria-hidden="true"></span><span class="aws-point">${name}</span></button>${note ? `<small class="aws-dim">${note}</small>` : ""}</td>
-    <td class="num${row.runs ? "" : " aws-dim"}">${row.runs ? awsCount(row.runs) : "no record"}</td>
+    <td class="num${row.runs ? "" : " aws-dim"}">${row.cents == null ? "no record" : awsCount(row.runs)}</td>
     <td class="num"><strong>${awsAmount(row)}</strong></td>
     <td class="aws-bar-cell"><span class="aws-bar" aria-hidden="true">${segments}</span></td>
     <td class="aws-states">${states}</td></tr>${children}`;
@@ -1907,15 +1936,13 @@ function renderAwsCosts(costs) {
     content.textContent = "no record";
     return;
   }
+  awsZone = costs.zone;
   read.textContent = costs.read_at == null ? "AWS amounts not read yet" :
     `AWS amounts read ${awsDateTime(new Date(costs.read_at * 1000))}`;
   const groups = Object.fromEntries(Object.keys(AWS_PERIODS).map(period => [period, awsPeriods(period, costs.days)]));
   const largest = Object.fromEntries(Object.entries(groups).map(([period, rows]) =>
     [period, rows.reduce((max, row) => Math.max(max, row.cents ?? 0), 0)]));
   awsCostGroups = {groups, largest};
-  const start = awsDate(costs.today), end = awsPeriodEnd("day", start);
-  const first = awsEastern(start), last = awsEastern(end);
-  const zoneChange = first.zone !== last.zone;
   const month = groups.month.find(row => row.id === "month-" + costs.today.slice(0,7) + "-01") ?? awsSum([]);
   const key = Object.entries(AWS_STATES).reverse().map(([state, [,meaning]]) =>
     `<span class="aws-key-item">${awsState(state)}<span>${meaning}</span></span>`).join("");
@@ -1928,8 +1955,7 @@ function renderAwsCosts(costs) {
     ": " + costs.kept.items.map(item => `${esc(item.name)} ${awsMoney(awsCents(item.month_usd))}`).join(", ") : ""}.
     These costs continue when no run is active.</p>` : "";
   content.innerHTML = `<p class="aws-note aws-rule">Each day on this pane is <b>one AWS bill day</b>. AWS counts days in <b>UTC</b>.
-    In Eastern time, a day starts at <b>${first.clock}${zoneChange ? " " + first.zone : ""} on the evening before</b> and ends at
-    ${last.clock}${zoneChange ? " " + last.zone : ""}. Weeks, months and the year are sums of these days.</p>
+    ${awsDayRule(costs.today)} Weeks, months and the year are sums of these days.</p>
     ${awsCostTiles(costs, month, awsLimitTips)}
     <div class="aws-history"><div class="aws-history-head"><h3>History</h3>
       <div class="filter" role="group" aria-label="Period of each row">${controls}</div></div>

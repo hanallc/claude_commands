@@ -12,10 +12,12 @@ from typing import Literal, TypedDict
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, ledger, run_cost
+from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.snapshot_codec import parse_snapshot_value
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.lib.user_zone import user_zone_name
 from scripts.lib.build_steps import RAW_ID, read_step_names
 from scripts.production import unit_names
 
@@ -84,8 +86,10 @@ class KeptCosts(TypedDict):
 
 
 class AwsCosts(TypedDict):
+    zone: str
     read_at: int | None
     next_read_at: int | None
+    read_error: str | None
     price_day: str | None
     records_start: str | None
     today: str
@@ -102,10 +106,14 @@ BILL_ZONE = ZoneInfo("UTC")
 CENT = Decimal("0.01")
 REGIONAL_ZONE = re.compile(r"([a-z]{2}(?:-[a-z0-9]+)+-[0-9]+)[a-z]")
 CARRIED_BILL_COSTS = "newest bill non-compute"
+COST_READ = "GetCostAndUsage"
+KEY_REFUSALS = frozenset({"UnrecognizedClientException", "InvalidClientTokenId", "InvalidAccessKeyId",
+                          "ExpiredToken", "ExpiredTokenException", "SignatureDoesNotMatch"})
 
 
 def empty_costs(instant: int) -> AwsCosts:
-    return {"read_at": None, "next_read_at": None, "price_day": None, "records_start": None, "today": bill_day(instant),
+    return {"zone": user_zone_name(), "read_at": None, "next_read_at": None, "read_error": None, "price_day": None,
+            "records_start": None, "today": bill_day(instant),
             "limits": {"day_usd": "0.00", "month_usd": "0.00", "reserve_usd": "0.00"}, "days": [], "kept": None}
 
 
@@ -115,6 +123,25 @@ def bill_day(instant: int) -> str:
 
 def usd(amount: Decimal) -> str:
     return f"{amount.quantize(CENT) + Decimal(0):.2f}"
+
+
+def read_error(rows: Sequence[dict[str, object]], since: int) -> str | None:
+    """Name why the newest AWS cost read after `since` failed.
+
+    A run that starts reads the AWS costs first. When that read fails, the launch history keeps the AWS error.
+    """
+    newest_at, code = since, ""
+    for row in rows:
+        try:
+            at = float(str(row["time"]))
+        except SPEND_READ_ERRORS:
+            continue
+        refused = aws_error_code(AwsUnavailable(str(row.get("reason", ""))), operation=COST_READ)
+        if refused and at > newest_at:
+            newest_at, code = at, refused
+    if not code:
+        return None
+    return "AWS refuses the key" if code in KEY_REFUSALS else f"AWS refuses the read ({code})"
 
 
 def recorded_unit(value: object) -> str:
@@ -499,6 +526,7 @@ def read_saved_costs(instant: int) -> AwsCosts:
     result["read_at"] = state.charge_refresh_at or None
     if state.charge_refresh_at and settings is not None:
         result["next_read_at"] = state.charge_refresh_at + settings.cost_explorer_interval_seconds
+    result["read_error"] = read_error(launches, state.charge_refresh_at)
     result["kept"] = fixed_costs(state, instant)
     try:
         names = job_names()

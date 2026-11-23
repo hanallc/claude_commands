@@ -108,8 +108,8 @@ def aws_cost_fixture() -> dict[str, object]:
                 work_cost if count else 103)}] if count or number == 7 else [],
             "unrecorded_compute_usd": money(unrecorded_compute), "no_run_usd": money(no_run), "runs_list": runs,
         })
-    return {"read_at": int(datetime(2026, 11, 18, 18, 43, tzinfo=UTC).timestamp()),
-            "next_read_at": int(datetime(2026, 11, 19, 17, 43, tzinfo=UTC).timestamp()),
+    return {"zone": "America/New_York", "read_at": int(datetime(2026, 11, 18, 18, 43, tzinfo=UTC).timestamp()),
+            "next_read_at": int(datetime(2026, 11, 19, 17, 43, tzinfo=UTC).timestamp()), "read_error": None,
             "price_day": "2026-11-17", "records_start": "2026-11-02", "today": "2026-11-19",
             "limits": {"day_usd": "35.00", "month_usd": "400.00", "reserve_usd": "3.00"},
             "days": days, "kept": {"month_usd": "28.20", "items": [
@@ -1716,10 +1716,10 @@ process.stdout.write(JSON.stringify(steps));
                       "us-east-1", "c7i.8xlarge", "Spot", "9 min 34 s", "newest AWS amount (Nov 17)", "~$5.25", "~$1.27"):
             self.assertIn(words, estimate)
         self.assertIn("<td class=\"num\">~$1.52</td><td class=\"num\">~$0.018</td>", estimate)
-        self.assertIn('<td class="num">no record</td><td class="num">~$0.78</td><td class="num">—</td>',
-                      estimate)
+        self.assertIn('Hana check and lint</button></td><td class="num">7</td><td class="num">21 s</td>'
+                      + '<td class="num">~$0.78</td><td class="num">—</td>', estimate)
         self.assertRegex(estimate, r'Hana machine with no run</td>.*<td class="num">no record</td>.*~\$0\.30</td>')
-        self.assertRegex(estimate, r'Total</td><td class="num">193</td><td class="num">29 h 39 min 24 s</td>')
+        self.assertRegex(estimate, r'Total</td><td class="num">193</td><td class="num">29 h 39 min 45 s</td>')
         self.assertIn('Unit not recorded</button><span class="aws-dim aws-hint">Run records before this release have no unit.',
                       units)
         self.assertRegex(units, r'Hana machine with no run</td>.*<td class="num">no record</td>.*~\$0\.30</td>')
@@ -1736,6 +1736,46 @@ process.stdout.write(JSON.stringify(steps));
         self.assertIn("no record", older)
         for detail in (estimate, billed, older):
             self.assertNotRegex(detail, r"(?i)\bgate\b|targeted test")
+
+    def test_aws_cost_times_use_the_user_zone(self) -> None:
+        for zone, rule, start, header in (
+            ("America/Los_Angeles", "In Pacific time, a day starts at <b>4:00 PM on the day before</b> and ends at 4:00 PM.",
+             "Sun Nov 22, 4:00 PM PST", "Start (Pacific)"),
+            ("America/New_York", "In Eastern time, a day starts at <b>7:00 PM on the day before</b> and ends at 7:00 PM.",
+             "Sun Nov 22, 7:00 PM EST", "Start (Eastern)"),
+            ("Europe/Berlin", "In Central European time, a day starts at <b>1:00 AM</b> and ends at 1:00 AM on the next day.",
+             "Mon Nov 23, 1:00 AM GMT+1", "Start (Central European)"),
+        ):
+            with self.subTest(zone=zone):
+                actual = cast(list[str], self.page_expression(
+                    "[awsDayRule('2026-11-23'), awsDateTime(awsDate('2026-11-23')), awsRunHeaders()[0]]",
+                    {"zone": zone}))
+                self.assertEqual([" ".join(actual[0].split()), *actual[1:]], [rule, start, header])
+
+    def test_aws_cost_tile_names_a_late_read_and_its_recorded_error(self) -> None:
+        read_at = int(datetime(2026, 11, 19, 21, 43, tzinfo=UTC).timestamp())
+        due_at = read_at + 86400
+        cases = (
+            (due_at - 60, None, "The next AWS read is due Fri Nov 20, 1:43 PM PST"),
+            (due_at + 60, None, "No AWS read since Nov 19"),
+            (due_at + 60, "AWS refuses the key", "No AWS read since Nov 19: AWS refuses the key"),
+        )
+        for now, error, expected in cases:
+            with self.subTest(expected=expected):
+                actual = self.page_expression(f"(Date.now = () => {now * 1000}, awsNextRead(data))", {
+                    "zone": "America/Los_Angeles", "read_at": read_at, "next_read_at": due_at, "read_error": error},
+                    walk=True)
+                self.assertEqual(actual, expected)
+
+    def test_aws_cost_history_shows_zero_runs_as_a_count(self) -> None:
+        days: list[dict[str, object]] = [{"day": "2026-11-21", "state": "estimate", "amount_usd": "1.21", "runs": 0, "runs_list": []},
+                {"day": "2026-11-20", "state": "none", "amount_usd": None, "runs": 0, "runs_list": []}]
+        cells = cast(list[str], self.page_expression(
+            "awsPeriods('day', data.days).map(row => awsHistoryRow(row, 0, data, {day:121}, new Map(), new Map())"
+            + ".match(/<td class=\"num[^\"]*\">([^<]*)<\\/td>/)[1])",
+            {"zone": "America/New_York", "today": "2026-11-21", "records_start": "2026-11-20", "price_day": None,
+             "days": days}, history=True))
+        self.assertEqual(cells, ["0", "no record"])
 
     def test_aws_cost_csv_joins_run_parts_across_bill_days(self) -> None:
         csv_text = cast(str, self.page_expression("awsRunsCsv(data.days)", aws_cost_fixture(), walk=True))
@@ -1777,9 +1817,12 @@ process.stdout.write(JSON.stringify(steps));
                         [["Dec 28 to Dec 31", "$0.10", 3], ["Dec 21 to Dec 27", "$0.20", 1]]],
         })
 
-    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
+    def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
+                        history: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
+        if history:
+            functions += html[html.index("function awsCurrentNote("):html.index("function renderAwsCosts(")]
         constants = ""
         if walk:
             start = html.index("function rowAdd(")
@@ -1804,6 +1847,7 @@ function fitLabels() {}
             functions += html[start:html.index('document.addEventListener("click", (e) => {', start)]
             constants += "function placeLimitLabels() {}\nconst document = {querySelectorAll: () => []};\n"
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
+            "if (data.zone) awsZone = data.zone;\n") + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         payload: dict[str, object] = {"walk": [], "waiters": [], "swap_by": [], "ram": RAM_FIXTURE,
