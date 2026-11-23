@@ -644,10 +644,11 @@ with socket.socket(socket.AF_UNIX) as sock:
             wrapper = """import os, runpy, sys
 from pathlib import Path
 from scripts.lib import conf_reads, unit_runs
+from scripts.production import stall_watch
 unit_runs.RUN_ROOT = Path(sys.argv[1])
 unit_runs.FORMER_RUN_ROOT = Path(sys.argv[2])
 script = Path(sys.argv[3]).resolve()
-defaults = (script.parents[2] / 'config/stall_watch.conf').resolve()
+defaults = stall_watch.WATCH_DEFAULTS.resolve()
 read_text = conf_reads.read_text
 conf_reads.read_text = lambda path: read_text(
     os.environ['STALL_TEST_WATCH_DEFAULTS'] if Path(path).resolve() == defaults else path

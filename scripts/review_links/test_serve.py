@@ -4407,7 +4407,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             (question, 'answer'), (investigation_key, 'read'), (question, 'later')))
 
         _, efficiency = case.decisions()
-        config = Path(__file__).resolve().parents[2]/'config/nightly_review.conf'
+        config = conf.test_config_path("nightly_review")
         _ = shutil.copyfile(config, case.fixture.temporary/'config/nightly_review.conf')
         self.assert_stale_review_actions(case, ((efficiency, 'approve'), (efficiency, 'decline')))
 
@@ -7035,7 +7035,7 @@ class ServerStartupTests(unittest.TestCase):
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
         configuration = temporary / "config"
-        _ = shutil.copytree(checkout / "config", configuration)
+        _ = conf.copy_for_test(checkout / "config", configuration)
         _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")

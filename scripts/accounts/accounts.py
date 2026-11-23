@@ -6567,7 +6567,9 @@ class SessionModelReader:
             return registry_rows.parse_registry(models_registry.registry_text())
         except (OSError, ValueError):
             try:
-                return registry_rows.parse_registry((REPOSITORY_ROOT / models_registry.REGISTRY_PATH).read_text())
+                fallback = (conf.test_config_path("models") if "CONF_DIR" in os.environ
+                            else REPOSITORY_ROOT / models_registry.REGISTRY_PATH)
+                return registry_rows.parse_registry(fallback.read_text())
             except (OSError, ValueError):
                 return {}
 

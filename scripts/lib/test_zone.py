@@ -193,7 +193,6 @@ class SetTests(unittest.TestCase):
                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
                 mock.patch.object(main_publish, "ssh", side_effect=send), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(zone.set_zone("Curacao"), 0)
         self.assertIn("mac: a newer Save is already live", output.getvalue())
@@ -281,7 +280,6 @@ class SetTests(unittest.TestCase):
         conf = self.checkout / "config/user_zone.conf"
         head = self.git(self.checkout, "rev-parse", "HEAD")
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", conf), \
                 mock.patch.object(live_settings, "publish", side_effect=RuntimeError("stopped before commit")), \
                 self.assertRaises(RuntimeError):
             _ = zone.set_zone("Curacao")
@@ -346,7 +344,6 @@ class SetTests(unittest.TestCase):
             return original_run(command, **options)
 
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
                 mock.patch.object(subprocess, "run", side_effect=run):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)

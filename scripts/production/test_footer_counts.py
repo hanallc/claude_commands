@@ -14,6 +14,7 @@ from typing import cast, final, override
 from unittest import mock
 
 
+from scripts.lib import conf
 from scripts.production import change_review
 from scripts.production import footer_counts
 from scripts.production import next_item
@@ -413,7 +414,7 @@ class FooterCountsTests(unittest.TestCase):
 
         config = self.root / "config"
         config.mkdir()
-        source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        source = conf.test_config_path("change_review")
         _ = (config / "change_review.conf").write_text(source.read_text())
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))

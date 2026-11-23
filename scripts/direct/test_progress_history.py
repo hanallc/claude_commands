@@ -351,12 +351,11 @@ from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
 from scripts.direct import pass_record as pass_recorder
-from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
           pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+          {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
 plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
@@ -396,7 +395,7 @@ for number in (1, 2):
     assert pass_recorder.config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+                {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
 '''

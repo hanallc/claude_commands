@@ -22,14 +22,16 @@ from scripts.lib import process_group
 
 from scripts.build_hold import override_guard
 from scripts.copies import copies
-from scripts.lib import cargo_output, conf_reads, scratch
+from scripts.lib import cargo_output, conf, conf_reads, scratch
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
 HOLD_DIR = Path.home() / ".local/state/build-hold"
-LINT_CONFIG = Path(__file__).resolve().parents[2] / "config/lint.conf"
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+LINT_CONFIG = (conf.test_config_path("lint") if "CONF_DIR" in os.environ
+               else Path(__file__).resolve().parents[2] / "config/lint.conf")
 TRIAL_HEADROOM_GIB = 50
 GIB = 2**30
 

@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -18,7 +19,7 @@ class ConfigFixtureTests(unittest.TestCase):
             _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
             _ = write_config_fixture(path, "MAX_REOPENS=19\n")
             text = path.read_text()
-        committed = Path(__file__).resolve().parents[2] / "config" / "direct.conf"
+        committed = conf.test_config_path("direct")
         expected = dict(line.split("=", 1) for line in committed.read_text().splitlines()
                         if "=" in line and not line.startswith("#"))
         expected.update(MAX_FIX_ATTEMPTS="17", MAX_REOPENS="19", fixture_only="kept")

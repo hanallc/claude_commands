@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.backup import state_backup
+from scripts.lib import conf
 from scripts.backup.state_backup import ALERT_KEY, READ_BLOCK_SIZE, LastBackup, checksum_path
 from scripts.lib.atomic_file import prepared_replacement
 
@@ -52,7 +53,7 @@ class StateBackupTests(unittest.TestCase):
         programs.mkdir()
         config = self.root / "config"
         config.mkdir()
-        template = (ROOT / "config/state_backup.conf").read_text(encoding="utf-8")
+        template = conf.test_config_path("state_backup").read_text(encoding="utf-8")
         _ = (config / "state_backup.conf").write_text(
             template.replace("mac.folder = ~/backups/natedev/aws-state", "mac.folder = ~/backup folder/aws-state"),
             encoding="utf-8",

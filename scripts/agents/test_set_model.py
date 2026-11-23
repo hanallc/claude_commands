@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -19,7 +20,7 @@ from unittest.mock import patch
 
 from scripts.agents import remote, set_model, shutdown, worker_lifecycle
 from scripts.herdr import herdr
-from scripts.lib import models_registry
+from scripts.lib import conf, models_registry
 from scripts.message import codex_daemon
 from scripts.production import session_staff, staff, unit_lookup
 
@@ -190,9 +191,8 @@ class SetModelTests(unittest.TestCase):
         (self.root / "last_success").touch()
         config = self.root / "config"
         config.mkdir()
-        source = Path(__file__).resolve().parents[2] / "config"
-        (config / "machines.conf").symlink_to(source / "machines.conf")
-        (config / "script_prompts.conf").symlink_to(source / "script_prompts.conf")
+        _ = shutil.copyfile(conf.test_config_path("machines"), config / "machines.conf")
+        _ = shutil.copyfile(conf.test_config_path("script_prompts"), config / "script_prompts.conf")
         _ = (config / "set_model.conf").write_text(
             "default_effort=high\n"
             + "# range: 0..10\nscreen_wait_seconds=0\n"

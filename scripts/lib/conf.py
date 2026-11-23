@@ -403,8 +403,10 @@ def path(file: str | Path) -> Path:
 
 
 def _repository_path(stem: str) -> Path:
-    """Return the repository configuration file for a validated stem."""
+    """Return the fallback file for a validated stem: the test-owned twin in a test run, else the repository file."""
     conf_reads.record(stem)
+    if "CONF_DIR" in os.environ:
+        return test_config_path(stem)
     return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 
@@ -551,8 +553,7 @@ def known_host_names() -> frozenset[str]:
     try:
         machines = _parse(source.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        fallback = test_config_path("machines") if "CONF_DIR" in os.environ else _repository_path("machines")
-        machines = _parse(fallback.read_text(encoding="utf-8"))
+        machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
     aliases = machines.get("aliases")
     hosts = {_local_host_name().casefold()}
     if aliases is not None:

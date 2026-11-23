@@ -31,7 +31,7 @@ from scripts.agents import detached_runs, restart, shutdown_record, worker_lifec
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, pass_notices, side_pane, turn_end, worker_panes
-from scripts.lib import atomic_file, copy_record, process_start, scratch, unit_runs
+from scripts.lib import atomic_file, conf, copy_record, process_start, scratch, unit_runs
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -270,7 +270,7 @@ class TurnEndTests(unittest.TestCase):
         for shared_sessions in (False, True):
             with self.subTest(shared_sessions=shared_sessions):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
-                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                _ = shutil.copyfile(conf.test_config_path("accounts"),
                                     self.case.fixture.root / "conf/accounts.conf")
                 self.case.agent.finish_after = 1
                 self.assertIs(self.case.dispatch("impl-shared" if shared_sessions else "impl"), worker.DispatchSubmission.SUBMITTED)
@@ -1877,10 +1877,9 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
 
     def test_a_detached_result_reaches_the_idle_worker_in_both_completion_orders(self) -> None:
-        source = Path(__file__).resolve().parents[2] / "config"
         config = self.case.fixture.root / "conf"
-        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
-            _ = shutil.copyfile(source / name, config / name)
+        for stem in ("detached_runs", "postmaster", "codex_daemon"):
+            _ = shutil.copyfile(conf.test_config_path(stem), config / f"{stem}.conf")
         cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
         for finishes_during_turn, self_stop, transcript_unavailable in cases:
             with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
@@ -2096,9 +2095,8 @@ class TurnEndTests(unittest.TestCase):
 
     def test_a_torn_final_reply_keeps_run_completion_pending_after_receipt_recovery(self) -> None:
         config = self.case.fixture.root / "conf"
-        source = Path(__file__).resolve().parents[2] / "config"
-        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
-            _ = shutil.copyfile(source / name, config / name)
+        for stem in ("detached_runs", "postmaster", "codex_daemon"):
+            _ = shutil.copyfile(conf.test_config_path(stem), config / f"{stem}.conf")
         self.case.agent.finish_after = 1
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]

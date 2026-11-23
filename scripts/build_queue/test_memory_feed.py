@@ -2746,7 +2746,7 @@ process.stdout.write(JSON.stringify({
                       job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
                       ) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
-        config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
+        config = conf.test_config_path("build_steps")
         _ = shutil.copyfile(config, self.root / "build_steps.conf")
         base = with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110))
         running = replace(base.view.running[0], step=step, pid=running_pid, job=job)

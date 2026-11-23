@@ -29,7 +29,9 @@ LOG_NAME = re.compile(r"nextest\.[a-z0-9_]{8}", re.IGNORECASE)
 RETENTION_DAYS = "nextest_failure_log_days"
 TAIL_BYTES = "nextest_failure_tail_bytes"
 SUMMARY_BYTES = "nextest_failure_summary_bytes"
-DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "config/mac_test.conf"
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+DEFAULT_SETTINGS = (conf.test_config_path("mac_test") if "CONF_DIR" in os.environ
+                    else Path(__file__).resolve().parents[2] / "config/mac_test.conf")
 SUMMARY_SCAN_BYTES = 8192
 
 

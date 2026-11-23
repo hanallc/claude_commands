@@ -6,7 +6,6 @@ from scripts.agents import remote
 import json
 import os
 import sqlite3
-import shutil
 import tempfile
 import unittest
 from contextlib import closing
@@ -17,6 +16,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
+from scripts.lib import conf
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import live_units
@@ -55,7 +55,7 @@ class StyleUnitsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "table-conf"
-        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = conf.copy_for_test(Path(__file__).resolve().parents[2] / "config", config)
         _ = write_config_fixture(config / "production.conf", "units_table_columns=170\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

@@ -8,6 +8,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import json
+import os
 import sys
 import time
 from collections.abc import Generator
@@ -64,7 +65,8 @@ def record_lock_seconds() -> float:
     key = "RESTART_RECORD_LOCK_SECONDS"
     config = conf.read_or_repository("shutdown")
     if isinstance(config.settings, dict) and config.effective_key(key) not in config.settings:
-        config = conf.read(Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")
+        config = conf.read(conf.test_config_path("shutdown") if "CONF_DIR" in os.environ
+                           else Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")
     return config.number(key)
 
 

@@ -2260,7 +2260,7 @@ assert not loaded, loaded
         self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
             if source.name != ADMISSION_CONFIG_FIXTURE.name:
-                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
+                self.assertEqual((config.parent / source.name).read_bytes(), conf.test_config_path(source.stem).read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -2310,7 +2310,7 @@ assert not loaded, loaded
         self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
 
     def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        settings = conf.read(conf.test_config_path("build_folders"))
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("CONF_DIR", None)
             with mock.patch.object(conf, "read", return_value=settings) as read:

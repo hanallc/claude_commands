@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.lib import conf
 from scripts.herdr import herdr_types
 
 import fcntl
@@ -811,7 +812,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         configuration = self.enterContext(scratch_accounts_config())
         _ = (configuration / "script_prompts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
+            conf.test_config_path("script_prompts").read_text())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
             "workspaces": [], "workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],

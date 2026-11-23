@@ -139,7 +139,7 @@ class RefusalWatchTests(unittest.TestCase):
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
         for name in ("send", "postmaster", "codex_daemon"):
-            _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
+            _ = shutil.copy2(conf.test_config_path(name),
                              Path(os.environ["CONF_DIR"]) / f"{name}.conf")
         (self.home / "notes").mkdir()
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))

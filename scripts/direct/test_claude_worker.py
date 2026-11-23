@@ -17,7 +17,7 @@ from unittest.mock import patch
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.direct import worker_state
-from scripts.lib import models_registry
+from scripts.lib import conf, models_registry
 from scripts.direct import claude_worker
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -166,7 +166,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         models = write_registry(self.root / "models.conf")
         self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
-            "CONF_DIR": str(CHECKOUT / "config"), "UNIT_WORKER_POLL_SECS": "0",
+            "CONF_DIR": str(conf.copy_for_test(CHECKOUT / "config", self.root / "config")), "UNIT_WORKER_POLL_SECS": "0",
             "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),

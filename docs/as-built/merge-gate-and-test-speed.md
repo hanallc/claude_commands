@@ -982,10 +982,11 @@ Quota reminders run in `scripts/whoami/test_quota_alert.py` and nine subject mod
 
 **`scripts/direct/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
-  - It patches `DEFAULT_CONFIG_PATH`, `DEFAULT_MODELS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
+  - It patches `DEFAULT_CONFIG_PATH` and `DEFAULT_MODELS_CONFIG_PATH` from the fixture HOME.
+  - It passes `USER_ZONE_CONF` to the call: the caller's value, else the `user_zone` twin.
   - It clears `_config_digest`'s cache before and after the call.
   - `check=True` raises `CalledProcessError`.
-  - The module imports `progress_history` and `user_zone` at load time, before any HOME swap.
+  - The module imports `progress_history`, which imports `user_zone`, at load time, before any HOME swap.
 - `communicate_launcher(process, timeout=TEST_HANG_GUARD_SECS) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
 - In `test_progress_history.py`, `run_command`, `run_failing_command` and `run_unowned_command` go through `invoke_recorder`.
 
@@ -1009,11 +1010,33 @@ Checkpoint tests use this shared helper instead of live registries.
 Configuration fixtures supply `CONF_DIR` and the real key limit comments.
 `test_config/` holds a test-owned copy of each `config/*.conf`.
 The shared fixture helpers below and the runner's `CONF_DIR` copy take their values from it.
-Some single test modules still copy the repository `config/` with their own code.
-`/tune` and the other live tools write only `config/` and `~/.claude/config`, so a tune does not change a test value.
+Single test modules and test support modules also use `conf.test_config_path` or `conf.copy_for_test` for fixture values.
+A fixture that can write a config file gets a copy, not the twin path.
+The twin protects the tests, not the limit comments: a key without a limit comment takes any value.
+A test module or test support module reads the repository `config/` only for one of these purposes:
+
+- It checks keys or limit comments.
+- It checks a value property that each value `/tune` or `/zone` can write keeps, for example a real zone name.
+- It checks or intercepts the production read path and gives it fixture values.
+- It lists file names and takes the values from the twins.
+
+No test depends on a value that `/tune` or `/zone` can change.
+
+`/tune` and `/zone` write only `config/` and `~/.claude/config`, so they do not change a test value.
+The test runner sets `CONF_DIR` to its `copy_for_test` copy when `CONF_DIR` is unset.
+The paired speed trial in `gate_box.py` removes `CONF_DIR` before each module run, so each run gets the runner copy, not the tree's `config/`.
+Production readers follow `CONF_DIR`:
+
+- `repeat_guard.configuration()` reads `SEND_REPEAT_CONFIG`, else `conf.path("send_repeat_guard")`.
+- `user_zone.settings_path()` reads `USER_ZONE_CONF`, else `conf.path("user_zone")`, at each call.
+- `statusline.sh` reads `statusline.conf` and `user_zone.conf` from `${CONF_DIR:-$HOME/.claude/config}`, the `conf.sh` rule. `USER_ZONE_CONF` still comes first.
+- `copies.config_settings()` and `record.sync_config()` read `COPIES_CONFIG` or `BUILD_TARGETS_CONFIG`, else `conf.read_or_repository` under `CONF_DIR`.
+- Under `CONF_DIR`, each repository fallback reads the twin: `conf._repository_path`, `shutdown_record.record_lock_seconds`, `copies.guard_choice_limit`, `waiting_rows.model_color_key` and the `models.conf` fallback of `accounts.SessionModelReader.registry`.
+- Under `CONF_DIR` at import, the default paths `stall_watch.WATCH_DEFAULTS`, `nextest_log.DEFAULT_SETTINGS`, `review.NOTIFY_CONFIG`, `rust_release.LINT_CONFIG`, `rebuild_row.DEFAULT_CONFIG` and `design_roles.DEFAULT_CONFIG` are the twins.
+
 `conf.test_config_path(stem)` is the one path to a test-owned file.
 `memory_test_support` templates use it.
-Under `CONF_DIR`, the `conf.read_or_repository` and `conf.known_host_names` fallbacks also use it.
+Under `CONF_DIR`, the `conf.read_or_repository` fallback and the `conf._repository_path` recovery also use it.
 `conf.copy_for_test(source, destination)` is the one copy of a config folder for a test.
 It keeps links and gives each top-level `.conf` file its `test_config/` values.
 It keeps a file that the destination already holds.

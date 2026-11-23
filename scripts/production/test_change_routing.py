@@ -554,7 +554,7 @@ class StaffRoutingTests(unittest.TestCase):
             config_env = config_environment(config)
             _ = write_config_fixture(config / "scratch.conf",
                                      f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
-            settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+            settings = conf.test_config_path("change_review")
             _ = (config / "change_review.conf").write_text(settings.read_text())
             _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),

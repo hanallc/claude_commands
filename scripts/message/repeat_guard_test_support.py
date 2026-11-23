@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 from scripts.message import repeat_guard
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 
@@ -73,7 +74,7 @@ def install_notice_test_config(home: Path) -> Path:
     """Give notice fixtures real settings without repository recovery."""
     config = home / ".claude/config"
     config.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[2] / "config/send.conf"
+    source = conf.test_config_path("send")
     _ = shutil.copyfile(source, config / "send.conf")
     return config
 

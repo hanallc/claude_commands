@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import conf
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
@@ -166,7 +167,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
     def test_context_deferral_block_reaches_the_caller(self) -> None:
         config = self.root / "config"
         config.mkdir()
-        _ = (config / "context_deferral.conf").write_bytes((ROOT / "config/context_deferral.conf").read_bytes())
+        _ = (config / "context_deferral.conf").write_bytes(conf.test_config_path("context_deferral").read_bytes())
         self.environment["CONF_DIR"] = str(config)
         result = self.run_python([str(DISPATCH), "stop"], {
             "last_assistant_message": "I will do it after the context reset.",
@@ -950,7 +951,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
             + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
             + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
         )
-        for config in (ROOT / "config/copies.conf", self.root / "missing-copies.conf"):
+        for config in (conf.test_config_path("copies"), self.root / "missing-copies.conf"):
             with self.subTest(config=config.name):
                 marker.unlink(missing_ok=True)
                 self.environment["COPIES_CONFIG"] = str(config)

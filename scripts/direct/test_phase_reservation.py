@@ -23,7 +23,7 @@ from unittest import mock
 
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.agents import worker_lifecycle
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
@@ -56,7 +56,7 @@ def isolate_fixture_git(test: unittest.TestCase, root: Path) -> None:
 def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str]:
     """Give worktree creation private roots and records."""
     configuration.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
+    source = conf.test_config_path("build_folders")
     keys = {line.partition("=")[0].strip() for line in source.read_text(encoding="utf-8").splitlines()}
     roots = "".join(f"{key}={root / ('worktrees' if key == 'roots.workspace' else key.split('.')[1])}\n"
                     for key in sorted(keys) if key.startswith("roots."))

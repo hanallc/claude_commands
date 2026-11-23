@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import conf
 
 
 COPY_IMPORT_AUDIT = '''import json, os, sys
@@ -280,7 +281,7 @@ class PythonRootTests(unittest.TestCase):
             for checkout in (parent, child):
                 _ = shutil.copytree(repository / "scripts", checkout / "scripts",
                                     ignore=shutil.ignore_patterns("__pycache__"))
-                _ = shutil.copytree(repository / "config", checkout / "config")
+                _ = conf.copy_for_test(repository / "config", checkout / "config")
             probe = "import json, scripts; print(json.dumps(list(scripts.__path__)))"
             _ = (child / "scripts/startup_probe.py").write_text(probe + "\n")
             repeat = (
@@ -350,7 +351,7 @@ class PythonRootTests(unittest.TestCase):
                 _ = shutil.copytree(repository / "scripts", checkout / "scripts",
                                     ignore=shutil.ignore_patterns("__pycache__"))
                 _ = (checkout / "scripts/build_targets/test_copy_imports.py").write_text(COPY_IMPORT_TEST)
-            _ = shutil.copytree(repository / "config", selected / "config")
+            _ = conf.copy_for_test(repository / "config", selected / "config")
             wrapper = selected / "targeted_probe.py"
             _ = wrapper.write_text(COPY_TARGETED_RUN)
             detached = other / "detached_probe.py"

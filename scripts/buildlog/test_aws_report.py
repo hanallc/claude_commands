@@ -23,6 +23,7 @@ from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
+from scripts.lib import conf
 from scripts.aws_target import ledger, measurement, run_cost
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
@@ -115,8 +116,8 @@ class AwsReportTests(MeasurementFixture):
     def test_report_renders_one_aws_section_without_target_registration(self) -> None:
         registry = self.root / "build_targets.conf"
         fixture = registry.read_text()
-        shipped = (Path(__file__).resolve().parents[2] / 'config/build_targets.conf').read_text()
-        for source, configuration in (('fixture', fixture), ('shipped', shipped)):
+        owned = conf.test_config_path('build_targets').read_text()
+        for source, configuration in (('fixture', fixture), ('test-owned', owned)):
             with self.subTest(configuration=source):
                 _ = registry.write_text(configuration)
                 original = self.render()

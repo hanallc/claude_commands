@@ -38,11 +38,13 @@ from uuid import UUID, uuid4
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.direct import recorder_state
-from scripts.lib import conf_reads
+from scripts.lib import conf, conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, worker_admission
 
 ROOT = Path(__file__).resolve().parents[2]
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+DEFAULT_CONFIG = conf.test_config_path('design_roles') if 'CONF_DIR' in os.environ else ROOT / 'config/design_roles.conf'
 Role = Literal['designer', 'reviewer']
 DESIGNER_SANDBOX = 'danger-full-access'
 
@@ -513,7 +515,7 @@ def _set_lifecycle(design: HeldDesign, role: Role, lifecycle: Lifecycle) -> Held
 def authority_request(operation: str, payload: dict[str, object]) -> dict[str, object]:
     """Send an ownership request after releasing all design locks."""
     config = configparser.ConfigParser()
-    path = Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')
+    path = Path(os.environ.get('DESIGN_ROLES_CONFIG') or DEFAULT_CONFIG)
     try:
         config.read_string(conf_reads.read_text(path))
     except FileNotFoundError as error:
@@ -819,7 +821,7 @@ def _allow_new_roles() -> None:
     config = configparser.ConfigParser()
     try:
         config.read_string(conf_reads.read_text(
-            Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')))
+            Path(os.environ.get('DESIGN_ROLES_CONFIG') or DEFAULT_CONFIG)))
     except FileNotFoundError:
         pass
     if not config.getboolean('roles', 'new_open', fallback=True):
@@ -1504,7 +1506,7 @@ def main(argv: list[str]) -> int:
             config = configparser.ConfigParser()
             try:
                 config.read_string(conf_reads.read_text(
-                    Path(os.environ.get('DESIGN_ROLES_CONFIG') or ROOT / 'config/design_roles.conf')))
+                    Path(os.environ.get('DESIGN_ROLES_CONFIG') or DEFAULT_CONFIG)))
             except FileNotFoundError:
                 pass
             if config.get('ownership', 'host') != local_host():

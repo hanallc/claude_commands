@@ -33,7 +33,6 @@ from scripts.build_hold.override_guard import require_checkout
 require_checkout(Path(__file__))
 
 
-SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
 NOW = datetime(2026, 10, 11, 21, 0, tzinfo=timezone.utc)
 SINCE = datetime(2026, 10, 11, 20, 5, tzinfo=timezone.utc)
 END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)

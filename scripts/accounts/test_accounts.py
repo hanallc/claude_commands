@@ -8361,7 +8361,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         config = self.root / "conf"
         config.mkdir()
         _ = (config / "accounts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
+            conf.test_config_path("accounts").read_text())
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                                                + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
@@ -8907,7 +8907,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         row = self.worker("w74", live=False)
         self.dispatch(row)
         atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+            conf.test_config_path("shutdown").read_text())
         pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
@@ -10179,6 +10179,16 @@ class SessionModelReaderTests(unittest.TestCase):
         self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
                          accounts.ObservedSessionModel("claude-opus-5-5", "high"))
 
+    def test_registry_fallback_reads_the_test_owned_models_file_under_conf_dir(self) -> None:
+        twin = self.home / "test_config/models.conf"
+        twin.parent.mkdir()
+        _ = twin.write_text("[fixture]\nrow=value\n", encoding="utf-8")
+        with (patch.object(models_registry, "registry_text", side_effect=OSError("unreadable")),
+              patch.object(conf, "test_config_path", return_value=twin) as twin_path):
+            registry = accounts.SessionModelReader().registry
+        twin_path.assert_called_once_with("models")
+        self.assertEqual(registry, {"fixture": {"row": "value"}})
+
     def test_model_reader_stops_at_the_configured_scan_limit(self) -> None:
         _ = write_config_fixture(self.settings, "session_model_scan_kib=256\n")
         turn = self.claude_turn("claude-opus-5-5")
@@ -10472,7 +10482,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
             _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+                conf.test_config_path("accounts").read_bytes())
             for setting, css, escape in (
                 ("brown", "#af875f", "\x1b[38;5;137m"),
                 ("magenta", "#800080", "\x1b[35m"),
