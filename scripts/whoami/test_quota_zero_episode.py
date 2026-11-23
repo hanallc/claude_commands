@@ -686,6 +686,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
 
     def test_zero_credits_off_without_room_switches_to_claude_on_the_same_pass_and_records_one_notice(self) -> None:
         _ = self.note(1, "off")
+        self.select_units("claude3")
         with mock.patch.object(quota_alert, "switch_to_claude", wraps=quota_alert.switch_to_claude) as fallback:
             _ = self.alert(spare_left=0)
             fallback.assert_called_once()
@@ -701,9 +702,8 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.assertEqual(routed[0]["cause"], "credits off")
         self.assertEqual(set(routed[0]["moved"]), {"direct", "design_roles"})
         push = self.zero_pushes()[-1]
-        self.assertIn("Claude", push.body)
-        self.assertIn("codex1", push.body)
-        self.assertNotIn("when Codex refuses", push.body)
+        self.assertEqual(push.message, "codex1 is empty; we're in self-actualize mode; worker work moves to claude3")
+        self.assertEqual(push.posted_title, "")
         self.assertEqual((len(self.zero_pushes()), self.relay.call_count), (1, 0))
 
     def test_zero_credits_on_without_another_account_names_claude_as_the_destination(self) -> None:
@@ -729,8 +729,10 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         failed = [entry for entry in entries if entry["kind"] == "failed"]
         self.assertEqual((len(requested), len(failed)), (1, 1))
         self.assertEqual(failed[0]["move_id"], requested[0]["move_id"])
-        self.assertIn("server could not stop", self.zero_pushes()[-1].body)
-        self.assertIn("Claude", self.zero_pushes()[-1].body)
+        self.assertEqual(failed[0]["reason"], "server could not stop")
+        self.assertEqual([entry for entry in entries if entry["kind"] == "no room"], [])
+        self.assertEqual(self.zero_pushes()[-1].message,
+                         "codex1 is empty; we're in self-actualize mode; worker work moves to the units account")
         self.swap.assert_called_once()
 
     def test_credits_off_fallback_hold_survives_reload_and_blocks_recovery_until_the_earliest_refill(self) -> None:
@@ -839,28 +841,29 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with quota_alert.state_file() as state:
             self.assertFalse(state.get("no_worker_mode", False))
 
-    def test_credits_off_with_a_failed_workers_move_keeps_workers_when_another_account_has_capacity(self) -> None:
+    def test_credits_off_with_a_failed_workers_move_starts_no_worker_mode(self) -> None:
+        """A failed move to an account with room is treated like no room."""
         _ = self.note(1, "off")
         self.swap.side_effect = accounts.AccountsError("server could not stop")
         with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
             for minute in (0, 2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=50)
-        self.assertEqual(self.worker_mode_texts(), [])
-        self.assertEqual(self.broadcasts.stops, [])
+        self.assertEqual(self.worker_mode_texts(), [conf.read("accounts").text("no_worker_mode_on")])
+        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
         with quota_alert.state_file() as state:
-            self.assertFalse(state.get("no_worker_mode", False))
+            self.assertTrue(state.get("no_worker_mode", False))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
 
-    def test_failed_credits_off_move_keeps_workers_when_another_account_can_pay(self) -> None:
+    def test_failed_credits_off_move_to_an_account_that_can_pay_starts_no_worker_mode(self) -> None:
         _ = self.note(1, "off")
         self.swap.side_effect = accounts.AccountsError("server could not stop")
         with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
             for minute in (0, 2):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_accounts=((2, 0, "166"),))
         self.swap.assert_called_once()
-        self.assertEqual((self.worker_mode_texts(), self.broadcasts.stops), ([], []))
+        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
         with quota_alert.state_file() as state:
-            self.assertFalse(state.get("no_worker_mode", False))
+            self.assertTrue(state.get("no_worker_mode", False))
 
     def test_refused_account_takes_work_again_when_credits_are_on_and_a_newer_reading_shows_a_balance(self) -> None:
         accounts_conf = conf.read("accounts")
@@ -882,32 +885,84 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         with quota_alert.state_file() as state:
             self.assertFalse(state.get("no_worker_mode", False))
 
-    def test_failed_claude_switch_reports_work_staying_on_codex_without_internal_logs(self) -> None:
+    def test_no_room_starts_no_worker_mode_and_names_the_units_account(self) -> None:
+        _ = self.note(1, "off")
+        self.select_units("claude3")
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            _ = self.alert(spare_left=0)
+        with quota_alert.state_file() as state:
+            self.assertTrue(state.get("no_worker_mode", False))
+        push = self.zero_pushes()[-1]
+        self.assertEqual((push.id, push.values), ("quota.codex_workers_stay", {
+            "account": "codex1", "outcome": "we're in self-actualize mode; worker work moves to claude3"}))
+        self.assertEqual(push.message, "codex1 is empty; we're in self-actualize mode; worker work moves to claude3")
+        self.assertNotIn("No action needed", push.message)
+
+    def test_an_unreadable_role_map_names_the_units_account_in_words(self) -> None:
+        _ = self.note(1, "off")
+        unreadable = role_map.RoleMapUnavailable("fixture role map unavailable")
+        with mock.patch.object(accounts, "group_accounts", side_effect=unreadable) as groups:
+            _ = self.alert(spare_left=0)
+        groups.assert_called()
+        self.assertEqual(self.zero_pushes()[-1].message,
+                         "codex1 is empty; we're in self-actualize mode; worker work moves to the units account")
+
+    def test_an_old_saved_workers_stay_notice_renders_with_the_new_words(self) -> None:
+        cases = (("work moves to Claude", "quota.codex_workers_stay",
+                  "codex1 is empty; we're in self-actualize mode; worker work moves to claude3"),
+                 ("workers wait for their next entry", "quota.codex_workers_stay",
+                  "codex1 is empty; workers wait for their queued move"),
+                 ("work could not move", "quota.codex_refused", None))
+        for outcome, expected_id, expected_message in cases:
+            with self.subTest(outcome=outcome):
+                self.phone.reset_mock()
+                _ = self.note(1, "off")
+                self.select_units("claude3")
+                stamp = self.now.isoformat(timespec="seconds")
+                old = quota_alert.ZeroEpisodeNotice(id="quota.codex_workers_stay", values={
+                    "account": "codex1", "reset": "Tue 2026-10-20 00:58 AST", "reason": "No other Codex account has room.",
+                    "outcome": outcome, "fallback": "New coding work uses Claude until the earliest Codex refill."})
+                with quota_alert.state_file() as state:
+                    state["codex_zero"] = {"codex1": quota_alert.CodexZeroEpisode(since=stamp,
+                        weekly_reset=(self.now + timedelta(days=2)).isoformat(), credits="off", phone="due",
+                        forecast_at=stamp, notice=old)}
+                _ = self.alert(spare_left=0)
+                pushes = self.zero_pushes()
+                self.assertEqual([push.id for push in pushes], [expected_id])
+                if expected_message is not None:
+                    self.assertEqual(pushes[0].message, expected_message)
+
+    def test_a_units_selection_that_is_not_claude_names_the_units_account_in_words(self) -> None:
+        _ = self.note(1, "off")
+        with mock.patch.object(accounts, "group_label", return_value="codex2"):
+            _ = self.alert(spare_left=0)
+        self.assertEqual(self.zero_pushes()[-1].message,
+                         "codex1 is empty; we're in self-actualize mode; worker work moves to the units account")
+
+    def test_failed_claude_switch_sends_the_codex_refused_text(self) -> None:
         """F006: a failed routing update cannot claim that new work moved to Claude."""
         _ = self.note(1, "off")
         with mock.patch.object(quota_alert, "edit_registry", return_value="agents_set_all_assignments: permission denied"):
             _ = self.alert(spare_left=0)
+            _ = self.alert(self.now + timedelta(minutes=2), spare_left=0)
         push = self.zero_pushes()[-1]
-        self.assertIn("could not move", push.title)
-        self.assertIn("switch to Claude failed", push.body)
-        self.assertIn("permission", push.body)
-        self.assertIn("Codex work stays on codex1", push.body)
-        self.assertNotIn("New coding work uses Claude", push.body)
-        self.assertNotIn("agents_set_all_assignments", push.body)
-        self.assertNotIn("switch to claude for", push.body)
+        self.assertEqual((push.id, push.values), ("quota.codex_refused", {"account": "codex1"}))
+        self.assertEqual(len(self.zero_pushes()), 1)
+        self.assertNotIn("agents_set_all_assignments", push.message)
+        with quota_alert.state_file() as state:
+            self.assertEqual(state.get("codex_zero", {})["codex1"]["notice"]["id"], "quota.codex_refused")
         self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
 
-    def test_failed_swap_names_the_account_and_user_cause_without_accounts_diagnostics(self) -> None:
+    def test_failed_swap_keeps_accounts_diagnostics_off_the_phone(self) -> None:
         """F006: account command diagnostics belong in the journal, not on the phone."""
         _ = self.note(1, "off")
+        self.select_units("claude3")
         cause = "accounts: cannot use codex2 (~/.codex): usage reading is unavailable"
         self.swap.side_effect = accounts.AccountsError(cause)
         _ = self.alert(spare_left=50)
         push = self.zero_pushes()[-1]
-        self.assertIn("could not move to codex2", push.body)
-        self.assertIn("its usage reading is unavailable", push.body)
-        self.assertNotIn("accounts:", push.body)
-        self.assertNotIn("~/.codex", push.body)
+        self.assertEqual(push.message, "codex1 is empty; we're in self-actualize mode; worker work moves to claude3")
+        self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "no room"], [])
         self.assertTrue(any(entry["kind"] == "failed" and entry["reason"] == cause for entry in moves.read_moves()))
 
     def test_codex_catalog_examples_equal_the_notices_emitted_for_their_scenarios(self) -> None:
@@ -920,6 +975,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                         2: datetime(2026, 10, 22, 11, tzinfo=timezone.utc)}
         spare_reset = datetime(2026, 10, 17, 11, tzinfo=timezone.utc)
         base_readings = self.readings
+        self.select_units("claude3")
         ids = {"quota.codex_workers_moved",
                "quota.codex_workers_stay", "quota.codex_credits_forecast"}
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/Curacao"}):
@@ -1021,7 +1077,6 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             fallback = state["fallback"]
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.hold, quota_alert.CreditsOffHold(until))
-        self.assertIn(until.strftime("%Y-%m-%d %H:%M"), self.zero_pushes()[-1].body)
         _ = self.alert(until - timedelta(minutes=1))
         self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
         self.swap.assert_not_called()

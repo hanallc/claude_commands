@@ -19,7 +19,6 @@ import fcntl
 import json
 import math
 from dataclasses import dataclass
-from enum import Enum
 import os
 import select
 import signal
@@ -30,7 +29,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TextIO, TypedDict, cast
+from typing import TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
@@ -39,17 +38,12 @@ from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
+from scripts.mac_test.mac_transport import (MacPlacement, RemoteRun, RemoteState, remote_command, stop_command,
+                                            stop_remote, stream_remote)
 
 
 def admission_command() -> list[str]:
     return [os.path.expanduser(word) for word in shlex.split(conf.read("mac_gate").text("admission_client_command"))]
-
-
-@dataclass(frozen=True)
-class MacPlacement:
-    host: str
-    episode: str
-    attempt: str
 
 
 def parse_placement(output: str) -> MacPlacement:
@@ -90,99 +84,6 @@ def mac_placement_refusal(output: str) -> MacPlacementRefusal | NoMacPlacementRe
     return NoMacPlacementRefusal()
 
 
-def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
-    """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
-
-    zsh refuses job control without a terminal, so the work shares the session's group. When the
-    input closes, the watcher ends every other process of the group, then runs `on_close` (work
-    such as a GUI app that started outside the group).
-    """
-    if owned_close:
-        # The gate hook stops the guest. Leave the hook alive until it finishes.
-        return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close) + r"""
-exec 3<&0
-{
-    read -r _ <&3
-    exec /bin/zsh -c "$on_close"
-} </dev/null >/dev/null 2>&1 &!
-/bin/zsh -c "$work" </dev/null
-printf '\nmac_exit=%s\n' $?
-""")
-    return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
-            + f"\ngrace_polls={grace_polls}" + r"""
-exec 3<&0
-group=$(ps -o pgid= -p $$)
-group=${group//[[:space:]]/}
-printf 'mac_group=%s\n' "$group"
-{
-    read -r _ <&3
-    zmodload zsh/system zsh/zselect
-    self=$sysparams[pid]
-    members() { reply=(${(f)"$(pgrep -g $group)"}); reply=(${reply:#$self}) }
-    members; (( ! $#reply )) || kill -TERM $reply
-    for _ in {1..$grace_polls}; do members; (( $#reply )) || break; zselect -t 10; done
-    members; (( ! $#reply )) || kill -KILL $reply
-    [[ -z $on_close ]] || /bin/zsh -c "$on_close"
-} </dev/null >/dev/null 2>&1 &
-watcher=$!
-/bin/zsh -c "$work" </dev/null
-code=$?
-kill -TERM "$watcher" 2>/dev/null
-printf '\nmac_exit=%s\n' $code
-""")
-
-
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str,
-                   *, owned_close: bool = False) -> list[str]:
-    work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
-    work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
-    # Ten polls a second while the group ends.
-    grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
-    wrapper = remote_wrapper(work, on_close, grace_polls, owned_close=owned_close)
-    return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
-
-
-class RemoteState(Enum):
-    NOT_STARTED = "not started"
-    LIVE = "live"
-    EXITED = "exited"
-
-
-@dataclass
-class RemoteRun:
-    state: RemoteState = RemoteState.NOT_STARTED
-    group: int = 0
-
-
-def stop_remote(placement: MacPlacement, remote: RemoteRun) -> bool:
-    if remote.group == 0:
-        return False
-    grace = conf.read("mac_gate").number("terminate_grace_seconds")
-    # The installed helper checks the group id before it sends; the ps check below proves the stop.
-    script = f"""group={remote.group}
-signal_group() {{ "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/process_group.py" "$group" "$1" 2>/dev/null }}
-signal_group TERM
-sleep {grace}
-signal_group KILL
-groups=$(ps -axo pgid=) || exit 1
-if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
-printf 'mac_stopped=%s\\n' "$group"
-"""
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", placement.host,
-                             "/bin/zsh -c " + shlex.quote(script)], capture_output=True, text=True)
-    return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
-
-
-def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            _ = process.wait(timeout=conf.read("mac_gate").number("terminate_grace_seconds"))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            _ = process.wait()
-
-
 def capture_command(command: list[str], *, capture_stderr: bool) -> tuple[int, str, str]:
     with subprocess.Popen(command, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE if capture_stderr else None, text=True) as process:
@@ -191,27 +92,6 @@ def capture_command(command: list[str], *, capture_stderr: bool) -> tuple[int, s
             return process.returncode, output, errors or ""
         finally:
             stop_command(process)
-
-
-def stream_remote(command: list[str], remote: RemoteRun, ssh: contextlib.ExitStack) -> int:
-    process = ssh.enter_context(subprocess.Popen(
-        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
-    _ = ssh.callback(stop_command, process)
-    remote.state = RemoteState.LIVE
-    assert process.stdout is not None
-    last = ""
-    for line in cast(TextIO, process.stdout):
-        if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
-            remote.group = int(line.removeprefix("mac_group="))
-            continue
-        print(line, end="", flush=True)
-        last = line.rstrip("\n")
-    ssh_status = process.wait()
-    if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
-        remote.state = RemoteState.EXITED
-        return int(last.removeprefix("mac_exit="))
-    print("mac queue: the Mac returned no exit status", file=sys.stderr)
-    return ssh_status or 255
 
 
 def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
