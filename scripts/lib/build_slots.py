@@ -172,15 +172,101 @@ def _pool_lock(pool: Path) -> Generator[int]:
 def _write_pool_marker(pool: Path, source: Path) -> None:
     """Replace the pool marker in one rename, so a reader never sees a partial path."""
     marker = pool / ".git" / build_folders.POOL_MARKER
+    # A failed write keeps its temporary file. Its name is never the marker name, so no reader takes it.
     temporary = marker.with_name(f"{marker.name}.{uuid4().hex}")
+    with temporary.open("w", encoding="utf-8") as stream:
+        _ = stream.write(f"{source}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, marker)
+
+
+_POOL_STAGE = re.compile(r"(?P<pool>.+)\.(?P<kind>clone|failed-clone)-[a-z0-9_]{8}")
+
+
+@dataclass(frozen=True)
+class PoolStage:
+    """A folder that a pool clone left beside the pool. It waits for a manual removal."""
+
+    path: Path
+    pool_name: str
+    failed: bool
+
+    @property
+    def reason(self) -> str:
+        return "failed pool clone" if self.failed else "crashed pool clone"
+
+
+def kept_pool_stages(folder: Path) -> list[PoolStage]:
+    """List each folder that a pool clone left in the `.pool` folder `folder`. Delete nothing.
+
+    A take renames the stage of a failed clone to `<name>.failed-clone-XXXXXXXX`.
+    A crashed take leaves `<name>.clone-XXXXXXXX`.
+    """
     try:
-        with temporary.open("w", encoding="utf-8") as stream:
-            _ = stream.write(f"{source}\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, marker)
-    finally:
-        temporary.unlink(missing_ok=True)
+        entries = sorted(folder.iterdir())
+    except FileNotFoundError:
+        return []
+    stages: list[PoolStage] = []
+    for entry in entries:
+        match = _POOL_STAGE.fullmatch(entry.name)
+        if match and not entry.is_symlink() and entry.is_dir():
+            stages.append(PoolStage(entry, match["pool"], match["kind"] == "failed-clone"))
+    return stages
+
+
+def _stage_hex() -> str:
+    return uuid4().hex[:8]
+
+
+def _new_stage(parent: Path, pool_name: str) -> Path:
+    """Make an empty `<name>.clone-XXXXXXXX` folder. Its mode follows the umask, as the mode of a Git clone does.
+
+    Skip a suffix that a clone or failed-clone folder has, so a later failed-clone rename never replaces a folder.
+    """
+    while True:
+        suffix = _stage_hex()
+        stage = parent / f"{pool_name}.clone-{suffix}"
+        if os.path.lexists(parent / f"{pool_name}.failed-clone-{suffix}"):
+            continue
+        try:
+            stage.mkdir()
+        except FileExistsError:
+            continue
+        return stage
+
+
+def _fill_pool(stage: Path, source: Path, git: git_remotes.GitRun, locked: tuple[int, ...]) -> None:
+    """Fetch `source` into a new repository in the empty folder `stage`, and prepare it as a pool.
+
+    `git clone` deletes its repository when it fails, so the pool uses `init` and `fetch`.
+    A failed fetch keeps the repository.
+    """
+    # A pool has the object format of its live checkout, so a sha256 repository also gets a pool.
+    object_format = _git(source, "rev-parse", "--show-object-format", pass_fds=locked)
+    _ = git(stage, "init", "--quiet", f"--object-format={object_format}")
+    _ = git(stage, "remote", "add", "origin", str(source))
+    # The clone refspecs: each branch as a remote ref, each tag, and HEAD. A local fetch never hardlinks objects.
+    _ = git(stage, "fetch", "--quiet", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*",
+            "+HEAD:refs/remotes/origin/HEAD")
+    # The pool has no local branch, so its HEAD is detached. Remote refs hold the branches.
+    head = _git(stage, "rev-parse", "--verify", "refs/remotes/origin/HEAD^{commit}", pass_fds=locked)
+    _ = _git(stage, "update-ref", "--no-deref", "HEAD", head, pass_fds=locked)
+    _write_pool_marker(stage, source)
+
+
+def _keep_failed_stage(stage: Path, pool_name: str) -> str:
+    """Rename the stage of a failed clone, so that no later take reads it. Return the note that names the kept folder."""
+    failed = stage.with_name(f"{pool_name}.failed-clone-{stage.name.removeprefix(f'{pool_name}.clone-')}")
+    kept = f"kept for a manual removal list: {stage} (build_slots, crashed pool clone"
+    # A rename onto an empty folder replaces it, so never rename onto a path that exists.
+    if os.path.lexists(failed):
+        return f"{kept}; {failed} exists)"
+    try:
+        _ = stage.rename(failed)
+    except OSError as error:
+        return f"{kept}; the rename failed: {error})"
+    return f"kept for a manual removal list: {failed} (build_slots, failed pool clone)"
 
 
 def pool_repository(source: Path) -> Path:
@@ -206,26 +292,24 @@ def pool_repository(source: Path) -> Path:
         new = not os.path.lexists(pool)
         if new:
             # A crashed clone leaves its stage folder. The pool lock excludes a clone that runs now.
-            stage_name = re.compile(re.escape(pool.name) + r"\.clone-[a-z0-9_]{8}")
-            for entry in sorted(pool.parent.iterdir()):
-                if stage_name.fullmatch(entry.name) and not entry.is_symlink() and entry.is_dir():
-                    print(f"kept for a manual removal list: {entry} (build_slots, crashed pool clone)", file=sys.stderr)
-            # Clone beside the pool and rename it, so an interrupted clone never looks like a pool.
-            with tempfile.TemporaryDirectory(dir=pool.parent, prefix=f"{pool.name}.clone-") as stage:
-                staged = Path(stage) / pool.name
-                _ = git(pool.parent, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(staged))
-                head = _git(staged, "rev-parse", "HEAD", pass_fds=locked)
-                _ = _git(staged, "update-ref", "--no-deref", "HEAD", head, pass_fds=locked)
-                # Remote refs hold the branches. A stale local branch would hide the current one in a copy.
-                heads = _git(staged, "for-each-ref", "--format=delete %(refname)", "refs/heads/", pass_fds=locked)
-                if heads:
-                    _ = git(staged, "update-ref", "--stdin", data=f"{heads}\n".encode())
-                branches = {key.rsplit(".", 1)[0] for key in git_remotes.read_git_settings(git, staged, "--local")
-                            if key.startswith("branch.")}
-                for section in sorted(branches):
-                    _ = git(staged, "config", "--local", "--remove-section", section)
-                _write_pool_marker(staged, source)
+            for stage in kept_pool_stages(pool.parent):
+                if stage.pool_name == pool.name and not stage.failed:
+                    print(f"kept for a manual removal list: {stage.path} (build_slots, {stage.reason})", file=sys.stderr)
+            # Fill a new stage folder and rename it, so an interrupted clone never looks like a pool.
+            staged = _new_stage(pool.parent, pool.name)
+            try:
+                _fill_pool(staged, source, git, locked)
                 _ = staged.rename(pool)
+            except BaseException as error:
+                if os.path.lexists(pool) and not os.path.lexists(staged):
+                    # The interrupt came after the rename. The pool is complete, and no stage stays.
+                    raise
+                # No code deletes the pool or a stage folder. Keep the stage under a name that no take reads.
+                note = _keep_failed_stage(staged, pool.name)
+                if isinstance(error, Exception):
+                    raise SlotGitFailure(f"slots: the copy pool clone of {source} failed; {note}: {error}") from error
+                error.add_note(note)
+                raise
         served = build_folders.pool_source(pool)
         if served is not None and served != source and not (served / ".git").exists():
             # The live checkout moved or was deleted. The pool now serves the checkout at the new path.

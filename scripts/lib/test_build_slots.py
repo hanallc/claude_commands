@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,106 @@ class BuildSlotsTests(unittest.TestCase):
         for folder in (crashed, *others):
             self.assertTrue(folder.is_dir())
             self.assertEqual(notices.getvalue().count(str(folder)), 1 if folder == crashed else 0)
+
+    def test_a_successful_first_clone_leaves_no_stage_folder(self) -> None:
+        with self.take_queue_copy():
+            pass
+        self.assertEqual(sorted(entry.name for entry in self.pool().parent.iterdir()),
+                         [self.pool().name, f"{self.pool().name}.lock"])
+        # The pool mode follows the umask, as the mode of a new folder does.
+        probe = self.root / "mode-probe"
+        probe.mkdir()
+        self.assertEqual(stat.S_IMODE(self.pool().stat().st_mode), stat.S_IMODE(probe.stat().st_mode))
+
+    def test_a_failed_fetch_keeps_the_stage_repository(self) -> None:
+        original_pool = cast(Callable[..., bytes], getattr(build_slots, "_pool_git"))
+
+        def fail_fetch(repo: Path, *arguments: str, data: bytes | None = None,
+                       pass_fds: Sequence[int] = ()) -> bytes:
+            if ".clone-" in repo.name and "fetch" in arguments:
+                raise build_slots.SlotGitFailure("injected fetch failure")
+            return original_pool(repo, *arguments, data=data, pass_fds=pass_fds)
+
+        with (mock.patch.object(build_slots, "_pool_git", side_effect=fail_fetch),
+              self.assertRaisesRegex(build_slots.SlotGitFailure, "injected fetch failure") as raised,
+              self.take_queue_copy()):
+            self.fail("a failed fetch made a copy")
+        failed, = self.pool().parent.glob(f"{self.pool().name}.failed-clone-*")
+        self.assertIn(f"kept for a manual removal list: {failed} (build_slots, failed pool clone)", str(raised.exception))
+        self.assertTrue((failed / ".git" / "HEAD").is_file())
+        self.assertEqual(self.git(failed, "remote", "get-url", "origin"), str(self.source))
+
+    def test_a_new_stage_skips_a_suffix_that_a_failed_clone_folder_has(self) -> None:
+        parent = self.pool().parent
+        parent.mkdir(parents=True, exist_ok=True)
+        taken = parent / f"{self.pool().name}.failed-clone-deadbeef"
+        taken.mkdir()
+        with (mock.patch.object(build_slots, "_stage_hex", side_effect=["deadbeef", "cafef00d"]),
+              mock.patch.object(build_slots, "_fill_pool", side_effect=OSError("No space left on device")),
+              self.assertRaises(build_slots.SlotGitFailure) as raised, self.take_queue_copy()):
+            self.fail("a failed clone made a copy")
+        failed = parent / f"{self.pool().name}.failed-clone-cafef00d"
+        self.assertIn(f"kept for a manual removal list: {failed} (build_slots, failed pool clone)", str(raised.exception))
+        self.assertTrue(taken.is_dir())
+        self.assertEqual(list(taken.iterdir()), [])
+        self.assertFalse((parent / f"{self.pool().name}.clone-deadbeef").exists())
+
+    def test_a_failed_clone_never_renames_onto_an_existing_path(self) -> None:
+        parent = self.pool().parent
+        parent.mkdir(parents=True, exist_ok=True)
+        original = cast(Callable[[Path, str], Path], getattr(build_slots, "_new_stage"))
+
+        def stage_then_block(folder: Path, name: str) -> Path:
+            stage = original(folder, name)
+            # Another folder takes the failed-clone name after the stage exists.
+            stage.with_name(stage.name.replace(".clone-", ".failed-clone-")).mkdir()
+            return stage
+
+        with (mock.patch.object(build_slots, "_new_stage", side_effect=stage_then_block),
+              mock.patch.object(build_slots, "_fill_pool", side_effect=OSError("No space left on device")),
+              self.assertRaises(build_slots.SlotGitFailure) as raised, self.take_queue_copy()):
+            self.fail("a failed clone made a copy")
+        stage, = parent.glob(f"{self.pool().name}.clone-*")
+        failed = stage.with_name(stage.name.replace(".clone-", ".failed-clone-"))
+        self.assertIn(f"kept for a manual removal list: {stage} (build_slots, crashed pool clone; {failed} exists)",
+                      str(raised.exception))
+        self.assertEqual(list(failed.iterdir()), [])
+
+    def test_a_stage_that_keeps_its_clone_name_is_called_a_crashed_clone(self) -> None:
+        with (mock.patch.object(build_slots, "_fill_pool", side_effect=OSError("No space left on device")),
+              mock.patch.object(Path, "rename", side_effect=OSError("rename refused")),
+              self.assertRaises(build_slots.SlotGitFailure) as raised, self.take_queue_copy()):
+            self.fail("a failed clone made a copy")
+        stage, = self.pool().parent.glob(f"{self.pool().name}.clone-*")
+        self.assertIn(f"kept for a manual removal list: {stage} (build_slots, crashed pool clone; the rename failed: "
+                      + "rename refused)", str(raised.exception))
+
+    def test_a_failed_clone_keeps_its_folder_under_its_own_name_and_the_next_take_succeeds(self) -> None:
+        parent = self.pool().parent
+        failed: list[Path] = []
+        cases: tuple[tuple[BaseException, type[BaseException]], ...] = (
+            (OSError("No space left on device"), build_slots.SlotGitFailure), (KeyboardInterrupt(), KeyboardInterrupt))
+        for error, raised_type in cases:
+            with (self.subTest(error=type(error).__name__),
+                  mock.patch.object(build_slots, "_write_pool_marker", side_effect=error),
+                  self.assertRaises(raised_type) as raised, self.take_queue_copy()):
+                self.fail("a failed clone made a copy")
+            kept = [entry for entry in parent.iterdir() if ".failed-clone-" in entry.name and entry not in failed]
+            self.assertEqual(len(kept), 1)
+            failed.append(kept[0])
+            self.assertTrue((kept[0] / ".git").is_dir())
+            notes = cast(list[str], getattr(raised.exception, "__notes__", []))
+            self.assertIn(f"kept for a manual removal list: {kept[0]} (build_slots, failed pool clone)",
+                          "\n".join([str(raised.exception), *notes]))
+            self.assertFalse(os.path.lexists(self.pool()))
+            self.assertEqual([entry for entry in parent.iterdir() if f"{self.pool().name}.clone-" in entry.name], [])
+        notices = io.StringIO()
+        with redirect_stderr(notices), self.take_queue_copy() as copy:
+            self.assertEqual(Path(self.git(copy.path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+                             self.pool() / ".git")
+        # The next take never reads a failed clone folder, and no code deletes it.
+        self.assertNotIn("failed-clone", notices.getvalue())
+        self.assertTrue(all(folder.is_dir() for folder in failed))
 
     def test_git_writes_in_a_copy_never_reach_the_live_repository(self) -> None:
         before = self.live_state()

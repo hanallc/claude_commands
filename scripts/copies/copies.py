@@ -1600,11 +1600,18 @@ class RemoteMirrorKept(CopyError):
 
 
 class NumberedCopyKept(CopyError):
-    """Removal kept numbered copies and found no other failure. Each kept copy goes on a manual removal list."""
+    """Removal kept numbered copies or pool clone folders and found no other failure.
+
+    Each kept folder goes on a manual removal list.
+    """
 
 
-def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
-    """Remove an owner's idle trees within the selected repository scope."""
+def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES, *, pool_stages: bool = False) -> None:
+    """Remove an owner's idle trees within the selected repository scope.
+
+    With `pool_stages`, also name each folder that a pool clone left in the scope. No owner holds these folders,
+    so only the `remove` command names them.
+    """
     scope = repository_scope(repo)
     workspaces = owned_workspaces(owner, scope)
     failures: list[str] = []
@@ -1653,7 +1660,7 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
             except (CopyError, OSError, scratch.ScratchError, git_rescue.RescueError) as error:
                 failures.append(str(error))
     try:
-        kept_copies = _kept_numbered_copies(owner, scope)
+        kept_copies = [*_kept_numbered_copies(owner, scope), *(_kept_pool_stages(scope) if pool_stages else [])]
     except (CopyError, OSError, ValueError, SlotGitFailure) as error:
         failures.append(str(error))
         kept_copies = []
@@ -1661,6 +1668,30 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         raise failure_type("\n".join([*failures, *kept_copies]))
     if kept_copies:
         raise NumberedCopyKept("\n".join(kept_copies))
+
+
+def _kept_pool_stages(scope: RepositoryScope) -> list[str]:
+    """Return one line for each folder that a pool clone left in the scope. Delete nothing."""
+    return [f"{stage.path}: kept: a {stage.reason} goes on a manual removal list"
+            for folder in sorted(gates_root().glob(f"*/{build_folders.POOL}"))
+            for stage in build_slots.kept_pool_stages(folder) if _pool_stage_in_scope(stage, scope)]
+
+
+def _pool_stage_in_scope(stage: build_slots.PoolStage, scope: RepositoryScope) -> bool:
+    """Compare the identity of the stage's live checkout with the scope, as `_copy_in_scope` does."""
+    if isinstance(scope, AllRepositories):
+        return True
+    # The pool marker names the live checkout. A stage clone has the live checkout as its origin.
+    live = build_folders.pool_source(stage.path.with_name(stage.pool_name))
+    if live is None and (stage.path / ".git" / "HEAD").is_file():
+        live = stage.path
+    if live is not None:
+        try:
+            return repository_name(live) == scope.name
+        except (CopyError, OSError, subprocess.SubprocessError, SlotGitFailure):
+            pass
+    # Without a readable clone, the repository folder name is the only identity.
+    return stage.path.parent.parent.name == build_folders.repository_folder_name(scope.name)
 
 
 def _kept_numbered_copies(owner: str, scope: RepositoryScope) -> list[str]:
@@ -3064,7 +3095,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             scope = (ALL_REPOSITORIES if args.repo is None else
                      SelectedRepository(repository_name(Path(args.repo).expanduser().resolve())))
-            remove_trees(caller_owner(), scope)
+            remove_trees(caller_owner(), scope, pool_stages=True)
     except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
             SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)

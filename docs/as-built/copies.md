@@ -139,8 +139,11 @@ The check inspects these entries without following symbolic links.
 It also selects the caller's numbered copies in the repository scope.
 It checks each copy with `build_slots.remove_copy(record)` and removes none of them.
 It names each numbered copy with its path and reason, and then exits non-zero.
+The command also names each crashed or failed pool clone folder under `<roots.build>/<repository>/.pool` in the scope.
+It deletes none of these folders. No owner holds them, so `remove_trees` names them only with `pool_stages=True`.
+Retirement and production tidy call `remove_trees` without it, so they never name these folders.
 An idle copy goes on a manual removal list. A busy copy is "in use".
-When kept numbered copies are the only failures, `remove_trees` raises `NumberedCopyKept`.
+When kept folders are the only failures, `remove_trees` raises `NumberedCopyKept`.
 Retirement and production tidy print that report to stderr and continue.
 `gates_root()` reads the configured build root without creating it.
 The two-day sweep lists idle numbered copies with expired use stamps for manual review.

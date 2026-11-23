@@ -27,7 +27,7 @@ from scripts.build_queue import slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
@@ -2660,6 +2660,25 @@ with patch.object(subprocess, 'run', pause_clone):
         # Retirement and tidy continue past this failure type, because only a manual list removes the copy.
         with self.assertRaises(copies.NumberedCopyKept):
             copies.remove_trees(self.owner_id)
+
+    def test_remove_names_each_pool_clone_folder_and_exits_non_zero(self) -> None:
+        pool = build_folders.pool_path(self.source)
+        for _ in range(2):
+            with (mock.patch.object(build_slots, "_write_pool_marker", side_effect=OSError("No space left on device")),
+                  self.assertRaisesRegex(copies.CopyError, "failed pool clone"),
+                  copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head))):
+                self.fail("a failed pool clone made a copy")
+        failed, other = sorted(pool.parent.glob(f"{pool.name}.failed-clone-*"))
+        # A crashed take leaves its stage under the clone name.
+        crashed = other.rename(pool.with_name(f"{pool.name}.clone-{other.name.rsplit('-', 1)[1]}"))
+        result = self.cli("remove", "--repo", str(self.source))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"{failed}: kept: a failed pool clone goes on a manual removal list", result.stderr)
+        self.assertIn(f"{crashed}: kept: a crashed pool clone goes on a manual removal list", result.stderr)
+        self.assertTrue(failed.is_dir())
+        self.assertTrue(crashed.is_dir())
+        # No owner holds a pool clone folder, so the per-owner calls from tidy and retirement do not name it.
+        copies.remove_trees(self.owner_id)
 
     def test_remove_keeps_each_failure_when_the_numbered_copy_list_fails(self) -> None:
         with (registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree,

@@ -55,16 +55,25 @@ See [Repository copies](copies.md) for copy cleanup and build output details.
 The pool is at `<roots.build>/<repository>/.pool/<checkout name>`.
 The pool folder has the name of the live checkout.
 Tools that name a repository from its common Git folder read the same name from a copy and from the live checkout.
-The pool is a clone with no checkout (`git clone --no-local --no-checkout`). It owns its objects.
-Its HEAD is detached. The clone deletes its local branches and their `branch.*` keys, so the remote refs hold all branches.
-The clone runs in a `<checkout name>.clone-XXXXXXXX` stage folder and is renamed to the pool when it is complete.
-Before a first clone, the take names each old stage folder that matches this name exactly.
-The pool name never matches it.
-The take prints `kept for a manual removal list: <path> (build_slots, crashed pool clone)` for each old stage folder.
-A take deletes one folder under the build root: the stage folder that the same call made.
-It deletes that folder under the pool lock, after a failed clone or after the rename.
+The pool is a repository with no checkout. It owns its objects.
+The take does not use `git clone`, because a failed clone deletes its repository.
+The take makes a new `<checkout name>.clone-XXXXXXXX` stage folder. Its mode follows the umask.
+In the stage folder, the take runs `git init`, adds the live checkout as `origin`, and fetches it.
+The fetch takes each branch as `refs/remotes/origin/*`, each tag, and HEAD. A fetch never hardlinks objects.
+The pool has no local branch. Its HEAD is detached at the HEAD commit of the live checkout.
+No code deletes the pool or a stage folder. Only a person removes them from a manual removal list.
+When the stage is complete, the take renames the stage folder to the pool, so no stage folder stays.
+After a failed clone (a Git error, a timeout, a full disk or an interrupt), the take keeps the stage folder and its repository.
+It renames the folder to `<checkout name>.failed-clone-XXXXXXXX`, so no later take reads it.
+The error of the take names the folder that stays with `kept for a manual removal list`.
+When that rename fails, the folder keeps its `.clone-` name, and the error calls it a crashed pool clone.
+A crashed take leaves its `<checkout name>.clone-XXXXXXXX` stage folder.
+Before a first clone, the take names each such folder of its pool.
+It prints `kept for a manual removal list: <path> (build_slots, crashed pool clone)`. The pool name never matches.
+`build_slots.kept_pool_stages` lists both kinds of folder. Only the `copies.py remove` command reports them.
 The file `.git/build-copy-pool` holds the path of the live checkout. `build_folders.pool_source` reads it.
 A take writes and syncs a temporary file in the same folder, and then renames it, so a reader never sees a partial path.
+A failed write keeps its temporary file. The file never has the marker name.
 `.pool/<checkout name>.lock` is the one lock for each pool configuration write in `build_slots`.
 A take holds it while it makes or refreshes the pool, and while it enables worktree configuration in the pool.
 Each Git child of these writes inherits the lock descriptor.
