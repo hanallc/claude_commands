@@ -22,7 +22,7 @@ from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
 from scripts.message import send_result
-from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
+from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
 
@@ -71,7 +71,8 @@ class TheListTests(unittest.TestCase):
         _ = os.environ.pop("CONF_DIR", None)
         self.list_config = self.root / ".claude/config/the_list.conf"
         self.list_config.parent.mkdir(parents=True)
-        _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in LIST_TEXT_LIMITS.items()))
+        settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730}
+        _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in settings.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
@@ -209,6 +210,163 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.log[1], the_list.ItemChange(START, the_list.MarkedRead(), "nate"))
         self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
         self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
+
+    def add_scheduled(self, start: str, *options: str) -> tuple[int, str, str]:
+        return self.command("add", "--title", "Check the predictions", "--owner", RUNNER.id,
+                            "--state", "scheduled", "--start", start, "--do", "Read the figures.\nSend the total.",
+                            "--source", "nate", *options)
+
+    def test_scheduled_items_round_trip_and_list_their_next_run(self) -> None:
+        start = "2026-11-30T09:00[America/Los_Angeles]"
+        stamp = "2026-11-30T09:00:00-08:00[America/Los_Angeles]"
+        for options, detail in (
+            ((), "Does not repeat"),
+            (("--repeat", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH"), "Repeats: Every 2 weeks on Monday and Thursday"),
+        ):
+            with self.subTest(detail=detail):
+                code, output, errors = self.add_scheduled(start, *options)
+                self.assertEqual((code, errors), (0, ""))
+                description, identity = output.splitlines()
+                self.assertEqual(description, detail)
+                item = the_list.load(MORTY.id, identity)
+                schedule = item.schedule
+                self.assertIs(item.state, the_list.ItemState.SCHEDULED)
+                self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
+                if isinstance(schedule, the_list.ScheduledSeries):
+                    run = schedule.first
+                    self.assertEqual(schedule.rule.rrule, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH")
+                else:
+                    assert isinstance(schedule, the_list.ScheduledRun)
+                    run = schedule
+                self.assertEqual(run.start.tzinfo, ZoneInfo("America/Los_Angeles"))
+                self.assertEqual(run.words, "Read the figures.\nSend the total.")
+                shown = self.command("list")[1]
+                self.assertIn(f"Scheduled · Starts {stamp}", shown)
+                if options:
+                    self.assertIn(f"Every 2 weeks on Monday and Thursday · next {stamp}", shown)
+                event = item.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), schedule)
+                page = list_page.render(self.root, include_counts=False).decode()
+                self.assertIn("Check the predictions", page)
+
+        parked = self.add("A parked item")
+        _ = the_list.park(MORTY.id, parked.id, START + timedelta(days=1), source="nate")
+        self.assertEqual(self.command("update", "--id", parked.id, "--state", "Scheduled", "--start", start,
+                                     "--do", "Check the total.", "--source", "nate"), (0, "Does not repeat\n", ""))
+        saved = the_list.load(MORTY.id, parked.id)
+        self.assertEqual(saved.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.schedule, the_list.ScheduledRun(
+            datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles")), "Check the total."))
+
+    def test_repeat_series_limit_uses_the_live_setting(self) -> None:
+        start = "2026-11-30T17:00:00Z"
+        for limit in (730, 2):
+            with self.subTest(limit=limit):
+                text = self.list_config.read_text()
+                _ = self.list_config.write_text(text.replace("series_run_limit=730", f"series_run_limit={limit}"))
+                code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
+                self.assertEqual((code, errors), (0, ""))
+                saved = the_list.load(MORTY.id, output.splitlines()[-1])
+                series = saved.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                last = series.first.start + timedelta(days=limit - 1)
+                self.assertEqual(series.rule.next_after(series.first.start, last - timedelta(days=1),
+                                                       the_list.series_run_limit()), last)
+                self.assertIs(series.rule.next_after(series.first.start, last, the_list.series_run_limit()),
+                              repeat_rule.NoNextRun.REMAINING)
+                refused, message, errors = self.add_scheduled(start, "--repeat", f"FREQ=DAILY;COUNT={limit + 1}")
+                self.assertEqual((refused, message), (1, ""))
+                self.assertIn(f"COUNT exceeds the series limit of {limit} runs", errors)
+
+    def test_repeated_item_updates_use_the_selected_scope(self) -> None:
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        second = start + timedelta(days=1)
+        moved = second + timedelta(hours=1)
+        for scope, now_at, first, runs_before, next_words in (
+            ("this", second, start, 0, "Read the figures.\nSend the total."),
+            ("following", second, moved, 1, "Read new figures."),
+            ("all", START, moved, 0, "Read new figures."),
+        ):
+            with self.subTest(scope=scope):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=4")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                before = the_list.load(MORTY.id, identity)
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", identity, "--source", "nate",
+                        "--scope", scope, "--start", moved.isoformat(), "--do", "Read new figures.")
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("Repeats: Daily", output)
+                item = the_list.load(MORTY.id, identity)
+                series = item.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                self.assertEqual((series.first.start, series.runs_before), (first, runs_before))
+                next_run = series.next_run(now_at, the_list.series_run_limit())
+                assert isinstance(next_run, the_list.SeriesRun)
+                self.assertEqual(next_run.run, the_list.ScheduledRun(moved, "Read new figures."))
+                after = series.next_run(moved + timedelta(microseconds=1), the_list.series_run_limit())
+                assert isinstance(after, the_list.SeriesRun)
+                self.assertEqual(after.run.words, next_words)
+                self.assertEqual(len(tuple(series.rule.runs(series.first.start, the_list.series_run_limit()))),
+                                 3 if scope == "following" else 4)
+                self.assertEqual(item.log[:-1], before.log)
+                self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"schedule": series}))
+
+    def test_repeated_item_removals_use_the_selected_scope(self) -> None:
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        second = start + timedelta(days=1)
+        third = start + timedelta(days=2)
+        for scope, now_at, operation, options, state in (
+            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED),
+            ("following", second, "park", ("--until", third.isoformat()), the_list.ItemState.WORKING),
+            ("all", START, "close", ("--words", "Stop these checks"), the_list.ItemState.CLOSED),
+            ("all", START, "update", ("--state", "Working"), the_list.ItemState.WORKING),
+        ):
+            with self.subTest(scope=scope, operation=operation):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                before = the_list.load(MORTY.id, identity)
+                with patch.object(the_list, "now", return_value=now_at):
+                    self.assertEqual(self.command(operation, "--id", identity, "--source", "nate",
+                                                  "--scope", scope, *options), (0, "", ""))
+                item = the_list.load(MORTY.id, identity)
+                self.assertIs(item.state, state)
+                if scope == "this":
+                    series = item.schedule
+                    assert isinstance(series, the_list.ScheduledSeries)
+                    next_run = series.next_run(second, the_list.series_run_limit())
+                    assert isinstance(next_run, the_list.SeriesRun)
+                    self.assertEqual((next_run.number, next_run.run.start), (3, third))
+                else:
+                    self.assertIs(item.schedule, the_list.NoSchedule.UNSET)
+                if operation == "park":
+                    self.assertEqual(item.parked_until, third)
+                self.assertEqual(item.log[:-1], before.log)
+                event = item.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), item.schedule)
+
+    def test_repeated_item_refuses_an_invalid_scope_without_writing(self) -> None:
+        code, output, errors = self.add_scheduled("2026-11-30T17:00:00Z", "--repeat", "FREQ=DAILY")
+        self.assertEqual((code, errors), (0, ""))
+        identity = output.splitlines()[-1]
+        path = the_list.folder(MORTY.id) / f"{identity}.md"
+        before = path.read_bytes()
+        for options, reason in (
+            (("update", "--do", "Read new figures."), "use --scope"),
+            (("update", "--do", "Read new figures.", "--scope", "following"), "from the second run"),
+            (("update", "--repeat", "FREQ=WEEKLY", "--scope", "this"), "change a repeat rule"),
+            (("close", "--words", "Stop"), "use --scope"),
+            (("close", "--words", "Stop", "--scope", "following"), "from the second run"),
+        ):
+            with self.subTest(options=options):
+                verb, *flags = options
+                code, output, errors = self.command(verb, "--id", identity, "--source", "nate", *flags)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn(reason, errors)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_text_limits_on_add_and_update(self) -> None:
         cases = (
@@ -674,6 +832,16 @@ class TheListTests(unittest.TestCase):
                                      (1, "", f"the_list: {item.id} is assigned to another producer\n"))
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
+        code, output, errors = self.add_scheduled("2026-11-30T17:00Z", "--producer", BOB.name,
+                                                   "--repeat", "FREQ=DAILY")
+        self.assertEqual((code, errors), (0, ""))
+        identity = output.splitlines()[-1]
+        saved = the_list.load(MORTY.id, identity)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", identity, "--do", "Change the check.", "--scope", "all"),
+                             (1, "", f"the_list: {identity} is assigned to another producer\n"))
+        self.assertEqual(the_list.load(MORTY.id, identity), saved)
+
     def test_producer_updates_and_appends_its_evidence(self) -> None:
         cases = (
             ("--evidence", "An updated result.\nAnother result.", "An updated result.\nAnother result."),
@@ -1114,6 +1282,7 @@ class TheListTests(unittest.TestCase):
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual((item.reviews, item.producer), ((), MORTY.id))
+        self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
@@ -1578,6 +1747,7 @@ class TheListTests(unittest.TestCase):
             ("latest_status", 1, 1),
             ("evidence", 1, 1),
             ("done_when", 1, 1),
+            ("schedule", "Invalid", {"start": START.isoformat(), "do": ""}),
             ("parked_until", START.replace(tzinfo=None), START.replace(tzinfo=None).isoformat()),
             ("closing_words", " ", " "),
         )

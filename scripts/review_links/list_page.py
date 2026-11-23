@@ -65,6 +65,7 @@ CHIP_BY_STATE = {
     the_list.ItemState.WAITING_FOR_NATE: ListChip.NEEDS_ME,
     the_list.ItemState.DELIVERED: ListChip.NEEDS_ME,
     the_list.ItemState.DONE: ListChip.ALL,
+    the_list.ItemState.SCHEDULED: ListChip.ALL,
     the_list.ItemState.PAUSED: ListChip.BLOCKED,
 }
 
@@ -238,10 +239,11 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
         body = f'<strong>{heading}</strong>'
-        if fields:
+        visible_fields = [(field, value) for field, value in fields.items() if field != "schedule"]
+        if visible_fields:
             body += '<dl>' + ''.join(
                 f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
-                for field, value in fields.items()) + '</dl>'
+                for field, value in visible_fields) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
         recipient = content.recipient_id(keeper)

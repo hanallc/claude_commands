@@ -72,6 +72,8 @@ A status answers the last next step: say if each named step happened. When a tim
 Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`, `--title`, or `--done-when`.
 Write no time in `--source`.
 The List is shared. Each item has one producer, who keeps its status, next step, ETA and check time current.

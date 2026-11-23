@@ -23,13 +23,13 @@ from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import delivery_state, record_store, session_pane, staff
+from scripts.production import delivery_state, record_store, repeat_rule, session_pane, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -40,6 +40,7 @@ class ListError(ValueError):
 class ItemState(StrEnum):
     NEW = "New"
     WORKING = "Working"
+    SCHEDULED = "Scheduled"
     BLOCKED = "Blocked"
     WAITING_FOR_NATE = "Waiting for nate"
     DELIVERED = "Delivered"
@@ -221,6 +222,72 @@ feedback_claims: set[tuple[Path, str]] = set()
 feedback_claims_lock = threading.Lock()
 
 
+class NoSchedule(StrEnum):
+    UNSET = ""
+
+
+@dataclass(frozen=True)
+class ScheduledRun:
+    start: datetime
+    words: str
+
+
+class RemovedRun(StrEnum):
+    SKIPPED = "skip this run"
+
+
+@dataclass(frozen=True)
+class RunException:
+    number: int
+    run: ScheduledRun | RemovedRun
+
+
+@dataclass(frozen=True)
+class ScheduledSeries:
+    first: ScheduledRun
+    rule: repeat_rule.RepeatRule
+    runs_before: int = 0
+    exceptions: tuple[RunException, ...] = ()
+
+    def next_run(self, moment: datetime, limit: int) -> SeriesRun | repeat_rule.NoNextRun:
+        """Find the next run with its original time and series number."""
+        exceptions = {entry.number: entry.run for entry in self.exceptions}
+        next_run: SeriesRun | repeat_rule.NoNextRun = repeat_rule.NoNextRun.REMAINING
+        instant = moment.astimezone(UTC)
+        for number, original in enumerate(self.rule.runs(self.first.start, limit - self.runs_before),
+                                          self.runs_before + 1):
+            run = exceptions.get(number, ScheduledRun(original, self.first.words))
+            if isinstance(run, ScheduledRun) and run.start.astimezone(UTC) >= instant:
+                if isinstance(next_run, repeat_rule.NoNextRun) or run.start.astimezone(UTC) < next_run.run.start.astimezone(UTC):
+                    next_run = SeriesRun(number, original, run)
+                if not exceptions:
+                    break
+        return next_run
+
+
+@dataclass(frozen=True)
+class SeriesRun:
+    number: int
+    original: datetime
+    run: ScheduledRun
+
+
+Schedule = NoSchedule | ScheduledRun | ScheduledSeries
+
+
+class ScheduleScope(StrEnum):
+    UNSPECIFIED = ""
+    THIS = "this"
+    FOLLOWING = "following"
+    ALL = "all"
+
+
+class ScheduleChanges(TypedDict, total=False):
+    start: datetime
+    words: str
+    repeat: repeat_rule.RepeatRule | NoSchedule
+
+
 @dataclass(frozen=True)
 class ListItem:
     number: int
@@ -247,6 +314,7 @@ class ListItem:
     log: tuple[ItemChange, ...]
     reviews: tuple[str, ...] = ()
     questions: tuple[question_record.Question, ...] = ()
+    schedule: Schedule = NoSchedule.UNSET
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
@@ -317,6 +385,7 @@ class ItemChanges(TypedDict, total=False):
     latest_status: str
     evidence: str
     done_when: str
+    schedule: Schedule
 
 
 class LogFields(ItemChanges, total=False):
@@ -449,6 +518,126 @@ def _required_time(text: str) -> datetime:
     if not isinstance(value, datetime):
         raise ListError("a required time is empty")
     return value
+
+
+def _scheduled_time(text: str) -> datetime:
+    stamp, bracket, zone = text.partition("[")
+    if not re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}", stamp):
+        raise ListError("a schedule start needs an ISO date, time, and time zone")
+    value = datetime.fromisoformat(stamp)
+    if bracket:
+        try:
+            if not zone.endswith("]"):
+                raise ValueError("missing closing bracket")
+            named = ZoneInfo(zone[:-1])
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ListError("use an IANA time zone such as [America/Los_Angeles]") from None
+        local = (value.astimezone(named) if value.utcoffset() is not None else value.replace(tzinfo=named))
+        if local.replace(tzinfo=None) != value.replace(tzinfo=None):
+            raise ListError("the start offset does not match its time zone")
+        value = local
+    _validate_time(value)
+    if value.astimezone(UTC).astimezone(value.tzinfo).replace(tzinfo=None) != value.replace(tzinfo=None):
+        raise ListError("the start does not exist in its time zone")
+    return value
+
+
+def _schedule_time_text(value: datetime) -> str:
+    zone = value.tzinfo
+    return value.isoformat() + (f"[{zone.key}]" if isinstance(zone, ZoneInfo) else "")
+
+
+def _schedule_fields(schedule: Schedule) -> dict[str, object] | None:
+    if isinstance(schedule, NoSchedule):
+        return None
+    first = schedule.first if isinstance(schedule, ScheduledSeries) else schedule
+    fields: dict[str, object] = {"start": _schedule_time_text(first.start), "do": first.words}
+    if isinstance(schedule, ScheduledSeries):
+        fields.update(repeat=schedule.rule.rrule, runs_before=schedule.runs_before)
+        fields["exceptions"] = [
+            {"number": entry.number, "removed": True} if isinstance(entry.run, RemovedRun)
+            else {"number": entry.number, "start": _schedule_time_text(entry.run.start), "do": entry.run.words}
+            for entry in schedule.exceptions
+        ]
+    return fields
+
+
+def _read_schedule(raw: object) -> Schedule:
+    if raw is None:
+        return NoSchedule.UNSET
+    fields = _json_fields(raw)
+    first = ScheduledRun(_scheduled_time(_field_text(fields.get("start"), "start")), _field_text(fields.get("do"), "do"))
+    schedule: Schedule = first
+    if fields.keys() != {"start", "do"}:
+        if fields.keys() != {"start", "do", "repeat", "runs_before", "exceptions"}:
+            raise ListError("invalid schedule fields")
+        runs_before = fields["runs_before"]
+        rows = fields["exceptions"]
+        if type(runs_before) is not int or not isinstance(rows, list):
+            raise ListError("invalid schedule run history")
+        exceptions: list[RunException] = []
+        for raw_row in cast(list[object], rows):
+            entry = _json_fields(raw_row)
+            number = entry.get("number")
+            if type(number) is not int:
+                raise ListError("a schedule exception needs a run number")
+            if entry.keys() == {"number", "removed"} and entry["removed"] is True:
+                run: ScheduledRun | RemovedRun = RemovedRun.SKIPPED
+            elif entry.keys() == {"number", "start", "do"}:
+                run = ScheduledRun(_scheduled_time(_field_text(entry["start"], "start")), _field_text(entry["do"], "do"))
+            else:
+                raise ListError("invalid schedule exception")
+            exceptions.append(RunException(number, run))
+        schedule = ScheduledSeries(first, repeat_rule.parse(_field_text(fields["repeat"], "repeat")), runs_before,
+                                   tuple(exceptions))
+    _validate_schedule(schedule)
+    return schedule
+
+
+def _validate_scheduled_run(run: ScheduledRun) -> None:
+    _validate_time(run.start)
+    if not _field_text(run.words, "do").strip():
+        raise ListError("a Scheduled item needs words for At that time, do this")
+
+
+def _validate_schedule(schedule: object) -> None:
+    if isinstance(schedule, NoSchedule):
+        return
+    if isinstance(schedule, ScheduledRun):
+        _validate_scheduled_run(schedule)
+        return
+    if not isinstance(schedule, ScheduledSeries):
+        raise ListError("invalid List field: schedule")
+    _validate_scheduled_run(schedule.first)
+    if schedule.runs_before < 0:
+        raise ListError("the number of earlier runs must be nonnegative")
+    if repeat_rule.parse(schedule.rule.rrule) != schedule.rule:
+        raise ListError("invalid schedule repeat rule")
+    schedule.rule.validate_start(schedule.first.start)
+    seen: set[int] = set()
+    for entry in schedule.exceptions:
+        if entry.number <= schedule.runs_before or entry.number in seen:
+            raise ListError("a schedule exception must name a distinct run in the current series")
+        seen.add(entry.number)
+        if isinstance(entry.run, ScheduledRun):
+            _validate_scheduled_run(entry.run)
+
+
+def series_run_limit() -> int:
+    settings = conf.read("the_list")
+    limit = settings.origin("series_run_limit", conf.positive_whole)
+    if not isinstance(limit, conf.UsableLiveValue):
+        raise ListError(f"a repeat needs a valid series_run_limit in {settings.source}")
+    return limit.value
+
+
+def _check_series_limit(schedule: Schedule) -> None:
+    if isinstance(schedule, ScheduledSeries):
+        limit = series_run_limit()
+        if schedule.runs_before >= limit:
+            raise ListError(f"the series has no runs left under the limit of {limit}")
+        if isinstance(schedule.rule.end, repeat_rule.RunCount) and schedule.rule.end.count > limit - schedule.runs_before:
+            raise ListError(f"COUNT exceeds the series limit of {limit} runs")
 
 
 def parking_date(moment: datetime, zone: tzinfo) -> str:
@@ -675,6 +864,11 @@ def _validate(item: ListItem) -> None:
     _ = next_check_value(next_check_text(item.next_check))
     if (item.state == ItemState.CLOSED) != isinstance(item.closed, datetime):
         raise ListError("only a Closed item must have a closed time")
+    _validate_schedule(item.schedule)
+    if (item.state is ItemState.SCHEDULED) != (item.schedule is not NoSchedule.UNSET):
+        raise ListError("a schedule requires the Scheduled state and a start and words")
+    if item.state is ItemState.SCHEDULED and item.parked_until is not NoTimestamp.UNSET:
+        raise ListError("a Scheduled item cannot be parked")
     if item.state == ItemState.CLOSED:
         _validate_closing_words(item.closing_words)
     elif item.closing_words:
@@ -729,6 +923,8 @@ def _review_keys(value: object) -> tuple[str, ...]:
 
 def _log_fields(fields: LogFields) -> dict[str, object]:
     values: dict[str, object] = dict(fields)
+    if "schedule" in fields:
+        values["schedule"] = _schedule_fields(fields["schedule"])
     if "producer" in fields:
         values["producer"] = staff_id(fields["producer"], "producer")
     if "eta" in fields:
@@ -754,7 +950,9 @@ def _read_log_fields(raw: object, number: int) -> LogFields:
     for field, value in _json_fields(raw).items():
         if field not in LogFields.__annotations__:
             raise ListError(f"unknown List log field: {field}")
-        if field == "eta":
+        if field == "schedule":
+            values[field] = _read_schedule(value)
+        elif field == "eta":
             eta = _json_fields(value)
             text, kind = eta.get("value"), eta.get("kind")
             if not isinstance(text, str) or not isinstance(kind, str):
@@ -960,11 +1158,12 @@ def _read_field_change(action: Literal["Added", "Updated", "Parked", "Closed"], 
             valid = {"title", "owner", "producer", "state", "eta", "next_step", "latest_status"} <= fields.keys()
             valid = valid and fields.keys() <= ItemChanges.__annotations__.keys()
         case "Updated":
-            valid = bool(fields) and fields.keys() <= ItemChanges.__annotations__.keys()
+            allowed = ItemChanges.__annotations__.keys() | ({"parked_until"} if "schedule" in fields else set[str]())
+            valid = bool(fields) and fields.keys() <= allowed
         case "Parked":
-            valid = fields.keys() == {"parked_until"}
+            valid = fields.keys() in ({"parked_until"}, {"parked_until", "schedule", "state"})
         case "Closed":
-            valid = fields.keys() == {"closing_words"}
+            valid = fields.keys() in ({"closing_words"}, {"closing_words", "schedule"})
     if not valid:
         raise ListError(f"invalid fields in a {action} log entry")
     return FieldChange(action, fields)
@@ -1056,7 +1255,8 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
-                        delivery_state.read_list_questions(fields.get("questions", "[]")))
+                        delivery_state.read_list_questions(fields.get("questions", "[]")),
+                        _read_schedule(cast(object, json.loads(fields.get("schedule", "null")))))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -1091,6 +1291,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "requested_by": item.requested_by.value,
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
+    if item.schedule is not NoSchedule.UNSET:
+        fields["schedule"] = json.dumps(_schedule_fields(item.schedule), ensure_ascii=False)
     if item.questions:
         fields["questions"] = json.dumps([question_record.stored(question) for question in item.questions], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
@@ -1273,6 +1475,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
                                 "requested_by": item.requested_by, **changes}
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
+        _check_series_limit(item.schedule)
         _check_links(read_reference, item.number, changes)
         _require_active_open_producers((item,))
         store.reserve_number(chosen)
@@ -1305,8 +1508,16 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         moment = now()
         changed = edit(item, moment)
         entries: list[ItemChange] = []
-        if changed != item:
+        schedule_changed = _schedule_fields(item.schedule) != _schedule_fields(changed.schedule)
+        if changed != item or schedule_changed:
             event = what(changed) if callable(what) else what
+            if isinstance(event, FieldChange) and schedule_changed:
+                log_fields: LogFields = {**event.fields, "schedule": changed.schedule}
+                if event.action != "Closed" and item.state != changed.state:
+                    log_fields["state"] = changed.state
+                if event.action != "Closed" and item.parked_until != changed.parked_until:
+                    log_fields["parked_until"] = changed.parked_until
+                event = replace(event, fields=log_fields)
             entries.append(ItemChange(moment, event, source))
             changed = replace(changed, updated=moment, unread_since=moment if unread else NoTimestamp.UNSET)
             if (isinstance(event, FieldChange) and event.action == "Updated"
@@ -1405,13 +1616,98 @@ def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
     return changed, unchanged
 
 
+def _require_schedule_scope(schedule: Schedule, scope: ScheduleScope) -> None:
+    if isinstance(schedule, ScheduledSeries):
+        if scope is ScheduleScope.UNSPECIFIED:
+            raise ListError("use --scope this, following, or all for a repeated item")
+    elif scope is not ScheduleScope.UNSPECIFIED:
+        raise ListError("--scope needs a repeated item")
+
+
+def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: datetime, limit: int) -> SeriesRun:
+    selected = series.next_run(moment, limit)
+    if isinstance(selected, repeat_rule.NoNextRun):
+        raise ListError("the series has no next run. Use --scope all")
+    if scope is ScheduleScope.FOLLOWING and selected.number == 1:
+        raise ListError("--scope following is available from the second run. Use --scope all")
+    return selected
+
+
+def _replace_series_run(series: ScheduledSeries, number: int, run: ScheduledRun | RemovedRun) -> ScheduledSeries:
+    exceptions = tuple(entry for entry in series.exceptions if entry.number != number)
+    return replace(series, exceptions=(*exceptions, RunException(number, run)))
+
+
+def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleScope, moment: datetime) -> Schedule:
+    _require_schedule_scope(schedule, scope)
+    if isinstance(schedule, NoSchedule):
+        if "start" not in edits or "words" not in edits:
+            raise ListError("use --start and --do for a new schedule")
+        run = ScheduledRun(edits["start"], edits["words"])
+        rule = edits.get("repeat", NoSchedule.UNSET)
+        return ScheduledSeries(run, rule) if isinstance(rule, repeat_rule.RepeatRule) else run
+    if isinstance(schedule, ScheduledRun):
+        run = ScheduledRun(edits.get("start", schedule.start), edits.get("words", schedule.words))
+        rule = edits.get("repeat", NoSchedule.UNSET)
+        return ScheduledSeries(run, rule) if isinstance(rule, repeat_rule.RepeatRule) else run
+    if scope is ScheduleScope.ALL:
+        rule = edits.get("repeat", schedule.rule)
+        run = ScheduledRun(edits.get("start", schedule.first.start), edits.get("words", schedule.first.words))
+        if not isinstance(rule, repeat_rule.RepeatRule):
+            return run
+        exceptions = schedule.exceptions
+        if _schedule_time_text(run.start) != _schedule_time_text(schedule.first.start) or rule != schedule.rule:
+            exceptions = ()
+        elif "words" in edits:
+            exceptions = tuple(replace(entry, run=replace(entry.run, words=run.words))
+                               if isinstance(entry.run, ScheduledRun) else entry for entry in exceptions)
+        return ScheduledSeries(run, rule, schedule.runs_before, exceptions)
+    selected = _scoped_series_run(schedule, scope, moment, series_run_limit())
+    if scope is ScheduleScope.THIS:
+        if "repeat" in edits:
+            raise ListError("change a repeat rule with --scope following or all")
+        run = ScheduledRun(edits.get("start", selected.run.start), edits.get("words", selected.run.words))
+        if _schedule_fields(run) == _schedule_fields(selected.run):
+            return schedule
+        if run.start.astimezone(UTC) < moment.astimezone(UTC):
+            raise ListError("choose a time on or after now for this run")
+        return _replace_series_run(schedule, selected.number, run)
+    run = ScheduledRun(edits.get("start", selected.original), edits.get("words", schedule.first.words))
+    rule = edits.get("repeat", schedule.rule)
+    if not isinstance(rule, repeat_rule.RepeatRule):
+        return run
+    if "repeat" not in edits and isinstance(rule.end, repeat_rule.RunCount):
+        rule = replace(rule, end=repeat_rule.RunCount(rule.end.count - (selected.number - schedule.runs_before - 1)))
+    return ScheduledSeries(run, rule, runs_before=selected.number - 1)
+
+
+def _remove_schedule(schedule: Schedule, scope: ScheduleScope, moment: datetime) -> Schedule:
+    _require_schedule_scope(schedule, scope)
+    if not isinstance(schedule, ScheduledSeries) or scope is ScheduleScope.ALL:
+        return NoSchedule.UNSET
+    limit = series_run_limit()
+    selected = _scoped_series_run(schedule, scope, moment, limit)
+    if scope is ScheduleScope.THIS:
+        series = _replace_series_run(schedule, selected.number, RemovedRun.SKIPPED)
+        if isinstance(series.next_run(moment, limit), SeriesRun):
+            return series
+    return NoSchedule.UNSET
+
+
+def _say_schedule(schedule: Schedule) -> None:
+    if isinstance(schedule, ScheduledSeries):
+        print("Repeats: " + schedule.rule.describe(schedule.first.start), flush=True)
+    elif isinstance(schedule, ScheduledRun):
+        print("Does not repeat", flush=True)
+
+
 def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str) -> ListItem:
     return _update(keeper, identity, changes, source=source).item
 
 
 _LAUNCHER = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
 _PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence",
-                           "title", "done_when")
+                           "title", "done_when", "start", "do", "repeat", "scope")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
 
 
@@ -1463,7 +1759,9 @@ def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
 
 
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str, add_evidence: str = "",
-            assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED) -> ListEdit:
+            assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED,
+            schedule_edits: ScheduleChanges | None = None, schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
+            say_schedule: bool = False) -> ListEdit:
     scope: staff.StaffId | AllItems = AllItems.INCLUDED
     if assigned_to is not AllItems.INCLUDED:
         _check_producer_update_fields(changes)
@@ -1474,19 +1772,41 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         source = assigned_to.name
         scope = assigned_to.id
 
-    def edit(item: ListItem, _: datetime) -> ListItem:
+    def edit(item: ListItem, moment: datetime) -> ListItem:
         _open(item)
-        if changes.get("state") == ItemState.CLOSED:
+        state = changes.get("state", item.state)
+        if state is ItemState.CLOSED:
             raise ListError("use close to record closing words and a time")
         changed = replace(item, **changes)
+        if schedule_edits:
+            if state is not ItemState.SCHEDULED:
+                raise ListError("use --state Scheduled with schedule fields")
+            changed = replace(changed, schedule=_schedule_edit(item.schedule, schedule_edits, schedule_scope, moment))
+        elif item.state is ItemState.SCHEDULED and state is not ItemState.SCHEDULED:
+            schedule = _remove_schedule(item.schedule, schedule_scope, moment)
+            changed = (replace(changed, state=ItemState.SCHEDULED, schedule=schedule)
+                       if isinstance(schedule, ScheduledSeries) else replace(changed, schedule=schedule))
+        elif schedule_scope is not ScheduleScope.UNSPECIFIED:
+            raise ListError("--scope needs a schedule change or removal")
+        elif "schedule" in changes:
+            _require_schedule_scope(item.schedule, schedule_scope)
+        if changed.state is ItemState.SCHEDULED:
+            changed = replace(changed, parked_until=NoTimestamp.UNSET)
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
+        if _schedule_fields(changed.schedule) != _schedule_fields(item.schedule):
+            if schedule_edits or "schedule" in changes:
+                _check_series_limit(changed.schedule)
+            if say_schedule:
+                _say_schedule(changed.schedule)
         return changed
 
     def event(changed: ListItem) -> FieldChange:
         fields: LogFields = {**changes}
+        if "state" in fields:
+            fields["state"] = changed.state
         if add_evidence:
             fields["evidence"] = changed.evidence
         return FieldChange("Updated", fields)
@@ -1539,7 +1859,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
-         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+         schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
     if isinstance(until, datetime):
@@ -1554,8 +1875,16 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         _open(item)
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")
-        return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, event, source, page_action=notice, assigned_to=assigned_to).item
+        schedule = _remove_schedule(item.schedule, schedule_scope, moment)
+        if isinstance(schedule, ScheduledSeries):
+            return replace(item, schedule=schedule)
+        state = ItemState.WORKING if item.state is ItemState.SCHEDULED else item.state
+        return replace(item, state=state, schedule=schedule, parked_until=until)
+
+    def parking_event(changed: ListItem) -> FieldChange:
+        return FieldChange("Updated", {}) if changed.state is ItemState.SCHEDULED else event
+
+    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to).item
 
 
 def unread_delivery(item: ListItem) -> bool:
@@ -1583,9 +1912,13 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
-          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
+        schedule = _remove_schedule(item.schedule, schedule_scope, moment)
+        if isinstance(schedule, ScheduledSeries):
+            return replace(item, schedule=schedule)
         if item.state == ItemState.CLOSED:
             if item.closing_words == words:
                 return item
@@ -1594,8 +1927,14 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         closed_questions = tuple(ItemChange(moment, QuestionClosed(question), source)
                                  for question in item.questions if question.answer is None)
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
-                       questions=answered, log=(*item.log, *closed_questions))
-    return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
+                       questions=answered, log=(*item.log, *closed_questions), schedule=schedule)
+
+    def close_event(changed: ListItem) -> FieldChange:
+        if changed.state is ItemState.SCHEDULED:
+            return FieldChange("Updated", {})
+        return FieldChange("Closed", {"closing_words": words})
+
+    return _change(keeper, identity, edit, close_event, source,
                    unread=False, page_action=notice, assigned_to=assigned_to).item
 
 
@@ -2036,6 +2375,13 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
     for item in visible:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
+        if isinstance(item.schedule, ScheduledRun):
+            state += " · Starts " + _schedule_time_text(item.schedule.start)
+        elif isinstance(item.schedule, ScheduledSeries):
+            state += " · Starts " + _schedule_time_text(item.schedule.first.start)
+            state += " · " + item.schedule.rule.describe(item.schedule.first.start)
+            next_run = item.schedule.next_run(moment, series_run_limit())
+            state += " · next " + _schedule_time_text(next_run.run.start) if isinstance(next_run, SeriesRun) else " · no runs remain"
         if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()
         if item.state != ItemState.CLOSED and isinstance(item.next_check, CheckCondition):
@@ -2089,6 +2435,10 @@ def _check_cli_text_limits(changes: ItemChanges, add_evidence: str | None) -> No
             raise ListError(f"{option} limit is {limit.value} {unit}. write it for nate: two short sentences")
 
 
+def _cli_state(value: str) -> str:
+    return ItemState.SCHEDULED.value if value == "scheduled" else value
+
+
 def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evidence: str | None) -> ItemChanges:
     options = cast(dict[str, object], vars(args))
     changes: ItemChanges = {}
@@ -2130,6 +2480,19 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evi
         changes["related_to"] = tuple(int(text.removeprefix("L").removeprefix("#")) for text in cast(list[str], related_to))
     _check_cli_text_limits(changes, add_evidence)
     return changes
+
+
+def _cli_schedule_edits(args: argparse.Namespace) -> ScheduleChanges:
+    options = cast(dict[str, object], vars(args))
+    edits: ScheduleChanges = {}
+    start, words, rule = options.get("start"), options.get("do"), options.get("repeat")
+    if isinstance(start, str):
+        edits["start"] = _scheduled_time(start)
+    if isinstance(words, str):
+        edits["words"] = words
+    if isinstance(rule, str):
+        edits["repeat"] = repeat_rule.parse(rule) if rule else NoSchedule.UNSET
+    return edits
 
 
 def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
@@ -2208,10 +2571,18 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--producer")
             for key in ("unit", "next-check", "eta", "next-step", "latest-status", "evidence", "add-evidence", "done-when"):
                 _ = command.add_argument("--" + key)
-            _ = command.add_argument("--state", choices=[state.value for state in ItemState if state != ItemState.CLOSED])
+            _ = command.add_argument("--state", type=_cli_state,
+                                     choices=[state.value for state in ItemState if state != ItemState.CLOSED])
+            _ = command.add_argument("--start", help="ISO time with an offset or [IANA zone]")
+            _ = command.add_argument("--do", help="At that time, do this")
+            _ = command.add_argument("--repeat", help="RFC 5545 rule, or empty to remove the repeat")
             _ = command.add_argument("--requested-by", choices=list(RequestedBy))
             _ = command.add_argument("--blocked-by", nargs="*")
             _ = command.add_argument("--related-to", nargs="*")
+        if name in ("update", "park", "close"):
+            _ = command.add_argument("--scope", type=ScheduleScope,
+                                     choices=(ScheduleScope.THIS, ScheduleScope.FOLLOWING, ScheduleScope.ALL),
+                                     default=ScheduleScope.UNSPECIFIED)
         if name == "add":
             _ = command.add_argument("--number", type=int)
         elif name == "park":
@@ -2272,6 +2643,7 @@ def main(argv: list[str] | None = None) -> int:
             if incomplete:
                 raise ListError("The List results are incomplete. Could not read every record.")
             return 0
+        schedule_scope = cast(ScheduleScope, getattr(args, "scope", ScheduleScope.UNSPECIFIED))
         if name == "update":
             identity = cast(str, args.id)
             if identity.isascii() and identity.isdecimal():
@@ -2279,14 +2651,17 @@ def main(argv: list[str] | None = None) -> int:
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
-                                              if value is not None and key not in {"command", "id", "source"})
+                                              if value is not None and key not in {"command", "id", "source"}
+                                              and value is not ScheduleScope.UNSPECIFIED)
                 _ = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source or "",
-                            add_evidence=add_evidence or "", assigned_to=caller)
+                            add_evidence=add_evidence or "", assigned_to=caller,
+                            schedule_edits=_cli_schedule_edits(args), schedule_scope=schedule_scope, say_schedule=True)
                 return 0
             if source is None:
                 parser.error("update requires --source for morty")
             changed = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source,
-                              add_evidence=add_evidence or "")
+                              add_evidence=add_evidence or "", schedule_edits=_cli_schedule_edits(args),
+                              schedule_scope=schedule_scope, say_schedule=True)
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
@@ -2343,15 +2718,26 @@ def main(argv: list[str] | None = None) -> int:
             owner = changes.get("owner")
             if owner is None:
                 raise ListError("owner must name a showrunner staff id")
+            schedule_edits = _cli_schedule_edits(args)
+            if schedule_edits or changes.get("state") is ItemState.SCHEDULED:
+                if changes.get("state") is not ItemState.SCHEDULED:
+                    raise ListError("use --state Scheduled with schedule fields")
+                schedule = _schedule_edit(NoSchedule.UNSET, schedule_edits, ScheduleScope.UNSPECIFIED, now())
+                _validate_schedule(schedule)
+                _check_series_limit(schedule)
+                changes["schedule"] = schedule
+                _say_schedule(schedule)
             item = add(keeper, cast(str, args.title), owner=owner, source=source,
                        number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes,
                        assigned_to=assigned_to)
             print(item.id)
             return _notify_producer_assignment(item, keeper, keeper, caller=caller.id)
         elif name == "park":
-            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source, assigned_to=assigned_to)
+            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source,
+                     assigned_to=assigned_to, schedule_scope=schedule_scope)
         elif name == "close":
-            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
+            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source,
+                      assigned_to=assigned_to, schedule_scope=schedule_scope)
         elif name == "reopen":
             _ = reopen(keeper, cast(str, args.id), source=source)
         else:

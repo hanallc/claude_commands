@@ -560,7 +560,7 @@ The log keeps dated changes in file order, newest last, with the source on each 
 The Added line preserves initial field values, including state, ETA, next step, and latest status.
 Quoted log values preserve line endings as JSON escapes.
 
-States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
+States are `New`, `Working`, `Scheduled`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
@@ -597,6 +597,26 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+
+Add or update a Scheduled item with `--state Scheduled --start <time> --do <words>`.
+Use an ISO time with an offset or an IANA zone in brackets.
+For example, use `--start '2026-11-30T09:00[America/Los_Angeles]'` to keep 09:00 across daylight-saving changes.
+Use `--repeat 'FREQ=WEEKLY;BYDAY=MO'` to repeat on Mondays.
+The CLI prints the rule in words before it saves the schedule.
+The schedule stores its start and instruction in the `schedule` field.
+A series also stores its RRULE, the number of earlier runs, and changes or removals for specific runs.
+Old records without the field have no schedule.
+The `list` command shows the start, repeat rule in words, and next run.
+
+Use `--scope this|following|all` to change or remove a repeat with `update`, `park`, or `close`.
+Use `this` to change the next run's start or words, or to skip the next run.
+Use `following` from the second run to apply the change from the next run.
+Use `all` to change or remove the series.
+Use `--repeat ''` to remove the repeat and keep one scheduled run.
+Use `update --state Working`, `park`, or `close` to remove the schedule.
+The record keeps its earlier log entries when the schedule changes or ends.
+A producer can change its own schedules. Morty can change all schedules.
+The CLI stores the schedule for later delivery.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
@@ -645,8 +665,9 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 | `next_step_max_chars` | 160 characters for the next step |
 | `done_when_max_chars` | 160 characters for done-when |
 | `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
+| `series_run_limit` | 730 runs per series, including the start |
 
-The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
+The CLI refuses a write if the applicable text setting is missing, invalid, or too small for the supplied text.
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
