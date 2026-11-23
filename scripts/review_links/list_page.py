@@ -1860,10 +1860,8 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || dateTimePickerOpen(document) || !current()) return;
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
- if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false'){
-  if(listCounts) await listCounts;
-  if(current()) tableView.finishDeliveryWindow(delivery);
- }
+ if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
+  tableView.finishDeliveryWindow(delivery);
  return pageRefreshFacts(page);
 }
 function applyListSnapshot(fresh){

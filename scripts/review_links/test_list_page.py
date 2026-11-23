@@ -677,7 +677,7 @@ window.fetch=async (path,options={})=>{
  requests.push([request.pathname+request.search,options.body && JSON.parse(options.body)]);
  if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
  if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
- return Response.json({id:'Q1',key:'fixture-review-key',list_key:created});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
             "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
@@ -727,8 +727,11 @@ window.fetch=async (path,options={})=>{
  const saved=requests.find(([,body])=>body?.words);
  check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
        'Send uses the shared endpoint and the selected List owner.');
- document.querySelector('#list-search').value='';
- document.querySelector('#list-search').dispatchEvent(new Event('input',{bubbles:true}));
+ const searchField=document.querySelector('#list-search');
+ await new Promise(done=>{
+  searchField.addEventListener('filterchange',done,{once:true});
+  searchField.value='';searchField.dispatchEvent(new Event('input',{bubbles:true}));
+ });
  row().querySelector('.list-toggle').click();
  check(recordIsOpen(row()),'A click opens the row.');
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
@@ -739,6 +742,85 @@ window.fetch=async (path,options={})=>{
             with self.subTest(status=status):
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
                     "status": status, "body": body})))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_new_item_question_keeps_the_filters_and_the_scroll(self) -> None:
+        # List item 237: a question sent from the New item dialog cleared the filters and jumped to the end.
+        root = self.root / "reviews"
+        for number in range(1, 25):
+            item = self.add(f"Needs me item {number}", number=number)
+            _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+        for number in range(25, 31):
+            _ = self.add(f"Working item {number}", number=number)
+        markup = list_page.render(root, include_counts=False)
+        self.assertRegex(markup.decode(), r'data-filter-value="needs-me"[^>]*data-filter-count="24"')
+        initial = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)),
+                                        new_item_dialog.render).decode()
+        _ = self.add("A Working item after the send", number=31)
+        fresh = list_page.render(root, include_counts=False).decode()
+        setup = r"""<script>
+const owner=__OWNER__,fresh=__FRESH__;
+let reads=0;
+window.setInterval=()=>0;
+window.fetch=async (path,options={})=>{
+ if(path===location.pathname){
+  if(options.method==='POST') return Response.json({});
+  reads++;
+  return new Response(fresh);
+ }
+ const request=new URL(path,location.href);
+ if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
+ if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
+ return Response.json({id:'Q1',key:'fixture-review-key'});
+};
+</script>""".replace("__OWNER__", json.dumps(MORTY.id)).replace(
+            "__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=(target,test)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(test()){observer.disconnect();resolve();}});
+  observer.observe(target,{subtree:true,childList:true,attributes:true});
+  if(test()){observer.disconnect();resolve();}
+ });
+ const frames=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const needsMe=()=>document.querySelector('[data-filter-value="needs-me"]');
+ needsMe().click();
+ const row=()=>document.querySelector('[data-list-item][data-number="18"]');
+ row().querySelector('.list-toggle').click();
+ const summaryTop=()=>row().querySelector('.list-row').getBoundingClientRect().top;
+ scrollBy({top:summaryTop()-150,behavior:'instant'});
+ await frames();
+ const hash=location.hash,top=summaryTop(),scroll=scrollY;
+ const params=new URLSearchParams(hash.slice(1));
+ check(needsMe().getAttribute('aria-pressed')==='true' && params.get('show')==='needs-me' &&
+  params.get('item')===row().dataset.key && recordIsOpen(row()) && scroll>0,
+  'Needs me is on and the page is scrolled to the open row. Found '+hash+' at '+scroll+' px.');
+ const dialog=document.querySelector('#review-new-item');
+ document.querySelector('.page-heading-actions [data-owner-new]').click();
+ const recipient=()=>dialog.querySelector('[name="recipient_id"]:checked');
+ await until(dialog,recipient);
+ dialog.querySelector('[name="kind"][value="question"]').click();
+ dialog.querySelector('[name="include_page"]').click();
+ const words=dialog.querySelector('textarea');
+ words.value='Why did the check fail?';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ dialog.querySelector('[type="submit"]').click();
+ await until(dialog,()=>!dialog.open);
+ await until(document.body,()=>document.querySelector('[data-list-item][data-number="31"]'));
+ await frames();
+ check(reads===1,'The question refreshes the List once. Found '+reads+' reads.');
+ check(needsMe().getAttribute('aria-pressed')==='true','The Needs me chip stays on.');
+ check(location.hash===hash,'The address keeps its filters. Expected '+hash+'. Found '+location.hash+'.');
+ check(scrollY===scroll,'The page keeps its scroll. Expected '+scroll+' px. Found '+scrollY+' px.');
+ check(recordIsOpen(row()) && summaryTop()===top,
+  'The open row keeps its top. Expected '+top+' px. Found '+summaryTop()+' px.');
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>"""
+        self.browser_actions(initial, setup, probe, reduced_motion=True, window_size=(1280, 720))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_retry_refreshes_without_revealing_the_saved_row(self) -> None:
