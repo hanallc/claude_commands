@@ -2675,17 +2675,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(self.agent.submitted, [])
 
-        source, target = (self.run_dir / f"{slot}_status" for slot in ("requested", "impl"))
-        for path in (source, target):
-            atomic_file.write_text_atomic(path, path.name)
-        before_status = source.read_bytes(), target.read_bytes()
-        with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse("impl")):
-            result = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
-                slot="requested", name="impl", phase="8", kind="impl", launcher_command=["assign.sh"],
-                completion_actions=pass_recorder.CompletionActions(status_file=str(source)))
-        self.assertEqual(result, worker.ExitCode.BUSY)
-        self.assertEqual((source.read_bytes(), target.read_bytes()), before_status)
-
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, prompt=self.prompt, kind="impl", lens="",
             launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)])

@@ -20,7 +20,7 @@ from uuid import UUID
 
 from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, pass_record, progress_history, recorder_state
+from scripts.direct import assign, assign_claude, pass_record, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
@@ -689,6 +689,10 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertEqual(len(self.native.fixture.world.launches), launches + 1)
 
 
+    def assert_lock_held(self, path: Path) -> None:
+        with path.open("a") as lock, self.assertRaises(BlockingIOError):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_incomplete_dispatch_rerun_keeps_its_pass_and_only_waits(self) -> None:
         self.native.agent.without_done = True
         first = self.launch()
@@ -713,9 +717,7 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         def restore_under_lock(path: Path, data: bytes, *, mode: int | None = None) -> None:
             if path == prompt:
-                with pass_record.recorder_lock_path(self.session_dir).open() as lock:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assert_lock_held(pass_record.recorder_lock_path(self.session_dir))
             write_bytes(path, data, mode=mode)
 
         for pass_status in ("active", "completed"):
@@ -770,11 +772,7 @@ class AssignLauncherTests(HookAssignmentFixture):
             def close_phase(row: staff.StaffRow, line: str, dispatch_id: str, *,
                             run: Path) -> worker.DispatchReceipt:
                 result = receipt(row, line, dispatch_id, run=run)
-                with pass_record.recorder_lock_path(run).open("a") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                    closed = pass_record.read_state(run, resolve_staff=False)
-                    closed[recorder_state.OPEN_PHASES_KEY] = []
-                    pass_record.write_state(run, closed)
+                self.record("finish-phase", "--phase-id", "7", "--status", "completed")
                 return result
 
             with patch.object(worker, "dispatch_receipt", side_effect=close_phase):
@@ -962,9 +960,25 @@ class AssignLauncherTests(HookAssignmentFixture):
 
     def test_a_fix_with_round_resolution_disabled_keeps_the_round_in_flight(self) -> None:
         self.start_repair()
+        self.native.agent.finish_after = 100
         with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "0"}):
             _ = self.successful("fix", execution=InProcessAssignment())
         self.assertEqual(self.repair_state()["in_flight"], ["F001"])
+        with self.subTest(retry="the repair round ends after preflight"):
+            prompt = Path(str(pass_record.pass_slots(pass_record.read_state(self.session_dir))["fix"]["prompt_file"]))
+            write_text_atomic(prompt, "Damaged prompt.\n")
+            claim_phase = cast(Callable[..., bool], assign_claude.claim_phase)
+
+            def abandon_round(*args: object, **kwargs: object) -> bool:
+                _ = self.finding_command("abandon", "--reason", "The repair round ended.")
+                return claim_phase(*args, **kwargs)
+
+            with patch.object(assign_claude, "claim_phase", side_effect=abandon_round):
+                refused = self.launch("fix")
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("Fix launch has no ledger round in flight", refused.stderr)
+            self.assertEqual(prompt.read_text(), "Damaged prompt.\n")
+            self.assertEqual(self.turn_starts, 1)
 
     def test_an_implementation_dispatch_does_not_resolve_a_repair_round(self) -> None:
         self.start_repair()
@@ -1192,7 +1206,8 @@ class AssignLauncherTests(HookAssignmentFixture):
         for text in ("detached_runs.py start", "--kind python-tests before --", "Simple, Fast and Beautiful", "poll"):
             self.assertIn(text, prompt)
         self.assertEqual(read_object(manifest), {"worker": name, "round": 1,
-                                               "paths": ["src/worker.py", "tests/test_worker.py"]})
+                                               "paths": ["src/worker.py", "tests/test_worker.py"],
+                                               "pass_instance_id": passed["instance_id"]})
         self.assertEqual((manifest.parent / f"{name}_status").read_text().strip(), "done")
         self.assertTrue((manifest.parent / f"{name}_summary.txt").read_text().strip())
         self.assertEqual(reply_file.read_text(), (manifest.parent / f"{name}_summary.txt").read_text())
@@ -1205,47 +1220,54 @@ class AssignLauncherTests(HookAssignmentFixture):
         run_command = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         start_pass = pass_record.start_pass
         write_manifest = atomic_file.write_text_atomic
-        ticket = "style-ticket-fixture"
+        interrupted_ticket = "style-ticket-interrupted"
+        interrupted = False
 
         def check_worker_arguments(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             if len(command) > 2 and Path(command[1]).name == "worker.py" and command[2] == "assign":
                 _ = run_command([sys.executable, "-c", "pass", *command[2:]], check=True)
             return run_command(command, **options)
 
-        def check_ticket_lock() -> None:
-            with (manifest.parent / "ticket-paths.lock").open("a") as lock:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
         def start_with_ticket_lock(args: argparse.Namespace,
                               selection: pass_record.DispatchSelection | pass_record.SelectDispatchAtRecorder
                               ) -> str:
             instance = start_pass(args, selection)
-            if pass_record.optional_arg(args, "team_slot") == ticket:
-                check_ticket_lock()
+            if pass_record.optional_arg(args, "team_slot").startswith("style-ticket-"):
+                self.assert_lock_held(manifest.parent / "ticket-paths.lock")
             return instance
 
         def write_with_ticket_lock(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
-            if path == manifest and assign.object_map(cast(object, json.loads(text))).get("worker") == ticket:
-                check_ticket_lock()
+            nonlocal interrupted
+            if path == manifest and (pass_record.json_object(text) or {}).get("worker") == interrupted_ticket:
+                self.assert_lock_held(manifest.parent / "ticket-paths.lock")
+                if not interrupted:
+                    interrupted = True
+                    raise OSError("Manifest publication interrupted.")
             write_manifest(path, text, new_file_mode=new_file_mode)
 
         self.native.agent.during_prompt = lambda: None
-        for round_number, case in enumerate(("stale manifest", "large paths", ticket), start=2):
+        for round_number, case in enumerate(("stale manifest", "large paths", interrupted_ticket), start=2):
             with self.subTest(admission=case):
                 paths = self.paths.read_text().splitlines()
                 manifest = manifest.parent / f"dispatch_{round_number}_paths.json"
-                if case == "stale manifest":
+                if case in ("stale manifest", interrupted_ticket):
                     write_text_atomic(manifest, json.dumps({"worker": "refused", "round": round_number, "paths": ["stale"]}))
                 elif case == "large paths":
                     paths = [f"src/{index:04d}-{'x' * 48}.py" for index in range(3300)]
                     write_text_atomic(self.paths, "\n".join(paths) + "\n")
-                worker_name = ticket if case == ticket else f"impl{round_number}"
+                worker_name = case if case.startswith("style-ticket-") else f"impl{round_number}"
                 with (patch.object(subprocess, "run", side_effect=check_worker_arguments),
                       patch.object(pass_record, "start_pass", side_effect=start_with_ticket_lock),
                       patch.object(atomic_file, "write_text_atomic", side_effect=write_with_ticket_lock)):
+                    if case == interrupted_ticket:
+                        refused = self.launch("implement", "--to", worker_name)
+                        self.assertEqual(refused.returncode, worker.ExitCode.UNCERTAIN, refused.stderr)
+                        self.assertIn("Manifest publication interrupted.", refused.stderr)
+                        self.assertEqual(self.turn_starts, round_number - 1)
                     _ = self.successful("implement", "--to", worker_name)
-                self.assertEqual(read_object(manifest), {"worker": worker_name, "round": round_number, "paths": paths})
+                passed = pass_record.pass_slots(read_object(self.session_dir / unit_runs.STATE_FILE))[worker_name]
+                self.assertEqual(read_object(manifest), {"worker": worker_name, "round": round_number,
+                                                       "paths": paths, "pass_instance_id": passed["instance_id"]})
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
@@ -1558,6 +1580,9 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.native.fixture.world.first_turn_timeout = True
         saved_state = state_path.read_bytes()
         manifest = status.parent / "dispatch_1_paths.json"
+        published = read_object(manifest)
+        published["paths"] = [*pass_record.string_list(published["paths"]), "src/widened.py"]
+        write_text_atomic(manifest, json.dumps(published))
         saved_manifest = manifest.read_bytes()
         prompt = Path(str(passed["prompt_file"]))
         content = prompt.read_bytes()
@@ -1575,6 +1600,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         saved = worker_panes.worker_pass(opened.row, self.session_dir)
         self.assertEqual(prompt.read_bytes(), content)
+        self.assertEqual(manifest.read_bytes(), saved_manifest)
         self.assertEqual(saved["instance_id"], passed["instance_id"])
         self.assertEqual(saved["assign_status_file"], str(status))
         self.assertEqual(progress_history.dispatch_delivery(saved).actions.status_file, str(status))

@@ -25,6 +25,7 @@ from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
@@ -555,18 +556,15 @@ def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: li
     actions = pass_recorder.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
         style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
-    path_file = directory / f".assignment-paths.{instance}.json"
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
-                "--new-pass-instance-id", str(instance), "--assignment-paths-file", str(path_file)]
+                "--new-pass-instance-id", str(instance)]
     worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
-    with log.open("a") as output:
+    with log.open("a") as output, TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
         offset = output.tell()
-        try:
-            write_text_atomic(path_file, json.dumps(paths))
-            result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
-        finally:
-            with suppress(OSError):
-                path_file.unlink(missing_ok=True)
+        path_file = Path(temporary) / "paths.json"
+        write_text_atomic(path_file, json.dumps(paths))
+        result = subprocess.run([*command, "--assignment-paths-file", str(path_file)], env=worker_env, text=True,
+                                stdout=output, stderr=subprocess.STDOUT)
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
