@@ -706,7 +706,10 @@ process.stdout.write(JSON.stringify({
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
                     title = cast(memory_feed.QueueRowTitle, row["title"])
-                    step = title["step"] if row["unit"] not in ("", "—") else ""
+                    # A row with no unit shows the step after ": " in its name.
+                    name = str(row["name"])
+                    step = (title["step"] if row["unit"] not in ("", "—") else
+                            name.partition(": ")[2])
                     self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":

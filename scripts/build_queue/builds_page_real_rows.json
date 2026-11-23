@@ -1,0 +1,837 @@
+{
+ "about": "Rows in the shape of the live Builds feed of 2026-11-23 12:30 PST, for the standing orders check in memory_page_proof.mjs. Times move to the proof reading time. The running hana CI row is admitted, so it shows.",
+ "staff_names": {
+  "admin-console": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">admin-console</span>",
+  "aws": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">aws</span>",
+  "builds": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">builds</span>",
+  "cables": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">cables</span>",
+  "cargo-liner": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">cargo-liner</span>",
+  "cargo-liner-style": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">cargo-liner-style</span>",
+  "errors": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">errors</span>",
+  "hana": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">hana</span>",
+  "inspectors": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">inspectors</span>",
+  "natedev": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">natedev</span>",
+  "natemerge": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">natemerge</span>",
+  "natest": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">natest</span>",
+  "phases": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">phases</span>",
+  "sdlc": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">sdlc</span>",
+  "spacetime": "<span class=\"staff-name\" data-color-text=\"role.showrunner\" style=\"color:#a379fd\">spacetime</span>",
+  "unit-board": "<span class=\"staff-name\" data-color-text=\"role.unit-director\" style=\"color:#ffaf02\">unit-board</span>"
+ },
+ "build_tools_bytes": 7665958912,
+ "queued_priority_units": [
+  "cables"
+ ],
+ "move_revision": "68123fca9eaf412daeeeb4f3f61fc82b",
+ "walk": [
+  {
+   "name": "hana CI",
+   "title": {
+    "unit": "",
+    "step": "hana CI · hana-linux-2 · check"
+   },
+   "about": "Runs the CI builds and tests",
+   "showrunner": "",
+   "unit": "",
+   "ci_label": "hana CI · hana-linux-2 · check",
+   "owner_text": "hana CI",
+   "state": "",
+   "pid": 1544783,
+   "detail": "2 of 2 runners busy · 2 h 13 min",
+   "used": 0.1060791015625,
+   "counted": 0.0,
+   "reserved": 0.0,
+   "started_at": 192048.33129167557,
+   "queued": false,
+   "keep_text": "hana-linux-1 · tests · 32 min · 41 MiB\nhana-linux-2 · check · 2 h 13 min · 67 MiB\nhana CI uses 0.1 GiB now. This use is part of the work inside the cap.",
+   "group": "",
+   "ci": true,
+   "parts": [],
+   "ci_runners": [
+    {
+     "unit": "github-runner-hana-linux-1.service",
+     "name": "hana-linux-1",
+     "state": "busy",
+     "used": 0.03963470458984375,
+     "pid": 3976835,
+     "started_at": 198098.4112918377,
+     "job": "tests"
+    },
+    {
+     "unit": "github-runner-hana-linux-2.service",
+     "name": "hana-linux-2",
+     "state": "busy",
+     "used": 0.06582260131835938,
+     "pid": 1544783,
+     "started_at": 192048.33129167557,
+     "job": "check"
+    }
+   ],
+   "ci_cgroup": "/sys/fs/cgroup/hana.slice/hana-ci.slice",
+   "admitted": true,
+   "progress": {
+    "kind": "NoProgress",
+    "reason": "no admission counter"
+   },
+   "machine": "natedev",
+   "vcpus": 32,
+   "key": "7519af51c0d81757d5457e18"
+  },
+  {
+   "kind": "mac-build",
+   "name": "inspectors: mend",
+   "title": {
+    "unit": "inspectors",
+    "step": "mend"
+   },
+   "verify": {
+    "verb": "lint",
+    "call": "verify lint",
+    "position": 1,
+    "total": 2,
+    "step": "mend"
+   },
+   "about": "Checks the code and formatting",
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "inspectors"
+    },
+    {
+     "kind": "text",
+     "text": ": mend"
+    }
+   ],
+   "showrunner": "hana",
+   "unit": "inspectors",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "hana",
+   "worker": "",
+   "gate_label": "placement v20261123T183650-3776023-4413-step-3/4cc773aa050a4c06baf7521849d51957",
+   "repository": "hana",
+   "pid": 79828,
+   "machine": "mac",
+   "started_at": 199906.9912917614,
+   "read_at": 199997.26157331467,
+   "used": 7.993743896484375,
+   "stage": {
+    "kind": "MacBuilding"
+   },
+   "vcpus": {
+    "kind": "MacJobsUnavailable"
+   },
+   "progress": {
+    "kind": "NoProgress",
+    "reason": "no current counter"
+   },
+   "key": "dc26cb9c73609e70f9ac8162"
+  },
+  {
+   "kind": "mac-build",
+   "name": "terminal: build",
+   "title": {
+    "unit": "",
+    "step": "terminal: build"
+   },
+   "call": "cargo build --release -p hana",
+   "about": "Builds the selected targets",
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "terminal: build"
+    }
+   ],
+   "showrunner": "",
+   "unit": "—",
+   "ci_label": "",
+   "runner": "unknown",
+   "owner_text": "unregistered session",
+   "worker": "",
+   "caller": "unregistered session",
+   "gate_label": "",
+   "repository": "hana",
+   "pid": 30081,
+   "machine": "mac",
+   "started_at": 199880,
+   "read_at": 199995,
+   "used": 0.599999999627471,
+   "stage": {
+    "kind": "MacBuilding"
+   },
+   "vcpus": {
+    "kind": "MacJobsUnavailable"
+   },
+   "progress": {
+    "kind": "RowProgress",
+    "phase": "building",
+    "done": 604,
+    "total": 1000,
+    "percent": 60.4,
+    "unit": "units"
+   },
+   "started_by": {
+    "name": "terminal",
+    "step": "build"
+   },
+   "key": "7ca8e11c0084aa4f6f31945e"
+  },
+  {
+   "name": "aws: test affected",
+   "title": {
+    "unit": "aws",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "aws"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "builds",
+   "unit": "aws",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "aws",
+   "worker": "",
+   "caller": "aws",
+   "between_steps": false,
+   "state": "",
+   "pid": 1352394,
+   "detail": "aws",
+   "used": 0.929229736328125,
+   "counted": 2.353282928466797,
+   "reserved": 1.4240531921386719,
+   "started_at": 199646.2102918625,
+   "progress": {
+    "kind": "RowProgress",
+    "phase": "testing",
+    "done": 30,
+    "total": 681,
+    "percent": 4.405286343612334,
+    "unit": "modules"
+   },
+   "queued": true,
+   "keep_text": "",
+   "group": "",
+   "ci": false,
+   "parts": [],
+   "need": 2.353282928466797,
+   "need_part": true,
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "direct cargo command",
+   "mac_text": "",
+   "call": "gate.py --affected --repo guestset",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "machine": "natedev",
+   "vcpus": 32,
+   "tokens": 1,
+   "priority_text": "queue priority: aws (the user's bump)",
+   "priority_entries": [
+    {
+     "unit": "aws",
+     "why": "the user's bump",
+     "set_at": 199219.0097875595,
+     "set_by": "506b6872-03cb-4a1a-9465-fbd9cf88975e"
+    }
+   ],
+   "key": "f828dcdb66450c0106c585a7"
+  },
+  {
+   "name": "natemerge: test all",
+   "title": {
+    "unit": "natemerge",
+    "step": "test all"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "natemerge"
+    },
+    {
+     "kind": "text",
+     "text": ": test all"
+    }
+   ],
+   "showrunner": "natedev",
+   "unit": "natemerge",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "natemerge",
+   "worker": "",
+   "caller": "natemerge",
+   "between_steps": false,
+   "state": "",
+   "pid": 3539649,
+   "detail": "natemerge",
+   "used": 1.3243598937988281,
+   "counted": 2.4803619384765625,
+   "reserved": 1.1560020446777344,
+   "started_at": 199766.71329164505,
+   "progress": {
+    "kind": "RowProgress",
+    "phase": "testing",
+    "done": 16,
+    "total": 896,
+    "percent": 1.7857142857142858,
+    "unit": "modules"
+   },
+   "queued": true,
+   "keep_text": "",
+   "group": "",
+   "ci": false,
+   "parts": [],
+   "need": 2.4803619384765625,
+   "need_part": true,
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "direct cargo command",
+   "mac_text": "",
+   "call": "merge_gate.py --checkout . --tests-only",
+   "about": "Runs every test module",
+   "changes": "no branch",
+   "machine": "natedev",
+   "vcpus": 32,
+   "tokens": 12,
+   "priority_text": "queue priority: natemerge (the user's bump: natemerge merge tests first while AWS holds the account)",
+   "priority_entries": [
+    {
+     "unit": "natemerge",
+     "why": "the user's bump: natemerge merge tests first while AWS holds the account",
+     "set_at": -169703.9164853096,
+     "set_by": "506b6872-03cb-4a1a-9465-fbd9cf88975e"
+    }
+   ],
+   "key": "97ee36b8e63e901e8e76787f"
+  }
+ ],
+ "waiters": [
+  {
+   "name": "cables: nextest hana",
+   "title": {
+    "unit": "cables",
+    "step": "nextest hana"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "cables"
+    },
+    {
+     "kind": "text",
+     "text": ": nextest hana"
+    }
+   ],
+   "showrunner": "hana",
+   "unit": "cables",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "cables",
+   "worker": "",
+   "caller": "cables",
+   "pid": 4037423,
+   "detail": "cables",
+   "need": 12.1826171875,
+   "since": 199965.9912917614,
+   "reason": "free memory",
+   "fits": false,
+   "place": 1,
+   "free": 10.394727325066924,
+   "why": "memory",
+   "verify": {
+    "verb": "test",
+    "call": "verify test hana · 11 filters",
+    "position": 1,
+    "total": 1,
+    "step": "nextest"
+   },
+   "runs_on": "hana-aws or Mac or mac-linux or natedev",
+   "targets": [
+    "hana-aws",
+    "mac",
+    "mac-linux",
+    "natedev"
+   ],
+   "mac_text": "",
+   "because": "mac-linux: the target does not support this command",
+   "about": "Runs the selected tests",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "895f3a4d416249b3b3d204b8409cac74",
+    "movable": true
+   },
+   "priority_text": "queue priority: cables (the user's bump)",
+   "priority_entries": [
+    {
+     "unit": "cables",
+     "why": "the user's bump",
+     "set_at": 199640.9484410286,
+     "set_by": "506b6872-03cb-4a1a-9465-fbd9cf88975e"
+    }
+   ],
+   "first_in_line": true,
+   "head_room": {
+    "unavailable": "",
+    "rows": [
+     {
+      "label": "Queue cap",
+      "gib": 24.801499938592315
+     },
+     {
+      "label": "− Builds",
+      "gib": 9.58791732788086
+     },
+     {
+      "label": "− Build reserved",
+      "gib": 4.818855285644531
+     },
+     {
+      "label": "= Free",
+      "gib": 10.394727325066924
+     }
+    ]
+   },
+   "key": "129e5f8dcaceebf4b88ea3e2"
+  },
+  {
+   "name": "phases: test affected",
+   "title": {
+    "unit": "phases",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "phases"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "sdlc",
+   "unit": "phases",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "phases",
+   "worker": "",
+   "caller": "phases",
+   "pid": 1027492,
+   "detail": "phases",
+   "need": 4.408962249755859,
+   "since": 191595.5953116417,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 2,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "targeted_test.py --repo . --affected",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "a07abdde5a1949519a6e85daa899f343",
+    "movable": true
+   },
+   "key": "4e94fabcdce3461fceceedcc"
+  },
+  {
+   "name": "natest: test affected",
+   "title": {
+    "unit": "natest",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "natest"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "builds",
+   "unit": "natest",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "natest",
+   "worker": "",
+   "caller": "natest",
+   "pid": 1050837,
+   "detail": "natest",
+   "need": 4.408962249755859,
+   "since": 191614.71131396294,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 4,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "gate.py --affected",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "direct cargo command",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "086b861d3092431d98676c4578d7f799",
+    "movable": true
+   },
+   "key": "d20626fea887ce8dbcd0b2cd"
+  },
+  {
+   "name": "unit-board: test affected",
+   "title": {
+    "unit": "unit-board",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "unit-board"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "sdlc",
+   "unit": "unit-board",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "unit-board",
+   "worker": "",
+   "caller": "unit-board",
+   "pid": 1050805,
+   "detail": "unit-board",
+   "need": 4.408962249755859,
+   "since": 191614.91502785683,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 5,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "targeted_test.py --checkout '{tree}'",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "54d198aa02874bef9fda79331bb6f97e",
+    "movable": true
+   },
+   "key": "e6e19582ea7c533efea90ce5"
+  },
+  {
+   "name": "admin-console: test affected",
+   "title": {
+    "unit": "admin-console",
+    "step": "test affected"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "admin-console"
+    },
+    {
+     "kind": "text",
+     "text": ": test affected"
+    }
+   ],
+   "showrunner": "sdlc",
+   "unit": "admin-console",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "admin-console",
+   "worker": "",
+   "caller": "admin-console",
+   "pid": 1119541,
+   "detail": "admin-console",
+   "need": 4.408962249755859,
+   "since": 191800.8693022728,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 14,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "targeted_test.py --repo newalways",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "direct cargo command",
+   "mac_text": "",
+   "about": "Runs the test modules that the change affects",
+   "changes": "no branch",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "0a6d2eff272640c7a83f34392dcd929b",
+    "movable": true
+   },
+   "key": "55dbc5a2ad9632c7e21a68a6"
+  },
+  {
+   "name": "spacetime: nextest hana_conduit",
+   "title": {
+    "unit": "",
+    "step": "spacetime: nextest hana_conduit"
+   },
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "spacetime: nextest hana_conduit"
+    }
+   ],
+   "showrunner": "spacetime",
+   "unit": "—",
+   "ci_label": "",
+   "runner": "showrunner",
+   "owner_text": "spacetime",
+   "worker": "",
+   "caller": "spacetime",
+   "pid": 154488,
+   "detail": "—",
+   "need": 8.862530708312988,
+   "since": 193664.9912917614,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 23,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "verify": {
+    "verb": "test",
+    "call": "verify test hana_conduit",
+    "position": 1,
+    "total": 1,
+    "step": "nextest"
+   },
+   "runs_on": "hana-aws or Mac or mac-linux or natedev",
+   "targets": [
+    "hana-aws",
+    "mac",
+    "mac-linux",
+    "natedev"
+   ],
+   "mac_text": "",
+   "because": "mac-linux: the target does not support this command",
+   "about": "Runs the selected tests",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "bbf7db59e3c14f358c3b6e3b9e4fbe45",
+    "movable": true
+   },
+   "key": "6def2d833c1e2bcd5a9de3cb"
+  },
+  {
+   "name": "cargo-liner: build cargo-style",
+   "title": {
+    "unit": "",
+    "step": "cargo-liner: build cargo-style"
+   },
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "cargo-liner: build cargo-style"
+    }
+   ],
+   "showrunner": "cargo-liner",
+   "unit": "—",
+   "ci_label": "",
+   "runner": "showrunner",
+   "owner_text": "cargo-liner",
+   "worker": "",
+   "caller": "cargo-liner",
+   "pid": 2841646,
+   "detail": "—",
+   "need": 2.4333140263333917,
+   "since": 195179.20220041275,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 33,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "runs_on": "natedev only",
+   "targets": [
+    "natedev"
+   ],
+   "because": "direct cargo command",
+   "mac_text": "",
+   "about": "Builds the selected targets",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "68cb9999cce34ffaa7ddd8567822e9d1",
+    "movable": true
+   },
+   "key": "8eb8e18fb893a7f58ffa3c07"
+  },
+  {
+   "name": "hana CI: check",
+   "title": {
+    "unit": "",
+    "step": "hana CI · hana-linux-2 · build"
+   },
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "hana CI: check"
+    }
+   ],
+   "showrunner": "",
+   "unit": "",
+   "ci_label": "hana CI · hana-linux-2 · build",
+   "runner": "unknown",
+   "owner_text": "hana CI · hana-linux-2 · build",
+   "worker": "",
+   "caller": "hana CI · hana-linux-2 · build",
+   "pid": 948520,
+   "detail": "",
+   "need": 2.856353568844497,
+   "since": 196251.9950466156,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 40,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "call": "cargo check --release --workspace --features hana_clerestory/default,hana_clerestory/monitor-probe,hana_clerestory/test,hana_clerestory/workaround-winit-3124,hana_clerestory/workaround-winit-4341,hana_clerestory/workaround-winit-4440,hana_clerestory/workaround-winit-4443,hana_clerestory/workaround-winit-4445,hana_kana/bevy,hana_kana/default,hana_kana/math,hana_kana/tween,hana_diegetic/bench_support,hana_diegetic/default,hana_diegetic/typography_overlay,hana_valence/tween,hana_lagrange/default,hana_lagrange/fit_overlay,hana_lagrange/test-support,hana_metrics/default,hana_metrics/render,hana_metrics/test,hana_rigging/test-support,hana/hotpatching,hana_mimesis_tools/test-support,hana_video/test --examples",
+   "runs_on": "",
+   "targets": [],
+   "mac_text": "",
+   "about": "Runs the CI builds and tests",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "1fe8f7cb0f3741da99ddc8e2e62defaf",
+    "movable": true
+   },
+   "key": "50224dd593b86cedbcd018b7"
+  },
+  {
+   "name": "style: mend",
+   "title": {
+    "unit": "cargo-liner-style",
+    "step": "mend"
+   },
+   "name_parts": [
+    {
+     "kind": "text",
+     "text": "style: mend"
+    }
+   ],
+   "showrunner": "cargo-liner",
+   "unit": "cargo-liner-style",
+   "ci_label": "",
+   "runner": "worker",
+   "owner_text": "style-ticket-1515",
+   "worker": "style-ticket-1515",
+   "caller": "style-ticket-1515",
+   "pid": 1312885,
+   "detail": "cargo-liner-style",
+   "need": 4.193981170654297,
+   "since": 196472.9912917614,
+   "reason": "behind #1 · head cables: nextest needs 12.2 GiB",
+   "fits": true,
+   "place": 43,
+   "free": 10.394727325066924,
+   "why": "its turn",
+   "verify": {
+    "verb": "lint",
+    "call": "verify lint cargo-port",
+    "position": 1,
+    "total": 2,
+    "step": "mend"
+   },
+   "runs_on": "hana-aws or Mac or mac-linux or natedev",
+   "targets": [
+    "hana-aws",
+    "mac",
+    "mac-linux",
+    "natedev"
+   ],
+   "mac_text": "",
+   "because": "mac-linux: the target does not support this command",
+   "about": "Checks the code and formatting",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "ef694629b5164f87a2e588588f4b9840",
+    "movable": true
+   },
+   "key": "2fe7764b5c9afd548cca5ce4"
+  },
+  {
+   "name": "errors: nextest",
+   "title": {
+    "unit": "errors",
+    "step": "nextest"
+   },
+   "name_parts": [
+    {
+     "kind": "staff",
+     "text": "errors"
+    },
+    {
+     "kind": "text",
+     "text": ": nextest"
+    }
+   ],
+   "showrunner": "hana",
+   "unit": "errors",
+   "ci_label": "",
+   "runner": "unit director",
+   "owner_text": "errors",
+   "worker": "",
+   "caller": "errors",
+   "pid": 588949,
+   "detail": "errors",
+   "need": 1.0,
+   "since": 198383.9912917614,
+   "reason": "waiting for mac",
+   "fits": false,
+   "place": 48,
+   "free": 10.394727325066924,
+   "why": "target",
+   "verify": {
+    "verb": "test",
+    "call": "verify test hana_prosody --run-ignored only --filter buffer_form_matches_file_form_for_short_and_long_recordings --mac 'item 174 Step A Mac Speech proof; nate at the Mac (go 11:35 PST via hana)'",
+    "position": 1,
+    "total": 1,
+    "step": "nextest"
+   },
+   "runs_on": "mac",
+   "targets": [
+    "mac"
+   ],
+   "mac_text": "",
+   "about": "Runs the selected tests",
+   "move": {
+    "kind": "QueueMoveMember",
+    "row_id": "e8be260afa954d489588ef64d168b144",
+    "movable": false
+   },
+   "key": "746e7ae92e2db4499798807f"
+  }
+ ]
+}

@@ -124,8 +124,10 @@ class MemoryHoverTests(unittest.TestCase):
                 chart = table.find(f".//div[@data-tip='{key}']")
                 assert cell is not None and chart is not None
                 unit = row["unit"] if row["unit"] != "—" and not row.get("ci_label") else ""
-                self.assertEqual("".join(cell.itertext()), row["title"]["step"] if unit else "")
-                self.assertEqual(chart.findtext(".//span[@class='name']"), unit or name)
+                # A row with no unit starts with the text before ": " in its name; the rest goes in Step.
+                owner_name, _, step = name.partition(": ")
+                self.assertEqual("".join(cell.itertext()), row["title"]["step"] if unit else step)
+                self.assertEqual(chart.findtext(".//span[@class='name']"), unit or owner_name)
                 owner = chart.find(".//span[@class='owner']")
                 assert owner is not None
                 self.assertEqual("".join(owner.itertext()), row.get("showrunner", "") if unit else "")

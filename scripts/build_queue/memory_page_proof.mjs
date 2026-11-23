@@ -54,11 +54,96 @@ const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof;
+const standingProof = previousPage === '--standing-orders';
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
 const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU'];
+
+// nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
+// on the served reading, which has rows in the shape of the live feed. The path names the page to check.
+// With a shot folder, the check first saves the Running and Queued card at each width as real-<width>.png.
+async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
+  await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+  for (const width of [1440, 900]) {
+    await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+    await navigate(path);
+    const shown = await evaluate(`(async () => {
+      // The handles draw when the page has its queue-move token.
+      for (const start = Date.now(); !document.querySelector('.queue-grip') && Date.now() - start < 3000;)
+        await new Promise(done => setTimeout(done, 20));
+      const walk = document.querySelector('#walk');
+      const card = walk.closest('.card').getBoundingClientRect();
+      const center = box => (box.top + box.bottom) / 2;
+      const firstLine = element => {
+        const nodes = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+          if (!node.textContent.trim()) continue;
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          const line = range.getClientRects()[0];
+          if (line) return line;
+        }
+      };
+      const rows = [...walk.querySelectorAll('tbody tr[data-tip]:not(.room)')].map(table => {
+        const key = table.dataset.tip;
+        const [kind, id] = key.split(':');
+        const data = (kind === 'row' ? latest.walk : kind === 'wait' ? latest.waiters : []).find(row => row.key === id);
+        const chart = walk.querySelector('.wrow[data-tip="' + key + '"]');
+        const name = chart.querySelector('.name');
+        const unit = name.querySelector('[data-color-text="role.unit-director"]');
+        const title = center(firstLine(name));
+        const grip = chart.querySelector('.queue-grip');
+        return {key, kind, unit:data?.title?.unit || '', machine:data?.machine || '', targets:data?.targets || [],
+          movable:kind === 'wait' && data?.move?.movable !== false, title:name.textContent, titleCut:name.scrollWidth > name.clientWidth,
+          grip:!!grip, gripOverlap:grip ? grip.getBoundingClientRect().right > name.getBoundingClientRect().left : false,
+          owner:chart.querySelector('.owner')?.textContent || '',
+          nameLines:Math.round(name.getBoundingClientRect().height / parseFloat(getComputedStyle(name).lineHeight)),
+          unitName:unit?.textContent || '', unitColor:unit ? getComputedStyle(unit).color : '', rowColor:getComputedStyle(chart).color,
+          // A Machine icon has no text, so its box stands for its first line.
+          offsets:[...table.cells].flatMap(cell => {
+            const line = cell.querySelector('.machine-icon')?.getBoundingClientRect() ?? firstLine(cell);
+            return line ? [[cell.className, Math.round((center(line) - title) * 10) / 10]] : [];
+          }),
+          icons:[...table.querySelectorAll('td.machine .machine-icon')].map(icon =>
+            [icon.getAttribute('aria-label'), ['run', 'dim'].find(state => icon.classList.contains(state)) || '']),
+          hover:kind === 'row' || kind === 'wait' ? tipText(key, latest).join('\\n').toLowerCase() : ''};
+      });
+      return {rows, headers:[...walk.querySelectorAll('thead th, tr.queue-head th')].map(cell => cell.textContent),
+        clip:{x:card.left+scrollX,y:card.top+scrollY,width:card.width,height:card.height,scale:1}};
+    })()`);
+    if (shotFolder) {
+      const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+      await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
+    }
+    const kinds = new Set(shown.rows.map(row => row.kind));
+    assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
+      `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
+    const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
+    for (const row of shown.rows) {
+      const where = `${row.key} at ${width} px`;
+      if (row.unit) {
+        assert.notEqual(row.owner, '', `Order 6: ${where} has no showrunner line under its title.`);
+        assert.equal(row.unitName, row.unit, `Order 2: the title of ${where} does not start with the unit name.`);
+        assert.notEqual(row.unitColor, row.rowColor, `Order 2: the unit name of ${where} has no unit color.`);
+      } else assert.ok(!row.title.includes(': '), `Order 2: ${where} does not start with its owner: ${row.title}`);
+      assert.equal(row.nameLines, 1, `Order 7: the title of ${where} wraps.`);
+      if (width === 1440) assert.equal(row.titleCut, false, `Order 7: the title of ${where} is cut.`);
+      assert.equal(row.grip, row.movable, `Order 9: ${where} has the wrong reorder handle state.`);
+      assert.equal(row.gripOverlap, false, `Order 9: the reorder handle of ${where} covers its title.`);
+      assert.deepEqual(row.offsets.filter(([, offset]) => Math.abs(offset) > 2), [],
+        `Order 8: a table cell of ${where} is not in line with the first line of the row title.`);
+      if (row.kind === 'tools') continue;
+      const machines = row.kind === 'row' ? [row.machine] : row.targets;
+      assert.deepEqual(row.icons, machines.map(machine => [machine, row.kind === 'row' ? 'run' : 'dim']),
+        `Orders 3 and 5: the Machine cell of ${where} does not show its machines.`);
+      for (const machine of machines)
+        assert.match(row.hover, word(machine), `Orders 3 and 5: the hover of ${where} does not name ${machine}.`);
+    }
+  }
+}
 
 async function assertRowCenters(evaluate) {
   const rows = await evaluate(`(() => {
@@ -109,7 +194,7 @@ try {
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePath = queueRowsProof ? comparison : focusedProof ? null : previousPage;
+  const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = process.env.SWAP_BEFORE_PAGE
@@ -621,6 +706,22 @@ try {
           }
           if (queueRowsProof) {
             console.log(JSON.stringify({pass:true,rows:rows.names}));
+            break browserProof;
+          }
+          await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
+        }
+        if (standingProof || !focusedProof) {
+          const real = JSON.parse(await readFile(join(repo, 'scripts/build_queue/builds_page_real_rows.json'), 'utf8'));
+          servedReading = {...structuredClone(readings.good), staff_names:real.staff_names, walk:real.walk, waiters:real.waiters,
+            queued_priority_units:real.queued_priority_units, move_revision:real.move_revision};
+          servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
+          // The queue-move stub gives the page a token, so the reorder handles draw.
+          queueFixture = servedReading;
+          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
+            standingProof ? folder : '');
+          queueFixture = null;
+          if (standingProof) {
+            console.log(JSON.stringify({pass:true}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1182,8 +1283,8 @@ try {
                     Object.assign(probe.style,{position:'absolute',whiteSpace:'nowrap',width:'auto',visibility:'hidden'});
                     walk.append(probe);const result=probe.getBoundingClientRect().width;probe.remove();return result;
                   };
-                  const widths=[...walk.querySelectorAll('.row-label .name, .row-label .owner')].flatMap(label=>
-                    label.closest('.wrow.wait') ? label.textContent.split(/\s+/).map(word=>width(label,word)) : [width(label,label.textContent)]);
+                  const widths=[...walk.querySelectorAll('.row-label .name, .row-label .owner')].map(label=>width(label,label.textContent)
+                    +parseFloat(getComputedStyle(label.closest('.row-label')).paddingInlineStart));
                   const room=walk.querySelector('.wrow.room .row-heading');
                   widths.push(width(room,room.textContent.replace(/(Free)/,'$1 '))+8);
                   return {column:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--amt')),
@@ -1889,9 +1990,10 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner: nextest']);
+            // A Mac build with no unit starts with its owner; the step after ": " goes in Step.
+            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
-            assert.deepEqual(macProof.map(row=>row.step),['build','nextest','']);
+            assert.deepEqual(macProof.map(row=>row.step),['build','nextest','nextest']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
@@ -1915,9 +2017,10 @@ try {
             assert.equal(failedMac.unknown,'—');
             await show(base);
 
+            // A waiting step sizes the Step column, so it can move the columns to the right of Step, but no column before it.
             const positions=()=>evaluate(`(() => {
               const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
-              return ['.duration','.verify','.pid'].map(selector=>{
+              return ['.duration','.verify'].map(selector=>{
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
@@ -1944,7 +2047,8 @@ try {
             const absentCells=await evaluate(`({step:document.querySelector('.walk-table tbody .step').textContent,
               owner:document.querySelector('.wrow[data-run] .owner').textContent,
               machine:document.querySelector('.walk-table td.machine').textContent})`);
-            assert.equal(absentCells.step,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+            // A row with no unit starts with the owner before ": " in its name, and its step goes in Step.
+            assert.equal(absentCells.step,'nextest');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
             for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);

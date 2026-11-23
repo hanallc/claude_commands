@@ -301,7 +301,6 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; line-height: var(--row-line); }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
-.wrow.wait .row-label .name { white-space: normal; }
 .wrow:has(.queue-grip) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
@@ -1140,9 +1139,16 @@ function queueRowLabels(row) {
   if (row.started_by) return {name: row.started_by.name, unit: "", owner: "", starter: row.started_by.name,
     repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
-  const showrunner = unit ? ownerText(row.showrunner) : "";
+  const verify = row.verify?.verb || "";
+  if (!unit) {
+    // A row with no unit starts with its owner, the text before ": " in its name, in plain ink. The step goes in Step.
+    const split = row.name.indexOf(": ");
+    return {name: split < 0 ? row.name : row.name.slice(0, split), unit, owner: "",
+      step: split < 0 ? "" : row.name.slice(split + 2), verify};
+  }
+  const showrunner = ownerText(row.showrunner);
   return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: unit && row.title?.unit ? row.title.step : "", verify: row.verify?.verb || ""};
+    step: row.title?.unit ? row.title.step : "", verify};
 }
 function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${unit || starter ? staffName(unit || starter) : esc(name)}</span></span>` +
@@ -2041,15 +2047,16 @@ function fitWalkDetails() {
       context.measureText(words.slice(index).join(" ")).width)));
   }));
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
-  // Running rows and Free set the label column. A longer waiting name wraps at a space, so only its widest word counts.
-  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner)")].flatMap(label =>
-    label.closest(".wrow.wait") ? label.textContent.split(/\s+/).map(word => [label, word]) : [[label, label.textContent]]);
+  // The widest row title or small line sets the label column, with the reorder handle space of its row.
+  // A title never wraps; in a pane too narrow for it, it ends in an ellipsis and the row hover gives the full text.
+  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner)")].map(label =>
+    [label, label.textContent, parseFloat(getComputedStyle(label.closest(".row-label")).paddingInlineStart)]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
-  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text]) => {
+  const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(([label, text, handle]) => {
     context.font = canvasFont(label);
-    return context.measureText(text).width;
+    return context.measureText(text).width + handle;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
   let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
