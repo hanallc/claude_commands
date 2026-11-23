@@ -1131,17 +1131,8 @@ class ProcessController:
                 attempt.answer = read_claim_answer(answer, expected=expected,
                     assigned_slot=self.placement.assignment.destination.slot
                         if isinstance(self.placement, AssignedOffloadRequest) else 0)
-                identity = claim_state.reply_claim_identity(stdout)
-                if answer.status in (0, 13) and isinstance(identity, claim_state.ClaimIdentity):
-                    self.claim_identity = identity
-                    for line in stdout.splitlines():
-                        if line.startswith("claim_fence="):
-                            self.claim_scope_key = line.removeprefix("claim_fence=")
-                        if line.startswith("mac_repository="):
-                            self.mac_repository = claim_state.mac_repository_record(
-                                cast(object, json.loads(line.removeprefix("mac_repository="))))
-                            self.claim_scope_key = self.mac_repository.fence_scope_key()
-                elif answer.status not in (10, 11, 12, claim_state.LEGACY_WAIT_CLAIM_RELEASED):
+                if not self.accept_claim_reply(answer) and answer.status not in (
+                        10, 11, 12, claim_state.LEGACY_WAIT_CLAIM_RELEASED):
                     self.inspect_claim(attempt, expected)
         finally:
             if isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
@@ -1154,6 +1145,21 @@ class ProcessController:
                     _ = process.wait()
             self.active = IDLE_PROCESS
             self.pending = SettledDispatchOperations()
+
+    def accept_claim_reply(self, answer: CommandOutput) -> bool:
+        """Keep the identity, fence and Mac repository of a granted claim reply."""
+        identity = claim_state.reply_claim_identity(answer.stdout)
+        if answer.status not in (0, 13) or not isinstance(identity, claim_state.ClaimIdentity):
+            return False
+        self.claim_identity = identity
+        for line in answer.stdout.splitlines():
+            if line.startswith("claim_fence="):
+                self.claim_scope_key = line.removeprefix("claim_fence=")
+            if line.startswith("mac_repository="):
+                self.mac_repository = claim_state.mac_repository_record(
+                    cast(object, json.loads(line.removeprefix("mac_repository="))))
+                self.claim_scope_key = self.mac_repository.fence_scope_key()
+        return True
 
     def inspect_claim(self, attempt: LocalClaimAttempt,
                       expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity) -> None:
