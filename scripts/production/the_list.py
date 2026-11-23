@@ -1865,19 +1865,18 @@ def _split_series(series: ScheduledSeries, selected: SeriesRun, edits: ScheduleC
     pending = ScheduledRun(edits.get("start", selected.run.start), edits.get("words", selected.run.words))
     if _validate_schedule_time(pending.start) < moment.astimezone(UTC):
         raise ListError("choose a time on or after now for this and following runs")
-    same_start = all(_schedule_time_text(pending.start) == _schedule_time_text(start)
-                     for start in (selected.original, selected.run.start))
-    reanchors = ("start" in edits and not same_start) or replace(rule, end=series.rule.end) != series.rule
+    same_start = _schedule_time_text(pending.start) == _schedule_time_text(selected.run.start)
+    reanchors = not same_start or replace(rule, end=series.rule.end) != series.rule
     if not reanchors:
-        end = rule.end
-        # COUNT in a following edit measures pending runs from the selected run.
-        changes_count = isinstance(end, repeat_rule.RunCount) and end.count != series.pending_count(end)
-        changes_end = "repeat" in edits and (end != series.rule.end or changes_count)
         word_edits: ScheduleChanges = {"words": edits["words"]} if "words" in edits else {}
         changed = _edit_all_runs(series, word_edits, rule)
-        if not changes_end:
+        end = rule.end
+        different_end = end != series.rule.end
+        if "repeat" not in edits or (not different_end and isinstance(end, repeat_rule.RepeatUntilLimit)):
             return changed
-        run_allowance = series_run_limit()
+        # COUNT in a following edit measures pending runs from the selected run.
+        changes_count = isinstance(end, repeat_rule.RunCount) and end.count != series.pending_count(end)
+        run_allowance = series_run_limit() if different_end or changes_count else series.run_allowance
         retained = series.select_following_runs(selected, rule, run_allowance)
         return replace(changed, run_allowance=run_allowance, following_runs=retained)
 
