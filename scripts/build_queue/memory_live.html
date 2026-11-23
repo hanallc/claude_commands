@@ -323,6 +323,7 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
+body.queue-unavailable .page-action[data-page-action^="builds-"] { display: none; }
 .track { position: relative; height: 18px; cursor: help; overflow: hidden; }
 .track .bud { position: absolute; top: -5px; bottom: -5px; margin-left: -1px; border-left: 2px dashed var(--cap); pointer-events: none; }
 .track .b { position: absolute; top: 0; bottom: 0; border-radius: 3px; overflow: hidden; display: flex; z-index: 1; transition: left 0.6s ease, width 0.6s ease; }
@@ -387,7 +388,7 @@ body.queue-unavailable .card { display: none; }
   <div class="page-heading-actions" data-page-actions>__BUILDS_PAGE_ACTIONS__</div>
   <script>
   // Stand-in until newalways (admin-console) is on main: replace with page_frame.page_action_button and the owner control's actions argument.
-  // The buttons move into the heading between the owner name and New item; a button opens its dialog, and a close returns focus to it.
+  // The buttons move into the heading between the owner name and New item; a button opens its dialog.
   (() => {
     const actions = document.currentScript.previousElementSibling;
     const heading = document.querySelector(".page-heading-actions:not([data-page-actions])");
@@ -404,7 +405,7 @@ body.queue-unavailable .card { display: none; }
       if (!dialog) return;
       if (!bound.has(dialog)) {
         bound.add(dialog);
-        bindConsoleDialog(dialog, () => { dialog.close(); button.focus({preventScroll: true}); });
+        bindConsoleDialog(dialog, () => dialog.close());
       }
       dialog.showModal();
     });
@@ -1124,6 +1125,7 @@ function setSeg(id, value, total) {
 function showQueueError(message) {
   $("queue-error").textContent = message;
   document.body.classList.add("queue-unavailable");
+  for (const dialog of document.querySelectorAll('dialog[id^="builds-"][open]')) dialog.close();
   hideTip();
 }
 
@@ -1308,10 +1310,23 @@ document.addEventListener("click", (e) => {
   toggle.setAttribute("aria-expanded", String(toggle.getAttribute("aria-expanded") !== "true"));
   renderSwap(latest);
 });
+// A closed section dialog returns focus to the element that opened it at this open: the pill or a heading button.
+const dialogOpeners = new WeakMap();
+function rememberOpener(opener) {
+  const dialog = document.getElementById(opener.getAttribute("aria-controls"));
+  if (!dialog) return;
+  if (!dialogOpeners.has(dialog)) dialog.addEventListener("close", () => dialogOpeners.get(dialog).focus({preventScroll: true}));
+  dialogOpeners.set(dialog, opener);
+}
+document.addEventListener("click", event => {
+  const opener = event.target.closest("[data-page-action]");
+  if (opener) rememberOpener(opener);
+}, true);
 // The pressure pill opens the swap dialog through its heading button; the pill tooltip stays off over the dialog.
 $("pill").addEventListener("click", event => {
   event.stopPropagation();
   document.querySelector('[data-page-action="builds-swap"]').click();
+  rememberOpener(event.currentTarget);
 });
 
 function renderLeftovers(d) {
@@ -1372,6 +1387,8 @@ function placeBarLabels(container, limit) {
 }
 
 function placeLimitLabels() {
+  // Closed, the gauges have no layout; the ResizeObserver places the labels when the dialog opens.
+  if (!$("builds-swap-dialog").open) return;
   for (const key of ["some", "full"]) {
     const label = $(`limit-${key}`);
     const track = label.closest(".gt");

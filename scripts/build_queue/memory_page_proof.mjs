@@ -1142,15 +1142,53 @@ try {
               assert.ok(opened.modal, action+' does not open its dialog.');
               assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
               assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
+              if (action==='builds-swap') {
+                // Closed, the page does not place the limit labels; the ResizeObserver places them when the dialog opens.
+                const limits=await evaluate(`(async () => {
+                  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                  const lefts=() => ['some','full'].map(key => document.querySelector('#limit-'+key).style.left);
+                  const observed=lefts();
+                  placeLimitLabels();
+                  return {observed,placed:lefts()};
+                })()`);
+                assert.deepEqual(limits.observed,limits.placed,'The swap dialog opens with its limit labels out of place.');
+                assert.ok(limits.placed.every(left => left!==''),'The swap dialog opens with no limit label place.');
+              }
               for (const type of ['keyDown','keyUp'])
                 await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
-              const closed=await evaluate(`({open:document.querySelector('#${action}-dialog').open,
-                focus:document.activeElement.dataset.pageAction})`);
+              // The dialog close event returns focus after the close, so read it one frame later.
+              const closed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#${action}-dialog').open,focus:document.activeElement.dataset.pageAction};
+              })()`);
               assert.deepEqual(closed,{open:false,focus:action},action+' does not close or return focus.');
             }
-            await evaluate("document.querySelector('#pill').click()");
+            // The pressure pill opens the swap dialog, and Escape returns focus to the pill.
+            const pill=await evaluate(`(() => {
+              const box=document.querySelector('#pill').getBoundingClientRect();
+              return {x:box.left+box.width/2,y:box.top+box.height/2};
+            })()`);
+            await call('Input.dispatchMouseEvent',{type:'mousePressed',...pill,button:'left',buttons:1,clickCount:1});
+            await call('Input.dispatchMouseEvent',{type:'mouseReleased',...pill,button:'left',buttons:0,clickCount:1});
             assert.ok(await evaluate("document.querySelector('#builds-swap-dialog').open"),'The pressure pill does not open the swap dialog.');
-            await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
+            for (const type of ['keyDown','keyUp'])
+              await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+            const pillClosed=await evaluate(`(async () => {
+              await new Promise(resolve => requestAnimationFrame(resolve));
+              return {open:document.querySelector('#builds-swap-dialog').open,focus:document.activeElement.id};
+            })()`);
+            assert.deepEqual(pillClosed,{open:false,focus:'pill'},'The swap dialog does not return focus to the pressure pill.');
+            // A queue outage closes an open section dialog and hides the section buttons with the cards.
+            const outage=await evaluate(`(async () => {
+              document.querySelector('[data-page-action="builds-swap"]').click();
+              showQueueError('The queue did not answer.');
+              await new Promise(resolve => requestAnimationFrame(resolve));
+              const shown=[...document.querySelectorAll('[data-page-action^="builds-"]')].filter(button=>button.getClientRects().length).length;
+              const open=document.querySelectorAll('dialog[id^="builds-"][open]').length;
+              document.body.classList.remove('queue-unavailable');
+              return {shown,open};
+            })()`);
+            assert.deepEqual(outage,{shown:0,open:0},'A queue outage leaves a section button or dialog on the page.');
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
             slotReview.walk=[
