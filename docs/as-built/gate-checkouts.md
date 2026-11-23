@@ -1,7 +1,7 @@
 # Standing gate checkouts
 
 `scripts/copies/copies.py` prepares gate, review, merge, and landing checkouts.
-`copies.standing` leases a reusable repository slot through `build_slots.take_slot()`.
+`copies.standing` takes a numbered copy under `roots.build` through `take_copy`.
 
 ## Configuration, place, and names
 
@@ -26,7 +26,7 @@ entries to the guard's scan. The guard does not read configuration separately.
 `config/build_folders.conf` sets the slot root and pool limits.
 The `slots.wait_seconds` setting limits the wait for a slot.
 The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
-`config/build_folders.conf` sets no slot root for natedev; the AWS image sets its own.
+`config/build_folders.conf` sets no slot root for natedev.
 The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
 Owners on the same machine share the pool for a repository.
 Each checkout uses `<slot-root>/<repository>-slot<N>`. The lease records the owner.

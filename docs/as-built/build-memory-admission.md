@@ -1685,7 +1685,6 @@ The folder stays with its hold marked ended.
 
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
-On natedev, cargo builds a scratch workspace in `/build/cargo/scratch/<folder>`.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
