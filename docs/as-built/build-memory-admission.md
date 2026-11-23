@@ -410,7 +410,10 @@ Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
 On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit.
-A row with no unit starts with its owner, the text before `: ` in its name, in plain ink. The text after `: ` goes in Step. The small line stays empty.
+A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. The feed sends that color as `unit_color` (`StaffNames.unit_color`).
+A row with no unit starts with its owner, the text before `: ` in its name. The text after `: ` goes in Step.
+An owner with a staff entry, such as a showrunner, shows in its staff color. Another owner, such as hana CI, shows in plain ink.
+A row with no unit has no small line, because the line would repeat the owner.
 A Mac row with no unit has a `started_by` field instead, so it shows in the same form as a unit row. Its owner starts the row (a staff owner, then the launcher). Its repository is the small text, and its step is in Step.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
@@ -2305,11 +2308,13 @@ A running row's `Machine` cell shows one bright icon in a faint box: the machine
 The feed's `machine` field is the one source for that machine.
 The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
 A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
 An icon keeps the 20 px text line, so it does not make a row taller, and a row of icons never wraps.
 Waiting rows size the `Step` column, so each step shows on one line; a new waiting row can move the columns to its right.
 In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
+Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
 A legend under the table shows `Legend:`, then each of the six icons with its name.
 Each machine on the page shows in its machine color: the `Machine` icons, the legend, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
 The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
@@ -2342,6 +2347,7 @@ A pane still too narrow for the chart and the table scrolls the Running and Queu
 The card never scrolls down, and its axis labels fit their 16 px row.
 The table starts half the cap line and one gap past the cap, and the fit measures the table at that same place.
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
+When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
 The 12rem cap (9rem in a narrow pane) on the label column stays.
 The chart, the top bar and the axis start one even gap after the label column.
@@ -2354,16 +2360,24 @@ It also fails when a row of icons wraps, the legend does not show the six machin
 The other checks hide scrollbars. One more load at 1440 px shows them, and the proof fails when the Running and Queued scroll box shows a scrollbar or can scroll.
 `--queue-rows` also saves that card's right edge as `after-edge.png`, or `before-edge.png` for a before page.
 `checkStandingOrders` in `memory_page_proof.mjs` checks nate's standing orders for the Builds page (`docs/plans/builds-page-standing-orders.md`).
-It runs in the gate proof, and alone with `--standing-orders <page>`, which also saves `real-1440.png` and `real-900.png`.
-It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue reading: a hyphenated unit, a non-unit owner with a long step, hana CI, a Mac build, an AWS row and a fixed waiting row.
+It runs in the gate proof, and alone with `--standing-orders [page]`, which also saves `real-1440.png` and `real-900.png`.
+The optional page must be a rendered page, such as the `memory_live.html` that the proof writes in its folder. A source page does not load.
+It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue reading. It has these rows:
+1. A hyphenated unit, and a unit with no staff entry (`lfo`).
+2. Showrunner runs with no unit, one with a long step.
+3. A running and a waiting hana CI row.
+4. A Mac build, and an AWS row.
+5. A fixed Mac-only waiting row.
 The queue-move stub gives the page a token, so the reorder handles draw.
 At 1440 px and at 900 px, dark, it fails when one of these is false:
 1. The table has no Unit and no Slot column.
 2. A unit row starts with its unit in its unit color, with the showrunner line under it. A row with no unit starts with its owner, and its title has no `: `.
-3. Each row title has one line. At 1440 px no title ends in an ellipsis.
-4. The table text and the machine icons are in line with the first line of the row title, within 2 px.
-5. Each movable waiting row has a reorder handle, and the handle does not cover the title. A fixed row has no handle.
-6. A running row shows one bright icon for its machine. A waiting row shows one dim icon for each machine that can take it. The hover names each machine.
+3. A showrunner's own run starts with the showrunner in the showrunner color, and has no small line.
+4. Each row title has one line. At 1440 px no title ends in an ellipsis. No line of a Step ends in `-`.
+5. The table text and the machine icons are in line with the first line of the row title, within 2 px.
+6. Each movable waiting row has a reorder handle, and the handle does not cover the title. A fixed row has no handle. All waiting row titles start at the same left edge.
+7. A running row shows one bright icon for its machine. A waiting row shows one dim icon for each machine that can take it. The hover names each machine.
+8. A Mac-only waiting step has no memory box, because the chart shows natedev memory.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.

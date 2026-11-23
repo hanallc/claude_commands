@@ -605,6 +605,12 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
 NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
 
 
+def ci_target_notes(machine: str) -> TargetNotes:
+    """Give a waiting CI step the host as its one target: the CI runners run there, as the running CI row shows."""
+    named = RunsOn((machine,))
+    return {"runs_on": named.text(), "targets": list(named.targets), "mac_text": ""}
+
+
 def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
     """Use the placement candidates for a route that names the Mac Linux guest."""
     # Older queue readings have no placement candidates.
@@ -1140,6 +1146,7 @@ class SwapTotals(TypedDict):
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
+    unit_color: NotRequired[str]
     ok: bool
     read_at: float
     render_seconds: float
@@ -3122,7 +3129,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(named, NoNamedStep):
             continue
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
-            NO_TARGET_NOTES if ci_label else step_target_notes(waiter, routes))
+            ci_target_notes(machine) if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
@@ -3290,7 +3297,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = "unavailable: " + pressure.reason
     page: MemoryPage = {
         "colors": configuration.colors,
-        "staff_names": staff_display.registry(),
+        "staff_names": staff_display.registry(), "unit_color": staff_display.unit_color(),
         "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,

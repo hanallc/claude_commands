@@ -1079,7 +1079,13 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(ci.get("ci_label"))
                 for row in (run, page["waiters"][0], ci):
                     self.assertFalse(row.get("mac_text"))
+                for row in (run, ci):
                     self.assertFalse(row.get("runs_on"))
+                # bob, 2026-11-23: a waiting CI step can run only on the host, where the running CI row shows it.
+                host = FIXTURE_MACHINE
+                self.assertEqual(ci.get("machine"), host)
+                self.assertEqual(page["waiters"][0].get("targets"), [host])
+                self.assertEqual(page["waiters"][0].get("runs_on"), f"{host} only")
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 

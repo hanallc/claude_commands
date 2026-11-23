@@ -116,6 +116,11 @@ class StaffNames:
         lead = self.html(parent.id, parent.name) + " · " if parent is not None else ""
         return lead + self.html(member.id, member.name)
 
+    def unit_color(self) -> str:
+        """Return the CSS color of the unit role, or "" when the setting has no valid color."""
+        color = accounts.role_color("units", self.colors)
+        return color.css if isinstance(color, accounts.StaffRoleColor) else ""
+
     def registry(self) -> dict[str, str]:
         """Supply the same escaped name spans to pages that render in JavaScript."""
         return {alias: self.html(member.id, alias) for alias, member in self.rows.items()}

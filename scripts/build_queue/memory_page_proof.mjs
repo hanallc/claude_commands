@@ -14,6 +14,7 @@
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
 // Use --queue-rows as the third argument for the dark desktop queue screenshot and the card right edge shot; a fourth argument names the before page.
+// Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -95,7 +96,25 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
         const unit = name.querySelector('[data-color-text="role.unit-director"]');
         const title = center(firstLine(name));
         const grip = chart.querySelector('.queue-grip');
+        // The last character of each line of the Step text, to find a word broken at its hyphen.
+        const stepEnds = [];
+        let last = null;
+        const stepText = document.createTreeWalker(table.querySelector('.step'), NodeFilter.SHOW_TEXT);
+        for (let node = stepText.nextNode(); node; node = stepText.nextNode()) {
+          for (let index = 0; index < node.length; index++) {
+            const range = document.createRange();
+            range.setStart(node, index);
+            range.setEnd(node, index + 1);
+            const box = range.getClientRects()[0];
+            if (!box) continue;
+            if (last && Math.abs(box.top - last.top) > 2) stepEnds.push(last.text);
+            last = {top:box.top, text:node.data[index]};
+          }
+        }
         return {key, kind, unit:data?.title?.unit || '', machine:data?.machine || '', targets:data?.targets || [],
+          runner:data?.runner || '', why:data?.why || '', stepEnds, nameLeft:name.getBoundingClientRect().left,
+          nameRole:name.querySelector('[data-color-text]')?.dataset.colorText || '',
+          memoryBox:chart.querySelector('.track')?.childElementCount > 0,
           movable:kind === 'wait' && data?.move?.movable !== false, title:name.textContent, titleCut:name.scrollWidth > name.clientWidth,
           grip:!!grip, gripOverlap:grip ? grip.getBoundingClientRect().right > name.getBoundingClientRect().left : false,
           owner:chart.querySelector('.owner')?.textContent || '',
@@ -122,6 +141,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
+    const waitLefts = new Set(shown.rows.filter(row => row.kind === 'wait').map(row => Math.round(row.nameLeft)));
+    assert.equal(waitLefts.size, 1, `Order 9: the waiting row titles do not line up at ${width} px: ${[...waitLefts]}`);
     for (const row of shown.rows) {
       const where = `${row.key} at ${width} px`;
       if (row.unit) {
@@ -129,6 +150,14 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
         assert.equal(row.unitName, row.unit, `Order 2: the title of ${where} does not start with the unit name.`);
         assert.notEqual(row.unitColor, row.rowColor, `Order 2: the unit name of ${where} has no unit color.`);
       } else assert.ok(!row.title.includes(': '), `Order 2: ${where} does not start with its owner: ${row.title}`);
+      if (row.runner === 'showrunner' && !row.unit) {
+        assert.equal(row.nameRole, 'role.showrunner', `Order 2: the showrunner that owns ${where} has no showrunner color.`);
+        // Form with a reason: the small line would repeat the owner.
+        assert.equal(row.owner, '', `Form: ${where}, a showrunner's own run, has a small line.`);
+      }
+      assert.deepEqual(row.stepEnds.filter(end => end === '-'), [], `Order 7: the Step of ${where} breaks at a hyphen.`);
+      // Form with a reason: a Mac-only waiting step has no memory box, because the chart shows natedev memory.
+      if (row.why === 'target') assert.equal(row.memoryBox, false, `Form: ${where}, a Mac-only step, has a memory box.`);
       assert.equal(row.nameLines, 1, `Order 7: the title of ${where} wraps.`);
       if (width === 1440) assert.equal(row.titleCut, false, `Order 7: the title of ${where} is cut.`);
       assert.equal(row.grip, row.movable, `Order 9: ${where} has the wrong reorder handle state.`);

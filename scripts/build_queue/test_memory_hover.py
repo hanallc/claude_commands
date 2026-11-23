@@ -38,6 +38,13 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
                                    "outside_bytes": 2 * GIB, "reserve_share_percent": 50}
 
 
+def step_text(element: ElementTree.Element, path: str) -> str:
+    """Return the whole text of the Step cell at path; a waiting step keeps each word in its own span."""
+    cell = element.find(path)
+    assert cell is not None
+    return "".join(cell.itertext())
+
+
 class MemoryHoverTests(unittest.TestCase):
     def test_build_limits_move_names_and_wait_reasons_to_hover(self) -> None:
         wait = limits_view.WaitGroup(limits_view.WaitWords("1 run waits for space.", "{count} runs wait for space."),
@@ -172,7 +179,7 @@ class MemoryHoverTests(unittest.TestCase):
                 colored = name.find("span[@data-color-text]")
                 self.assertEqual(colored.get("data-color-text") if colored is not None else None, color)
                 self.assertEqual(chart.findtext(".//span[@class='owner']"), "hana")
-                self.assertEqual(table.findtext("th[@class='step']/span"), step)
+                self.assertEqual(step_text(table, "th[@class='step']"), step)
                 self.assertIn("<dt>Started by</dt>", rendered[index + 1])
                 self.assertIn(start, rendered[index + 1].split("<dt>Started by</dt>", 1)[1].split("</dd>", 1)[0])
 
@@ -238,7 +245,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(chart.findtext(".//span[@class='name']/span[@data-color-text='role.unit-director']"), "builder")
                 self.assertEqual(chart.findtext(".//span[@class='owner']/span[@data-color-text='role.showrunner']"), "builds")
                 self.assertEqual(table.findtext("td[@class='verify']"), verify)
-                self.assertEqual(table.findtext("th[@class='step']/span"), step)
+                self.assertEqual(step_text(table, "th[@class='step']"), step)
         for key, machine in (("row:fixture-run-0", "natedev"), ("row:fixture-run-2", "mac-linux"),
                              ("row:fixture-run-3", "mac")):
             with self.subTest(key=key):
@@ -259,7 +266,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertIn(f"<dt>Named targets</dt><dd>{machines('Mac', 'natedev', 'mac-linux', 'hana-aws')}</dd>", rendered[4])
         self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='name']"), "hana CI")
         self.assertEqual(root.findtext(".//div[@data-run='fixture-run-1']//span[@class='owner']"), "")
-        self.assertEqual(root.findtext(".//tr[@data-tip='row:fixture-run-1']/th[@class='step']/span"), "")
+        self.assertEqual(step_text(root, ".//tr[@data-tip='row:fixture-run-1']/th[@class='step']"), "")
         self.assertNotIn("impl3", rendered[0])
         self.assertNotIn("building tests", rendered[0])
         self.assertIn("<dt>Caller</dt><dd>impl3</dd>", rendered[1])
@@ -393,7 +400,7 @@ class MemoryHoverTests(unittest.TestCase):
                                  ["tools", "", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']//span[@class='name']"), "first")
-                self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "")
+                self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "")
 
     def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
         data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
@@ -444,7 +451,7 @@ class MemoryHoverTests(unittest.TestCase):
         for key, name in (("wait:fixture-wait-2", "demo check"), ("wait:fixture-wait-3", "demo build")):
             row = root.find(f".//tr[@data-tip='{key}']")
             assert row is not None
-            self.assertEqual(row.findtext("th[@class='step']/span"), name)
+            self.assertEqual(step_text(row, "th[@class='step']"), name)
             self.assertEqual(root.findtext(f".//div[@data-tip='{key}']//span[@class='name']"), "builder")
 
     def test_cargo_and_gate_tooltips_show_a_call_without_verify(self) -> None:
@@ -826,7 +833,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(result[1:], ["4.1 of 48.0 GiB taken", 0.125, 3])
                 if rows:
                     self.assertEqual(rows[0][0].text, "—")
-                    self.assertEqual(rows[0].findtext("th[@class='step']/span"), "")
+                    self.assertEqual(step_text(rows[0], "th[@class='step']"), "")
                     self.assertEqual(chart_rows[0].findtext(".//span[@class='name']"), "hana CI")
 
     def test_mac_row_uses_its_stage_unit_memory_and_aligned_tooltip(self) -> None:
@@ -846,7 +853,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(metadata[0].text, expected)
                 vcpus = metadata.find("td[@class='vcpus']")
                 assert vcpus is not None
-                self.assertEqual(metadata.findtext("th[@class='step']/span"), "hana nextest")
+                self.assertEqual(step_text(metadata, "th[@class='step']"), "hana nextest")
                 self.assertEqual(table.findtext(".//div[@data-run='fixture-run-0']//span[@class='name']"), "trunk")
                 self.assertEqual(vcpus.text, "12")
                 owner = table.find(".//div[@data-run='fixture-run-0']/span/span[@class='owner']")
@@ -870,7 +877,7 @@ class MemoryHoverTests(unittest.TestCase):
         assert row is not None
         for column in ("place", "duration", "pid", "vcpus"):
             self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
-        self.assertEqual(row.findtext("th[@class='step']/span"), "")
+        self.assertEqual(step_text(row, "th[@class='step']"), "")
         self.assertEqual(result[1].count("unavailable"), 1)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
