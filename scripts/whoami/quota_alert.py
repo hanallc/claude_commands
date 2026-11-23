@@ -1905,30 +1905,6 @@ def _credits_run_out(balance: float, usage: run_out.CreditsUsed, now: datetime) 
     return until.astimezone(user_zone())
 
 
-def _worker_move_failure_cause(cause: str) -> str:
-    """Describe a swap failure without exposing the accounts command's diagnostics."""
-    text = cause.lower()
-    if "reading" in text or "cannot read" in text:
-        return "its usage reading is unavailable"
-    if "sign-in" in text or "sign in" in text:
-        return "its sign-in is unavailable"
-    if "used up" in text:
-        return "its usage is exhausted"
-    if "server" in text and "stop" in text:
-        return "its server could not stop"
-    if "permission" in text:
-        return "access to its worker settings was denied"
-    return "its worker account could not be prepared"
-
-
-def _work_routing_failure_cause(cause: str) -> str:
-    if "permission" in cause.lower():
-        return "permission to update the work-routing settings was denied"
-    if "longer than" in cause.lower() or "timeout" in cause.lower():
-        return "the work-routing update timed out"
-    return "the work-routing settings could not be updated"
-
-
 @dataclass(frozen=True)
 class WorkersMovedWithoutNotice:
     """The workers moved to room before they used paid credits."""
@@ -1940,16 +1916,15 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     from scripts.accounts import accounts
     reset = report.weekly_reset
     assert reset is not None
-    values = {"account": label, "reset": reset_display(refusals.KnownReset(reset))}
     if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
-        return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={**values,
-            "outcome": "workers wait for their next entry", "reason": "A workers next entry is queued.",
-            "fallback": "The queued head controls the next move; fallback moves wait."})
+        return ZeroEpisodeNotice(id="quota.codex_workers_stay",
+                                 values={"account": label, "outcome": "workers wait for their queued move"})
     chosen = _zero_destination(label, now, prefer_weekly_room=True,
                                included_only=isinstance(credits, agent_accounts.CreditsOn))
     if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
         chosen = _zero_destination(label, now, prefer_weekly_room=True, included_only=True)
     stamp = now.isoformat(timespec="seconds")
+    move_failed = False
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
             and isinstance(state["fallback"], NoCodexQuotaFallback)):
         move_id = uuid.uuid4().hex
@@ -1969,20 +1944,19 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             if not isinstance(error, accounts.WorkerMovesStartFailed):
                 moves.append_move(moves.FailedMove(kind="failed", at=stamp, tool="codex", subject="workers",
                     move_id=move_id, reason=str(error)))
-            values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
-            if isinstance(credits, agent_accounts.CreditsOn):
-                chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
+            move_failed = True
+            chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
         else:
             if isinstance(credits, agent_accounts.CreditsOn):
                 return WorkersMovedWithoutNotice()
-            values["target"] = chosen.label
-            values["transition"] = (f"Codex work now uses {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else "Codex work now spends paid credits")
-            values["funding"] = (f"{chosen.weekly_left:g}% weekly usage left"
-                                 if not accounts.codex_destination_uses_credits(chosen, now) else "its own paid credits")
-            return ZeroEpisodeNotice(id="quota.codex_workers_moved", values=values)
+            uses_credits = accounts.codex_destination_uses_credits(chosen, now)
+            return ZeroEpisodeNotice(id="quota.codex_workers_moved", values={
+                "account": label, "reset": reset_display(refusals.KnownReset(reset)), "target": chosen.label,
+                "transition": "Codex work now spends paid credits" if uses_credits else f"Codex work now uses {chosen.label}",
+                "funding": "its own paid credits" if uses_credits else f"{chosen.weekly_left:g}% weekly usage left"})
     if isinstance(credits, agent_accounts.CreditsOn):
         return _paid_credits_notice(label, report, chosen, reset)
-    if isinstance(chosen, accounts.NoAccountWithRoom):
+    if isinstance(chosen, accounts.NoAccountWithRoom) and not move_failed:
         entries = moves.read_moves()
         closed = {entry["move_id"] for entry in entries if entry["kind"] == "room again"}
         if not any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "no room"
@@ -1990,7 +1964,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             moves.append_move(moves.NoRoomMove(kind="no room", at=stamp, tool="codex", subject="workers",
                 move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                 if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
-        values["reason"] = "No other Codex account has room."
     candidates = [reset]
     if isinstance(chosen, accounts.NoAccountWithRoom) and isinstance(chosen.earliest_reset, accounts.EarliestReset):
         candidates.append(chosen.earliest_reset.at)
@@ -1999,20 +1972,27 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             if isinstance(window, accounts.ReadingWindow) and isinstance(window.reset, accounts.KnownReset) and window.reset.at > now:
                 candidates.append(window.reset.at)
     until = min(candidates)
-    values["until"] = reset_display(refusals.KnownReset(until))
     note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, hold=CreditsOffHold(until))
     _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
-        values["outcome"] = "work could not move"
-        values["fallback"] = (f"The switch to Claude failed because {_work_routing_failure_cause(switched.cause)}. "
-                              + f"Codex work stays on {label}.")
-    else:
-        values["outcome"] = "work moves to Claude"
-        values["fallback"] = ("New coding work uses Claude, the other coding assistant, until the earliest Codex refill "
-                              + f"at {values['until']}. Current turns finish first.")
-    del values["until"]
-    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values=values)
+        return ZeroEpisodeNotice(id="quota.codex_refused", values={"account": label})
+    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={
+        "account": label, "outcome": f"we're in self-actualize mode; worker work moves to {_units_account()}"})
+
+
+def _units_account() -> str:
+    """Name the Claude account of the units group. Never raise: unknown gives generic words."""
+    from scripts.accounts import accounts
+
+    try:
+        label = accounts.group_label(accounts.group_accounts(), "units")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return "the units account"
+    parsed = note_file.parse_account_label(label) if isinstance(label, str) else None
+    if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude":
+        return parsed.label
+    return "the units account"
 
 
 def _paid_credits_notice(label: str, report: Report,
@@ -2073,6 +2053,9 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
     values = dict(notice["values"])
     if "file" in values:
         values["file"] = note_file.note_name(label)
+    if notice["id"] == "quota.codex_workers_stay":
+        # An episode saved before the one-line text also holds reset, reason and fallback.
+        values = {"account": values["account"], "outcome": values["outcome"]}
     if workers_queued:
         if notice["id"] == "quota.paid_credits":
             return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in
@@ -2130,7 +2113,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 episodes[label]["credits_off_fallback"] = "waiting_for_next_entry"
             current = _current_notice(label, notice, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
-            log.append(f"quota zero {label}: {rendered.title}\n{rendered.body}")
+            log.append(f"quota zero {label}: {rendered.title}" + (f"\n{rendered.body}" if rendered.body else ""))
         episode = episodes[label]
         setting = agent_accounts.codex_credits_setting(label)
         if (at_zero and existing_episode
@@ -2159,10 +2142,11 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             _ = episode.pop("forecast_phone", None)
             _ = episode.pop("forecast_notice", None)
             result = render(changed["id"], **changed["values"])
-            log.append(f"quota credits off {label}: {result.body}")
+            log.append(f"quota credits off {label}: {result.posted_body}")
 
         # Old opening notices used values that the current templates do not accept.
-        if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay"):
+        if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay",
+                                           "quota.codex_refused"):
             episode["notice"] = _paid_credits_notice(label, report,
                 _zero_destination(label, now, prefer_weekly_room=True, included_only=True),
                 report.weekly_reset or datetime.fromisoformat(episode["weekly_reset"]))

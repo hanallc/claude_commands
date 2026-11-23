@@ -417,7 +417,7 @@ Unknown capacity cannot confirm exhaustion.
 The flag starts only on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
 The credits-off path uses the same capacity rule.
-A failed move does not start no-worker mode while another account has allowance or permitted credits.
+On the refusal path, a failed move does not start no-worker mode while another account has allowance or permitted credits. On the credits-off zero path, a failed move counts as no room and can start the mode.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.

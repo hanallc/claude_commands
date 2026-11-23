@@ -187,7 +187,8 @@ class PushTextTests(unittest.TestCase):
                         self.assertLess(len(text), 1024)
                     else:
                         self.assertLess(len(text), 500)
-                    self.assertLess(len(push.title), 45)
+                    # A one-line text posts no title; its line is the message.
+                    self.assertLess(len(push.posted_title), 45)
 
     def test_decision_argv_carries_the_question_record_path(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")

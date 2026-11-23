@@ -90,8 +90,8 @@ The title gives the remaining quota and the default outcome.
 For example, “codex2 has 2% left; codex1 next” means workers move to codex1.
 It names paid credits only when the account allows them and no other Codex account has room.
 With no paid credits and no Codex account with room, the title ends “units work alone next”: no-worker mode starts at 0%.
-The reminder says “No action needed.”
-The reminder has no body.
+The reminder is one line (`one_line`): the phone shows the app name as the title and the line as the whole message.
+It has no “No action needed.” line and no body.
 
 A pane worker's proved quota refusal marks its pass refused and keeps it open for redispatch after the account move.
 The move preserves its native conversation, pane, and terminal.
@@ -184,8 +184,14 @@ The notice names that choice.
 The pane move stops the live agent before it resumes the conversation.
 The request records `cause: credits off`, separately from provider refusal.
 Without room, or after a failed move, that pass routes Codex assignments to Claude.
+A failed move counts as no room. It writes its `failed` record and no `no room` record.
 Assignment changes are live in the same pass, even while a landing holds main. Main gets them at the next notes pass that finds main free.
-The notice names the earliest refill and any failure.
+The notice `quota.codex_workers_stay` is one line: `<account> is empty; we're in self-actualize mode; worker work moves to <units>`.
+`<units>` is the Claude account of the units group in the role map.
+When the role map cannot be read or has no units account, the line says `the units account`.
+With credits off and a workers entry queued, the line is `<account> is empty; workers wait for their queued move`.
+When the switch to Claude fails, the notice is `quota.codex_refused`.
+An episode saved with the older values (`reset`, `reason`, `fallback`) renders with only its account and outcome.
 The fallback remains until that refill or the selected account recovers.
 Turning credits on permits recovery when the selected account can work.
 An account with credits off cannot buy room from its credit balance.
@@ -203,7 +209,8 @@ An episode rereads this setting on every pass.
 The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
 No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits.
 Unknown capacity cannot confirm exhaustion.
-A failed move alone does not start the mode.
+At weekly zero with credits off, a failed move counts as no room, so it can start the mode.
+On the refusal path, a failed move alone does not start the mode.
 Starting the mode sends the no-capacity notice and stops the Codex workers once.
 Capacity recovery ends the mode without a timer or delay.
 An off-to-on change is recorded in the episode, so a later on-to-off change acts again.
