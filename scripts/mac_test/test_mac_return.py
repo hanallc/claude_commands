@@ -30,7 +30,7 @@ class MacReturnTests(OffloadCommandFixture):
 
         self.assertEqual(interrupted.returncode, 75, interrupted.stdout + interrupted.stderr)
         self.assertIn("running tests before the outage", interrupted.stdout)
-        self.assert_wire("lost", "")
+        self.assert_wire("lost", "cleanup_unconfirmed")
         self.assert_claim_is_kept()
         self.assert_claimed_commands()
         cleanup, = self.leftover_events()
