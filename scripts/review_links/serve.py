@@ -2480,10 +2480,11 @@ class ReviewLinksServer(ThreadingHTTPServer):
                     print(f"review-links delivery recovery: {error}", file=sys.stderr)
                 finally:
                     self.delivery_status.startup_recovery_pending.clear()
+                # A Go goes first: its resend carries the producer's next-step notice in the same message.
                 try:
-                    recover_list()
-                finally:
                     recover_goes(self.store_folder)
+                finally:
+                    recover_list(self.store_folder)
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
         try:

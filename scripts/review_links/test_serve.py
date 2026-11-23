@@ -5292,9 +5292,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             sent.clear()
             recovered = threading.Event()
             recover = list_page.recover_pending
-            def recover_and_finish() -> None:
+            def recover_and_finish(ledger: Path) -> None:
                 try:
-                    recover()
+                    recover(ledger)
                 finally:
                     recovered.set()
             with patch.object(list_page, "recover_pending", side_effect=recover_and_finish):
@@ -5305,10 +5305,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                 finally:
                     restarted.server_close()
 
-    def go_fixture(self, *, natedev: bool = False) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem, the_list.Ask, str]:
+    def go_fixture(self, *, natedev: bool = False, waiting: bool = False, producer: staff.StaffRow | None = None
+                   ) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem, the_list.Ask, str]:
         """Open one Go ask for a unit row; return the signed Go form body.
 
         The test client is a loopback address. Without natedev, the fixture accepts it as another device.
+        With waiting, the item waits for nate. With a producer, that row produces the item; else morty does.
         """
         _ = write_config_fixture(conf.path("review_links"), "go_refused_addresses=192.0.2.1\ndelivery_pause_seconds=0\n")
         if not natedev:
@@ -5316,8 +5318,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty, item = self.list_keeper_item("Merge the needsme unit")
         unit = staff.StaffRow(staff.StaffId("fixture-unit"), "unit", "devtools", staff.StaffRoot(),
                               current_session=staff.StaffId("fixture-unit-session"))
-        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, unit))))
+        rows = (morty, unit) if producer is None else (morty, unit, producer)
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        if waiting:
+            _ = the_list.update(morty.id, item.id, {"state": the_list.ItemState.WAITING_FOR_NATE}, source="morty")
+        if producer is not None:
+            _ = the_list.move_open_producer(morty.id, item.id, morty.id, producer.id, source="morty")
         item = the_list.mark_read(morty.id, item.id, source="morty")
         ask = the_list.add_ask(morty.id, item.id, kind=the_list.AskKind.GO, target=unit.id, what="Merge needsme to main.",
                                why="The merge needs nate's go.", config=False, requester=morty.id, source="morty")
@@ -5370,10 +5377,102 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((closed.is_open, closed.go_id), (False, go_id))
         self.assertEqual(saved.log[-1].what, the_list.GoGiven(closed))
         self.assertNotIsInstance(saved.unread_since, datetime)
-        self.assertEqual(list_page.shown_asks(saved, staff.snapshot()), ())
+        self.assertEqual(the_list.answerable_asks(saved, staff.snapshot()), ())
         again, reply = self.post(go_ledger.GO_PATH, body)
         self.assertEqual((again, json.loads(reply)["reason"]), (400, "This ask is no longer open."))
         self.assertEqual(len(self.go_ledger_records()), 1)
+
+    def sent_messages(self, delivery: Mock) -> dict[str, list[str]]:
+        """Group the stubbed sends by recipient."""
+        messages: dict[str, list[str]] = {}
+        for sent_call in delivery.call_args_list:
+            messages.setdefault(cast(str, sent_call.args[0]), []).append(cast(str, sent_call.args[2]))
+        return messages
+
+    def test_list_go_on_the_last_ask_of_a_waiting_item_sets_working_and_sends_the_producer_one_message(self) -> None:
+        morty, unit, item, _ask, body = self.go_fixture(waiting=True)
+        self.assertEqual(item.producer, morty.id)
+        code, reply, delivery = self.post_go(body)
+        self.assertEqual(code, 200, reply)
+        fields = cast(dict[str, str], json.loads(reply))
+        self.assertEqual((fields["item_state"], fields["open_ask"], fields["unread"]), ("Working", "false", "false"))
+        go_id = self.go_ledger_records()[0].stem
+        command = f"update --id {item.id} --source morty --next-step"
+        messages = self.sent_messages(delivery)
+        self.assertEqual(sorted(messages), sorted([unit.id, morty.id]))
+        (to_producer,), (to_target,) = messages[morty.id], messages[unit.id]
+        self.assertIn(f"{go_ledger.CHECK_COMMAND} {go_id}", to_producer)
+        self.assertIn(command, to_producer)
+        self.assertNotIn(command, to_target)
+        saved = the_list.load(morty.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.WORKING)
+        self.assertNotIsInstance(saved.unread_since, datetime)
+        notice = the_list.feedback_requests(saved)[the_list.go_next_step_request(go_id)]
+        self.assertEqual((notice.recipient, notice.state), (morty.id, "sent"))
+        self.assertEqual(go_ledger.read(self.root, go_id)["sent"], {unit.id: True, morty.id: True})
+
+    def restart_and_recover_all(self, send: Callable[..., None] | None = None) -> list[tuple[str, str]]:
+        """Start a second server that runs the Go and List Tell recoveries; return each send and its message."""
+        recovered = threading.Event()
+        recover = list_page.recover_pending
+        def recover_and_finish(ledger: Path) -> None:
+            try:
+                recover(ledger)
+            finally:
+                recovered.set()
+        with (patch.object(change_page, "send_to_staff", side_effect=send) as delivery,
+              patch.object(change_page, "recover_pending"),
+              patch.object(list_page, "recover_pending", side_effect=recover_and_finish)):
+            restarted = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            try:
+                self.assertTrue(recovered.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                restarted.server_close()
+        return [(cast(str, sent_call.args[0]), cast(str, sent_call.args[2])) for sent_call in delivery.call_args_list]
+
+    def test_list_go_next_step_goes_only_with_the_go_after_failed_sends(self) -> None:
+        morty, unit, item, _ask, body = self.go_fixture(waiting=True)
+        def morty_offline(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
+            if recipient == morty.id:
+                raise OSError("The session is offline.")
+        code, _reply, _delivery = self.post_go(body, send_error=morty_offline)
+        self.assertEqual(code, 200)
+        go_id = self.go_ledger_records()[0].stem
+        request = the_list.go_next_step_request(go_id)
+        notice = lambda: the_list.feedback_requests(the_list.load(morty.id, item.id))[request]
+        self.assertEqual((notice().state, go_ledger.read(self.root, go_id)["sent"]), ("pending", {unit.id: True, morty.id: False}))
+        # A List Tell recovery that runs beside the click leaves the notice to the Go path.
+        with patch.object(change_page, "send_to_staff") as delivery:
+            list_page.recover_pending(self.root)
+        delivery.assert_not_called()
+        # The start sends the Go again; it fails again, and the List Tell recovery sends nothing alone.
+        to_morty = [message for recipient, message in self.restart_and_recover_all(morty_offline) if recipient == morty.id]
+        self.assertTrue(to_morty)
+        self.assertTrue(all(go_id in message and "--next-step" in message for message in to_morty))
+        self.assertEqual(notice().state, "pending")
+        # The next start reaches morty with one message: the Go and the next step together.
+        sent = self.restart_and_recover_all()
+        self.assertEqual([recipient for recipient, _ in sent], [morty.id])
+        self.assertIn(go_id, sent[0][1])
+        self.assertIn(f"update --id {item.id} --source morty --next-step", sent[0][1])
+        self.assertEqual((notice().state, go_ledger.read(self.root, go_id)["sent"]), ("sent", {unit.id: True, morty.id: True}))
+        self.assertEqual(self.restart_and_recover_all(), [])
+
+    def test_list_go_sends_another_producer_the_next_step_alone(self) -> None:
+        bob = staff.StaffRow(staff.StaffId("fixture-bob"), "producer", "bob", staff.StaffRoot(),
+                             current_session=staff.StaffId("fixture-bob-session"))
+        morty, unit, item, _ask, body = self.go_fixture(waiting=True, producer=bob)
+        code, reply, delivery = self.post_go(body)
+        self.assertEqual(code, 200, reply)
+        go_id = self.go_ledger_records()[0].stem
+        messages = self.sent_messages(delivery)
+        self.assertEqual(sorted(messages), sorted([unit.id, morty.id, bob.id]))
+        (to_producer,) = messages[bob.id]
+        self.assertIn(f"update --id {item.id} --source bob --next-step", to_producer)
+        self.assertNotIn(go_id, to_producer)
+        saved = the_list.load(morty.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.WORKING)
+        self.assertEqual(the_list.feedback_requests(saved)[the_list.go_next_step_request(go_id)].state, "sent")
 
     def test_list_go_from_natedev_is_refused_and_writes_nothing(self) -> None:
         morty, _unit, item, _ask, body = self.go_fixture(natedev=True)

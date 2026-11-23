@@ -1381,6 +1381,8 @@ Delimiters between word characters or slashes stay literal, so `src/**/test/**/f
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry.
 Mark read on an unparked Waiting for nate item with no open question and no open ask also sets the state to Working.
+An open ask whose target has no staff row does not count here, because the page shows no box for it.
+A Go that leaves no ask with a box moves the item to Working by the same rule; see [Asks for nate's Go](#asks-for-nates-go).
 The same write logs the state change and saves a notice for the item's producer.
 The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
 The existing sender delivers it with its retry and alert rules.
@@ -1542,8 +1544,8 @@ After Mark read, an open question returns the item to Morty answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells its recipient which action Nate completed.
-The recipient is the item's producer for Mark read and the record keeper for each other action.
-The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
+The recipient is the item's producer for Mark read and for the next-step notice of a Go, and the record keeper for each other action.
+The notice saves its recipient, so a later producer change does not move a saved Mark read or Go notice.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Feedback sends the user's words without changing the item state or parking time.
@@ -1599,7 +1601,7 @@ Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
 The Update cell shows “sent to <recipient>” with its time until the next log entry from another writer.
-The recipient is the record keeper, or the item's producer for a Mark read notice.
+The recipient is the record keeper, or the item's producer for a Mark read or Go next-step notice.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
@@ -1635,7 +1637,9 @@ Closed items show no check text in the page or CLI.
 An ask names one change that waits for nate's go or approval (List item 232).
 A producer opens it with `the_list.py ask` ([The List: `the_list.py`](showrunner-automation.md#the-list-the_listpy)).
 An open ask whose target has a staff row puts the item in Needs me, also during an active park.
-Mark read on an item with an open ask clears the dot, keeps the state and sends no message.
+An open ask whose target has no staff row shows no box and does not hold the item.
+`the_list.answerable_asks` is the one rule for both: the page boxes, Needs me, Mark read and the Go use it.
+Mark read on an item with an open ask that shows a box clears the dot, keeps the state and sends no message.
 The open row shows one box for each open ask, above the item fields.
 The box has a warning border and a heading: “Needs your go” or “Needs your approval”.
 It shows What, Who needs it (the target's staff name and role) and Why.
@@ -1660,7 +1664,13 @@ An accepted click does these steps in this order:
    The file lock `go-ledger/.lock` orders each ledger change across processes and threads.
    The server holds it from this record to the end of the List save in step 2.
 2. The List closes the ask with the go id and logs “**Go** — nate: <what> → <agent>” (or **Approved**).
-   When no ask stays open, the item leaves Needs me.
+   When no ask that shows a box stays open, the item leaves Needs me.
+   When the Go leaves no ask that shows a box on an unparked Waiting for nate item with no open question, the item becomes Working.
+   The same write logs the state change and saves a next-step notice for the item's producer, as Mark read does.
+   When the Go makes the item read, it also logs “Marked read” after the state change, as Mark read does.
+   A later unread walk stops there, so a later Go on the same item can make it read again.
+   The notice has the request id `<go id>-next-step`, so its delivery key differs from the key of the Go message.
+   An item in another state keeps its state.
    The item becomes read only when it has no other unread change, such as an unread answer, an unread delivery or a newer update.
    When the save cannot confirm folder durability, the List reads the item again.
    If the ask holds this go id, the server keeps the record and continues.
@@ -1670,9 +1680,12 @@ An accepted click does these steps in this order:
    If no ask holds this go id, the server removes the ledger record, and the page shows “The Go could not be saved. Try again.”
    When that read also fails, the record stays and the page shows “The Go could not be saved. Try again.”
    At each server start, the server reads the item of each kept record. It removes the record when no ask holds its go id, and keeps it when the read fails.
-3. The server answers the page. The page removes the box.
+3. The server answers the page. The page removes the box and applies the saved state, so a Working row leaves Needs me in place.
 4. The server sends the target and morty one message through the List Tell sender.
    The message names What and carries only the go id and the check command.
+   When the Go set Working, the producer gets one message.
+   A producer that is a Go recipient gets the Go message with the next-step line at its end. The notice becomes sent with it.
+   Another producer gets the next-step notice alone, through the List Tell sender.
    The server sets `sent` to true for each recipient that the message reached.
    A failed send alerts the item's showrunners with the title “List Go needs attention”.
    It also adds the log line “Go not delivered to <agent>”, so nate sees it.
@@ -1681,7 +1694,10 @@ An accepted click does these steps in this order:
 At server start, the server sends each Go that has an unsent recipient again, through the same path.
 It sends only to the recipients that the message did not reach.
 It removes each record whose item shows no ask with its go id. When the item read fails, the record stays.
-It does this after the List Tell recovery.
+It does this before the List Tell recovery, so a resend to the producer carries its next-step line in the same message.
+The List Tell recovery does not send a next-step notice whose Go record has its recipient unsent.
+Only the Go path sends that notice, with the Go, also when nate presses Go during the start recovery.
+When the producer is not a Go recipient, the List Tell recovery sends the notice alone.
 
 `go_check.py <go id>` asks the server with the caller's staff id from `staff.py`.
 The server answers `go ok` only when all of these are true:

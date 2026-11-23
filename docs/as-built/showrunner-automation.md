@@ -603,7 +603,9 @@ Each ask stores the kind, What, Why, the target, the config flag, the opened tim
 The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
 An open ask makes the item unread, and the log gets an “Ask opened” line.
 The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
-When no ask stays open, the item becomes read if it has no other unread change.
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
 A Go message that does not reach a recipient adds a “Go not delivered” log line.
 nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 

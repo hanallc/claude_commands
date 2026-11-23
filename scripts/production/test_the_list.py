@@ -1032,7 +1032,7 @@ class TheListTests(unittest.TestCase):
             return list_page.list_chip(item.state, parked=False, open_question=the_list.has_open_question(item),
                                        unread_delivery=the_list.unread_delivery(item),
                                        unread_answer=bool(the_list.unread_answer_ids(item)),
-                                       open_ask=bool(list_page.shown_asks(item, staff.snapshot())))
+                                       open_ask=bool(the_list.answerable_asks(item, staff.snapshot())))
         read = go(the_list.mark_read(MORTY.id, self.add().id, source="morty"))
         self.assertNotIsInstance(read.unread_since, datetime)
         told = the_list.mark_read(MORTY.id, self.add().id, source="morty")
@@ -1056,6 +1056,66 @@ class TheListTests(unittest.TestCase):
         updated = go(the_list.load(MORTY.id, updated.id))
         self.assertIsInstance(updated.unread_since, datetime)
         self.assertEqual(chip(updated), list_page.ListChip.WORKING)
+
+    def read_with_go_asks(self, state: the_list.ItemState, *targets: staff.StaffId) -> tuple[the_list.ListItem, tuple[the_list.Ask, ...]]:
+        """Add a read item in this state with one open Go ask for each target."""
+        item = the_list.mark_read(MORTY.id, self.add(changes={"state": state, "producer": BOB.id}).id, source="morty")
+        asks = tuple(the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=target, what="Merge.",
+                                      why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+                     for target in targets)
+        return the_list.load(MORTY.id, item.id), asks
+
+    def test_go_keeps_a_waiting_item_waiting_while_another_ask_stays_open(self) -> None:
+        item, (first, second) = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE, OWNER.id, OWNER.id)
+        given = the_list.give_go(MORTY.id, item.id, first.ask_id, "0" * 32, source="nate").item
+        self.assertEqual(given.state, the_list.ItemState.WAITING_FOR_NATE)
+        self.assertEqual(the_list.answerable_asks(given, staff.snapshot()), (second,))
+        self.assertIsInstance(given.unread_since, datetime)
+        self.assertEqual(given.log[-1].what, the_list.GoGiven(given.asks[0]))
+        self.assertEqual(the_list.feedback_requests(given), {})
+
+    def test_go_keeps_the_state_of_an_item_in_another_state(self) -> None:
+        for state in (the_list.ItemState.WORKING, the_list.ItemState.BLOCKED, the_list.ItemState.DELIVERED):
+            with self.subTest(state=state.value):
+                item, (ask,) = self.read_with_go_asks(state, OWNER.id)
+                given = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate").item
+                self.assertEqual(given.state, state)
+                self.assertNotIsInstance(given.unread_since, datetime)
+                self.assertEqual(given.log[-1].what, the_list.GoGiven(given.asks[0]))
+                self.assertEqual(the_list.feedback_requests(given), {})
+
+    def test_a_go_after_a_go_that_set_working_leaves_the_item_read(self) -> None:
+        item, (first,) = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE, OWNER.id)
+        working = the_list.give_go(MORTY.id, item.id, first.ask_id, "0" * 32, source="nate").item
+        self.assertEqual((working.state, working.unread_since), (the_list.ItemState.WORKING, the_list.NoTimestamp.UNSET))
+        self.assertEqual([type(change.what) for change in working.log[len(item.log):]],
+                         [the_list.GoGiven, the_list.FieldChange, the_list.MarkedRead, the_list.PageFeedback])
+        second = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Publish.",
+                                  why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+        self.assertIsInstance(the_list.load(MORTY.id, item.id).unread_since, datetime)
+        again = the_list.give_go(MORTY.id, item.id, second.ask_id, "1" * 32, source="nate").item
+        self.assertEqual((again.state, again.unread_since), (the_list.ItemState.WORKING, the_list.NoTimestamp.UNSET))
+        chip = list_page.list_chip(again.state, parked=False, open_question=the_list.has_open_question(again),
+                                   unread_delivery=the_list.unread_delivery(again),
+                                   unread_answer=bool(the_list.unread_answer_ids(again)),
+                                   open_ask=bool(the_list.answerable_asks(again, staff.snapshot())))
+        self.assertEqual(chip, list_page.ListChip.WORKING)
+
+    def test_an_open_ask_whose_target_has_no_staff_row_does_not_hold_a_waiting_item(self) -> None:
+        gone = staff.StaffId("gone-session")
+        item, _ = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE, gone)
+        self.assertEqual((len(the_list.open_asks(item)), the_list.answerable_asks(item, staff.snapshot())), (1, ()))
+        self.assertIsInstance(item.unread_since, datetime)
+        read = self.page_read(item).item
+        self.assertEqual(read.state, the_list.ItemState.WORKING)
+        self.assertEqual(the_list.feedback_requests(read)["read"].recipient, BOB.id)
+        item, (ask, _) = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE, OWNER.id, gone)
+        given = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate").item
+        self.assertEqual((given.state, given.unread_since), (the_list.ItemState.WORKING, the_list.NoTimestamp.UNSET))
+        self.assertEqual(len(the_list.open_asks(given)), 1)
+        notice = the_list.feedback_requests(given)[the_list.go_next_step_request("0" * 32)]
+        self.assertEqual((notice.recipient, notice.state), (BOB.id, "pending"))
+        self.assertIn(f"update --id {item.id} --source bob --next-step", notice.words)
 
     def test_old_records_without_asks_load_without_writes(self) -> None:
         item = self.add()

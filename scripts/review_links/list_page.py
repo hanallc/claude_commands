@@ -78,13 +78,6 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
     return ListChip.MORTY_ANSWERING if open_question else chip
 
 
-def shown_asks(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[the_list.Ask, ...]:
-    """Show an open ask only when its target has a staff row."""
-    if item.state == the_list.ItemState.CLOSED:
-        return ()
-    return tuple(ask for ask in the_list.open_asks(item) if members.by_id(ask.target) is not None)
-
-
 class ListRecord(NamedTuple):
     """An item and the fixed producer ID that owns its record."""
 
@@ -490,7 +483,7 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
     """Show one box with a Go or Approved button for each open ask."""
     boxes: list[str] = []
     row_id = entry.key.replace("/", "-")
-    for ask in shown_asks(entry.item, names.members):
+    for ask in the_list.answerable_asks(entry.item, names.members):
         member = names.members.by_id(ask.target)
         assert member is not None
         box_id = html.escape(f"ask-{row_id}-{ask.ask_id}", quote=True)
@@ -649,7 +642,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "unread-answer": str(bool(unread_answers)).lower(),
-                  "open-ask": str(bool(shown_asks(item, names.members))).lower(),
+                  "open-ask": str(bool(the_list.answerable_asks(item, names.members))).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
@@ -797,7 +790,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     open_question = item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
-    open_ask = bool(shown_asks(item, staff.snapshot()))
+    open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -1011,7 +1004,7 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *,
     keeper, identity, ask_id, page = _signed_go(root, body)
     members = staff.snapshot()
     item = the_list.load(keeper, identity)
-    ask = next((ask for ask in shown_asks(item, members) if ask.ask_id == ask_id), None)
+    ask = next((ask for ask in the_list.answerable_asks(item, members) if ask.ask_id == ask_id), None)
     target = members.by_id(ask.target) if ask is not None else None
     if ask is None or target is None:
         raise question_record.AnswerRefused("This ask is no longer open.")
@@ -1038,6 +1031,8 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *,
 def deliver_go(ledger: Path, go_id: str) -> None:
     """Send the Go to each unsent recipient through the List Tell sender and keep the result in the ledger.
 
+    When the Go moved the item to Working, the producer gets one message with the next step.
+    A producer that is a Go recipient gets the Go and the next step together; another producer gets the next step alone.
     A failed send alerts the item's showrunners and adds a "Go not delivered" log line for nate, once per recipient.
     """
     entry = go_ledger.read(ledger, go_id)
@@ -1050,13 +1045,30 @@ def deliver_go(ledger: Path, go_id: str) -> None:
     target = members.by_id(ask.target)
     settings = conf.read("review_links")
     tries = settings.whole("delivery_tries")
+    pause = settings.number("delivery_pause_seconds")
     message = go_ledger.message(item, ask, go_id, target.name if target is not None else ask.target)
     source = the_list.folder(keeper) / f"{item.id}.md"
     key = change_page.review_delivery_key(source, item.id, go_id)
-    failures = change_page.send_with_retries(change_page.SENDER, pending, message, tries,
-                                             settings.number("delivery_pause_seconds"), key=key)
+    next_step = the_list.go_next_step_request(go_id)
+    notice = the_list.feedback_requests(item).get(next_step)
+    producer = the_list.notice_recipient(keeper, notice) if notice is not None and notice.state == "pending" else None
+    plain = tuple(recipient for recipient in pending if recipient != producer)
+    failures = change_page.send_with_retries(change_page.SENDER, plain, message, tries, pause, key=key)
     failed = {failure.recipient for failure in failures}
-    go_ledger.mark(ledger, go_id, "sent", (recipient for recipient in pending if recipient not in failed))
+    sent = [recipient for recipient in plain if recipient not in failed]
+    if producer is not None and producer in pending:
+        def send(_: the_list.ListItem, saved: the_list.PageFeedback) -> the_list.PageFeedback:
+            missed = change_page.send_with_retries(change_page.SENDER, (producer,), message + "\n" + saved.words,
+                                                   tries, pause, key=key)
+            failures.extend(missed)
+            if missed:
+                return saved
+            sent.append(producer)
+            return replace(saved, state="sent")
+        the_list.deliver_feedback(keeper, item.id, next_step, send)
+    go_ledger.mark(ledger, go_id, "sent", sent)
+    if producer is not None and producer not in entry["sent"]:
+        deliver(ListFeedbackDelivery(keeper, item.id, next_step))
     # Report each failed recipient to nate once per Go; a resend at a later start reports nothing new.
     new = [failure for failure in failures if not entry["reported"].get(str(failure.recipient), False)]
     if not new:
@@ -1086,11 +1098,26 @@ def recover_goes(ledger: Path) -> None:
             print(f"List Go recovery {go_id}: {error}", file=sys.stderr)
 
 
-def recover_pending() -> None:
-    """Retry each pending request once at server start."""
+def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.PageFeedback) -> bool:
+    """Find a Go's next-step notice that only the Go path sends: the Go record has its recipient unsent.
+
+    The Go path sends that recipient the Go and the next step in one message.
+    """
+    go_id = the_list.next_step_go_id(feedback.request)
+    if go_id is None:
+        return False
+    try:
+        entry = go_ledger.read(ledger, go_id)
+    except (OSError, ValueError):
+        return False
+    return entry["sent"].get(the_list.notice_recipient(keeper, feedback)) is False
+
+
+def recover_pending(ledger: Path) -> None:
+    """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
-            if feedback.state == "pending":
+            if feedback.state == "pending" and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
                     deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
                 except (OSError, ValueError) as error:
@@ -1204,7 +1231,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
                               unread_delivery=the_list.unread_delivery(entry.item),
                               unread_answer=bool(unread_answers),
-                              open_ask=bool(shown_asks(entry.item, members)))] += 1
+                              open_ask=bool(the_list.answerable_asks(entry.item, members)))] += 1
         row_reviews = reviews
         if entry.item.reviews and (
             reviews is LinkedReviewRead.AFTER_RENDER
@@ -1709,6 +1736,7 @@ function bindFeedbackForm(form){
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
+  form.applySavedState=applySavedState;
   retain();
   const edit=()=>{draftStamp++;retain();};
   words.addEventListener('input',edit);until.addEventListener('input',edit);
@@ -1973,10 +2001,8 @@ document.addEventListener('submit',async event=>{
    const asks=box.parentElement;
    box.remove();
    if(!asks.children.length) asks.remove();
-   if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
-   if(['true','false'].includes(result.unread))
-    syncUnread(item,recordDetails(item)?.querySelector('[data-feedback-form]') ?? null,result.unread==='true',
-     result.unread_sort ?? 0);
+   // The row's feedback form applies the saved state, so a Go that sets Working moves the row as Mark read does.
+   recordDetails(item).querySelector('[data-feedback-form]').applySavedState(result);
    tableView.applyAction();
    if(item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.applyAction();}
   });

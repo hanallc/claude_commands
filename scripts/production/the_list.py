@@ -1413,7 +1413,12 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             what: ListEvent | Callable[[ListItem], ListEvent], source: str, *,
             unread: bool | Callable[[ListItem], bool] = True,
             page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
-            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+            follow: Callable[[ListItem, ListItem, datetime], tuple[ItemChange, ...]] | None = None) -> ListEdit:
+    """Save one edit and its log entry under the write lock.
+
+    `follow` gives the entries that come after the edit's own entry, from the item before and after the edit.
+    """
     store = _store(keeper)
     _ = store.path(identity)
     with store.locked():
@@ -1438,6 +1443,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if changed != item:
             event = what(changed) if callable(what) else what
             entries.append(ItemChange(moment, event, source))
+            if follow is not None:
+                entries.extend(follow(item, changed, moment))
             stays_unread = unread(changed) if callable(unread) else unread
             changed = replace(changed, updated=moment, unread_since=moment if stays_unread else NoTimestamp.UNSET)
             if (isinstance(event, FieldChange) and event.action == "Updated"
@@ -1451,7 +1458,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                                        form_words=request.form_words, parked_until=request.parked_until)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
             elif request.action == "read" and changed.state != item.state:
-                entries.append(ItemChange(moment, _next_step_notice(request, changed), PAGE_SOURCE))
+                notice = _next_step_notice(request.request, "nate read", changed, form_words=request.words)
+                entries.append(ItemChange(moment, notice, PAGE_SOURCE))
             elif request.action == "unpark":
                 reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
                           else UnparkNoChangeReason.NO_ACTIVE_PARKING)
@@ -1822,28 +1830,42 @@ def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staf
 
 
 def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, source: str) -> ListEdit:
-    """Close the ask with the go id; mark the item read when no ask stays open."""
+    """Close the ask with the go id; mark the item read when no answerable ask stays open.
+
+    When the Go closes the last answerable ask of an item that waits for nate, the item moves to Working.
+    The same write saves a notice that asks the item's producer for the next step, as Mark read does.
+    """
     def edit(item: ListItem, moment: datetime) -> ListItem:
         _open(item)
         if not any(ask.ask_id == ask_id for ask in open_asks(item)):
             raise ListError("This ask is no longer open.")
-        return replace(item, asks=tuple(replace(ask, closed=moment, go_id=go_id) if ask.ask_id == ask_id else ask
-                                        for ask in item.asks))
+        closed = replace(item, asks=tuple(replace(ask, closed=moment, go_id=go_id) if ask.ask_id == ask_id else ask
+                                          for ask in item.asks))
+        return replace(closed, state=ItemState.WORKING) if _waits_for_nate(closed, moment) else closed
 
     def event(changed: ListItem) -> GoGiven:
         return GoGiven(next(ask for ask in changed.asks if ask.ask_id == ask_id))
 
     def stays_unread(changed: ListItem) -> bool:
         # Another open ask or an unread change other than an ask or a Go keeps the item unread.
-        return bool(open_asks(changed)) or any(not isinstance(change.what, (AskOpened, GoGiven))
-                                               for change in _unread_changes(changed))
+        return bool(answerable_asks(changed, staff.snapshot())) or any(
+            not isinstance(change.what, (AskOpened, GoGiven)) for change in _unread_changes(changed))
+
+    def working(item: ListItem, changed: ListItem, moment: datetime) -> tuple[ItemChange, ...]:
+        if changed.state == item.state:
+            return ()
+        state = ItemChange(moment, FieldChange("Updated", {"state": ItemState.WORKING}), source)
+        # As with Mark read, the read comes after the state change, so a later unread walk stops before it.
+        read = () if stays_unread(changed) else (ItemChange(moment, MarkedRead(), PAGE_SOURCE),)
+        notice = _next_step_notice(go_next_step_request(go_id), "nate gave the Go on", changed)
+        return (state, *read, ItemChange(moment, notice, PAGE_SOURCE))
     before: list[ListItem] = []
 
     def save(item: ListItem, moment: datetime) -> ListItem:
         before.append(item)
         return edit(item, moment)
     try:
-        return _change(keeper, identity, save, event, source, unread=stays_unread)
+        return _change(keeper, identity, save, event, source, unread=stays_unread, follow=working)
     except AtomicDurabilityUnconfirmed:
         # The new content can be visible. Keep the Go when the saved ask holds this go id.
         try:
@@ -1873,20 +1895,47 @@ def has_open_question(item: ListItem) -> bool:
     return any(question.answer is None for question in item.questions)
 
 
+def answerable_asks(item: ListItem, members: staff.StaffSnapshot) -> tuple[Ask, ...]:
+    """Find the open asks that nate can answer: the item is open and the ask's target has a staff row.
+
+    The page shows only these asks, so only these asks keep an item waiting for nate.
+    """
+    if item.state == ItemState.CLOSED:
+        return ()
+    return tuple(ask for ask in open_asks(item) if members.by_id(ask.target) is not None)
+
+
 def _waits_for_nate(item: ListItem, moment: datetime) -> bool:
-    """Return True for an unparked item that waits for nate with no open question and no open ask."""
-    return (item.state == ItemState.WAITING_FOR_NATE and not has_open_question(item) and not open_asks(item)
-            and not parking_active(item.parked_until, moment))
+    """Return True for an unparked item that waits for nate with no open question and no ask that nate can answer."""
+    return (item.state == ItemState.WAITING_FOR_NATE and not has_open_question(item)
+            and not answerable_asks(item, staff.snapshot()) and not parking_active(item.parked_until, moment))
 
 
-def _next_step_notice(request: PageRequest, item: ListItem) -> PageFeedback:
-    """Ask the item's producer for the next step and save the producer as the recipient."""
+_GO_NEXT_STEP = "-next-step"
+
+
+def go_next_step_request(go_id: str) -> str:
+    """Name the next-step notice of one Go. Its own name gives it a delivery key apart from the Go."""
+    return go_id + _GO_NEXT_STEP
+
+
+def next_step_go_id(request: str) -> str | None:
+    """Find the go id of a Go's next-step notice, or None for each other request."""
+    go_id = request.removesuffix(_GO_NEXT_STEP)
+    return go_id if go_id != request else None
+
+
+def _next_step_notice(request: str, done: str, item: ListItem, *, form_words: str = "") -> PageFeedback:
+    """Ask the item's producer for the next step and save the producer as the recipient.
+
+    `done` names what nate did, such as "nate read". A Mark read keeps its page words in `form_words`,
+    so a retry matches the page request.
+    """
     producer = staff.snapshot().by_id(item.producer)
     name = shlex.quote(producer.name if producer is not None else item.producer)
-    words = (f"List page: nate read item {item.number}, so it is now Working. Write its next step: "
+    words = (f"List page: {done} item {item.number}, so it is now Working. Write its next step: "
              + f"`{_LAUNCHER} update --id {item.id} --source {name} --next-step \"<step>\"`.")
-    # The page words stay in form_words, so a retry matches the page request.
-    return PageFeedback(request.request, words, action="read", form_words=request.words, recipient=item.producer)
+    return PageFeedback(request, words, action="read", form_words=form_words, recipient=item.producer)
 
 
 def notice_recipient(keeper: staff.StaffId, feedback: PageFeedback) -> staff.StaffId:
