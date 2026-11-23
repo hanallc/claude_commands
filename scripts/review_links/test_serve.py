@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -882,6 +882,37 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(the_list.records(recipient.id, include_closed=True), [])
                     self.assertNotIn("list_key", saved)
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
+
+    def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        unit = case.fixture.unit
+        morty = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="bob")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        words = "The frame time graph has a gap."
+        output, errors = StringIO(), StringIO()
+        self.new_item_post_done.clear()
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
+              patch("platform.system", return_value="Linux"),
+              capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
+            code = new_item.main(["bug", unit.name, words, "--session", "another-session"])
+            # The server replies before it delivers the item.
+            self.assertTrue(self.new_item_post_done.wait(TEST_HANG_GUARD_SECS))
+        # The server's request log shares stderr with the command.
+        self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
+        self.assertNotIn("new_item:", errors.getvalue())
+        key, = [key for key, record in cache.get().records.items() if record.type == review_items.ReviewType.BUG]
+        self.assertEqual(cache.get().records[key].owner, owner.id)
+        item, = the_list.records(morty.id, include_closed=True)
+        self.assertEqual(output.getvalue(), f"Bug \u2192 {unit.name}, a unit of {owner.name}. "
+                         + f"Producer: bob (from {owner.name}). List item {item.number}.\n")
+        self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
+                         (words, owner.id, producer.id, unit.name, (key,)))
 
     def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
