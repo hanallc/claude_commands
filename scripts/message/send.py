@@ -4746,7 +4746,7 @@ def mac_locked_check(asking: AskingSession | NoAskingSession, clears_when: str) 
     from scripts.mac_test import mac_test
 
     scripts = Path(__file__).resolve().parents[1]
-    named = ["--asking", asking.name] if isinstance(asking, mac_test.AskingSession) else []
+    named = [f"--asking={asking.name}"] if isinstance(asking, mac_test.AskingSession) else []
     off = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose", *named])
     return f"{off} || {shlex.join(['/bin/sh', '-c', clears_when])}"
 

@@ -6751,7 +6751,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(code, 0)
         self.assertIn("SENT: to the user", output)
         sent.assert_called_once()
-        # The delivering host adds the off-on-purpose check, so the forward keeps the caller's check.
+        # The forward sends --self-clearing, so no host adds the off-check; the sender keeps its own check.
         self.assertEqual(cast(send.Options, sent.call_args.args[0]).clears_when, "true")
         self.assert_mac_locked_not_sent()
 
@@ -6776,7 +6776,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         options = cast(send.Options, sent.call_args.args[0])
         scripts = Path(send.__file__).resolve().parents[1]
         off_check = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose",
-                                "--asking", "hana"])
+                                "--asking=hana"])
         self.assertEqual(options.clears_when, f"{off_check} || /bin/sh -c 'exit 1'")
         sent_at = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
         with (mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")),

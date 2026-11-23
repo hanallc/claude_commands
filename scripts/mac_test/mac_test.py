@@ -3223,7 +3223,7 @@ def parser() -> argparse.ArgumentParser:
         _ = command.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
     for command in commands.choices.values():
         _ = command.add_argument("--target", default=argparse.SUPPRESS)
-    # The Mac is the only target that a user turns off on purpose, so this subcommand takes no --target.
+    # This subcommand checks only the Mac, so it takes no --target.
     off = commands.add_parser("off-on-purpose", help="exit 0 when the user turned the Mac off, 1 when it is in use")
     _ = off.add_argument("--asking", type=parsed_asking, default=NO_ASKING_SESSION, metavar="SESSION")
     return root

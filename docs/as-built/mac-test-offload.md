@@ -216,7 +216,7 @@ A block is a lease that a showrunner gives to one session. It does not count whe
 `mac.locked` in `send.py` asks with its `sender=` value, so the block holder still reaches the user.
 For a Mac that is off on purpose, `send.py` prints `SKIPPED: the Mac is off on purpose (<reason>)` and exits 0.
 A sent `mac.locked` push also stops when the user turns the Mac off.
-For a Mac in use at send time, `send.py` stores the clear check as `mac_test.py off-on-purpose --asking <sender> || /bin/sh -c '<caller check>'`.
+For a Mac in use at send time, `send.py` stores the clear check as `mac_test.py off-on-purpose --asking=<sender> || /bin/sh -c '<caller check>'`.
 `mac_test.py off-on-purpose [--asking SESSION]` exits 0 when `machine_off_on_purpose("mac")` gives off on purpose, and 1 otherwise.
 A `--machine natedev` forward does not change the check: the sending host keeps the caller's check without the off-check.
 Only the host that delivers the push asks; a `--machine natedev` forward asks on natedev and reads that skip as confirmed.
