@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_remotes, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -521,18 +521,6 @@ def caller_owner() -> str:
     return str(row.id)
 
 
-type GitSettings = dict[str, list[str]]
-
-
-def read_git_settings(repo: Path, *options: str) -> GitSettings:
-    settings: GitSettings = {}
-    for entry in os.fsdecode(git(repo, "config", *options, "--null", "--list")).split("\0"):
-        if entry:
-            key, _, value = entry.partition("\n")
-            settings.setdefault(key, []).append(value)
-    return settings
-
-
 def origin_url(source: Path) -> str | None:
     """Read the origin URL when the repository has one."""
     try:
@@ -609,55 +597,11 @@ def claim_tree(tree: Path, *, create: bool, inherited_fds: list[int] | None = No
         yield ClaimState.ACQUIRED if idle and same else ClaimState.BUSY if same else ClaimState.REPLACED
 
 
-def source_origin(source: Path) -> tuple[str, str]:
-    """Return the upstream URL and the source refs that represent it."""
-    origin = origin_url(source)
-    if origin is not None:
-        return origin, "refs/remotes/origin"
-    return str(source), "refs/heads"
-
-
 def resolved_remote_url(repo: Path, url: str) -> str:
     """Resolve a local remote path from its repository."""
     if re.match(r"^[^/]+:", url):
         return url
     return str((repo / Path(url).expanduser()).resolve())
-
-
-def refresh_remotes(tree: Path, source: Path, *, new_checkout: bool = False) -> None:
-    """Keep upstream refs and saved local branches in separate remotes."""
-    url, refs = source_origin(source)
-    settings = read_git_settings(tree, "--local")
-
-    def references(repo: Path, *prefixes: str) -> dict[str, str]:
-        listing = git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", *prefixes)
-        return dict(line.split(" ", 1) for line in listing.decode().splitlines())
-
-    # A new checkout gets both ref sets in one fetch. Compare refs only on reuse.
-    source_references = {} if new_checkout else references(source, refs, "refs/heads")
-    current_refs = {} if new_checkout else references(tree, "refs/remotes/origin", "refs/remotes/source")
-    mappings: list[str] = []
-    stale_heads: list[str] = []
-    for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
-        mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
-        for key, value in ((f"remote.{remote}.url", remote_url),
-                           (f"remote.{remote}.fetch", f"+refs/heads/*:refs/remotes/{remote}/*")):
-            if settings.get(key) != [value]:
-                _ = git(tree, "config", "--replace-all", key, value)
-        prefix = f"refs/remotes/{remote}/"
-        expected = {name.removeprefix(source_refs + "/"): value.split()[0]
-                    for name, value in source_references.items() if name.startswith(source_refs + "/")}
-        current = {name.removeprefix(prefix): value.strip()
-                   for name, value in current_refs.items() if name.startswith(prefix)}
-        if new_checkout or current != expected:
-            stale_heads.append(prefix + "HEAD")
-            mappings.append(mapping)
-    if stale_heads:
-        # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
-        _ = git(tree, "update-ref", "--no-deref", "--stdin",
-                data="".join(f"delete {ref}\n" for ref in stale_heads).encode())
-    if mappings:
-        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
 def initialize_git(tree: Path, source: Path) -> None:
@@ -686,7 +630,7 @@ def initialize_git(tree: Path, source: Path) -> None:
             _ = git(tree, "ls-files", "--stage")
         except CopyError:
             index.unlink(missing_ok=True)
-    refresh_remotes(tree, source, new_checkout=new_checkout)
+    git_remotes.refresh_remotes(git, tree, source, origin_url(source), new_checkout=new_checkout)
     exclude = tree / ".git/info/exclude"
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     entries = [entry for entry in (f"/{scratch.BUSY}", "/target")
@@ -847,7 +791,7 @@ def merge_changes(tree: Path, source: Path, revision: str, *,
         before = commit_at(tree, "HEAD") if isinstance(committed_base, str) else ""
         if revision.startswith("origin/"):
             branch = revision.removeprefix("origin/")
-            origin, _ = source_origin(source)
+            origin, _ = git_remotes.source_origin(source, origin_url(source))
             origin = resolved_remote_url(source, origin)
             _ = git(source, "check-ref-format", f"refs/heads/{branch}")
             _ = git(tree, "fetch", "-q", "--refmap=", "--", origin, f"refs/heads/{branch}")
@@ -957,7 +901,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     if not isinstance(record, copy_record.NotRegistered):
                         raise CopyError(f"{tree}: unreadable legacy workspace")
                     origin = git(tree, "remote", "get-url", "origin").decode().strip()
-                    upstream, _ = source_origin(source)
+                    upstream, _ = git_remotes.source_origin(source, origin_url(source))
                     resolved_origin = resolved_remote_url(tree, origin)
                     if resolved_origin not in (resolved_remote_url(source, upstream), str(source)):
                         raise CopyError(f"{tree}: legacy workspace source differs")
@@ -980,11 +924,11 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                         register(str(record.fields["copy_commit"]))
                     else:
                         scratch.renew(tree)
-                    refresh_remotes(tree, source)
+                    git_remotes.refresh_remotes(git, tree, source, origin_url(source))
                 else:
                     initialize_git(tree, source)
                     _ = git(tree, "checkout", "-q", "-B", branch, base)
-                    source_settings = read_git_settings(source)
+                    source_settings = git_remotes.read_git_settings(git, source)
                     for key in ("user.name", "user.email"):
                         values = source_settings.get(key)
                         value = values[-1] if values else os.fsdecode(git(source, "config", key))
@@ -995,7 +939,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                 finally:
                     caller_error = sys.exception()
                     try:
-                        refresh_remotes(tree, source)
+                        git_remotes.refresh_remotes(git, tree, source, origin_url(source))
                         mark_target(tree)
                         register(commit_at(tree, "HEAD"))
                     except (OSError, scratch.ScratchError, CopyError) as error:
@@ -1372,13 +1316,28 @@ def remote_step_source(source: Path, tree_id: str, caller: Path, trust: SshSourc
         yield checkout
 
 
+def _copy_unit_names(owner: str) -> tuple[str, str]:
+    """Read the unit and showrunner names of the owner's numbered copies."""
+    from scripts.production import staff
+
+    caller = copy_owner(owner)
+    if isinstance(caller, StaffOwner):
+        try:
+            rows = staff.local_snapshot()
+            member = rows.owner_of(caller.row_id)
+            if member is not None:
+                parent = rows.parent_of(member)
+                return member.name, parent.name if parent is not None else member.name
+        except staff.StaffUnreadable:
+            pass
+    return owner, owner
+
+
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
              merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = ()) -> Generator[Path]:
     """Hold a numbered copy through preparation and use."""
     del command
-    from scripts.production import staff
-
     owner = checked_owner(owner)
     source = Path(repo).expanduser().resolve()
     base = source_commit(source, policy)
@@ -1389,27 +1348,13 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             return
     with _slot_preparation():
         canonical = slot_source(source)
-        if source != canonical and main_checkout(source) != canonical:
-            _ = git(canonical, "fetch", "-q", "--", str(source), base)
     work = step or "build"
     purpose = read_step_names().shown(work)
-    unit = owner
-    caller = copy_owner(owner)
-    showrunner = owner
-    if isinstance(caller, StaffOwner):
-        try:
-            rows = staff.local_snapshot()
-            member = rows.owner_of(caller.row_id)
-            if member is not None:
-                unit = member.name
-                parent = rows.parent_of(member)
-                showrunner = parent.name if parent is not None else member.name
-        except staff.StaffUnreadable:
-            pass
+    unit, showrunner = _copy_unit_names(owner)
     with ExitStack() as held_slot:
         with _slot_preparation():
-            copy = held_slot.enter_context(build_slots.take_copy(canonical, base, showrunner=showrunner,
-                unit=unit, work=work, purpose=purpose))
+            copy = held_slot.enter_context(build_slots.take_copy(source, base, showrunner=showrunner,
+                unit=unit, work=work, purpose=purpose, live=canonical))
         tree = copy.path
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *copy.pass_fds))
         defaults = copy.env
@@ -1654,6 +1599,10 @@ class RemoteMirrorKept(CopyError):
     """A remote mirror needs another cleanup attempt before retirement."""
 
 
+class NumberedCopyKept(CopyError):
+    """Removal kept numbered copies and found no other failure. Each kept copy goes on a manual removal list."""
+
+
 def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
     """Remove an owner's idle trees within the selected repository scope."""
     scope = repository_scope(repo)
@@ -1703,8 +1652,58 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
                 print(f"removed {tree}")
             except (CopyError, OSError, scratch.ScratchError, git_rescue.RescueError) as error:
                 failures.append(str(error))
+    try:
+        kept_copies = _kept_numbered_copies(owner, scope)
+    except (CopyError, OSError, ValueError, SlotGitFailure) as error:
+        failures.append(str(error))
+        kept_copies = []
     if failures:
-        raise failure_type("\n".join(failures))
+        raise failure_type("\n".join([*failures, *kept_copies]))
+    if kept_copies:
+        raise NumberedCopyKept("\n".join(kept_copies))
+
+
+def _kept_numbered_copies(owner: str, scope: RepositoryScope) -> list[str]:
+    """Return one line for each numbered copy of the owner in the scope.
+
+    Removal keeps every numbered copy: an idle copy goes on a manual removal list, and a busy copy stays in use.
+    """
+    unit, _ = _copy_unit_names(owner)
+    kept: list[str] = []
+    for path, form in sorted(build_folders.copy_folders(gates_root()), key=lambda entry: entry[0]):
+        if form.unit != unit:
+            continue
+        record = build_folders.numbered_copy_record(path)
+        if not _copy_in_scope(record, form, scope):
+            continue
+        try:
+            if isinstance(record, build_folders.NoNumberedCopySource):
+                reason = "the copy has no source record"
+            elif isinstance(record, build_folders.UnreadableNumberedCopySource):
+                reason = record.reason
+            elif build_slots.remove_copy(record):
+                reason = "a numbered copy goes on a manual removal list"
+            else:
+                reason = "the copy is in use"
+        except (OSError, ValueError, SlotGitFailure) as error:
+            reason = str(error)
+        kept.append(f"{path}: kept: {reason}")
+    return kept
+
+
+def _copy_in_scope(record: build_folders.NumberedCopyRecord, form: build_folders.BuildCopy,
+                   scope: RepositoryScope) -> bool:
+    """Compare the identity of the copy's live checkout with the scope, as `--repo` reads it."""
+    if isinstance(scope, AllRepositories):
+        return True
+    copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+    if isinstance(copy, build_folders.NumberedCopySource):
+        try:
+            return repository_name(build_folders.pool_source(copy.source) or copy.source) == scope.name
+        except (CopyError, OSError):
+            pass
+    # Without a readable live checkout, the folder name is the only identity.
+    return form.repo == build_folders.repository_folder_name(scope.name)
 
 
 REMOTE_MIRROR_PROBE_TIMEOUT_S = 5

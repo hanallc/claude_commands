@@ -250,7 +250,9 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertEqual(request.owner, "gate-owner")
             mirror = self.mirror_record(request.owner)
             self.assertEqual(publish_mirror(mirror), 0)
-        copies.remove_trees("gate-owner")
+        with self.assertRaisesRegex(copies.NumberedCopyKept, f"{tree}: kept:"):
+            copies.remove_trees("gate-owner")
+        self.assertTrue(tree.exists())
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors("gate-owner"), [])
 
@@ -302,7 +304,8 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(publish_mirror(other), 0)
         with copies.standing(owner, self.source, copies.CommittedSource("HEAD")) as tree:
             pass
-        copies.remove_trees(owner)
+        with self.assertRaisesRegex(copies.NumberedCopyKept, f"{tree}: kept:"):
+            copies.remove_trees(owner)
         self.assertTrue(tree.exists())
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors(owner), [])

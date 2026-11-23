@@ -292,7 +292,7 @@ class FolderFormTests(unittest.TestCase):
         self.assertTrue(folders.expired_folder(one.path, cutoff=time.time() + 10))
         self.assertTrue(one.path.is_dir())
         _ = subprocess.run(["git", "worktree", "remove", "--force", str(one.path)],
-                           cwd=self.root, check=True, capture_output=True)
+                           cwd=folders.pool_path(self.root), check=True, capture_output=True)
         folders.lease_path(one.path).unlink()
         one.path.with_suffix(".lock").unlink()
         with take(second) as reused:
@@ -337,7 +337,8 @@ class FolderFormTests(unittest.TestCase):
                                     work="test", purpose="test envrc") as copy:
             record = folders.numbered_copy_record(copy.path)
             assert isinstance(record, folders.NumberedCopySource)
-            self.assertEqual((record.source, record.commit), (self.root, revision))
+            self.assertEqual((record.source, record.commit), (folders.pool_path(self.root).resolve(), revision))
+            self.assertEqual(folders.pool_source(record.source), self.root)
             with folders.numbered_copy_use_lease(copy.path) as reader:
                 assert isinstance(reader, folders.NumberedCopyUseLease)
                 self.assertEqual(reader.source, record)

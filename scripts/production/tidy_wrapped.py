@@ -372,11 +372,14 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
         except staff.StaffRefused as error:
             raise TidyRefused(str(error)) from error
     owners = {str(member.id) for member in (row, *units)}
-    try:
-        for owner in sorted(owners):
+    for owner in sorted(owners):
+        try:
             copies.remove_trees(owner)
-    except copies.CopyError as error:
-        raise TidyRefused(str(error)) from error
+        except copies.NumberedCopyKept as error:
+            # A numbered copy stays for a manual removal list, so it does not stop the wrap.
+            print(error, file=sys.stderr)
+        except copies.CopyError as error:
+            raise TidyRefused(str(error)) from error
     roots = {root for kind in record_store.RecordKind
              for root in record_store.staff_store_folders(kind, members=identities.record)}
     protected = roots.union(record_store.archive_folders(roots))

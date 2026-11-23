@@ -12,6 +12,9 @@ The CLI converts its flags into these policies.
 
 Staged copies use a private source index and a synthetic commit without changing source refs.
 Local gates take a detached numbered copy through `build_slots.take_copy()`.
+`copies.standing()` passes the requested source to `take_copy()` and does not fetch into the live checkout.
+The copy is a linked worktree of the repository's copy pool.
+See [Standing gate checkouts](gate-checkouts.md#copy-pool) for the pool.
 The repo word and unit select the parent folder under the host's build root.
 `copies.standing()` uses the caller's staff unit name when it finds the staff row.
 The maker takes the lowest free existing number or creates the smallest missing number.
@@ -133,6 +136,12 @@ The check inspects these entries without following symbolic links.
 
 `copies.py list` reads numbered copy leases and remote mirror rows.
 `copies.py remove` removes owned legacy editable copies and remote mirrors.
+It also selects the caller's numbered copies in the repository scope.
+It checks each copy with `build_slots.remove_copy(record)` and removes none of them.
+It names each numbered copy with its path and reason, and then exits non-zero.
+An idle copy goes on a manual removal list. A busy copy is "in use".
+When kept numbered copies are the only failures, `remove_trees` raises `NumberedCopyKept`.
+Retirement and production tidy print that report to stderr and continue.
 `gates_root()` reads the configured build root without creating it.
 The two-day sweep lists idle numbered copies with expired use stamps for manual review.
 See [Build folders](build-folders.md#numbered-copies-and-removal) for the lock and removal rules.

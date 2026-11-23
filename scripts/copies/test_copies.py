@@ -231,6 +231,10 @@ source_check_seconds=1
         return subprocess.run(["git", "-C", str(path), *arguments], capture_output=True,
                               text=True, check=True, timeout=10).stdout.strip()
 
+    def pool_git(self, source: Path | None = None) -> str:
+        """Return the Git folder of the copy pool that serves `source`, or the fixture source."""
+        return str(build_folders.pool_path(source or self.source).resolve() / ".git")
+
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return invoke_cli(copies, lambda: copies.main(list(arguments)), list(arguments),
                           dict(os.environ), self.base)
@@ -264,7 +268,8 @@ source_check_seconds=1
                 with copies.standing(owner, self.source, copies.CommittedSource(self.head)) as tree:
                     self.assertEqual(self.lease(tree)["unit"], self.gates.name)
                 removed = self.cli("remove")
-                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertEqual(removed.returncode, 2, removed.stderr)
+                self.assertIn(f"{tree}: kept:", removed.stderr)
                 self.assertTrue(tree.exists())
 
         # The user, 11-16: a test or lint run showed as a gate of the base commit's subject.
@@ -306,7 +311,9 @@ source_check_seconds=1
             self.assertEqual(reused, tree)
             self.assertEqual(reused, tree)
             self.assertEqual((reused / "target/artifact").read_text(), "role cache")
-        copies.remove_trees("toolchain-trial")
+        with self.assertRaises(copies.CopyError) as kept:
+            copies.remove_trees("toolchain-trial")
+        self.assertIn(f"{tree}: kept:", str(kept.exception))
         self.assertTrue(tree.exists())
 
     def test_missing_staff_row_refuses_run_and_remove_in_one_line(self) -> None:
@@ -1659,7 +1666,7 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertTrue(tree.is_relative_to(self.gates))
             self.assertFalse((tree / "target").is_symlink())
             self.assertTrue((tree / ".git").is_file())
-            self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"), str(self.source / ".git"))
+            self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"), self.pool_git())
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             self.assertEqual(self.git(tree, "branch", "--show-current"), "")
             self.assertEqual(self.git(tree, "status", "--porcelain"), "")
@@ -1680,7 +1687,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 with self.subTest(tree=tree):
                     if tree == trees[0]:
                         self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                                         str(self.source / ".git"))
+                                         self.pool_git())
                         self.assertEqual(self.git(tree, "remote", "get-url", "origin"),
                                          self.git(self.source, "remote", "get-url", "origin"))
                         self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.published)
@@ -1722,7 +1729,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 with self.subTest(tree=tree):
                     if tree == trees[0]:
                         self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                                         str(self.source / ".git"))
+                                         self.pool_git())
                         self.assertEqual(self.git(tree, "remote", "get-url", "origin"),
                                          self.git(self.source, "remote", "get-url", "origin"))
                         self.assertEqual(self.git(tree, "rev-parse", "origin/builds"), self.published)
@@ -1997,7 +2004,7 @@ with patch.object(subprocess, 'run', pause_clone):
         for source in (second, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource(commit)) as tree:
                 self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                                 str(self.source / ".git"))
+                                 self.pool_git())
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
                 saved = copies.clone(tree, task="gate:retained-proof")
         shutil.rmtree(first)
@@ -2575,7 +2582,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 })
                 files = {"target/debug/x": (b"binary\x00x", 0o751), "target/release/y": (b"binary\x00y", 0o705)}
                 expected = [files[relative] for relative in built]
-                copies.remove_trees(self.owner_id)
+                _ = self.remove_keeps(checkout)
                 for path, (content, mode) in zip(published, expected, strict=True):
                     self.assertTrue(path.is_absolute())
                     self.assertFalse(path.is_symlink())
@@ -2629,31 +2636,67 @@ with patch.object(subprocess, 'run', pause_clone):
                     self.assertEqual(self.snapshot(tree), before)
                     self.assertIn(f"\t{tree.parent.name}\t", result.stdout)
 
-    def test_remove_refuses_busy_tree_then_deletes_both_idle_trees_and_repeats(self) -> None:
+    def remove_keeps(self, *kept: Path, scope: copies.RepositoryScope = copies.ALL_REPOSITORIES) -> str:
+        """Run owner removal, check that it names and keeps each numbered copy, and return its failures."""
+        with self.assertRaises(copies.CopyError) as failure:
+            copies.remove_trees(self.owner_id, scope)
+        for path in kept:
+            self.assertIn(f"{path}: kept:", str(failure.exception))
+            self.assertTrue(path.exists())
+        return str(failure.exception)
+
+    def test_remove_names_each_kept_numbered_copy_and_exits_non_zero(self) -> None:
+        with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as idle:
+            pass
+        with copies.standing("other-unit", self.source, copies.CommittedSource(self.head)) as other:
+            pass
+        result = self.cli("remove", "--repo", str(self.source))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"{idle}: kept: a numbered copy goes on a manual removal list", result.stderr)
+        self.assertEqual(result.stderr.count(str(idle)), 1, result.stderr)
+        self.assertNotIn(str(other), result.stderr)
+        self.assertTrue(idle.exists())
+        self.assertTrue(other.exists())
+        # Retirement and tidy continue past this failure type, because only a manual list removes the copy.
+        with self.assertRaises(copies.NumberedCopyKept):
+            copies.remove_trees(self.owner_id)
+
+    def test_remove_keeps_each_failure_when_the_numbered_copy_list_fails(self) -> None:
+        with (registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree,
+              mock.patch.object(build_folders, "copy_folders",
+                                side_effect=build_folders.InvalidFolderForm("unreadable copy folder"))):
+            with self.assertRaises(copies.CopyError) as failure:
+                copies.remove_trees(self.owner_id)
+        self.assertNotIsInstance(failure.exception, copies.NumberedCopyKept)
+        failures = str(failure.exception).splitlines()
+        self.assertEqual(len(failures), 2)
+        self.assertIn(str(tree), failures[0])
+        self.assertEqual(failures[1], "unreadable copy folder")
+
+    def test_remove_keeps_busy_and_idle_copies_and_exits_non_zero_each_time(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
                 result = self.cli('remove', '--repo', str(self.source))
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, '')
-                self.assertTrue(first.is_dir())
-                self.assertTrue(second.is_dir())
-                self.assertEqual(build_folders.build_folder_state(first), 'held')
-                self.assertEqual(build_folders.build_folder_state(second), 'held')
-        result = self.cli('remove', '--repo', str(self.source))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(first.exists())
-        self.assertTrue(second.exists())
-        self.assertEqual(self.cli('remove', '--repo', str(self.source)).returncode, 0)
+                for path in (first, second):
+                    self.assertIn(f'{path}: kept: the copy is in use', result.stderr)
+                    self.assertTrue(path.is_dir())
+                    self.assertEqual(build_folders.build_folder_state(path), 'held')
+        for _ in range(2):
+            result = self.cli('remove', '--repo', str(self.source))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            for path in (first, second):
+                self.assertIn(f'{path}: kept: a numbered copy goes on a manual removal list', result.stderr)
+                self.assertTrue(path.exists())
 
-    def test_owner_removal_deletes_a_gate_while_its_workspace_is_live(self) -> None:
+    def test_owner_removal_keeps_a_gate_and_its_live_workspace(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as gate:
             pass
         with registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
-            with self.assertRaises(copies.CopyError) as refusal:
-                copies.remove_trees(self.owner_id)
-            self.assertIn(str(tree), str(refusal.exception))
-            self.assertEqual(len(str(refusal.exception).splitlines()), 1)
-            self.assertTrue(gate.exists())
+            failures = self.remove_keeps(gate).splitlines()
+            self.assertEqual(len(failures), 2)
+            self.assertIn(str(tree), failures[0])
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             record = scratch.task_of(tree)
             assert isinstance(record, copy_record.Registered)
@@ -2666,10 +2709,7 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_owner_removal_preserves_a_gate_and_its_busy_workspace_borrower(self) -> None:
         gate = self.idle_gate_source()
         with registered_workspace(self.owner_id, gate, self.head, name='borrower', branch='worker') as tree:
-            with self.assertRaises(copies.CopyError) as refusal:
-                copies.remove_trees(self.owner_id)
-            self.assertIn(str(tree), str(refusal.exception))
-            self.assertTrue(gate.exists())
+            self.assertIn(str(tree), self.remove_keeps(gate))
             self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), self.head)
             record = scratch.task_of(tree)
             assert isinstance(record, copy_record.Registered)
@@ -2679,16 +2719,14 @@ with patch.object(subprocess, 'run', pause_clone):
         gate = self.idle_gate_source()
         with registered_workspace(self.owner_id, gate, self.head, name="borrower", branch="worker") as tree:
             pass
-        copies.remove_trees(self.owner_id)
+        _ = self.remove_keeps(gate)
         self.assertFalse(tree.exists())
-        self.assertTrue(gate.exists())
 
     def test_owner_removal_preserves_a_gate_borrowed_by_another_owners_workspace(self) -> None:
         gate = self.idle_gate_source()
         with registered_workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
             pass
-        copies.remove_trees(self.owner_id)
-        self.assertTrue(gate.exists())
+        _ = self.remove_keeps(gate)
         self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), self.head)
         record = scratch.task_of(tree)
         assert isinstance(record, copy_record.Registered)
@@ -2716,32 +2754,32 @@ with patch.object(subprocess, 'run', pause_clone):
         legacy = self.base / 'old-gate.removing'
         legacy.mkdir(parents=True)
         _ = (legacy / 'source.txt').write_text('legacy work')
-        copies.remove_trees(self.owner_id)
-        self.assertTrue(gate.exists())
+        _ = self.remove_keeps(gate)
         self.assertEqual((legacy / 'source.txt').read_text(), 'legacy work')
         self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), self.head)
 
-    def test_owner_removal_deletes_an_idle_repository_while_another_gate_is_busy(self) -> None:
+    def test_owner_removal_reports_an_idle_gate_and_a_busy_gate(self) -> None:
         other = self.base / 'other-repository'
         _ = self.git(self.base, 'clone', '-q', str(self.source), str(other))
         _ = self.git(other, 'remote', 'set-url', 'origin', 'https://example.invalid/other.git')
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as busy:
             with copies.standing(self.owner_id, other, copies.CommittedSource('HEAD')) as idle:
                 pass
-            copies.remove_trees(self.owner_id)
-            self.assertTrue(idle.exists())
+            failures = self.remove_keeps(idle, busy)
+            self.assertIn(f'{busy}: kept: the copy is in use', failures)
+            self.assertIn(f'{idle}: kept: a numbered copy goes on a manual removal list', failures)
             self.assertEqual(build_folders.build_folder_state(idle), 'free')
             self.assertEqual(build_folders.build_folder_state(busy), 'held')
-        copies.remove_trees(self.owner_id)
-        self.assertTrue(busy.exists())
+        _ = self.remove_keeps(idle, busy)
 
-    def test_remove_cli_reports_a_kept_workspace_and_a_removed_gate(self) -> None:
+    def test_remove_cli_reports_a_kept_workspace_and_a_kept_gate(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as gate:
             pass
         with registered_workspace(self.owner_id, self.source, self.head, name="live", branch="worker") as tree:
             result = self.cli("remove")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn(str(tree), result.stderr)
+            self.assertIn(f"{gate}: kept:", result.stderr)
             self.assertEqual(result.stdout, "")
             self.assertTrue(gate.exists())
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
@@ -2787,17 +2825,22 @@ with patch.object(subprocess, 'run', pause_clone):
         with copies.standing("other-unit", self.source, copies.CommittedSource(self.head)) as kept:
             pass
         narrowed = self.cli("remove", "--repo", str(other))
-        self.assertEqual(narrowed.returncode, 0, narrowed.stderr)
+        self.assertEqual(narrowed.returncode, 2, narrowed.stderr)
+        self.assertIn(f"{second}: kept:", narrowed.stderr)
+        self.assertNotIn(str(first), narrowed.stderr)
         self.assertTrue(second.exists())
         self.assertTrue(first.exists())
         result = self.cli("remove")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        for gate in (first, second):
+            self.assertIn(f"{gate}: kept:", result.stderr)
+        self.assertNotIn(str(kept), result.stderr)
         self.assertTrue(first.exists())
         self.assertFalse(worker.exists())
         self.assertFalse(legacy.exists())
         self.assertNotIn(str(legacy), scratch.holds())
         self.assertTrue(kept.exists())
-        copies.remove_trees(self.owner_id)
+        _ = self.remove_keeps(first, second)
 
     def test_owner_removal_retries_busy_and_interrupted_trees_without_a_source(self) -> None:
         with registered_workspace(self.owner_id, self.source, self.head, name='removal-retry', branch='removal-retry') as tree:
@@ -2860,16 +2903,18 @@ with patch.object(subprocess, 'run', pause_clone):
             pass
         shutil.rmtree(other)
         result = self.cli("remove", "--repo", str(self.source))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.count(": kept:"), 1, result.stderr)
+        self.assertIn(f"{tree}: kept:", result.stderr)
         self.assertTrue(tree.exists())
         self.assertTrue(kept.exists())
 
     def test_explicit_repository_scopes_select_only_the_requested_repository(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             pass
-        copies.remove_trees(self.owner_id, copies.SelectedRepository(self.source.name))
-        self.assertTrue(tree.exists())
-        copies.remove_trees(self.owner_id, copies.AllRepositories())
+        _ = self.remove_keeps(tree, scope=copies.SelectedRepository(self.source.name))
+        copies.remove_trees(self.owner_id, copies.SelectedRepository("unrelated-repository"))
+        _ = self.remove_keeps(tree, scope=copies.AllRepositories())
 
     def test_owner_removal_requires_a_repository_scope_in_the_python_api(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
@@ -2878,8 +2923,7 @@ with patch.object(subprocess, 'run', pause_clone):
             with self.subTest(value=value), self.assertRaisesRegex(copies.CopyError, "repository scope"):
                 copies.remove_trees(self.owner_id, cast(copies.RepositoryScope, cast(object, value)))
             self.assertTrue(tree.exists())
-        copies.remove_trees(self.owner_id, copies.AllRepositories())
-        self.assertTrue(tree.exists())
+        _ = self.remove_keeps(tree, scope=copies.AllRepositories())
 
     def test_owner_removal_allows_an_ordinary_copy_with_a_crate_name(self) -> None:
         with registered_workspace(self.owner_id, self.source, self.head, name="crate-notes", branch="notes") as tree:
@@ -3078,7 +3122,7 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertTrue(tree.exists())
         self.assertTrue(gate.exists())
         _ = path.write_text(record)
-        copies.remove_trees(self.owner_id)
+        _ = self.remove_keeps(gate)
         self.assertFalse(tree.exists())
 
     def test_invalid_owner_refuses_without_creating_a_tree(self) -> None:
@@ -3164,22 +3208,21 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(tree.exists())
 
-    def test_relocated_source_keeps_the_old_copy_and_uses_a_new_copy(self) -> None:
+    def test_relocated_source_moves_its_pool_and_reuses_the_copy(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / 'target/compiled'
             _ = cache.write_text('warm')
         relocated = self.base / 'relocated' / self.source.name
         relocated.parent.mkdir()
         _ = self.source.rename(relocated)
-        _ = self.git(relocated, 'worktree', 'repair', str(tree))
         with copies.standing(self.owner_id, relocated, copies.CommittedSource(self.head)) as reused:
-            self.assertEqual(reused, tree.with_name("2"))
+            self.assertEqual(reused, tree)
             self.assertEqual(cache.read_text(), "warm")
-            self.assertFalse((reused / "target/compiled").exists())
-            self.assertEqual(self.git(reused, "rev-parse", "--path-format=absolute", "--git-common-dir"), str(relocated / ".git"))
+            self.assertEqual(self.git(reused, "rev-parse", "--path-format=absolute", "--git-common-dir"), self.pool_git(relocated))
             self.assertEqual(self.git(reused, 'remote', 'get-url', 'origin'), self.git(relocated, 'remote', 'get-url', 'origin'))
+        self.assertEqual(build_folders.pool_source(Path(self.pool_git(relocated)).parent), relocated.resolve())
 
-    def test_replacement_source_keeps_the_copy_with_missing_git_metadata(self) -> None:
+    def test_replacement_source_reuses_the_copy_in_its_pool(self) -> None:
         origin = self.git(self.source, 'remote', 'get-url', 'origin')
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             cache = tree / 'target/compiled'
@@ -3188,11 +3231,10 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(self.base, 'clone', '-q', '--branch', 'main', origin, str(self.source))
         self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD'), self.published)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")) as fresh:
-            self.assertEqual(fresh, tree.with_name("2"))
+            self.assertEqual(fresh, tree)
             self.assertEqual(self.git(fresh, "rev-parse", "HEAD"), self.published)
-            self.assertFalse((fresh / "target/compiled").exists())
+            self.assertEqual(self.git(fresh, "rev-parse", "--path-format=absolute", "--git-common-dir"), self.pool_git())
         self.assertEqual(cache.read_text(), 'warm')
-        self.assertTrue(tree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
     def test_caller_oserror_passes_through_without_conversion(self) -> None:

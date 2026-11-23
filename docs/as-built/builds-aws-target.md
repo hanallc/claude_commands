@@ -1629,6 +1629,9 @@ The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
 Systemd mounts that path as a bounded filesystem for each command.
 The runner stages the verified bundle in the main checkout's Git directory.
 `build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+Rollout step: before the copy pool change runs on the Hana guest, a person removes the old-layout copy `~/build/hana/aws-hana/1`.
+Until then, `take_copy` raises `build_folders.OldLayoutCopy` for the assigned number, and `hana_runner` refuses every Hana run.
+No code removes this copy.
 The maker rescues source edits before reset and retains Cargo output within the configured size limit.
 The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
 The shell cache lives at `~/build/hana/main/shells`.

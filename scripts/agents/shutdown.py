@@ -1628,6 +1628,9 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     except copies.RemoteMirrorKept as error:
         print(f"refused: {error}")
         return 1
+    except copies.NumberedCopyKept as error:
+        # A numbered copy stays for a manual removal list, so it does not stop the retirement.
+        print(error, file=sys.stderr)
     except copies.CopyError as error:
         print(f"anomaly: {error}".replace("\n", " "))
         if require_cleanup:
@@ -1681,6 +1684,8 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
                 return 1
         try:
             copies.remove_trees(str(row.id))
+        except copies.NumberedCopyKept as error:
+            print(error, file=sys.stderr)
         except copies.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")

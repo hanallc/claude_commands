@@ -147,9 +147,11 @@ Workers use `scratch.py new --worker` only for downloads and other files unrelat
 
 `build_slots.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
 
+Each copy is a linked worktree of the copy pool at `<build root>/<repo>/.pool/<checkout name>`, not of the live checkout. Unit folder scans skip the `.pool` folder, and `.pool` is not a valid unit name. A copy from before the pool is kept and skipped. A take reads its lease without the lock, skips it, and names all such copies in one line. If the lease hint misses it, the locked reuse check raises `FileExistsError` and the take tries the next number. See [Standing gate checkouts](gate-checkouts.md#copy-pool).
+
 Copy `1` has sibling files `1.lock` and `1.lease.json`. The lease records the holder, source, commit, and checkout and Git directory identities. The kernel lock alone determines when the copy is free. The owner passes the lock descriptor to children and keeps the lease through use. The lock remains held until the last holder closes its descriptor.
 
-The Nix environment check uses the lease to verify the numbered copy's `.envrc` against the recorded commit in a trusted source. Style lint passes its copy lease to the verifier. Legacy temporary cleanup excludes these folders and their lock and lease files.
+The Nix environment check uses the lease to verify the numbered copy's `.envrc` against the recorded commit in a trusted source. For a copy in a pool, the trusted source is the live checkout in the pool record. Style lint passes its copy lease to the verifier. Legacy temporary cleanup excludes these folders and their lock and lease files.
 
 The Hana AWS guest fetches verified bundles into its main checkout at `~/rust/hana`.
 The command uses its assigned copy number under `~/build/hana/aws-hana`.

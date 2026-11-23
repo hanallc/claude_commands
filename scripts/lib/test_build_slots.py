@@ -20,6 +20,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.buildlog import repository
 from scripts.copies import copies
 from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue
 from scripts.lib.build_slots_test_support import private_slot_config
@@ -48,8 +49,8 @@ class BuildSlotsTests(unittest.TestCase):
         _ = (self.source / ".gitignore").write_text("target/\n")
         self.base = commit_repository(self.source, "first")
 
-    def git(self, folder: Path, *arguments: str) -> str:
-        return subprocess.run(["git", "-C", str(folder), *arguments], check=True, capture_output=True,
+    def git(self, folder: Path, *arguments: str, check: bool = True) -> str:
+        return subprocess.run(["git", "-C", str(folder), *arguments], check=check, capture_output=True,
                               text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -79,13 +80,185 @@ class BuildSlotsTests(unittest.TestCase):
             self.assertEqual(copy.path, second)
         self.assertFalse(first.exists())
 
+    def live_state(self) -> tuple[str, bytes | None, bytes, bool]:
+        git_folder = self.source / ".git"
+        packed = git_folder / "packed-refs"
+        return (self.git(self.source, "for-each-ref"), packed.read_bytes() if packed.exists() else None,
+                (git_folder / "config").read_bytes(), (git_folder / "config.worktree").exists())
+
+    def test_a_copy_links_to_a_private_pool_and_not_to_the_live_checkout(self) -> None:
+        with self.take_queue_copy() as copy:
+            common = Path(self.git(copy.path, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+            self.assertEqual(common, self.pool() / ".git")
+            self.assertNotEqual(common, self.source / ".git")
+            # Tools name a repository by the folder of its common Git folder, so a copy keeps the live name.
+            self.assertEqual(repository.repo_name(str(copy.path)), self.source.name)
+        self.assertNotIn(str(self.root / "build"), self.git(self.source, "worktree", "list", "--porcelain"))
+        self.assertEqual(self.git(self.pool(), "rev-parse", "--is-bare-repository"), "false")
+        self.assertEqual(sorted(entry.name for entry in self.pool().iterdir()), [".git"])
+        self.assertEqual(self.git(self.pool(), "symbolic-ref", "-q", "HEAD", check=False), "")
+        self.assertEqual(self.git(self.pool(), "remote", "get-url", "origin"), "git@example.invalid:group/widget.git")
+        self.assertEqual(build_folders.pool_source(self.pool()), self.source)
+        # Remote refs hold the branches, so the clone keeps no stale local branch.
+        self.assertEqual(self.git(self.pool(), "for-each-ref", "refs/heads/"), "")
+        self.assertEqual(self.git(self.pool(), "config", "--get", "remote.origin.pushurl", check=False), "")
+        self.assertEqual(self.git(self.pool(), "config", "--local", "--get-regexp", r"^branch\.", check=False), "")
+
+    def test_a_push_from_a_copy_never_reaches_a_local_repository(self) -> None:
+        upstream = self.root / "widget.git"
+        _ = self.git(self.root, "init", "-q", "--bare", str(upstream))
+        _ = self.git(self.source, "push", "-q", str(upstream), "trunk")
+        _ = self.git(self.source, "remote", "set-url", "origin", str(upstream))
+        _ = self.git(self.source, "fetch", "-q", "origin")
+        before = (self.live_state(), self.git(upstream, "for-each-ref"))
+        with self.take_queue_copy() as copy:
+            for remote in ("source", "origin"):
+                with self.subTest(remote=remote):
+                    pushed = subprocess.run(["git", "-C", str(copy.path), "push", remote, "HEAD:refs/heads/x"],
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertNotEqual(pushed.returncode, 0, pushed.stderr)
+                    self.assertIn("remote helper 'no-push'", pushed.stderr)
+        self.assertEqual((self.live_state(), self.git(upstream, "for-each-ref")), before)
+
+    def test_a_first_take_keeps_and_names_only_a_crashed_clone_stage(self) -> None:
+        parent = self.pool().parent
+        crashed = parent / f"{self.source.name}.clone-abc_1234"
+        (crashed / self.source.name / ".git").mkdir(parents=True)
+        others = (parent / f"{self.source.name}.clone-short", parent / "other.clone-abcd1234")
+        for folder in others:
+            folder.mkdir()
+        notices = io.StringIO()
+        with redirect_stderr(notices), self.take_queue_copy():
+            pass
+        # The scan runs only before a first clone, and the pool name never matches a stage name.
+        with redirect_stderr(notices), self.take_queue_copy():
+            pass
+        # No take deletes a folder under the build root. The crashed stage goes on a manual removal list.
+        self.assertIn(f"kept for a manual removal list: {crashed} (build_slots, crashed pool clone)", notices.getvalue())
+        for folder in (crashed, *others):
+            self.assertTrue(folder.is_dir())
+            self.assertEqual(notices.getvalue().count(str(folder)), 1 if folder == crashed else 0)
+
+    def test_git_writes_in_a_copy_never_reach_the_live_repository(self) -> None:
+        before = self.live_state()
+        with self.take_queue_copy() as copy:
+            for arguments in (("checkout", "-q", "-B", "trunk"),
+                              ("-c", "user.name=Copy", "-c", "user.email=copy@example.invalid",
+                               "commit", "-q", "--allow-empty", "-m", "copy commit"),
+                              ("update-ref", "refs/x", "HEAD"), ("config", "foo.bar", "1"),
+                              ("fetch", "-q", "--prune", "source")):
+                _ = self.git(copy.path, *arguments)
+        self.assertEqual(self.live_state(), before)
+        self.assertFalse(before[3])
+        self.assertEqual(self.git(self.pool(), "rev-parse", "refs/x"), self.git(self.pool(), "rev-parse", "trunk"))
+
+    def test_a_dirty_copy_is_rescued_into_the_pool(self) -> None:
+        with self.take_queue_copy() as copy:
+            _ = (copy.path / "change.txt").write_text("unsaved edit\n")
+        with self.take_queue_copy() as reused:
+            self.assertEqual(reused.path, copy.path)
+        rescued = self.rescue_refs().splitlines()
+        self.assertEqual(len(rescued), 1)
+        self.assertEqual(self.git(self.pool(), "show", rescued[0] + ":change.txt"), "unsaved edit")
+        self.assertEqual(self.git(self.source, "for-each-ref", "refs/rescue/"), "")
+
+    def test_the_pool_takes_the_live_filter_keys_and_the_copy_runs_the_clean_filter(self) -> None:
+        _ = self.git(self.source, "config", "filter.upper.clean", "tr a-z A-Z")
+        _ = (self.source / ".gitattributes").write_text("*.up filter=upper\n")
+        self.base = commit_repository(self.source, "filter attributes")
+        with self.take_queue_copy() as copy:
+            self.assertEqual(self.git(self.pool(), "config", "--local", "filter.upper.clean"), "tr a-z A-Z")
+            _ = (copy.path / "note.up").write_text("quiet\n")
+            _ = self.git(copy.path, "add", "note.up")
+            self.assertEqual(self.git(copy.path, "cat-file", "-p", ":note.up"), "QUIET")
+            _ = self.git(copy.path, "reset", "-q", "note.up")
+            (copy.path / "note.up").unlink()
+        # A later take makes the local filter keys of the pool equal the live keys, with each value.
+        _ = self.git(self.pool(), "config", "--local", "filter.stale.clean", "cat")
+        _ = self.git(self.source, "config", "--unset", "filter.upper.clean")
+        for value in ("first", "second"):
+            _ = self.git(self.source, "config", "--add", "filter.upper.smudge", value)
+        with self.take_queue_copy():
+            pass
+        filters = [self.git(folder, "config", "--local", "--get-regexp", r"^filter\.") for folder in (self.pool(), self.source)]
+        self.assertEqual(filters[0], "filter.upper.smudge first\nfilter.upper.smudge second")
+        self.assertEqual(filters[0], filters[1])
+
+    def test_a_take_refuses_a_repository_that_is_not_a_pool(self) -> None:
+        with (mock.patch.object(build_slots, "pool_repository", return_value=self.source),
+              self.assertRaisesRegex(build_slots.SlotGitFailure, "is not a copy pool")):
+            with self.take_queue_copy():
+                self.fail("a copy linked to the live checkout")
+        self.assertFalse(build_folders.copy_path("widget", "queue", 1).exists())
+        self.assertEqual(len(self.git(self.source, "worktree", "list").splitlines()), 1)
+
+    def test_an_old_layout_copy_is_kept_and_skipped(self) -> None:
+        # Make the copy that a take made before pools: a linked worktree of the live checkout.
+        def live_checkout(source: Path) -> Path:
+            return source
+
+        with (mock.patch.object(build_slots, "pool_repository", side_effect=live_checkout),
+              mock.patch.object(build_folders, "pool_source", return_value=self.source),
+              self.take_queue_copy() as old):
+            old_path = old.path
+            _ = (old_path / "change.txt").write_text("old edit\n")
+        lease = old_path.with_name(old_path.name + ".lease.json").read_bytes()
+        notices = io.StringIO()
+        with redirect_stderr(notices), self.take_queue_copy() as copy:
+            self.assertEqual(copy.path, old_path.with_name("2"))
+            self.assertEqual(Path(self.git(copy.path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+                             self.pool() / ".git")
+        self.assertIn(f"kept for a manual removal list: {old_path} (build_slots, old layout)", notices.getvalue())
+        self.assertEqual(notices.getvalue().count(str(old_path)), 1)
+        self.assertEqual((old_path / "change.txt").read_text(), "old edit\n")
+        self.assertEqual(old_path.with_name(old_path.name + ".lease.json").read_bytes(), lease)
+        self.assertEqual(self.git(self.source, "for-each-ref", "refs/rescue/"), "")
+
+    def test_an_assigned_old_layout_copy_fails_and_stays(self) -> None:
+        def live_checkout(source: Path) -> Path:
+            return source
+
+        with (mock.patch.object(build_slots, "pool_repository", side_effect=live_checkout),
+              mock.patch.object(build_folders, "pool_source", return_value=self.source),
+              self.take_queue_copy() as old):
+            old_path = old.path
+        lease = old_path.with_name(old_path.name + ".lease.json").read_bytes()
+        message = (f"assigned copy 1 at {old_path} is an old-layout copy on the manual removal list; "
+                   + "a person must remove it")
+        with (redirect_stderr(io.StringIO()), self.assertRaises(build_folders.OldLayoutCopy) as raised,
+              build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue", work="reuse",
+                                    purpose="test", selection=build_slots.ExactSlotRequest(1))):
+            self.fail("the take must not lease an old-layout copy")
+        self.assertEqual(str(raised.exception), message)
+        self.assertEqual(old_path.with_name(old_path.name + ".lease.json").read_bytes(), lease)
+        self.assertFalse(old_path.with_name("2").exists())
+
+    def test_a_copy_works_after_git_gc_prunes_the_live_repository(self) -> None:
+        _ = (self.source / "change.txt").write_text("only in the live checkout\n")
+        commit = commit_repository(self.source, "later commit")
+        with self.take_queue_copy(commit=commit) as copy:
+            path = copy.path
+        _ = self.git(self.source, "reset", "-q", "--hard", self.base)
+        _ = self.git(self.source, "reflog", "expire", "--expire=now", "--all")
+        _ = self.git(self.source, "gc", "-q", "--prune=now")
+        self.assertNotEqual(subprocess.run(["git", "-C", str(self.source), "cat-file", "-e", commit],
+                                           capture_output=True, timeout=TEST_HANG_GUARD_SECS).returncode, 0)
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
+        self.assertEqual(self.git(path, "show", "HEAD:change.txt"), "only in the live checkout")
+        self.assertEqual(self.git(path, "status", "--porcelain"), "")
+
     def take_queue_copy(self, source: Path | None = None,
                         commit: str | None = None) -> AbstractContextManager[build_slots.LeasedCopy]:
         return build_slots.take_copy(self.source if source is None else source, self.base if commit is None else commit,
                                      showrunner="builds", unit="queue", work="reuse", purpose="test")
 
+    def pool(self) -> Path:
+        return build_folders.pool_path(self.source)
+
     def rescue_refs(self) -> str:
-        return self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/")
+        if not self.pool().exists():
+            return ""
+        return self.git(self.pool(), "for-each-ref", "--format=%(refname)", "refs/rescue/")
 
     def lease(self, path: Path) -> dict[str, object]:
         return cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
@@ -150,10 +323,10 @@ class BuildSlotsTests(unittest.TestCase):
         reference = "refs/build-slots/"
 
         def imported_commit() -> str:
-            refs = self.git(self.source, "for-each-ref", "--format=%(refname)", reference).splitlines()
+            refs = self.git(self.pool(), "for-each-ref", "--format=%(refname)", reference).splitlines()
             self.assertEqual(len(refs), 1)
             self.assertTrue(refs[0].startswith(reference + "take-"))
-            return self.git(self.source, "rev-parse", refs[0])
+            return self.git(self.pool(), "rev-parse", refs[0])
 
         for ending in ("release", "caller failure", "checkout failure", "fetch failure"):
             with self.subTest(ending=ending):
@@ -161,16 +334,25 @@ class BuildSlotsTests(unittest.TestCase):
                 with self.take_queue_copy():
                     pass
                 original = cast(Callable[..., str], getattr(build_slots, "_git"))
+                original_pool = cast(Callable[..., bytes], getattr(build_slots, "_pool_git"))
 
                 def fail_git(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                              accepted: tuple[int, ...] = (0,)) -> str:
                     result = original(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
-                    if ((ending == "checkout failure" and "checkout" in arguments)
-                            or (ending == "fetch failure" and "fetch" in arguments)):
+                    if ending == "checkout failure" and "checkout" in arguments:
                         raise build_slots.SlotGitFailure("injected Git failure")
                     return result
 
-                with mock.patch.object(build_slots, "_git", side_effect=fail_git):
+                def fail_pool_git(repo: Path, *arguments: str, data: bytes | None = None,
+                                  pass_fds: Sequence[int] = ()) -> bytes:
+                    result = original_pool(repo, *arguments, data=data, pass_fds=pass_fds)
+                    # Only the fetch of the requested commit writes no FETCH_HEAD.
+                    if ending == "fetch failure" and "--no-write-fetch-head" in arguments:
+                        raise build_slots.SlotGitFailure("injected Git failure")
+                    return result
+
+                with (mock.patch.object(build_slots, "_git", side_effect=fail_git),
+                      mock.patch.object(build_slots, "_pool_git", side_effect=fail_pool_git)):
                     if ending in ("checkout failure", "fetch failure"):
                         with self.assertRaisesRegex(build_slots.SlotGitFailure, "injected Git failure"):
                             with self.take_queue_copy(source, commit):
@@ -183,6 +365,7 @@ class BuildSlotsTests(unittest.TestCase):
                     else:
                         with self.take_queue_copy(source, commit):
                             self.assertEqual(imported_commit(), commit)
+                self.assertEqual(self.git(self.pool(), "for-each-ref", reference), "")
                 self.assertEqual(self.git(self.source, "for-each-ref", reference), "")
                 self.assertEqual(build_folders.build_folder_state(path), "free")
 
@@ -196,6 +379,7 @@ class BuildSlotsTests(unittest.TestCase):
             path = first.path
         before = self.git(path, "status", "--porcelain=v2")
         original = cast(Callable[..., str], getattr(build_slots, "_git"))
+        original_pool = cast(Callable[..., bytes], getattr(build_slots, "_pool_git"))
         fetched: list[str] = []
         references: list[str] = []
         comparisons: list[tuple[str, ...]] = []
@@ -203,15 +387,22 @@ class BuildSlotsTests(unittest.TestCase):
         def observe_git(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                         accepted: tuple[int, ...] = (0,)) -> str:
             result = original(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
-            if "fetch" in arguments:
-                reference = arguments[-1].partition(":")[2]
-                references.append(reference)
-                fetched.append(self.git(folder, "rev-parse", reference))
             if arguments[:1] == ("merge-base",):
                 comparisons.append(arguments)
             return result
 
-        with mock.patch.object(build_slots, "_git", side_effect=observe_git):
+        def observe_pool_git(repo: Path, *arguments: str, data: bytes | None = None,
+                             pass_fds: Sequence[int] = ()) -> bytes:
+            result = original_pool(repo, *arguments, data=data, pass_fds=pass_fds)
+            # Only the fetch of the requested commit writes no FETCH_HEAD.
+            if "--no-write-fetch-head" in arguments:
+                reference = arguments[-1].partition(":")[2]
+                references.append(reference)
+                fetched.append(self.git(repo, "rev-parse", reference))
+            return result
+
+        with (mock.patch.object(build_slots, "_git", side_effect=observe_git),
+              mock.patch.object(build_slots, "_pool_git", side_effect=observe_pool_git)):
             with self.assertRaises(build_slots.SlotRepositoryMismatch):
                 with self.take_queue_copy(source, commit):
                     self.fail("the unrelated repository received a copy")
@@ -219,17 +410,17 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertEqual(comparisons, [("merge-base", references[0], self.base)])
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(path, "status", "--porcelain=v2"), before)
-        self.assertEqual(self.git(self.source, "for-each-ref", "refs/build-slots/"), "")
+        self.assertEqual(self.git(self.pool(), "for-each-ref", "refs/build-slots/"), "")
         self.assertFalse((path / "foreign.txt").exists())
 
-    def test_clone_creates_a_copy_in_its_persistent_source_repository(self) -> None:
+    def test_clone_creates_a_copy_in_the_pool_of_its_persistent_source(self) -> None:
         source, commit = self.clone_source()
         session_copy = self.root / "private-session-copy"
         _ = source.rename(session_copy)
         source = session_copy
         with self.take_queue_copy(source, commit) as copy:
             path = copy.path
-            self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
+            self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.pool() / ".git"))
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
             self.assertEqual(self.lease(path)["commit"], commit)
         self.assertEqual(self.lease(path)["commit"], commit)
@@ -252,8 +443,8 @@ class BuildSlotsTests(unittest.TestCase):
                         self.fail("The invalid copy record created a copy.")
 
     def test_two_copies_share_one_git_config_migration(self) -> None:
-        common = self.source / ".git"
-        lock_path = common / "build-copy-config.lock"
+        common = self.pool() / ".git"
+        lock_path = self.pool().with_name(f"{self.pool().name}.lock")
         first_read, resume_first = threading.Event(), threading.Event()
         git = cast(Callable[..., str], getattr(build_slots, "_git"))
         flock = fcntl.flock
@@ -294,13 +485,13 @@ class BuildSlotsTests(unittest.TestCase):
             first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual((first_path, second_path), (first_copy, first_copy.with_name("2")))
-        self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
-        self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
-        self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
+        self.assertEqual(self.git(self.pool(), "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
+        self.assertNotIn("core.bare=", self.git(self.pool(), "config", "--local", "--list"))
+        self.assertEqual(self.git(self.pool(), "config", "--file", str(common / "config.worktree"),
                                   "--get-all", "core.bare"), "false")
 
     def test_git_inherits_the_shared_lock_during_copy_config_migration(self) -> None:
-        lock_path = self.source / ".git/build-copy-config.lock"
+        lock_path = self.pool().with_name(f"{self.pool().name}.lock")
         git = cast(Callable[..., str], getattr(build_slots, "_git"))
         locked_commands: list[tuple[str, ...]] = []
 
@@ -367,7 +558,7 @@ class BuildSlotsTests(unittest.TestCase):
                 self.assertEqual(len(after - before), 1)
                 saved, = after - before
                 restored = self.root / f"restored-{number}"
-                _ = self.git(self.source, "worktree", "add", "--detach", str(restored), saved)
+                _ = self.git(self.pool(), "worktree", "add", "--detach", str(restored), saved)
                 self.assertEqual((restored / "change.txt").read_text(), "source edit before reset\n")
                 self.assertEqual((restored / "untracked.txt").read_text(), "untracked source\n")
                 backups = tuple(restored.glob(".rescue-index-*"))
@@ -391,7 +582,7 @@ class BuildSlotsTests(unittest.TestCase):
             self.assertEqual((path / "change.txt").read_text(), "first commit\n")
         refs = self.rescue_refs().splitlines()
         self.assertEqual(len(refs), 1)
-        self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "save this source")
+        self.assertEqual(self.git(self.pool(), "show", refs[0] + ":change.txt"), "save this source")
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn(str(path), output.getvalue())
 

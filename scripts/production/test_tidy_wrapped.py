@@ -455,6 +455,10 @@ class TidyWrappedTests(unittest.TestCase):
             unrelated_cache = (unrelated / "target").resolve().parent
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Each owner's kept copy prints its line, and the wrap continues to the next owner.
+        for kept in (unit_tree, retired_tree):
+            self.assertIn(f"{kept}: kept: a numbered copy goes on a manual removal list", result.stderr)
+        self.assertNotIn(str(unrelated), result.stderr)
         self.assertTrue(unit_tree.exists())
         self.assertEqual(build_folders.build_folder_state(unit_tree), "free")
         self.assertTrue(retired_tree.exists())

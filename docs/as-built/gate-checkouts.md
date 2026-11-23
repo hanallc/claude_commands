@@ -2,6 +2,7 @@
 
 `scripts/copies/copies.py` prepares gate, review, merge, and landing checkouts.
 `copies.standing` takes a numbered copy under `roots.build` through `take_copy`.
+Each numbered copy is a linked worktree of a private copy pool, never of the live checkout.
 
 ## Configuration, place, and names
 
@@ -48,9 +49,63 @@ Preparation selects the requested commit and applies the source and merge polici
 The checkout remains after use. A later caller can reuse its build output.
 See [Repository copies](copies.md) for copy cleanup and build output details.
 
+## Copy pool
+
+`build_slots.pool_repository` makes the pool on the first take and refreshes it on each take.
+The pool is at `<roots.build>/<repository>/.pool/<checkout name>`.
+The pool folder has the name of the live checkout.
+Tools that name a repository from its common Git folder read the same name from a copy and from the live checkout.
+The pool is a clone with no checkout (`git clone --no-local --no-checkout`). It owns its objects.
+Its HEAD is detached. The clone deletes its local branches and their `branch.*` keys, so the remote refs hold all branches.
+The clone runs in a `<checkout name>.clone-XXXXXXXX` stage folder and is renamed to the pool when it is complete.
+Before a first clone, the take names each old stage folder that matches this name exactly.
+The pool name never matches it.
+The take prints `kept for a manual removal list: <path> (build_slots, crashed pool clone)` for each old stage folder.
+A take deletes one folder under the build root: the stage folder that the same call made.
+It deletes that folder under the pool lock, after a failed clone or after the rename.
+The file `.git/build-copy-pool` holds the path of the live checkout. `build_folders.pool_source` reads it.
+A take writes and syncs a temporary file in the same folder, and then renames it, so a reader never sees a partial path.
+`.pool/<checkout name>.lock` is the one lock for each pool configuration write in `build_slots`.
+A take holds it while it makes or refreshes the pool, and while it enables worktree configuration in the pool.
+Each Git child of these writes inherits the lock descriptor.
+One `--local` read of the pool serves the remote, filter and pushurl checks.
+
+Each take does these steps in the pool:
+
+1. Refresh the `origin` and `source` remotes with `git_remotes.refresh_remotes`.
+2. Make the local `filter.*` keys of the pool equal the live local keys, with all values, so the copies run the same filters.
+   The take removes each pool `filter.*` key that the live checkout does not have.
+3. Set `remote.source.pushurl` to a URL that Git cannot use. Do the same for `origin` when its URL is a local path.
+4. Fetch the requested commit as `refs/build-slots/take-*`. The take deletes this ref when it ends.
+   A commit from another repository must share history with the pool HEAD, or the take fails with `SlotRepositoryMismatch`.
+   A commit from the live checkout of the pool needs no shared history, so a snapshot commit with no parent works.
+
+A push from a copy through the `source` remote, or through an `origin` remote with a local URL, fails.
+A command can still push to a path that it names.
+Git commands that write to the pool keep automatic maintenance synchronous.
+A detached maintenance child would keep the copy lock descriptors open.
+
+Rescue refs (`refs/rescue/*`), worktree configuration keys, and Git maintenance write to the pool.
+A copy never writes to the live repository.
+`take_copy` refuses a repository that is not a marked pool under the build root.
+A pool serves one live checkout. A take from a second checkout with the same pool path fails.
+When the recorded checkout no longer exists, the take records the new checkout path in the pool.
+`build_slots.source_checkout` of a copy or a pool returns the live checkout while that checkout exists.
+The pool holds commits from the live checkout, from the take sources, and from commands in copies.
+The live checkout owns the pool, so the `.envrc` trust check of a copy follows the pool record to that checkout.
+The first take on each machine clones the full repository once.
+
+A copy from before the pool links to the live checkout.
+A take never reuses or changes such a copy.
+The take reads each copy lease without the copy lock and skips each copy whose source is not a pool.
+It prints one `kept for a manual removal list: <paths> (build_slots, old layout)` line for the skipped copies.
+An assigned number (`ExactSlotRequest`) on an old copy fails at once with `build_folders.OldLayoutCopy`:
+`assigned copy <n> at <path> is an old-layout copy on the manual removal list; a person must remove it`.
+That number stays blocked until a person removes the old copy.
+
 ## Reset and build output
 
-Each gate makes a clone with its own `.git` directory.
+Each task clone from `copies.clone` has its own `.git` directory.
 The clone borrows objects from the last available store in the source's single-path alternates chain.
 A missing store, repeated store, or alternates file with multiple lines ends the chain.
 A source with no chain keeps its own objects as the borrowed store.
@@ -65,6 +120,7 @@ The clone stages only Git metadata inside a `TemporaryDirectory` within the lock
 The code moves `.git` into the checkout before the staging context ends.
 The context removes staging files after a clone failure.
 
+For a numbered copy, the pool holds the remotes and refs below.
 The copy's `origin` URL equals the source repository's `origin` URL.
 Each use refreshes `refs/remotes/origin/*` from the source's matching remote refs.
 It does not map the source's local branches into those refs.

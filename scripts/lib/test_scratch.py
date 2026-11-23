@@ -3126,10 +3126,10 @@ print(scratch.target('gate:proof', 'tree', False))
             self.assertIsInstance(scratch.remove_folder(copy.path), scratch.KeptFolder)
         with scratch.copy_lock(copy.path):
             self.assertEqual(build_folders.build_folder_state(copy.path), "held")
-        kept = scratch.remove_folder(source)
-        self.assertIsInstance(kept, scratch.KeptFolder)
-        assert isinstance(kept, scratch.KeptFolder)
-        self.assertIn(str(copy.path), kept.reason)
+        # The copy links to its pool, and only the build folder owner removes the pool.
+        pool = build_folders.pool_path(source)
+        self.assertEqual(scratch.remove_folder(pool),
+                         scratch.KeptFolder(pool, "the build folder owner handles removal"))
         with scratch.locked_holds() as holds:
             holds[str(copy.path)] = scratch.Hold(task=ROW, maker="old owner", reason="old hold", made=0.0, ended=0.0)
             scratch.write_holds(holds)
@@ -3139,6 +3139,7 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertEqual(scratch.remove_folder(copy.path),
                          scratch.KeptFolder(copy.path, "the numbered copy requires manual review"))
         self.assertTrue(copy.path.exists())
+        self.assertTrue((pool / ".git/objects").is_dir())
         self.assertTrue((source / ".git/objects").is_dir())
 
     def test_an_unreadable_numbered_copy_keeps_git_sources(self) -> None:

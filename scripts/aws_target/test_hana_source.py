@@ -335,7 +335,8 @@ source_basis_max_commits=8
             self.assertEqual(leased.path, self.root / 'guest-build/hana/aws-hana/1')
             proof = build_folders.numbered_copy_record(leased.path)
             assert isinstance(proof, build_folders.NumberedCopySource)
-            self.assertEqual(proof.source, main)
+            # The copy links to the private pool of the guest main checkout.
+            self.assertEqual(build_folders.pool_source(proof.source), main)
             self.assertEqual(proof.commit, manifest.commit)
             self.assertFalse((main / '.git/hana-bundle').exists())
             with self.assertRaisesRegex(BlockingIOError, 'assigned copy 1'), self.materialize(manifest):

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import fcntl
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -23,7 +24,7 @@ from typing import cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
+from scripts.lib import build_folders, conf, copy_record, git_files, git_remotes, git_rescue
 from scripts.lib.slot_root import configured_slot_root as configured_slot_root
 
 
@@ -68,23 +69,41 @@ class SlotGitFailure(RuntimeError):
     """A slot Git command failed or exceeded its configured deadline."""
 
 
-def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: tuple[int, ...] = (0,)) -> str:
+def _run_git(source: Path, arguments: Sequence[str], *, data: bytes | None = None, pass_fds: Sequence[int] = (),
+             accepted: tuple[int, ...] = (0,)) -> bytes:
     timeout = build_folders.repository_git_timeout()
     try:
-        result = subprocess.run(["git", "-C", str(source), *arguments],
-                                capture_output=True, text=True,
+        result = subprocess.run(["git", "-C", str(source), *arguments], input=data, capture_output=True,
                                 pass_fds=tuple(dict.fromkeys((*pass_fds, *build_folders.held_build_folder_descriptors()))),
                                 timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode not in accepted:
-        raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: {result.stderr.strip()}")
-    return result.stdout.strip()
+        raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
 
+
+def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: tuple[int, ...] = (0,)) -> str:
+    return _run_git(source, arguments, pass_fds=pass_fds, accepted=accepted).decode().strip()
+
+
+def _pool_git(repo: Path, *arguments: str, data: bytes | None = None, pass_fds: Sequence[int] = ()) -> bytes:
+    # Git children inherit the copy locks. Keep automatic maintenance synchronous.
+    return _run_git(repo, ("-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false", *arguments),
+                    data=data, pass_fds=pass_fds)
 
 
 def source_checkout(source: Path) -> Path:
-    """Read the main checkout, including repositories with separate Git metadata."""
+    """Read the main checkout, including repositories with separate Git metadata.
+
+    For a numbered copy or its pool, return the live checkout that the pool serves while it exists.
+    """
+    checkout = _main_checkout(source)
+    served = build_folders.pool_source(checkout)
+    return served if served is not None and served.is_dir() else checkout
+
+
+def _main_checkout(source: Path) -> Path:
     # --show-cdup prints a line only inside a work tree: the path from source to its top.
     common, current, bare, *cdup = _git(source, "rev-parse", "--path-format=absolute", "--git-common-dir",
                                        "--git-dir", "--is-bare-repository", "--show-cdup").splitlines()
@@ -131,6 +150,112 @@ def _persistent_source(source: Path) -> Path:
         source = source_checkout(Path(original))
 
 
+# Git has no helper for this scheme, so a push to a remote with this push URL fails.
+_NO_PUSH_URL = "no-push://a-copy-pool-never-pushes"
+
+
+def _filters(settings: git_remotes.GitSettings) -> git_remotes.GitSettings:
+    return {key: values for key, values in settings.items() if key.startswith("filter.")}
+
+
+@contextmanager
+def _pool_lock(pool: Path) -> Generator[int]:
+    """Hold the one lock for each write to the pool configuration, and yield its descriptor.
+
+    Pass the descriptor to each Git child, so a write keeps the lock if the take process exits.
+    """
+    with (pool.parent / f"{pool.name}.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield lock.fileno()
+
+
+def _write_pool_marker(pool: Path, source: Path) -> None:
+    """Replace the pool marker in one rename, so a reader never sees a partial path."""
+    marker = pool / ".git" / build_folders.POOL_MARKER
+    temporary = marker.with_name(f"{marker.name}.{uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            _ = stream.write(f"{source}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def pool_repository(source: Path) -> Path:
+    """Make or refresh the private clone whose linked worktrees are the numbered copies of `source`.
+
+    The pool is a non-bare clone without a checkout at `<build root>/<repo>/.pool/<checkout name>`. Its HEAD is detached,
+    and its `origin` is the upstream URL of `source`. Each call copies the refs and `filter.*` keys of
+    `source` into the pool. A pool owns its objects, so no copy writes to `source`.
+    """
+    if build_folders.pool_source(source) is not None:
+        return source
+    source = source.resolve()
+    pool = build_folders.pool_path(source)
+    # pool_path reads the origin URL and refuses a source without one.
+    origin = _git(source, "remote", "get-url", "origin")
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    with _pool_lock(pool) as lock:
+        locked = (lock,)
+
+        def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
+            return _pool_git(repo, *arguments, data=data, pass_fds=locked)
+
+        new = not os.path.lexists(pool)
+        if new:
+            # A crashed clone leaves its stage folder. The pool lock excludes a clone that runs now.
+            stage_name = re.compile(re.escape(pool.name) + r"\.clone-[a-z0-9_]{8}")
+            for entry in sorted(pool.parent.iterdir()):
+                if stage_name.fullmatch(entry.name) and not entry.is_symlink() and entry.is_dir():
+                    print(f"kept for a manual removal list: {entry} (build_slots, crashed pool clone)", file=sys.stderr)
+            # Clone beside the pool and rename it, so an interrupted clone never looks like a pool.
+            with tempfile.TemporaryDirectory(dir=pool.parent, prefix=f"{pool.name}.clone-") as stage:
+                staged = Path(stage) / pool.name
+                _ = git(pool.parent, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(staged))
+                head = _git(staged, "rev-parse", "HEAD", pass_fds=locked)
+                _ = _git(staged, "update-ref", "--no-deref", "HEAD", head, pass_fds=locked)
+                # Remote refs hold the branches. A stale local branch would hide the current one in a copy.
+                heads = _git(staged, "for-each-ref", "--format=delete %(refname)", "refs/heads/", pass_fds=locked)
+                if heads:
+                    _ = git(staged, "update-ref", "--stdin", data=f"{heads}\n".encode())
+                branches = {key.rsplit(".", 1)[0] for key in git_remotes.read_git_settings(git, staged, "--local")
+                            if key.startswith("branch.")}
+                for section in sorted(branches):
+                    _ = git(staged, "config", "--local", "--remove-section", section)
+                _write_pool_marker(staged, source)
+                _ = staged.rename(pool)
+        served = build_folders.pool_source(pool)
+        if served is not None and served != source and not (served / ".git").exists():
+            # The live checkout moved or was deleted. The pool now serves the checkout at the new path.
+            _write_pool_marker(pool, source)
+            served = source
+        if served != source:
+            # Envrc trust follows the pool to one live checkout, so a pool never takes a second one.
+            raise SlotGitFailure(f"slots: {pool} is not the copy pool of {source}; it serves {served}")
+        # One read of the local pool keys serves the remote, filter and pushurl checks.
+        settings = git_remotes.read_git_settings(git, pool, "--local")
+        git_remotes.refresh_remotes(git, pool, source, origin, new_checkout=new, settings=settings)
+        # The local filter.* keys of the pool equal the live local keys. Both read the same global keys.
+        live_filters = _filters(git_remotes.read_git_settings(git, source, "--local"))
+        pool_filters = _filters(settings)
+        for key in sorted(live_filters.keys() | pool_filters.keys()):
+            if pool_filters.get(key) != live_filters.get(key):
+                if key in pool_filters:
+                    _ = git(pool, "config", "--local", "--unset-all", key)
+                for value in live_filters.get(key, []):
+                    _ = git(pool, "config", "--local", "--add", key, value)
+        # A push from a copy must never reach a repository on this machine.
+        for remote, blocked in (("source", True), ("origin", git_remotes.local_url(origin))):
+            key = f"remote.{remote}.pushurl"
+            if blocked and settings.get(key) != [_NO_PUSH_URL]:
+                _ = git(pool, "config", "--local", "--replace-all", key, _NO_PUSH_URL)
+            elif not blocked and settings.get(key) == [_NO_PUSH_URL]:
+                _ = git(pool, "config", "--local", "--unset-all", key)
+    return pool.resolve()
+
+
 @contextmanager
 def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]:
     """Retain one imported commit in the owner repository until the take ends."""
@@ -139,10 +264,13 @@ def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         return
     reference = f"refs/build-slots/take-{uuid4().hex}"
     previous = _git(repository, "rev-parse", "HEAD")
+    # A commit from the live checkout of the pool can have no parent, such as a snapshot of a dirty worktree.
+    served = build_folders.pool_source(repository)
+    own = served is not None and git_files.at(served).common_dir == git_files.at(source).common_dir
     try:
-        _ = _git(repository, "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--",
-                 str(source), f"{commit}:{reference}")
-        if not _git(repository, "merge-base", reference, previous, accepted=(0, 1)):
+        _ = _pool_git(repository, "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--",
+                      str(source), f"{commit}:{reference}")
+        if not own and not _git(repository, "merge-base", reference, previous, accepted=(0, 1)):
             raise SlotRepositoryMismatch(repository, source)
         yield
     finally:
@@ -179,10 +307,9 @@ def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> No
     read_extension = ("config", "--local", "--type=bool", "--get", "extensions.worktreeConfig")
     if _git(path, *read_extension, accepted=(0, 1), pass_fds=(descriptor,)) == "true":
         return
-    with (common_dir / "build-copy-config.lock").open("a") as lock:
-        # Git retains the lock if the slot process exits during a write.
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        descriptors = (descriptor, lock.fileno())
+    # The common Git folder of a copy is in its pool, so the migration takes the pool lock.
+    with _pool_lock(common_dir.parent) as lock:
+        descriptors = (descriptor, lock)
         if _git(path, *read_extension, accepted=(0, 1), pass_fds=descriptors) == "true":
             return
         # Preserve the main checkout's location when Git enables worktree configuration.
@@ -231,7 +358,12 @@ def _copy_order(parent: Path) -> Generator[int]:
     except FileNotFoundError:
         numbers = {}
     existing = {number for number, folder in numbers.items() if folder}
-    yield from sorted(existing)
+    old = {number for number in existing if build_folders.old_layout_copy(parent, number)}
+    if old:
+        # A take never reuses an old copy. Skip each one without its lock, and name them in one line.
+        paths = ", ".join(str(parent / str(number)) for number in sorted(old))
+        print(f"kept for a manual removal list: {paths} (build_slots, old layout)", file=sys.stderr)
+    yield from sorted(existing - old)
     number = 1
     while True:
         if number not in existing:
@@ -241,9 +373,16 @@ def _copy_order(parent: Path) -> Generator[int]:
 
 @contextmanager
 def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[LeasedCopy]:
-    """Take the assigned number or the first free copy."""
-    repository = _persistent_source(source_checkout(source))
+              purpose: str, selection: SlotSelection = LOWEST_FREE_SLOT,
+              live: Path | None = None) -> Generator[LeasedCopy]:
+    """Take the assigned number or the first free copy.
+
+    `source` holds `commit`. `live` names the checkout whose pool holds the copy; the default is `source`.
+    """
+    repository = pool_repository(_persistent_source(source_checkout(source if live is None else live)))
+    if build_folders.pool_source(repository) is None:
+        raise SlotGitFailure(f"slots: {repository} is not a copy pool under {build_folders.build_root()}; "
+                             + "a copy never links to a live checkout")
     name = build_folders.repo_word(repository)
     revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
     if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
@@ -262,6 +401,12 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     path = held.enter_context(build_folders.slot_build_folder(spec))
                 except build_folders.SlotSourceBusy:
                     raise
+                except build_folders.OldLayoutCopy as error:
+                    if isinstance(selection, ExactSlotRequest):
+                        raise build_folders.OldLayoutCopy(
+                            f"assigned copy {number} at {parent / str(number)} is an old-layout copy "
+                            + "on the manual removal list; a person must remove it") from error
+                    continue
                 except (BlockingIOError, FileExistsError):
                     continue
                 descriptor = build_folders.build_folder_lock_fd(path)
@@ -356,8 +501,8 @@ def _numbered_copy_busy_marks(copy: build_folders.NumberedCopySource, *, dry_run
             yield True
 
 
-def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
-    """Check a numbered copy for manual review."""
+def remove_copy_locked(path: Path) -> bool:
+    """Return True when an idle numbered copy can go on a manual removal list. Remove nothing."""
     from scripts.lib import scratch
 
     record = build_folders.numbered_copy_record(path)
@@ -382,14 +527,14 @@ def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
                     store = Path(borrowed).resolve()
                     if store.is_relative_to(copy.git_directory) or store.is_relative_to(path.resolve()):
                         return False
-        if not dry_run:
-            print(f"kept for a manual removal list: {path} (build_slots, numbered copy)", file=sys.stderr)
-        return dry_run
+        return True
 
 
-def remove_copy(copy: build_folders.NumberedCopySource | build_folders.NumberedCopyRemovalPending, *,
-                dry_run: bool = False) -> bool:
-    """Check a free numbered copy for manual review."""
+def remove_copy(copy: build_folders.NumberedCopySource | build_folders.NumberedCopyRemovalPending) -> bool:
+    """Take the removal lease and return True when the free numbered copy can go on a manual removal list.
+
+    Remove nothing. The caller names the copy.
+    """
     path = copy.copy.path if isinstance(copy, build_folders.NumberedCopyRemovalPending) else copy.path
     form = build_folders.parse_form(path)
     if isinstance(form, build_folders.UnverifiedFolderPath):
@@ -400,7 +545,7 @@ def remove_copy(copy: build_folders.NumberedCopySource | build_folders.NumberedC
                                            root=build_folders.build_root()) as lease:
         if not isinstance(lease, build_folders.HeldFolderRemovalLease):
             return False
-        if build_folders.numbered_copy_record(path) != copy or not remove_copy_locked(path, dry_run=dry_run):
+        if build_folders.numbered_copy_record(path) != copy or not remove_copy_locked(path):
             return False
         return True
 

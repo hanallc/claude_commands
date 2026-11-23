@@ -834,15 +834,19 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             self.assertTrue(tree.exists())
         self.assertTrue(self.worktree.is_dir())
 
-    def test_retirement_retry_removes_a_tree_kept_while_busy(self) -> None:
+    def test_retirement_and_its_retry_keep_and_name_a_numbered_copy(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertNotIn("busy", output)
+            self.assertIn(f"{tree}: kept: the copy is in use", output)
+            self.assertNotIn("anomaly", output)
             self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn("unchanged", output)
+        self.assertIn(f"{tree}: kept: a numbered copy goes on a manual removal list", output)
+        self.assertNotIn("anomaly", output)
         self.assertTrue(tree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), "free")
 
@@ -892,6 +896,17 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(git(self.root / "origin.git", "rev-parse", branch), tip)
         self.assertEqual(self.calls, [])
+
+    def test_retirement_retry_without_a_checkout_names_a_kept_numbered_copy(self) -> None:
+        with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
+            pass
+        self.park_without_worktree()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIn("unchanged", output)
+        self.assertIn(f"{tree}: kept: a numbered copy goes on a manual removal list", output)
+        self.assertNotIn("anomaly", output)
+        self.assertTrue(tree.exists())
 
     def test_retirement_retry_refuses_a_rebase_after_the_unit_checkout_is_absent(self) -> None:
         self.park_without_worktree()

@@ -65,7 +65,9 @@ class RescueError(RuntimeError):
 
 def _git(work_tree: Path, *arguments: str, data: bytes = b"", index: Path | None = None,
          accepted: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
-    command = ["git", "--no-optional-locks", "-C", str(work_tree), *arguments]
+    # The commands inherit the copy locks. Keep automatic maintenance synchronous, so no detached child keeps them.
+    command = ["git", "--no-optional-locks", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+               "-C", str(work_tree), *arguments]
     environment = dict(os.environ)
     if arguments[:1] == ("commit-tree",):
         environment.update(_RESCUE_IDENTITY)

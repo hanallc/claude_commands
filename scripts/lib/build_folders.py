@@ -244,6 +244,10 @@ class SlotSourceBusy(BlockingIOError):
     """The source lock prevents creation of a slot checkout."""
 
 
+class OldLayoutCopy(FileExistsError):
+    """The numbered copy links to a live checkout and waits for a person to remove it."""
+
+
 @dataclass(frozen=True)
 class NoSlotCheckout:
     """The folder does not contain a repository slot."""
@@ -346,6 +350,9 @@ ParsedFolder = FolderForm | OutsideFolderLayout | InvalidFolderComponents | Unve
 _DECIMAL_NAME = re.compile(r"[0-9]+")
 _METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 _UNIT_LOCKS = ".unit-locks"
+# Each repository's numbered copies are linked worktrees of this private clone.
+POOL = ".pool"
+POOL_MARKER = "build-copy-pool"
 _unit_lock_claims: set[tuple[int, Path]] = set()
 _unit_lock_claims_guard = Lock()
 
@@ -369,7 +376,7 @@ def _form_name(name: str) -> str:
 
 
 def _unit_name(unit: str) -> str:
-    if unit in ("main", "ci"):
+    if unit in ("main", "ci", POOL):
         raise InvalidFolderForm(f"{unit!r} is a reserved unit name")
     return _form_name(unit)
 
@@ -416,9 +423,37 @@ def repo_word(repository: Path) -> str:
             location = re.sub(r"^(?:[^/:]+@)?(?:\[[^\]]+\]|[^/:]+):", "", origin, count=1)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise InvalidFolderForm(f"{repository}: cannot read the origin URL") from error
-    word = _form_name(location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+    return repository_folder_name(location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+
+
+def repository_folder_name(name: str) -> str:
+    """Apply the configured alias to a repository name."""
+    word = _form_name(name)
     key = f"repo_word.{word}"
     return _form_name(_settings().values(key).get(key, word))
+
+
+def pool_path(source: Path) -> Path:
+    """Return the path of the copy pool for the live checkout `source`.
+
+    The pool folder has the name of the checkout, so the repository name that tools read from a
+    copy's common Git folder is the name of the live repository.
+    """
+    if source.name in ("", ".", ".."):
+        raise InvalidFolderForm(f"{source} has no checkout name for a copy pool")
+    return build_root() / repo_word(source) / POOL / source.name
+
+
+def pool_source(repository: Path) -> Path | None:
+    """Read the live checkout of a marked copy pool, or None for another repository."""
+    try:
+        path = repository.resolve()
+        if path.parent.name != POOL or path.parent.parent.parent != build_root().resolve():
+            return None
+        text = (path / ".git" / POOL_MARKER).read_text(encoding="utf-8").strip()
+    except (OSError, RuntimeError):
+        return None
+    return Path(text) if text else None
 
 
 def worktree_path(repo: str, unit: str, short_name: str) -> Path:
@@ -1017,7 +1052,12 @@ def numbered_copy_envrc(envrc: Path, *, trusted_source: Callable[[Path], bool]) 
                 or len(parts) != 3):
             return NumberedCopyEnvrc.NEEDS_APPROVAL
         record = numbered_copy_record(parent)
-        if not isinstance(record, NumberedCopySource) or not trusted_source(record.source):
+        if not isinstance(record, NumberedCopySource):
+            return NumberedCopyEnvrc.NEEDS_APPROVAL
+        # A pool holds commits from its live checkout, from the take sources, and from commands in copies.
+        # The live checkout owns the pool, so trust follows that checkout.
+        live = pool_source(record.source)
+        if not trusted_source(record.source if live is None else live):
             return NumberedCopyEnvrc.NEEDS_APPROVAL
         descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
@@ -1059,12 +1099,15 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
     assert isinstance(spec.slot_checkout, SlotCheckout)
     try:
         record = _numbered_copy_record(path, form, directory)
-        if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
-                or not may_remove_folder_tree(path, record.git_directory)):
-            raise ValueError("copy has no matching source record")
-        _copy_identity_fields(fields, record)
-        fields["commit"] = record.commit
-        return True
+        if isinstance(record, NumberedCopySource) and pool_source(record.source) is None:
+            old_source = record.source
+        else:
+            if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
+                    or not may_remove_folder_tree(path, record.git_directory)):
+                raise ValueError("copy has no matching source record")
+            _copy_identity_fields(fields, record)
+            fields["commit"] = record.commit
+            return True
     except git_files.NotACheckout as error:
         try:
             lease = _read_copy_lease(path, directory)
@@ -1081,6 +1124,22 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
         raise FileExistsError(f"{path}: incomplete copy retained") from error
     except (OSError, ValueError, RuntimeError) as error:
         raise FileExistsError(f"{path}: copy identity could not be verified") from error
+    # An old copy links to a live checkout. A take never writes to it again.
+    print(f"kept for a manual removal list: {path} (build_folders, old layout)", file=sys.stderr)
+    raise OldLayoutCopy(f"{path}: old layout: the copy links to {old_source}, not to a copy pool")
+
+
+def old_layout_copy(parent: Path, number: int) -> bool:
+    """Read the lease without the copy lock, and return True when the copy links to a checkout that is not a pool.
+
+    The answer is a hint. An unreadable lease returns False, and the locked reuse check decides.
+    """
+    try:
+        value = cast(object, json.loads(lease_path(parent / _folder_number(number)).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    source = cast(dict[str, object], value).get("source_path") if isinstance(value, dict) else None
+    return isinstance(source, str) and bool(source) and pool_source(Path(source)) is None
 
 
 def _current_copy_lock(path: Path, directory: int) -> None:
@@ -1290,7 +1349,7 @@ def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
             yield UnknownFolderLease(repo, str(error))
             continue
         for unit in units:
-            if unit.name in ("ci", "main"):
+            if unit.name in ("ci", "main", POOL):
                 continue
             try:
                 mode = unit.lstat().st_mode

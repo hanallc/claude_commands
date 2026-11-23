@@ -161,7 +161,12 @@ with fake_cargo_output_roots():
         assert workspace.is_relative_to(root / 'workspaces')
         assert copy_record.copy_folder(workspace) == workspace
         assert (workspace / 'source.txt').read_text() == 'source\\n'
-    copies.remove_trees('private-test')
+    try:
+        copies.remove_trees('private-test')
+    except copies.NumberedCopyKept as kept:
+        assert f'{gate}: kept:' in str(kept)
+    else:
+        raise AssertionError('remove kept the numbered copy without a report')
     assert not workspace.exists()
     assert gate.exists()
     clone = copies.clone(source, task='gate:private-proof', word='proof')
