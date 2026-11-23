@@ -21,7 +21,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 import errno
 import hashlib
@@ -673,9 +673,9 @@ def program_environment() -> dict[str, str]:
 
 
 def natedev_refusal(program: Program) -> str:
-    """Why natedev cannot take the program: a checkout that holds the tools that check the run, or an output
-    folder that the limit cannot bind."""
-    return hand_made_limit.limit_refusal(program.argv, program.repo, program_environment())
+    """Why natedev cannot take the program: a refusal of the cargo folder check, a checkout that holds the tools
+    that check the run, or an output folder that the limit cannot bind."""
+    return hand_made_limit.start_refusal(program.argv, program.repo, program_environment())
 
 
 @dataclass
@@ -696,24 +696,29 @@ class NatedevRun:
     def run(self, output: Output) -> int:
         """Run the program under bwrap.
 
-        A checkout that holds the tools that check the run, a limit that bwrap does not set up, an output folder
-        that the limit cannot bind (the program can change the target link after the check), or a cargo failure
-        from offline mode ends the attempt as a refusal.
+        For cargo, the folder steps of the build-hold cargo wrapper come first, and the build folder lock stays
+        held until the program ends. A refusal of the folder check, a checkout that holds the tools that check
+        the run, a limit that bwrap does not set up, an output folder that the limit cannot bind (the program can
+        change the target link after the check), or a cargo failure from offline mode ends the attempt as a
+        refusal.
         """
         bwrap = shutil.which("bwrap")
         if bwrap is None:
             raise Refused(hand_made_limit.BWRAP_MISSING)
         environment = program_environment()
-        refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
-        if refusal:
-            raise Refused(refusal)
-        self.temp.mkdir(exist_ok=True)
-        status_read, status_write = os.pipe()
-        try:
+        with ExitStack() as held:
+            lock = hand_made_limit.held_output(self.program.argv, self.program.repo, environment, held)
+            refusal = hand_made_limit.limit_refusal(self.program.argv, self.program.repo, environment)
+            if refusal:
+                raise Refused(refusal)
+            self.temp.mkdir(exist_ok=True)
+            status_read, status_write = os.pipe()
+            _ = held.callback(os.close, status_read)
             try:
                 command = hand_made_limit.limit_argv(bwrap, self.program, self.temp, environment, status_write)
                 process = self.place.popen(command, cwd=self.program.repo, env=environment, stdin=subprocess.DEVNULL,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(status_write,))
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           pass_fds=(status_write, *lock))
             finally:
                 os.close(status_write)
             self.started_at = time.time()
@@ -726,8 +731,6 @@ class NatedevRun:
             if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
                 raise Refused(hand_made_limit.NO_NETWORK)
             return status
-        finally:
-            os.close(status_read)
 
 
 @contextmanager
