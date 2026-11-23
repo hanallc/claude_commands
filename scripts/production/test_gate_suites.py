@@ -22,7 +22,7 @@ from unittest import mock
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
-from scripts.direct.local_release_wait import LocalReleaseEvents
+from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test

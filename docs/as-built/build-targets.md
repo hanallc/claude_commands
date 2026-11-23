@@ -781,6 +781,7 @@ Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER
 The helper imports each Python program once and calls its existing `main` on the main thread.
 Each request carries the arguments, environment, working directory, and input text.
 The helper restores this state after each call.
+Each call runs in a copy of the helper's context, so a `ContextVar` value lasts for one call, as in its own process.
 It returns the exit status and captured output to the caller.
 The helper replays stderr when each call ends.
 The helper exits when its input pipe closes.
@@ -795,7 +796,7 @@ The detached step recorders from `invoke.sh` also keep their own processes.
 Shell fixtures and scripts with no line that starts `def main(` use their original process path.
 The helper finds that line with a text search, not a parse.
 The helper changes only the environment names that differ between calls.
-A failed helper request also uses that path.
+A failed helper request also uses that path. A `SystemExit` while the helper loads a program is a failed request.
 The change does not wrap or re-execute `verify.sh`.
 
 `VERIFY_PY_TRACE` retains one timing row for each helper call.
