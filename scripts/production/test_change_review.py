@@ -1738,11 +1738,11 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(self.ready()[0], 0)
         self.assertEqual(self.listing.read_bytes(), written)
 
-        with self.subTest(merge_branch="local-merge-gate"):
+        with self.subTest(merge_branch="local-gate"):
             local = self.branch_unit("local", "local", "local-unit", "local.md")
             _ = self.merge_change("Change-Review: Local | Read | Local result", branch="local-unit")
             checkpoint = self.git("rev-parse", "HEAD^2")
-            _ = self.git("commit", "--amend", "-m", f"Merge commit '{checkpoint}' into local-merge-gate")
+            _ = self.git("commit", "--amend", "-m", f"Merge commit '{checkpoint}' into local-gate")
             merged = self.git("rev-parse", "HEAD")
             _ = self.git("push", "--force", "origin", "integration")
             self.promote()

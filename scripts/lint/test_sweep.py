@@ -828,7 +828,7 @@ class RebuildTests(SweepCase):
     def test_rebuilds_names_each_cause_and_clone_kind(self) -> None:
         cases = [
             ("/tmp/gate-check.hana", "gate and merge copies", "floor take", 1),
-            ("/tmp/merge-check.hana", "gate and merge copies", "floor take", 2),
+            ("/tmp/merge-copy.hana", "gate and merge copies", "floor take", 2),
             ("/tmp/claude/unit/run/phases/3/clone", "phase clones", "budget take", 3),
             ("/tmp/tmp.ABCDEF", "mktemp folders", "tmp sweep", 4),
             ("/tmp/claude-1000/scratchpad/hana", "scratchpad clones", "none", 5),

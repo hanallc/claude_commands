@@ -1,4 +1,4 @@
-"""Hold and interruption contracts for merge-gate jobs."""
+"""Hold and interruption contracts for gate jobs."""
 
 from __future__ import annotations
 

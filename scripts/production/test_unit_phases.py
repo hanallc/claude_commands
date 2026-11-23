@@ -165,7 +165,7 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue"),
                                                     "XDG_STATE_HOME": str(self.root / "state"),
-                                                    "GATE_STATE_DIR": str(self.root / "merge-gate")}))
+                                                    "GATE_STATE_DIR": str(self.root / "gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 

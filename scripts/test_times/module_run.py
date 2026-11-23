@@ -648,7 +648,7 @@ class StandaloneModuleRun:
 
 
 def runner_folder_owner() -> GateModuleLease | StandaloneModuleRun:
-    if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
+    if root := os.environ.pop("GATE_MODULE_DIR", ""):
         return GateModuleLease(Path(root))
     return StandaloneModuleRun()
 

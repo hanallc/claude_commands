@@ -37,7 +37,6 @@ class Fixture(unittest.TestCase):
     def test_folder(self):
         print('TMPDIR=' + os.environ['TMPDIR'], flush=True)
         self.assertNotIn('GATE_PARENT_PID', os.environ)
-        self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
 """
 REPO = Path(__file__).resolve().parents[2]
 MODULE_RUN = REPO / "scripts/test_times/module_run.py"

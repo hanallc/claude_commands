@@ -1721,7 +1721,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].instance_type, 'm7a.4xlarge')
 
     def test_targeted_run_records_mode_and_gate_job_in_every_event(self) -> None:
-        self.request['mode'] = gate.SuiteMode.TARGETED.wire
+        self.request['mode'] = gate.SuiteMode.TARGETED.value
         job_record = {'kind': 'StepJob', 'step': 'test-affected', 'unit': '', 'branch': '', 'modules': 0}
         self.request['gate_job'] = job_record
         cloud_gate.save(self.folder / 'request.json', self.request)
@@ -2225,9 +2225,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 run = gate.GateRun((passed,), 3, 2, executions=(failed, passed) if retried else (passed,))
                 result = self.result()
                 result['gate'] = gate_box.encode_run(run)
-                # An older box names the step merge-gate; the store keeps the new name.
                 result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
-                                                             self.now, self.now + 3, 'merge-gate')
+                                                             self.now, self.now + 3, 'gate')
                 _ = destination.write_text('{"interrupted":')
                 cloud_gate.save(self.folder / cloud_gate.RESULT_FILE, result)
                 with (mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(buildlog)}),
@@ -2955,37 +2954,11 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
-    def test_old_checkout_modes_reach_the_box(self) -> None:
-        runner = self.repo / 'scripts/production/gate.py'
-        source = runner.read_text()
-        _ = runner.write_text(source.replace('"gate"', '"merge-gate"').replace('"test-affected"', '"targeted-test"'))
-        _ = gate.checked_git(self.repo, 'add', '.')
-        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use the previous suite mode values')
-        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
-        _ = runner.write_text(source.replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
-        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Read only the new suite mode values')
-        new_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
-        mapping = '{"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}'
-        self.assertIn(mapping, source)
-        _ = runner.write_text(source.replace(mapping, '{}'))
-        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Write the old values without reading them')
-        writes_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
-        for mode in gate.SuiteMode:
-            with self.subTest(mode=mode):
-                self.assertTrue(cloud_gate.accepts_suite_mode(self.repo, head, mode))
-                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, new_only, mode))
-                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, writes_only, mode))
-                self.assertIs(gate.SuiteMode(mode.wire), mode)
-                self.assertEqual(gate.SuiteMode.step(mode.wire), mode.value)
-                self.assertEqual(gate.SuiteMode.step(mode.value), mode.value)
-        self.assertEqual(gate.SuiteMode.step('gpu-size-trial'), 'gpu-size-trial')
-
     def test_unknown_checkout_modes_use_local_gate_without_starting_the_cloud_service(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         runner = self.repo / 'scripts/production/gate.py'
         source = runner.read_text()
-        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"')
-                              .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"'))
         _ = gate.checked_git(self.repo, 'add', '.')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
         passed = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'OK'),), 1, 0)
@@ -3001,7 +2974,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 local.assert_called_once_with(self.repo, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
                                               source='tests-only', full=True, mode=mode)
                 service.assert_not_called()
-                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
+                reason = f'The tested commit does not read SuiteMode value {mode.value!r}'
                 self.assertEqual(output.getvalue(), 'Cloud gate uses natedev: ' + reason + '\n')
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
@@ -3881,8 +3854,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         folder = root / 'legacy-attempt'
         request = cloud_gate.prepare(self.repo, folder, mode, 1800)
-        self.assertEqual(request['mode'], 'merge-gate')
-        cloud_gate.save(folder / 'request.json', {**request, 'mode': mode.value})
+        self.assertEqual(request['mode'], 'gate')
         cloud_gate.save(root / 'current.json', {'attempt': folder.name, 'tree': request['tree'], 'commit': request['head'],
             'mode': mode.value, 'full': False, 'module_time_limit_s': 1800, 'modules': 'all', 'selection_tree': 'all'})
         cloud_gate.save(folder / 'launch.json', {'instance': 'i-fixture', 'region': 'us-east-2',
@@ -3903,7 +3875,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         def service(command: Sequence[str]) -> int:
             self.assertEqual(Path(command[command.index('--worker') + 1]), folder)
             worker_request = cloud_gate.read(folder / 'request.json')
-            self.assertEqual(worker_request['mode'], 'merge-gate')
+            self.assertEqual(worker_request['mode'], 'gate')
             self.assertNotIn('gate_job', worker_request)
             if fake.has_result:
                 sidecar = Path(command[command.index('--sidecar') + 1])

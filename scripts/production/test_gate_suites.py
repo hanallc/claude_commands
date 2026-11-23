@@ -25,7 +25,7 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
+from scripts.production import affected_modules, checkpoint_gate, gate
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
@@ -775,7 +775,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "typecheck_python", return_value=Path(sys.executable)),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
             for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
-                         "suite_scope_prefix", "merge_gate_governor_gib", "SampledRSSAdmission",
+                         "suite_scope_prefix", "gate_governor_gib", "SampledRSSAdmission",
                          "PassedTreeLedger", "clean_test_tree", "process_memory_mib"):
                 _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
             run = gate.run_suites(self.checkout, type_dirs=("scripts",), max_running_jobs=1,
@@ -941,8 +941,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "start_gate_job", side_effect=start_module),
               mock.patch.object(gate, "finish_gate_job", side_effect=finish_module),
               contextlib.redirect_stdout(output)):
-            code = targeted_test.main(["--repo", str(self.checkout),
-                                       "--module", "lib/test_first.py", "--module", "lib/test_second.py"])
+            code = gate.main(["--affected", "--repo", str(self.checkout),
+                              "--module", "lib/test_first.py", "--module", "lib/test_second.py"])
         self.assertEqual(code, 0, output.getvalue())
         admit.assert_called_once()
         self.assertEqual(len(reservations), 2)
@@ -996,14 +996,11 @@ patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requeste
         self.assertIn("--module needs --tests-only", errors.getvalue())
 
     def test_gate_commands_refuse_abbreviated_options(self) -> None:
-        for main, arguments, short in (
-            (gate.main, ["--tests-on", "--full"], "--tests-on"),
-            (targeted_test.main, ["--ful"], "--ful"),
-        ):
-            with (self.subTest(command=main.__module__),
+        for arguments, short in ((["--tests-on", "--full"], "--tests-on"), (["--affected", "--ful"], "--ful")):
+            with (self.subTest(arguments=arguments),
                   mock.patch.object(gate, "run_tests_only") as run,
                   contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal):
-                _ = main(arguments)
+                _ = gate.main(arguments)
             self.assertEqual(refusal.exception.code, 2)
             self.assertIn(f"unrecognized arguments: {short}", errors.getvalue())
             run.assert_not_called()

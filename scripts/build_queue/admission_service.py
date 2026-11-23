@@ -3483,8 +3483,8 @@ class AdmissionServer:
             stem = stem.with_name(stem.name + "0")
         if profile.step == "build":
             shape = build_shape(list(request.argv)).key
-        elif profile.step in {"gate", "merge-gate"}:
-            shape = gate.merge_gate_shape(request.argv)
+        elif profile.step == "gate":
+            shape = gate.gate_shape(request.argv)
         else:
             shape = ""
         cloud = isinstance(request.place, wire.CloudPlace)
@@ -6221,9 +6221,7 @@ ADMISSION_CALLERS = {
     "verify.sh": "direct/verify.sh",
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
-    "merge_gate.py": "production/merge_gate.py",
     "gate.py": "production/gate.py",
-    "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
     "queue_place.py": "build_queue/queue_place.py",
     "offload.py": "mac_test/offload.py",

@@ -2781,7 +2781,7 @@ class Deployment:
         """Preview the approved gate update in configured region order."""
         if not isinstance(self.mode, plan_run.PlanRun):
             raise DeploymentRefused('The gate plan requires the plan identity.')
-        with self._require_account_stack('up --workload merge-gates --plan'):
+        with self._require_account_stack('up --workload gates --plan'):
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
@@ -2961,7 +2961,7 @@ class Deployment:
         """Add the gate resources and preserve every Rust parameter."""
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
-        with self._require_account_stack('up --workload merge-gates'):
+        with self._require_account_stack('up --workload gates'):
             gate_probe.invalidate_record(self.directory)
             settings = read_deployment_settings(self.settings_path)
             regions = gate_regions(settings.region)
@@ -3403,12 +3403,12 @@ class DeploymentArguments(argparse.Namespace):
 
 def run_setup_plan(args: DeploymentArguments) -> int:
     try:
-        workloads = ('rust', 'merge-gates', 'hana') if args.command == 'hana-setup' else ('rust', 'merge-gates')
+        workloads = ('rust', 'gates', 'hana') if args.command == 'hana-setup' else ('rust', 'gates')
         if (args.command not in ('up', 'hana-setup')
                 or args.workload not in workloads
-                or args.command == 'up' and args.workload != 'merge-gates'
+                or args.command == 'up' and args.workload != 'gates'
                 or args.trial_action or args.approve_resources or args.approve_destroy):
-            raise DeploymentRefused('Use --plan with hana-setup or up --workload merge-gates without approval flags.')
+            raise DeploymentRefused('Use --plan with hana-setup or up --workload gates without approval flags.')
         plan = plan_run.PlanRun(plan_identity.plan_credentials, execute_command, time.sleep)
         subject = Deployment(args.settings, args.directory, args.output, execute=execute_command, mode=plan)
         if args.command == 'up':
@@ -3438,7 +3438,7 @@ def main() -> int:
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
-    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana', 'plan-identity'), default='merge-gates')
+    _ = parser.add_argument('--workload', choices=('gates', 'hana', 'plan-identity'), default='gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)

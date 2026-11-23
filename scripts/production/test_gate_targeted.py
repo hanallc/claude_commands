@@ -26,7 +26,7 @@ class TargetedTestTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # The fixture's main branch has no merge gate pass.
+        # The fixture's main branch has no gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")
 
@@ -60,8 +60,8 @@ import sys
 original_exit = argparse.ArgumentParser.exit
 
 def checked_exit(parser, status=0, message=None):
-    from scripts.production import gate, merge_gate
-    print("gate module identity:", gate is merge_gate is sys.modules["__main__"])
+    from scripts.production import gate
+    print("gate module identity:", gate is sys.modules["__main__"])
     original_exit(parser, status, message)
 
 argparse.ArgumentParser.exit = checked_exit
@@ -76,7 +76,7 @@ argparse.ArgumentParser.exit = checked_exit
             self.assertIn("--affected", result.stdout)
 
     def test_a_targeted_run_with_no_session_names_the_worktree_owner(self) -> None:
-        # targeted_test under systemd, or with no session, still names who started its queue requests.
+        # gate.py --affected under systemd, or with no session, still names who started its queue requests.
         observed: list[dict[str, str]] = []
 
         def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:

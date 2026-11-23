@@ -81,8 +81,6 @@ Both callers read the value when they use it.
 
 ## gate.conf
 
-`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
-
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.
 `nightly_result_modules=8` limits the failed test modules named in a result push.
@@ -859,7 +857,7 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run gates and targeted tests on natedev.
 `enabled=off` also refuses the pinned `hana-gpu` route and stops the hourly placement-score reads.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
@@ -872,7 +870,7 @@ Capacity refusals and unsupported types select the next variant.
 After all regions refuse, a normal gate can use natedev.
 All regions use the same daily and monthly spend caps.
 
-`deploy.py up --workload merge-gates --approve-resources` updates the home stack and the regional gate stack.
+`deploy.py up --workload gates --approve-resources` updates the home stack and the regional gate stack.
 The home stack keeps the bucket and the global instance profile.
 The regional stack uses the default VPC and contains only gate network, launch, policy, and expiry resources.
 The deployment resolves the pinned image by its Name and owner in each region.

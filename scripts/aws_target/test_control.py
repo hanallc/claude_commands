@@ -552,8 +552,8 @@ region_transfer_usd={"us-west-1":0.00015}
         events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'gate', 'region': home, 'result': 'refused',
                        'time': self.clock.now - 3600 - 400, 'error_code': 'InsufficientInstanceCapacity'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
-        tables = {table.title: table for table in merge_gates.tables}
+        gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
+        tables = {table.title: table for table in gates.tables}
 
         # At 0.25 USD/h, 6 minutes cost 0.0250 USD and 12 minutes cost 0.0500 USD.
         # The other region adds the configured transfer charge of 0.00015 USD before rounding.
@@ -571,11 +571,11 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
         self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
-        self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
+        self.assertEqual(gates.summary_of(gates.cheapest),
                          f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
-        self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
-        self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
+        self.assertEqual(gates.refused.rows[0], (fast, '1', '0'))
+        self.assertEqual(gates.launched.rows[0], (fast, '1', '0'))
 
     def test_launch_history_readers_accept_missing_and_unreadable_gate_jobs(self) -> None:
         self.assertEqual(self.snapshot(), 0)

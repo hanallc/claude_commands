@@ -199,7 +199,7 @@ Bucket policies added outside the stack are out of scope.
 To plan a merge gate update, run this command in a terminal on natedev.
 
 ```sh
-deploy.py up --workload merge-gates --plan
+deploy.py up --workload gates --plan
 ```
 
 The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
@@ -941,7 +941,7 @@ The entry point accepts the box directory, links, and mutable result dictionary.
 The candidate supplies its own suite, timing, and record code.
 The guest installs no signal handler.
 The module time limit and process groups stop the gate.
-The bootstrap names no `merge_gate` attribute and copies no host function source.
+The bootstrap copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
 The controller then uses the normal natedev fallback.
@@ -1084,7 +1084,7 @@ The snapshot test derives IAM actions from every request in the real snapshot pa
 It checks the scaler policy for each action, all resources, and no regional condition.
 The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
 The grant has no regional condition because a score request can name several target regions.
-A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
+A missing deployed policy requires `deploy.py up --workload gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
 The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
@@ -1108,7 +1108,7 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
-The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
+The fixed action requests `deploy.py up --workload gates --approve-resources` on natedev.
 That command updates permissions but does not replace scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
@@ -1245,7 +1245,7 @@ A region filter at the top of the page shows all regions by default; the user as
    One region has no column scale or column box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=merge-gate`.
+6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=gate`.
 
 ### Billed hours check
 
@@ -1459,7 +1459,7 @@ python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
 The user installs the policy and starts the service:
 
 ```sh
-python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py up --workload gates --approve-resources
 python3 scripts/aws_target/deploy.py gpu-size-trial run --trial-folder DIR --approve-resources
 ```
 
@@ -1514,7 +1514,7 @@ It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
 The CPU gate statement remains unchanged.
 
-After deployment, `deploy.py up --workload merge-gates --approve-resources` checks GPU access with the trial scaler profile.
+After deployment, `deploy.py up --workload gates --approve-resources` checks GPU access with the trial scaler profile.
 Setup compares the profile's caller ARN with the stack's scaler user ARN. A mismatch fails setup.
 It reads instances, offerings, Spot prices, and quota in the home region.
 It uses the trial's Cost Explorer reader and probes local credential export.
@@ -1857,7 +1857,7 @@ Phase E adds no stored shape or queue wire field.
 Run the gate setup command on natedev.
 
 ```sh
-python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py up --workload gates --approve-resources
 ```
 
 Approved gate setup removes the old `gate-probe.json` before it can change gate resources.

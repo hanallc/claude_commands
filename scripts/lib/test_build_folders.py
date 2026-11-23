@@ -1856,17 +1856,17 @@ assert not loaded, loaded
                 self.assertEqual(folders.tmpfs_temporary_parent(), expected)
 
     def test_inherited_parent_changes_between_allocations(self) -> None:
-        first = folders.create_build_folder(folders.UniqueBuildFolder("merge-gate-"))
+        first = folders.create_build_folder(folders.UniqueBuildFolder("gate-"))
         other = self.root / "inherited parent with spaces"
         other.mkdir()
         with mock.patch.dict(os.environ, {"TMPDIR": str(other)}):
-            second = folders.create_build_folder(folders.UniqueBuildFolder("merge-gate-"))
+            second = folders.create_build_folder(folders.UniqueBuildFolder("gate-"))
         self.assertEqual(first.parent, self.root)
         self.assertEqual(second.parent, other)
         self.assertTrue(first.is_dir())
         self.assertTrue(second.is_dir())
-        self.assertTrue(first.name.startswith("merge-gate-"))
-        self.assertTrue(second.name.startswith("merge-gate-"))
+        self.assertTrue(first.name.startswith("gate-"))
+        self.assertTrue(second.name.startswith("gate-"))
 
     def test_explicit_parent_overrides_tmpdir_and_keeps_prefix_and_permissions(self) -> None:
         parent = self.root / "record parent with spaces"
@@ -1921,13 +1921,13 @@ assert not loaded, loaded
         missing = self.root / "missing memory filesystem"
         with self.assertRaises(OSError):
             _ = folders.create_build_folder(folders.UniqueBuildFolder(
-                "merge-gate-", folders.ExplicitBuildParent(missing)))
+                "gate-", folders.ExplicitBuildParent(missing)))
         self.assertFalse(missing.exists())
         self.root.chmod(0o500)
         try:
             with self.assertRaises(PermissionError):
                 _ = folders.create_build_folder(folders.UniqueBuildFolder(
-                    "merge-gate-", folders.ExplicitBuildParent(self.root)))
+                    "gate-", folders.ExplicitBuildParent(self.root)))
         finally:
             self.root.chmod(0o700)
         self.assertEqual(list(self.root.iterdir()), [])
@@ -1938,7 +1938,7 @@ assert not loaded, loaded
         with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
-                    "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
+                    "gate-", folders.ExplicitBuildParent(parent))) as name:
                 path = Path(name)
                 self.assertEqual(path.parent, parent)
                 self.assertTrue(path.is_dir())

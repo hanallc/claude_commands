@@ -166,11 +166,11 @@ agent_swap_share_percent=20
 # whole: 0..50
 peak_history_share_percent=10
 # whole: 1..
-peak_hold_seconds.merge-gate=180
+peak_hold_seconds.gate=180
 # whole: 1..
-peak_hold_seconds.targeted-test=180
+peak_hold_seconds.test-affected=180
 # range: 5e-324..1.6742321987285425e299
-program_first_peak_gib.targeted-test=4
+program_first_peak_gib.test-affected=4
 # range: 0..
 progress_profile_sweep_seconds=0.05
 # whole: 1..86400

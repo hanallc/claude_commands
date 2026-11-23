@@ -135,7 +135,7 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
+  ~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py --affected --checkout '{tree}'
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF] [--publish PATH ...]

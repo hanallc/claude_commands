@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
-from scripts.production import gate, land_runs
+from scripts.production import gate
 from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -383,7 +383,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 self.assertEqual(self.pass_records()[-1]["kind"], "full")
 
     @gate_suites("lib", "hooks")
-    def test_merge_gate_runs_all_modules_on_a_small_change(self) -> None:
+    def test_gate_runs_all_modules_on_a_small_change(self) -> None:
         subject, _ = self.prepare_affected_subject()
         first = self.run_gate("--tests-only", "--full")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -495,13 +495,6 @@ class MergeGateLedgerTests(MergeGateFixture):
                                             sorted(self.suites))
         with mock.patch.dict(os.environ, self.environment):
             with mock.patch.dict(os.environ, {"HOME": str(self.state / "default-home")}):
-                old = Path.home() / ".local/state/merge-gate"
-                old.mkdir(parents=True)
-                _ = os.environ.pop("GATE_PASSED_DIR", None)
-                with self.assertRaises(land_runs.GateStateMoveRequired):
-                    _ = ledger.path
-                with self.assertRaises(land_runs.GateStateMoveRequired):
-                    _ = gate.push_record_path(self.checkout, "checkpoint", "fixture")
                 os.environ["GATE_PASSED_DIR"] = str(self.state / "explicit-passes")
                 self.assertEqual(ledger.path, self.state / "explicit-passes/passed-trees.jsonl")
                 self.assertEqual(gate.push_record_path(self.checkout, "checkpoint", "fixture").parent,
@@ -559,7 +552,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(record["tree"], tree)
         self.assertEqual(record["failed_modules"], ["hooks/test_first.py"])
         notice.assert_called_once()
-        self.assertEqual(notice.call_args.args[:2], ("quiet", f"merge-gate-nightly:{tree}"))
+        self.assertEqual(notice.call_args.args[:2], ("quiet", f"gate-nightly:{tree}"))
         message = cast(str, notice.call_args.args[2])
         self.assertIn("hooks/test_first.py", message)
         self.assertNotIn(str(checkout), message)
@@ -665,7 +658,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         send.assert_called_once()
         arguments = send.call_args
         assert arguments is not None
-        self.assertEqual(arguments.args[:2], ("quiet", "merge-gate-nightly:fixture-tree"))
+        self.assertEqual(arguments.args[:2], ("quiet", "gate-nightly:fixture-tree"))
         self.assertIn("hooks/test_first.py", cast(str, arguments.args[2]))
         self.assertIn("could not tell quiet: offline", output.getvalue())
 

@@ -25,10 +25,6 @@ KEPT_RESULTS = 300
 DEFAULT_STATE_DIR = "~/.local/state/gate"
 
 
-class GateStateMoveRequired(Exception):
-    """The default gate state still requires the deploy move."""
-
-
 class LandRecord(TypedDict):
     """A running land; owners[i] is the "unit phase" of commits[i]. An older record has no owners."""
 
@@ -51,15 +47,8 @@ class LandResult(TypedDict):
 
 
 def default_state_dir() -> Path:
-    """Return the default gate state folder after the deploy move."""
-    directory = Path(DEFAULT_STATE_DIR).expanduser()
-    # Chunk 6 removes this guard and the old folder path.
-    old = Path("~/.local/state/merge-gate").expanduser()
-    if os.path.lexists(old) and not os.path.lexists(directory):
-        raise GateStateMoveRequired(
-            "Gate state move required: set /build:hold drain natedev, then run "
-            + "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh")
-    return directory
+    """Return the default gate state folder."""
+    return Path(DEFAULT_STATE_DIR).expanduser()
 
 
 def state_dir() -> Path:

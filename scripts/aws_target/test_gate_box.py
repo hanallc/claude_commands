@@ -163,10 +163,7 @@ subprocess.run = fail_log_put
         self.assertIs(aws_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
-        # The embedded startup hook names merge_gate.py to recognize a gate parent; the guest itself never runs it.
-        startup = repr(inspect.getsource(python_startup))
-        self.assertIn(startup, gate_box.GUEST)
-        self.assertNotIn('merge_gate', gate_box.GUEST.replace(startup, ''))
+        self.assertIn(repr(inspect.getsource(python_startup)), gate_box.GUEST)
         self.assertIn('gate_runner.SelectedModules', gate_box.CANDIDATE_GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
@@ -327,7 +324,7 @@ subprocess.run = fail_log_put
     def test_candidate_accepts_the_new_suite_mode_values(self) -> None:
         for mode in gate.SuiteMode:
             with self.subTest(mode=mode):
-                self.production_boot_stubs(('transient result upload',), mode=mode, wire=False)
+                self.production_boot_stubs(('transient result upload',), mode=mode)
 
     def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
         self.production_boot_stubs(('',), candidate_change='missing')
@@ -342,7 +339,6 @@ with mock.patch.object(gate, 'process_memory_mib'):
     compile(gate_box.GUEST, '<bootstrap>', 'exec')
     startup = repr(inspect.getsource(python_startup))
     assert startup in gate_box.GUEST
-    assert 'merge_gate' not in gate_box.GUEST.replace(startup, '')
     assert 'inspect.getsource' not in gate_box.GUEST
 '''
         reply = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True,
@@ -350,7 +346,7 @@ with mock.patch.object(gate, 'process_memory_mib'):
         self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
 
     def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '',
-                              mode: gate.SuiteMode = gate.SuiteMode.GATE, wire: bool = True) -> None:
+                              mode: gate.SuiteMode = gate.SuiteMode.GATE) -> None:
         stages = ['boot', 'tool preparation', 'tools ready', 'bwrap ready', 'tools checked',
                   'source ready', 'tests start', 'result upload']
         boot_errors = {
@@ -381,7 +377,7 @@ with mock.patch.object(gate, 'process_memory_mib'):
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/gate.py').write_text(
-                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nfrom typing import override\nimport os\n'
+                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nimport os\n'
                     + inspect.getsource(gate.SuiteMode)
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\n'
                     + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
@@ -418,10 +414,9 @@ def run_guest(root, links, result):
     raise subprocess.CalledProcessError(22, ['curl', url])
 ''')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
-                request_mode = mode.wire if wire else mode.value
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
-                    'mode': request_mode,
+                    'mode': mode.value,
                     'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, signal, subprocess, sys
 from urllib.parse import urlsplit
@@ -535,7 +530,7 @@ else:
                     command.chmod(0o700)
                 (tools / 'python3').symlink_to(sys.executable)
                 links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
-                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': request_mode,
+                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': mode.value,
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
                          'source': 'https://fixture.invalid/source/snapshot.bundle',
                          'request': 'https://fixture.invalid/requests/attempt.json',
@@ -693,10 +688,10 @@ else:
         job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
         run = gate.GateRun((job,), 2, 0, coverage=ModuleCoverage.SUBSET)
         affected = gate_box.completion_record(
-            run, "attempt", "commit", "tree", "remote-host", 9, 15, "targeted-test")
+            run, "attempt", "commit", "tree", "remote-host", 9, 15, "test-affected")
         self.assertEqual(affected["selection"], "affected")
         self.assertEqual(affected["step"], "test-affected")
-        for mode in ("targeted-test", "merge-gate"):
+        for mode in ("test-affected", "gate"):
             with self.subTest(mode=mode):
                 record = gate_box.completion_record(
                     run, "attempt", "commit", "tree", "remote-host", 9, 15, mode, split=True)
@@ -708,16 +703,15 @@ else:
             job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
             run = gate.GateRun((job,), 2, 0)
             keys = {"attempt": "attempt", "commit": "commit", "tree": "tree"}
-            guest_record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+            guest_record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "gate")
             self.assertEqual(guest_record["selection"], "full")
-            guest_record["step"] = "merge-gate"
             row: dict[str, object] = {
                 **keys, "host": "remote-host", "verdict": "pass", "gate": gate_box.encode_run(run),
                 "record": guest_record,
             }
             cloud_gate.save(folder / "outcome.json", {"status": "complete", "result": row})
             _ = (folder / "gate.log").write_text("")
-            for mode, split, selection in (("merge-gate", True, "subset"), ("targeted-test", False, "affected")):
+            for mode, split, selection in (("gate", True, "subset"), ("test-affected", False, "affected")):
                 with self.subTest(mode=mode, split=split):
                     request: dict[str, object] = {
                         **keys, "head": "head", "mode": mode, "modules": ["scripts/fixture/test_one.py"], "split": split,

@@ -142,19 +142,19 @@ def failed_tests(output: str) -> frozenset[str]:
     return frozenset(NEXTEST_FAIL.findall(output))
 
 
-# A red module in the merge gate output: `--- accounts/test_accounts.py exit=1 ---`.
+# A red module in the gate output: `--- accounts/test_accounts.py exit=1 ---`.
 GATE_RED = re.compile(r"^--- (\S+) (?:rerun alone )?exit=(-?\d+) ---$", re.MULTILINE)
-# A module that the merge gate passed when it ran the module again alone.
+# A module that the gate passed when it ran the module again alone.
 GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit=", re.MULTILINE)
 
 
-def runs_merge_gate(command: Sequence[str]) -> bool:
-    return any(Path(word).name in {"merge_gate.py", "gate.py"} for word in command)
+def runs_gate(command: Sequence[str]) -> bool:
+    return any(Path(word).name == "gate.py" for word in command)
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
-    """Return the red gate modules of a merge gate command, or the red nextest tests of another command."""
-    if not runs_merge_gate(command):
+    """Return the red gate modules of a gate command, or the red nextest tests of another command."""
+    if not runs_gate(command):
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))
     return frozenset(match[1] for match in GATE_RED.finditer(output) if match[2] != "0") - green
@@ -162,7 +162,7 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
 
 def only_tests(command: list[str], names: frozenset[str]) -> list[str]:
     """Restrict the command to the named gate modules, or tests with verify.sh --filter or nextest -E test(=name)."""
-    if runs_merge_gate(command):
+    if runs_gate(command):
         return [*command, *(word for name in sorted(names) for word in ("--module", name))]
     if any(Path(word).name == "verify.sh" for word in command):
         return [*command, *(word for name in sorted(names) for word in ("--filter", name))]

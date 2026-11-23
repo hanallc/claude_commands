@@ -25,33 +25,15 @@ class LandRunTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root)}))
 
-    def test_default_state_requires_the_folder_move(self) -> None:
-        for label, old_exists, new_exists, explicit in (
-            ("move required", True, False, False),
-            ("explicit state", True, False, True),
-            ("neither folder", False, False, False),
-            ("new folder", True, True, False),
-        ):
+    def test_state_dir_reads_the_selected_folder_or_the_default(self) -> None:
+        for label, explicit in (("explicit state", True), ("default state", False)):
             with self.subTest(state=label), patch.dict(os.environ, {"HOME": str(self.root / label)}):
                 _ = os.environ.pop("GATE_STATE_DIR", None)
-                old = Path.home() / ".local/state/merge-gate"
-                new = Path.home() / ".local/state/gate"
-                if old_exists:
-                    old.mkdir(parents=True)
-                if new_exists:
-                    new.mkdir(parents=True)
                 if explicit:
                     os.environ["GATE_STATE_DIR"] = str(self.root / "selected")
                     self.assertEqual(land_runs.state_dir(), self.root / "selected")
-                elif old_exists and not new_exists:
-                    with self.assertRaises(land_runs.GateStateMoveRequired) as refused:
-                        _ = land_runs.state_dir()
-                    self.assertIn("bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh",
-                                  str(refused.exception))
-                    self.assertIn("/build:hold drain natedev", str(refused.exception))
-                    self.assertFalse(new.exists())
                 else:
-                    self.assertEqual(land_runs.state_dir(), new)
+                    self.assertEqual(land_runs.state_dir(), Path.home() / ".local/state/gate")
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
         self.assertEqual(gate.gate_state_dir(), self.root)

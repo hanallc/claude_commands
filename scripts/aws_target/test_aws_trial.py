@@ -295,7 +295,7 @@ class GuestTests(unittest.TestCase):
                   mock.patch.object(gate, 'gate_reservation', side_effect=AssertionError('admission')),
                   mock.patch.object(gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
                   mock.patch.object(gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
-                  mock.patch.object(gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
+                  mock.patch.object(gate, 'gate_governor_gib', side_effect=AssertionError('governor')),
                   mock.patch.object(gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
                   mock.patch.object(gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
                 previous = Path.cwd()

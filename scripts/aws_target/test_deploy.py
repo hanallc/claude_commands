@@ -4332,7 +4332,7 @@ sys.exit(7)
     def failed_gpu_probe_output(self, operation: str, code: str, *,
                                 fault: str = '', advice: str = 'Check the gate scaler permissions and repeat approved setup.') -> str:
         subject, _commands = self.gate_fixture(probe_faults={fault or operation: code})
-        argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--approve-resources']
+        argv = ['deploy.py', 'up', '--workload', 'gates', '--approve-resources']
         with (mock.patch.object(deploy, 'Deployment', return_value=subject), mock.patch.object(sys, 'argv', argv),
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 1)
@@ -4462,7 +4462,7 @@ sys.exit(7)
 
     def test_gate_setup_rejects_a_scaler_profile_for_another_principal(self) -> None:
         subject, commands = self.gate_fixture(has_gpu_target=False, scaler_arn='fixture-other-principal')
-        argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--approve-resources']
+        argv = ['deploy.py', 'up', '--workload', 'gates', '--approve-resources']
         with (mock.patch.object(deploy, 'Deployment', return_value=subject), mock.patch.object(sys, 'argv', argv),
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 1)

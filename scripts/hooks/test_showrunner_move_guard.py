@@ -53,8 +53,8 @@ class RefusalTest(unittest.TestCase):
         return guard.refusal(command, self.proc)
 
     def test_exit_sent_into_another_pane_is_refused(self) -> None:
-        for command in ("tmux send-keys -t merge-gate:0.0 /exit Enter",
-                        "tmux send-keys -t merge-gate '/exit' Enter && sleep 1",
+        for command in ("tmux send-keys -t gate:0.0 /exit Enter",
+                        "tmux send-keys -t gate '/exit' Enter && sleep 1",
                         "herdr pane send --pane 3 '/exit'"):
             self.assertEqual(self.refused(command), guard.EXIT_REFUSAL, command)
 
@@ -71,7 +71,7 @@ class RefusalTest(unittest.TestCase):
 
     def test_the_skill_path_and_nearby_commands_pass(self) -> None:
         for command in (MOVE,
-                        "tmux send-keys -t merge-gate 'run the gate' Enter",
+                        "tmux send-keys -t gate 'run the gate' Enter",
                         "kill 5151",
                         "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py stop sid",
                         "~/.claude/scripts/lib/py ~/.claude/scripts/agents/shutdown.py resume sid --why 'continue now'",

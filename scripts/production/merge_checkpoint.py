@@ -184,7 +184,7 @@ def end_pushed_worktrees(production: ProductionDocument) -> None:
 
 @contextmanager
 def merge_lock(checkout: Path, name: str) -> Generator[None]:
-    """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
+    """Held for a whole gate. A unit rename takes it before it writes the merge branch, so
     neither lands a commit inside the other's run."""
     common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.returncode:
@@ -193,7 +193,7 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"merge lock: waiting — a merge gate or a unit rename is writing {name}'s merge branch", flush=True)
+            print(f"merge lock: waiting — a gate or a unit rename is writing {name}'s merge branch", flush=True)
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -1455,13 +1455,13 @@ def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
                 finished = subprocess.run([*recorder, "finish-external-wait", "--wait-id", wait_id],
                                           capture_output=True, text=True, check=False)
                 if finished.returncode:
-                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
+                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close gate wait")
             except OSError as error:
                 checkpoint_gate.report("wait", "NotRecorded", str(error))
 
 
 @contextmanager
-def merge_gate_wait(worktree: Path, phase_id: str, unit: str, checkpoint: str) -> Generator[None, None, None]:
+def gate_wait(worktree: Path, phase_id: str, unit: str, checkpoint: str) -> Generator[None, None, None]:
     """Resolve the full checkpoint in durable history, including finished runs."""
     with _external_merge_wait(["start-checkpoint-wait", "--commit", checkpoint,
         "--working-dir", str(worktree), "--phase-id", phase_id, "--unit", unit,
@@ -1763,7 +1763,7 @@ def run(request: MergeRequest, *, push_scope: StandaloneCheckpointPush | Resumed
                 return
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
+                    with gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
                         if isinstance(batch_checkout, ResetBatchCheckout):
                             if not batch_test_started:
                                 batch_log.parent.mkdir(parents=True, exist_ok=True)
@@ -2090,7 +2090,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
                 return
             with ExitStack() as waits:
                 for item in code_items:
-                    _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
+                    _ = waits.enter_context(gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
                 batch_checkout.expected_tip = test_tip
                 tests_green = run_batch_tests(reference, tuple(sorted(test_paths)), requests,

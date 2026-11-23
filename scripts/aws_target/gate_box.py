@@ -805,7 +805,7 @@ def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected
     """Classify a record from the assignment."""
     if split:
         return "subset"
-    return "affected" if SuiteMode.step(mode) == SuiteMode.TARGETED.value else "full"
+    return "affected" if mode == SuiteMode.TARGETED.value else "full"
 
 
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
@@ -828,7 +828,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': SuiteMode.step(mode),
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

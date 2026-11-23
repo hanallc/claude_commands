@@ -42,7 +42,7 @@ class StepNames:
 
 @dataclass(frozen=True)
 class OtherCommand:
-    """The command is not a merge gate, a targeted test or verify.sh."""
+    """The command is not a gate.py or verify.sh command."""
 
 
 OTHER_COMMAND = OtherCommand()
@@ -89,16 +89,10 @@ SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".
                              ".sh", ".ts", ".zsh"})
 VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
-    "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
+    "gate", "integrate", "test-all", "test-modules",
     "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
-QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named", HAND_MADE.step: "hand made"}
-MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
-GATE_PROGRAMS = {
-    "gate": MERGE_GATE_PROGRAMS,
-    "test-affected": (*MERGE_GATE_PROGRAMS, "targeted_test.py"),
-    "merge-gate": MERGE_GATE_PROGRAMS,
-    "targeted-test": ("targeted_test.py",),
-}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named", HAND_MADE.step: "hand made"}
+GATE_PROGRAMS = {"gate": ("gate.py",), "test-affected": ("gate.py",)}
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
 # gate.py exits with this status when the assigned Mac Linux guest took no run.
 # It first writes the claim failure next to the placement file, so its caller can place the gate again.
@@ -256,7 +250,7 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
-    """A merge gate tests every module; a targeted test tests the affected modules unless --full."""
+    """A gate tests every module; an affected test run tests the affected modules unless --full."""
     modules = _count(arguments, "--module")
     if modules:
         return StepJob("test-modules", modules=modules)
@@ -264,17 +258,17 @@ def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
 
 
 def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
-    """Name the job of a merge gate, targeted test or verify.sh command."""
+    """Name the job of a gate.py or verify.sh command."""
     program = parse_command_program(argv)
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
-    if name == "targeted_test.py" or (name in MERGE_GATE_PROGRAMS and "--affected" in arguments):
-        return _test_job(arguments, affected=True)
     if name == "verify.sh":
         return _verify_step(arguments)
-    if name not in MERGE_GATE_PROGRAMS:
+    if name not in GATE_SCRIPTS:
         return OTHER_COMMAND
+    if "--affected" in arguments:
+        return _test_job(arguments, affected=True)
     branch = _option(arguments, "--merge-branch")
     if "--nightly" in arguments:
         return StepJob("test-nightly", branch=branch)

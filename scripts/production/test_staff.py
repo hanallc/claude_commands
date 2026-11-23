@@ -1070,7 +1070,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
-            doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
+            doc=staff.LiveDoc("natedev", self.root / "gate-fixture/production.md"))
         with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
             self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(staff.snapshot().by_id(row.id))
@@ -1086,7 +1086,7 @@ class StaffTests(StaffCommandTestCase):
         primary_file.parent.mkdir(parents=True)
         _ = primary_file.write_bytes(before)
         for field in ("doc", "worktree"):
-            path = Path("/dev/shm/merge-gate-fixture") / field
+            path = Path("/dev/shm/gate-fixture") / field
             with (self.subTest(field=field),
                   mock.patch.dict(os.environ, {"STAFF_FILE": "", "HOME": str(primary_home)}),
                   mock.patch.object(staff, "_file", return_value=primary_file)):
@@ -1165,7 +1165,7 @@ class StaffTests(StaffCommandTestCase):
 
     def test_primary_staff_update_keeps_unchanged_test_root_rows(self) -> None:
         runner = fixture_member("showrunner", name="stray",
-            doc=staff.LiveDoc("natedev", Path("/dev/shm/merge-gate-existing/production.md")))
+            doc=staff.LiveDoc("natedev", Path("/dev/shm/gate-existing/production.md")))
         unrelated = fixture_member("showrunner", name="other", runtime_id="019b3a40-4250-7000-8000-000000000102")
         primary_home = self.root / "primary-home"
         primary_file = primary_home / ".local/state/staff/staff.json"
@@ -1176,7 +1176,7 @@ class StaffTests(StaffCommandTestCase):
             changed = staff.rename(unrelated.id, "renamed")
             self.assertEqual(changed.name, "renamed")
             self.assertEqual(staff.snapshot().by_id(runner.id), runner)
-        self.assertIn("/dev/shm/merge-gate-existing/production.md", primary_file.read_text())
+        self.assertIn("/dev/shm/gate-existing/production.md", primary_file.read_text())
 
     def test_worktree_guard_changes_only_the_recorded_expected_location(self) -> None:
         _, unit, _ = self.tree()

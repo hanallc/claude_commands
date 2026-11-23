@@ -1330,7 +1330,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         source = candidate_source(repo, selected)
         relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
-                               origin_main=source.origin_main, mode=mode.wire, full=full,
+                               origin_main=source.origin_main, mode=mode.value, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,

@@ -19,14 +19,9 @@ from scripts.lib import conf
 from scripts.lib.build_steps import read_step_names
 
 KINDS = ('gate', 'test-affected')
-_MODE_ALIASES = {'merge-gate': 'gate', 'targeted-test': 'test-affected'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
 _NO_RESERVED_HOURS = Decimal(0)
-
-
-def _run_kind(mode: str) -> str:
-    return _MODE_ALIASES.get(mode, mode)
 
 
 @dataclass(frozen=True)
@@ -125,10 +120,8 @@ def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: date
         if not start <= at < end:
             continue
         mode = row.get('mode')
-        if isinstance(mode, str):
-            mode = _run_kind(mode)
         if row.get('result') == 'fallback':
-            fallbacks.append((at, {**row, 'mode': mode} if isinstance(mode, str) else row))
+            fallbacks.append((at, row))
         if 'mode' not in row:
             omitted += 1
         elif row.get('result') == 'finished':
@@ -371,7 +364,7 @@ class RunEvidence:
 
     def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], BoxTimeSource]:
         """Own region box times, else the type's times in all regions, else times of types with its vCPU count."""
-        kinds = dict.fromkeys(map(_run_kind, modes))
+        kinds = dict.fromkeys(modes)
         own = [time for kind in kinds for time in self.by_region.get((size, region, kind), [])]
         if own:
             return own, BoxTimeSource.OWN
@@ -392,7 +385,7 @@ class RunEvidence:
 
         Requests without a mode count only when the modes cover every kind.
         """
-        kinds = tuple(dict.fromkeys(map(_run_kind, modes)))
+        kinds = tuple(dict.fromkeys(modes))
         counted = (*kinds, NO_MODE) if set(KINDS) <= set(kinds) else kinds
         refused = sum(self.refused.get((size, region, mode), 0) for mode in counted)
         launched = sum(self.launched.get((size, region, mode), 0) for mode in counted)
@@ -406,7 +399,7 @@ class RunEvidence:
 
         A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
         seconds, source = self.box_seconds(size, region, modes)
-        seconds = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
+        seconds = seconds or [time for kind in dict.fromkeys(modes) for time in self.by_mode.get(kind, [])]
         box = ((Decimal(median(seconds)) if seconds else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
         # Capacity refusals do not depend on the run kind, so every request counts.
@@ -671,7 +664,7 @@ def _run_evidence(runs: Sequence[FinishedGateRun], rows: Sequence[dict[str, obje
             continue
         result = row.get('result')
         attempts[str(row.get('attempt', ''))].append((at, str(result)))
-        key = str(row.get('instance_type', '')), str(row.get('region') or home), _run_kind(str(row.get('mode', NO_MODE)))
+        key = str(row.get('instance_type', '')), str(row.get('region') or home), str(row.get('mode', NO_MODE))
         if result == 'launched':
             launched[key] += 1
         elif result == 'refused' and row.get('error_code') in ZONE_REFUSALS | QUOTA_REFUSALS:

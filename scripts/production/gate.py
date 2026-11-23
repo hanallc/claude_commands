@@ -418,7 +418,7 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
         os.close(descriptor)
 
 
-def merge_gate_governor_gib() -> float:
+def gate_governor_gib() -> float:
     """Read one memory setting when the gate uses it."""
     try:
         value = conf.read("build_admission").number("merge_gate_governor_gib")
@@ -788,7 +788,7 @@ class NoGateRecovery:
 
 
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
-    "merge_gate_recovery", default=NoGateRecovery())
+    "gate_recovery", default=NoGateRecovery())
 _reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
@@ -1218,7 +1218,7 @@ raise SystemExit(99)
     # A module that a gate box or a timer runs inherits no owner; its queue requests still name one.
     owner = admission_records.named_owner(environment, GATE_MODULE_OWNER)
     return {**environment, **owner, "TMPDIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
-            "MERGE_GATE_MODULE_DIR": str(root),
+            "GATE_MODULE_DIR": str(root),
             "CARGO_TARGET_DIR": cargo, "CARGO_BUILD_BUILD_DIR": cargo,
             "HERDR_BIN": MISSING_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
@@ -1641,8 +1641,8 @@ def _gate_job_parent() -> Path:
 
 
 def gate_test_parent(tmpfs: Path) -> Path:
-    """Return the parent of the merge gate test fixtures."""
-    return tmpfs / "merge-gate-tests"
+    """Return the parent of the gate test fixtures."""
+    return tmpfs / "gate-tests"
 
 
 def report_retained_gate_test_folders(tmpfs: Path) -> None:
@@ -1671,7 +1671,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         max_running_jobs = 1
     if shared:
         recover_gate_runs(repo)
-    governor_gib = merge_gate_governor_gib() if shared else 0.0
+    governor_gib = gate_governor_gib() if shared else 0.0
     try:
         memory_stop_reruns = conf.read("gate").whole("memory_stop_reruns") if shared else 0
     except conf.Unusable as error:
@@ -2142,9 +2142,6 @@ def live_state_refusal(repo: Path, target: str) -> str:
         except (OSError, subprocess.SubprocessError) as error:
             return f"promotion refused: live state check could not export {target}: {error}"
         settings = tree / "config" / "gate.conf"
-        # Chunk 6 removes the old config path.
-        if not settings.exists():
-            settings = tree / "config" / "merge_gate.conf"
         if not settings.exists():
             return ""
         # A target tree from before these checks names none.
@@ -2758,8 +2755,8 @@ def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
         return False
     owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
     minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
-    outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
-        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+    outcome = showrunners.tell(owner, f"gate-nightly-unassigned:{result.id}",
+        f"Nightly gate result {result.id} has no assigned fix after {minutes} minutes: "
         + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
         + f"The user gets the result push only after assignment: gate.py nightly-assigned --result {result.id} --unit UNIT.")
     print(f"Nightly assignment alert: {outcome}", flush=True)
@@ -2975,7 +2972,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
     requires_full = bool(failed) or not type_failures
     try:
         detail = (f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                  + "Every merge gate now requires the full suite until a merge gate passes."
+                  + "Every gate now requires the full suite until a gate passes."
                   if requires_full else "Tests passed. A type failure does not require full test runs.")
         if type_failures:
             lines = [line for job in type_failures for line in job.output.splitlines()]
@@ -2991,8 +2988,8 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
         if result_id:
             detail += f"\nAssign the fix, then run gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
-        outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
-                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
+        outcome = showrunners.tell(owner, f"gate-nightly:{tree}",
+                                   f"Nightly gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
         if outcome == f"told {owner}":
             return NightlyNoticeReceived(datetime.now(UTC).isoformat())
@@ -3579,7 +3576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--body", default="Checkpoint verified by the complete gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")

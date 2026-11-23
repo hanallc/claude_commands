@@ -557,7 +557,7 @@ class GateWorker:
         error_code = launch_error_code(reason)
         now = self.clock()
         row: dict[str, object] = {'time': now, 'attempt': request['attempt'], 'instance_type': size,
-            'vcpus': self.size_vcpus, 'result': result, 'mode': gate.SuiteMode.step(str(request['mode'])), 'region': self.box_region}
+            'vcpus': self.size_vcpus, 'result': result, 'mode': str(request['mode']), 'region': self.box_region}
         if result != 'finished' and self.price_read_evidence:
             row['spot_price_reads'] = self.price_read_evidence
         if result == 'finished':
@@ -692,7 +692,7 @@ class GateWorker:
             else:
                 readings = self.live_spot_prices(variants)
                 live_prices = [price for reading in readings if reading.used for price in reading.prices]
-                variants = self.rank_variants(variants, gate.SuiteMode.step(ledger.text(request, 'mode')), live_prices)
+                variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
                 if not variants:
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                     return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes')
@@ -1051,7 +1051,7 @@ def time_limit_result(request: dict[str, object], text: str, elapsed: float,
     now = time.time()
     record = gate_box.completion_record(run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'),
                                         ledger.text(request, 'tree'), store.host_name(), now - elapsed, now,
-                                        gate.SuiteMode.step(ledger.text(request, 'mode')))
+                                        ledger.text(request, 'mode'))
     record['vcpus'] = vcpus
     record['max_jobs'] = vcpus
     return {'attempt': request['attempt'], 'commit': request['commit'], 'tree': request['tree'],
@@ -1145,8 +1145,6 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
         offset = handle.tell()
         if not _import_already_appended(marker, handle, destination, record_id):
             save(marker, {'id': record_id, 'destination': str(destination), 'offset': offset})
-            # An older box names the step merge-gate or targeted-test.
-            record = {**record, 'step': gate.SuiteMode.step(ledger.text(record, 'step'))}
             run = gate_box.decode_run(row['gate'])
             gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
@@ -1299,7 +1297,7 @@ def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float
     folder.mkdir(parents=True, exist_ok=True)
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.wire, 'modules': modules, 'source_key': '',
+        'mode': mode.value, 'modules': modules, 'source_key': '',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
     return request
@@ -1380,9 +1378,9 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
 def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
     """Read the tested enum without executing code from the tested commit.
 
-    The commit must read the wire value that prepare sends, as a member value or in its _missing_ mapping.
+    The commit must read the value that prepare sends as a member value.
     """
-    for path in ('scripts/production/gate_routes.py', 'scripts/production/gate.py', 'scripts/production/merge_gate.py'):
+    for path in ('scripts/production/gate_routes.py', 'scripts/production/gate.py'):
         source = subprocess.run(['git', 'show', f'{commit}:{path}'], cwd=repo,
                                 capture_output=True, text=True, check=False)
         if source.returncode:
@@ -1394,10 +1392,7 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
         for definition in module.body:
             if isinstance(definition, ast.ClassDef) and definition.name == 'SuiteMode':
                 return any(isinstance(row, (ast.Assign, ast.AnnAssign)) and isinstance(row.value, ast.Constant)
-                           and row.value.value == mode.wire
-                           or isinstance(row, ast.FunctionDef) and row.name == '_missing_'
-                           and any(isinstance(node, ast.Constant) and node.value == mode.wire for node in ast.walk(row))
-                           for row in definition.body)
+                           and row.value.value == mode.value for row in definition.body)
     return False
 
 
@@ -1447,11 +1442,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         require_selected_tree(repo, tree, selected)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
-                                      'mode': mode.wire, 'full': full, 'module_time_limit_s': module_time_limit_s,
+                                      'mode': mode.value, 'full': full, 'module_time_limit_s': module_time_limit_s,
                                       'modules': list(selected.paths) if isinstance(selected, gate.TreeSelection) else 'all',
                                       'selection_tree': selected.tree if isinstance(selected, gate.TreeSelection) else 'all'}
-        if previous.get('mode') == mode.value:
-            previous['mode'] = mode.wire
         same_request = all(previous.get(key) == value for key, value in identity.items())
         book = ledger.CostLedger(directory)
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
@@ -1558,10 +1551,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
                         reservation.status = 0
-                        return LocalFallback(f'The tested commit does not read SuiteMode value {mode.wire!r}')
+                        return LocalFallback(f'The tested commit does not read SuiteMode value {mode.value!r}')
                     if _saved_gate_job(request) != attempt.gate_job:
                         request['gate_job'] = state['gate_job']
-                    request['mode'] = mode.wire
+                    request['mode'] = mode.value
                     request['full'] = full
                     if retry_launch:
                         request['retry_launch'] = retry_launch

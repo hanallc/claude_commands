@@ -34,7 +34,7 @@ from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_RE
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
-from scripts.production import mac_gate_process, gate, targeted_test
+from scripts.production import mac_gate_process, gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -443,7 +443,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual((status, result.returncode), (0, 0), result.output)
         self.assertIn("[]", result.output.splitlines())
 
-    def test_a_merge_gate_ends_the_natedev_reservation_before_its_hold_wait(self) -> None:
+    def test_a_gate_ends_the_natedev_reservation_before_its_hold_wait(self) -> None:
         argv = ["--repo", str(self.checkout), "--merge-branch", "integration", "--unit-branch", "unit-phase",
                 "--checkpoint", "checkpoint", "--previous-checkpoint", "previous", "--unit", "fixture",
                 "--phase", "phase-2"]
@@ -699,7 +699,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 local.assert_not_called()
         self.assertNotIn("falls back", self.output.getvalue())
 
-    def test_merge_gate_cli_reports_the_mac_linux_refusal(self) -> None:
+    def test_gate_cli_reports_the_mac_linux_refusal(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
         assignment = self.gate_assignment("mac-linux")
         path = self.write_gate_assignment(assignment)
@@ -842,7 +842,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIn("Gate placement blocked. the request left the queue", result.stderr)
         guest.assert_called_once()
 
-    def test_merge_gate_cli_reports_failed_mac_linux_jobs(self) -> None:
+    def test_gate_cli_reports_failed_mac_linux_jobs(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
         assignment = self.gate_assignment("mac-linux")
         path = self.write_gate_assignment(assignment)
@@ -868,7 +868,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         local.assert_not_called()
 
     @gate_suites("lib")
-    def test_merge_gate_cli_uses_the_cloud_route_before_natedev_fallback(self) -> None:
+    def test_gate_cli_uses_the_cloud_route_before_natedev_fallback(self) -> None:
         self.exclude_modules(LIB_FIRST)
         script = str(gate.__file__)
         with (mock.patch.object(mac_gate_process, "load_mac_gate_route") as load_mac,
@@ -883,13 +883,13 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(cast(object, self.cloud_route.call_args.kwargs["mode"]), SuiteMode.GATE)
 
     @gate_suites("lib")
-    def test_targeted_test_cli_sends_the_whole_selection_to_the_cloud(self) -> None:
+    def test_affected_cli_sends_the_whole_selection_to_the_cloud(self) -> None:
         self.exclude_modules(LIB_FIRST)
         jobs = (gate.GateJobResult("lib", "test_first.py", 0, 1, ""),
                 gate.GateJobResult("lib", "test_second.py", 0, 1, ""))
         self.cloud_route.return_value = gate.GateRun(jobs, 1, 0)
         with mock.patch.object(gate, "run_suites") as local:
-            status = targeted_test.main(["--repo", str(self.checkout)])
+            status = gate.main(["--affected", "--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())
         self.assert_targeted_cloud_selection(LIB_FIRST, LIB_SECOND, gate_job=StepJob("test-affected"))
         local.assert_not_called()

@@ -502,7 +502,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         gate: dict[str, object] = {
             "event_type": "pass_started", "phase_instance_id": "instance-a",
             "pass_instance_id": "overlapping-gate", "pass_kind": "fix", "fix_pass": 99,
-            "pass_activity": "run the merge gate", "pass_started_at": 1_110, "timestamp_epoch": 1_110,
+            "pass_activity": "run the gate", "pass_started_at": 1_110, "timestamp_epoch": 1_110,
         }
         records.extend([gate, {**gate, "event_type": "pass_finished", "status": "completed",
                                "timestamp_epoch": 1_240, "pass_elapsed_seconds": 130}])
@@ -526,7 +526,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         _ = self.open_finding("blocker", "retry fails")
         self.close_round(["F001"], verdict="still_open")
         with self.history_file.open("a", encoding="utf-8") as stream:
-            for number, activity in ((2, "run the merge gate"), (3, "relaunch the repair after a launcher fault")):
+            for number, activity in ((2, "run the gate"), (3, "relaunch the repair after a launcher fault")):
                 started = 1_200 + number * 20
                 event: dict[str, object] = {
                     "event_type": "pass_started", "phase_instance_id": "instance-a",

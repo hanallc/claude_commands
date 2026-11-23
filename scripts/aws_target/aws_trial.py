@@ -176,7 +176,7 @@ def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> N
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:
     return {'task': 'paired', 'attempt': attempt, 'base': asdict(trial.base), 'changed': asdict(trial.changed),
             'commit': trial.changed.commit, 'tree': trial.changed.tree, 'head': trial.changed.commit,
-            'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
+            'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'test-affected',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
             'expires': expires, 'gate_job': snapshot_codec.snapshot_value(PAIRED_TRIAL_JOB),
             'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),

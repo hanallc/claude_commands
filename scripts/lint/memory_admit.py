@@ -193,13 +193,13 @@ GATE_TESTS = "tests"
 GATE_TYPES = "types"
 
 
-def merge_gate_shape(argv: Sequence[str]) -> str:
+def gate_shape(argv: Sequence[str]) -> str:
     """Separate type-check profiles from test-only profiles."""
     return GATE_TYPES if "--type-dirs" in argv else GATE_TESTS
 
 
 PROC = Path("/proc")
-# These cargo subcommands compile; arbitrary programs and merge gates run.
+# These cargo subcommands compile; arbitrary programs and gates run.
 
 
 HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom]] = {

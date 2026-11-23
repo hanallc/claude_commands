@@ -1,4 +1,4 @@
-"""The line of checkpoint lands that wait for the merge gate.
+"""The line of checkpoint lands that wait for the gate.
 
 The land runner takes each item with `next`, in order. Each item has a label, which is the runner's own
 line, and the commits it lands: the third field of each line of its batch file, and each `--commit`.

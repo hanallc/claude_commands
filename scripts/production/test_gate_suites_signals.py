@@ -88,7 +88,7 @@ class GateProcessStateTests(unittest.TestCase):
         directory.mkdir()
         recovery = gate.GateRecovery(directory / "dead.json", str(root), 424242, "fixture")
         for location in (home, home / "rust", home / "worktrees", home / ".claude", root / "gate"):
-            folder = location / "merge-gate-fixture"
+            folder = location / "gate-fixture"
             folder.mkdir(parents=True)
             _ = (folder / "keep").write_text("fixture data")
             recovery.folders.append(str(folder))
@@ -183,7 +183,7 @@ class GateProcessStateTests(unittest.TestCase):
 @final
 class MergeGateSignalsTests(GateSuitesFixture):
     def abandoned_gate(self, recovery: gate.GateRecovery) -> Path:
-        folder = self.root / "gate" / "merge-gate-abandoned"
+        folder = self.root / "gate" / "gate-abandoned"
         folder.mkdir(parents=True, exist_ok=True)
         self.write(folder / "module-output", "unfinished")
         recovery.folders.append(str(folder))
@@ -383,7 +383,7 @@ gate.run_suites(Path.cwd(), full=True)
         parent.mkdir()
         with mock.patch.dict(os.environ, self.environment, clear=True):
             with gate.private_gate_recovery(self.checkout, parent) as recovery:
-                with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
+                with gate.gate_temporary(recovery, "gate", parent) as folder:
                     self.assertTrue(folder.is_dir())
                     self.assertEqual(recovery.folders, [str(folder)])
                     self.assertEqual(build_folders.build_folder_state(folder), "held")
@@ -403,7 +403,7 @@ gate.run_suites(Path.cwd(), full=True)
                     with (recovery_scope as recovery,
                           mock.patch.object(build_folders, "remove_build_folder", return_value=False) as remove,
                           redirect_stderr(io.StringIO()) as report):
-                        with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
+                        with gate.gate_temporary(recovery, "gate", parent) as folder:
                             self.assertTrue(folder.is_dir())
                     remove.assert_called_once()
                     self.assertTrue(folder.is_dir())
@@ -425,7 +425,7 @@ gate.run_suites(Path.cwd(), full=True)
                       redirect_stderr(io.StringIO()) as report,
                       gate.private_gate_recovery(self.checkout, parent) as recovery,
                       ExitStack() as cleanup):
-                    folder = cleanup.enter_context(gate.gate_temporary(recovery, "merge-gate", parent))
+                    folder = cleanup.enter_context(gate.gate_temporary(recovery, "gate", parent))
                     blocked = folder.with_name(folder.name + suffix)
                     self.assertTrue(blocked.is_file())
 

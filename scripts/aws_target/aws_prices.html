@@ -179,13 +179,11 @@ const SVG = "http://www.w3.org/2000/svg";
 const SHOW = [["spot", "Spot price", "Spot", "USD/h"], ["cost", costViewLabel(), "Gate", "USD"],
               ["quota", "Quota", "Fit", "boxes"]];
 const TYPES = [["standard", "Standard"], ["gpu", "GPU"]];
-const RUN_SCOPE_ALIASES = new Map([["merge-gate", "gate"], ["targeted-test", "test-affected"]]);
 const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
 const measures = new Set(query.has("show") ? query.get("show").split(",") : SHOW.map(([key]) => key));
 let types = query.get("types") === "gpu" ? "gpu" : "standard";
-const savedScope = query.get("runs");
-let scope = RUN_SCOPE_ALIASES.get(savedScope) ?? savedScope;
+let scope = query.get("runs");
 
 function element(tag, text, className) {
   const node = document.createElement(tag);

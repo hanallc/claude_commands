@@ -506,7 +506,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
         tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
 
-GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload merge-gates --approve-resources'
+GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload gates --approve-resources'
 GPU_SELECTION_REQUIRED = 'This target requires a configured Hana package and integration test'
 
 

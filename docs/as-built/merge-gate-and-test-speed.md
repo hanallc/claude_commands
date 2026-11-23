@@ -218,7 +218,7 @@ A user systemd service uses the scaler profile and removes inherited AWS key, pr
 The user alone runs the administrator deployment command:
 
 ```sh
-python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py up --workload gates --approve-resources
 ```
 
 The existing Rust foundation stack must exist first.
@@ -339,7 +339,6 @@ It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
 `python3 -m scripts.production.gate` accepts the same options.
-The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
@@ -415,10 +414,9 @@ Cleanup stops the confirmed groups and removes the journal, even when the tempor
 The receipt stays with a retained checkout.
 See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
-### Targeted tests: `scripts/production/targeted_test.py`
+### Targeted tests: `gate.py --affected`
 
-The entry has its own parser and description.
-It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
+The mode uses the parser, suite arguments, signal wrapper, copy lock, and suite runner of `gate.py`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
@@ -437,7 +435,7 @@ A dirty checkout writes up to 50 `dirty_paths` and the total `dirty_path_count`.
 The runner prints the path count.
 This record changes no selection and refuses no run.
 
-### The gate: `scripts/production/merge_gate.py`
+### The gate: `scripts/production/gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
@@ -557,7 +555,7 @@ A selection of zero modules passes.
 Affected passes record `kind: affected` and never replace the full base.
 Types, admission, isolated reruns, and later merge checks keep their existing behavior.
 
-**Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
+**Nightly.** `gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
@@ -573,7 +571,7 @@ The gate reads `nightly_result_push` and `nightly_result_modules` from `config/g
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
 `nightly_result_modules=8` limits the failed test modules named before `and N more`.
 A push failure does not change the gate result, marker or showrunner notice.
-A run that never reaches merge_gate.py sends no push unless the timer script sends one.
+A run that never reaches gate.py sends no push unless the timer script sends one.
 The checkout retains its ignored build files and holds the copies busy lock during the run.
 The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
@@ -606,7 +604,7 @@ The record holds the branch, tree, finish time, failure lines, receipt time, ass
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 When a result needs manual assignment, the notice names the failed test files and includes the result ID.
-After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
+After assignment, run `gate.py nightly-assigned --result ID --unit UNIT`.
 The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
@@ -618,10 +616,10 @@ Both automatic and manual assignment send a user push.
 The push names the assignee when the receipt is confirmed.
 If automatic assignment has no confirmed receipt, the push shows the nightly result without a receipt time.
 An unassigned red result never sends a user push.
-`merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
+`gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
 The alert repeats once in each later deadline window until the fix is assigned.
 `nightly_assign_minutes=30` sets that window in `config/gate.conf`.
-The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
+The alert uses the key `gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
 A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
@@ -638,7 +636,7 @@ Without a calling session, the gate finds the registered production for the merg
 `--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 
-**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.MERGE_GATE, machine=SharedMachine()) -> GateRun`):
+**Suite runner** (`run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, *, source="tests-only", full=False, mode=SuiteMode.GATE, machine=SharedMachine()) -> GateRun`):
 
 `SharedMachine` is the default and keeps the existing shared scheduling behavior.
 `HoldExemptNamedModuleMachine` uses shared scheduling and skips the build hold.
@@ -1004,7 +1002,7 @@ New files can be selected.
 `copies.standing` supplies an isolated checkout of `origin/main`.
 The command applies the patch with `git apply --3way`.
 It runs the direct tests for changed Python files and imports each changed module.
-The check uses `merge_gate.test_module_environment` and its tripwires.
+The check uses `gate.test_module_environment` and its tripwires.
 An empty helper module can pass discovery; a failed package import cannot.
 The fast check uses no full merge gate or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
@@ -1126,7 +1124,7 @@ The cloud guest bootstrap supplies its own root after a fresh clone.
 Blender uses its own interpreter and sets `PYTHONPATH` explicitly.
 
 `update_registration.state_block` imports `merged_checkpoints` in its body.
-This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
+This keeps `scripts.production.merge_checkpoint` and `scripts.production.gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.
 
 **Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-<major>.<minor>`. The key uses the version floor from `lib/py`, currently `python3-3.12`. Worker fixtures set `XDG_CACHE_HOME` for each temporary HOME. They write `sys.executable` into that cache file. They unset `CLAUDE_PYTHON`, which bypasses the cache. This avoids Python resolution for roughly 19 helper launches per `verify.sh`, `review.sh`, or `assign.sh` run.
 
@@ -1144,7 +1142,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
-| `GATE_STATE_DIR`, `GATE_PYTHON`, `GATE_BASEDPYRIGHT`, `GATE_UV` | `merge_gate.py` | `~/.local/state/gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
+| `GATE_STATE_DIR`, `GATE_PYTHON`, `GATE_BASEDPYRIGHT`, `GATE_UV` | `gate.py` | `~/.local/state/gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.
 Tests use a private `STAFF_FILE` and private run folders.
@@ -1414,7 +1412,7 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
 
 The merge gate owns each module folder through a `tool_folder` context.
-The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
+The gate passes the absolute path of the module folder in `GATE_MODULE_DIR`.
 The runner puts its config-read log, scratch root, and review root inside that folder.
 Before test discovery, the runner guards the real home’s `.claude/config` against Python writes.
 Python child processes inherit the guard through a temporary startup hook.

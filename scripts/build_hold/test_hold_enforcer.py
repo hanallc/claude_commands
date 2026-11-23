@@ -412,8 +412,8 @@ class HoldEnforcerTests(unittest.TestCase):
         member = fixture_member("producer", name="holder")
         _ = (self.holders / "holder").rename(self.holders / member.id)
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"))
-        _ = self.process(11, "python3", parent=10, argv=("python3", "targeted_test.py"))
-        _ = self.process(20, "python3", argv=("python3", "merge_gate.py"))
+        _ = self.process(11, "python3", parent=10, argv=("python3", "gate.py", "--affected"))
+        _ = self.process(20, "python3", argv=("python3", "gate.py"))
         _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
         _ = self.process(30, "Runner.Worker")
         _ = self.process(40, "custom-build")
@@ -911,8 +911,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIn("usage:", errors.getvalue())
 
     def test_drain_classifies_gate_entry_points_and_work_evidence(self) -> None:
-        entries = (("bash", "verify.sh", "check"), ("python3", "merge_gate.py", "--tests-only"),
-                   ("python3", "targeted_test.py"))
+        entries = (("bash", "verify.sh", "check"), ("python3", "gate.py", "--tests-only"),
+                   ("python3", "gate.py", "--affected"))
         for argv in entries:
             with self.subTest(entry=argv):
                 _ = self.process(10, argv[0], argv=argv, session="gate-owner")
@@ -1964,8 +1964,8 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(decisions[21].process.cwd, "/dev/shm/mac-idle-suite-123/tmp456")
         self.assertEqual(decisions[40].owner, OwningSession("detached-session"))
 
-    def test_waiting_merge_gate_and_verify_survive_while_their_build_children_stop(self) -> None:
-        _ = self.process(30, "python3", argv=("python3", "merge_gate.py", "--checkout", "/tree", "--tests-only"), session="gate")
+    def test_waiting_gate_and_verify_survive_while_their_build_children_stop(self) -> None:
+        _ = self.process(30, "python3", argv=("python3", "gate.py", "--checkout", "/tree", "--tests-only"), session="gate")
         _ = self.process(20, "python3", parent=30, start=11_001, argv=("python3", "-m", "unittest", "suite"))
         _ = self.process(10, "rustc", parent=20, start=11_002)
         _ = self.process(21, "basedpyright", parent=30, start=11_001, argv=("basedpyright", "src"))
@@ -1984,26 +1984,24 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual({row["pid"] for row in self.rows()}, {20, 21, 41})
         self.assertTrue(all(row["action"] == "stopped" for row in self.rows()))
 
-    def test_merge_gate_entry_points_wait_but_mentions_do_not_protect_tests(self) -> None:
+    def test_gate_entry_points_wait_but_mentions_do_not_protect_tests(self) -> None:
         for name in ("cloud_gate.py", "gate_box.py"):
             with self.subTest(name=name):
                 _ = self.process(30, "python3", argv=("python3", f"/tree/{name}"), session="other")
                 self.assertEqual(self.decisions(), ())
         for argv in (
-            ("/tree/merge_gate.py", "--tests-only"),
             ("/tree/gate.py", "--tests-only"),
             ("python3", "-u", "/tree/gate.py", "--affected"),
             ("python3", "-m", "scripts.production.gate", "--tests-only"),
-            ("python3", "-u", "/tree/merge_gate.py", "--promote-only"),
-            ("python3", "-m", "scripts.production.merge_gate", "--tests-only"),
+            ("python3", "-u", "/tree/gate.py", "--promote-only"),
         ):
             with self.subTest(argv=argv):
                 _ = self.process(30, "python3", argv=argv, session="other")
                 decision, = self.decisions()
                 self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
         for argv in (
-            ("python3", "-m", "unittest", "merge_gate.py"),
-            ("python3", "/tree/test_driver.py", "merge_gate.py"),
+            ("python3", "-m", "unittest", "gate.py"),
+            ("python3", "/tree/test_driver.py", "gate.py"),
         ):
             with self.subTest(argv=argv):
                 _ = self.process(30, "python3", argv=argv, session="other")

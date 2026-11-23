@@ -22,7 +22,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 REPO = Path(__file__).resolve().parents[2]
 MODULE_RUN = REPO / "scripts/test_times/module_run.py"
 CASE_LIMIT = 2
-LIMIT_LINE = f"stopped at the {CASE_LIMIT}-second direct test limit; run longer tests with targeted_test.py --module"
+LIMIT_LINE = f"stopped at the {CASE_LIMIT}-second direct test limit; run longer tests with gate.py --affected --module"
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"
 LIMIT_FIXTURE = STANDALONE_TEST_STARTUP + """
@@ -217,8 +217,7 @@ unittest.TextTestRunner().run(case)
         home = self.root / "installed-home"
         production = home / ".claude/scripts/production"
         production.mkdir(parents=True)
-        for name, expected in (("gate.py", True), ("merge_gate.py", True), ("targeted_test.py", True),
-                               ("merge_checkpoint.py", True), ("other_tool.py", False)):
+        for name, expected in (("gate.py", True), ("merge_checkpoint.py", True), ("other_tool.py", False)):
             entry = production / name
             _ = entry.write_text("import sys\nsys.stdin.read()\n")
             with self.subTest(entry=name):

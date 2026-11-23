@@ -360,7 +360,7 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
                 late_main = route == "resumed after gate"
                 if late_main:
                     _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
-                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 if fault == "origin and result writes fail":
@@ -1053,7 +1053,7 @@ raise SystemExit(1)
                 self.bind_fixture(self.root)
                 self.promotions = str(self.promote)
                 self.production_doc()
-                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 start = self.git("rev-parse", "HEAD")
@@ -1283,7 +1283,7 @@ raise SystemExit(1)
                 self.bind_fixture(self.root)
                 alpha = self.checkpoint()
                 beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
-                self.env["GATE_STATE_DIR"] = str(self.root / "merge-gate")
+                self.env["GATE_STATE_DIR"] = str(self.root / "gate")
                 with patch.dict("os.environ", self.env):
                     results = land_runs.results_path()
                 alpha_row = self.batch_line("alpha", "2", alpha)

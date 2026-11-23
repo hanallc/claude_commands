@@ -88,7 +88,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         arguments = notice.call_args
         assert arguments is not None
         tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
-        self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"merge-gate-nightly:{tree}"))
+        self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"gate-nightly:{tree}"))
         message = cast(str, arguments.args[2])
         self.assertIn(failing_file, message)
         self.assertNotIn("requires the full suite", message)
@@ -557,7 +557,7 @@ class NightlyPushTests(unittest.TestCase):
                             herdr_upkeep.upkeep()
                         sent.assert_not_called()
                         self.assertEqual(notice.call_count, 2)
-                        self.assertEqual(notice.call_args.args[1], f"merge-gate-nightly-unassigned:{record_path.stem}")
+                        self.assertEqual(notice.call_args.args[1], f"gate-nightly-unassigned:{record_path.stem}")
                     if route == "assignment race":
                         def racing_check(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                             del options
@@ -653,7 +653,7 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertEqual(alerts.call_count, expected, f"minute {minutes}")
             owner, key, text = cast(tuple[str, str, str], alerts.call_args.args)
             self.assertEqual(owner, "sdlc")
-            self.assertEqual(key, f"merge-gate-nightly-unassigned:{record_path.stem}")
+            self.assertEqual(key, f"gate-nightly-unassigned:{record_path.stem}")
             self.assertIn(f"nightly-assigned --result {record_path.stem} --unit UNIT", text)
             self.assertIn("production/test_staff.py", text)
             alerts.return_value = "could not tell sdlc: offline"

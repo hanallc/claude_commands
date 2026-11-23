@@ -4904,7 +4904,7 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertEqual(grant.need, 100 * GIB)
             self.assertEqual(set(fixture.server.reservations), {request.episode})
 
-    def test_the_1222_mend_head_starts_before_three_merge_gates(self) -> None:
+    def test_the_1222_mend_head_starts_before_three_gates(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.hold_starts()
             mend = fixture.request(need=int(7.3 * GIB), step="mend")
@@ -5305,7 +5305,7 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
 class ServiceTests(unittest.TestCase):
 
-    def test_merge_gate_keeps_the_explicit_unit_from_another_director(self) -> None:
+    def test_gate_keeps_the_explicit_unit_from_another_director(self) -> None:
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "fixture", staff.StaffRoot(),
                                 current_session=staff.StaffId("runner-session"))
         units = tuple(staff.StaffRow(staff.StaffId(f"director-{name}"), "unit", name, staff.ReportsTo(runner.id),
@@ -9171,7 +9171,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
         for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
             with self.subTest(name=name):
                 self.assertEqual(name in service.ADMISSION_CALLERS, expected)
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()

@@ -390,7 +390,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=merge gate\n"
+            + "names.gate=gate\n"
             + "owned.default={unit} {step}\n"
             + "owned.test-affected={unit} {step}\n"
             + "owned.ci-default=CI {step}\n"
@@ -551,7 +551,7 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
             job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.FixedExclusion("not enabled"))))
         reading = replace(base, view=replace(base.view, running=(step,)))
-        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
         other = replace(build, pid=8203, gate_placement="episode/other-attempt")
         mac = queue_view.MacBuildReading(now, (build, other))
@@ -585,7 +585,7 @@ class MemoryFeedTests(unittest.TestCase):
             0, 0, 0, owner=str(step.pid)) for step in running)
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "merge gate", "claude_commands",
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
         mac = queue_view.MacBuildReading(now, (native,))
         with (mock.patch.object(admission_client, "view", return_value=reading),
@@ -792,7 +792,7 @@ process.stdout.write(JSON.stringify({
             self.assertTrue(row["name"].startswith("solo: "))
 
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
-        gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
+        gate_command = ["python3", "/repo/scripts/production/gate.py", "--merge-branch", "sdlc"]
         cases = (
             (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
             (["--tests-only", "--full"], StepJob("test-all", branch="")),
@@ -816,10 +816,8 @@ process.stdout.write(JSON.stringify({
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
-            (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
-            (["py", "targeted_test.py", "--full"], StepJob("test-all")),
-            (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
-            (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-X", "dev", "/repo/scripts/production/gate.py", "--affected"], StepJob("test-affected")),
+            (["py", "gate.py", "--affected", "--full"], StepJob("test-all")),
             (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
              StepJob("integrate", unit="handler", branch="sdlc")),
             (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
@@ -842,19 +840,17 @@ process.stdout.write(JSON.stringify({
             (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
             (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
              StepJob("test-modules", modules=1)),
-            (["merge_gate.py", "--affected"], StepJob("test-affected")),
             (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
             (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
-            (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-cpass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-Bc", "pass", "merge_gate.py"], OTHER_COMMAND),
-            (["python3", "-", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-cpass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-Bc", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "-", "gate.py"], OTHER_COMMAND),
             (["bash", "-c", "true", "verify.sh"], OTHER_COMMAND),
-            (["python3", "-Xdev", "-mscripts.production.merge_gate", "--nightly"], StepJob("test-nightly")),
-            (["python3", "-u", "-W", "ignore", "merge_gate.py", "--tests-only", "--full"], StepJob("test-all")),
-            (["python3", "tool.py", "merge_gate.py"], OTHER_COMMAND),
+            (["python3", "-Xdev", "-mscripts.production.gate", "--nightly"], StepJob("test-nightly")),
+            (["python3", "-u", "-W", "ignore", "gate.py", "--tests-only", "--full"], StepJob("test-all")),
+            (["python3", "tool.py", "gate.py"], OTHER_COMMAND),
             (["cargo", "build"], OTHER_COMMAND),
         ):
             with self.subTest(command=command):
@@ -1917,7 +1913,7 @@ process.stdout.write(JSON.stringify({
             for legacy in (False, True):
                 for continuation in (False, True):
                     with self.subTest(caller=caller, member=member, legacy=legacy, continuation=continuation):
-                        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+                        facts = admission_records.EndedStepFacts("gate", admission_records.PackageNotRecorded(),
                                                                  absent, absent, member)
                         held = admission_records.BetweenStepsSlot(run, "finished", admission_records.GIB,
                                                                   inputs.now + 10, facts)
@@ -1931,7 +1927,7 @@ process.stdout.write(JSON.stringify({
                             encoded = cast(dict[str, object], encoded["slot"])
                         identity = cast(dict[str, object], encoded["identity"])
                         if legacy:
-                            identity.update(kind="EndedStepIdentity", source="step", name="merge-gate")
+                            identity.update(kind="EndedStepIdentity", source="step", name="gate")
                         _ = identity.pop("caller_name", None)
                         if caller is not None:
                             identity["caller_name"] = caller
@@ -2239,8 +2235,8 @@ process.stdout.write(JSON.stringify({
         accepted = re.search(r'^case "\$CMD" in\n    ([\w|-]+)\) ;;', script.read_text(), re.MULTILINE)
         assert accepted is not None
         verbs = set(accepted[1].split("|"))
-        jobs = (("merge_gate.py",), ("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
-                ("merge_gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
+        jobs = (("gate.py",), ("gate.py", "--tests-only"), ("gate.py", "--nightly"),
+                ("gate.py", "--promote-only"), ("gate.py", "--affected"), ("gate.py", "--affected", "--module", "test_sample"))
         recorded_jobs: list[str] = []
         for command in jobs:
             job = command_job(command)
@@ -3027,24 +3023,24 @@ process.stdout.write(JSON.stringify({
             return memory_feed.reading()
 
     def test_unreadable_gate_rows_strip_the_showrunner_prefix_on_local_and_cloud_rows(self) -> None:
-        merge_staff = unit_labels.make_labels("sdlc-merge-gate", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
-                                             unit_labels.DirectsUnit("sdlc-merge-gate"))
+        merge_staff = unit_labels.make_labels("sdlc-lander", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                             unit_labels.DirectsUnit("sdlc-lander"))
         page = self.gate_job_page("gate", (), owner=merge_staff)
         rows = [*(row for row in page["walk"] if row.get("queued") or row.get("kind") == "cloud"),
                 *(row for row in page["waiters"] if row.get("kind") in (None, "cloud"))]
         self.assertEqual(len(rows), 4)
         for row in rows:
             with self.subTest(pid=row["pid"]):
-                self.assertEqual(row["name"], "merge-gate")
-                self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), "merge-gate")
+                self.assertEqual(row["name"], "lander")
+                self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), "lander")
 
     def test_gate_modes_and_jobs_show_approved_names_on_local_and_cloud_rows(self) -> None:
         approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
                     "promote", "CI", "toolchain trial"}
         modes = {mode.value for mode in SuiteMode}
-        self.assertEqual(modes | {"merge-gate", "targeted-test"}, memory_feed.GATE_STEPS)
+        self.assertEqual(modes, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
-            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
+            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED.value else (
                 ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
@@ -3071,16 +3067,14 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) and about else "")
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
-                  "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
-        for step in ("gate", "merge-gate"):
-            with self.subTest(step=step):
-                page = self.gate_job_page(step, copied)
-                local, = [row for row in page["walk"] if row.get("queued")]
-                waiting, = [row for row in page["waiters"] if not row.get("kind")]
-                for row in (local, waiting):
-                    self.assertIn(row["title"]["step"], approved)
-                    self.assertEqual(row["name"], "devtools: test all")
-                    self.assertEqual(row.get("about"), "Runs every test module")
+                  "python3", "/repo/scripts/production/gate.py", "--tests-only", "--full")
+        page = self.gate_job_page("gate", copied)
+        local, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = [row for row in page["waiters"] if not row.get("kind")]
+        for row in (local, waiting):
+            self.assertIn(row["title"]["step"], approved)
+            self.assertEqual(row["name"], "devtools: test all")
+            self.assertEqual(row.get("about"), "Runs every test module")
 
         page = self.gate_job_page("gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
@@ -3351,8 +3345,8 @@ process.stdout.write(JSON.stringify({
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        merge_staff = unit_labels.make_labels("sdlc-merge-gate", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
-                                             unit_labels.DirectsUnit("sdlc-merge-gate"))
+        merge_staff = unit_labels.make_labels("sdlc-lander", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                             unit_labels.DirectsUnit("sdlc-lander"))
         unit_worker = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                               unit_labels.UnderDirector("panes", "panes", ""))
         runner_worker = unit_labels.make_labels("land", unit_labels.UnderShowrunner("builds", "builds", ""),
@@ -3364,7 +3358,7 @@ process.stdout.write(JSON.stringify({
             ("literal{step}", director, "panes: literal{step}"),
             ("gate", runner, "builds"),
             ("gate", director, "panes"),
-            ("gate", merge_staff, "merge-gate"),
+            ("gate", merge_staff, "lander"),
             ("gate", unit_worker, "panes"),
             ("gate", runner_worker, "builds"),
             ("test-affected", unknown, "unknown"),

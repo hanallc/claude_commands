@@ -4616,7 +4616,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
         second: admission_records.Reservation = {**first, "filters": list(reversed(first["filters"]))}
         self.assertEqual(gate.reservation_profile_key(first, "host"), gate.reservation_profile_key(second, "host"))
 
-    def test_a_late_merge_gate_profile_lowers_only_the_remaining_keep_aside(self) -> None:
+    def test_a_late_gate_profile_lowers_only_the_remaining_keep_aside(self) -> None:
         row = self.reservation("gate", need=4 * GIB)
         reading = admission_records.MeasuredMemory(9 * GIB, swap_bytes=5 * GIB,
             anonymous=admission_records.AnonymousRunUse(GIB))
@@ -4647,9 +4647,9 @@ class ProgressKeepAsideTests(unittest.TestCase):
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
         first = self.reservation("gate")
-        first["shape"] = gate.merge_gate_shape(["gate"])
+        first["shape"] = gate.gate_shape(["gate"])
         second: admission_records.Reservation = {**first, "worktree": "/another/gate"}
-        nightly: admission_records.Reservation = {**second, "shape": gate.merge_gate_shape(["gate", "--type-dirs", "scripts"])}
+        nightly: admission_records.Reservation = {**second, "shape": gate.gate_shape(["gate", "--type-dirs", "scripts"])}
 
         self.assertEqual(gate.reservation_profile_key(first, "host"),
                          gate.reservation_profile_key(second, "host"))
@@ -5086,7 +5086,7 @@ class ProcessRunUseTests(unittest.TestCase):
         self.assertEqual(place.peak_bytes, 6 * GIB)
         self.assertEqual(int(path.with_suffix(".max").read_text()), 6 * GIB)
 
-    def test_merge_gate_context_holder_without_a_scope_gets_a_cap_value(self) -> None:
+    def test_gate_context_holder_without_a_scope_gets_a_cap_value(self) -> None:
         from scripts.build_queue.queue_place import queue_place
 
         self.fixture.configure(**{"program_first_peak_gib.gate": 6})
@@ -6080,7 +6080,7 @@ class StrictTargetLineTests(unittest.TestCase):
     def test_zero_need_switch(self) -> None:
         for bypass in (False, True):
             with self.subTest(bypass=bypass), patch.object(gate, "ZERO_NEED_MAY_PASS", bypass, create=True):
-                rows = self.plan(self.waiter(1, 13.9), self.waiter(2, 0, step="merge-gate"))
+                rows = self.plan(self.waiter(1, 13.9), self.waiter(2, 0, step="gate"))
                 if bypass:
                     self.assertIsInstance(rows[1].admission, gate.ProposedAdmission)
                 else:

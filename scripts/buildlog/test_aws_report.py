@@ -302,12 +302,12 @@ class AwsReportTests(MeasurementFixture):
         for attempt, size, mode, at, box_s, gate_s in (
             ('merge-m', 'm7a.8xlarge', 'gate', MIDNIGHT - 3600, 100, 60),
             ('target-m', 'm7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 200, 30),
-            ('merge-c', 'c7a.8xlarge', 'merge-gate', MIDNIGHT - 3600, 300, 180),
-            ('target-c', 'c7a.8xlarge', 'targeted-test', MIDNIGHT - 3600, 100, 90),
-            ('unbilled-m', 'm7a.8xlarge', 'merge-gate', NOW, 600, 120),
-            ('unbilled-c', 'c7a.8xlarge', 'targeted-test', NOW, 400, 150),
-            ('old', 'old.8xlarge', 'merge-gate', MIDNIGHT - 86401, 100, 90),
-            ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
+            ('merge-c', 'c7a.8xlarge', 'gate', MIDNIGHT - 3600, 300, 180),
+            ('target-c', 'c7a.8xlarge', 'test-affected', MIDNIGHT - 3600, 100, 90),
+            ('unbilled-m', 'm7a.8xlarge', 'gate', NOW, 600, 120),
+            ('unbilled-c', 'c7a.8xlarge', 'test-affected', NOW, 400, 150),
+            ('old', 'old.8xlarge', 'gate', MIDNIGHT - 86401, 100, 90),
+            ('future', 'future.8xlarge', 'test-affected', MIDNIGHT + 86400, 100, 90),
         ):
             launches.extend((
                 {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched',
@@ -317,10 +317,10 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
             {'time': NOW, 'attempt': 'orphan', 'instance_type': 'orphan.8xlarge', 'mode': 'gate', 'result': 'finished', 'gate_s': 30},
             {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
-            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
+            {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'test-affected', 'result': 'finished', 'gate_s': 30},
             {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused',
              'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'},
-            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused',
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused',
              'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
         charges = self.state / 'charges'
@@ -355,8 +355,6 @@ class AwsReportTests(MeasurementFixture):
         evidence = run_cost.run_evidence(launches, start, end, 'us-east-2')
         box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('gate',))
         self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
-        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('merge-gate', 'gate'))
-        self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
         self.assertEqual(evidence.refusals_per_launch('m7a.8xlarge', 'us-east-2', ('test-affected',))[1:], (0, 1))
         self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('test-affected',))[1:], (2, 0))
 
@@ -370,13 +368,13 @@ class AwsReportTests(MeasurementFixture):
         }
         runs = [
             run_cost.FinishedGateRun(*unknown_only[:2], 'gpu-size-trial', DAY, Decimal(60), Decimal(100)),
-            run_cost.FinishedGateRun(*mixed_modes[:2], 'merge-gate', DAY, Decimal(60), Decimal(100)),
+            run_cost.FinishedGateRun(*mixed_modes[:2], 'gate', DAY, Decimal(60), Decimal(100)),
             run_cost.FinishedGateRun(*mixed_modes[:2], 'gpu-size-trial', DAY, Decimal(60), Decimal(200)),
-            run_cost.FinishedGateRun(*zero_box_time[:2], 'targeted-test', DAY, Decimal(0), Decimal(0)),
+            run_cost.FinishedGateRun(*zero_box_time[:2], 'test-affected', DAY, Decimal(0), Decimal(0)),
         ]
         self.assertEqual(run_cost.billed_allocations(bills, runs), {
             (*unknown_only, 'gpu-size-trial'): Decimal('0.60'),
-            (*mixed_modes, 'merge-gate'): Decimal('0.20'),
+            (*mixed_modes, 'gate'): Decimal('0.20'),
             (*mixed_modes, 'gpu-size-trial'): Decimal('0.40'),
         })
 

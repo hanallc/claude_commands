@@ -120,7 +120,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
 
-    def test_the_merge_gate_and_a_tests_only_run_name_an_owner_with_no_session(self) -> None:
+    def test_the_gate_and_a_tests_only_run_name_an_owner_with_no_session(self) -> None:
         # A gate under systemd, or with no session, still names who started its queue requests.
         observed: list[dict[str, str]] = []
 

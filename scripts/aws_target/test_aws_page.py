@@ -324,7 +324,7 @@ class AwsCombinedTableTests(PageCostFixture):
             **({'quota_requests': quota_history} if quota_history else {}),
         }))
         events: list[dict[str, object]] = []
-        for mode, times in (('merge-gate', (3600, 360)), ('targeted-test', (600, 1800))):
+        for mode, times in (('gate', (3600, 360)), ('test-affected', (600, 1800))):
             for index, (size, seconds) in enumerate(zip(standard, times, strict=True)):
                 run = {'attempt': f'{mode}-{index}', 'instance_type': size, 'mode': mode, 'region': regions[0]}
                 events.extend(({**run, 'time': now - 60 - seconds, 'result': 'launched'},
@@ -546,11 +546,6 @@ class AwsCombinedTableTests(PageCostFixture):
       const {colors} = scaleCells({values: values.map(value => [null, value])}, {rows: [0, 1, 2], columns: [1]});
       check(indices.every(index => colors.get(`${index},1`) === `var(--scale-${color})`), `Tied ${color} endpoint`);
     }
-""")
-
-    def test_old_merge_gate_url_selects_the_gate_scope(self) -> None:
-        self.run_browser_checks('?prices=cost&runs=merge-gate', """
-    check(scope === "gate" && scopeCosts().scope === "gate", "The old URL selects the gate scope");
 """)
 
     def test_cost_switch_uses_the_configured_gate_name_without_standard_types(self) -> None:

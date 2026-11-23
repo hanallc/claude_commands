@@ -2002,7 +2002,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             ("hierarchies-unit", "hierarchies"),
             ("morty", "morty"),
             ("postmaster reply", ""),
-            ("sdlc-merge-gate", "sdlc-merge-gate"),
+            ("sdlc-lander", "sdlc-lander"),
             ("natedev", "natedev"),
             ("postmaster", "postmaster"),
         ):

@@ -655,7 +655,7 @@ class PlanSetupTests(CostFixture):
         self.assertTrue(output.endswith('plan run: refused: Hana scaler ec2:StartInstances denied.\n'))
 
     def test_plan_approval_flags_refuse_without_contacting_aws(self) -> None:
-        status, output = self.run_plan('up', '--workload', 'merge-gates', '--approve-resources')
+        status, output = self.run_plan('up', '--workload', 'gates', '--approve-resources')
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, [])
         self.assertTrue(output.splitlines()[-1].startswith('plan run: refused:'))
@@ -780,7 +780,7 @@ shared_usd_per_month=1
         self.write_gate_configuration()
         before = {path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}
         output, errors = StringIO(), StringIO()
-        argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--settings', str(self.settings),
+        argv = ['deploy.py', 'up', '--workload', 'gates', '--settings', str(self.settings),
                 '--directory', str(self.state), '--output', str(self.root / 'output'), '--plan', *arguments]
         with mock.patch.object(sys, 'argv', argv), redirect_stdout(output), redirect_stderr(errors):
             status = deploy.main()
@@ -1026,7 +1026,7 @@ shared_usd_per_month=1
             self.assertIs(access, LockResult.ACQUIRED)
             status, output = self.run_plan()
         self.assertEqual(status, 1, output)
-        self.assertEqual(output, 'plan run: refused: up --workload merge-gates --plan: '
+        self.assertEqual(output, 'plan run: refused: up --workload gates --plan: '
                                  + 'Another command is using the AWS account stack. '
                                  + 'Run the same command again when that command ends.\n')
         self.assertEqual(self.calls, [])
@@ -1100,7 +1100,7 @@ shared_usd_per_month=1
         unexpected = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
         approved = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=unexpected)
         operations: tuple[tuple[str, Callable[[], object]], ...] = (
-            ('up --workload merge-gates', lambda: approved.gate_up(approve_resources=True)),
+            ('up --workload gates', lambda: approved.gate_up(approve_resources=True)),
             ('remove-images', lambda: approved.remove_images(approve_destroy=True)),
             ('apply', lambda: approved.apply(approve_resources=True)),
             ('down', lambda: approved.down(approve_destroy=True)),

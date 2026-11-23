@@ -407,7 +407,7 @@ class DirectorStopTests(unittest.TestCase):
                 self.assert_allowed(fixture.call())
                 self.assertEqual(queued.read_bytes(), before)
 
-    def test_merge_gate_with_no_open_order_phase_stops_without_a_wake(self) -> None:
+    def test_merge_unit_with_no_open_order_phase_stops_without_a_wake(self) -> None:
         with director_stop_fixture() as fixture:
             fixture.set_unit_type("merge")
             state_path = fixture.run / "progress_history_state.json"

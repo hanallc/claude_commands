@@ -146,11 +146,11 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         parent = gate.gate_test_parent(tmpfs)
         parent.mkdir(parents=True)
         held = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "merge-gate-test-", build_folders.ExplicitBuildParent(parent)))
+            "gate-test-", build_folders.ExplicitBuildParent(parent)))
         release = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
         self.addCleanup(release, held)
         free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "merge-gate-", build_folders.ExplicitBuildParent(parent)))
+            "gate-", build_folders.ExplicitBuildParent(parent)))
         release(free)
         # The shared parent also holds a folder from another program.
         foreign = tmpfs / "foreign"
