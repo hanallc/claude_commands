@@ -70,7 +70,7 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
     row_style = HEADING_STYLE.encode()
-    style = OWNER_STYLE.encode()
+    style = (OWNER_STYLE + HEADING_POSITION).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
@@ -90,13 +90,62 @@ HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;g
                  + 'max-width:100%;margin-inline-start:auto}')
 
 
+# The stacking order, lowest to highest: page content with its own sticky bars (z-index 3 or lower),
+# the heading row (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
+# and the sticky status line (20).
 OWNER_STYLE = """<style>
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card,#1a1a19);color:var(--ink-2,#c3c2b7);border:1px solid var(--line,#34332f);border-radius:8px;cursor:pointer}
 .page-owner svg{width:18px;height:18px}
+:root{--page-heading-space:8px;--page-heading-top:var(--page-heading-space)}
+:is(.page-heading,main>.page-heading-actions){position:sticky;top:var(--page-heading-space);z-index:4;
+background:var(--bg,Canvas)}
+:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]{box-shadow:0 1px 0 var(--line)}
+:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]::before{content:'';position:absolute;
+inset:auto 0 100%;height:var(--page-heading-space);background:inherit}
 </style>"""
+
+
+# The heading row sticks with a space above it. At scroll zero it stays in its normal place.
+# A stuck row shows an opaque band in the space and a line under it. Neither takes layout space.
+# A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
+HEADING_POSITION = """<script>
+function stickyPageStatusHeight(){
+ const banner=document.querySelector('[data-page-status]');
+ return banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+}
+function pageHeadingSpace(){
+ return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+}
+function stuckPageHeadingBottom(){
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
+ return pageHeadingSpace()+row.getBoundingClientRect().height+stickyPageStatusHeight();
+}
+document.addEventListener('DOMContentLoaded',()=>{
+ const root=document.documentElement.style;
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
+ const banner=document.querySelector('[data-page-status]');
+ const set=(name,pixels)=>{if(root.getPropertyValue(name)!==pixels+'px') root.setProperty(name,pixels+'px');};
+ // The row is stuck when its sticky top clips it.
+ new IntersectionObserver(entries=>row.toggleAttribute('data-page-heading-stuck',entries.at(-1).intersectionRatio<1),
+  {root:document,rootMargin:-(pageHeadingSpace()+1)+'px 0px 0px 0px',threshold:1}).observe(row);
+ const place=()=>{
+  set('--page-status-height',stickyPageStatusHeight());
+  set('--page-heading-height',row.getBoundingClientRect().height);
+ };
+ const resize=new ResizeObserver(place);
+ resize.observe(row);
+ if(banner){
+  resize.observe(banner);
+  // The clock writes the same state each second; only a new state can change the position.
+  new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) place();})
+   .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
+ }
+ place();
+},{once:true});
+</script>"""
 
 
 PAGE_SCRIPT_ERRORS = r"""<script>(() => {
@@ -342,7 +391,8 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .page-status[data-state=Late] .page-status-state,.page-status-slow{color:var(--warning)}
 .page-status[data-state=Failed] .page-status-state{color:var(--error)}
 .page-status[data-state=Paused] .page-status-state{color:var(--ink-3)}
-.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;top:0;z-index:20;padding:4px 0}
+.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;z-index:20;padding:4px 0;
+top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px))}
 .page-status-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}

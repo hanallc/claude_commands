@@ -175,6 +175,26 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
+The heading row holds the page title, the heading actions, the owner name and the New item button.
+On a page without a title, the actions wrapper holds the owner controls.
+The row is sticky near the top of the page, with an opaque page background, and content scrolls under it.
+A stuck row has an 8 px space (`--page-heading-space`) above it, so the title does not touch the top edge.
+An opaque band in the page background fills that space, and content does not show in it.
+While the row is stuck, a thin `--line` box shadow shows under it.
+The band and the line take no layout space, and neither shows at scroll zero.
+A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
+Nothing steps while the page scrolls: each part moves by at most the scroll distance.
+The status line never covers the owner name or button, and the row never covers the status line.
+Scrolling never changes the layout of the content, and at scroll zero the row stays in its normal place.
+On a narrow page the row can wrap to more lines.
+The AWS region filter sticks directly below the heading row and any sticky status line.
+The Images group index sticks 16 px below the heading row and any sticky status line.
+The stacking order, from lowest to highest, is as follows:
+1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
+2. The heading row (z-index 4).
+3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
+4. The sticky Late or Failed status line (z-index 20).
+An item jump places the focused row below the heading row and the status line.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
