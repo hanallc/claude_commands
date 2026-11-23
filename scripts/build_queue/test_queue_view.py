@@ -339,19 +339,19 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
                     self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
-    def test_mac_names_use_the_package_then_the_repository(self) -> None:
-        for command, repository, expected in (
-            ("cargo build --release -p hana", "", "hana build"),
-            ("cargo build -phana", "other", "hana build"),
-            ("cargo build --package=hana", "other", "hana build"),
-            ("cargo check --package hana", "other", "hana check"),
-            ("cargo nextest run", "cargo-liner", "cargo-liner nextest"),
-            ("cargo build", "", "build"),
-            ("", "", "cargo"),
+    def test_mac_command_step_reads_the_verb_and_the_package(self) -> None:
+        for command, expected in (
+            ("cargo build --release -p hana", ("build", "hana")),
+            ("cargo build -phana", ("build", "hana")),
+            ("cargo build --package=hana", ("build", "hana")),
+            ("cargo check --package hana", ("check", "hana")),
+            ("cargo nextest run", ("nextest", "")),
+            ("cargo build", ("build", "")),
+            ("", ("", "")),
         ):
             with self.subTest(command=command):
-                self.assertEqual(queue_view.mac_step_name(queue_view.MacBuild(1, "/project", 0,
-                    command, repository)), expected)
+                self.assertEqual(queue_view.mac_command_step(queue_view.MacBuild(1, "/project", 0,
+                    command, "other")), expected)
 
     def test_mac_command_jobs_reads_all_supported_positive_values(self) -> None:
         for argument in ("--test-threads 12", "--test-threads=12", "-j12", "-j 12", "--jobs 12", "--jobs=12"):
@@ -386,7 +386,7 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(build.stage, queue_view.MacTesting(710002))
                     self.assertEqual(build.resident_bytes, 1048576)
                     self.assertEqual(build.jobs, 4)
-                    self.assertEqual(queue_view.mac_step_name(build), "hana nextest")
+                    self.assertEqual(queue_view.mac_command_step(build), ("nextest", ""))
 
 
     def test_mac_reader_finds_all_three_tile_runs_and_their_counters(self) -> None:
@@ -406,7 +406,7 @@ class MacQueueViewTests(unittest.TestCase):
                     "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
                 if index == 0:
                     _ = (folder / "Cargo.toml").write_text(
-                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                        '[workspace.package]\nrepository = "https://github.com/hanallc/hana"\n')
                 generation = f"fixture-{pid}"
                 log = f"run-{generation}-{pid}.log"
                 arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]

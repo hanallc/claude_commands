@@ -5,6 +5,13 @@
   "build_admission": {
     "head_stall_alert_minutes": 9
   },
+  "build_folders": {
+    "slots.Nates-MacBook-Pro-2023.cargo-liner.max": 14,
+    "slots.Nates-MacBook-Pro-2023.hana.max": 13
+  },
+  "build_targets": {
+    "enabled.mac-linux": 22
+  },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
   },
@@ -19,10 +26,20 @@
     "sweep": 11,
     "sweep_build_floor_gib.natedev": 6
   },
+  "mac_test": {
+    "offload": 21
+  },
   "merge_gate": {
     "GATE_TIME_LIMIT_FACTOR": 5
   },
+  "send": {
+    "review_hold": 16
+  },
   "statusline": {
+    "account.claude2": 15,
     "role.worker": 12
+  },
+  "user_zone": {
+    "zone": 17
   }
 }

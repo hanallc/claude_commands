@@ -19,6 +19,16 @@ An identical nested committed proof can reuse its held copy.
 A run can still wait for normal build admission.
 The AWS gate uses its separate slot path.
 
+The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
+The sender accepts the main checkout or a model worktree linked to it.
+The sender stages the capture index, Git bundle, and archive in the main checkout's Git directory.
+The guest downloads the archive inside the main checkout.
+The guest stages the runtime in a per-command mount at `~/rust/hana/.git/hana-payload`.
+The guest stages the verified bundle inside the main checkout's Git directory.
+The runner takes the assigned copy number under `~/build/hana/aws-hana`.
+The receiver probes that numbered copy's lock before it reports lease release.
+The shell cache lives at `~/build/hana/main/shells`.
+
 The caller holds the copy lease through preparation and execution.
 The lease records the source checkout, commit, Git directory identities, and holder.
 Python callers pass the lock descriptor and its environment setting to build and test children.
@@ -47,6 +57,16 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the numbered copy root.
 Its Git children inherit the destination lease and busy lock.
+Before `copies.py clone` creates a checkout, it selects clone folders by the owner's prefix.
+The task record ties each clone path to its owner, repository, and session.
+The guard checks that identity against the local mirror record and any readable registry record for that path.
+A clone without `--owner` uses the caller's owner when available and needs no remote registry write.
+The maker marks its setup lease as released when setup completes.
+The clone record stays for later leases.
+The guard probes the folder lock without delay.
+It refuses only when the folder lease proves that the holder ended or the PID was reused.
+The refusal lists each path and gives one `copies.py mirror-remove` command for it.
+Removal uses the scratch coordinator for clones in both the scratch root and session folders.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.

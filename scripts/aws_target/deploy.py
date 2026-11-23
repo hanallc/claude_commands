@@ -38,7 +38,7 @@ from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
-from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.config import AwsOn, BudgetNotificationAddress, DeploymentSettings, aws_switch, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.lib import conf
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -538,10 +538,7 @@ def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
 
 
 def _print_hana_placement(workload: conf.ConfigRead) -> None:
-    enabled = workload.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    state = 'enabled' if enabled == 'on' else 'disabled'
+    state = 'enabled' if isinstance(aws_switch(workload), AwsOn) else 'disabled'
     print(f'Hana placement is {state}. This command does not change it.')
 
 

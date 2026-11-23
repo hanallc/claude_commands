@@ -192,8 +192,8 @@ class FolderAuditTests(unittest.TestCase):
     def test_mirror_cleanup_keeps_home_folders_outside_the_build_root(self) -> None:
         build = self.home / "build"
         configuration = self.root / "config/build_folders.conf"
-        key = conf.read("build_folders").effective_key("roots.slot_cargo")
-        _ = write_config_fixture(configuration, f"{key}={build / 'cargo'}\n")
+        key = conf.read("build_folders").effective_key("roots.build")
+        _ = write_config_fixture(configuration, f"{key}={build}\n")
         checkout = self.root / "job"
         workspace = checkout / "checkout"
         for prefix in (self.home / "nixos", build):
@@ -996,7 +996,7 @@ class FolderAuditTests(unittest.TestCase):
         idle = folder(self.temp / "idle", 8)
         now = time.time()
         output = f"p42\nfcwd\nn{used}\n"
-        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 0, output, "")
         with unittest.mock.patch.object(subprocess, "run", return_value=completed):
             outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
                                          proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))

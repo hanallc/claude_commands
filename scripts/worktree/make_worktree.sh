@@ -8,4 +8,4 @@ if [[ $# != 3 ]]; then
 fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec "$script_dir/../lib/py" "$script_dir/worktrees.py" make "$@"
+exec "$script_dir/../lib/py" "$script_dir/finished_worktrees.py" "$@"

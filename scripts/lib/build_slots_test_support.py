@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -64,8 +65,6 @@ roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.scratch={root / 'scratch'}
 roots.copies={root / 'workspaces'}
-roots.mirror={root / 'mirrors'}
-roots.shell={root / 'shells'}
 patterns.slot={{repository}}-slot{{slot}}
 patterns.tool={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
@@ -75,9 +74,7 @@ patterns.editable={{repository}}-{{owner}}/{{purpose}}
 patterns.temporary={{repository}}/{{owner}}-{{purpose}}-{{suffix}}
 patterns.gate={{purpose}}-{{suffix}}
 patterns.standing={{repository}}/{{owner}}-gate{{suffix}}
-patterns.mirror={{repository}}/{{owner}}-s{{slot}}
 patterns.target={{purpose}}
-patterns.shell-cache={{repository}}
 patterns.scratch={{purpose}}-{{suffix}}
 prefixes.queue-place=queue-place-
 # range: 0.001..60
@@ -93,6 +90,9 @@ slots.wait_seconds=30"""
     fixed_lines = fixed.splitlines()
     if machine != "natedev":
         fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
+    mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
+    if mac_hosts and mac_hosts[0] != machine:
+        fixed_lines.extend(("# whole: 1..", f"slots.{mac_hosts[0]}.default_max=1"))
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
     lines = [line for line in settings.read_text().splitlines()

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import ClassVar, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.production import session_staff, staff, unit_config
+from scripts.production import change_review, session_staff, staff, unit_config, unit_phases
 from scripts.production.staff_test_support import (
     StaffTestCase, isolated_staff_file, isolated_source_readers, source_environment,
     fixture_member, fixture_worker, fixture_runtime_id, fixture_session, recorded_showrunner, recorded_unit,
@@ -45,8 +45,10 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
+from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -92,14 +94,16 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        fixture = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        cls.repository_seed = fixture / "repo"
         _ = subprocess.run(["git", "init", "-b", "feature/rubric", str(cls.repository_seed)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, env=fixture_git_environment(fixture))
 
     @override
     def setUp(self) -> None:
         self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        isolate_fixture_git(self, self.root)
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         unit_runs.RUN_ROOT.mkdir()
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -198,8 +202,6 @@ class ProgressHistoryTests(unittest.TestCase):
         script.parent.mkdir(parents=True)
         _ = script.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(log)!r}).touch()\n")
         script.chmod(0o755)
-        digest = cast(Callable[[], str], vars(pass_recorder)["config_digest"])
-        clear = cast(Callable[[], None], getattr(digest, "cache_clear"))
         reads = self.root / "config-reads"
         original = self.models_config_file.read_text()
         configuration = models_registry.LaunchModelConfiguration(self.models_config_file, original, ())
@@ -210,17 +212,16 @@ class ProgressHistoryTests(unittest.TestCase):
                 "MODELS_CONFIG_TIER_ONLY": "0", "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "missing-sync-state"),
                 "MODELS_LAUNCH_CONFIGURATION": configuration.environment({})["MODELS_LAUNCH_CONFIGURATION"] if inherited else "",
             }):
+                # The two subtests call the digest in one process with a changed environment and file,
+                # as verify_helper.py does in two calls.
                 _ = self.models_config_file.write_text(original + "# later edit\n")
-                clear()
-                try:
-                    text = original if inherited else self.models_config_file.read_text()
-                    with conf_reads.record_reads(reads):
-                        self.assertEqual(digest(), hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
-                    self.assertIn("direct", reads.read_text().splitlines())
-                    self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
-                    self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
-                finally:
-                    clear()
+                text = original if inherited else self.models_config_file.read_text()
+                with conf_reads.record_reads(reads):
+                    self.assertEqual(pass_recorder.config_digest(),
+                                     hashlib.sha256(text.encode() + b"fixture=1\n").hexdigest()[:12])
+                self.assertIn("direct", reads.read_text().splitlines())
+                self.assertFalse(log.exists(), "progress telemetry ran catalog synchronization")
+                self.assertEqual(launches.call_count, int(inherited), "telemetry decoded unexpected inherited text")
 
     def test_review_trial_counts_rerun_findings_as_code(self) -> None:
         self.write_full_config()
@@ -389,7 +390,6 @@ for number in (1, 2):
     events = [json.loads(line) for line in history.read_text().splitlines()]
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
-    assert pass_recorder.config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
@@ -2104,6 +2104,10 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(load_phases(old), phases)
         self.assertEqual((phases[0]["started_at"], phases[0]["finished_at"]), (1010, 1060))
 
+    def fixture_commit(self, message: str) -> str:
+        """Make an empty commit in the fixture working dir and return its full hash."""
+        return commit_repository(self.working_dir, message, allow_empty=True)
+
     def covered_wait_phase(self, name: str) -> Path:
         session = self.start_run(name, 1000)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
@@ -2579,7 +2583,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     with self.subTest(across_runs=across_runs, active_later=active_later, associations=associations):
                         name = f"checkpoint-{across_runs}-{active_later}-{associations}"
                         first = self.covered_wait_phase(name)
-                        commit = "a" * 40
+                        commit = self.fixture_commit(name)
                         if associations:
                             _ = self.run_command("checkpoint", "--session-dir", str(first), "--phase", "6", "--commit", commit, at=1015)
                         _ = self.run_command("finish-phase", "--session-dir", str(first), "--status", "completed", at=1020)
@@ -2638,7 +2642,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     def test_checkpoint_from_another_worktree_marks_the_requested_phases_uncertain(self) -> None:
         first = self.start_run("other-checkpoint-owner", 1000)
         _ = self.run_command("start-phase", "--session-dir", str(first), "--phase-id", "7", "--phase-title", "Owner", at=1010)
-        commit = "c" * 40
+        commit = self.fixture_commit("other checkpoint owner")
         _ = self.run_command("checkpoint", "--session-dir", str(first), "--phase", "7", "--commit", commit, at=1015)
         self.working_dir = self.root / "different-worktree"
         self.working_dir.mkdir()
@@ -2737,9 +2741,157 @@ print('two homes isolated; recorder lock retained; caller restored')
         wait, = cast(list[dict[str, object]], report["handoffs"])
         self.assertEqual(wait["owner_session"], "receiving-director")
 
+    def test_checkpoint_refuses_a_hash_that_is_not_a_commit_and_records_a_real_commit(self) -> None:
+        session = self.covered_wait_phase("checkpoint-commit-check")
+        missing = "4d38667805cd7cdb0f8a0b8e2e6e1c4d3dc3e4f0"
+        refused = self.run_failing_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                           "--commit", missing, at=1015)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(refused.stderr.splitlines(),
+                         [f"checkpoint refused: {missing} is not a commit in {self.working_dir.resolve()}"])
+        self.assertEqual(self.phase_events(session.name, "checkpoint"), [])
+        commit = self.fixture_commit("real checkpoint")
+        _ = subprocess.run(["git", "-C", str(self.working_dir), "tag", "-a", "annotated", "-m", "annotated", commit],
+                           check=True, capture_output=True)
+        tag = subprocess.run(["git", "-C", str(self.working_dir), "rev-parse", "annotated"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(tag, commit)
+        refused = self.run_failing_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                           "--commit", tag, at=1018)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(refused.stderr.splitlines(),
+                         [f"checkpoint refused: {tag} is not a commit in {self.working_dir.resolve()}"])
+        recorded = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1020)
+        checkpoints = self.phase_events(session.name, "checkpoint")
+        self.assertEqual([(event["checkpoint_commit"], event["event_id"]) for event in checkpoints], [(commit, recorded)])
+        repeated = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1025)
+        self.assertEqual((repeated, len(self.phase_events(session.name, "checkpoint"))), (recorded, 1))
+
+    def test_checkpoint_checks_a_moved_working_dir_in_its_current_folder(self) -> None:
+        session = self.start_run("moved-checkpoint", 1000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 1010)
+        commit = self.fixture_commit("moved checkpoint")
+        row = unit_runs.run_owner(self.read_state(session), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
+        moved = self.root / "moved-worktree"
+        _ = self.working_dir.rename(moved)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), moved), expected=row.worktree)
+        recorded = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1020)
+        self.assertEqual([(event["checkpoint_commit"], event["event_id"])
+                          for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
+
+    def test_checkpoint_without_a_phase_started_event_checks_the_current_directory(self) -> None:
+        session = self.covered_wait_phase("checkpoint-current-directory")
+        history = self.history_dir / "runs" / f"{session.name}.jsonl"
+        _ = history.write_text("".join(line + "\n" for line in history.read_text().splitlines()
+                                       if '"event_type":"phase_started"' not in line))
+        state_file = session / plan_history.STATE_FILENAME
+        state = cast(dict[str, object], json.loads(state_file.read_text()))
+        state["working_dir"] = ""
+        _ = state_file.write_text(json.dumps(state))
+        current = self.root / "current-directory"
+        _ = subprocess.run(["git", "init", "-q", str(current)], check=True, capture_output=True)
+        commit = commit_repository(current, "current directory checkpoint", allow_empty=True)
+        refused = self.run_failing_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                           "--commit", commit, at=1015)
+        self.assertEqual(refused.stderr.splitlines(), [f"checkpoint refused: {commit} is not a commit in {Path.cwd()}"])
+        with chdir(current):
+            recorded = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                        "--commit", commit, at=1020)
+        self.assertEqual([(event["checkpoint_commit"], event["event_id"])
+                          for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
+
+    def test_void_in_one_run_leaves_another_runs_checkpoint_of_the_same_commit(self) -> None:
+        first = self.covered_wait_phase("void-run-a")
+        second = self.covered_wait_phase("void-run-b")
+        commit = self.fixture_commit("shared checkpoint")
+        voided = self.run_command("checkpoint", "--session-dir", str(first), "--phase", "6", "--commit", commit, at=1015)
+        kept = self.run_command("checkpoint", "--session-dir", str(second), "--phase", "6", "--commit", commit, at=1016)
+        _ = self.run_command("void-checkpoint", "--session-dir", str(first), "--event-id", voided,
+                             "--reason", "recorded in the wrong run", at=1020)
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            events = progress_history.load_events({"checkpoint"})[0]
+        self.assertEqual([(event["event_id"], event["run_id"]) for event in events], [(kept, second.name)])
+
+    def test_void_checkpoint_hides_the_wrong_checkpoint_from_every_reader(self) -> None:
+        session = self.covered_wait_phase("void-checkpoint")
+        history = self.history_dir / "runs" / f"{session.name}.jsonl"
+        wrong = self.fixture_commit("wrong checkpoint")
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", wrong, at=1015)
+        wrong_id = str(self.phase_events(session.name, "checkpoint")[0]["event_id"])
+        run_events = cast(Callable[[dict[str, object]], list[dict[str, object]]], vars(progress_history)["_run_events"])
+
+        def checkpoint_ids() -> dict[str, list[str]]:
+            """The checkpoint event ids each reader of checkpoint events sees."""
+            with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+                producers = change_review.checkpoint_producers(staff.initial_snapshot())
+                readers = {
+                    "load_events": progress_history.load_events({"checkpoint"})[0],
+                    "load_events_all": progress_history.load_events()[0],
+                    "events_for_worktrees": progress_history.events_for_worktrees(
+                        (self.working_dir,), frozenset({"checkpoint"})),
+                    "run_events": run_events({"history_file": str(history)}),
+                    "read_run_events": plan_history.read_run_events(history),
+                }
+            ids = {name: [str(event["event_id"]) for event in events if event.get("event_type") == "checkpoint"]
+                   for name, events in readers.items()}
+            ids["checkpoint_producers"] = [wrong_id] if wrong in producers else []
+            sent = unit_phases.phase_sent_work(plan_history.read_run_events(history))
+            ids["phase_sent_work"] = [wrong_id] if isinstance(sent, unit_phases.SentCommit) and sent.commit == wrong else []
+            return ids
+
+        def resolved(commit: str) -> bool:
+            with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+                found = progress_history.resolve_checkpoint(commit, self.working_dir, "6")
+            return isinstance(found, progress_history.ResolvedCheckpointPhase)
+
+        self.assertTrue(all(ids == [wrong_id] for ids in checkpoint_ids().values()), checkpoint_ids())
+        self.assertTrue(resolved(wrong))
+        before = history.read_bytes()
+        _ = self.run_command("void-checkpoint", "--session-dir", str(session), "--event-id", wrong_id,
+                             "--reason", "hash names no commit", at=1020)
+        after = history.read_bytes()
+        self.assertTrue(after.startswith(before))
+        appended = [cast(dict[str, object], json.loads(line)) for line in after[len(before):].decode().splitlines()]
+        self.assertEqual([(event["event_type"], event["voided_event_id"], event["reason"], event["phase_id"])
+                          for event in appended],
+                         [("checkpoint_voided", wrong_id, "hash names no commit", "6")])
+        self.assertTrue(all(ids == [] for ids in checkpoint_ids().values()), checkpoint_ids())
+        self.assertFalse(resolved(wrong))
+        right = self.fixture_commit("right checkpoint")
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", right, at=1030)
+        self.assertTrue(resolved(right))
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", wrong, at=1040)
+        self.assertEqual([event["checkpoint_commit"] for event in self.phase_events(session.name, "checkpoint")],
+                         [wrong, right, wrong])
+
+    def test_void_checkpoint_refuses_unknown_non_checkpoint_repeated_and_unexplained_voids(self) -> None:
+        session = self.covered_wait_phase("void-refusals")
+        history = self.history_dir / "runs" / f"{session.name}.jsonl"
+        commit = self.fixture_commit("voided once")
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
+        checkpoint_id = str(self.phase_events(session.name, "checkpoint")[0]["event_id"])
+        started_id = str(self.phase_events(session.name, "phase_started")[0]["event_id"])
+        _ = self.run_command("void-checkpoint", "--session-dir", str(session), "--event-id", checkpoint_id,
+                             "--reason", "wrong phase", at=1020)
+        recorded = history.read_bytes()
+        for event_id, reason, refusal in (
+            ("no-such-event", "typo", "void-checkpoint refused: event no-such-event is not in this run"),
+            (started_id, "not a checkpoint",
+             f"void-checkpoint refused: event {started_id} is a phase_started event, not a checkpoint"),
+            (checkpoint_id, "again", f"void-checkpoint refused: checkpoint {checkpoint_id} is already voided"),
+            (checkpoint_id, "  ", "void-checkpoint requires a reason"),
+        ):
+            with self.subTest(refusal=refusal):
+                refused = self.run_failing_command("void-checkpoint", "--session-dir", str(session),
+                                                   "--event-id", event_id, "--reason", reason, at=1030)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertEqual(refused.stderr.splitlines(), [refusal])
+                self.assertEqual(history.read_bytes(), recorded)
+
     def test_phase_finish_marks_an_external_gate_unclosed_and_preserves_later_gate_completion(self) -> None:
         session = self.covered_wait_phase("external-close")
-        commit = "e" * 40
+        commit = self.fixture_commit("external close")
         _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
         first = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(self.working_dir),
                                  "--phase-id", "6", "--owner-session", "receiver", at=1020)
@@ -2755,7 +2907,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def test_external_start_serializes_with_phase_finish_publication(self) -> None:
         session = self.covered_wait_phase("external-interleave")
-        commit = "f" * 40
+        commit = self.fixture_commit("external interleave")
         _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
         environment = {**os.environ, "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1030",
                        "CONF_DIR": str(Path(self.config_file).parent), "MODELS_CONFIG_FILE": str(self.models_config_file)}
@@ -8216,11 +8368,18 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([phase.phase for phase in owners.by_phase], ["6"])
         self.assertEqual(owners.refused, [])
 
+    def model_phase_source(self) -> Path:
+        root = self.root.resolve()
+        config = model_worktree_environment(root, self.config_file.parent)
+        self.enterContext(patch.dict(os.environ, config))
+        source = root / "rust" / "fixture"
+        source.parent.mkdir()
+        return source
+
     def test_reused_phase_id_claims_its_new_worktree_and_baselines(self) -> None:
-        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
-        self.start_numbered_phase(session_dir, "57c", 40_010)
-        directory = phase_reservation.phase_directory(session_dir, "57c")
-        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", "-b", "feature/rubric", str(source)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
 
         def git(root: Path, *arguments: str) -> str:
             return subprocess.run(
@@ -8229,6 +8388,12 @@ with patch.object(fcntl, "flock", admission):
                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             ).stdout.strip()
 
+        _ = git(source, "commit", "--allow-empty", "-qm", "base")
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        session_dir = self.start_run("reused-57c", 40_000, unit_owned=True)
+        self.start_numbered_phase(session_dir, "57c", 40_010)
+        directory = phase_reservation.phase_directory(session_dir, "57c")
+        _ = phase_reservation.enroll(directory, "57c", "unconfigured")
         _ = git(self.working_dir, "add", ".")
         _ = git(self.working_dir, "commit", "-qm", "home baseline")
         with redirect_stdout(io.StringIO()):
@@ -8239,13 +8404,12 @@ with patch.object(fcntl, "flock", admission):
         old_head = git(self.working_dir, "rev-parse", "HEAD")
         self.finish_numbered_phase(session_dir, 40_020)
 
-        scratch = self.root / "scratch"
-        _ = git(self.working_dir, "worktree", "add", "-qb", "scratch", str(scratch))
-        _ = (scratch / "new.txt").write_text("new start\n", encoding="utf-8")
-        _ = git(scratch, "add", "new.txt")
-        _ = git(scratch, "commit", "-qm", "scratch baseline")
-        _ = (scratch / "dirty.txt").write_text("present before dispatch\n", encoding="utf-8")
-        new_head = git(scratch, "rev-parse", "HEAD")
+        checkout = make_fixture_worktree(self.working_dir, "reservation", "p57c")
+        _ = (checkout / "new.txt").write_text("new start\n", encoding="utf-8")
+        _ = git(checkout, "add", "new.txt")
+        _ = git(checkout, "commit", "-qm", "phase baseline")
+        _ = (checkout / "dirty.txt").write_text("present before dispatch\n", encoding="utf-8")
+        new_head = git(checkout, "rev-parse", "HEAD")
         self.assertNotEqual(new_head, old_head)
 
         self.start_numbered_phase(session_dir, "57c", 40_030)
@@ -8258,27 +8422,29 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(current["working_dir"], str(self.working_dir))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
-                "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+                "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(checkout),
             ]), 0)
-        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(scratch) + "\n")
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(checkout) + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), new_head + "\n")
         self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? dirty.txt\n")
-        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["new.txt"], scratch)
+        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["new.txt"], checkout)
         self.assertIsInstance(owners, phase_reservation.Attribution)
         if isinstance(owners, phase_reservation.Attribution):
             self.assertEqual([phase.phase for phase in owners.by_phase], ["57c"])
             self.assertEqual(owners.refused, [])
 
     def test_explicit_phase_checkout_stays_selected_after_the_staff_folder_moves(self) -> None:
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], capture_output=True, check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
+                           capture_output=True, check=True)
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
         run = self.start_run("phase-checkout", 40_000, unit_owned=True)
         self.start_numbered_phase(run, "4a", 40_010)
         row = unit_runs.run_owner(self.read_state(run), staff.snapshot())
         assert isinstance(row, staff.StaffRow)
-        checkout = self.root / "phase-repository"
-        _ = subprocess.run(["git", "init", "-q", str(checkout)], capture_output=True, check=True)
-        _ = subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
-                            "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "phase"],
-                           capture_output=True, check=True)
+        checkout = make_fixture_worktree(source, "reservation", "p4a")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(phase_reservation.main([
                 "claim", "--session-dir", str(run), "--phase", "4a", "--repo", str(checkout),
@@ -8325,14 +8491,16 @@ with patch.object(fcntl, "flock", admission):
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_an_open_phase_retry_keeps_its_claim_from_any_cwd(self) -> None:
-        scratch = self.root / "scratch"
-        _ = subprocess.run(["git", "init", "-q", str(scratch)], check=True, capture_output=True,
+        source = self.model_phase_source()
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         _ = subprocess.run(
-            ["git", "-C", str(scratch), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-             "commit", "--allow-empty", "-qm", "scratch baseline"],
+            ["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "--allow-empty", "-qm", "phase baseline"],
             check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+        self.working_dir = make_fixture_worktree(source, "reservation", "home")
+        checkout = make_fixture_worktree(source, "reservation", "p57c")
         for name, extra in (("retry-57c", ()),
                             ("retry-backfilled-57c", ("--started-at", "1970-01-01T11:06:45+00:00"))):
             with self.subTest(name=name):
@@ -8343,12 +8511,12 @@ with patch.object(fcntl, "flock", admission):
                 _ = phase_reservation.enroll(directory, "57c", "unconfigured")
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(phase_reservation.main([
-                        "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(scratch),
+                        "claim", "--session-dir", str(session_dir), "--phase", "57c", "--repo", str(checkout),
                     ]), 0)
                 state = (session_dir / plan_history.STATE_FILENAME).read_bytes()
                 events = self.read_events(name)
                 records = {path: path.read_bytes() for path in directory.iterdir() if path.is_file()}
-                for cwd in (self.working_dir, scratch, self.root):
+                for cwd in (self.working_dir, checkout, self.root):
                     with self.subTest(cwd=cwd), chdir(cwd):
                         self.start_numbered_phase(session_dir, "57c", 40_020, *extra)
                         self.assertEqual((session_dir / plan_history.STATE_FILENAME).read_bytes(), state)
@@ -8439,6 +8607,7 @@ with patch.object(fcntl, "flock", admission):
         session = self.start_run("four-open-phases", base)
         arguments = ("--session-dir", str(session))
         ids = ("75", "76", "77", "78")
+        commit = self.fixture_commit("four open phases")
         expected: dict[str, tuple[int, str]] = {}
         for index, phase_id in enumerate(ids):
             started = base + index * 10
@@ -8448,7 +8617,7 @@ with patch.object(fcntl, "flock", admission):
                                  "gpt-called", 0, "--phase-id", phase_id)
             self.team_slot = ""
             _ = self.run_command("checkpoint", *arguments, "--phase", phase_id,
-                                 "--commit", "a" * 40, at=started + 2)
+                                 "--commit", commit, at=started + 2)
             _ = self.run_command("start-wait", *arguments, "--phase-id", phase_id,
                                  "--owner-session", "fixture-director", "--kind", "WaitingForUser", at=started + 3)
             eta = f"13:{index:02d}"
@@ -9362,6 +9531,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         self.assertEqual(parsed.call_count, 4)
 
     def test_fixed_run_owner_survives_clear_and_uses_the_current_staff_folder_and_git_branch(self) -> None:
+        isolate_fixture_git(self, self.root)
         owner = fixture_member("showrunner", name="progress")
         first, second = self.root / "first", self.root / "second"
         first.mkdir()

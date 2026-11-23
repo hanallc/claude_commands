@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,11 +60,26 @@ class MissingLaterFile:
     """No deadline file existed before the save."""
 
 
-def save(key: str, until: datetime, *, record_log: Callable[[Callable[[], None]], None] | None = None) -> None:
-    """Let the log writer publish the deadline after its revision check."""
+@contextmanager
+def locked() -> Generator[Path]:
+    """Hold the deadline lock through a save or a native move."""
     target = path()
     target.parent.mkdir(parents=True, exist_ok=True)
     with file_lock.exclusive(target.with_suffix('.lock')):
+        yield target
+
+
+def move_locked(target: Path, previous: str, current: str) -> None:
+    """Move the old deadline under the lock. Keep a newer deadline at the destination."""
+    stored = stored_times(target)
+    if previous in stored:
+        _ = stored.setdefault(current, stored.pop(previous))
+        write_text_atomic(target, json.dumps(stored)+'\n')
+
+
+def save(key: str, until: datetime, *, record_log: Callable[[Callable[[], None]], None] | None = None) -> None:
+    """Let the log writer publish the deadline after its revision check."""
+    with locked() as target:
         previous: bytes | MissingLaterFile
         try:
             previous = target.read_bytes()

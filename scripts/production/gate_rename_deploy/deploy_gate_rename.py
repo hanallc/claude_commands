@@ -216,12 +216,18 @@ def require_installed_code(tree: Path, direction: Direction) -> None:
     else:
         default_matches = isinstance(default, ast.Constant) and default.value == expected_folder
     if default_matches and gate_path.is_file():
-        gate = ast.parse(gate_path.read_text())
-        modes = {child.value.value for node in gate.body
-                 if isinstance(node, ast.ClassDef) and node.name == "SuiteMode"
-                 for child in node.body if isinstance(child, ast.Assign) and isinstance(child.value, ast.Constant)}
-        if modes == set(direction.names().values()):
-            return
+        # The gate module can import SuiteMode from gate_routes.py; read the first file that defines it.
+        for source in (gate_path, production / "gate_routes.py"):
+            if not source.is_file():
+                continue
+            suite_modes = [node for node in ast.parse(source.read_text()).body
+                           if isinstance(node, ast.ClassDef) and node.name == "SuiteMode"]
+            if suite_modes:
+                modes = {child.value.value for child in suite_modes[0].body
+                         if isinstance(child, ast.Assign) and isinstance(child.value, ast.Constant)}
+                if modes == set(direction.names().values()):
+                    return
+                break
     expected = "old" if reverse else "new"
     raise DeploymentFailed(f"Install the {expected} gate code in the live checkout before deployment.", 2)
 
@@ -323,7 +329,7 @@ def in_force_holder() -> build_hold.Holder:
 def stop_waiting_gates(settings: DeploymentSettings) -> None:
     """Stop each gate that only waits, by its run record or its exact pid and start time."""
     holder = in_force_holder()
-    processes = build_hold.read_audit_processes(PROC_ROOT)
+    processes = build_hold.read_audit_processes(PROC_ROOT, build_hold.DRAIN_BUILD_AUDIT)
     runs = hold_enforcer.classify_drain_runs(processes, hold_enforcer.admitted_processes(),
                                              hold_enforcer.claimed_processes(PROC_ROOT))
     if isinstance(runs, build_hold.ClaimsUnreadable):

@@ -94,6 +94,10 @@ The question form for every question to the user is defined by this import:
 
 @~/.claude/docs/question_template.md
 
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
+
 ---
 
 <Throughout>
@@ -272,9 +276,9 @@ The question form for every question to the user is defined by this import:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up, in the question form imported above <Throughout/>. Set it
+  where it first comes up (in idle update mode, the short form of <IdleUpdate/>), in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
-  restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
+  restates the question or its choices; the full item after his yes in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).
@@ -605,11 +609,9 @@ notice to the unit director before any merge command runs:
    bump: merge and push the code checkpoint first, then gate the pushed tip
    in a detached clone in the background; red goes to the unit and the
    showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
-   and `--from-child`. The script checks ancestry,
-   origin, scope and conflicts, reports overlaps with other units, merges,
-   tests, reruns red packages, pushes, promotes, and records the result. Its
-   first `held` or `failed` line stops a single-item run.
-   A batch drops stopped items and retries the remaining items once.
+   and `--from-child`. The script checks ancestry, origin, scope, conflicts, and overlaps before it merges.
+   A single checkpoint reruns red packages. The first hold or failure stops a batch.
+   Return every stopped row to its requester. Proceed with the next queued item.
    Send each final `send <unit>:` message to its unit director.
    A `merge director:` line names red tests or modules that are red on the
    base without the checkpoint. It goes to the merge director, who repairs
@@ -937,9 +939,9 @@ Use `cargo-berth sequence` for merge order.
    A longer wait needs a logged reason. In a status report, the waiting unit's
    `update` names the wait with its start and clear times.
 
-   While it waits, start the waiting unit's next phase that does not need the
-   wait (Rules: parallel by default); else work inside its current phase: its
-   fix built in a scratch copy, tests, docs or research.
+   Start the waiting unit's next independent phase in a model worktree.
+   If it has no independent phase, start tests, docs, or research in its current phase.
+   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and an approval only the user can give in a unit director's own
    session (a permission prompt, an action that cannot be undone). A unit's

@@ -410,11 +410,11 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
-def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
+def launch_state(records: Sequence[dict[str, object]], gate_switch: aws_config.AwsSwitch) -> LaunchState:
     """Show the switch state or the latest launch evidence."""
-    if gate_switch is cloud_gate.CloudGateSwitch.OFF:
+    if isinstance(gate_switch, aws_config.AwsOff):
         return {'kind': 'off'}
-    if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
+    if isinstance(gate_switch, aws_config.AwsSwitchUnusable):
         return {'kind': 'invalid'}
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
@@ -548,10 +548,13 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
     return data
 
 
+GATE_SWITCH_ON = aws_config.AwsOn()
+
+
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
-              gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
+              gate_switch: aws_config.AwsSwitch = GATE_SWITCH_ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = {row[0] for row in placement.rows} | tables.hours.checked_regions
@@ -675,7 +678,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
-                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
+                     settled_notes=settled_amount_notes(watched), gate_switch=aws_config.aws_switch(values))
     comparisons = run_cost.gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)

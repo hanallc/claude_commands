@@ -1,23 +1,154 @@
-"""Conversation-pause alarms, executable exits, and concurrent processes."""
+"""Test conversation-pause deadlines, executable exits, and concurrent processes."""
 
 from __future__ import annotations
 
 import fcntl
+import json
+import os
+import signal
 import subprocess
 import sys
+import time
 import unittest
+from pathlib import Path
 from typing import ClassVar
 
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.hooks.conversation_pause_test_support import (
-    LIBRARY, PROMPT_HOOK, QUESTION, ConversationPauseFixture,
-    asked_read, cross_session,
+    LIBRARY, PROMPT_HOOK, QUESTION, SESSION, STOP_HOOK, ConversationPauseFixture,
+    asked_read, cross_session, scheduled_wakeup,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+_RUN_HOOK_PROBE = """
+import runpy
+import sys
+
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+
+
+def _block_pause_import(marker: Path) -> str:
+    return f"""
+import builtins
+import os
+import threading
+from pathlib import Path
+
+real_import = builtins.__import__
+
+def block_pause_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "scripts.hooks" and fromlist and "conversation_pause" in fromlist:
+        marker = Path({str(marker)!r})
+        pending = marker.with_suffix(".tmp")
+        pending.write_text(str(os.getpid()))
+        pending.replace(marker)
+        threading.Event().wait(35)
+        raise SystemExit("pause import probe reached its limit")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = block_pause_import
+"""
+
+
 class ConversationPauseProcessTests(ConversationPauseFixture):
     run_in_subprocess: ClassVar[bool] = True
+
+    def run_hook_probe(
+        self, hook: Path, payload: dict[str, object], preamble: str, *, budget: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            [sys.executable, "-c", preamble + _RUN_HOOK_PROBE, str(hook)],
+            input=json.dumps(payload),
+            env={**self.environment, "CONVERSATION_PAUSE_HOOK_BUDGET": str(budget)},
+        )
+
+    def test_hooks_install_no_signal_handler(self) -> None:
+        _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
+        preamble = """
+import signal
+
+def refuse_handler(*args, **kwargs):
+    raise SystemExit("hook installed a signal handler")
+
+signal.signal = refuse_handler
+"""
+        cases: tuple[tuple[Path, dict[str, object]], ...] = (
+            (STOP_HOOK, {"session_id": SESSION}),
+            (PROMPT_HOOK, {"session_id": SESSION, "prompt": "hello"}),
+        )
+        for hook, payload in cases:
+            with self.subTest(hook=hook.name):
+                result = self.run_hook_probe(hook, payload, preamble, budget=5)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+    def test_hook_budget_covers_the_pause_library_import(self) -> None:
+        marker = self.root / "pause-import"
+        preamble = _block_pause_import(marker)
+        _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
+        for hook in (STOP_HOOK, PROMPT_HOOK):
+            with self.subTest(hook=hook.name):
+                marker.unlink(missing_ok=True)
+                result = self.run_hook_probe(hook, {"session_id": SESSION}, preamble, budget=1)
+                self.assertTrue(marker.exists())
+                self.assertEqual((result.returncode, result.stdout), (0, ""))
+                self.assertEqual(result.stderr, "conversation-pause: HookBudgetSpent: gave up after 1 seconds\n")
+
+    def test_killing_hook_stops_its_worker_before_the_budget_expires(self) -> None:
+        marker = self.root / "pause-worker"
+        script = _block_pause_import(marker) + _RUN_HOOK_PROBE
+        with subprocess.Popen(
+            [sys.executable, "-c", script, str(PROMPT_HOOK)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            env={**self.environment, "CONVERSATION_PAUSE_HOOK_BUDGET": "30"},
+        ) as hook:
+            try:
+                assert hook.stdin is not None
+                _ = hook.stdin.write(json.dumps({"session_id": SESSION, "prompt": "hello"}))
+                hook.stdin.close()
+                wait_until(marker.exists, marker.parent, timeout=5, processes=(hook,))
+                worker_pid = int(marker.read_text())
+                self.assertNotEqual(worker_pid, hook.pid)
+            finally:
+                hook.kill()
+            self.assertEqual(hook.wait(timeout=5), -signal.SIGKILL)
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(worker_pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+        self.fail(f"Worker {worker_pid} did not stop within 3 seconds after its hook died")
+
+    def test_schedule_write_timeout_removes_the_temporary_file(self) -> None:
+        marker = self.root / "schedule-replace"
+        preamble = f"""
+import os
+import threading
+from pathlib import Path
+
+real_replace = os.replace
+
+def block_schedule_replace(source, destination, *args, **kwargs):
+    if Path(destination).parent.name == "scheduled-prompts":
+        Path({str(marker)!r}).touch()
+        threading.Event().wait()
+    return real_replace(source, destination, *args, **kwargs)
+
+os.replace = block_schedule_replace
+"""
+        result = self.run_hook_probe(
+            STOP_HOOK, {"session_id": SESSION, "session_crons": [scheduled_wakeup("task")]},
+            preamble, budget=1,
+        )
+        self.assertTrue(marker.exists())
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+        self.assertEqual(result.stderr, "conversation-pause: HookBudgetSpent: gave up after 1 seconds\n")
+        self.assertEqual(list(self.scheduled_prompts_path().parent.iterdir()), [])
 
     def test_prompt_hook_invalid_json_reports_one_line_and_exits_zero(self) -> None:
         result = subprocess.run(
