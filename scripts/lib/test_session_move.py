@@ -105,8 +105,8 @@ class SessionMoveTests(unittest.TestCase):
         self.assertFalse((self.root / session_folder.LOCK).exists())
         self.assertFalse(self.holds.with_name(self.holds.name + ".lock").exists())
 
-    def test_real_run_moves_both_entries_after_a_missing_transcript(self) -> None:
-        refused = self.leaf("a-missing-transcript")
+    def test_real_run_keeps_a_folder_with_no_transcript_and_moves_the_others(self) -> None:
+        kept = self.leaf("a-missing-transcript")
         first = self.leaf("b-movable")
         second = self.leaf("c-movable")
         folder = self.index(first.name, "demo")
@@ -115,14 +115,25 @@ class SessionMoveTests(unittest.TestCase):
 
         status, output, errors = self.invoke()
 
-        self.assertEqual(status, 1, errors)
-        self.assertIn(f"{refused.name}: no working folder in a transcript", errors)
-        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(status, 0, errors)
+        self.assertIn(f"session_move: kept {kept}: {kept.name}: no working folder in a transcript", errors)
+        self.assertEqual((kept / "draft.md").read_bytes(), b"scratch content\n")
         self.assertEqual(output.splitlines()[-1],
-                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
+                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 0 other")
         for source in (first, second):
             self.assertFalse(source.exists())
             self.assertEqual((target / source.name / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_dry_run_plan_is_complete_when_a_folder_has_no_transcript(self) -> None:
+        kept = self.leaf("a-missing-transcript")
+
+        status, output, errors = self.invoke("--dry-run")
+
+        self.assertEqual(status, 0, errors)
+        self.assertIn(f"session_move: kept {kept}: {kept.name}: no working folder in a transcript", errors)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: would move 0 folders (0.00 GiB), kept 0 live, refused 0 other")
+        self.assertTrue(kept.is_dir())
 
     def test_unreadable_project_keeps_later_projects_in_the_scan(self) -> None:
         unreadable = self.leaf("unreadable").parent

@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
-from scripts.build_queue import admission_service, admission_records, placement
+from scripts.build_queue import admission_protocol, admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
@@ -44,6 +44,7 @@ from scripts.direct import step_record
 
 
 EMPTY_PROCESS_ENVIRONMENT: Mapping[str, str] = MappingProxyType({})
+LOCAL_PLACE = admission_protocol.LocalPlace()
 
 
 class HoldEnforcerTests(unittest.TestCase):
@@ -144,9 +145,9 @@ class HoldEnforcerTests(unittest.TestCase):
         table = self.table()
         table[700] = replace(table[700], pid_namespace=build_hold.PidNamespaceRelation.DIFFERENT)
 
-        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
-             redirect_stderr(io.StringIO()):
-            kept = hold_enforcer.working_gates(table, build_hold.ClaimsUnreadable("private claims are damaged"))
+        with redirect_stderr(io.StringIO()):
+            kept = hold_enforcer.working_gates(table, build_hold.ClaimsUnreadable("private claims are damaged"),
+                                               frozenset())
         self.assertEqual(kept, (table[701].identity,))
 
     def test_regular_enforcement_protects_a_suite_runner_in_another_pid_namespace(self) -> None:
@@ -211,7 +212,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 assert isinstance(runs[0], hold_enforcer.WorkingRun)
                 self.assertEqual(runs[0].reason, 'Mac or AWS claim')
                 with (mock.patch.object(hold_enforcer, 'claimed_processes', return_value=claims),
-                        mock.patch.object(hold_enforcer, 'admitted_processes', return_value=frozenset())):
+                        mock.patch.object(hold_enforcer, 'admission_state', return_value=self.run_state())):
                     kept = hold_enforcer.drain_identities(self.proc, build_hold.HolderIdentity('holder', 'holder'))
                 self.assertIn(table[700].identity, kept)
 
@@ -460,7 +461,7 @@ class HoldEnforcerTests(unittest.TestCase):
             return original_wait(holder, proc_root, sleep=advance, clock=lambda: self.now)
 
         with mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
-             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(hold_enforcer, "admission_state", return_value=self.run_state()), \
              mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, \
              mock.patch.object(os, "kill") as kill, \
@@ -522,7 +523,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
         # The fake gate starts at tick 11000; fix the boot clock after it so a fresh host keeps it.
         with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
-             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(hold_enforcer, "admission_state", return_value=self.run_state()), \
              mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000), \
              mock.patch.object(os, "sysconf", return_value=100), \
              mock.patch.object(build_hold, "start_hold", side_effect=publish), \
@@ -532,6 +533,143 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
+
+    def local_reservation(self, pid: int, run: admission_protocol.RunIdentity | admission_protocol.NoRun, *,
+                          place: admission_protocol.LocalPlace | admission_protocol.CloudPlace = LOCAL_PLACE
+                          ) -> admission_service.ReservationRecord:
+        return admission_service.ReservationRecord(
+            f"episode-{pid}", "", admission_protocol.Owner(pid, "11000"), 1, "fixture", "test", str(self.root), "", "",
+            admission_records.NoTestWidth(), admission_records.NoCallRecord(), f"reservation-{pid}",
+            {"pid": pid, "start_time": "11000", "need": 1, "since": 100.0}, run=run, place=place)
+
+    def run_state(self, *, slot_owner: int = 0, slot_start: str = "11000",
+                  reservations: tuple[admission_service.ReservationRecord, ...] = ()) -> admission_service.ServiceState:
+        state = admission_service.ServiceState({record.episode: record for record in reservations}, {}, {},
+                                               admission_records.ReadyToStart())
+        if slot_owner:
+            slot = admission_service.VerifyRunSlot("fixture", admission_protocol.Owner(slot_owner, slot_start))
+            state.verify_run_slots[slot.key] = slot
+        return state
+
+    def run_with_step(self, step_environment: Mapping[str, str] = EMPTY_PROCESS_ENVIRONMENT) -> None:
+        """Write run 100 with a working step: gate 101 and its cargo 102."""
+        _ = self.process(100, "python3", argv=("python3", "copies.py", "run"), session="runner")
+        _ = self.process(101, "bash", parent=100, argv=("bash", "verify.sh", "test"), environment=step_environment)
+        _ = self.process(102, "cargo", parent=101, argv=("cargo", "test"))
+
+    def drain_keep(self, state: admission_service.ServiceState) -> tuple[build_hold.ProcessIdentity, ...]:
+        with mock.patch.object(admission_service, "read_state", return_value=state):
+            return hold_enforcer.drain_identities(self.proc, build_hold.HolderIdentity("holder", "holder"))
+
+    def assert_kept(self, keep: tuple[build_hold.ProcessIdentity, ...], *pids: int) -> None:
+        self.assertCountEqual(keep, tuple(build_hold.ProcessIdentity(pid, "11000") for pid in pids))
+
+    def assert_next_step(self, run: int,
+                         expected: type[hold_enforcer.KeptBuild | hold_enforcer.WouldStopBuild]) -> None:
+        """Start a step under the run in the hold and check the enforcer and the client hold check."""
+        _ = self.process(90, "bash", parent=run, start=12_000, argv=("bash", "verify.sh", "test"))
+        _ = self.process(91, "cargo", parent=90, start=12_000, argv=("cargo", "test"))
+        self.assert_step_kept(90, 91, "12000", expected)
+
+    def assert_step_kept(self, gate: int, build: int, start: str,
+                         expected: type[hold_enforcer.KeptBuild | hold_enforcer.WouldStopBuild]) -> None:
+        """Check the enforcer decision for the build and the client hold check for its gate."""
+        from scripts.build_targets import build_targets
+
+        decisions = {item.process.identity.pid: item for item in self.decisions()}
+        self.assertIsInstance(decisions[build], expected)
+        lineage = build_targets.read_caller_lineage(self.proc, gate, start)
+        self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+            NoOwningSession(), self.holders, lineage),
+            build_targets.NoBlockingHold if expected is hold_enforcer.KeptBuild else build_hold.Holder)
+
+    def test_drain_keeps_a_run_between_steps(self) -> None:
+        _ = self.process(100, "python3", argv=("python3", "copies.py", "run"), session="runner")
+        keep = self.drain_keep(self.run_state(slot_owner=100))
+        self.assert_kept(keep, 100)
+        self.write_holder(keep)
+        self.assert_next_step(100, hold_enforcer.KeptBuild)
+
+    def test_drain_keeps_the_run_and_the_working_step(self) -> None:
+        self.run_with_step()
+        run = admission_protocol.RunIdentity(100, "11000")
+        keep = self.drain_keep(self.run_state(slot_owner=100, reservations=(self.local_reservation(101, run),)))
+        self.assert_kept(keep, 100, 101)
+        self.write_holder(keep)
+        for pid in (101, 102):
+            shutil.rmtree(self.proc / str(pid))
+        self.assert_next_step(100, hold_enforcer.KeptBuild)
+
+    def test_drain_keeps_a_working_run_with_no_slot(self) -> None:
+        # The exempt unit gets no verify run slot; its local reservation names the run.
+        self.run_with_step()
+        run = admission_protocol.RunIdentity(100, "11000")
+        keep = self.drain_keep(self.run_state(reservations=(self.local_reservation(101, run),)))
+        self.assert_kept(keep, 100, 101)
+        self.write_holder(keep)
+        for pid in (101, 102):
+            shutil.rmtree(self.proc / str(pid))
+        self.assert_next_step(100, hold_enforcer.KeptBuild)
+
+    def test_drain_keeps_the_step_when_its_run_controller_is_gone(self) -> None:
+        self.run_with_step()
+        keep = self.drain_keep(self.run_state(slot_owner=100))
+        self.assert_kept(keep, 100, 101)
+        self.write_holder(keep)
+        shutil.rmtree(self.proc / "100")
+        _ = self.process(101, "bash", argv=("bash", "verify.sh", "test"))
+        self.assert_step_kept(101, 102, "11000", hold_enforcer.KeptBuild)
+
+    def test_drain_reads_the_run_from_buildlog_run_when_admission_state_is_unreadable(self) -> None:
+        self.run_with_step({"BUILDLOG_RUN": "100:11000"})
+        _ = self.process(110, "python3", argv=("python3", "copies.py", "run"), session="other-runner")
+        _ = self.process(111, "bash", parent=110, argv=("bash", "verify.sh", "test"),
+                         environment={"BUILDLOG_RUN": "110:99999"})
+        _ = self.process(112, "cargo", parent=111, argv=("cargo", "test"))
+        errors = io.StringIO()
+        with mock.patch.object(admission_service, "read_state", side_effect=ValueError("damaged")), \
+             redirect_stderr(errors):
+            keep = hold_enforcer.drain_identities(self.proc, build_hold.HolderIdentity("holder", "holder"))
+        self.assert_kept(keep, 100, 101, 111)
+        expected = ("admission state unavailable: damaged; "
+                    + "the drain keeps every outermost gate and reads runs from BUILDLOG_RUN")
+        self.assertEqual(errors.getvalue().splitlines(), [expected])
+
+    def test_drain_does_not_keep_a_run_that_only_waits(self) -> None:
+        _ = self.process(100, "python3", argv=("python3", "copies.py", "run"), session="runner")
+        _ = self.process(101, "bash", parent=100, argv=("bash", "verify.sh", "test"))
+        state = self.run_state()
+        run = admission_protocol.RunIdentity(100, "11000")
+        state.run_places[admission_records.run_owner(100, "11000")] = admission_protocol.RunPlace(
+            run, 100.0, admission_protocol.Owner(101, "11000"))
+        keep = self.drain_keep(state)
+        self.assertEqual(keep, ())
+        self.write_holder(keep)
+        self.assert_next_step(100, hold_enforcer.WouldStopBuild)
+
+    def test_drain_does_not_keep_a_slot_owner_with_another_start_time(self) -> None:
+        _ = self.process(100, "python3", argv=("python3", "copies.py", "run"), session="runner")
+        self.assertEqual(self.drain_keep(self.run_state(slot_owner=100, slot_start="10999")), ())
+
+    def test_drain_keeps_the_owner_of_a_local_reservation_with_no_run(self) -> None:
+        self.run_with_step()
+        cases = ((admission_protocol.LocalPlace(), (100, 101)), (admission_protocol.CloudPlace("aws"), (101,)))
+        for place, kept in cases:
+            with self.subTest(place=type(place).__name__):
+                reservation = self.local_reservation(100, admission_protocol.NoRun(), place=place)
+                state = self.run_state(reservations=(reservation,))
+                self.assert_kept(self.drain_keep(state), *kept)
+
+    def test_drain_keeps_work_with_no_run_by_its_own_identity(self) -> None:
+        _ = self.process(60, "cargo", argv=("cargo", "build"), session="agent")
+        _ = self.process(61, "rustc", parent=60)
+        _ = self.process(70, "bash", argv=("bash", "verify.sh", "check"), session="ci")
+        _ = self.process(71, "cargo", parent=70, argv=("cargo", "clippy"))
+        no_run = self.local_reservation(70, admission_protocol.NoRun())
+        for name, state in (("no admission record", self.run_state()),
+                            ("local step with no run", self.run_state(reservations=(no_run,)))):
+            with self.subTest(name):
+                self.assert_kept(self.drain_keep(state), 60, 70)
 
     def test_drain_command_refuses_remote_targets(self) -> None:
         for target in ("mac", "aws", "all"):
@@ -668,7 +806,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 run, = runs
                 self.assertIsInstance(run, hold_enforcer.WaitingRun)
                 with mock.patch.object(build_hold, "read_audit_processes", return_value=table), \
-                     mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+                     mock.patch.object(hold_enforcer, "admission_state", return_value=self.run_state()), \
                      mock.patch.object(target_config, "read_targets", return_value=()):
                     kept_runs = hold_enforcer.drain_identities(
                         self.proc, build_hold.HolderIdentity(holders[0].key, holders[0].name))
@@ -781,10 +919,9 @@ class HoldEnforcerTests(unittest.TestCase):
                 errors = io.StringIO()
                 with mock.patch.object(hold_enforcer, "claimed_processes",
                                        return_value=build_hold.ClaimsUnreadable("private claims are damaged")), \
-                     mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
                      redirect_stderr(errors):
-                    self.assertEqual(hold_enforcer.working_gates(table, hold_enforcer.claimed_processes(self.proc)),
-                                     (identity,))
+                    self.assertEqual(hold_enforcer.working_gates(table, hold_enforcer.claimed_processes(self.proc),
+                                                                 frozenset()), (identity,))
                 self.assertEqual(errors.getvalue().splitlines(), ["claims unreadable: private claims are damaged"])
                 for admitted, claimed, expected in (
                     (frozenset[build_hold.ProcessIdentity](), frozenset[build_hold.ProcessIdentity](),
