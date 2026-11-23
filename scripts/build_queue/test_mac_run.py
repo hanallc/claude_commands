@@ -2092,7 +2092,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
               mock.patch.object(worktrees, "_run_ssh", fake_ssh)):
             self.assertEqual(worktrees.migrate_on_mac("claude_commands", dry_run=False), 255)
         remote = ("~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py"
-                  + " migrate --until-input-ends --repo claude_commands")
+                  + " migrate --repo claude_commands")
         self.assertEqual(commands, [(*mac_linux.SSH, "fixture-mac", remote)])
         self.assertIn("ServerAliveInterval=15", commands[0])
         self.assertIn("ServerAliveCountMax=2", commands[0])

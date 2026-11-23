@@ -15,14 +15,6 @@ class MacRunRefused(Exception):
     """The Mac refused the repository claim before the run started."""
 
 
-class MacClaimBusy(MacRunRefused):
-    """A live claim for the same repository holds the Mac."""
-
-    def __init__(self, target: str, what: str) -> None:
-        super().__init__(f"{target} is busy with {what}")
-        self.what: str = what
-
-
 @contextmanager
 def held(repo: Path, target: str, work: SuiteMode | StepJob,
          gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
@@ -71,9 +63,9 @@ def repository_claim(repo: Path, target: str, what: str,
         except (OSError, ValueError) as error:
             raise MacRunRefused(str(error)) from error
         if isinstance(attempt, mac_test.ClaimBusy):
-            raise MacClaimBusy(target, attempt.holder['what'])
+            raise MacRunRefused(f"{target} is busy with {attempt.holder['what']}")
         if isinstance(attempt, mac_test.ClaimHeldByCopy):
-            raise MacClaimBusy(target, attempt.holders[0]['what'])
+            raise MacRunRefused(f"{target} is busy with {attempt.holders[0]['what']}")
         if isinstance(attempt, mac_test.ClaimDenied):
             raise MacRunRefused(attempt.reason)
         if not acquired:

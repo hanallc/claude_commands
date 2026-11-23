@@ -77,22 +77,26 @@ A new unit or style production uses `worktree` as its main short name. The branc
   It holds the repository's Mac claim on natedev (`mac_run.repository_claim`, target `mac`, kind `mirror`, what `migrate --repo <word>`).
   The claim id has the `mac-linux-` prefix, so the Mac activity watch does not release it. The holder releases it.
   The claim identity comes from natedev's main checkout for `<word>`. Without that checkout, the command prints `kept: <word>: natedev has no main checkout for the Mac claim (…)` and exits 1.
-  Inside the claim it runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py migrate --until-input-ends --repo <word>` over ssh to the `host` of the `mac` target.
+  Inside the claim it runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py migrate --repo <word>` over ssh to the `host` of the `mac` target.
   The ssh options are `mac_linux.SSH`, which include `ServerAliveInterval=15` and `ServerAliveCountMax=2`, so a dead link ends ssh.
   It prints the Mac output and returns the Mac exit status.
-  The ssh input stays open while natedev holds the claim. `--until-input-ends` sends SIGINT to the Mac run when its input ends.
   On a stop, natedev closes the ssh input and waits for ssh to end before it releases the claim.
   The claim is released at the end, also when ssh fails.
-  A busy claim prints `kept: <word> busy with <what>`, a refused claim prints `kept: <word> claim refused: <reason>`, and both exit 1 with no ssh.
-  `--dry-run` takes no claim and passes `--dry-run` to the Mac.
+  Limit: the claim covers the Mac run only while ssh lives. If ssh ends first, the Mac run can go on without the claim.
+  The process scan and the Cargo flocks on the Mac always guard each target, with or without the claim.
+  A busy or refused claim prints `kept: <word>: <reason>`, for example `kept: origin: mac is busy with native Mac run`. It exits 1 with no ssh.
+  `--dry-run` takes no claim, needs no natedev main checkout, and passes `--dry-run` to the Mac.
   `--host` needs `--repo`, takes no `--list`, and is refused on the Mac.
 - Before migration links a real `target` folder to its output, it checks the target.
-  This applies to a main checkout and to an already moved worktree that still has a real `target`. That worktree links to the output in its worktree record.
+  This applies to a main checkout and to an already moved worktree whose `target` is a real folder or is missing. That worktree links to the output in its worktree record.
+  A linked moved worktree prints only `output <checkout> -> <output>`.
   1. A process scan of the target must find no holder. A holder keeps the checkout as `target in use (pids …)`.
-  2. Migration takes a non-blocking exclusive flock on each Cargo lock (`sweep.LOCK_NAMES`) at `target/*/` and `target/*/*/`. A held lock keeps the checkout as `kept: <lock> held`.
+  2. Migration takes a non-blocking exclusive flock on each Cargo lock (`sweep.LOCK_NAMES`) at any depth under `target`. The walk reads only folder and file names. It stops at a folder with a lock and skips Cargo output folders (`sweep.HASHED_DIRS`, `incremental`, `doc`). A held lock keeps the checkout as `kept: <lock> held`.
   3. Migration holds the flocks through the rename and the link.
-  When the output is not empty, migration moves the target to `.saved-target-*/target` beside the checkout instead.
-  If a new `target` appears between the move and the link, migration keeps the checkout as `rerun: …`. The reason names the folder that holds the earlier target: the output, or `.saved-target-*/target` when the output was not empty. Run migration again.
+  When the output is not empty, migration moves the target to `.saved-target-<checkout name>-*/target` beside the checkout instead.
+  Migration defers SIGTERM, SIGHUP and SIGINT from each rename to its link (`cancellation.defer_cleanup_signals`), so a stop does not leave the checkout with no `target`.
+  If a new `target` appears between the move and the link, migration keeps the checkout as `rerun: …`. The reason names the folder that holds the earlier target: the output, or `.saved-target-<checkout name>-*/target` when the output was not empty. Run migration again.
+  Each later run reports each `.saved-target-<checkout name>-*` folder of the checkout as `kept for a manual removal list: …`.
   A held or changed build-folder lock keeps the checkout as `kept: <output>: the build folder lock is held. Rerun when idle`.
   In each case migration goes on with the next checkout.
 - `worktrees.py old-links` lists recorded links and the live sessions that use them.
@@ -145,7 +149,7 @@ They check for processes that use the source before the copy and before they mov
 They compare source entries before and after the copy. A change makes them discard the staged copy and keep the source.
 If another process creates the destination during the copy, the move stops and reports the occupied path.
 If the source is already in the backup, a retry can publish the verified stage after the destination becomes free.
-Full migration reports each legacy scratch backup that recovery still needs and exits with status 1.
+Full migration and `--repo` migration report each legacy scratch backup that recovery still needs and exit with status 1. `--repo` reports only the backups of its repository.
 For a linked checkout, Git starts repair from the saved Git entry so it can update a relative `.git` pointer.
 The copy includes only tracked files from a real `target` folder.
 The move renames an untracked `target` into an empty or missing assigned output when the paths permit a rename on the same filesystem.
