@@ -9,6 +9,9 @@
     "slots.nates-macbook-pro-2023.cargo-liner.max": 14,
     "slots.nates-macbook-pro-2023.hana.max": 13
   },
+  "build_targets": {
+    "enabled.mac-linux": 22
+  },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
   },
@@ -24,7 +27,7 @@
     "sweep_build_floor_gib.natedev": 6
   },
   "mac_test": {
-    "offload": 20
+    "offload": 21
   },
   "gate": {
     "gate_time_limit_factor": 5

@@ -74,7 +74,7 @@ The roster, unit board, staff display, and cleanup consumers use this evidence.
 
 Unknown evidence retains its reason. Unrelated process diagnostics do not refuse a staff write about another member.
 The target's own live identity still refuses retirement. Unavailable peer evidence also retains the target.
-`unit_runs.report_anomaly` prints each repeated run anomaly once per process.
+`unit_runs.report_anomaly` prints each repeated run anomaly once per command. A `ContextVar` holds the printed messages, and verify_helper.py runs each command in a new context copy.
 A shared read through `worker_lifecycle.locked_state` creates no missing state folder.
 
 ### Assignment and result flow

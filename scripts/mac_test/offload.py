@@ -58,6 +58,7 @@ from scripts.mac_test import fix_return
 from scripts.mac_test.fix_return import FIX_NOT_RUN, FixResult
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
+from scripts.lib.sizes import gib
 from scripts.direct.step_selection import Pinned
 
 if TYPE_CHECKING:
@@ -1440,11 +1441,9 @@ def parse_cleanup(value: str) -> CleanupOutcome:
 
 
 def report_cleanup(cleanup: CleanupOutcome, target: str, *, path: str, free_floor_gib: float) -> None:
-    from scripts.lint import sweep
-
     label = target or "Mac"
     if isinstance(cleanup, CleanupDone):
-        size = sweep.gib(cleanup.size.kib * 1024) if isinstance(cleanup.size, MeasuredCleanupSize) else "size not measured"
+        size = gib(cleanup.size.kib * 1024) if isinstance(cleanup.size, MeasuredCleanupSize) else "size not measured"
         print(f"{label} build output removed: {path}, {size}; "
               + f"Mac free {cleanup.free_gib:g} GiB under the {free_floor_gib:g} GiB floor", flush=True)
     elif isinstance(cleanup, CleanupFailed):

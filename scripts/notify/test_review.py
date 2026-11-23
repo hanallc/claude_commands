@@ -1085,6 +1085,25 @@ class LocalReviewTests(unittest.TestCase):
                          (entry.id, "session-1", push_texts.fingerprint(entry)))
         self.assertIsNotNone(datetime.fromisoformat(ask["time"]).tzinfo)
 
+    def test_texts_ask_and_approval_review_show_a_one_line_text_as_posted(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "codex1 has {left} left", push_texts.NoActionNeeded(), "",
+            (push_texts.PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+        self.assertEqual(output.getvalue(), "test/typical\nTitle: none (the phone shows the app name)\ncodex1 has 1% left\n")
+        reviewed: list[review.Draft] = []
+
+        def judge(draft: review.Draft, *_args: object, **_kwargs: object) -> review.ReviewOutcome:
+            reviewed.append(draft)
+            return review.Unreviewed("fixture")
+
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(review, "_review", side_effect=judge), redirect_stdout(io.StringIO())):
+            _ = review.texts(["test"], approve=False)
+        self.assertEqual([(draft.title, draft.body) for draft in reviewed], [("", "codex1 has 1% left")])
+
     def test_texts_ask_clears_the_previous_request_if_the_save_fails(self) -> None:
         entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
             "The check passed.", (push_texts.PushExample("example", {}),), purpose="Test.")

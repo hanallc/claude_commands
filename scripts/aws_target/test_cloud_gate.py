@@ -1422,6 +1422,23 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.fake.commands, [])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
 
+    def test_reconcile_command_ends_an_expired_gate_and_launches_no_box(self) -> None:
+        self.record_running_gate('expired', 'm7a.8xlarge', 'us-east-2')
+        api = AwsCli('fixture', 'us-east-2', 1, execute=self.fake)
+        arguments = ['cloud_gate', '--reconcile', '--directory', str(self.state), '--settings', str(self.settings)]
+        with mock.patch.object(sys, 'argv', arguments), mock.patch.object(cloud_gate, 'AwsCli', return_value=api):
+            self.assertEqual(cloud_gate.main(), 0)
+        worker = ['cloud_gate', '--worker', str(self.folder), '--directory', str(self.state)]
+        with (mock.patch.object(sys, 'argv', worker), redirect_stderr(StringIO()) as error,
+              self.assertRaises(SystemExit) as refused):
+            _ = cloud_gate.main()
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn('--worker and --cleanup require --sidecar', error.getvalue())
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
+        operations = {command[command.index('--region') + 3] for command in self.fake.commands}
+        self.assertEqual(operations, {'terminate-instances', 'describe-instances'})
+        self.assertEqual(self.fake.launches, [])
+
     def test_reconcile_closes_the_missing_box_in_a_batch(self) -> None:
         worker, _ = self.steering_fixture()
         timeout = cloud_gate.settings().number('termination_timeout_s')
@@ -2999,7 +3016,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
     def run_spot_route(self, interruptions: int, *, box_failures: int = 0, log_error: str = '',
                        status: int = 0, one_choice: bool = False, limit_after_first: bool = False,
-                       crash_after: int | None = None,
+                       switch_off_after_first: bool = False, crash_after: int | None = None,
                        crash_on_retry_save: bool = False,
                        lower_limit_on_resume: bool = False) -> tuple[cloud_gate.LocalFallback | cloud_gate.CloudCompleted,
                                                                list[Path], list[FakeGateAws]]:
@@ -3068,6 +3085,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             fakes.append(fake)
             if limit_after_first:
                 self.costs({'daily_limit_usd': '0'})
+            if switch_off_after_first:
+                self.configure_gate('enabled=off')
             if len(folders) == crash_after:
                 crashed = True
                 raise SystemExit('fixture controller crash')
@@ -3199,6 +3218,64 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; daily_limit'))
         self.assertEqual(fakes[1].launches, [])
         self.assertFalse((folders[1] / 'launch.json').exists())
+
+    def test_switch_off_after_an_interruption_launches_no_new_box(self) -> None:
+        for interruptions, box_failures in ((1, 0), (0, 1)):
+            with self.subTest(interruptions=interruptions, box_failures=box_failures):
+                fixture = self.retry_fixture() if box_failures else self
+                outcome, folders, fakes = fixture.run_spot_route(interruptions, box_failures=box_failures,
+                                                                 switch_off_after_first=True)
+                self.assertEqual(len(folders), 1)
+                self.assertEqual(len(fakes[0].launches), 1)
+                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+                assert isinstance(outcome, cloud_gate.LocalFallback)
+                self.assertTrue(outcome.reason.endswith('cloud gates are off (cloud_gate.conf enabled=off)'))
+
+    def off_route_with_gate(self, start: str, service: mock.Mock) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+        """Run the route with the switch off and one open gate whose worker has the given start."""
+        self.configure_gate('enabled=off')
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
+        self.assertIsInstance(book.reserve_gate(self.settings, ledger.GateReservation(
+            'gate-worker', int(time.time()), int(time.time()) + 1200, Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+        book.gate_owner('gate-worker', ledger.GateWorkerOwner(os.getpid(), start, str(self.root / 'gate-worker')))
+        return self.off_route(service)
+
+    def off_route(self, service: mock.Mock) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+        mode = gate.SuiteMode.GATE
+        return cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                    service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
+
+    def test_switch_off_starts_no_reconcile_for_a_live_worker(self) -> None:
+        identity = process_start(os.getpid())
+        assert isinstance(identity, Started)
+        service = mock.Mock(return_value=0)
+        outcome = self.off_route_with_gate(identity.start, service)
+        self.assertEqual(outcome, cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)'))
+        service.assert_not_called()
+
+    def test_switch_off_keeps_its_reason_when_the_reconcile_start_fails(self) -> None:
+        refused = mock.Mock(side_effect=OSError('fixture service refusal'))
+        with redirect_stderr(StringIO()) as error:
+            outcomes = [self.off_route_with_gate('dead-worker-start', refused)]
+            with mock.patch.object(ledger.CostLedger, 'read_snapshot',
+                                   side_effect=ledger.LedgerUnavailable('fixture ledger fault')):
+                outcomes.append(self.off_route(mock.Mock(return_value=0)))
+        refused.assert_called_once()
+        self.assertEqual(outcomes, [cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')] * 2)
+        self.assertEqual(error.getvalue().splitlines(), ['The cloud gate reconcile did not start: fixture service refusal',
+                                                         'The cloud gate reconcile did not start: fixture ledger fault'])
+
+    def test_switch_off_runs_only_the_reconcile_step_for_an_open_gate(self) -> None:
+        service = mock.Mock(return_value=0)
+        outcome = self.off_route_with_gate('dead-worker-start', service)
+        self.assertEqual(outcome, cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)'))
+        service.assert_called_once()
+        command = cast(list[str], service.call_args.args[0])
+        self.assertEqual(command[command.index('-m') + 1:command.index('-m') + 3], ['scripts.aws_target.cloud_gate', '--reconcile'])
+        self.assertNotIn('--worker', command)
+        self.assertNotIn('--sidecar', command)
+        self.assertFalse(any(part.startswith('--property=ExecStopPost=') for part in command))
 
     def test_normal_gate_failure_does_not_retry(self) -> None:
         outcome, folders, _ = self.run_spot_route(0, status=1)

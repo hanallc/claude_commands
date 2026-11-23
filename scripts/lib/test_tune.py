@@ -17,8 +17,20 @@ from unittest import mock
 from scripts.lib import conf, live_settings, main_publish, models_registry, tune, waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase, pending_rows
+from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("tune.py")
+
+
+def member(identity: str, kind: staff.Kind, name: str) -> staff.StaffRow:
+    return staff.StaffRow(staff.StaffId(identity), kind, name, staff.StaffRoot(), current_session=staff.StaffId(identity))
+
+
+DWIGHT = member("920b0a64-6eee-479e-8c07-e03e4dcd4ef6", "producer", "dwight")
+BOB = member("2c1f7d2e-5a43-4a3e-9d0b-6f1f2b9e8c11", "producer", "bob")
+MODELS = member("f5636030-6745-4ff4-aeda-4c2773d18da8", "unit", "models")
+MEMBERS = staff.StaffSnapshot((DWIGHT, BOB, MODELS))
+MAP_HEADER = "# Map a showrunner or unit to the producer it reports to.\n"
 
 
 class TuneTests(PublicationTestCase):
@@ -299,6 +311,115 @@ class TuneTests(PublicationTestCase):
                 self.assertEqual([(change.key, change.publish_on_main) for change in changes], [(pending_key, False)])
         self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), repo.remote_tip())
         self.assertEqual((mac / relative).read_text(), f"{original}{key}={value}\n{pending_key}={pending_value}\n")
+
+    def commit_producer_map(self) -> Path:
+        repo = self.repository
+        rows = repo.config.with_name("producer_map.conf")
+        _ = rows.write_text(MAP_HEADER)
+        _ = repo.git(repo.checkout, "add", "config/producer_map.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "producer map fixture")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        return rows
+
+    def test_only_a_staff_row_can_be_added_to_the_producer_map(self) -> None:
+        repo = self.repository
+        rows = self.commit_producer_map()
+        baseline = self.snapshot()
+        with (mock.patch.dict(os.environ, repo.env, clear=True),
+                mock.patch.object(staff, "snapshot", return_value=MEMBERS)):
+            for stem, key, value in (
+                ("producer_map", DWIGHT.id, BOB.id),
+                ("producer_map", "models", BOB.id),
+                ("producer_map", MODELS.id, MODELS.id),
+                ("producer_map", MODELS.id, "bob"),
+                ("example", MODELS.id, BOB.id),
+            ):
+                with self.subTest(stem=stem, key=key, value=value), self.assertRaises(conf.Unusable):
+                    _ = live_settings.stage_save(live_settings.WaitingChange(stem, key, value, "refused"))
+                self.assertEqual(rows.read_text(), MAP_HEADER)
+                self.assertEqual(self.snapshot(), baseline)
+        self.assertEqual(self.waiting(), [])
+
+    def test_a_producer_map_row_is_live_and_on_main_with_its_name_comment(self) -> None:
+        repo = self.repository
+        rows = self.commit_producer_map()
+        peer = repo.root / "peer"
+        _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
+        with (mock.patch.dict(os.environ, repo.env, clear=True),
+                mock.patch.object(staff, "snapshot", return_value=MEMBERS)):
+            saved = live_settings.stage_save(live_settings.WaitingChange(
+                "producer_map", MODELS.id, BOB.id, "tune(producer_map): models reports to bob"))
+            assert isinstance(saved, live_settings.StagedSave)
+            self.assertEqual(saved.replaced_value, "")
+            self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
+            self.assertTrue(live_settings.write_mac("producer_map", MODELS.id, BOB.id, order=saved.order))
+            # An unrelated commit reaches main first; the waiting row and its comment stay live across the pull.
+            _ = (peer / "other.txt").write_text("peer\n")
+            _ = repo.git(peer, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "commit", "-qam", "Peer change")
+            _ = repo.git(peer, "push", "-q", "origin", "main")
+            self.assertEqual(live_settings.publish(repo.checkout, wait=True), ["main: pushed", "mac: pulled"])
+            remapped = live_settings.stage_save(live_settings.WaitingChange(
+                "producer_map", MODELS.id, DWIGHT.id, "tune(producer_map): models reports to dwight"))
+            assert isinstance(remapped, live_settings.StagedSave)
+            self.assertEqual(remapped.replaced_value, BOB.id)
+            self.assertEqual(live_settings.publish(repo.checkout, wait=True), ["main: pushed", "mac: pulled"])
+        self.assertIn(shlex.join(["--name-comment", "# models = bob", "producer_map", MODELS.id, BOB.id]),
+                      repo.ssh_log.read_text())
+        expected = f"{MAP_HEADER}{MODELS.id} = {DWIGHT.id}  # models = dwight\n"
+        self.assertEqual(rows.read_text(), expected)
+        self.assertEqual(repo.git(repo.origin, "show", "main:config/producer_map.conf"), expected.rstrip("\n"))
+        self.assertEqual(repo.git(repo.origin, "show", "main:other.txt"), "peer")
+        self.assertEqual(self.waiting(), [])
+
+    def test_the_mac_writes_the_name_comment_from_natedev(self) -> None:
+        repo = self.repository
+        rows = self.commit_producer_map()
+        with (mock.patch.dict(os.environ, {**repo.env, live_settings.SAVE_ORDER_ENV: "1"}, clear=True),
+                mock.patch("platform.system", return_value="Darwin"),
+                mock.patch.object(staff, "snapshot", side_effect=AssertionError("the Mac reads no staff record"))):
+            self.assertEqual(live_settings.main(["--name-comment", "# models = bob", "producer_map", MODELS.id, BOB.id]), 0)
+        self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
+
+    def test_natedev_checks_a_row_even_with_a_name_comment(self) -> None:
+        repo = self.repository
+        rows = self.commit_producer_map()
+        errors = io.StringIO()
+        with (mock.patch.dict(os.environ, repo.env, clear=True), mock.patch("platform.system", return_value="Linux"),
+                mock.patch.object(staff, "snapshot", return_value=MEMBERS), redirect_stderr(errors)):
+            self.assertEqual(live_settings.main(["--name-comment", "# dwight = bob", "producer_map", DWIGHT.id, BOB.id]), 1)
+            self.assertEqual(rows.read_text(), MAP_HEADER)
+            self.assertEqual(live_settings.main(["--name-comment", "# wrong = names", "producer_map", MODELS.id, BOB.id]), 0)
+        self.assertIn("not the staff id of an active showrunner or unit", errors.getvalue())
+        self.assertEqual(rows.read_text(), f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n")
+
+    def test_a_waiting_remap_keeps_its_name_comment_across_a_pull(self) -> None:
+        repo = self.repository
+        rows = self.commit_producer_map()
+        published = f"{MAP_HEADER}{MODELS.id} = {BOB.id}  # models = bob\n"
+        _ = rows.write_text(published)
+        _ = repo.git(repo.checkout, "commit", "-qam", "Map models to bob")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        peer = repo.root / "peer"
+        _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
+        remapped = f"{MAP_HEADER}{MODELS.id} = {DWIGHT.id}  # models = dwight\n"
+        with (mock.patch.dict(os.environ, repo.env, clear=True),
+                mock.patch.object(staff, "snapshot", return_value=MEMBERS)):
+            saved = live_settings.stage_save(live_settings.WaitingChange(
+                "producer_map", MODELS.id, DWIGHT.id, "tune(producer_map): models reports to dwight"))
+            assert isinstance(saved, live_settings.StagedSave)
+            _ = (peer / "other.txt").write_text("peer\n")
+            _ = repo.git(peer, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "commit", "-qam", "Peer change")
+            _ = repo.git(peer, "push", "-q", "origin", "main")
+            _ = repo.git(repo.checkout, "fetch", "-q", "origin", "main")
+            waiting_rows.move_to(repo.checkout, "origin/main")
+            self.assertEqual(rows.read_text(), remapped)
+            self.assertEqual(repo.git(repo.checkout, "show", "HEAD:other.txt"), "peer")
+            self.assertEqual(live_settings.publish(repo.checkout, wait=True), ["main: pushed", "mac: pulled"])
+        self.assertEqual(rows.read_text(), remapped)
+        self.assertEqual(repo.git(repo.origin, "show", "main:config/producer_map.conf"), remapped.rstrip("\n"))
+        self.assertEqual(self.waiting(), [])
 
     def test_an_intermediate_pull_keeps_the_newer_live_save_and_its_receipt(self) -> None:
         repo = self.repository
@@ -720,10 +841,11 @@ class TuneTests(PublicationTestCase):
         for value in ("#af875f", "part#fragment"):
             with self.subTest(value=value), mock.patch.dict(os.environ, repo.env, clear=True), \
                     mock.patch("platform.system", return_value="Darwin"), \
-                    mock.patch.object(tune, "_forward", return_value=0) as forward:
+                    mock.patch.object(main_publish, "forward", return_value=0) as forward:
                 arguments = ["statusline", "account.claude1", value, "--why", "Chosen color", "--user-words", "Save"]
                 self.assertEqual(tune.main(arguments), 0)
-                forward.assert_called_once_with(arguments, repo.env.get("ZONE_SSH") or "ssh")
+                forward.assert_called_once_with("lib/tune.py", arguments, label="tune",
+                                                ssh_program=repo.env.get("ZONE_SSH") or "ssh")
 
 
 if __name__ == "__main__":

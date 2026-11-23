@@ -96,7 +96,7 @@ def _own_policy(move: WorkerMove, policy: worker_panes.LaunchPolicy) -> worker_p
 def _request(move: WorkerMove, source: str, terminal: str) -> moves.MoveCommon:
     common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool="codex" if move.family == "codex" else "claude",
                               subject=move.row.id, move_id=uuid4().hex)
-    requested: moves.RequestedMove = {**common, "kind": "requested", "terminal": terminal,
+    requested: moves.RequestedMove = {**common, "kind": "requested", "scope": "group", "terminal": terminal,
                                       "from": source, "to": move.target, "why": move.why, "window": "unknown"}
     moves.append_move(requested)
     refusal = refusal_watch.transcript_refusal(str(move.row.current_session))

@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +21,7 @@ from scripts.build_queue.test_placement import (
 )
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
+from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_pressure_reading
@@ -57,6 +58,11 @@ def ids(line: records.QueueMoveLine) -> list[str]:
 
 
 class QueueMoveTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The service applies natedev holds only on natedev; the guest has another host name.
+        _ = self.enterContext(patch.object(store, "host_name", return_value="natedev"))
+
     def test_release_skips_remote_waiters_with_local_admission_context(self) -> None:
         for mac_only in (False, True):
             with self.subTest(mac_only=mac_only), PlacementFixture() as fixture:

@@ -18,6 +18,7 @@ from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -262,12 +263,18 @@ class AssignLauncherFixture(unittest.TestCase):
         bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         _ = set_up_fixture(self.addCleanup, self.native)
         _ = self.enterContext(assignment_helpers(bytecode_setting))
-        self.home = Path.home()
+        self.home = Path.home().resolve()
+        model = model_worktree_environment(self.home, Path(os.environ["CONF_DIR"]))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, model)))
         self.session_dir = self.native.run_dir
-        self.project = self.session_dir.parent / "project"
-        self.project.mkdir()
+        self.project = self.home / "rust" / "project"
+        self.project.mkdir(parents=True)
         _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
+        _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
+        self.commit_project()
+        self.project = make_fixture_worktree(self.project, "fixture", "project")
+        # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
         _ = unit_config.write(self.project, unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")),
                                                                 unit_config.NoAppPort(), ()))
         owner = staff.by_id(self.native.fixture.parent.id)
@@ -277,7 +284,6 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = staff.rename(parent.id, "fixture-production")
         owner = staff.rename(owner.id, "fixture")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.project), expected=owner.worktree)
-        _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
@@ -312,7 +318,6 @@ class AssignLauncherFixture(unittest.TestCase):
                 print(result.stderr, end="", file=sys.stderr)
             return result
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
-        self.commit_project()
         (self.session_dir / "progress_history_state.json").unlink()
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",

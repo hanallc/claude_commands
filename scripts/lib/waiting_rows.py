@@ -29,6 +29,8 @@ REGISTRY_PATH = "config/models.conf"
 ORDER_PATH = "config/settings-orders.json"
 LEGACY_GATE_STEM = "merge_gate"
 RegistryReplay = Callable[[str, str, str], str]
+# Each row of this stem is "<key> = <value>  # <name> = <name>", so a reader sees the names.
+NAMED_ROWS = "producer_map"
 
 
 def model_color_host(key: str) -> str:
@@ -76,9 +78,26 @@ def model_color_value(value: str) -> bool:
     return re.fullmatch(r"#[0-9a-f]{6}", value) is not None
 
 
-def append_setting(source: str, key: str, value: str) -> str:
+def _append_line(source: str, line: str) -> str:
+    """Add the line at the end; a last line with no newline gets one first."""
     ending = "\n" if source and not source.endswith("\n") else ""
-    return f"{source}{ending}{key}={value}\n"
+    return f"{source}{ending}{line}\n"
+
+
+def append_setting(source: str, key: str, value: str) -> str:
+    return _append_line(source, f"{key}={value}")
+
+
+def named_row(source: str, key: str, value: str, comment: str) -> str:
+    """Write a named row with its current name comment at the end of the line."""
+    row = f"{key} = {value}  {comment}"
+    setting = conf.settings(source).get(key)
+    if setting is None:
+        return _append_line(source, row)
+    lines = source.splitlines(keepends=True)
+    body = lines[setting.line].rstrip("\r\n")
+    lines[setting.line] = row + lines[setting.line][len(body):]
+    return "".join(lines)
 
 
 @dataclass(frozen=True)

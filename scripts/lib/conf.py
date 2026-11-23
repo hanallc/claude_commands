@@ -78,6 +78,14 @@ class UnstampedConfiguration(Enum):
     UNSTAMPED = "no file stamp"
 
 
+def file_stamp(source: Path) -> ConfigurationStamp | UnstampedConfiguration:
+    """Stamp the file without a read, so a cache keyed by the stamp sees each edit."""
+    try:
+        return ConfigurationStamp.from_stat(source.stat())
+    except OSError:
+        return UnstampedConfiguration.UNSTAMPED
+
+
 _report_changes: ContextVar[bool] = ContextVar("report_configuration_changes", default=False)
 _reported_bad_edits: set[tuple[Path, str, str, ConfigurationStamp | UnstampedConfiguration]] = set()
 _bad_edits_lock = Lock()

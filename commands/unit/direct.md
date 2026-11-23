@@ -234,6 +234,8 @@ turn's final line names which one**:
 `— holding: waiting on <what is running>` · `gate: <name>` · `decision: <question>` ·
 `blocked: <cause>` · `done: run summary emitted`
 
+In idle update mode (<IdleUpdate/>), a turn with no text for nate carries this line only.
+
 The closed list:
 
 - **waiting** — a background dispatch, verification, smoke run, or style pass is
@@ -526,6 +528,10 @@ Read `~/.claude/docs/direct/authorization.md` in full when an action needs user 
 `<DecisionEconomy/>` is defined by this import, shared with every session:
 
 @~/.claude/docs/decision_criteria.md
+
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
 
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:
