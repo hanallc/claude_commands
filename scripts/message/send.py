@@ -4731,12 +4731,17 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
     return f"auto-mode:{session}:{hashlib.sha256(joined.encode()).hexdigest()[:12]}"
 
 
+def template_values(options: Options) -> dict[str, str]:
+    """The --value key=value pairs of a template push, by key."""
+    return {key: item for key, _, item in (value.partition("=") for value in options.values)}
+
+
 def reviewed_waits(options: Options) -> Options:
     """Review the waits sentence within the configured budget.
 
     Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
     """
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
@@ -4780,7 +4785,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 def refusal_report(options: Options) -> rca.Report:
     """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
                       key=options.key or "")
@@ -5905,8 +5910,9 @@ def main(argv: list[str]) -> int:
             if (options.to == USER and options.text_id == MAC_LOCKED_TEXT
                     and not isinstance(options.scope, NamedMachine)):
                 from scripts.mac_test import mac_test
-                values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
-                mac_use = mac_test.machine_off_on_purpose("mac", values.get("sender"))
+                sender = template_values(options).get("sender")
+                asking = mac_test.AskingSession(sender) if sender else mac_test.NO_ASKING_SESSION
+                mac_use = mac_test.machine_off_on_purpose("mac", asking)
                 if isinstance(mac_use, mac_test.OffOnPurpose):
                     print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
                     return EXIT["skipped"]

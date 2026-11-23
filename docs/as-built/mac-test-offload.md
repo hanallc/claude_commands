@@ -210,8 +210,10 @@ For a Mac that is off on purpose, `send.py` prints `SKIPPED: the Mac is off on p
 Only the host that delivers the push asks; a `--machine natedev` forward asks on natedev and reads that skip as confirmed.
 The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
-When the user turns the Mac off after the push, `mac_idle.py cleared` exits 0 and the push stops its repeats.
-The next pass that finds the Mac off saves `pushed` as false.
+`mac_idle.push_retired` holds the one rule that ends a sent push: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
+`mac_idle.py cleared` exits 0 on this rule, and the push stops its repeats.
+Each watch pass applies the same rule before its early return and saves `pushed` as false.
+The watch reads the off-on-purpose state once per pass.
 The clear check retires the key, so the same `mac-idle-<since>` key pushes again when the Mac is in use again.
 The title is "Mac tests stopped".
 The action is "Wake the Mac or check its network."

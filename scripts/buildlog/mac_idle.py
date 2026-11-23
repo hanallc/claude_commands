@@ -397,6 +397,21 @@ def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
     return False
 
 
+def mac_off_on_purpose() -> bool:
+    """Tell whether the user turned the Mac off: a Mac block, offload=off or enabled.mac=off."""
+    from scripts.mac_test import mac_test
+
+    return isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
+
+
+def push_retired(saved: mac_idle_alert.SavedAlert, off: bool) -> bool:
+    """Tell whether a sent unreachable push is over. The watch and the clear check use this one rule.
+
+    The push is over when the user turned the Mac off, when the Mac is not unreachable, or when no step waits.
+    """
+    return off or saved["state"] != "unreachable" or saved["waiting"] == 0
+
+
 def record_case(call: VerifyCall, cause: str, action: str, wait: str, now: float) -> None:
     host = store.host_name()
     identity = hashlib.sha256(f"{host}:{call.call_id}:{cause}".encode()).hexdigest()
@@ -507,6 +522,10 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
                                 if (kept["cause"], kept["holder"]) == (saved["cause"], saved["holder"]) else now)
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
+        off = mac_off_on_purpose()
+        if saved["pushed"] and push_retired(saved, off):
+            # The clear check retires the sent push on the same rule, so the push goes again when the outage is back.
+            saved["pushed"] = False
         write_record(paths.state / "alert.json", saved)
         if (not isinstance(reading, IdleMac | MacUnreachable)
                 or now - saved["since"] < settings.alert_seconds or not calls):
@@ -523,16 +542,11 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
             write_record(paths.state / "alert.json", saved)
-        if isinstance(reading, MacUnreachable) and now - saved["since"] >= settings.push_seconds:
-            # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
-            # The clear check retires a sent push, so the push goes again when the Mac is in use again.
-            off = isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose)
-            if off and saved["pushed"]:
-                saved["pushed"] = False
-                write_record(paths.state / "alert.json", saved)
-            elif not off and not saved["pushed"]:
-                saved["pushed"] = push_outage(saved, now)
-                write_record(paths.state / "alert.json", saved)
+        # A Mac that the user turned off sends no push. The page line and the showrunner message stay.
+        if (isinstance(reading, MacUnreachable) and now - saved["since"] >= settings.push_seconds
+                and not off and not saved["pushed"]):
+            saved["pushed"] = push_outage(saved, now)
+            write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
             return
         waiters = admission.waiters if isinstance(admission, AdmissionWaiters) else []
@@ -566,25 +580,22 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
 def main(args: list[str]) -> int:
     paths = watch_paths()
     if args[:2] == ["cleared", "--since"] and len(args) == 3:
-        from scripts.mac_test import mac_test
-
         try:
             since = float(args[2])
         except ValueError:
             return 1
         if not math.isfinite(since):
             return 1
-        # A push already sent stops its repeats when the user turns the Mac off.
-        if isinstance(mac_test.machine_off_on_purpose("mac"), mac_test.OffOnPurpose):
-            return 0
+        # With no fresh saved alert, only a Mac that the user turned off ends the push.
+        off = mac_off_on_purpose()
         saved = mac_idle_alert.read_alert(paths.state / "alert.json")
         try:
             freshness = mac_idle_alert.read_idle_config().stale_seconds
         except mac_idle_alert.MacIdleConfigError:
-            return 1
+            return int(not off)
         if not isinstance(saved, dict) or time.time() - saved["written"] > freshness:
-            return 1
-        return int(saved["state"] == "unreachable" and int(saved["since"]) == int(since) and saved["waiting"] > 0)
+            return int(not off)
+        return int(int(saved["since"]) == int(since) and not push_retired(saved, off))
     elif args == ["watch"]:
         watch_once(paths, time.time())
     else:

@@ -562,7 +562,22 @@ class MachineInUse:
 MACHINE_IN_USE = MachineInUse()
 
 
-def machine_off_on_purpose(target: str, asking_session: str | None = None) -> OffOnPurpose | MachineInUse:
+@dataclass(frozen=True)
+class AskingSession:
+    """The session that asks. A Mac block that it holds does not turn the Mac off for it."""
+
+    name: str
+
+
+class NoAskingSession:
+    """No session asks, so every Mac block counts."""
+
+
+NO_ASKING_SESSION = NoAskingSession()
+
+
+def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAskingSession = NO_ASKING_SESSION
+                           ) -> OffOnPurpose | MachineInUse:
     """The one rule for every outage push: the user turned the named target off.
 
     Each target reads enabled.<target>=off. The Mac also reads its block and offload=off. A block is a lease that
@@ -580,7 +595,7 @@ def machine_off_on_purpose(target: str, asking_session: str | None = None) -> Of
         return MACHINE_IN_USE
     try:
         block = read_block(state_paths().block)
-        if not isinstance(block, NoMacBlock) and block.holder != asking_session:
+        if not isinstance(block, NoMacBlock) and asking_session != AskingSession(block.holder):
             return OffOnPurpose(f"{block.holder} blocks it: {block.reason}")
     except StateReadError:
         pass
