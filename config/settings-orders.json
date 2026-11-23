@@ -23,6 +23,9 @@
     "sweep": 11,
     "sweep_build_floor_gib.natedev": 6
   },
+  "mac_test": {
+    "offload": 18
+  },
   "merge_gate": {
     "GATE_TIME_LIMIT_FACTOR": 5
   },
