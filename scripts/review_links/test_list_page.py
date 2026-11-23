@@ -1126,6 +1126,10 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();'''
         page = page.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
         card = b'<!doctype html><html data-theme="dark"><body><p>Review card fixture</p></body></html>'
+        # The probe starts a private browser. Close the idle shared browsers first.
+        for cached in (self._chrome, self._firefox):
+            if cached is not None:
+                cached.close()
         for browser in WINDOW_BROWSERS:
             with self.subTest(browser=browser):
                 self.assertEqual(window_probe_results({list_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
