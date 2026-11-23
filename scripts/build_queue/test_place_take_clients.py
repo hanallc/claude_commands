@@ -197,9 +197,13 @@ class HandoffClientTests(unittest.TestCase):
             client.write_assignment(path, wire.LocalPlacementGranted(assignment, granted))
             closed = mock.Mock(assignment=assignment, state=placement.ClosedAssignment("completed"))
             position = SlotQueuePosition(request.episode, request.since)
-            grants: tuple[tuple[wire.Admitted | wire.LocalPlacementGranted, bool, tuple[int, wire.ReleaseEnding]], ...] = (
+            local = wire.LocalPlacementGranted(assignment, granted)
+            grants: tuple[tuple[wire.Admitted | wire.LocalPlacementGranted | first_step.GatePlacement, bool,
+                                tuple[int, wire.ReleaseEnding]], ...] = (
                 (granted, True, (0, "handed_off")),
-                (wire.LocalPlacementGranted(assignment, granted), True, (0, "handed_off")),
+                (local, True, (0, "handed_off")),
+                # The gate takes its own memory reservation when it starts.
+                (first_step.GatePlacement(local, request), True, (0, "handed_off")),
                 (granted, False, (1, "result")))
             for grant, handoff, expected in grants:
                 with (self.subTest(grant=type(grant).__name__, expected=expected),

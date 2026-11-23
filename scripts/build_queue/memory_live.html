@@ -910,12 +910,17 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
+  const guestFields = row.guest_run ? [field('Runs on', row.guest_run.target), field('Guest attempt', row.guest_run.attempt)] : [];
+  const namesGuest = row.targets?.includes('mac-linux');
+  const namedTargets = !waiting && namesGuest
+    ? [field('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
-    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+    : stepTitle(row, unavailable && !row.guest_run ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
   if (row.changes) rows.push(field('Changes', row.changes));
-  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (unavailable) return [...rows, ...stepFields, ...guestFields, ...namedTargets,
+    ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -961,7 +966,7 @@ function stepTooltip(key, data) {
     }
   } else {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(field('Runs on', machine));
+    rows.push(field('Runs on', machine), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1809,28 +1814,35 @@ function renderWalk(d) {
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
+  const targetCell = (machine, named) => {
+    if (!named) return `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`;
+    const targets = machine && !named.includes(machine) ? [...named, machine] : named;
+    const labels = targets.map(target => target === machine
+      ? `<strong class="machine" data-machine="${esc(target)}">${esc(target)} (running)</strong>`
+      : `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ");
+    const content = machine ? labels : `<span class="wait-target">${labels || "—"}</span>`;
+    return `<td class="machine" data-machine="${esc(targets.join(" or "))}">${content}</td>`;
+  };
+  const cells = (place, name, duration, unit, pid, target, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      (Array.isArray(machine)
-        // A waiting step lists the machines that can take it, each in its machine color.
-        ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
-        : `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`) + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
+      target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
       (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
-  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.guest_run || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", "", null, "", null, "tools", "", "tools");
+    cells("", "Build tools", "", "", null, targetCell(""), null, "tools", "", "tools");
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
+    const target = targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined);
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, target, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
@@ -1863,7 +1875,8 @@ function renderWalk(d) {
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
-    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, rowClass);
+    const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
+    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, target, null, tip, w.verify?.verb, rowClass);
     const note = w.order_note || (["build hold", "build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "");
     rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
