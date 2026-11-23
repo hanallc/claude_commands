@@ -24,14 +24,15 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import cli
 from scripts.buildlog import index
-from scripts.buildlog import mac_idle, mac_idle_alert, sample
+from scripts.buildlog import mac_idle, mac_idle_alert, machine_facts, sample
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.buildlog.mac_idle_test_support import write_idle_alert
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
 from scripts.direct import step_record
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings
+from scripts.lint.memory_test_support import write_config_fixture, fake_memory_readings, memory_gate_shell_environment
 from scripts.message import send
 from scripts.buildlog.test_index import use_test_log
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
@@ -211,6 +212,13 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertNotIn("disk", messages[0])
         push.assert_not_called()
         self.assertEqual([row["call_id"] for row in self.rows()], ["waiting-125"])
+
+    def test_outage_message_keeps_its_line_when_the_mac_state_changes_after_the_reading(self) -> None:
+        saved = mac_idle_alert.read_alert(write_idle_alert(self.paths.state, 1600))
+        assert isinstance(saved, dict)
+        with mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send:
+            self.assertTrue(REAL_NOTIFY_OUTAGE(self.paths, saved, 1600, (), {}, mac_idle.AdmissionWaiters([])))
+        self.assertTrue(cast(str, send.call_args.args[0]).startswith("MAC BLOCKED by research"))
 
     def test_unparseable_wait_time_still_alerts(self) -> None:
         self.step(updated="invalid-time")
@@ -1307,10 +1315,12 @@ done
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
-             mock.patch.object(mac_idle, "watch_once") as watch:
+             mock.patch.object(mac_idle, "watch_once") as watch, \
+             mock.patch.object(machine_facts, "sample_once") as facts:
             self.assertEqual(cli.main(["sample"]), 0)
         watch.assert_called_once()
         self.assertEqual(watch.call_args.args[1], 1000)
+        facts.assert_called_once_with(machine_facts.state_path(), 1000)
 
     def test_memory_wait_reads_the_marker_when_its_normal_hook_is_empty(self) -> None:
         self.admission.free(0)
@@ -1331,7 +1341,7 @@ test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
         with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
             process = subprocess.Popen(["bash", "-c", command, "memory-marker-test",
-                str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ,
+                str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**memory_gate_shell_environment(),
                 "TEST_RETRY_MARKER": str(marker)}, stdout=output, stderr=errors, start_new_session=True)
             expired = False
             try:

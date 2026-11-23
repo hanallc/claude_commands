@@ -4887,11 +4887,13 @@ def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
     return _colored_span(label, f"account.{label}", colors, kind="bold")
 
 
-def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
-    if not role:
-        return [_span("")]
+def board_role_span(role: str, colors: dict[str, str]) -> BoardSpan:
     key = ROLE_COLOR_KEYS.get(role)
-    return [_colored_span(role, key, colors) if key else _span(role), *([_span(" ✓")] if selected else [])]
+    return _colored_span(role, key, colors) if key else _span(role)
+
+
+def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
+    return [board_role_span(role, colors), *([_span(" ✓")] if role and selected else [])]
 
 
 def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
@@ -5060,10 +5062,12 @@ def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str,
     return orders
 
 
-def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
+def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+                 include_empty_total: bool = False) -> Board:
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
-    return _status_board(reading, account_config=account_config, colors=role_colors())
+    return _status_board(reading, account_config=account_config, colors=role_colors(),
+                         include_empty_total=include_empty_total)
 
 
 MODEL_COUNT_COLUMNS = (*MODEL_ROLES, "total")
@@ -5179,12 +5183,13 @@ def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
     return ModelsBoard(rows, orders)
 
 
-def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
+def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str],
+                  include_empty_total: bool = False) -> Board:
     rows = sorted(reading.rows, key=lambda row: row.label.casefold())
     # The reset text changes at the next local midnight.
     today = reading.checked_at.astimezone(reading.zone).date()
     stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
-    if not rows:
+    if not rows and not include_empty_total:
         return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
     lines = account_details_in_row_order([
         line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)])

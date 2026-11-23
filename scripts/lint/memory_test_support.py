@@ -38,6 +38,11 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
+# Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
+UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
+UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
+
+
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
     """Merge the template, existing settings, and explicit overrides in that order.
 
@@ -142,6 +147,11 @@ def config_environment(root: Path) -> dict[str, str]:
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
+
+
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

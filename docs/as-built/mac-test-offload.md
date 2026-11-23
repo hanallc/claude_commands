@@ -26,6 +26,18 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+## Mac Linux gate type checks
+
+A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
+The guest puts the type-check environment in the copy's gate tool folder.
+For a run with type checks, the guest checks for `basedpyright` and `uv` before it starts the gate.
+If a tool is missing, the guest refuses the route.
+The guest returns the type-check result with the test results.
+If the assigned Mac Linux guest refuses the route, the gate fails and reports the guest and the reason.
+The caller must submit a new run to retry.
+
+## Mac queue runs
+
 `mac_queue_run.py --kind run` checks the Mac block before placement, before remote preparation, and before the remote command.
 The run uses the holding unit's session for the block check and the placement request.
 Workers of that unit can start a run during its block.
@@ -55,6 +67,26 @@ Tree repair steps remain local.
 Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A busy Mac keeps the lint on natedev. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting.
 
 A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+
+## Mac Linux guest folders
+
+The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
+A Mac block or a busy repository slot can refuse the claim.
+The route reports `not started` with the refusal reason before any upload or retry backoff.
+The route releases the claim when the guest proves the run ended.
+The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
+The guest run lock still refuses another guest run until the first run ends.
+Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
+
+The Mac Linux route runs the suite in a numbered copy.
+It makes a per-run tool folder under the copy's `target` directory.
+Bubblewrap binds the tool folder's `tmp` directory to `/tmp` and mounts a private tmpfs at `/dev/shm`.
+The guest removes the tool folder when the suite returns.
+A forced stop can leave the tool folder in the numbered copy.
+On a later allocation, the shared build folder allocator removes the folder if its lease owner has ended and the locks permit removal.
+The suite uses a private PID namespace and mounts its own `/proc`.
+At the guest deadline, the namespace ends all suite processes, including processes that change groups.
+If `bwrap` is missing, the route declines before it sends the source.
 
 ## How it works
 
@@ -112,7 +144,14 @@ Its default interval is 60 seconds.
 The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
-They make no SSH or recipient lookup calls.
+Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work` (`mac_idle.view_alert_line`).
+That read uses only the local block, claim and `unreachable_until` files, and `/proc` for the claim holder's process.
+It does not look for a CI job on the Mac, so a saved `free` line can show for one sample beside a CI job that just started.
+It compares the cause, not the holder, so a block or idle claim that replaces another one of the same cause shows the old holder until the next sample.
+The view shows the saved line only when the live state and cause agree with the saved reading.
+A saved line that disagrees is stale, and the view shows no Mac condition until the next sample.
+The watch message formats the reading that the watch just wrote, so it does not read the live state again.
+The views make no SSH or recipient lookup calls.
 
 The check counts live steps that can use a Mac.
 It accepts `AnyTarget` records with Mac targets.
@@ -302,8 +341,14 @@ Without `--target`, `--settings` selects the configuration.
 
 `write_result` writes `mac`, `reason`, and `seconds` from the typed run outcome.
 A busy result adds `holder`: its known job, `leftovers`, or `unreadable`.
-Missing or contradictory results are unusable.
-Declined, lost, and invalid results return the step to its waiting state.
+Verify checks the exact launch permission when a routed Mac command gives no usable result.
+The check uses the admission query timeout.
+Verify exits with status 2 if the queue consumed launch permission or cannot confirm it.
+One exception applies: the runner reported a settled refusal before any test started.
+Then no test started and no Mac cleanup is open, and Verify treats the result as a runner decline.
+The same exit applies when the runner loses the verdict and cannot confirm Mac cleanup.
+The local Verify place becomes free when Verify exits.
+The remote claim stays available for recovery until the runner confirms cleanup.
 
 - Declines print `mac_test: not running on the Mac (<reason>)`: `off`, `repo`, `linux_only`, `backoff`; claim `blocked`, `busy`, `state`; probe `unreachable` (with backoff), `disk`; then `copy`. The claim gates work; the probe has no process-count, load or power check: a Mac on battery runs tests. An app open on the Mac does not exclude a test.
 - The probe reads the hostname and free GiB against `free_floor_gib`, with no power or process check. Coordination records decide whether the Mac is held or busy.
@@ -341,8 +386,19 @@ Declined, lost, and invalid results return the step to its waiting state.
   The reader holds a shared lock until the copy ends.
   The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
   If the log writer cannot start nextest, the runner reports a setup failure.
-- **Markers.** `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
-- `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
+- `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
+  Later ordinary output invalidates the held marker.
+  A held marker supplies the command verdict even if SSH ends with an error.
+  `parse_cleanup` records a missing, malformed, or out-of-range cleanup marker as `CleanupUnconfirmed`.
+  `ReportedMacStatus` holds the verdict and the cleanup state.
+- A cleanup timeout preserves the verdict and records unconfirmed cleanup.
+  This applies to each routed Mac command and to the cleanup stream after a fetch.
+  A timeout retains the claim for recovery.
+  If a stream ends without a usable cleanup marker, `claimed_run` checks for leftovers.
+  In that case, it releases the claim only after `LeftoversEnded`.
+- When launch authorization has no confirmed reply, one deadline covers the exact release.
+  The release helper gives SSH the remaining time.
+  At the deadline, the runner stops the release helper and its local SSH process as a group.
 - SIGINT, SIGTERM, and SIGHUP stop the SSH child.
   The runner checks remote leftovers and releases its claim only after it confirms their end.
   The exit status is 128 plus the signal number.
@@ -359,10 +415,14 @@ Declined, lost, and invalid results return the step to its waiting state.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
   Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  Each routed Mac command uses that limit from the time it receives the verdict.
+  A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
   A failed check or a remaining process keeps the remote claim.
 
-- Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`.
+- Every ssh call takes `ssh_options(config)`: `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval=15`, and
+  `ServerAliveCountMax` = `unreachable_wait_seconds` (`build_targets.conf`) / 15, rounded up. A session with no answer
+  for that wait ends, and the routed run ends as lost.
 
 ### `verify.sh test` — `scripts/direct/verify.sh`
 
@@ -376,8 +436,10 @@ Its saved-result key includes `--run-ignored only`.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
 A retry backoff does not refuse at once. `build_targets.py probe-backoff --target mac` probes the Mac one time.
-A pass clears the backoff and the failed probe mark, and the call waits for placement.
-A failed probe refuses the call as unreachable. Movable steps skip the Mac during the backoff, as before.
+A successful probe clears failures that predate the probe.
+A failed probe refuses the call as unreachable.
+For queued steps, the queue uses the normal Mac probe to check recovery during an active backoff.
+Each target gets at most one recovery probe per waiting pass interval.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 
@@ -609,7 +671,7 @@ The token boundary, local repair rule, and step records remain in verify.sh.
 
 A failed reach writes `failed_probe` in the target state folder.
 The record has no expiry time.
-A successful `probe_mac` or a passed Mac-only backoff probe removes it and the retry backoff.
+A successful probe removes the mark and retry backoff if both records predate the probe.
 An unresolved startup or an interrupted target keeps the record unchanged.
 
 A tool version mismatch writes `version-decline-<repository>` in the same folder.

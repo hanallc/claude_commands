@@ -1445,7 +1445,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
 
 @contextmanager
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                 merge: MergePolicy = NO_MERGE, step: str = "") -> Generator[Path]:
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
     """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
     job = command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
@@ -1453,11 +1453,13 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
         with ExitStack() as scope:
             if isinstance(job, StepJob):
                 source = Path(repo).expanduser().resolve()
-                if isinstance(verify_command(command), VerifyCommand):
+                if gate_targets or isinstance(verify_command(command), VerifyCommand):
                     source = scope.enter_context(requested_source(source, policy, merge))
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
-                admitted = scope.enter_context(first_step.admitted_run(command, source))
+                admission = (first_step.admitted_run(command, source, targets=gate_targets) if gate_targets
+                             else first_step.admitted_run(command, source))
+                admitted = scope.enter_context(admission)
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
                 admitted.handoff(tree)
             else:
@@ -2103,16 +2105,61 @@ class BusyRemoteMirror(CopyError):
     """A live run holds this remote mirror."""
 
 
+class BusyRemoteHost(BusyRemoteMirror):
+    """An operation holds the lease for the host's mirrors."""
+
+
+@contextmanager
+def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
+    """Use a shared lease for one mirror and an exclusive lease for all mirrors."""
+    registry = remote_registry()
+    registry.mkdir(parents=True, exist_ok=True)
+    lock_path = registry / (remote_key(host, "") + ".host-lease")
+    with lock_path.open("a", encoding="utf-8") as lock:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BusyRemoteHost(f"{host}: a mirror lease is busy") from error
+        yield
+
+
 @contextmanager
 def remote_lease(mirror: RemoteMirror) -> Generator[None]:
     """Take the mirror lease before admission, claims and record locks."""
-    remote_registry().mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(remote_lease_path(mirror), wait=False) as state:
+    with _remote_mirror_lock(mirror.host, remote_lease_path(mirror)) as state:
         if state is file_lock.LockResult.BUSY:
             record = remote_record_path(mirror)
             session = read_remote_mirror(record).session if record.exists() else mirror.session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
+
+
+@contextmanager
+def remote_mirror_lease(host: str, path: Path) -> Generator[None]:
+    """Take the lease named in a shell run's sidecar."""
+    if (path.parent != remote_registry() or path.suffix != ".lease" or len(path.stem) != 64
+            or any(character not in "0123456789abcdef" for character in path.stem)):
+        raise CopyError(f"{path}: invalid remote mirror lease path")
+    with _remote_mirror_lock(host, path) as state:
+        if state is file_lock.LockResult.BUSY:
+            raise BusyRemoteMirror(f"{path}: the mirror lease is busy")
+        record = path.with_suffix(".json")
+        if record.exists():
+            mirror = read_remote_mirror(record)
+            if mirror.host != host or remote_lease_path(mirror) != path:
+                raise CopyError(f"{path}: the lease does not match the registered mirror")
+        yield
+
+
+@contextmanager
+def _remote_mirror_lock(host: str, path: Path) -> Generator[file_lock.LockResult]:
+    """Take the same host and mirror leases for shell and Python callers."""
+    with (
+        remote_host_lease(host, exclusive=False),
+        file_lock.exclusive(path, wait=False) as state,
+    ):
+        yield state
 
 
 def path_missing_command(path: str) -> str:
@@ -2559,7 +2606,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
+            targets = first_step.gate_targets(command, args.targets)
+            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge, gate_targets=targets))
             environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
                            "BUILDLOG_PREPARED_COPY": str(tree)}
             target = tree / "target"
@@ -2576,6 +2624,21 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 selection = PublicationSelection.AVAILABLE
         publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
         return command_exit
+
+
+def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
+    """Place and run a named gate in the caller's prepared checkout."""
+    source = Path(args.repo or "").resolve()
+    targets = first_step.gate_targets(command, args.targets)
+    if not targets:
+        raise CopyError("gate-step requires a gate command and named targets")
+    with first_step.admitted_run(command, source, targets=targets) as admitted:
+        admitted.handoff(source)
+        result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
+                                                          check=False, text=True))
+        if result.stderr:
+            _ = sys.stderr.write(result.stderr)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
 def captured_path(root: Path, number: int, path: Path) -> Path:
@@ -2848,6 +2911,8 @@ class CopyArguments(argparse.Namespace):
     apply_uncommitted: str | None = None
     merge: str | None = None
     publish: list[str] = []
+    targets: str = ""
+    lease_fd: list[int] = []
     command: list[str] = []
     source: str = ""
     task: str = ""
@@ -2895,6 +2960,11 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     _ = clone_command.add_argument("--repository", default="hana")
     _ = clone_command.add_argument("--session", default="")
     run = commands.add_parser("run", help="run a command in a private source copy")
+    gate = commands.add_parser("gate-step", help="place a gate in a prepared checkout")
+    _ = gate.add_argument("--repo", required=True)
+    _ = gate.add_argument("--targets", required=True)
+    _ = gate.add_argument("--lease-fd", action="append", type=int, default=[])
+    _ = gate.add_argument("command", nargs=argparse.REMAINDER)
     hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
     _ = hold.add_argument("--repo", required=True)
     _ = hold.add_argument("--tree", default="")
@@ -2912,6 +2982,7 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     _ = run.add_argument("--commit", required=True)
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
+    _ = run.add_argument("--targets", default="", help="name the gate targets in a comma-separated list")
     _ = run.add_argument("--publish", action="append", default=[], metavar="PATH",
                          help="copy a built relative path into a scratch folder")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
@@ -2987,6 +3058,8 @@ def main(argv: list[str] | None = None) -> int:
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
             return run_copy(args, command, policy, merge)
+        if args.action == "gate-step":
+            return run_gate_step(args, command_tail(args.command))
         if args.action == "list":
             list_trees()
         else:

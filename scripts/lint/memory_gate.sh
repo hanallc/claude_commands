@@ -153,7 +153,11 @@ build_hold_check_local() {
     local status=0
     local session_args=()
     if [[ -n "${BUILDLOG_PLACEMENT_EPISODE:-}" ]]; then session_args=(--session "${PLACEMENT_SESSION:-}"); fi
-    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" ${session_args[@]+"${session_args[@]}"} || status=$?
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" \
+            ${session_args[@]+"${session_args[@]}"}
+    ) || status=$?
     build_hold_check_result "$status" check-local
 }
 

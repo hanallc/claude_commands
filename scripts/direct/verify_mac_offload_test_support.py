@@ -14,7 +14,8 @@ from scripts.lib.checkout_test_support import python_tool_source, write_python_t
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
+                                              write_pressure_reading)
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
@@ -36,6 +37,7 @@ from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from secrets import token_hex
 from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
@@ -48,6 +50,7 @@ from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+
 
 _REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
 
@@ -509,6 +512,8 @@ if has "$@"; then
     if ! has "$@"; then printf 'Cargo.toml\0'; fi
     exit 0
 fi
+wanted=--max-parents=0
+if has "$@"; then printf '%s\n' "${TEST_ROOT_COMMIT:?}"; exit 0; fi
 for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
@@ -553,6 +558,16 @@ if "--assignment-file" in arguments:
     with redirect_stdout(io.StringIO()):
         claim_status = assigned_mac_test.command_claim(claim_args, paths, watch_claim=False,
             session=assignment.session, assignment=assignment)
+    if claim_status == claim_state.MAC_HISTORY_KEY_UNAVAILABLE_STATUS:
+        from scripts.mac_test import offload
+
+        reason = claim_state.MAC_HISTORY_KEY_UNAVAILABLE
+        status = offload.write_result(offload.DeclinedMacRun(reason, 0), offload.ResultFile(result))
+        try:
+            _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, assignment.episode, assignment.owner, reason))
+        except wire.AdmissionUnavailable as error:
+            print(f"fixture cancellation failed: {{error}}", file=sys.stderr, flush=True)
+        raise SystemExit(status)
     if claim_status != 0:
         raise SystemExit(75)
     held, = [held for held in claim_state.read_claims(paths) if held.record["pid"] == os.getpid()]
@@ -1031,6 +1046,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
             self.fixture_paths()
             self.environment = self.fixture_environment.copy()
+            self.environment["TEST_ROOT_COMMIT"] = token_hex(20)
         else:
             # Standalone consumers own their fixture through doCleanups().
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1225,7 +1241,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
         config = self.root / "build_targets.conf"
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
-                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
+                              + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
@@ -1300,6 +1316,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "holder_pid"),
             "TEST_METADATA": json.dumps(metadata),
+            "TEST_ROOT_COMMIT": token_hex(20),
             "TEST_RUNNER_SECONDS": "3.25",
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
@@ -1362,7 +1379,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
-            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
+            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "remove_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
@@ -1379,6 +1396,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         setup = r'''
 set -euo pipefail
 PY=$TEST_REAL_DIRECT/../lib/py
+VERIFY_START_DIR=$TEST_REAL_DIRECT
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
@@ -1408,7 +1426,7 @@ MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB=""
 PINNED_TARGET="" STEP_FORCE_MAC=0
-PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
+PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_ATTEMPT="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
 admit_verify_run() { :; }

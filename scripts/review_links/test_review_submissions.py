@@ -109,9 +109,12 @@ class ReviewSubmissionTests(unittest.TestCase):
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.root / "config"),
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
+        conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(conf.path("machines"))
 
     @property
     def identities(self) -> update_registration.QuestionStaff:
@@ -1863,6 +1866,16 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.path.parent, investigation.folder(PRODUCER))
         record, = investigation.records(PRODUCER, include_read=True)
         self.assertEqual((record.id, record.owner), (saved.id, PRODUCER))
+
+    def test_list_owner_config_write_uses_the_test_directory(self) -> None:
+        path = conf.path("console")
+        live_path = Path(os.path.expanduser("~/.claude/config/console.conf"))
+        self.assertNotEqual(path, live_path)
+        self.assertEqual(path, self.root / "config" / "console.conf")
+
+        setting = f"page.list.owner={PRODUCER}"
+        _ = write_config_fixture(path, setting + "\n")
+        self.assertIn(setting, path.read_text(encoding="utf-8").splitlines())
 
     def test_f098_send_refuses_a_failed_owner_read_before_filing(self) -> None:
         document = self.doc.read_bytes()
