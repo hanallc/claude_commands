@@ -75,7 +75,8 @@ class MacIdleTests(NotificationGuardedTestCase):
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
         _ = write_config_fixture(self.root / "mac_test.conf",
-                                 "alert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+                                 "offload=on\nalert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
+        _ = write_config_fixture(self.root / "build_targets.conf")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
@@ -652,6 +653,118 @@ done
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["messaged"], saved["pushed"]), (True, True))
 
+    def test_mac_off_on_purpose_sends_no_push_and_a_mac_in_use_still_pushes(self) -> None:
+        def offload_off() -> None:
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+
+        def offload_on() -> None:
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+
+        def mac_disabled() -> None:
+            _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
+
+        def mac_enabled() -> None:
+            _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
+
+        def unblock() -> None:
+            (self.paths.mac_state / "block.json").unlink()
+
+        self.unreachable()
+        for signal_name, turn_off, turn_on in (("block", self.block, unblock), ("offload", offload_off, offload_on),
+                                               ("enabled", mac_disabled, mac_enabled)):
+            (self.paths.state / "alert.json").unlink(missing_ok=True)
+            mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
+            turn_off()
+            with self.subTest(signal=signal_name), \
+                 mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
+                 mock.patch.object(subprocess, "run",
+                                   return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run:
+                for now in (1180, 1600, 1660):
+                    mac_idle.watch_once(self.paths, now)
+                run.assert_not_called()
+                notify.assert_called_once()
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                self.assertEqual((saved["state"], saved["pushed"]), ("unreachable", False))
+                line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1660, ZoneInfo("UTC"))
+                self.assertIn("MAC UNREACHABLE", line or "")
+                turn_on()
+                mac_idle.watch_once(self.paths, 1720)
+                run.assert_called_once()
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
+                self.assertTrue(mac_idle.read_record(self.paths.state / "alert.json")["pushed"])
+
+    def test_a_push_ended_by_turning_the_mac_off_goes_again_when_the_mac_is_in_use(self) -> None:
+        self.unreachable()
+
+        def pushed() -> bool:
+            return bool(mac_idle.read_record(self.paths.state / "alert.json")["pushed"])
+
+        with (mock.patch.object(mac_idle, "notify_outage", return_value=True),
+              mock.patch.object(subprocess, "run",
+                                return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run):
+            mac_idle.watch_once(self.paths, 1600)
+            run.assert_called_once()
+            self.assertTrue(pushed())
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+            mac_idle.watch_once(self.paths, 1660)
+            run.assert_called_once()
+            self.assertFalse(pushed())
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+            mac_idle.watch_once(self.paths, 1720)
+            self.assertEqual(run.call_count, 2)
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--key") + 1], "mac-idle-1000")
+            self.assertTrue(pushed())
+
+    def test_a_push_retired_while_no_step_waits_on_a_mac_off_goes_again_in_use(self) -> None:
+        self.unreachable()
+        with (mock.patch.object(mac_idle, "notify_outage", return_value=True),
+              mock.patch.object(subprocess, "run",
+                                return_value=subprocess.CompletedProcess[str]([], 0, "SENT", "")) as run):
+            mac_idle.watch_once(self.paths, 1600)
+            run.assert_called_once()
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+            for record in (self.root / "steps").glob("*.json"):
+                record.unlink()
+            (self.paths.mac_state / "unreachable_until").unlink()
+            mac_idle.watch_once(self.paths, 1660)
+            saved = mac_idle.read_record(self.paths.state / "alert.json")
+            self.assertEqual((saved["since"], saved["pushed"]), (1000, False))
+            with mock.patch.object(time, "time", return_value=1660):
+                self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+            self.step()
+            self.unreachable()
+            mac_idle.watch_once(self.paths, 1720)
+            self.assertEqual(run.call_count, 2)
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
+            self.assertEqual(command[command.index("--key") + 1], "mac-idle-1000")
+
+    def test_one_outage_sends_one_push_across_no_waiting_steps_and_a_free_mac_reading(self) -> None:
+        def saved() -> tuple[str, str, int, bool]:
+            alert = mac_idle.read_record(self.paths.state / "alert.json")
+            return (str(alert["state"]), str(alert["cause"]), cast(int, alert["waiting"]), bool(alert["pushed"]))
+
+        self.unreachable()
+        with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True),
+              mock.patch.object(mac_idle, "push_outage", return_value=True) as push):
+            mac_idle.watch_once(self.paths, 1600)
+            self.assertEqual(saved(), ("unreachable", "", 1, True))
+            for record in (self.root / "steps").glob("*.json"):
+                record.unlink()
+            mac_idle.watch_once(self.paths, 1660)
+            self.assertEqual(saved(), ("unreachable", "", 0, True))
+            self.step()
+            (self.paths.mac_state / "unreachable_until").unlink()
+            mac_idle.watch_once(self.paths, 1720)
+            self.assertEqual(saved(), ("idle", "free", 1, True))
+            self.unreachable()
+            mac_idle.watch_once(self.paths, 1780)
+            self.assertEqual(saved(), ("unreachable", "", 1, True))
+        push.assert_called_once()
+
     def test_parked_app_claim_alert_names_holder_and_never_repairs(self) -> None:
         self.waiting_steps(7)
         _ = self.claim()
@@ -985,6 +1098,18 @@ done
             self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
         with mock.patch.object(time, "time", return_value=1481):
             self.assertEqual(mac_idle.main(["cleared", "--since", "999"]), 1)
+
+    def test_cleared_stops_a_sent_push_when_the_user_turns_the_mac_off(self) -> None:
+        self.unreachable()
+        with mock.patch.object(time, "time", return_value=1180):
+            mac_idle.watch_once(self.paths, 1180)
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
+            _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\n")
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
+            self.block()
+            self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
 
 
     def test_alert_boundary_validates_fields_and_line_is_fast_without_subprocess(self) -> None:

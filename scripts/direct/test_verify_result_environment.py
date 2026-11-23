@@ -10,7 +10,7 @@ from typing import cast, override
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
 )
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 FIXED_ENVIRONMENT = {
@@ -127,7 +127,7 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
         _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=peer,natedev\nkind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n")
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         result = self.verify("test", "sample", "--target", "peer", extra={
             "NO_COLOR": "1", **{name: "caller" for name in FIXED_ENVIRONMENT},
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",

@@ -2514,6 +2514,113 @@ class WorktreeLifecycleTests(unittest.TestCase):
         for path in (tree, output):
             self.assertIn(f"kept for a manual removal list: {path}", gone.stderr)
 
+    def test_make_carries_direnv_permission_only_for_the_allowed_source_file(self) -> None:
+        self.layout_fixture()
+        source = self.home / "rust/origin"
+        source.parent.mkdir()
+        _ = self.git(self.root, "clone", str(self.repository), str(source))
+        _ = self.git(source, "remote", "set-url", "origin", str(self.origin))
+        source_rc = source / ".envrc"
+        original = b"export FIXTURE=tracked\n"
+        _ = source_rc.write_bytes(original)
+        target_rc = source / "fixture.envrc"
+        _ = target_rc.write_bytes(original)
+        _ = self.git(source, "add", source_rc.name, target_rc.name)
+        _ = self.git(source, "commit", "-m", "Add the fixture environment")
+
+        log = self.root / "direnv.log"
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        direnv = bin_dir / "direnv"
+        link_target = self.root / "nested"
+        link_target.mkdir()
+        (self.repository / "bin-link").symlink_to(link_target, target_is_directory=True)
+        _ = direnv.write_text(rf"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["DIRENV_TEST_LOG"]).open("a") as log:
+    log.write(json.dumps([os.getcwd(), *args]) + "\n")
+if args == ["status", "--json"]:
+    path = os.environ.get("DIRENV_TEST_PATH", str(Path.cwd() / ".envrc"))
+    print(json.dumps({{"state": {{"foundRC": {{"path": path, "allowed": int(os.environ["DIRENV_TEST_STATUS"])}}}}}}))
+    raise SystemExit(0)
+if len(args) == 2 and args[0] == "allow":
+    if os.environ["DIRENV_TEST_CHANGE_ON_ALLOW"] == "1":
+        (Path(args[1]) / ".envrc").write_text("export FIXTURE=changed_during_allow\n")
+    raise SystemExit(int(os.environ["DIRENV_TEST_ALLOW_EXIT"]))
+if len(args) == 2 and args[0] == "deny":
+    raise SystemExit(0)
+raise SystemExit(2)
+""")
+        direnv.chmod(0o755)
+        original_path = self.environment["PATH"]
+        self.environment["DIRENV_TEST_LOG"] = str(log)
+
+        for name, expected_commands, warning in (
+            ("equal", ["status", "allow"], False),
+            ("relative-path", ["status", "allow"], False),
+            ("symlink-path", ["status", "allow"], False),
+            ("different", [], True),
+            ("unallowed", ["status"], True),
+            ("other-file", ["status"], True),
+            ("allow-failed", ["status", "allow"], True),
+            ("changed-during-allow", ["status", "allow", "deny"], True),
+            ("source-symlink", [], True),
+            ("checkout-symlink", [], True),
+            ("absent", [], False),
+        ):
+            with self.subTest(name=name):
+                match name:
+                    case "relative-path":
+                        fake_path = os.path.relpath(bin_dir, self.repository)
+                    case "symlink-path":
+                        fake_path = "bin-link/../bin"
+                    case _:
+                        fake_path = str(bin_dir)
+                self.environment["PATH"] = fake_path + os.pathsep + original_path
+                self.environment["DIRENV_TEST_STATUS"] = "1" if name == "unallowed" else "0"
+                self.environment["DIRENV_TEST_ALLOW_EXIT"] = "1" if name == "allow-failed" else "0"
+                self.environment["DIRENV_TEST_CHANGE_ON_ALLOW"] = "1" if name == "changed-during-allow" else "0"
+                found = source.parent / ".envrc" if name == "other-file" else source_rc
+                self.environment["DIRENV_TEST_PATH"] = str(found)
+                if name == "absent":
+                    _ = self.git(source, "checkout", "--detach", self.base)
+                elif name in {"source-symlink", "checkout-symlink"}:
+                    source_rc.unlink()
+                    source_rc.symlink_to(target_rc.name)
+                    if name == "checkout-symlink":
+                        _ = self.git(source, "commit", "-am", "Link the fixture environment")
+                        source_rc.unlink()
+                        _ = source_rc.write_bytes(original)
+                else:
+                    _ = source_rc.write_bytes(b"export FIXTURE=modified\n" if name == "different" else original)
+                _ = log.write_text("")
+                command = [sys.executable, "-B", str(WORKTREES), "make", "origin", "demo", name]
+                result = self.command(self.repository, command)
+                if name in {"source-symlink", "checkout-symlink"}:
+                    _ = self.git(source, "restore", source_rc.name)
+                tree = self.trees / "origin/demo" / name
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(tree))
+                notice = f"make: .envrc not allowed. Run direnv allow {shlex.quote(str(tree))}"
+                notices = [line for line in result.stderr.splitlines() if line.startswith("make: .envrc")]
+                self.assertEqual(notices, [notice] if warning else [])
+                calls = {"status": [str(source), "status", "--json"],
+                         "allow": [str(self.repository), "allow", str(tree)],
+                         "deny": [str(self.repository), "deny", str(tree)]}
+                self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                                 [calls[command] for command in expected_commands])
+                if name == "equal":
+                    _ = log.write_text("")
+                    repeated = self.command(self.repository, command)
+                    self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                    self.assertEqual(repeated.stdout.strip(), str(tree))
+                    self.assertEqual(log.read_text(), "")
+
     def test_make_assigns_output_to_a_legacy_checkout_on_its_recorded_branch(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "probe")
@@ -3026,29 +3133,21 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.environment.update({"PATH": str(bin_dir) + os.pathsep + self.environment["PATH"],
                                  "LINT_SWEEP_STATE_DIR": str(state)})
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
-        host = conf.local_host_key_name()
-        _ = write_config_fixture(config, f"roots.slot_cargo.{host}={cargo_root}\nroots.cargo_paths.{host}={mirror}\n"
-            + f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
+        _ = write_config_fixture(config, f"roots.build={self.root / 'build'}\nroots.build.natedev={self.root / 'build'}\n"
             + f"roots.workspace={self.root / 'worktrees'}\n")
         return tree, build
 
-    def test_landed_worktree_lists_its_external_cargo_output(self) -> None:
+    def test_landed_legacy_worktree_reports_only_its_checkout(self) -> None:
+        # The old Cargo mirror keys are gone, so its output is no longer found or listed.
         tree, build = self.landed_cargo_worktree()
         file = build / "debug/deps/libportable-1234567890abcdef.rlib"
         file.parent.mkdir(parents=True)
         _ = file.write_text("build output")
-        self.assertEqual(self.finish_landed(reviewed=(build, tree)),
+        self.assertEqual(self.finish_landed(reviewed=(tree,)),
                          [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
         self.assertEqual(file.read_text(), "build output")
-        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
-
-    def test_landed_worktree_reports_an_empty_external_output(self) -> None:
-        tree, build = self.landed_cargo_worktree()
-        build.mkdir()
-        self.assertEqual(self.finish_landed(reviewed=(build, tree)),
-                         [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
-        self.assertTrue(build.is_dir())
         self.assertTrue(tree.is_dir())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
 
     def test_worktree_removal_keeps_unassigned_outputs(self) -> None:
         tree, default = self.landed_cargo_worktree()

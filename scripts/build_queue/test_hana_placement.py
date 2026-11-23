@@ -33,7 +33,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
 
@@ -878,7 +878,7 @@ class HanaGpuQueueTests(unittest.TestCase):
             _ = (fixture.root / 'build_targets.conf').write_text(
                 'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
                 + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
-                + 'settings.hana-gpu=cloud_gate.conf\n')
+                + 'settings.hana-gpu=cloud_gate.conf\n' + UNREACHABLE_WAIT_FIXTURE)
             account = target_config.ssh_target_state_directory('aws')
             account.mkdir(parents=True)
             _ = (account / 'gate-deployment.json').write_text('{"gpu_instance_types":["g6.2xlarge"]}')

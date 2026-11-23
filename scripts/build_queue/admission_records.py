@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
-from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
@@ -155,7 +155,8 @@ class GpuTestSlots:
 # These steps run test binaries; a GPU repository's tests open render apps.
 GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
-REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected"})
+# A hand made run counts in the run limit of its machine and repository, as a gate does.
+REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected", HAND_MADE.step})
 RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
 
 

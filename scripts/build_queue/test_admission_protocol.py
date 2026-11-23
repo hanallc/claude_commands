@@ -60,6 +60,35 @@ class ProtocolTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "placement requires version 3"):
                         _ = wire.encode_reply(reply, version=2)
 
+    def test_placement_status_report_parses_across_service_and_client_versions(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt,
+                                                                include_permission=True)
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused("runner"),
+                                                     placement.DispatchPathSettled(), NOW)
+            known = status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("runner"),
+                placement.NoProviderClaim(), placement.PermissionConsumed(NOW), report)
+            reply = status_wire.PlacementStatusReply(known)
+            encoded = wire.encode_reply(reply)
+            self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            status = cast(dict[str, object], cast(dict[str, object], envelope["data"])["status"])
+            # An older service sends no report: the client reads no report, so Verify keeps the lost path.
+            del status["report"]
+            older_service = wire.parse_reply(json.dumps(envelope), status_request)
+            self.assertEqual(older_service,
+                             status_wire.PlacementStatusReply(replace(known, report=placement.NoTerminalReport())))
+            # An older client reads a reply with a field it does not know.
+            status["field_from_a_newer_service"] = "ignored"
+            self.assertEqual(wire.parse_reply(json.dumps(envelope), status_request), older_service)
+
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
