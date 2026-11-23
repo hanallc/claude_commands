@@ -40,6 +40,7 @@ from scripts.agents import pane_record as hook_pane_record
 
 from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.herdr.test_herdr import ClaudeForegroundSocket
 from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
@@ -117,7 +118,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
-        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN))
         _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))

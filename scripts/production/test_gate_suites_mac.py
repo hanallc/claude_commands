@@ -484,12 +484,12 @@ class MacGateSuitesTests(GateSuitesFixture):
         assignment = self.gate_assignment("mac-linux")
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
-        reason = "mac-linux: not started: the guest did not arm the run: fixture SSH refused the connection"
+        reason = "the guest did not arm the run: fixture SSH refused the connection"
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
               mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(reason)) as guest,
               mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
-        self.assertIn(reason, errors.getvalue())
+        self.assertEqual(errors.getvalue(), f"Mac Linux guest took no run: {reason}\n")
         guest.assert_called_once()
         local.assert_not_called()
         self.cloud_route.assert_not_called()
@@ -530,7 +530,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                                     selection_certified=True)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
               mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(
-                  "mac-linux: not started: the guest did not arm the run: fixture")) as guest,
+                  "the guest did not arm the run: fixture")) as guest,
               mock.patch.object(gate, "run_suites", return_value=local_result) as local,
               mock.patch.object(admission_client, "claim_failure", side_effect=settle) as settled,
               mock.patch.object(first_step, "_placement_grant", side_effect=place) as placed,
@@ -567,7 +567,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
               mock.patch.object(mac_linux, "route", return_value=mac_linux.GuestNotStarted(
-                  "mac-linux: not started: fixture")) as guest,
+                  "fixture")) as guest,
               mock.patch.object(admission_client, "claim_failure", side_effect=settle),
               mock.patch.object(first_step, "_placement_grant",
                                 side_effect=first_step.FirstStepRefused("the request left the queue", 75)),

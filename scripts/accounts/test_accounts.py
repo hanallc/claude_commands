@@ -57,6 +57,7 @@ from scripts.agents.test_support import write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -1199,7 +1200,7 @@ class AccountsTests(unittest.TestCase):
                      agent_session=herdr.ReportedAgentSession("idle-thread")),
                   herdr.AgentOccupant(pane_id="w1:p3", agent="codex", agent_status=herdr.AgentStatus.STARTING,
                      agent_session=herdr.ReportedAgentSession("starting-thread"))]
-        with (patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"),
+        with (patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN),
               patch.object(herdr.Herdr, "agents", return_value=agents) as activity,
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({
                   "busy-thread": (990,), "idle-thread": (991,), "starting-thread": (992,)}, ())) as conversations):

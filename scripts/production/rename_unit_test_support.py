@@ -32,6 +32,7 @@ from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.agents import shutdown
 from scripts.agents import pane_record
 from scripts.style import style_ledger
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
@@ -367,7 +368,7 @@ class FolderRenameFixture(StaffTestCase):
         self.configuration = self.root / "production.conf"
         self.env = {
             **config_environment(self.root),
-            "HOME": str(self.home), "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(self.home), "HERDR_BIN": MISSING_HERDR_BIN,
             "HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux",
             "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "HERDR_PANE_RECORD_DIR": str(self.records),

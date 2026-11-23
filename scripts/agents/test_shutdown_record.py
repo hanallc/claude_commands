@@ -18,6 +18,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.agents import shutdown_record
 from scripts.lib import conf
 from scripts.agents.test_support import ShutdownTestCase
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 class ShutdownRecordTests(ShutdownTestCase):
@@ -28,7 +29,7 @@ class ShutdownRecordTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": "/nonexistent/herdr"})))
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": MISSING_HERDR_BIN})))
 
     def test_a_missing_record_lock_key_fails_and_names_the_key_and_path(self) -> None:
         config = self.root / "config"

@@ -31,6 +31,7 @@ from scripts.production.staff_test_support import (
     fixture_member, isolated_source_readers, isolated_staff_file, production_staff_record,
     recorded_showrunner, source_environment, unit_membership,
 )
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LIST = """# Change review
 
@@ -93,7 +94,7 @@ class FooterCountsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
+            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
         _ = self.enterContext(isolated_source_readers())
