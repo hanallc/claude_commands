@@ -5,6 +5,7 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext
 import os
 from pathlib import Path
+import signal
 from tempfile import TemporaryDirectory
 from typing import cast
 import unittest
@@ -31,6 +32,57 @@ def placed(target: str) -> wire.Assignment:
 
 
 class GateDefaultPlacementTests(unittest.TestCase):
+    def test_sigterm_releases_each_direct_placement_before_termination(self) -> None:
+        merge = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
+                 '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1']
+        nightly = ['--nightly', '--merge-branch', 'main', '--unit', 'fixture']
+        for arguments in (['--affected'], ['--tests-only'], nightly, merge):
+            with self.subTest(arguments=arguments):
+                events: list[str] = []
+
+                @contextmanager
+                def admit(*_args: object, **_options: object) -> Generator[object]:
+                    events.append('admit')
+                    try:
+                        yield mock.Mock(spec=first_step.FirstStepAdmission,
+                                        grant=mock.Mock(spec=first_step.GatePlacement))
+                    finally:
+                        events.append('release')
+
+                def interrupt(*_args: object) -> int:
+                    handler = signal.getsignal(signal.SIGTERM)
+                    assert callable(handler)
+                    events.append('interrupt')
+                    handler(signal.SIGTERM, None)
+                    raise AssertionError('SIGTERM did not interrupt the gate')
+
+                def interrupt_placed(args: gate.GateArguments, target: gate.GateTarget) -> int:
+                    with gate.gate_suite_target(args, Path.cwd(), target):
+                        return interrupt()
+
+                def terminate(number: int) -> None:
+                    self.assertEqual(number, signal.SIGTERM)
+                    self.assertEqual(signal.getsignal(number), signal.SIG_DFL)
+                    events.append('terminate')
+
+                with (mock.patch.dict(os.environ, clear=True),
+                      mock.patch.object(first_step, 'admitted_run', side_effect=admit),
+                      mock.patch.object(gate, 'current_gate_placement',
+                                        side_effect=[gate.NO_GATE_ASSIGNMENT, placed('aws')]),
+                      mock.patch.object(gate, 'run_tests_only', side_effect=interrupt),
+                      mock.patch.object(gate, 'merge_checkpoint', side_effect=interrupt_placed),
+                      mock.patch.object(gate, 'nightly', side_effect=interrupt_placed),
+                      mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
+                      mock.patch.object(gate, '_sweep_nightly_build_folders'),
+                      mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
+                      mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),
+                      mock.patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+                      mock.patch.object(signal, 'raise_signal', side_effect=terminate),
+                      self.assertRaises(SystemExit) as exited):
+                    _ = gate.main(arguments)
+                self.assertEqual(exited.exception.code, 128 + signal.SIGTERM)
+                self.assertEqual(events, ['admit', 'interrupt', 'release', 'terminate'])
+
     def test_default_modes_enter_one_admission_for_the_whole_command(self) -> None:
         checkpoint = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
                       '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1']
@@ -173,7 +225,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             clone.mkdir()
             command = ('gate.py', '--nightly', '--merge-branch', 'main', '--unit', 'fixture')
             args = gate.GateArguments(repo=str(repo), merge_branch='main', unit='fixture', command=command)
-            assignment = placed('aws')
+            assignment = placed('mac-linux')
             admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
             with (mock.patch.object(gate, 'nightly_git'), mock.patch.object(gate, 'checked_git', return_value='tree'),
                   mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
@@ -186,7 +238,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(gate.nightly(args, gate.NO_GATE_ASSIGNMENT), 0)
             admit.assert_called_once_with(command, clone)
             self.assertEqual(run.call_args.args[0], clone)
-            self.assertEqual(run.call_args.kwargs['target'], gate.AwsGateAssignment(assignment.assignment))
+            self.assertEqual(run.call_args.kwargs['target'], gate.MacLinuxAssignment(assignment.assignment))
             publish.assert_called_once()
 
     def test_promote_only_skips_placement(self) -> None:
