@@ -2835,6 +2835,19 @@ class ClientTests(unittest.TestCase):
                 self.assertFalse(fixture.clock.sleeps)
                 self.doCleanups()
 
+    def test_a_hung_service_refuses_a_placement_status_query_once_without_token_words(self) -> None:
+        # The gate prints its own refusal line; a query holds no step and no cargo token.
+        with AdmissionFixture() as fixture:
+            fixture.configure(unreachable_limit_seconds=0.3, silence_seconds=5)
+            transport = self.use_transport(fixture, Exchange(TimeoutError()))
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors, \
+                    self.assertRaises(wire.AdmissionUnavailable) as refused:
+                _ = client.placement_status("episode-a", "attempt-a")
+            self.assertEqual(refused.exception.reason, "build queue unreachable for 0.3 s")
+            self.assertEqual(output.getvalue() + errors.getvalue(), "")
+            self.assertEqual(fixture.clock.monotonic(), 0.3)
+            self.assertEqual(len(transport.requests), 1)
+
     def test_lint_cancellation_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
         cases: tuple[tuple[str, str], ...] = (
             ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))
@@ -2958,7 +2971,9 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(result, 2)
                     self.assertEqual(fixture.clock.monotonic(), limit)
                     duration = "1 min" if limit == 60 else f"{limit} s"
-                    self.assertIn(f"build queue unreachable for {duration}; step stopped", errors.getvalue())
+                    # A placement control request holds no step and no token, so its reason has no token words.
+                    self.assertEqual(errors.getvalue().count(f"build queue unreachable for {duration}"), 1, errors.getvalue())
+                    self.assertNotIn("step stopped", errors.getvalue())
                     self.assertEqual(len(transport.attempts), len(exchanges))
                     self.assertTrue(transport.requests)
                     self.assertTrue(all(request == transport.requests[0] for request in transport.requests))
