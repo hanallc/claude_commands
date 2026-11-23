@@ -21,7 +21,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import cached_property
 from itertools import chain
@@ -33,7 +33,7 @@ from scripts.lib import atomic_file, urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production.issues import ALL_FIELDS, PROPOSAL_TAG, Issue, frontmatter, header_fields
 from scripts.production import record_store, staff, unit_names
-from scripts.review_links import new_item_dialog, review_events
+from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, ReviewMark, StoredReviewLog
 
 FENCE = "---"
@@ -164,6 +164,10 @@ def _with_review_log(text: str, path: Path, events: tuple[ReviewLog, ...]) -> st
     return "".join(lines)
 
 
+def pending_review_reply(issue: Issue) -> bool:
+    return not review_is_done(issue) and review_mark(issue) == ReviewMark.WAITING
+
+
 @dataclass(frozen=True)
 class ProposalSubmissionReply:
     owner: staff.StaffId
@@ -180,7 +184,7 @@ _NO_SUBMISSION_REPLY = NoProposalSubmissionReply()
 
 def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate", *,
                   check: Callable[[], object] | None = None, waiting_why: str = "", check_state: Callable[[], None] = lambda: None,
-                  reply_token: str = "",
+                  new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof = reply_tokens.MINT_REPLY_PROOF,
                   submission_reply: ProposalSubmissionReply | NoProposalSubmissionReply = _NO_SUBMISSION_REPLY) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
@@ -201,7 +205,7 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
                            if entry.words.startswith(("Answer: ", "question: "))), "")
             closed = review_is_done(issue)
             repeated = not closed and isinstance(review_mark(issue), NoMark) and latest == words
-            if not repeated and (closed or review_mark(issue) != ReviewMark.WAITING):
+            if not repeated and not pending_review_reply(issue):
                 raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
             if repeated:
                 return False
@@ -215,10 +219,10 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
         mark = review_events.changed_mark(review_mark(issue), change)
         new_wait: dict[str, str] = {}
         if change == ReviewMark.WAITING and issue.value("review_submission"):
-            details = review_submission(issue)
-            assert isinstance(details, new_item_dialog.ReviewSubmission)
-            token = reply_token or new_item_dialog.new_reply_token()
-            new_wait["review_submission"] = json.dumps(new_item_dialog.stored_submission(replace(details, reply_token=token)))
+            fields = cast(dict[str, object], json.loads(issue.value("review_submission")))
+            _ = new_item_dialog.read_submission(fields)
+            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+            new_wait["review_submission"] = json.dumps(new_item_dialog.renewed_submission_fields(fields, proof))
         if not new_wait and events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
             return False
         text = _with_review_log(read_issue(path), path, events)
@@ -526,12 +530,56 @@ def write_issue(path: Path, text: str) -> None:
     owner = proposal_owner(fields, fields.value("proposed_by") if fields.value("review_submission") else "")
     if not owner:
         owner = _proposal_owner(path.parent, fields.value("proposed_by"))
-    with proposal_numbers() as numbers:
-        with numbers.write(path, identity, owner):
-            _replace_issue(path, text)
+    with proposal_numbers() as numbers, numbers.write(path, identity, owner):
+        _replace_issue(path, text)
+
+
+def renew_reply_proof(issue: Issue, proof: reply_tokens.ReplyTokenProof) -> None:
+    """Replace the proof under the Proposal lock."""
+    fields = cast(dict[str, object], json.loads(issue.value("review_submission")))
+    updated = new_item_dialog.renewed_submission_fields(fields, proof)
+    text, _ = set_fields(read_issue(issue.path), {"review_submission": json.dumps(updated)}, issue.path)
+    write_issue(issue.path, text)
+
+
+def scrub_reply_token(path: Path) -> bool:
+    with issue_lock(path):
+        text = read_issue(path)
+        lines = record_store.lines_with_endings(text)
+        fields = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
+        raw = fields.value("review_submission")
+        if not raw:
+            return False
+        value = cast(dict[str, object], json.loads(raw))
+        if "reply_token" not in value:
+            return False
+        write_issue(path, text)
+        return True
+
+
+def _hash_legacy_reply(path: Path, text: str) -> str:
+    lines = record_store.lines_with_endings(text)
+    end = _closing_fence(lines, path)
+    span = _key_span(lines, end, "review_submission")
+    if span is None:
+        return text
+    issue = Issue(path, header_fields(lines[1:end]))
+    origin = review_submission(issue)
+    if not isinstance(origin, new_item_dialog.ReviewSubmission):
+        return text
+    value = cast(dict[str, object], json.loads(issue.value("review_submission")))
+    updated = new_item_dialog.hashed_submission_fields(value, origin)
+    if updated is value:
+        return text
+    start, _ = span
+    newline = lines[start][len(lines[start].rstrip("\r\n")):]
+    lines[start] = "review_submission: " + json.dumps(updated) + newline
+    return "".join(lines)
 
 
 def _replace_issue(path: Path, text: str) -> None:
+    if "review_submission:" in text:
+        text = _hash_legacy_reply(path, text)
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(

@@ -94,7 +94,7 @@ Requests and cleanup continue when this logging setting is unusable.
 ### Build filesystem space
 
 The natedev service reads `free_floor_gib` from the `[disk]` section of `build_admission.conf` each pass.
-The service measures available space at the configured `roots.slot_cargo` path once per pass.
+The service measures available space at the build root (`build_folders.conf` `roots.build`, `/build` on natedev) once per pass.
 If space is below the floor or the reading fails, new local steps wait in order.
 Running steps continue.
 Eligible remote steps can start on a remote target.
@@ -458,6 +458,12 @@ A running AWS gate box shows `box running · no link or load reading`, because i
 A probe that cannot start shows `facts unreadable`.
 A missing or invalid file reads as `machine_facts.FactsUnread.VALUE` and shows `facts not sampled`.
 Facts older than `machine_facts.STALE_SECONDS` (three timer periods) show `facts not sampled since HH:MM` in the user's zone.
+
+A Mac claim without a repository row shows under the Mac heading as `1 in use`, with a run mark.
+A kept claim (`mac_test.run_is_kept()`: the leftovers of a stopped run) shows as `1 kept (leftover of a stopped run)`, and two or more show as `2 kept (leftovers of stopped runs)`. Both kinds show as `1 in use · 1 kept (leftover of a stopped run)`.
+A kept claim has the kept mark, a filled square (`.build-limit-mark.kept`), in place of the run mark, under the heading and in a repository cell. The legend names it `A place kept by a stopped run`.
+`limits_view.read_mac()` carries the kind as `MacClaimUse`. A kept claim still counts in the limit. A repository cell counts it in `used` and in `kept`, and its hover names it under `Places`.
+
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
 A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
 `can run on` is one line that names the targets that can take the step now.
@@ -687,7 +693,8 @@ Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Cargo estimates separate compile history from no-compile history.
 `index_step_evidence` joins each anonymous peak by host, call id, and step.
 `StepEvidence` keeps its shape and compile count independent.
-For a test step (`TEST_STEPS`: `nextest`, `test`, `t`), it also keeps the decoded argv as `arguments`.
+For a test step (`TEST_STEPS`: `nextest`, `test`, `t`) or a `check` step, it also keeps the decoded argv as `arguments`.
+`history_selection` reads it for test steps, and `same_check_targets` reads it for check.
 `history_selection` gives each anonymous row its package, scope and filter set.
 A recorded field wins. Only a missing field is parsed from `arguments`, once, through `test_selection`.
 A row with neither keeps the recorder defaults: no package, `full`, no filters.
@@ -723,6 +730,10 @@ With one to four own rows, a non-build estimate uses their largest peak or a low
 A repository without own history keeps the pool and fallback order.
 A full test estimate with a package keeps only rows whose package and scope match.
 Other steps, and requests with no package, keep the recorded scope rule.
+A check estimate keeps only rows whose check targets match the request (`check_targets`): `--all-targets` or named targets.
+Test code raises the check peak, so an all-target check never takes its need from lib and bin checks.
+A check peak without recorded arguments has unknown targets, so no check estimate uses it.
+A new peak joins its estimate when the buildlog index records its arguments.
 A filtered compile estimate (`filtered_history_peak`) takes the larger of two ranked anonymous peaks:
 the exact filter set's rows and the package's filtered rows.
 Indexed peaks times `ANON_SHARE` come next, exact filter first. Check or build compile peaks come last.
@@ -1755,8 +1766,7 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 The folder stays with its hold marked ended.
 
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
-The scratch root is `build_folders.conf` `roots.scratch`: `/build/claude/scratch` on natedev and `/tmp/claude/scratch` on the Mac.
-On natedev, cargo builds a scratch workspace in `/build/cargo/scratch/<folder>`.
+The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.

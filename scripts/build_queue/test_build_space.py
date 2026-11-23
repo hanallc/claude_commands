@@ -18,9 +18,9 @@ from scripts.lint import memory_admit as gate
 
 class BuildSpaceTests(unittest.TestCase):
     def configure_floor(self, fixture: AdmissionFixture, *, estimate_lifetime: str = "3600") -> Path:
-        output = fixture.root / "cargo-output"
+        output = fixture.root / "build-output"
         output.mkdir()
-        _ = (fixture.root / "build_folders.conf").write_text(f"roots.slot_cargo={output}\n")
+        _ = (fixture.root / "build_folders.conf").write_text(f"roots.build={output}\n")
         write_memory_config(fixture.root / "build_admission.conf",
                             free_floor_gib="150", estimate_refresh_seconds=estimate_lifetime)
         _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",

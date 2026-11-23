@@ -44,6 +44,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
 from scripts.production.production_doc import Production
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -131,7 +132,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
-            "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": ""})))
+            "HERDR_BIN": MISSING_HERDR_BIN, "BUILDLOG_RUN": ""})))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -1636,7 +1637,7 @@ placement_once
             with self.subTest(arguments=arguments):
                 request_file = tools.root / f"first-step-{number}.json"
                 episode, since = f"verify-first-{number}", time.time()
-                environment = {**tools.environment, "HERDR_BIN": "/nonexistent/herdr", "UNIT_RUN_DIR": "",
+                environment = {**tools.environment, "HERDR_BIN": MISSING_HERDR_BIN, "UNIT_RUN_DIR": "",
                     "UNIT_SESSION_DIR": "", "UNIT_DETACHED_RUN": "1", "BUILDLOG_FIRST_STEP_REQUEST": str(request_file),
                     "BUILDLOG_FIRST_STEP_PID": str(os.getpid()), "BUILDLOG_FIRST_STEP_EPISODE": episode,
                     "BUILDLOG_FIRST_STEP_SINCE": str(since), "ADMISSION_SOCKET": str(self.queue.socket_path)}

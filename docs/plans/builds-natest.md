@@ -1038,14 +1038,14 @@ Each `copies.py` use does less Git work, with the same trees, remote refs and ex
 #### As-built
 
 - `scripts/lib/inotify.py` is the one inotify binding. It holds `IN_MODIFY` and `read_events(descriptor)`, which does one read; `events` loops on it.
-- `LocalReleaseEvents` and `local_release_waiter` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
+- `LocalReleaseEvents` and `local_release_waiter` in `scripts/lib/release_waiter.py` take `mask`. The default `RELEASE_CHANGES` equals `0xFC8`, written with named constants. `LocalReleaseEvents.wait` uses `read_events` and returns when something changed or the deadline passes.
 - `wait_until(..., watch_writes=False)` is the one wait that can watch writes. `VerifyTokenWaitFixture.wait_for_output` is one `wait_until(..., watch_writes=True)` call, then the `assertIn`. The raw-mask patches are gone.
 - `verify_hold_wait_test_support.py` catches only `FileNotFoundError` around `add_watch`.
 - Tests: `test_fixture_releases_a_call_when_a_scanned_directory_disappears`, `ReleaseDeadlineTests.test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop`, and the live-writer test.
 - Same-load pairs show no speed change, as expected.
 
 **Files:**
-- `scripts/lib/inotify.py`, `scripts/direct/local_release_wait.py` (owner verify), `scripts/direct/wait_for_test_state.py` — the binding and the wait
+- `scripts/lib/inotify.py`, `scripts/lib/release_waiter.py`, `scripts/direct/local_release_wait.py` (owner verify), `scripts/direct/wait_for_test_state.py` — the binding and the wait
 - `scripts/direct/verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`, `verify_mac_offload_test_support.py` — fixtures
 - `scripts/direct/test_verify_hold_events.py` (owner verify), `scripts/direct/test_review_launcher.py` — tests
 

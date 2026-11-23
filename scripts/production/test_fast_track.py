@@ -30,6 +30,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -70,7 +71,7 @@ from scripts.sample import item
 class ChangedValueTests(unittest.TestCase):
     def test_changed_value(self):
         self.assertEqual(item.VALUE, "after")
-        self.assertEqual(os.environ["HERDR_BIN"], "/nonexistent/herdr")
+        self.assertEqual(os.environ["HERDR_BIN"], ''' + repr(MISSING_HERDR_BIN) + ''')
         for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)

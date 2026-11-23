@@ -30,6 +30,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib import test_hang_guard
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,7 +146,7 @@ class CliFixture(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-            "STAFF_FILE": str(self.root / "staff.json"), "HERDR_BIN": "/nonexistent/herdr",
+            "STAFF_FILE": str(self.root / "staff.json"), "HERDR_BIN": MISSING_HERDR_BIN,
             "BEVY_UPGRADE_NOTIFIER": str(notifier), "BEVY_UPGRADE_SEND": str(sender),
             "TEST_TOOL_HELPER": str(helper), "NOTIFIER_CALLS": str(self.root / "notifier-calls"),
             "SEND_CALLS": str(self.root / "send-calls"), "TEST_SHOWRUNNER_ADDRESS": f"session:{CURRENT_ID}",
