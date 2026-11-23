@@ -19,11 +19,14 @@ from scripts.build_targets import target_config, targets
 from scripts.build_targets.target_config import Target
 from scripts.buildlog import cli, mac_idle, mac_idle_alert, machine_facts, machine_watch, sample
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+from scripts.buildlog.test_index import use_test_log
 from scripts.direct import step_record
 from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test
 from scripts.message import send_budget
+
+use_test_log()
 
 START = 100_000.0
 HOUR = 3600.0
