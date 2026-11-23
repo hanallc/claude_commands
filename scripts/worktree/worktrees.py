@@ -101,6 +101,11 @@ class Kept:
 
 
 @dataclass(frozen=True)
+class Clean:
+    """The check found no unsaved work in the checkout."""
+
+
+@dataclass(frozen=True)
 class OriginBranchAbsent:
     """Origin has no branch to delete."""
 
@@ -538,11 +543,16 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
     return CheckedOriginTip(tip)
 
 
+def dirty_check(path: Path) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes, and name them on one line."""
+    dirty = git(path, "status", "--porcelain").stdout
+    return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines())) if dirty else Clean()
+
+
 def cleanup(path: Path) -> CleanupReady | Kept:
     _ = git(path, "fetch", "--no-prune", "origin")
-    dirty = git(path, "status", "--porcelain").stdout
-    if dirty:
-        return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
+    if isinstance(dirty := dirty_check(path), Kept):
+        return dirty
     head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode == 1:
         return Kept(path, "HEAD is detached")
@@ -606,9 +616,8 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if isinstance(member, session_staff.MemberFound):
         return Kept(path, f"staff member {member.row.name} holds this worktree")
     if path.exists():
-        dirty = git(path, "status", "--porcelain").stdout
-        if dirty:
-            return Kept(path, f"dirty worktree: {dirty.rstrip()}")
+        if isinstance(dirty := dirty_check(path), Kept):
+            return dirty
         head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
         expected = f"refs/heads/{record.branch}"
         if head.returncode or head.stdout.strip() != expected:
@@ -927,19 +936,19 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         record_file(path).unlink(missing_ok=True)
 
 
-def unsaved_work(path: Path) -> str | None:
-    """Give the reason to keep a checkout, or None when Git holds all its work on a remote."""
-    if git(path, "status", "--porcelain").stdout:
-        return "it has uncommitted changes"
-    if git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes").stdout.strip():
-        return "it has commits that are on no remote"
-    return None
+def unsaved_work(path: Path) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes or with commits that are on no remote."""
+    dirty = dirty_check(path)
+    if isinstance(dirty, Clean) and git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes").stdout.strip():
+        return Kept(path, "commits that are on no remote")
+    return dirty
 
 
 def remove_named(unit: str, short_name: str) -> list[str]:
     """Remove each recorded worktree of `unit` called `short_name`, and keep its branch.
 
-    A worktree with unsaved work stays. Return one line for each kept worktree.
+    A worktree with unsaved work stays, and its line names the command to run after the work is saved.
+    A worktree that an error stops stays, and its line names the first line of the error.
     """
     lines: list[str] = []
     for record_path in sorted(state_folder().glob("*.json")):
@@ -952,15 +961,17 @@ def remove_named(unit: str, short_name: str) -> list[str]:
             continue
         path, repo = Path(record.path), Path(record.repo)
         try:
-            reason = unsaved_work(path) if path.exists() else None
-            if reason is None:
+            state = unsaved_work(path) if path.exists() else Clean()
+            if isinstance(state, Clean):
                 remove_git_checkout(path, repo)
                 continue
         except (Refused, OSError, ValueError) as error:
-            reason = str(error)
+            first_line = str(error).partition("\n")[0]
+            lines.append(f"{path} not removed: {first_line}")
+            continue
         command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
                               str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
-        lines.append(f"{path} kept: {reason}. Save the work, then run: {command}")
+        lines.append(f"{path} kept: {state.reason}. Save the work, then run: {command}")
     return lines
 
 

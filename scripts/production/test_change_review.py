@@ -3249,26 +3249,29 @@ class ActionTest(unittest.TestCase):
         self.assertTrue(demo.is_dir() and copy.is_dir())
         self.assertTrue(kept.is_dir())
 
-    def try_folder(self) -> tuple[Path, Path]:
-        """Give row C76 a producer unit and that unit's recorded try folder; return the folder and its repository."""
+    def try_folder(self, team: str = "tryunit", row: str = "C76") -> tuple[Path, Path]:
+        """Give row C76 the Producer unit tryunit and row C77 an empty Producer cell.
+
+        Record the try folder of `team` for `row`, and return the folder and its repository.
+        """
         unit = fixture_member("unit", name="tryunit", parent=fixture_member("showrunner", name="fixture").id)
         _ = self.path.write_text(LIST.replace("| How to check |\n| --- | --- | --- | --- | --- |",
                                               "| How to check | Producer |\n| --- | --- | --- | --- | --- | --- |")
                                  .replace("| Launch Hana |", f"| Launch Hana | {unit.id} |")
                                  .replace("| Change a font |", "| Change a font | |"), encoding="utf-8")
         root = self.path.parent
-        origin, repo, tree = root / "origin.git", root / "repo", root / "worktrees/repo/tryunit/try-C76"
+        origin, repo, tree = root / "origin.git", root / "repo", root / f"worktrees/repo/{team}/try-{row}"
         for arguments in (("init", "--bare", str(origin)), ("init", "-b", "main", str(repo)),
                           ("-C", str(repo), "commit", "--allow-empty", "-m", "base"),
                           ("-C", str(repo), "remote", "add", "origin", str(origin)),
                           ("-C", str(repo), "push", "-q", "origin", "main"),
-                          ("-C", str(repo), "worktree", "add", "-q", "-b", "tryunit-try-C76", str(tree))):
+                          ("-C", str(repo), "worktree", "add", "-q", "-b", f"{team}-try-{row}", str(tree))):
             _ = subprocess.run(["git", *arguments], check=True, capture_output=True)
         base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
                               text=True).stdout.strip()
         worktrees.write_record(worktrees.WorktreeRecord(
-            1, str(tree), "tryunit-try-C76", str(repo), base, "main", "tryunit", "2026-11-23T00:00:00+00:00",
-            worktrees.RecordedWorktreeOutput("tryunit", "try-C76", root / "build/repo/tryunit/try-C76")))
+            1, str(tree), f"{team}-try-{row}", str(repo), base, "main", team, "2026-11-23T00:00:00+00:00",
+            worktrees.RecordedWorktreeOutput(team, f"try-{row}", root / f"build/repo/{team}/try-{row}")))
         self.addCleanup(worktrees.record_file(tree).unlink, missing_ok=True)
         return tree, repo
 
@@ -3287,9 +3290,41 @@ class ActionTest(unittest.TestCase):
                                   "--verdict", "no")
         remove.assert_not_called()
         self.assertEqual(code, 0)
-        self.assertIn(f"{tree} kept: it has uncommitted changes. Save the work, then run: env --chdir={repo} ", output)
+        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: env --chdir={repo} ", output)
         self.assertIn(f"worktrees.py remove {tree}\n", output)
         self.assertTrue((tree / "notes.txt").is_file())
+
+    def test_an_empty_producer_removes_the_list_showrunners_try_folder_without_a_staff_read(self) -> None:
+        # The list change-review.md names the showrunner change-review.
+        tree, repo = self.try_folder("change-review", "C77")
+        with (mock.patch.object(worktrees, "remove_git_checkout") as remove,
+              mock.patch.object(change_routing, "producer_row") as producer_row):
+            code, _, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C77",
+                             "--verdict", "works")
+        self.assertEqual(code, 0)
+        remove.assert_called_once_with(tree, repo)
+        producer_row.assert_not_called()
+
+    def test_a_try_folder_error_prints_its_first_line_and_the_verdict_stays(self) -> None:
+        _ = self.try_folder()
+        with mock.patch.object(worktrees, "git", side_effect=RuntimeError("fixture git failed\nsecond line")):
+            code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                      "--verdict", "works")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("\ntry folder not checked: fixture git failed\n", output)
+        self.assertNotIn("second line", output)
+        self.assertIn("| C76 | Panels keep shields | works |", self.path.read_text(encoding="utf-8"))
+
+    def test_a_try_folder_error_keeps_the_verdict_intent_for_a_retry(self) -> None:
+        _ = self.try_folder()
+        cleanup = replace(change_review.PendingVerdictCleanup.for_row(self.path.parent, self.path, "C76"), verdict="works")
+        cleanup.save()
+        with mock.patch.object(worktrees, "git", side_effect=RuntimeError("fixture git failed")):
+            self.assertEqual(cleanup.finish(lambda _: None), ["try folder not checked: fixture git failed"])
+        self.assertTrue(cleanup.intent.is_file())
+        with mock.patch.object(worktrees, "remove_git_checkout"):
+            self.assertEqual(cleanup.finish(lambda _: None), [])
+        self.assertFalse(cleanup.intent.exists())
 
     def test_withdraw_removes_the_rows_try_folder(self) -> None:
         tree, repo = self.try_folder()

@@ -368,8 +368,8 @@ such as `sdlc/C434` or `sdlc/C9`.
 
 ## A folder for the user to try
 
-When the user needs a folder to try a change in (a repro, a demo crate, a
-copy), make a worktree after `add` prints the row's number. Never make the folder by hand.
+When the user needs a folder to try a change in (a repro or a copy), make a worktree after `add` prints the row's number.
+The try folder needs a repository checkout. Never make the folder by hand.
 The team that made the row runs this from its own worktree:
 
 ```sh
@@ -382,8 +382,15 @@ Name that path in the row's How to check cell (`edit`).
 
 The row's verdict or withdraw sends the try folder to `worktrees.py remove` and keeps its branch.
 That removal lists the checkout and its build output for manual removal.
+The removal by hand of a try folder also deletes its branch `<team>-try-C<n>`.
+The hold in `docs/as-built/removal-by-hand.md` keeps script removal off.
+A verdict checks only the worktree records on the machine that runs it.
+A try folder on another machine stays, and its team removes it there.
 A try folder with uncommitted changes, or with commits that are on no remote, stays.
 The verdict or withdraw then prints one line with the path, the reason and the command the team runs after it saves the work.
+A Git, file or removal error prints `<path> not removed: <first line of the error>`.
+Any other error prints `try folder not checked: <first line of the error>`, and the row's verdict stays.
+A verdict from the review page keeps its retry record after a `try folder not checked:` line.
 Cargo stores final binaries in `target_directory` and intermediates in `build_directory`.
 Check both output filesystems with `df -h` before a large build.
 

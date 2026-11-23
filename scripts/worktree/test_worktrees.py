@@ -2531,7 +2531,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         code = "from scripts.worktree.worktrees import remove_named; print(*remove_named('other', 'try-C12'))"
         kept = self.command(self.repository, [str(python), "-c", code])
         self.assertEqual(kept.returncode, 0, kept.stderr)
-        self.assertTrue(kept.stdout.startswith(f"{other} kept: it has uncommitted changes. Save the work, then run: "))
+        self.assertTrue(kept.stdout.startswith(f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: "))
         self.assertTrue(kept.stdout.endswith(f"worktrees.py remove {other}\n"))
         self.assertNotIn("kept for a manual removal list", kept.stderr)
 
