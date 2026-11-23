@@ -43,6 +43,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
+from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, send_hold, staff_names
@@ -151,9 +152,9 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
             + 'user_pref("layout.css.devPixelsPerPx", "1.0");\n'
             + 'user_pref("ui.prefersReducedMotion", 1);\n'
             + 'user_pref("network.proxy.type", 0);\n', encoding="utf-8")
-        _ = subprocess.run([firefox, "--headless", "--no-remote", "--profile", folder,
-                            "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
+        run_process_group([firefox, "--headless", "--no-remote", "--profile", folder,
+                           "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
+                          timeout=15).check_returncode()
         with output.open("rb") as stream:
             image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
     if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > new_item_dialog.MAX_IMAGE_BYTES:

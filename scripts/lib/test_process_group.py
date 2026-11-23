@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
@@ -217,6 +218,36 @@ class ProcessGroupTests(PrivateGroupFixture):
         with patch.object(os, "killpg") as send:
             self.assertEqual(process_group.main([str(child.pid), "KILL"]), 0)
             send.assert_called_once_with(child.pid, signal.SIGKILL)
+
+
+def process_ended(pid: int) -> bool:
+    """Wait for a process to leave or become a zombie."""
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        if state == "Z":
+            return True
+        time.sleep(.05)
+    return False
+
+
+class RunProcessGroupTests(unittest.TestCase):
+    def test_a_finished_command_leaves_no_child(self) -> None:
+        done = process_group.run_process_group(
+            ["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!; echo said >&2"], timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual((done.returncode, done.stderr), (0, "said\n"))
+        self.assertTrue(process_ended(int(done.stdout)))
+
+    def test_a_timeout_stops_the_command_and_its_child(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        record = folder / "child"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _ = process_group.run_process_group(
+                ["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(record))}; wait"], timeout=1)
+        self.assertTrue(process_ended(int(record.read_text())))
 
 
 class ShellProcessGroupTests(PrivateGroupFixture):

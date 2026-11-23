@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -16,6 +15,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
@@ -1353,11 +1353,11 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         try:
             profile = output.parent / "profile"
             profile.mkdir()
-            run = subprocess.run(
+            run = run_process_group(
                 ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                  "--window-size", "1440,900", "--screenshot", str(output),
                  f"http://127.0.0.1:{server.server_port}/"],
-                capture_output=True, text=True, timeout=75, check=False)
+                timeout=75)
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():

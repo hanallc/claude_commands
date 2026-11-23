@@ -26,6 +26,7 @@ from scripts.accounts import accounts, next_moves, role_map
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
 from scripts.whoami import agent_accounts, run_out, usage_store
@@ -220,9 +221,9 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
         try:
             profile = Path(temporary) / "profile"
             profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+            run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                   "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
+                                 timeout=45)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:

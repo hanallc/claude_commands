@@ -20,6 +20,7 @@ from typing import cast, override
 
 from scripts.review_links import console, page_frame, review_submissions, serve
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -647,11 +648,11 @@ window.fetch=async(url,options={})=>{
         try:
             profile = Path(temporary) / 'profile'
             profile.mkdir()
-            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                    '--window-size', '1600,900',
                                    '--screenshot', str(Path(temporary) / 'page.png'),
                                    f'http://127.0.0.1:{server.server_port}/?page={identity}'],
-                                  capture_output=True, text=True, timeout=45)
+                                  timeout=45)
             case.assertEqual(done.returncode, 0, done.stderr)
         finally:
             server.shutdown()

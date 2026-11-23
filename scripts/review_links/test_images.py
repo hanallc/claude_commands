@@ -24,6 +24,7 @@ from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
@@ -153,7 +154,7 @@ class ChangeImageTests(ImagesFixture):
             _ = Path(shot).write_bytes(PNG)
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
-        with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+        with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
             identity = image_store.register_output(output)
         self.assertEqual(run.call_count, 2)
         self.assertTrue(image_store.change_image(self.root, identity))
@@ -176,7 +177,7 @@ class ChangeImageTests(ImagesFixture):
                     _ = Path(shot).write_bytes(PNG)
                     return subprocess.CompletedProcess(arguments, 0, "", "")
 
-                with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+                with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
                     identity = image_store.register_output(output)
                 self.assertEqual(run.call_count, 2)
                 self.assertTrue(image_store.change_image(self.root, identity))
@@ -492,10 +493,10 @@ class ImagesTests(ImagesFixture):
             try:
                 profile = self.temporary / "browser-profile"
                 profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                       "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
                                       f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=45)
+                                     timeout=45)
                 self.assertEqual(run.returncode, 0, run.stderr)
             finally:
                 server.shutdown()
@@ -1570,9 +1571,9 @@ async (find, whenPageShows, check, controlRefresh) => {
             try:
                 profile = self.temporary / 'question-browser-profile'
                 profile.mkdir()
-                done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', '1200,900', '--screenshot', str(self.temporary/'question-browser.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=60)
+                    f'http://127.0.0.1:{server.server_port}/'], timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 complete.set()

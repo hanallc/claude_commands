@@ -10,6 +10,11 @@ Callers handle `ProcessLookupError` when the group has ended.
 Shell callers use their checkout's helper through `scripts/lib/py`.
 The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
 `test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
+`run_process_group(command, timeout=..., env=...)` runs a command in its own group and returns its text output.
+It stops the whole group when the command returns, fails, or reaches its timeout.
+`stop_process_group(process)` sends TERM, then KILL, to the group of a `start_new_session` child and closes its pipes.
+Every headless Firefox and Chrome run uses one of these two helpers.
+A browser leaves helper processes after its own exit or a timeout, and a plain `subprocess.run` stops only the leader.
 
 ## Session commands
 
