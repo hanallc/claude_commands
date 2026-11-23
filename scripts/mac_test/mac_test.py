@@ -601,7 +601,8 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
         pass
     try:
         settings = conf.read("mac_test")
-        if not settings.value("offload", conf.on_off, default=True, recover_invalid=False):
+        # A missing key reads the committed file, as the router does. A bad value counts as in use.
+        if not settings.value("offload", conf.on_off, recover_invalid=False):
             return OffOnPurpose("offload=off")
     except ConfigError:
         pass

@@ -405,7 +405,7 @@ def mac_off_on_purpose() -> bool:
 
 
 def push_retired(saved: mac_idle_alert.SavedAlert, off: bool) -> bool:
-    """Tell whether a sent unreachable push is over. The watch and the clear check use this one rule.
+    """Tell whether a sent unreachable push is over. The clear check uses this rule.
 
     The push is over when the user turned the Mac off, when the Mac is not unreachable, or when no step waits.
     """
@@ -523,8 +523,9 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
         off = mac_off_on_purpose()
-        if saved["pushed"] and push_retired(saved, off):
-            # The clear check retires the sent push on the same rule, so the push goes again when the outage is back.
+        if saved["pushed"] and off:
+            # Only a Mac that the user turned off ends a sent push here, so it goes again when the Mac is in use.
+            # Other ends stay with the clear check: one outage sends one push.
             saved["pushed"] = False
         write_record(paths.state / "alert.json", saved)
         if (not isinstance(reading, IdleMac | MacUnreachable)

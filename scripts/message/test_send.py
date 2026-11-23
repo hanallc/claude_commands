@@ -6708,13 +6708,34 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         def missing_settings_with_no_committed_copy(_state: Path, mac_test_conf: Path,
                                                     _build_targets_conf: Path) -> None:
             # CONF_DIR is not a Git checkout, so conf finds no committed copy.
-            # A missing live file reads the committed file.
+            # The offload read fails, so the Mac counts as in use.
             mac_test_conf.unlink()
 
         for fault in (corrupt_block, unusable_offload, unusable_enabled, missing_settings_with_no_committed_copy):
             fault(*self.mac_in_use())
             with self.subTest(fault=fault.__name__):
                 self.assert_mac_locked_sent()
+
+    def test_mac_locked_push_reads_the_committed_offload_when_the_live_value_is_missing(self) -> None:
+        _, mac_test_conf, _ = self.mac_in_use()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        # CONF_DIR is a Git checkout here, so conf reads the committed copy.
+        for arguments in (("init", "-q"), ("add", mac_test_conf.name), ("commit", "-qm", "committed settings")):
+            _ = subprocess.run(["git", "-C", str(mac_test_conf.parent), "-c", "user.name=Send test",
+                                "-c", "user.email=send@example.invalid", "-c", "commit.gpgsign=false", *arguments],
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                               env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def missing_key() -> None:
+            _ = mac_test_conf.write_text("# The live file has no offload key.\n")
+
+        for fault in (missing_key, mac_test_conf.unlink):
+            fault()
+            with self.subTest(fault=fault.__name__):
+                code, output, sent = self.mac_locked_main()
+                self.assertEqual(code, 0)
+                self.assertIn("SKIPPED: the Mac is off on purpose (offload=off)", output)
+                sent.assert_not_called()
 
     def test_mac_locked_block_holder_still_pushes_and_another_sender_does_not(self) -> None:
         state, _, _ = self.mac_in_use()

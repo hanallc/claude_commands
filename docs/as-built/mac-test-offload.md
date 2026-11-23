@@ -202,17 +202,18 @@ The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `pus
 A Mac that the user turned off sends no phone push: a Mac block, `offload=off` or `enabled.mac=off`.
 `mac_test.machine_off_on_purpose` holds this one rule for every outage push and takes any target name.
 Each target reads `enabled.<machine>` in `build_targets.conf`; only the Mac also reads its block and `offload`.
-Only an explicit `off` counts. A missing key, an unusable value or an unreadable record counts as in use.
-A missing live `mac_test.conf` is not unusable: conf reads the committed file, so the committed `offload` value counts.
+Only an explicit `off` counts. A missing `enabled.<machine>` key, an unusable value or an unreadable record counts as in use.
+A missing live `mac_test.conf` or a missing `offload` key reads the committed file, as the router does, so the committed `offload` value counts.
 A block is a lease that a showrunner gives to one session. It does not count when its holder asks.
 `mac.locked` in `send.py` asks with its `sender=` value, so the block holder still reaches the user.
 For a Mac that is off on purpose, `send.py` prints `SKIPPED: the Mac is off on purpose (<reason>)` and exits 0.
 Only the host that delivers the push asks; a `--machine natedev` forward asks on natedev and reads that skip as confirmed.
 The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
-`mac_idle.push_retired` holds the one rule that ends a sent push: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
+`mac_idle.push_retired` is the clear-check rule: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
 `mac_idle.py cleared` exits 0 on this rule, and the push stops its repeats.
-Each watch pass applies the same rule before its early return and saves `pushed` as false.
+The watch saves `pushed` as false only for a Mac that is off on purpose, before its early return.
+Otherwise one outage sends one phone push, also across a pass with no waiting steps or a short free-Mac reading.
 The watch reads the off-on-purpose state once per pass.
 The clear check retires the key, so the same `mac-idle-<since>` key pushes again when the Mac is in use again.
 The title is "Mac tests stopped".

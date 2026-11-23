@@ -742,6 +742,29 @@ done
             self.assertEqual(command[command.index("--text-id") + 1], "mac_idle.unreachable")
             self.assertEqual(command[command.index("--key") + 1], "mac-idle-1000")
 
+    def test_one_outage_sends_one_push_across_no_waiting_steps_and_a_free_mac_reading(self) -> None:
+        def saved() -> tuple[str, str, int, bool]:
+            alert = mac_idle.read_record(self.paths.state / "alert.json")
+            return (str(alert["state"]), str(alert["cause"]), cast(int, alert["waiting"]), bool(alert["pushed"]))
+
+        self.unreachable()
+        with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True),
+              mock.patch.object(mac_idle, "push_outage", return_value=True) as push):
+            mac_idle.watch_once(self.paths, 1600)
+            self.assertEqual(saved(), ("unreachable", "", 1, True))
+            for record in (self.root / "steps").glob("*.json"):
+                record.unlink()
+            mac_idle.watch_once(self.paths, 1660)
+            self.assertEqual(saved(), ("unreachable", "", 0, True))
+            self.step()
+            (self.paths.mac_state / "unreachable_until").unlink()
+            mac_idle.watch_once(self.paths, 1720)
+            self.assertEqual(saved(), ("idle", "free", 1, True))
+            self.unreachable()
+            mac_idle.watch_once(self.paths, 1780)
+            self.assertEqual(saved(), ("unreachable", "", 1, True))
+        push.assert_called_once()
+
     def test_parked_app_claim_alert_names_holder_and_never_repairs(self) -> None:
         self.waiting_steps(7)
         _ = self.claim()
