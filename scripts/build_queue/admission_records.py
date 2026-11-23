@@ -1346,6 +1346,14 @@ StartSpacing = ReadyToStart | NextStartAt
 
 
 @dataclass(frozen=True)
+class LocalAdmissionOccupancy:
+    """The service captures these reservations and owners after it grants starts."""
+
+    reservations: tuple[Reservation, ...]
+    verify_run_owners: Mapping[str, frozenset[str]]
+
+
+@dataclass(frozen=True)
 class QueueExplanation:
     """The explanation holds queue evidence, policy, decisions, and memory checks."""
     now: float
@@ -1361,6 +1369,8 @@ class QueueExplanation:
     spacing: StartSpacing = ReadyToStart()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     room: MemoryRoom | ReadingUnavailable = ReadingUnavailable()
+    local_occupancy: LocalAdmissionOccupancy | None = field(
+        default=None, kw_only=True, metadata={"acquisition_unused": True})
 
 
 @dataclass(frozen=True)

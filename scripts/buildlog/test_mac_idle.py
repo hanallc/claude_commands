@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import cli
 from scripts.buildlog import index
-from scripts.buildlog import mac_idle, mac_idle_alert, sample
+from scripts.buildlog import mac_idle, mac_idle_alert, machine_facts, sample
 from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -1315,10 +1315,12 @@ done
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
-             mock.patch.object(mac_idle, "watch_once") as watch:
+             mock.patch.object(mac_idle, "watch_once") as watch, \
+             mock.patch.object(machine_facts, "sample_once") as facts:
             self.assertEqual(cli.main(["sample"]), 0)
         watch.assert_called_once()
         self.assertEqual(watch.call_args.args[1], 1000)
+        facts.assert_called_once_with(machine_facts.state_path(), 1000)
 
     def test_memory_wait_reads_the_marker_when_its_normal_hook_is_empty(self) -> None:
         self.admission.free(0)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, admission_service, placement, queue_evidence, slot_wait
+from scripts.build_queue import admission_records, admission_service, limits_view, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -26,7 +26,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, parse
+from scripts.buildlog import charts, cost_actions, costs, machine_facts, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -386,6 +386,7 @@ class MemoryFeedTests(unittest.TestCase):
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "MACHINE_FACTS_FILE": str(self.root / "machine-facts.json"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
@@ -459,6 +460,7 @@ class MemoryFeedTests(unittest.TestCase):
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
         return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons()))
                 .replace('</head>', staff_names.script({}) + '</head>', 1))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
@@ -1294,8 +1296,12 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              # Each cycle reads the clock once, then once more after its token dump request.
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
+              # Each cycle reads the clock for the loop, token dump, Mac source, and limits source.
+              mock.patch.object(time, "monotonic", side_effect=(
+                  0.0, 0.0, 0.0, 0.0,
+                  100.0, 100.0, 100.0, 100.0,
+                  301.0, 301.0, 301.0, 301.0,
+              )) as clock,
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
               mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
@@ -1306,6 +1312,7 @@ process.stdout.write(JSON.stringify({
             with self.assertRaises(FeedStopped):
                 _ = memory_feed.main([])
         self.assertEqual(queue.call_count, 3)
+        self.assertEqual(clock.call_count, 12)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
         # The second report read has the same text, so only the first one writes report.json.
@@ -1342,11 +1349,17 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=(
+                          0.0, 0.0, 0.0, 0.0,
+                          29.0, 29.0, 29.0, 29.0,
+                          # The third cycle has no token dump request.
+                          30.0, 30.0, 30.0,
+                      )) as clock,
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+                self.assertEqual(clock.call_count, 11)
 
     def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
         clock = [0.0]
@@ -2690,6 +2703,9 @@ process.stdout.write(JSON.stringify({
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"), (block,), (), eligibility.NO_BACKOFF),
                      targets.TargetSnapshot(LocalTarget("natedev", "linux"), (targets.Free(),), (), eligibility.NO_BACKOFF))
         labels = {"mac-owner": unit_labels.UnitLabels("director", "hana", "research")}
+        background = limits_view.Background(frozenset({"https://example.invalid/team/hana"}),
+                                            limits_view.Metric("money", None, None, "USD"))
+        mac = limits_view.MacReading(limits={"hana": 1}, claims_readable=True)
         for admission_error, expected in (("", ""), ("fixture down", "MAC IDLE WATCH: admission query failed: fixture down.")):
             with self.subTest(admission_error=admission_error):
                 path = write_idle_alert(self.root / "mac-idle", now)
@@ -2701,13 +2717,41 @@ process.stdout.write(JSON.stringify({
                      mock.patch.object(target_availability, "read_snapshots", return_value=snapshots), \
                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels), \
                      mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana")):
-                    page = memory_feed.reading()
+                    page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: mac)
                 self.assertEqual(page["mac_idle_alert"], expected)
+                limits = page.get("build_limits")
+                assert limits is not None
+                self.assertEqual(limits.mac.state, "Held")
+                self.assertEqual([(row.name, row.mac.used, row.mac.limit) for row in limits.repositories],
+                                 [("hana", 0, 1)])
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
                 self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
                 self.assertEqual({tuple(waiter.get("targets", ())) for waiter in page["waiters"]}, {("natedev", "mac")})
+
+    def test_feed_carries_saved_machine_facts_into_build_limits(self) -> None:
+        reading = queued_reading(captured_reading(), ())
+        now = reading.explanation.now
+        background = limits_view.Background(frozenset(), limits_view.Metric("money", None, None, "USD"))
+        saved: machine_facts.SavedFacts = {"version": machine_facts.VERSION, "written": now, "machines": {
+            "natedev": machine_facts.facts("read", load=8.04, cpus=32),
+            "mac": machine_facts.facts("read", link_ms=3.2, load=1.5, cpus=12, battery={"percent": 85, "mains": True}),
+            "aws": machine_facts.facts("no_box")}}
+
+        def limits() -> limits_view.BuildLimits:
+            with mock.patch.object(admission_client, "view", return_value=reading), \
+                 mock.patch.object(time, "time", return_value=now):
+                page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: None)
+            shown = page.get("build_limits")
+            assert shown is not None
+            return shown
+
+        self.assertEqual(limits().mac.facts, "facts not sampled")
+        _ = (self.root / "machine-facts.json").write_text(json.dumps(saved))
+        shown = limits()
+        self.assertEqual((shown.natedev.facts, shown.mac.facts, shown.aws.facts),
+                         ("load 8.0/32", "link 3 ms · load 1.5/12 · battery 85% · not in use", "no box running"))
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
