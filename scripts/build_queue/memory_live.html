@@ -938,6 +938,8 @@ function stepTooltip(key, data) {
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
     if (['build space', 'build hold'].includes(row.why)) rows.push(field('Reason', row.reason));
     if (row.order_note) rows.push(field('Order', row.order_note));
+    // A CI step ranks at the start of its GitHub job.
+    if (row.job_start) rows.push(field('Job start', row.job_start));
     if (row.kind !== 'cloud' && row.why !== 'target') {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
@@ -1882,7 +1884,9 @@ function renderWalk(d) {
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
     const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, target, null, tip, w.verify?.verb, rowClass);
-    const note = w.order_note || (["build hold", "build space", "the build in the same Cargo folder"].includes(w.why) ? w.reason : "");
+    const reason = w.order_note
+      || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
+    const note = [reason, w.job_start && `job started ${w.job_start}`].filter(Boolean).join(" · ");
     rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);

@@ -2588,7 +2588,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            package=row["package"] if "package" in row else PackageNotRecorded(),
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
                            route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""),
-                           what=row.get("what", ""))
+                           ci_job_start=records.waiter_job_start(row), what=row.get("what", ""))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")

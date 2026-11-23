@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, tzinfo
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, overload
@@ -618,13 +619,15 @@ NO_TARGET_NOTES: TargetNotes = {"runs_on": "", "targets": [], "mac_text": ""}
 
 
 def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
-    """Use the placement candidates for a route that names the Mac Linux guest."""
+    """Use the placement candidates for a route that can place the step in the Mac Linux guest."""
     # Older queue readings have no placement candidates.
     recorded: object = getattr(step, "placement_candidates", ())
     if not isinstance(recorded, tuple):
         return None
+    # The service never places a step on a fixed exclusion, so the page does not name it.
     candidates = tuple(row for row in cast(tuple[object, ...], recorded)
-                       if isinstance(row, placement.CandidateEligibility))
+                       if isinstance(row, placement.CandidateEligibility)
+                       and not isinstance(row.eligibility, placement.FixedExclusion))
     guest = tuple(candidate.eligibility for candidate in candidates if candidate.destination.target == MAC_LINUX_TARGET)
     if not guest:
         return None
@@ -1018,6 +1021,7 @@ class MemoryWaitRow(WaitRow):
     place: int
     move: NotRequired[admission_records.QueueMoveMember]
     order_note: NotRequired[str]
+    job_start: NotRequired[str]
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -1280,6 +1284,12 @@ def job_age(started_at: float, now: float) -> str:
         return f"{minutes} min"
     hours = minutes // 60
     return f"{hours} h {minutes % 60} min" if hours < 48 else f"{hours // 24} days"
+
+
+def job_start_text(job_start: admission_records.JobStart, now: float, zone: tzinfo) -> str:
+    """Show when the GitHub job of a CI step started, in the user zone, and its age."""
+    started = targets.clock(datetime.fromtimestamp(job_start.started_at, UTC), zone)
+    return f"{started} · {job_age(job_start.started_at, now)} ago"
 
 
 def ci_amount(value: float) -> str:
@@ -1599,9 +1609,11 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-def wait_why(reason: admission_records.WaitReason) -> str:
+def wait_why(reason: admission_records.WaitingStepReason) -> str:
     """Name the resource or queue action that a waiter needs."""
     match reason:
+        case admission_records.MachineChoiceWait():
+            return "machine choice"
         case admission_records.NeedsMemory():
             return "memory"
         case admission_records.BehindHead():
@@ -3138,6 +3150,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                     ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
+        if isinstance(waiter.ci_job_start, admission_records.JobStart):
+            waiters[place]["job_start"] = job_start_text(waiter.ci_job_start, explanation.now, zone)
         if member is not None:
             waiters[place]["move"] = member
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)

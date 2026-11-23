@@ -28,6 +28,7 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue import limits_view, memory_feed
 from scripts.build_queue.admission_test_support import (AdmissionFixture, FixedSystemReader, ObservedAdmissionServer,
                                                      only_admitted, GIB)
 from scripts.buildlog import store
@@ -698,6 +699,31 @@ class PlacementTests(unittest.TestCase):
                     self.assertEqual(running.placement_candidates, (
                         placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("the guest is off")),
                         placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST)))
+
+    def test_a_placement_wait_row_waits_for_a_machine_choice_not_a_reading(self) -> None:
+        with PlacementFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            parent = fixture.request(run=fixture.run_owner())
+            _ = only_admitted(fixture.connect(parent).replies())
+            # A speculative copy waits for the guest while its parent holds local memory.
+            request = replace(placement_request(fixture), purpose=placement.SpeculativeCopy(parent.episode, fixture.clock.now()))
+            request = replace(request, constraints=replace(request.constraints, candidates=(mac_linux_candidate(),)))
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 1))
+            os.utime(backoff, (now, now))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                _ = publish_candidate(fixture, request)
+                wait, = fixture.server.handle_request(request)
+                assert isinstance(wait, wire.PlacementWait), wait
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+            decoded = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(decoded, wire.ViewReply), decoded
+            row, = decoded.reading.view.waiting
+            self.assertEqual(row.reason, records.MachineChoiceWait())
+            self.assertEqual(records.reason_phrase(row.reason, (row,)), "waits for a machine choice")
+            self.assertEqual(memory_feed.wait_why(row.reason), "machine choice")
+            self.assertEqual(limits_view.wait_words(limits_view.waiting_cause(row)).one, "1 run waits for a machine choice.")
 
     def test_a_guest_reading_after_backoff_can_restore_a_waiting_guest(self) -> None:
         with PlacementFixture() as fixture:
