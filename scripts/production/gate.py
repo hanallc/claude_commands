@@ -117,7 +117,7 @@ from scripts.build_queue.admission_client import (  # noqa: E402
 )
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, no_hold_wait, queue_place, release_place, suite_scope_prefix,
+    HeldReservation, QueuePlace, QueuePlaceRefused, no_hold_wait, queue_place, release_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -214,6 +214,36 @@ class WholeMachine:
 
 
 SHARED_MACHINE = SharedMachine()
+
+
+@dataclass(frozen=True)
+class LocalGateAssignment:
+    """Use the reservation that the queue granted to this gate."""
+
+    grant: admission_wire.Admitted
+    owner: placement.SubmittingOwner
+
+    def suite_place(self, temporary: Path) -> QueuePlace:
+        try:
+            configuration = admission_records.read_memory_config()
+        except conf.Unusable as error:
+            raise GateRefused(str(error)) from error
+        return QueuePlace(Path(self.grant.max_path).with_suffix(""), temporary / "reservation.cgroup",
+                          configuration=configuration, reservation=HeldReservation(self.grant))
+
+    def mark_children(self, environment: dict[str, str]) -> None:
+        directory = Path(self.grant.max_path).parent.resolve()
+        socket_path = admission_wire.admission_socket_path().resolve()
+        environment[admission_client.RESERVED_STEP_ENV] = (
+            f"{self.grant.reservation}\t{self.owner.pid}\t{directory}\t{socket_path}\t{cpu_pool_path().resolve()}")
+
+
+@dataclass(frozen=True)
+class NoLocalGateGrant:
+    """The suite runner has no gate grant from placement."""
+
+
+NO_LOCAL_GATE_GRANT = NoLocalGateGrant()
 
 
 @dataclass(frozen=True)
@@ -1661,12 +1691,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.GATE,
                machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine = SHARED_MACHINE,
+               local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
     named = isinstance(selected, NamedModules)
-    under_parent = shared and named and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
-    owns_place = shared and not under_parent
+    placed = isinstance(local_grant, LocalGateAssignment)
+    under_parent = shared and named and not placed and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)
+    needs_shared_slots = shared and not under_parent
     if under_parent:
         max_running_jobs = 1
     if shared:
@@ -1692,7 +1724,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     if not gate_parent.is_dir() or not os.access(gate_parent, os.W_OK):
         raise GateRefused(f"the test runner requires a writable gate folder at {gate_parent}")
     report_retained_gate_test_folders(gate_parent)
-    hold = BuildHoldWait() if owns_place and isinstance(machine, SharedMachine) else None
+    hold = BuildHoldWait() if needs_shared_slots and isinstance(machine, SharedMachine) else None
     tested_tree: CleanTestTree | UnrecordableTestTree = UnrecordableTestTree("whole machine")
     if hold is not None:
         hold.wait_until_free()
@@ -1752,7 +1784,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise GateRefused(str(error)) from error
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
-    scope_prefix = suite_scope_prefix() if owns_place else []
+    scope_prefix = suite_scope_prefix() if needs_shared_slots else []
     state_directory = gate_state_dir() if shared else gate_parent
     timings_path = state_directory / "module_seconds.json"
     timings = machine.module_seconds.copy() if isinstance(machine, WholeMachine) else read_measures(timings_path)
@@ -1818,15 +1850,19 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if owns_place else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if owns_place else nullcontext(NoSharedCPU())) as cpu_pool):
+          (nullcontext(local_grant.suite_place(temporary)) if placed else
+           gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
+           else nullcontext(None)) as reservation,
+          (shared_cpu_pool() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
         deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
         initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
-        if reservation is not None:
+        if placed:
+            local_grant.mark_children(environment)
+        elif reservation is not None:
             environment = reservation.child_environment(environment)
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
@@ -3144,7 +3180,7 @@ class AwsGateAssignment:
     assignment: placement.PlacementAssignment
 
 
-GateTarget = str | MacLinuxAssignment | AwsGateAssignment | NoGateAssignment
+GateTarget = str | LocalGateAssignment | MacLinuxAssignment | AwsGateAssignment | NoGateAssignment
 
 
 class GateAssignmentRefused(GateRefused):
@@ -3173,22 +3209,14 @@ def checked_gate_target(args: GateArguments) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
-    The caller keeps the reservation of a local grant through the handoff, so the queue reads the assignment as current.
-    After the check, the gate ends that reservation, because the gate takes its own reservation.
+    Keep the local grant through the handoff and the suite run.
     """
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
     flag = natedev_only_flag(args)
-    if flag is not None and not isinstance(placed, NoGateAssignment) and target != "natedev":
+    if flag is not None and not isinstance(placed, NoGateAssignment) and placed.assignment.destination.target != "natedev":
         raise GateAssignmentRefused(
             f"gate.py {flag} runs only on natedev and cannot take the {placed.assignment.destination.target} assignment")
-    if isinstance(placed, admission_wire.LocalPlacementGranted):
-        try:
-            ended = release_place(placed.grant.reservation, 0, placed.grant.cleanup_timing)
-        except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
-            raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {error}") from error
-        if isinstance(ended, admission_wire.Refused):
-            raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {ended.reason}")
     return target
 
 
@@ -3209,7 +3237,19 @@ def placement_target(
         return MacLinuxAssignment(placed.assignment)
     if placed.assignment.destination.target == "aws":
         return AwsGateAssignment(placed.assignment)
+    if isinstance(placed, admission_wire.LocalPlacementGranted) and placed.assignment.destination.target == "natedev":
+        return LocalGateAssignment(placed.grant, placed.assignment.owner)
     return placed.assignment.destination.target
+
+
+def release_local_gate(assignment: LocalGateAssignment, status: int) -> None:
+    grant = assignment.grant
+    try:
+        ended = release_place(grant.reservation, status, grant.cleanup_timing)
+    except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
+        raise GateAssignmentRefused(f"Cannot end the local gate reservation: {error}") from error
+    if isinstance(ended, admission_wire.Refused):
+        raise GateAssignmentRefused(f"Cannot end the local gate reservation: {ended.reason}")
 
 
 def current_gate_placement(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded
@@ -3376,6 +3416,16 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
     match target:
+        case LocalGateAssignment():
+            status = 1
+            try:
+                run = (run_named_modules(repo, named, mode, local_grant=target) if named else
+                       run_routed(lambda _routed, _dirty: run_suites(
+                           repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode, local_grant=target)))
+                status = int(not run.passed)
+                return run
+            finally:
+                release_local_gate(target, status)
         case "natedev" | NoGateAssignment():
             if named:
                 return run_named_modules(repo, named, mode)
@@ -3447,7 +3497,8 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
-def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode) -> GateRun:
+def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode, *,
+                      local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT) -> GateRun:
     """Run the named modules through shared admission, with the hold exemption for the configured unit.
 
     The unit identity is not proof against a session that claims to be that unit.
@@ -3465,13 +3516,13 @@ def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode) -> Gate
             labels = memory_admit.priority_labels([caller.session_id])
         if memory_admit.queue_unit(caller.unit, caller.session_id, labels) == exempt_unit:
             machine = HoldExemptNamedModuleMachine()
-    return run_suites(repo, mode=mode, machine=machine,
+    return run_suites(repo, mode=mode, machine=machine, local_grant=local_grant,
                       selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
 @contextmanager
-def unwind_tests_only_on_sigterm() -> Generator[None]:
+def unwind_gate_on_sigterm() -> Generator[None]:
     """Finish test cleanup before the default SIGTERM action."""
     if (threading.current_thread() is not threading.main_thread()
             or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
@@ -3608,7 +3659,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        return run_gate_command(args, target)
+        with (nullcontext() if args.promote_only else unwind_gate_on_sigterm()):
+            return run_gate_command(args, target)
     except (GateRefused, first_step.FirstStepRefused) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3619,8 +3671,7 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
         with test_run_folder(), gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
             return run_tests_only(args, SuiteMode.TARGETED, assigned)
     if args.tests_only:
-        with (unwind_tests_only_on_sigterm(),
-              gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned):
+        with gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
             return run_tests_only(args, SuiteMode.GATE, assigned)
     try:
         if args.nightly:

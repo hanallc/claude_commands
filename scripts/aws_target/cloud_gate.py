@@ -52,8 +52,12 @@ from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True)
-class LocalFallback:
+class CloudDeclined:
     reason: str
+
+
+# Keep the name used by the AWS off test outside this change.
+LocalFallback = CloudDeclined
 
 
 @dataclass
@@ -189,9 +193,11 @@ def availability() -> Available | Unavailable:
         if not any(fit.known and not fit.full and not fit.recently_refused for fit in map(quotas.fit, variants)):
             return Unavailable('No gate variant has current Spot quota room')
         proposed = gate_booking(values, 'placement-preview', now, now + values.whole('lifetime_minutes') * 60)
-        snapshot.gate_reservations.append(proposed)
-        spend = book.placement_spending_preview(snapshot, policy_path, now)
-        return Available() if isinstance(spend, ledger.SpendingAllowed) else Unavailable(spend.reason)
+        try:
+            reason = book.gate_booking_refusal(snapshot, policy_path, proposed)
+        except (OSError, ValueError, ArithmeticError) as error:
+            return Unavailable(str(error) or 'The gate booking cost is unavailable')
+        return Unavailable(reason) if reason else Available()
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return Unavailable('The local AWS gate evidence is unavailable')
 
@@ -751,7 +757,7 @@ class GateWorker:
             return capacity_order(variant), price is None, cost, type_rank(variant), position
         return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
 
-    def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
+    def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | CloudDeclined:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
         if launch.get('instance'):
@@ -766,7 +772,7 @@ class GateWorker:
                       flush=True)
             if len(deployed.unsupported_types) == len(sizes) and not path.exists():
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                return LocalFallback('The stack allows no configured gate type; run deploy.py up')
+                return CloudDeclined('The stack allows no configured gate type; run deploy.py up')
         variants: Sequence[GateLaunchVariant] = deployed.variants
         if not path.exists():
             if 'retry_launch' in request:
@@ -777,7 +783,7 @@ class GateWorker:
                 variants = self.rank_variants(variants, gate.SuiteMode.step(ledger.text(request, 'mode')), live_prices)
                 if not variants:
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                    return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes')
+                    return CloudDeclined('Every gate type and region has a median gate time above max_gate_minutes')
                 launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
                     'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
             save(path, launch)
@@ -910,7 +916,7 @@ class GateWorker:
                 if not definite_refusal(str(error)):
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
+                return CloudDeclined(f'{size} in {zone}: {launch_error_code(str(error))}')
             instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
@@ -920,7 +926,7 @@ class GateWorker:
             self.box_zone = zone
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-        return LocalFallback('Spot capacity is unavailable in every configured region')
+        return CloudDeclined('Spot capacity is unavailable in every configured region')
 
     def artifact_etags(self, bucket: str, prefix: str) -> dict[str, str]:
         listing = self.api.call('list-objects-v2', '--bucket', bucket, '--prefix', prefix,
@@ -964,7 +970,7 @@ class GateWorker:
                 raise ValueError('The worker has no readable process identity')
             self.book.gate_owner(attempt, ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve())))
             launched = self.launch(folder, request, deployment)
-            if isinstance(launched, LocalFallback):
+            if isinstance(launched, CloudDeclined):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
             prefix = 'artifacts/' + attempt + '/'
@@ -1486,7 +1492,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command),
         authorization: wire.FirstAuthorization | placement.NoLaunchPermission = NO_ASSIGNED_LAUNCH,
-        ) -> LocalFallback | CloudCompleted:
+        ) -> CloudDeclined | CloudCompleted:
     # Record the final fallback here so worker replies and service errors produce one row.
     attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode, gate_job=gate_job)
     if isinstance(authorization, wire.FirstAuthorization):
@@ -1496,7 +1502,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
                             selected=selected, service=service, attempt=attempt)
     except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
-        outcome = LocalFallback(str(error))
+        outcome = CloudDeclined(str(error))
     except BaseException:
         if isinstance(authorization, wire.FirstAuthorization):
             report_gate_execution(authorization, attempt, placement.AttemptCancelled('The gate caller ended'))
@@ -1505,9 +1511,9 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
                        else placement.AttemptDeclined(outcome.reason))
         report_gate_execution(authorization, attempt, disposition)
-    if isinstance(outcome, LocalFallback):
+    if isinstance(outcome, CloudDeclined):
         if attempt.interruptions:
-            outcome = LocalFallback(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
+            outcome = CloudDeclined(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
         try:
             append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
                 'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
@@ -1521,12 +1527,12 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
-              selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+              selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> CloudDeclined | CloudCompleted:
     switch = aws_switch(settings())
     if not isinstance(switch, AwsOn):
         reason = cloud_gate_off_reason(switch)
         end_open_gates(attempt.directory, service)
-        return LocalFallback(reason)
+        return CloudDeclined(reason)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
@@ -1534,7 +1540,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     with control_lock(root):
         current = root / 'current.json'
         if not current.exists() and not deployment_path.exists():
-            return LocalFallback('image or stack is absent')
+            return CloudDeclined('image or stack is absent')
         tree, _dirty = working_tree(repo)
         require_selected_tree(repo, tree, selected)
         previous = read(current) if current.exists() else {}
@@ -1560,7 +1566,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 if not settle_incompatible_attempt(folder, book, service):
                     attempt.identifier = folder.name
                     attempt.gate_job = _saved_gate_job(previous)
-                    return LocalFallback('The incompatible cloud attempt has not ended')
+                    return CloudDeclined('The incompatible cloud attempt has not ended')
                 same_request = False
                 ended = False
                 folder = root / uuid4().hex
@@ -1587,13 +1593,13 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
                     return outcome
         if not deployment_path.exists():
-            return LocalFallback('image or stack is absent')
+            return CloudDeclined('image or stack is absent')
         home = conf.read(account_settings_path()).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(deployment_path, home)
         regional = ledger.rows(deployment, 'regions')[0]
         if not regional.get('image') or not regional.get('template'):
-            return LocalFallback('image or stack is absent')
+            return CloudDeclined('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
@@ -1629,20 +1635,20 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 result = read(result_path) if result_path.exists() else {}
                 failure = retryable_cloud_failure(result)
                 if failure is not RetryableCloudFailure.NONE:
-                    outcome = LocalFallback(ledger.text(result, 'reason'))
+                    outcome = CloudDeclined(ledger.text(result, 'reason'))
                 else:
                     if not (folder / 'launch.json').exists():
                         if attempt.interruptions > retry_limit:
                             reservation.status = 0
-                            return LocalFallback('The Spot interruption retry limit is reached')
+                            return CloudDeclined('The Spot interruption retry limit is reached')
                         if box_failures > box_retry_limit:
                             reservation.status = 0
-                            return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
+                            return CloudDeclined(f'The box failure retry limit is reached: {last_box_failure}')
                         # A retry launches a new box, so it reads the switch again.
                         switch = aws_switch(settings())
                         if not isinstance(switch, AwsOn):
                             reservation.status = 0
-                            return LocalFallback(cloud_gate_off_reason(switch))
+                            return CloudDeclined(cloud_gate_off_reason(switch))
                     command = gate_attempt_command('--worker', folder, directory, sidecar)
                     request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
                                                        selected=selected, gate_job=attempt.gate_job)
@@ -1650,7 +1656,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
                         reservation.status = 0
-                        return LocalFallback(f'The tested commit does not read SuiteMode value {mode.wire!r}')
+                        return CloudDeclined(f'The tested commit does not read SuiteMode value {mode.wire!r}')
                     if _saved_gate_job(request) != attempt.gate_job:
                         request['gate_job'] = state['gate_job']
                     request['mode'] = mode.wire
@@ -1694,13 +1700,13 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                                'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
                                'last_box_failure': last_box_failure})
                 if attempt.interruptions > retry_limit:
-                    return LocalFallback('The Spot interruption retry limit is reached')
+                    return CloudDeclined('The Spot interruption retry limit is reached')
                 if box_failures > box_retry_limit:
-                    return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
+                    return CloudDeclined(f'The box failure retry limit is reached: {last_box_failure}')
                 if next_variant >= len(ledger.rows(launch, 'variants')):
                     if failure is RetryableCloudFailure.BOX:
-                        return LocalFallback(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
-                    return LocalFallback('No cloud capacity choice remains')
+                        return CloudDeclined(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
+                    return CloudDeclined('No cloud capacity choice remains')
                 folder = root / uuid4().hex
                 saved_request = {}
                 attempt.identifier = folder.name
@@ -1733,31 +1739,31 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
 
 
 def run_service(repo: Path, folder: Path, request: dict[str, object], command: Sequence[str],
-                service: Callable[[Sequence[str]], int]) -> LocalFallback | CloudCompleted:
+                service: Callable[[Sequence[str]], int]) -> CloudDeclined | CloudCompleted:
     # The service owns every AWS call. The session only reads local evidence.
     _ = service(command)
     if not (folder / 'outcome.json').exists():
-        return LocalFallback('The scaler service has no final result')
+        return CloudDeclined('The scaler service has no final result')
     outcome = read(folder / 'outcome.json')
     if outcome.get('status') != 'complete':
-        return LocalFallback(ledger.text(outcome, 'reason'))
+        return CloudDeclined(ledger.text(outcome, 'reason'))
     try:
         row = outcome_result(folder, outcome)
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return LocalFallback(str(error))
+        return CloudDeclined(str(error))
     return _complete_outcome(repo, folder, request, row)
 
 
 def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
-                      row: dict[str, object]) -> LocalFallback | CloudCompleted:
+                      row: dict[str, object]) -> CloudDeclined | CloudCompleted:
     try:
         validate_result(row, request)
         head = ledger.text(request, 'head')
         selection = gate_box.completion_selection(ledger.text(request, 'mode'), split=request.get('split') is True)
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return LocalFallback(str(error))
+        return CloudDeclined(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
-        return LocalFallback('The checkout changed during the cloud attempt')
+        return CloudDeclined('The checkout changed during the cloud attempt')
     record = {**ledger.mapping(row['record']), 'selection': selection}
     import_record(folder, {**row, 'record': record})
     print((folder / 'gate.log').read_text(), end='', flush=True)
@@ -1847,7 +1853,7 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
         return 'The AWS launch permission differs from the request'
     outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                   selected=selected, gate_job=gate_job, authorization=authorization)
-    return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
+    return outcome.reason if isinstance(outcome, CloudDeclined) else outcome.run
 
 
 if __name__ == '__main__':
