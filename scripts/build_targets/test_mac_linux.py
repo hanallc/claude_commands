@@ -25,10 +25,11 @@ import unittest
 from unittest.mock import call, patch
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import mac_run
+from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
-from scripts.lib import conf, process_group
+from scripts.buildlog import store
+from scripts.lib import conf, process_group, process_start
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
@@ -94,37 +95,55 @@ assert 'O_NOFOLLOW' in shell
 assert 'EPOCHREALTIME' not in shell
 outer_seconds = int(os.environ['FIXTURE_RUN_SECONDS']) + int(os.environ['FIXTURE_TRANSFER_SECONDS'])
 assert f'timeout --signal=KILL {outer_seconds} python3' in shell
-payload = sys.stdin.buffer.read()
 offset = re.search(r'^head -c ([0-9]+) [|] tar', shell, re.M)
 assert offset
 bootstrap_bytes = int(offset[1])
-bundle = payload[bootstrap_bytes:]
-assert bundle.startswith((b'# v2 git bundle\\n', b'# v3 git bundle\\n'))
-header, pack = bundle.split(b'\\n\\n', 1)
-assert pack.startswith(b'PACK')
-Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(bundle)))
-with Path(os.environ['FIXTURE_BUNDLE_FORMS']).open('a') as forms:
-    forms.write('delta\\n' if any(line.startswith(b'-') for line in header.splitlines()) else 'first\\n')
-if scenario == 'disconnect':
-    payload = payload[:-1]
-if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
+payload = Path(os.environ['FIXTURE_SOURCE_BYTES']).with_suffix('.payload')
+payload.unlink(missing_ok=True)
+
+
+def record_bundle():
+    bundle = payload.read_bytes()[bootstrap_bytes:] if payload.exists() else b''
+    if b'\\n\\n' not in bundle:
+        return
+    assert bundle.startswith((b'# v2 git bundle\\n', b'# v3 git bundle\\n'))
+    header, pack = bundle.split(b'\\n\\n', 1)
+    assert pack.startswith(b'PACK')
+    Path(os.environ['FIXTURE_SOURCE_BYTES']).write_text(str(len(bundle)))
+    with Path(os.environ['FIXTURE_BUNDLE_FORMS']).open('a') as forms:
+        forms.write('delta\\n' if any(line.startswith(b'-') for line in header.splitlines()) else 'first\\n')
+
+
+# A separate process carries the input, as the SSH hops do: the guest input ends when the natedev link ends,
+# not when this process ends. A disconnect ends the link inside the bundle.
+guest_input, link = os.pipe()
+forward = ['head', '-c', str(bootstrap_bytes + 16)] if scenario == 'disconnect' else ['tee', str(payload)]
+_ = subprocess.Popen(forward, stdout=link)
+before_copy = scenario in ('disconnect-before-copy', 'interrupted-before-copy')
+# A guest whose SSH server has not seen the end of the link keeps its input open.
+held = before_copy or 'FIXTURE_HELD_LINK' in os.environ
+guest = subprocess.Popen(['bash', '-c', shell], stdin=guest_input,
+                         stdout=subprocess.DEVNULL if before_copy else None,
+                         stderr=subprocess.PIPE if before_copy else None,
+                         env=environment, start_new_session=True, pass_fds=(link,) if held else ())
+os.close(guest_input)
+os.close(link)
+if before_copy:
     import selectors
 
-    guest = subprocess.Popen(['bash', '-c', shell], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.PIPE, env=environment, start_new_session=True)
-    guest.stdin.write(payload)
-    guest.stdin.close()
     with selectors.DefaultSelector() as ready:
         ready.register(guest.stderr, selectors.EVENT_READ)
         assert ready.select(3), 'The guest did not take the run lock.'
     assert guest.stderr.readline().startswith(b'mac-linux run locked ')
     assert guest.stderr.readline() == b'fixture pause before take_copy\\n'
+    record_bundle()
     if scenario == 'interrupted-before-copy':
         print('fixture local SSH is still active', file=sys.stderr, flush=True)
         signal.pause()
     os._exit(255)
-sys.exit(subprocess.run(['bash', '-c', shell], input=payload, env=environment,
-                        start_new_session=True).returncode)
+status = guest.wait()
+record_bundle()
+sys.exit(status)
 '''
 
 
@@ -477,12 +496,23 @@ class GuestCommandParityTests(unittest.TestCase):
         self.assertIn(f'the guest PATH finds {self.copy / "target/built"}', refusal)
 
 
+# A Mac claim identity for a fixture reservation that holds no claim.
+FIXTURE_CLAIM = claim_state.ClaimIdentity(mac_test.MAC_LINUX_CLAIM_ID_PREFIX + 'fixture', 'episode', 'attempt')
+
+
 class MacLinuxRouteTests(unittest.TestCase):
     root: Path = Path()
     guest_home: Path = Path()
     trace: Path = Path()
     repo: Path = Path()
     registry: Path = Path()
+    placed: placement.PlacementAssignment = placement.PlacementAssignment(
+        'gate-episode', 'gate-attempt', placement.PlacementDestination(
+            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude', slot=1), 1),
+        execution_identity.SourceKeyUnavailable('fixture'), placement.SubmittingOwner('natedev', 1, 'start'),
+        OwningSession('submitting-session'), 0.0)
+    # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
+    consumed: tuple[tuple[wire.ConsumePermission, str, bool], ...] = ()
 
     @override
     def setUp(self) -> None:
@@ -531,7 +561,18 @@ class MacLinuxRouteTests(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.test',
             'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.test',
+            'ADMISSION_SOCKET': str(self.root / 'no-queue.sock'),
         })))
+        self.consumed = ()
+
+        def consume(request: wire.ConsumePermission) -> wire.FirstAuthorization:
+            holder = request.holder
+            assert isinstance(holder, placement.ClaimHolderIdentity)
+            held = mac_run.claim_held(mac_linux.GUEST_CLAIM_TARGET, request.claim.claim_id, holder.pid, holder.start_time)
+            self.consumed = (*self.consumed, (request, self.trace.read_text(encoding='utf-8'), held))
+            return wire.FirstAuthorization(request.assignment, request.claim)
+
+        _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
@@ -587,7 +628,8 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job, type_dirs=type_dirs)
+                                     module_time_limit_s=3, gate_job=gate_job, assignment=self.placed,
+                                     type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
@@ -638,6 +680,54 @@ fi
                     self.assertEqual(claim_state.read_claims(paths), ())
         self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
         self.assert_guest_clean()
+
+    def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
+        result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, trace, held), = self.consumed
+        start = process_start.process_start(os.getpid())
+        assert isinstance(start, process_start.Started)
+        self.assertEqual(request.assignment, self.placed)
+        self.assertEqual(request.holder, placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start))
+        destination = self.placed.destination
+        self.assertEqual(request.claim, placement.ProviderClaimReference(destination.provider, destination.target,
+            destination.scope, request.claim.claim_id, self.placed.episode, self.placed.attempt))
+        self.assertTrue(request.claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
+        self.assertTrue(held)
+        self.assertEqual(trace, '')
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
+        refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),
+                                      'the attempt is closed: cancelled')
+        def refuse(_request: wire.ConsumePermission) -> wire.DispatchStatus:
+            return refusal
+
+        cases: tuple[tuple[Callable[[wire.ConsumePermission], wire.DispatchStatus] | wire.AdmissionUnavailable, str], ...] = (
+            (refuse, 'the queue refused the launch permission: the attempt is closed: cancelled'),
+            (wire.AdmissionUnavailable('the queue is down'), 'the launch permission is unavailable: the queue is down'))
+        for answer, reason in cases:
+            with self.subTest(reason=reason):
+                with patch.object(admission_client, 'consume_permission', side_effect=answer) as consume:
+                    self.assertEqual(self.not_started(self.route()), reason)
+                consume.assert_called_once()
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
+                self.assert_guest_clean()
+
+    def test_the_route_consumes_the_assignment_it_got_and_reads_no_placement_file(self) -> None:
+        # The gate checked its assignment at its start. The route reads no placement file again.
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
+        self.placed = replace(self.placed, attempt='checked-attempt')
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(placement_file)}),
+              patch.object(admission_client, 'read_assignment',
+                           side_effect=AssertionError('the route read the placement file'))):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        (request, _, _), = self.consumed
+        self.assertEqual(request.assignment, self.placed)
 
     def test_busy_mac_claim_refuses_the_route_before_ssh(self) -> None:
         paths = claim_state.state_paths('mac')
@@ -758,7 +848,7 @@ fi
     def test_local_timeout_kills_the_recorded_group_and_proves_end(self) -> None:
         configuration = self.registry.with_name('mac_linux.conf')
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=30'))
-        with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30'}),
+        with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30', 'FIXTURE_HELD_LINK': '1'}),
               patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6)):
             result = self.route('hang')
         self.assertIsInstance(result, str)
@@ -771,6 +861,74 @@ fi
 
     def run_lock(self) -> Path:
         return self.guest_home / '.claude' / mac_linux.RUN_LOCK_PATH
+
+    @staticmethod
+    def process_sessions() -> dict[int, tuple[int, int, int]]:
+        """The parent, process group and session of each live process."""
+        found: dict[int, tuple[int, int, int]] = {}
+        for entry in Path('/proc').iterdir():
+            if entry.name.isdigit():
+                with suppress(OSError):
+                    state, parent, group, session = entry.joinpath('stat').read_text().rpartition(')')[2].split()[:4]
+                    if state != 'Z':
+                        found[int(entry.name)] = (int(parent), int(group), int(session))
+        return found
+
+    def assert_run_ends(self, deadline: float, group: int, *sessions: int) -> None:
+        """Before the deadline, the run group and the given sessions have no live process, and the run lock is free."""
+        while True:
+            live = [pid for pid, (_, process_group, session) in self.process_sessions().items()
+                    if process_group == group or session in sessions]
+            free = subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']) == 0
+            if not live and free:
+                return
+            self.assertLess(time.monotonic(), deadline, f'live processes {live}, run lock free: {free}')
+            time.sleep(0.05)
+
+    def test_a_stopped_natedev_side_ends_the_guest_run_with_no_cleanup(self) -> None:
+        program = '\n'.join((
+            'from pathlib import Path',
+            'import sys',
+            'from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED',
+            'from scripts.build_targets import mac_linux',
+            'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
+            'from scripts.build_queue import admission_wire',
+            'mac_linux.consume_launch_permission = lambda claim, assignment: None',
+            'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
+            '                selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED,',
+            '                assignment=admission_wire.read_assignment(Path(sys.argv[2])).assignment)'))
+        placement_file = self.root / 'assignment.json'
+        admission_client.write_assignment(placement_file, wire.Assignment(self.placed))
+        environment = {**os.environ, 'FIXTURE_GUEST_RESULT': 'hang',
+                       'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}
+        group_record = self.root / 'run.group'
+        with (self.root / 'natedev.log').open('wb') as log, subprocess.Popen(
+                [sys.executable, '-c', program, str(self.repo), str(placement_file)], cwd=Path(__file__).resolve().parents[2],
+                env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log) as natedev:
+            try:
+                started = time.monotonic() + 30
+                while not group_record.is_file() or not group_record.read_text():
+                    self.assertIsNone(natedev.poll(), (self.root / 'natedev.log').read_text())
+                    self.assertLess(time.monotonic(), started, 'The guest run did not start.')
+                    time.sleep(0.05)
+                stream, = (pid for pid, (parent, _, session) in self.process_sessions().items()
+                           if parent == natedev.pid and session == pid)
+            finally:
+                natedev.kill()
+        # SIGKILL runs no code in the natedev process, so only the end of its link can stop the guest run.
+        deadline = time.monotonic() + mac_linux.GUEST_KILL_GRACE_SECONDS
+        self.assert_run_ends(deadline, int(group_record.read_text()), stream)
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run'])
+
+    def test_the_link_watcher_ends_with_the_run_and_leaves_no_process(self) -> None:
+        # The guest keeps its input open after the run, so a watcher that outlives the run stays live.
+        with patch.dict(os.environ, {'FIXTURE_HELD_LINK': '1'}):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        group = int(self.run_lock().read_text().split()[0])
+        self.assert_run_ends(time.monotonic() + mac_linux.GUEST_KILL_GRACE_SECONDS, group)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_cleanup_cancels_an_attempt_before_it_takes_the_lock(self) -> None:
         git = self.run_lock().parent
@@ -930,10 +1088,10 @@ fi
 
         @contextmanager
         def record_failure(repo: Path, work: SuiteMode | StepJob,
-                           gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
-            with reservation(repo, work, gate_job):
+                           gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
+            with reservation(repo, work, gate_job) as claim:
                 try:
-                    yield
+                    yield claim
                 except mac_linux.GuestUnavailable as error:
                     unproven.append(error)
                     raise
@@ -962,7 +1120,7 @@ fi
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0),
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
                 result = mac_linux.route(self.repo, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
-                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED)
+                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
                 first, = attempts
                 failure, = unproven
                 assert isinstance(failure, mac_linux.GuestEndUnproven), failure
@@ -1083,9 +1241,9 @@ fi
         prove_guest_end = mac_linux.prove_guest_end
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual([type(proof) for proof in proofs],
                                  [mac_linux.GuestEndPending, mac_linux.GuestEndPending, mac_linux.GuestEndProven])
@@ -1166,7 +1324,8 @@ fi
         with (patch.object(Path, 'read_text', read_with_delay),
               patch.object(mac_linux, 'monotonic', lambda: now)):
             result = self.route()
-        self.assertEqual(now, 1.25)
+        # The run command and the cleanup command each read the helper once; the cleanup read passes the deadline.
+        self.assertEqual(now, 2.5)
         self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assert_guest_clean('probe', 'arm', 'run')
 
@@ -1243,9 +1402,9 @@ fi
             raise KeyboardInterrupt
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
@@ -1262,10 +1421,10 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 events.append('released')
 
@@ -1304,17 +1463,17 @@ fi
         lock_statuses: list[int] = []
 
         @contextmanager
-        def reservation(*_args: object) -> Generator[None]:
+        def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
             events.append('reserved')
             try:
-                yield
+                yield FIXTURE_CLAIM
             finally:
                 lock_statuses.append(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']))
                 events.append('released')
 
-        def fail_stream(repo: Path, command: list[str], bootstrap: bytes,
-                        timeout: int) -> subprocess.CompletedProcess[bytes]:
-            stream = stream_guest_bundle(repo, command, bootstrap, timeout)
+        def fail_stream(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int) -> subprocess.CompletedProcess[bytes]:
+            stream = stream_guest_bundle(repo, command, bootstrap, timeout, link)
             self.assertEqual(stream.returncode, 255)
             events.append('SSH failed')
             raise mac_linux.GuestUnavailable('fixture SSH failed')
@@ -1440,6 +1599,18 @@ fi
     def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
         # Without Chromium on the guest PATH, the runner stops before a test starts.
         (self.root / 'bin/chromium').unlink()
+        # A host can have Chromium, as the guest has: a PATH folder that holds it changes to a fixture folder of links
+        # to each of its other entries.
+        folders = os.environ['PATH'].split(os.pathsep)
+        for index, folder in enumerate(folders):
+            if folder and shutil.which('chromium', path=folder):
+                links = self.root / f'path-{index}'
+                links.mkdir()
+                for entry in Path(folder).iterdir():
+                    if entry.name != 'chromium':
+                        (links / entry.name).symlink_to(entry)
+                folders[index] = str(links)
+        os.environ['PATH'] = os.pathsep.join(folders)
         self.assertIsNone(shutil.which('chromium'))
         reason = self.not_started(self.route())
         self.assertRegex(reason, r'^SSH or source stream exited 1: .*Chromium is absent from the guest PATH')

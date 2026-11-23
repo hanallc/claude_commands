@@ -82,12 +82,9 @@ class FirstStepAdmission:
         self.grant = HandedOff()
 
     def _hand_gate(self, grant: GatePlacement) -> None:
-        if isinstance(grant.grant, wire.LocalPlacementGranted):
-            # The gate takes its own memory reservation when it starts.
-            local = grant.grant.grant
-            answer = queue_place.release_place(local.reservation, 0, local.cleanup_timing)
-            if isinstance(answer, wire.Refused):
-                raise FirstStepRefused(answer.reason)
+        # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
+        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
+        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
 
@@ -217,9 +214,10 @@ def run_gate_with_placement(
         try:
             refusal = read_gate_claim_failure(assignment_file, request)
             settled = client.claim_failure(refusal)
+            # The guest gate can consume the launch permission before it takes no run.
             if (settled.assignment != refusal.assignment
                     or settled.state != placement.ClosedAssignment(refusal.reason)
-                    or not isinstance(settled.permission, placement.PermissionAvailable)
+                    or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                     or not isinstance(settled.retry, placement.RetryAt)):
                 raise wire.AdmissionUnavailable('the queue has not settled the Mac guest attempt')
             destination = refusal.assignment.destination

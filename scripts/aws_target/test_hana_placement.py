@@ -640,7 +640,7 @@ class HanaGpuPlacementTests(CostFixture):
         self.trials = self.root / 'trials'
         gpu_target = target_config.SshTarget('hana-gpu', 'linux', self.gpu_settings)
         _ = self.gpu_settings.write_text(
-            'execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            'enabled=on\nexecution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
             + f'hana_gpu_repository={KEY}\nhana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
             + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
         self.account_dir.mkdir(parents=True)
@@ -686,7 +686,7 @@ class HanaGpuPlacementTests(CostFixture):
         _ = self.grants.write_text(json.dumps({'gpu_instance_types': ['g6.2xlarge']}))
         self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
         _ = self.grants.write_text(grants)
-        _ = self.gpu_settings.write_text(self.gpu_settings.read_text().replace('enabled=on', 'enabled=off'))
+        _ = self.gpu_settings.write_text(self.gpu_settings.read_text().replace('hana_gpu_route_enabled=on', 'hana_gpu_route_enabled=off'))
         self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
 
     def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
