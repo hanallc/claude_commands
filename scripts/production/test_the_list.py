@@ -55,7 +55,9 @@ class TheListTests(unittest.TestCase):
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": rows}))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
-            "CLAUDE_CODE_SESSION_ID": MORTY.current_session}))
+            "CLAUDE_CODE_SESSION_ID": MORTY.current_session,
+            # Each date this file expects is a New York date; the live zone setting must not move it.
+            "USER_ZONE": "America/New_York"}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
@@ -151,7 +153,6 @@ class TheListTests(unittest.TestCase):
 
     def test_commands_preserve_fields_text_and_history(self) -> None:
         content = "Use the result.\r\n\n\n## Latest status\n\nThis heading stays in the text.\n"
-        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
         result = self.command("add", "--title", 'The page: "List"', "--owner", RUNNER.id,
             "--number", "106", "--source", "nate", "--state", "Working", "--unit", "unit-board",
             "--next-check", "2026-11-16T19:00:00+00:00", "--eta", "Nov 16 15:00 EST",
@@ -1558,8 +1559,7 @@ class TheListTests(unittest.TestCase):
 
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
-        with patch.object(the_list, "user_zone", return_value=ZoneInfo("America/New_York")):
-            self.assertEqual(self.command("park", "--id", item.id, "--until", "2026-11-17", "--source", "nate"), (0, "", ""))
+        self.assertEqual(self.command("park", "--id", item.id, "--until", "2026-11-17", "--source", "nate"), (0, "", ""))
         item = the_list.load(MORTY.id, item.id)
         self.assertEqual(item.parked_until, datetime(2026, 11, 17, 5, tzinfo=UTC))
         self.assertEqual(item.state, the_list.ItemState.WORKING)

@@ -293,6 +293,7 @@ class QueuePlace:
     configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming = field(kw_only=True, repr=False)
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
+    reservation: HeldReservation | UnreservedProgram = field(default_factory=UnreservedProgram, kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def publish_sample(self, suffix: str, value: str) -> None:
@@ -314,6 +315,18 @@ class QueuePlace:
                 self.publish_sample(".wave", f"{self.peak_bytes} {int(now)}\n")
                 self.wave_at = now
 
+    def child_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Mark children that run under this reservation."""
+        child = dict(environment)
+        if isinstance(self.reservation, HeldReservation):
+            grant = self.reservation.grant
+            directory = Path(grant.max_path).parent.resolve()
+            socket_path = wire.admission_socket_path().resolve()
+            cpu_pool = admission_client.cpu_pool_path().resolve()
+            child[admission_client.RESERVED_STEP_ENV] = (
+                f"{grant.reservation}\t{os.getpid()}\t{directory}\t{socket_path}\t{cpu_pool}")
+        return child
+
     def popen(self, argv: Sequence[str], **popen_arguments: Unpack[PopenArguments]) -> subprocess.Popen[bytes]:
         if isinstance(self.program, StartedProgram):
             raise QueuePlaceRefused("a queue place can start only one program")
@@ -322,6 +335,9 @@ class QueuePlace:
         if not popen_arguments.get("start_new_session", True):
             raise QueuePlaceRefused("a queued program must start in its own process group")
         popen_arguments["start_new_session"] = True
+        if isinstance(self.reservation, HeldReservation):
+            environment = popen_arguments.get("env")
+            popen_arguments["env"] = self.child_environment(os.environ if environment is None else environment)
         prefix: list[str] = []
         if self.purpose not in (ProgramPurpose.PROBE, ProgramPurpose.RUNNER) and os.environ.get("BUILDLOG_SCOPE") != "0":
             with redirect_stdout(sys.stderr):
@@ -478,9 +494,9 @@ def held_reservation(request: QueueRequest, *,
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):
         raise QueuePlaceRefused("left the admission queue")
-    output.finished()
     held = HeldReservation(reply)
     try:
+        output.finished()
         yield held
     finally:
         _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
@@ -538,7 +554,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")
-        place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
+        place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments,
+                           reservation=grant)
         failed = False
         try:
             yield place
