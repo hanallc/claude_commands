@@ -28,10 +28,11 @@ from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
@@ -455,17 +456,25 @@ def ancestry(request: MergeRequest) -> CheckpointOrigin:
     already = merged(request)
     if not isinstance(request.kind, CodeCheckpoint):
         _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
+        main_tip = good(git(checkout, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"), "ancestry")
         closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
                            request.commit), "ancestry")
         unmerged = good(git(checkout, "rev-list", "--reverse", "--topo-order", "--no-merges",
-                            f"{request.production.merge_branch}..{request.commit}", "^origin/main"), "ancestry").splitlines()
-        pending = [commit for commit in unmerged if commit != closing]
-        if pending:
-            first = pending[0]
-            subject = good(git(checkout, "show", "-s", "--format=%s", first), "ancestry")
+                            f"{request.production.merge_branch}..{request.commit}", f"^{main_tip}"), "ancestry").splitlines()
+        run_git = partial(git, checkout)
+        for commit in unmerged:
+            if commit == closing:
+                continue
+            try:
+                if git_merge_tree.leaves_target_unchanged(run_git, commit, main_tip):
+                    continue
+            except OSError as error:
+                raise checkpoint_gate.Stop("ancestry", "failed", str(error),
+                                           "the showrunner will inspect the failed command") from error
+            subject = good(git(checkout, "show", "-s", "--format=%s", commit), "ancestry")
             kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
-            raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {first[:12]}: {subject}",
-                                       f"wait for {first[:12]} to merge, then resend the {kind}")
+            raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {commit[:12]}: {subject}",
+                                       f"wait for {commit[:12]} to merge, then resend the {kind}")
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return CheckpointOrigin(origin_branch.removeprefix("origin/"), already)

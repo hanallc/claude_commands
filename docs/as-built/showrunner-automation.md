@@ -293,6 +293,7 @@ Each local Promote checkout must exist before the command pushes.
 - **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
+     For a shrink or as-built checkpoint, a pending commit counts as merged if a clean test merge leaves the fetched `origin/main` tree unchanged.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
