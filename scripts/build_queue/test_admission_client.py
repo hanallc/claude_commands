@@ -1589,6 +1589,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(errors.getvalue().count("build queue not reachable; trying for 5 s"), 1)
                     self.assertEqual(errors.getvalue().count(
                         "build queue unreachable for 5 s; step stopped; cargo token given back"), 1)
+                    self.assertNotIn("queue reached again", errors.getvalue())
                     self.assertNotIn("step refused", errors.getvalue())
                     self.doCleanups()
 
@@ -2700,14 +2701,17 @@ class ClientTests(unittest.TestCase):
     def test_closed_connection_reconnects_immediately_with_same_episode_and_since(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
+            gpu_wait = reply_bytes(wait_reply(records.GpuSlotWait(1, 1), 1, "head", "GPU test slot"))
             transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), b""),
-                Exchange(reply_bytes(WAIT), b""), Exchange(reply_bytes(GRANTED)))
+                Exchange(gpu_wait, gpu_wait, b""), Exchange(reply_bytes(WAIT) + reply_bytes(GRANTED)))
             with redirect_stderr(io.StringIO()) as output:
                 result = client.admit(request, lambda _wait: None, lambda: request)
             self.assertEqual(result, GRANTED)
             self.assertEqual(transport.requests, [request] * 3)
             self.assertEqual(transport.attempts, [0, 0, 0])
             self.assertEqual(output.getvalue().count("admission service restarted; waiting again"), 1)
+            self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("queue reached again")],
+                ["queue reached again: GPU test slot", "queue reached again: free memory"])
 
     def test_silent_service_reports_after_120_seconds_and_keeps_waiting(self) -> None:
         with AdmissionFixture() as fixture:
