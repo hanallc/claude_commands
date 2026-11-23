@@ -2,7 +2,7 @@
 
 The browser marks a send with the hold header. The server saves the request and answers 202 at once.
 When the hold time ends, the server replays the saved request to itself; the normal handler then saves and sends.
-An undo before that time deletes the saved request, so nothing is saved and nothing is sent.
+An undo before that time replaces the saved request with an undone mark, so nothing is saved and nothing is sent.
 Each hold is a file, so a server restart replays the holds that it finds, and a browser that lost its
 connection reads the same result again. A replay first writes a "may have left" result, so a server that stops
 during a replay never sends that request again.
@@ -16,7 +16,8 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -57,6 +58,34 @@ class ReleasedFile(TypedDict):
     released_at: float
 
 
+class UndoneFile(TypedDict):
+    state: Literal["undone"]
+    undone_at: float
+
+
+HoldFile = PendingFile | ReleasedFile | UndoneFile
+
+
+class BadFile(Enum):
+    """A file in the hold folder that is not a readable hold."""
+    UNREADABLE = "unreadable"
+
+
+class HoldHeader(Enum):
+    """The X-Send-Hold answer header: the send waits for Undo, or its result is not ready."""
+    HELD = "held"
+    PENDING = "pending"
+
+
+class HeldFields(TypedDict):
+    hold: str
+    seconds: int
+
+
+class HoldsStopped(Exception):
+    """The server restarts, so it takes no new hold."""
+
+
 @dataclass(frozen=True)
 class HeldResponse:
     status: int
@@ -66,6 +95,7 @@ class HeldResponse:
 
 class HoldState(Enum):
     PENDING = "pending"
+    UNDONE = "undone"
     MISSING = "missing"
 
 
@@ -105,27 +135,46 @@ class Holds:
         self._lock: threading.Condition = threading.Condition()
         self._timers: dict[str, threading.Timer] = {}
         self._releasing: set[str] = set()
+        # Results that the server could not write; the page reads them from memory.
+        self._failed: dict[str, HeldResponse] = {}
+        self._answering: int = 0
         self._stopping: bool = False
 
     def _file(self, hold_id: str) -> Path:
         return self._folder / f"{hold_id}.json"
 
-    def _write(self, hold_id: str, saved: PendingFile | ReleasedFile) -> None:
+    def _write(self, hold_id: str, saved: HoldFile) -> None:
         # A hold keeps the user's words and images, so only the owner can read it.
         self._folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_text_atomic(self._file(hold_id), json.dumps(saved), new_file_mode=0o600)
 
-    def _saved(self, path: Path) -> PendingFile | ReleasedFile | None:
-        """Read one hold file, or name it on stderr and skip it when it is not a hold."""
+    def _saved(self, path: Path) -> HoldFile | BadFile:
+        """Read one hold file, or name it on stderr when it is not a hold."""
         try:
-            saved = cast(PendingFile | ReleasedFile, json.loads(path.read_text(encoding="utf-8")))
-            if saved["state"] in ("pending", "released"):
+            saved = cast(HoldFile, json.loads(path.read_text(encoding="utf-8")))
+            if saved["state"] in ("pending", "released", "undone"):
                 return saved
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"review-links send hold {path.name}: {error}", file=sys.stderr)
-            return None
+            return BadFile.UNREADABLE
         print(f"review-links send hold {path.name}: unknown state", file=sys.stderr)
-        return None
+        return BadFile.UNREADABLE
+
+    @contextmanager
+    def answering(self) -> Generator[None]:
+        """Keep the server from a restart while a request saves a hold or answers it.
+
+        Raise HoldsStopped after a stop, because the browser could then lose the answer of a saved hold.
+        """
+        with self._lock:
+            if self._stopping:
+                raise HoldsStopped
+            self._answering += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._answering -= 1
 
     def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float) -> str:
         """Save one send and start its timer. Return the hold id."""
@@ -147,15 +196,24 @@ class Holds:
         timer.start()
 
     def undo(self, hold_id: str) -> UndoResult:
-        """Delete a send that the server has not released."""
+        """Cancel a send that the server has not released.
+
+        An undone mark replaces the saved words, so a repeated undo, after a lost answer, still says undone.
+        """
         with self._lock:
             timer = self._timers.pop(hold_id, None)
-            if timer is None:
-                return UndoResult.ALREADY_SENT if hold_id in self._releasing or self._file(hold_id).exists() \
-                    else UndoResult.MISSING
-            timer.cancel()
-            self._file(hold_id).unlink(missing_ok=True)
-            return UndoResult.UNDONE
+            if timer is not None:
+                timer.cancel()
+                undone: UndoneFile = {"state": "undone", "undone_at": time.time()}
+                self._write(hold_id, undone)
+                return UndoResult.UNDONE
+            if hold_id in self._releasing or hold_id in self._failed:
+                return UndoResult.ALREADY_SENT
+            path = self._file(hold_id)
+            saved = self._saved(path) if path.exists() else BadFile.UNREADABLE
+        if saved is BadFile.UNREADABLE:
+            return UndoResult.MISSING
+        return UndoResult.UNDONE if saved["state"] == "undone" else UndoResult.ALREADY_SENT
 
     def send_now(self, hold_id: str) -> bool:
         """Release a pending send at once, because its page closed. Return whether it was pending."""
@@ -168,12 +226,12 @@ class Holds:
         return True
 
     def stop_if_idle(self) -> bool:
-        """Stop all releases when no replay runs, so a restart cannot cut one. Return whether they stopped.
+        """Stop all holds when no replay runs and no hold request is answered. Return whether they stopped.
 
         A timer that fires after the stop leaves its file pending, and the next server sends it.
         """
         with self._lock:
-            self._stopping = not self._releasing
+            self._stopping = not self._releasing and not self._answering
             return self._stopping
 
     def _release(self, hold_id: str) -> None:
@@ -195,11 +253,11 @@ class Holds:
             # A server that stops during the replay finds this result, and never sends the request again.
             self._write(hold_id, released_file(failed(MAY_HAVE_LEFT)))
         except (OSError, ValueError, KeyError, TypeError) as error:
+            # A pending file left here would leave with the next server, after the page said it failed.
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
-            try:
-                self._write(hold_id, released_file(failed(f"The held send failed: {error}")))
-            except OSError:
-                pass
+            self._file(hold_id).unlink(missing_ok=True)
+            with self._lock:
+                self._failed[hold_id] = failed(f"The held send failed: {error}")
             return
         try:
             response = self._replay(saved["path"], saved["headers"], body)
@@ -212,6 +270,8 @@ class Holds:
             self._write(hold_id, released_file(response))
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
+            with self._lock:
+                self._failed[hold_id] = response
 
     def result(self, hold_id: str, *, wait: float = RESULT_WAIT_SECONDS) -> HeldResponse | HoldState:
         """Return the response of a released send, waiting a short time for a pending one.
@@ -225,11 +285,20 @@ class Holds:
                 if left <= 0:
                     return HoldState.PENDING
                 _ = self._lock.wait(left)
+            if hold_id in self._failed:
+                return self._failed[hold_id]
             path = self._file(hold_id)
-            saved = self._saved(path) if path.exists() else None
-        if saved is None or saved["state"] == "pending":
+            saved = self._saved(path) if path.exists() else BadFile.UNREADABLE
+        if saved is BadFile.UNREADABLE:
             return HoldState.MISSING
-        return HeldResponse(saved["status"], saved["content_type"], base64.b64decode(saved["body"]))
+        match saved["state"]:
+            case "pending":
+                # Only a stopped server keeps a pending file without its timer; the next server sends it.
+                return HoldState.PENDING
+            case "undone":
+                return HoldState.UNDONE
+            case "released":
+                return HeldResponse(saved["status"], saved["content_type"], base64.b64decode(saved["body"]))
 
     def recover(self) -> None:
         """Schedule each saved send after a restart, and delete old results."""
@@ -237,24 +306,35 @@ class Holds:
             return
         with self._lock:
             for path in sorted(self._folder.glob("*.json")):
-                saved = self._saved(path) if valid_hold_id(path.stem) else None
-                if saved is not None and saved["state"] == "pending":
+                saved = self._saved(path) if valid_hold_id(path.stem) else BadFile.UNREADABLE
+                if saved is not BadFile.UNREADABLE and saved["state"] == "pending":
                     self._schedule(path.stem, saved["due"])
         self.expire()
 
     def expire(self) -> None:
-        """Delete the results that no browser read within RESULT_KEEP_SECONDS."""
+        """Delete each result and undone mark older than RESULT_KEEP_SECONDS, and each file that is not a hold.
+
+        The folder is private to the holds, so a bad hold, or an old temporary file of a cut write, goes too.
+        """
         if not self._folder.is_dir():
             return
         oldest = time.time() - RESULT_KEEP_SECONDS
         with self._lock:
             busy = self._timers.keys() | self._releasing
-        # A released file does not change again, so the reads need no lock.
-        for path in self._folder.glob("*.json"):
-            if not valid_hold_id(path.stem) or path.stem in busy:
+        # A released or undone file does not change again, so the reads need no lock.
+        for path in self._folder.iterdir():
+            if path.stem in busy:
+                continue
+            if path.suffix != ".json" or not valid_hold_id(path.stem):
+                if path.is_file() and path.stat().st_mtime < oldest:
+                    path.unlink(missing_ok=True)
                 continue
             saved = self._saved(path)
-            if saved is not None and saved["state"] == "released" and saved["released_at"] < oldest:
+            if saved is BadFile.UNREADABLE:
+                path.unlink(missing_ok=True)
+            elif saved["state"] == "released" and saved["released_at"] < oldest:
+                path.unlink(missing_ok=True)
+            elif saved["state"] == "undone" and saved["undone_at"] < oldest:
                 path.unlink(missing_ok=True)
 
 
@@ -276,6 +356,6 @@ def replay_to(address: str, port: int) -> Replay:
     return replay
 
 
-def held_fields(hold_id: str, seconds: float) -> dict[str, object]:
+def held_fields(hold_id: str, seconds: int) -> HeldFields:
     """Return the 202 answer that tells the browser to show its Undo for this many seconds."""
     return {"hold": hold_id, "seconds": seconds}

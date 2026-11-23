@@ -2369,15 +2369,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if len(body) != size:
             self.json_response(400, {"reason": "The send is incomplete."})
             return
-        hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds)
-        self.json_response(202, send_hold.held_fields(hold_id, seconds), hold="held")
+        try:
+            # A restart waits until the browser has the hold id, so it can read the result from the next server.
+            with server.send_holds.answering():
+                hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds)
+                self.json_response(202, send_hold.held_fields(hold_id, seconds), hold=send_hold.HoldHeader.HELD)
+        except send_hold.HoldsStopped:
+            self.json_response(503, {"reason": "The console is restarting. Send again."})
 
     def hold_result(self, hold_id: str) -> None:
         """Answer with the response of a released send, or say that it is still held."""
         server = cast(ReviewLinksServer, self.server)
+        refusal = self.tailscale_refusal()
+        if refusal or not self.same_origin():
+            self.json_response(403, {"reason": refusal or "Read the send from the console page."})
+            return
         result = server.send_holds.result(hold_id) if send_hold.valid_hold_id(hold_id) else send_hold.HoldState.MISSING
         if result is send_hold.HoldState.PENDING:
-            self.json_response(202, {"pending": True}, hold="pending")
+            self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
+        elif result is send_hold.HoldState.UNDONE:
+            self.json_response(404, {"reason": "This send was undone."})
         elif result is send_hold.HoldState.MISSING:
             self.json_response(404, {"reason": "This send was undone or its result expired."})
         else:
@@ -2389,11 +2400,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             _ = self.wfile.write(result.body)
 
-    def json_response(self, status: int, fields: Mapping[str, object], *, hold: str = "") -> None:
+    def json_response(self, status: int, fields: Mapping[str, object], *,
+                      hold: send_hold.HoldHeader | None = None) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
-        if hold:
-            self.send_header("X-Send-Hold", hold)
+        if hold is not None:
+            self.send_header("X-Send-Hold", hold.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")

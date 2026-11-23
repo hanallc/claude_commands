@@ -4,6 +4,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -45,17 +46,51 @@ class HoldsTests(unittest.TestCase):
     def held_files(self) -> list[str]:
         return sorted(path.name for path in self.folder.glob("*.json"))
 
-    def test_an_undo_before_the_time_ends_deletes_the_send(self) -> None:
+    def test_an_undo_before_the_time_ends_replaces_the_send_with_an_undone_mark(self) -> None:
         replays = Replays()
         holds = Holds(self.folder, replays)
         hold_id = holds.hold("/review", {"Origin": "http://host", "Cookie": "kept out"}, b"words", 60)
         self.assertTrue(send_hold.valid_hold_id(hold_id))
         self.assertIs(holds.result(hold_id, wait=0), HoldState.PENDING)
         self.assertIs(holds.undo(hold_id), UndoResult.UNDONE)
+        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        self.assertNotIn(base64.b64encode(b"words").decode(), (self.folder / f"{hold_id}.json").read_text())
+        # A repeated undo, after a lost answer, still says undone.
+        self.assertIs(holds.undo(hold_id), UndoResult.UNDONE)
+        self.assertIs(holds.result(hold_id, wait=0), HoldState.UNDONE)
+        with patch.object(send_hold, "RESULT_KEEP_SECONDS", -1.0):
+            holds.expire()
         self.assertEqual(self.held_files(), [])
         self.assertIs(holds.undo(hold_id), UndoResult.MISSING)
-        self.assertIs(holds.result(hold_id, wait=0), HoldState.MISSING)
         self.assertEqual(replays.sent, [])
+
+    def test_a_stop_waits_for_a_hold_request_and_refuses_one_after_it(self) -> None:
+        holds = Holds(self.folder, Replays())
+        with holds.answering():
+            self.assertFalse(holds.stop_if_idle())
+        self.assertTrue(holds.stop_if_idle())
+        with self.assertRaises(send_hold.HoldsStopped), holds.answering():
+            pass
+
+    def test_a_failed_result_write_keeps_the_result_in_memory_and_deletes_the_send(self) -> None:
+        replays = Replays()
+        holds = Holds(self.folder, replays)
+        hold_id = holds.hold("/review", {}, b"words", 60)
+        _ = holds.undo(hold_id)
+        pending: send_hold.PendingFile = {"state": "pending", "path": "/review", "headers": {}, "body": "d29yZHM=",
+                                          "due": time.time() + 60}
+        _ = (self.folder / f"{hold_id}.json").write_text(json.dumps(pending), encoding="utf-8")
+        after = Holds(self.folder, replays)
+        after.recover()
+        with patch.object(send_hold, "write_text_atomic", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(after.send_now(hold_id))
+            result = after.result(hold_id, wait=5)
+        assert isinstance(result, HeldResponse)
+        self.assertEqual(result.status, 503)
+        self.assertEqual(replays.sent, [])
+        self.assertEqual(self.held_files(), [])
+        self.assertIs(after.undo(hold_id), UndoResult.ALREADY_SENT)
 
     def test_the_send_leaves_when_the_time_ends_and_its_result_stays_until_the_sweep(self) -> None:
         replays = Replays()
@@ -143,11 +178,17 @@ class HoldsTests(unittest.TestCase):
         self.assertEqual((self.folder / f"{hold_id}.json").stat().st_mode & 0o777, 0o600)
         _ = (self.folder / f"{'1' * 24}.json").write_text("not json", encoding="utf-8")
         _ = (self.folder / f"{'2' * 24}.json").write_text('{"state": "other"}', encoding="utf-8")
+        stale = self.folder / f".{hold_id}.json.1.x.tmp"
+        _ = stale.write_text("cut write", encoding="utf-8")
+        os.utime(stale, (0, 0))
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             Holds(self.folder, Replays()).recover()
             holds.expire()
         self.assertIn("unknown state", stderr.getvalue())
+        # The sweep deletes each bad hold and each old file that is not a hold; the pending hold stays.
+        self.assertEqual(self.held_files(), [f"{hold_id}.json"])
+        self.assertFalse(stale.exists())
         self.assertIs(holds.result("1" * 24, wait=0), HoldState.MISSING)
 
     def test_a_failed_replay_gives_a_503_result(self) -> None:

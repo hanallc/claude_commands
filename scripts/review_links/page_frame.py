@@ -611,7 +611,7 @@ function showSendUndo(hold,seconds){
  return new Promise(resolve=>{
   let done=false;
   const remove=()=>{
-   toast.remove();watch.disconnect();view.removeEventListener('pagehide',closed);removeEventListener('pagehide',remove);
+   toast.remove();watch.disconnect();view.removeEventListener('pagehide',closed);removeEventListener('pagehide',closed);
    if(!stack.children.length) stack.remove();
   };
   const finish=undone=>{
@@ -627,8 +627,8 @@ function showSendUndo(hold,seconds){
    resolve(false);
   };
   view.addEventListener('pagehide',closed);
-  // A card frame that goes away takes its toast with it; the server timer sends.
-  if(view!==window) addEventListener('pagehide',remove);
+  // A card frame that goes away takes its toast with it, so it sends at once too.
+  if(view!==window) addEventListener('pagehide',closed);
   fade.finished.then(()=>finish(false),()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();

@@ -792,6 +792,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def hold_states(self) -> list[str]:
+        """Return the state of each saved hold file."""
+        return [cast(send_hold.HoldFile, json.loads(path.read_text(encoding="utf-8")))["state"]
+                for path in sorted((self.root / send_hold.HOLD_FOLDER).glob("*.json"))]
+
     def held_new_item(self) -> tuple[test_review_page.ReviewPageTests, staff.StaffRow, bytes]:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -860,11 +865,14 @@ class ReviewLinksServerTests(unittest.TestCase):
             refused = self.held_http("POST", undo, headers={"Origin": "https://elsewhere.invalid"})
             self.assertEqual(refused[0], 403)
             self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
-            self.assertEqual(self.held_http("POST", undo)[::2], (404, {"outcome": "missing"}))
-            self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 404)
+            # A repeated Undo, after a lost answer, still says undone.
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            result = f"{send_hold.HOLD_PATH}/{hold_id}"
+            self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
+            self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
             send.assert_not_called()
         self.assertEqual(investigation.records(other.id), [])
-        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
+        self.assertEqual(self.hold_states(), ["undone"])
         self.assertEqual(self.request(f"/{send_hold.HOLD_FOLDER}/{hold_id}.json").status, 404)
 
     def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
@@ -887,7 +895,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.held_http("POST", review_page.PAGE_PATH + "?x=1", b"words", headers=marked)[0], 403)
         self.assertEqual(self.held_http("POST", review_page.PAGE_PATH, b"", headers=marked)[0], 400)
         self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/not-an-id/undo")[0], 404)
-        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
+        self.assertEqual(set(self.hold_states()), {"undone"})
 
     def raw_held_post(self, headers: list[str], body: bytes) -> bytes:
         """Send one marked Review POST with these extra header lines, end the send side, and return the answer."""
