@@ -420,6 +420,43 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result.modules, (self.repo / "scripts/checks/test_own.py",))
         self.assertEqual(result.base.commit, landing)
 
+    def test_a_join_selects_a_test_that_main_added_for_a_module_the_row_changed(self) -> None:
+        # Red 2 of item 191: the row changed a settings type, and main had added a test that builds it.
+        self.write("scripts/lib/eligibility.py", "VALUE = 1\n")
+        self.certify()
+        _ = self.git("switch", "-c", "row")
+        self.write("scripts/lib/eligibility.py", "VALUE = 2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, ())
+        _ = self.git("switch", "main")
+        self.write("scripts/buildlog/machine_facts.py", "from scripts.lib import eligibility\n")
+        self.add_test("buildlog/test_machine_facts.py", "from scripts.lib import eligibility\n")
+        _ = self.git("update-ref", "refs/remotes/origin/main", self.commit())
+        _ = self.git("switch", "row")
+        _ = self.git("merge", "--no-ff", "main", "-m", "Join main")
+        result = self.selection()
+        self.assertEqual(result.changed_files, ("scripts/lib/eligibility.py",))
+        self.assertEqual(result.modules, (self.repo / "scripts/buildlog/test_machine_facts.py",))
+
+    def test_recorded_content_reads_select_a_test_whose_module_embeds_a_changed_source(self) -> None:
+        # Red 3 of item 191: gate_box.GUEST embeds the startup hook source through inspect.getsource.
+        self.write("scripts/lib/sitecustomize.py", "NAME = 'gate'\n")
+        # A computed module name keeps the import graph from selecting the test.
+        self.write("scripts/aws_target/gate_box.py", "import importlib\nimport inspect\nHOOK = 'site' + 'customize'\n"
+                   + "GUEST = inspect.getsource(importlib.import_module(f'scripts.lib.{HOOK}'))\n")
+        self.add_test("aws_target/test_gate_box.py", "from scripts.aws_target import gate_box\n")
+        self.certify()
+        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
+        run = cast(dict[str, object], json.loads(log.read_text()))
+        for row in cast(list[dict[str, object]], run["modules"]):
+            row["folder_scans"] = []
+            row["content_reads"] = (["scripts/lib/sitecustomize.py", "scripts/aws_target/gate_box.py"]
+                                    if row["module"] == "test_gate_box.py" else [])
+        _ = log.write_text(json.dumps(run) + "\n")
+        self.write("scripts/lib/sitecustomize.py", "NAME = 'merge_gate'\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/aws_target/test_gate_box.py",))
+
     def test_a_dirty_file_at_the_landing_tip_is_the_only_changed_path(self) -> None:
         self.add_test("checks/test_own.py", "VALUE = 1\n")
         landing = self.commit()
