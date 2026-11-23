@@ -61,6 +61,7 @@ def patch_text(*headers: str) -> str:
 
 class BerthHookTests(unittest.TestCase):
     root: Path = Path()
+    main: Path = Path()
     repo: Path = Path()
     session_dir: Path = Path()
     bin_dir: Path = Path()
@@ -72,14 +73,14 @@ class BerthHookTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         isolate_fixture_git(self, self.root)
-        self.repo = self.root / "rust" / "fixture"
-        (self.repo / "src").mkdir(parents=True)
+        self.main = self.root / "rust" / "fixture"
+        (self.main / "src").mkdir(parents=True)
         for command in (["init", "-q", "-b", "main"], ["config", "user.name", "t"], ["config", "user.email", "t@example.invalid"],
                         ["config", "gc.auto", "0"], ["config", "maintenance.auto", "false"]):
-            _ = subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
-        _ = (self.repo / "src" / "lib.rs").write_text("fn a() {}\n")
-        _ = subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True, capture_output=True)
-        _ = subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "base"], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(self.main), *command], check=True, capture_output=True)
+        _ = (self.main / "src" / "lib.rs").write_text("fn a() {}\n")
+        _ = subprocess.run(["git", "-C", str(self.main), "add", "-A"], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(self.main), "commit", "-q", "-m", "base"], check=True, capture_output=True)
         self.session_dir = self.root / "unit" / "run-1"
         self.session_dir.mkdir(parents=True)
         self.bin_dir = self.root / "bin"
@@ -97,9 +98,11 @@ class BerthHookTests(unittest.TestCase):
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
             "DESIGN_ROLES_HOST": "fixture-host",
-            "HOME": str(self.root),
+            **model_worktree_environment(self.root, self.root / "config"),
             "HERDR_BIN": "/nonexistent/herdr",
         }
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            self.repo = make_fixture_worktree(self.main, "design-unit", "home")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
         owner = staff.update_current_session(owner.id, staff.native_id(DIRECTOR))
@@ -133,9 +136,8 @@ class BerthHookTests(unittest.TestCase):
             "./src/panels/\ndocs/panels.md\n")
 
     def make_phase_worktree(self, phase: str) -> Path:
-        self.environment.update(model_worktree_environment(self.root, self.root / "config"))
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            return make_fixture_worktree(self.repo, "design-unit", f"p{phase}")
+            return make_fixture_worktree(self.main, "design-unit", f"p{phase}")
 
     def claim_phase_worktree(self, phase: str, root: Path) -> None:
         directory = phase_reservation.phase_directory(self.session_dir, phase)
@@ -248,7 +250,7 @@ class BerthHookTests(unittest.TestCase):
 
     def map_director_session(self, reservation: str = RESERVATION) -> None:
         """cargo-berth's session map names `reservation` for the director's bare session id."""
-        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
         ledger.mkdir()
         _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
             DIRECTOR: {"coordination_run_id": RUN, "reservation_id": reservation}}}))
@@ -278,7 +280,7 @@ class BerthHookTests(unittest.TestCase):
                 if case == "another reservation mapped":
                     self.map_director_session(reservation="01a13f9c-0000-7000-8000-000000000002")
                 else:
-                    shutil.rmtree(self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY)
+                    shutil.rmtree(self.main / ".git" / phase_reservation.LEDGER_DIRECTORY)
                     self.map_director_session()
                     self.open_second_phase()
                 code, written = self.backstop()
@@ -307,7 +309,7 @@ class BerthHookTests(unittest.TestCase):
         self.answer_left_unmapped()
         self.open_second_phase()
         self.map_director_session()
-        path = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+        path = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
         _ = path.write_text(json.dumps({"identities": {
             DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": "another-run"}}}))
         _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
@@ -335,7 +337,7 @@ class BerthHookTests(unittest.TestCase):
         self.map_director_session()
         self.open_second_phase()
         if holding == "mapped":
-            path = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
+            path = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY / phase_reservation.SESSION_MAP_FILE
             _ = path.write_text(json.dumps({"identities": {
                 DIRECTOR: {"reservation_id": RESERVATION, "coordination_run_id": RUN},
                 phase_reservation.phase_session_id(DIRECTOR, "16"): {
@@ -500,7 +502,7 @@ class BerthHookTests(unittest.TestCase):
 
     def map_phase_session(self, phase: str) -> None:
         """Berth's session map names the phase's own session, as a check acquired under it leaves it."""
-        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger = self.main / ".git" / phase_reservation.LEDGER_DIRECTORY
         ledger.mkdir(exist_ok=True)
         _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
             phase_reservation.phase_session_id(DIRECTOR, phase): {"reservation_id": RESERVATION,
