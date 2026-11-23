@@ -2428,7 +2428,8 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': claim})
 
         cancel = shell_functions(trial.ROOT / 'scripts/direct/verify.sh',
-                                 'stop_assigned_gpu_unit', 'cancel_tree_run', 'forward_mac_runner_signal')
+                                 'remove_tree_watch', 'stop_assigned_gpu_unit',
+                                 'cancel_tree_run', 'forward_mac_runner_signal')
         cancel += """
 after_tree_change() { return 0; }
 find_mac_runner_pid() { runner_pid=42; }
@@ -2449,6 +2450,7 @@ CMD=test
                 result = subprocess.run(['bash', '-c', cancel + command, 'verify.sh', str(self.root)],
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn('command not found', result.stderr)
                 self.assertEqual(result.stdout.splitlines(),
                     ['42 TERM', 'build_targets.py stop-hana-gpu --assignment-file assignment.json'])
 

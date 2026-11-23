@@ -298,6 +298,7 @@ CMD=check
 RUN_STARTED=0
 after_tree_change() { return 0; }
 stop_tree_watch() { :; }
+remove_tree_watch() { TREE_WATCH_DIR=""; }
 release_token() { :; }
 note_event() { :; }
 interrupt_hold_wait() { :; }

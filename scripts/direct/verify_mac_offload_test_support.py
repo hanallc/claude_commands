@@ -49,6 +49,7 @@ from scripts.lib.shell_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
+
 _REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
 
 
@@ -1358,7 +1359,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
-            "collect_child", "verify_helper",
+            "collect_child", "run_cleanup", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
