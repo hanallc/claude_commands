@@ -3379,6 +3379,7 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Check the other item", number=2)
         self.browser_action_sequence(r"""
  const toggle=form.querySelector('[data-later-toggle]');
@@ -3413,7 +3414,7 @@ window.fetch=async(_path,options={})=>{
  check(!row.hidden,'Unpark returns the item to Working');
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
         self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -4319,10 +4320,10 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_lost_park_reply_keeps_the_other_open_row_at_the_same_pixel(self) -> None:
         root = self.root / "reviews"
-        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         for number in range(1, 17):
             state = the_list.ItemState.DELIVERED if number == 5 else the_list.ItemState.WORKING
             _ = self.add(f"List item {number}", state, number=number)
+        parked = self.add("The item to park", the_list.ItemState.BLOCKED, number=17)
         before = list_page.render(root, include_counts=False).decode()
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
         _ = the_list.update(MORTY.id, parked.id, {"state": the_list.ItemState.WORKING}, source="morty")
@@ -4538,6 +4539,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_switching_rows_moves_a_lost_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4555,10 +4557,11 @@ observer.observe(original.parentElement,{childList:true});
  check(aboveOnly(),'Opening another row moves the notice above the table.');
  row.querySelector('.list-toggle').click();
  check(inlineOnly(),'Opening the first row returns the notice to its details.');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -4581,7 +4584,7 @@ observer.observe(original.parentElement,{childList:true});
  check(!shows(1) && shows(2),'Closing row one does not restore the older notice.');
  second.querySelector('.list-toggle').click();
  check(status.hidden,'opening the latest failed row hides the notice above the table');
-''')
+''', add_item=False)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_clears_the_list_save_notice(self) -> None:
@@ -5353,6 +5356,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence("""
@@ -5369,10 +5373,11 @@ observer.observe(original.parentElement,{childList:true});
  submit('remove');
  finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
  check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
-""", reduced_motion=True)
+""", reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_refusal_restores_update_order_during_motion(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence(r"""
@@ -5394,7 +5399,7 @@ observer.observe(original.parentElement,{childList:true});
  check(updateKey()===original && first()==='1','the restored Update key puts the row first');
  restore?.finish();await flush();
  check(!animation() && first()==='1','the correct order remains after the animation');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_closed_response_clears_unread_when_the_server_reports_read(self) -> None:
@@ -5468,6 +5473,7 @@ observer.observe(original.parentElement,{childList:true});
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
+        _ = self.add("Test List action retries", number=1)
         _ = self.add("Next item", number=2)
         self.browser_action_sequence(r"""
  document.querySelector('[data-sort="0"]').click();
@@ -5505,7 +5511,7 @@ observer.observe(original.parentElement,{childList:true});
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
-""")
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_respects_reduced_motion(self) -> None:

@@ -200,6 +200,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         the_list.folder(keeper).mkdir(parents=True)
         return keeper
 
+    def list_keeper_item(self, title: str) -> tuple[staff.StaffRow, the_list.ListItem]:
+        """Add an item through a morty row that only a patched staff snapshot names."""
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))):
+            item = the_list.add(morty.id, title, owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        return morty, item
+
     def propose_feature(self, key: str) -> None:
         with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
             result = feature_log.main(['propose', '--review', key, '--project', 'claude',
@@ -5023,9 +5031,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(the_list.load(keeper, item.id), delivered)
 
     def test_list_feedback_saves_before_delivery_and_recovers_at_server_start(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
-        item = the_list.add(morty.id, "The feedback item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        morty, item = self.list_keeper_item("The feedback item")
         sent = threading.Event()
         completed = threading.Event()
         real_deliver = list_page.deliver
@@ -5094,14 +5100,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                     restarted.server_close()
 
     def test_list_unpark_retry_after_expiry_preserves_new_parking(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
         start = datetime(2026, 11, 18, tzinfo=timezone.utc)
         expiry = start + timedelta(hours=1)
         new_time = expiry + timedelta(hours=1)
         with patch.object(the_list, "now", return_value=start) as clock:
-            item = the_list.add(morty.id, "Unpark this item", owner=the_list.UnassignedOwner.NATE,
-                                source="nate", changes={})
+            morty, item = self.list_keeper_item("Unpark this item")
             parked = the_list.park(morty.id, item.id, expiry, source="morty")
             request = uuid4().hex
             def unpark_body(request_id: str) -> str:
@@ -5183,9 +5186,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertIs(payload.get("park_request_saved"), saved)
 
     def test_list_remove_reports_saved_when_directory_sync_fails_after_replace(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
-        item = the_list.add(morty.id, "Remove this item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        morty, item = self.list_keeper_item("Remove this item")
         request = uuid4().hex
         fields = {"keeper": morty.id, "id": item.id, "request": request,
                   "token": list_page.request_token(self.root, morty.id, item.id, request),
@@ -5280,9 +5281,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
 
     def test_list_ask_saves_before_delivery_and_retries_the_same_question(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
-        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        morty, item = self.list_keeper_item("The question item")
         words = "Which check passed?"
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
         claiming, resume_claim = threading.Event(), threading.Event()
@@ -5594,9 +5593,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(view, the_list.QuestionAttention(frozenset({"Q1"})))
 
     def test_list_ask_preserves_unicode_separators(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
-        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        morty, item = self.list_keeper_item("The question item")
         words = "First check?\u2028Second check?\u2029Third check?"
         request = uuid4().hex
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
@@ -5624,9 +5621,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          [("Q1", words)])
 
     def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
-        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
-                               current_session=staff.StaffId("fixture-morty-session"))
-        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        morty, item = self.list_keeper_item("The question item")
         request, words = uuid4().hex, "Which check passed?"
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
