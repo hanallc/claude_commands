@@ -137,6 +137,7 @@ class GuestRouteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.lift_read_limit_guard()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.config = self.root / "config"
         self.config.mkdir()
@@ -165,6 +166,10 @@ class GuestRouteTests(unittest.TestCase):
         (self.root / "place").mkdir()
         # The queue gives the run to the guest; a later wait gives it to natedev.
         self.line = FakeLine(self.root / "place", answers=[remote(hand_made_guest.MACHINE), local_grant()])
+
+    def lift_read_limit_guard(self) -> None:
+        """Remove the refusal for a guest with no read limit, so that the test reaches the guest route behind it."""
+        _ = self.enterContext(mock.patch.object(hand_made_guest, "NO_READ_LIMIT", ""))
 
     def checkout(self, name: str, origin: str) -> Path:
         """A clean checkout with check.py and an origin/main at its head."""
@@ -288,7 +293,7 @@ class GuestRouteTests(unittest.TestCase):
     def test_a_refused_mac_claim_takes_no_run(self) -> None:
         with mock.patch.object(mac_run, "held", side_effect=mac_run.MacRunRefused("mac is busy with fixture")):
             status, errors = self.attempt()
-        self.assert_failed(status, errors, "not started: mac is busy with fixture")
+        self.assert_failed(status, errors, "mac-linux: mac is busy with fixture")
         self.assertEqual(self.guest.events, [])
 
     def test_a_failed_guest_start_takes_no_run_and_names_the_cause(self) -> None:
@@ -358,17 +363,37 @@ class GuestRouteTests(unittest.TestCase):
         status, errors = self.attempt(machines=("natedev", hand_made_guest.MACHINE))
         self.assert_start_unknown(status, errors, "Connection to fixture-guest closed by remote host.")
 
-    def test_a_guest_that_refuses_the_command_word_gives_the_run_to_natedev(self) -> None:
+    def test_a_guest_that_refuses_the_command_word_ends_the_attempt_as_a_refusal(self) -> None:
         self.guest.status, self.guest.refused = 1, True
         self.guest.setup_error = "The guest refuses the command word target/run.sh: fixture"
         status, errors = self.attempt(machines=("natedev", hand_made_guest.MACHINE))
-        self.assertEqual(status, 0, errors)
-        self.assertEqual(self.output.getvalue(), b"hand made ran\n")
-        self.assertIn("mac-linux failed: guest start: The guest refuses the command word target/run.sh: fixture", errors)
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        cause = "mac-linux refused the run: The guest refuses the command word target/run.sh: fixture"
+        self.assertIn(cause, errors)
         self.assertNotIn(mac_linux.RUN_REFUSED, errors)
-        self.assertEqual(self.line.given_back, [("mac-linux", MAC_LINUX_NO_ANSWER)])
+        # As on the Mac, the run does not go back to natedev.
+        self.assertEqual((self.line.given_back, self.line.place.started, self.output.getvalue()), ([], [], b""))
+        self.assertEqual(self.line.closed, [("mac-linux", None, f"the guest run stopped: {cause}")])
         self.assertEqual(self.guest.events[-3:], ["run count=False", "prove True", "refs removed"])
-        self.assertEqual(self.only_row()["failed_machines"], ["mac-linux"])
+        row = self.only_row()
+        self.assertEqual((row["refusal"], row["status"], row["machine"], row["failed_machines"]),
+                         (cause, None, "mac-linux", []))
+
+    def test_a_folder_word_that_the_check_refuses_at_the_run_start_takes_no_guest_run(self) -> None:
+        (self.repo / "out").mkdir()
+        answer = self.runner
+
+        def ignore(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            _ = (self.repo / ".gitignore").write_text("target/\n/out\n")
+            return answer(argv, timeout=timeout, env=env)
+
+        with mock.patch.object(self, "runner", ignore):
+            status, errors = self.attempt(COMMAND + ("out",))
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        self.assertIn("a folder changed after the check: " + hand_made.FOLDER_REFUSAL.format(
+            word="out", entry="the folder", folder=self.repo / "out", reason="git ignores"), errors)
+        self.assertEqual((self.guest.events, self.line.given_back), ([], []))
+        self.assertEqual(self.line.closed, [("mac-linux", None, "a checked file changed after the check")])
 
     def test_the_guest_end_is_proved_after_a_failed_run(self) -> None:
         self.guest.status = 3

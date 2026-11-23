@@ -34,6 +34,7 @@ def read_execution_transport(target: SshTarget) -> ExecutionTransport:
 
 def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
     """Read the workload without reading credentials or deployment records."""
+    from scripts.aws_target.config import AwsOn, aws_switch
     from scripts.buildlog.repository import remote_identity
     from scripts.lib import conf
 
@@ -50,7 +51,7 @@ def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
             raise ValueError('Hana permits only check and lint judgments')
         return cast('tuple[placement.CommandKind, ...]', kinds)
 
-    if not configuration.value('enabled', conf.on_off):
+    if not isinstance(aws_switch(configuration), AwsOn):
         return DisabledHanaRoute()
     key = configuration.value('repository_identity', repository_key)
     kinds = configuration.value('kinds', permitted_kinds)
@@ -511,13 +512,17 @@ GPU_SELECTION_REQUIRED = 'This target requires a configured Hana package and int
 
 def gpu_setup(transport: HanaGpuNextestTransport, *, configuration: conf.ConfigRead | None = None
               ) -> tuple[str, ...] | HanaStepRefused:
-    """Read the enabled route and the saved gate grants without calling AWS."""
+    """Read the cloud gate switch, the enabled route and the saved gate grants without calling AWS."""
+    from scripts.aws_target.config import AwsOn, aws_switch, cloud_gate_off_reason
     from scripts.build_targets.target_config import ssh_target_state_directory
     from scripts.mac_test import claim_state
     from scripts.lib import conf
 
+    settings = conf.read(transport.settings) if configuration is None else configuration
+    switch = aws_switch(settings)
+    if not isinstance(switch, AwsOn):
+        return HanaStepRefused(cloud_gate_off_reason(switch))
     try:
-        settings = conf.read(transport.settings) if configuration is None else configuration
         if settings.text('hana_gpu_route_enabled') != 'on':
             return HanaStepRefused(GPU_SETUP_REQUIRED)
         sizes = tuple(settings.words('hana_gpu_instance_types'))

@@ -23,7 +23,6 @@ from scripts.lib import conf
 
 
 _HELD_LOCKS: set[str] = set()
-_INHERITED_LOCK = os.environ.get("MAIN_PUSH_LOCK_HELD", "")
 RECORD_NAME = "main-push-lock.jsonl"
 
 
@@ -80,7 +79,9 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Ge
     if path in _HELD_LOCKS:
         yield
         return
-    if _INHERITED_LOCK == path:
+    # The hold a parent gave this process. It is read at each use, because verify_helper.py
+    # runs many commands in one process.
+    if os.environ.get("MAIN_PUSH_LOCK_HELD", "") == path:
         _HELD_LOCKS.add(path)
         try:
             yield
